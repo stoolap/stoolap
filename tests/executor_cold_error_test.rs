@@ -122,9 +122,8 @@ fn assert_read_error(db: &Database, sql: &str) {
         .query(sql, ())
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
     assert!(
-        matches!(result, Err(Error::Internal { ref message })
-            if message == "corrupt V4 block: invalid column block length"
-                || message == "scan error: corrupt V4 block: invalid column block length"),
+        matches!(result, Err(Error::Io { ref message })
+            if message == "invalid column block length"),
         "{sql}: {result:?}"
     );
 }

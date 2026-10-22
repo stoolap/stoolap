@@ -31,8 +31,10 @@ use crate::functions::aggregate::{CallTemplate, ColumnsKey, GroupedAggregates};
 use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
-use crate::storage::traits::{Engine, Scanner, Table};
+use crate::storage::expression::{
+    AndExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr,
+};
+use crate::storage::traits::{Engine, Scanner, Table, Transaction};
 
 use super::aggregation::{
     ungrouped_column, AggregatePath, CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
@@ -1298,6 +1300,9 @@ struct PreparedSubquery {
     /// Every conjunct is one the scan takes: a call that pushes them all
     /// has the scan's answer, as the general path does, and skips the filter
     pushed_whole: bool,
+    /// The pushed equality on the table's primary key, by its position in
+    /// `pushdown`: a call reads the row its key names instead of scanning
+    point: Option<usize>,
     /// An EXISTS block's correlation equalities, which pick its candidate rows
     candidates: Option<SharedProgram>,
     /// The WHERE; for an EXISTS block, what of it the candidates leave
@@ -1412,7 +1417,15 @@ struct Grouping {
     keyed: Option<KeyedPlan>,
     /// An uncorrelated block without subqueries, as written: run once as a
     /// statement, so every aggregate path the general path admits answers it
-    statement: Option<Box<SelectStatement>>,
+    statement: Option<Box<StatementRun>>,
+}
+
+/// A block run as a statement of its own, with the plan its runs keep, as
+/// a cached statement keeps its own
+struct StatementRun {
+    statement: SelectStatement,
+    classification: std::sync::OnceLock<Arc<super::query_classification::QueryClassification>>,
+    compiled: RwLock<CompiledExecution>,
 }
 
 impl std::fmt::Debug for Grouping {
@@ -1570,6 +1583,9 @@ struct Kept {
     scopes: Arc<str>,
     /// Every table the block and the blocks in it read
     tables: Vec<SmartString>,
+    /// The statement parameters the block and the blocks in it read, by
+    /// position, which its answer depends on; None when it reads another slot
+    params: Option<Arc<[usize]>>,
     /// Its candidates grouped by key once per run, when that answers as the probe
     keyed: Option<KeyedPlan>,
 }
@@ -1786,6 +1802,43 @@ impl Builder<'_> {
                 }
                 ancestor = subqueries[at as usize].parent;
             }
+        }
+        // A block's answer depends on the parameters it and the blocks in it
+        // read; any other slot it reads leaves it every parameter
+        let mut params: Vec<Option<SmallVec<[usize; 2]>>> = subqueries
+            .iter()
+            .map(|sq| {
+                sq.reads
+                    .iter()
+                    .all(|slot| *slot < param_count)
+                    .then(|| sq.reads.clone())
+            })
+            .collect();
+        for nested in 0..subqueries.len() {
+            let mut ancestor = subqueries[nested].parent;
+            while let Some(at) = ancestor {
+                let at = at as usize;
+                params[at] = match (params[at].take(), &params[nested]) {
+                    (Some(mut read), Some(more)) => {
+                        for slot in more {
+                            if !read.contains(slot) {
+                                read.push(*slot);
+                            }
+                        }
+                        Some(read)
+                    }
+                    _ => None,
+                };
+                ancestor = subqueries[at].parent;
+            }
+        }
+        for (sq, read) in subqueries.iter_mut().zip(params) {
+            let (Answer::Value(_, kept) | Answer::Exists(kept) | Answer::Members(kept, _)) =
+                &mut sq.answer;
+            kept.params = read.map(|mut read| {
+                read.sort_unstable();
+                Arc::from(read.as_slice())
+            });
         }
         let holes = HoleSet {
             holes: subqueries
@@ -2171,6 +2224,7 @@ impl Builder<'_> {
             identity: Arc::new(identity),
             scopes: Arc::from(scopes),
             tables: table.iter().cloned().collect(),
+            params: None,
             keyed,
         };
         let answer = match form {
@@ -2244,13 +2298,22 @@ impl Builder<'_> {
                 && !correlated
                 && !sq.where_clause.as_deref().is_some_and(mentions_subquery)
             {
-                grouping.statement = Some(Box::new(sq.clone()));
+                grouping.statement = Some(Box::new(StatementRun {
+                    statement: sq.clone(),
+                    classification: std::sync::OnceLock::new(),
+                    compiled: RwLock::new(CompiledExecution::Unknown),
+                }));
             }
         }
         self.subqueries[id as usize] = Some(PreparedSubquery {
             table,
             column_indices: (0..scope.columns.len()).collect(),
             schema: CompactArc::clone(&schema),
+            point: schema.pk_column_index().and_then(|pk| {
+                pushdown
+                    .iter()
+                    .position(|c| c.operator == Operator::Eq && c.index == pk)
+            }),
             pushdown,
             pushed_whole,
             candidates,
@@ -2870,6 +2933,34 @@ pub struct PreparedDml {
     sets: Vec<(usize, SharedProgram)>,
     /// Each VALUES row's programs, None for a value without a subquery
     values: Vec<Vec<Option<SharedProgram>>>,
+    /// An INSERT's ON CONFLICT DO UPDATE, None without a subquery there
+    conflict: Option<PreparedConflict>,
+}
+
+/// An INSERT's ON CONFLICT SET values and DO UPDATE WHERE, over the row
+/// met joined with the excluded row
+struct PreparedConflict {
+    /// The target's columns the joined row is laid out for
+    columns: CompactArc<Vec<String>>,
+    upsert: Arc<super::dml::CompiledUpsert>,
+    /// A value read for each conflict holds a block that reads the target
+    reads_target: bool,
+}
+
+impl std::fmt::Debug for PreparedConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedConflict")
+            .field("columns", &self.columns)
+            .field("reads_target", &self.reads_target)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The ON CONFLICT DO UPDATE of `stmt`, an INSERT into `table` of `schema`
+pub(crate) struct ConflictSites<'e> {
+    pub(crate) table: &'e SmartString,
+    pub(crate) schema: &'e Schema,
+    pub(crate) stmt: &'e InsertStatement,
 }
 
 impl PreparedDml {
@@ -2884,6 +2975,7 @@ impl PreparedDml {
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
         values: &[impl AsRef<[Expression]>],
+        conflict: Option<&ConflictSites<'_>>,
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
@@ -2950,6 +3042,62 @@ impl PreparedDml {
             }
             rewritten_values.push(programs);
         }
+        // ON CONFLICT reads the row met and the excluded row, joined
+        let joined = conflict
+            .map(|sites| {
+                let width = sites.schema.columns.len();
+                let excluded = SmartString::from("excluded");
+                // `excluded` names the excluded row, also when the target bears
+                // that name; the target then has a name no qualifier can spell
+                let target = if *sites.table == excluded {
+                    SmartString::from(format!("{RESOLVED}{excluded}"))
+                } else {
+                    sites.table.clone()
+                };
+                ScopeTable::joined(
+                    [(target, sites.schema), (excluded, sites.schema)],
+                    2 * width,
+                )
+                .ok_or_else(|| Error::internal("an ON CONFLICT row that does not line up"))
+            })
+            .transpose()?;
+        let mut conflict_parts = None;
+        if let (Some(sites), Some(joined)) = (conflict, &joined) {
+            let scopes = [joined];
+            let chain = Chain { scopes: &scopes };
+            let mut reads_target = false;
+            let mut per_value = |builder: &mut Builder<'_>, value: &Expression| {
+                let first = builder.subqueries.len();
+                let mut value_work = Rewritten::default();
+                let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
+                if !value_work.reads_row
+                    && !is_leaf(value)
+                    && !volatile(value, &executor.function_registry)
+                {
+                    let slot = builder.slot();
+                    run_slots.push((slot, rewritten_value));
+                    return Ok(slot_parameter(slot));
+                }
+                // Read for each conflict, after the statement's earlier writes
+                reads_target |= builder.subqueries[first..]
+                    .iter()
+                    .flatten()
+                    .any(|sq| sq.table.as_ref() == Some(sites.table));
+                Ok::<_, Error>(rewritten_value)
+            };
+            let site_sets = Executor::conflict_sets(sites.schema, sites.stmt);
+            let mut sets = Vec::with_capacity(site_sets.len());
+            for (column, value) in site_sets {
+                sets.push((column, per_value(&mut builder, value)?));
+            }
+            let where_ = sites
+                .stmt
+                .update_where
+                .as_deref()
+                .map(|clause| per_value(&mut builder, clause))
+                .transpose()?;
+            conflict_parts = Some((sets, where_, reads_target));
+        }
         let mut read_as = FxHashMap::default();
         if let Some(parts) = &where_parts {
             compare_as_scan(&parts.clause, schema, &mut read_as);
@@ -2973,6 +3121,30 @@ impl PreparedDml {
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
+        let prepared_conflict = match (conflict, &joined, conflict_parts) {
+            (Some(sites), Some(joined), Some((sets, where_, reads_target))) => {
+                let over_joined = CompileContext::new(&joined.columns, &executor.function_registry)
+                    .with_prepared_subqueries();
+                let updates = sets
+                    .iter()
+                    .map(|(index, value)| {
+                        let column = &sites.schema.columns[*index];
+                        compile_with(&over_joined, value)
+                            .map(|p| (*index, column.data_type, column.vector_dimensions, p))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let where_ = where_
+                    .as_ref()
+                    .map(|clause| compile_with(&over_joined, clause))
+                    .transpose()?;
+                Some(PreparedConflict {
+                    columns: sites.schema.column_names_arc(),
+                    upsert: Arc::new(Executor::upsert_of(sites.schema, updates, where_)?),
+                    reads_target,
+                })
+            }
+            _ => None,
+        };
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
@@ -2989,6 +3161,7 @@ impl PreparedDml {
             where_,
             sets,
             values,
+            conflict: prepared_conflict,
         })
     }
 }
@@ -3165,7 +3338,7 @@ impl Executor {
     ) -> Result<Option<PreparedRunner<'a>>> {
         let (blocks, holes) = (&held.blocks, &held.joined);
         let inner_ctx = ctx.with_incremented_query_depth();
-        let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx)? else {
+        let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx, None)? else {
             return Ok(None);
         };
         Ok(Some(PreparedRunner::new(
@@ -3304,6 +3477,24 @@ impl<'a> DmlRunner<'a> {
     pub(crate) fn values(&self) -> &'a [Vec<Option<SharedProgram>>] {
         &self.prepared.values
     }
+
+    /// The ON CONFLICT DO UPDATE, its programs over the row met joined with
+    /// the excluded row; None without a prepared one
+    pub(crate) fn conflict_upsert(&self) -> Option<&'a Arc<super::dml::CompiledUpsert>> {
+        self.prepared
+            .conflict
+            .as_ref()
+            .map(|conflict| &conflict.upsert)
+    }
+
+    /// Whether a value read for each conflict holds a block that reads the
+    /// target, which inside a transaction would see the statement's writes
+    pub(crate) fn conflict_reads_target(&self) -> bool {
+        self.prepared
+            .conflict
+            .as_ref()
+            .is_some_and(|conflict| conflict.reads_target)
+    }
 }
 
 fn mentions_subquery(expr: &Expression) -> bool {
@@ -3436,25 +3627,36 @@ impl Builder<'_> {
 }
 
 impl Executor {
-    /// `name` as this statement reads it: through the explicit transaction,
-    /// or through the statement's snapshot, each at the statement's view
-    fn prepared_table(&self, name: &str, ctx: &ExecutionContext) -> Result<Box<dyn Table>> {
+    /// `name` as this statement reads it: through `through`, the statement's
+    /// own transaction, else the explicit transaction, else the statement's
+    /// snapshot, each at the statement's view
+    fn prepared_table(
+        &self,
+        name: &str,
+        ctx: &ExecutionContext,
+        through: Option<&dyn Transaction>,
+    ) -> Result<Box<dyn Table>> {
         use crate::storage::traits::transaction::StatementTable;
-        let active = self
-            .active_transaction
-            .lock()
-            .map_err(|_| Error::internal("active transaction lock poisoned"))?;
-        let table = match active.as_ref() {
-            Some(tx) => tx
-                .transaction
-                .get_statement_table_at(name, ctx.scan_view(name)),
+        let table = match through {
+            Some(tx) => tx.get_statement_table_at(name, ctx.scan_view(name)),
             None => {
-                drop(active);
-                ctx.statement_snapshot()
-                    .ok_or_else(|| {
-                        Error::internal("a prepared statement reads without a snapshot")
-                    })?
-                    .statement_table_at(name, ctx.scan_view(name))
+                let active = self
+                    .active_transaction
+                    .lock()
+                    .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+                match active.as_ref() {
+                    Some(tx) => tx
+                        .transaction
+                        .get_statement_table_at(name, ctx.scan_view(name)),
+                    None => {
+                        drop(active);
+                        ctx.statement_snapshot()
+                            .ok_or_else(|| {
+                                Error::internal("a prepared statement reads without a snapshot")
+                            })?
+                            .statement_table_at(name, ctx.scan_view(name))
+                    }
+                }
             }
         };
         let table = table.map_err(|e| match e {
@@ -3537,6 +3739,25 @@ impl Executor {
             })
     }
 
+    /// Whether the plan holds a DML statement prepared for the current
+    /// schema, which puts it in the family without walking it again
+    pub(crate) fn holds_prepared_dml(
+        &self,
+        compiled: Option<&RwLock<CompiledExecution>>,
+        ctx: &ExecutionContext,
+    ) -> bool {
+        compiled
+            .and_then(|slot| slot.read().ok())
+            .is_some_and(|guard| match &*guard {
+                CompiledExecution::PreparedDml(p) => {
+                    p.cached_epoch == self.engine.schema_epoch()
+                        && p.blocks.param_count == ctx.params().len()
+                        && ctx.outer_row().is_none()
+                }
+                _ => false,
+            })
+    }
+
     /// Whether an UPDATE's or DELETE's WHERE and SET values run prepared:
     /// they hold a subquery, and every form in them is the family's
     pub(crate) fn dml_family<'e>(
@@ -3564,8 +3785,9 @@ impl Executor {
     }
 
     /// The plan's prepared UPDATE, DELETE or INSERT over a target of
-    /// `schema`, named `scope_name`, with its blocks' tables open; prepared
-    /// now when the plan holds none for this schema, these columns and this
+    /// `schema`, named `scope_name`, with its blocks' tables open, through
+    /// the statement's own transaction `through` when given; prepared now
+    /// when the plan holds none for this schema, these columns and this
     /// parameter count
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_prepared_dml(
@@ -3576,14 +3798,25 @@ impl Executor {
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
         values: &[impl AsRef<[Expression]>],
+        conflict: Option<&ConflictSites<'_>>,
+        through: Option<&dyn Transaction>,
         ctx: &ExecutionContext,
     ) -> Result<(Arc<PreparedDml>, DmlTables)> {
         let epoch = self.engine.schema_epoch();
         let columns = schema.column_names_arc();
+        let same = |held: &CompactArc<Vec<String>>, now: &CompactArc<Vec<String>>| {
+            CompactArc::ptr_eq(held, now) || held == now
+        };
+        let conflict_columns = conflict.map(|sites| sites.schema.column_names_arc());
         let fits = |p: &PreparedDml| {
             p.cached_epoch == epoch
                 && p.blocks.param_count == ctx.params().len()
-                && (CompactArc::ptr_eq(&p.columns, &columns) || p.columns == columns)
+                && same(&p.columns, &columns)
+                && match (&p.conflict, &conflict_columns) {
+                    (Some(held), Some(now)) => same(&held.columns, now),
+                    (None, None) => true,
+                    _ => false,
+                }
         };
         let inner_ctx = ctx.with_incremented_query_depth();
         // A column change between taking the plan and opening a block's
@@ -3607,6 +3840,7 @@ impl Executor {
                         where_clause,
                         sets,
                         values,
+                        conflict,
                         ctx.params().len(),
                         epoch,
                     )?);
@@ -3625,7 +3859,25 @@ impl Executor {
                     prepared
                 }
             };
-            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
+            // A block read for each conflict that reads the target would see
+            // the statement's writes: it reads a snapshot taken before them
+            let reads_target = prepared.conflict.as_ref().is_some_and(|c| c.reads_target);
+            let snapshot_ctx = match through {
+                Some(_) if reads_target => {
+                    let snapshot = self.new_statement_snapshot(
+                        self.isolation_level(),
+                        inner_ctx.statement_view(),
+                    )?;
+                    Some(inner_ctx.with_statement_snapshot(snapshot))
+                }
+                _ => None,
+            };
+            let block_ctx = snapshot_ctx.as_ref().unwrap_or(&inner_ctx);
+            let through = through.filter(|_| snapshot_ctx.is_none());
+            if let Some(tables) =
+                PreparedRunner::open_tables(self, &prepared.blocks, block_ctx, through)?
+            {
+                let inner_ctx = snapshot_ctx.unwrap_or(inner_ctx);
                 return Ok((prepared, DmlTables { tables, inner_ctx }));
             }
             if fresh {
@@ -3652,7 +3904,7 @@ impl Executor {
         let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
             return Err(Error::internal("a prepared statement without one table"));
         };
-        let table = self.prepared_table(&ts.name.value_lower, ctx)?;
+        let table = self.prepared_table(&ts.name.value_lower, ctx, None)?;
         let scope_name = ts
             .alias
             .as_ref()
@@ -3665,7 +3917,9 @@ impl Executor {
             let prepared = self.prepared_for(compiled, stmt, &*table, scope_name, ctx, fresh)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_plan_taken();
-            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
+            if let Some(tables) =
+                PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx, None)?
+            {
                 break (prepared, tables);
             }
             if fresh {
@@ -3743,8 +3997,39 @@ impl Executor {
     }
 }
 
-/// Each subquery's table by its id; None for a block without FROM
-type BlockTables = Vec<Option<Box<dyn Table>>>;
+/// The rows a primary key equality read by key, in place of a scan
+struct PointRows {
+    rows: RowVec,
+    at: Option<usize>,
+}
+
+impl Scanner for PointRows {
+    fn next(&mut self) -> bool {
+        let at = self.at.map_or(0, |at| at + 1);
+        self.at = Some(at);
+        at < self.rows.len()
+    }
+
+    fn row(&self) -> &Row {
+        &self.rows[self.at.unwrap_or(0)].1
+    }
+
+    fn err(&self) -> Option<&Error> {
+        None
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The schema of a scope read before any row: a table without columns
+pub(crate) static NO_COLUMNS: std::sync::LazyLock<Schema> =
+    std::sync::LazyLock::new(|| Schema::new("", Vec::new()));
+
+/// Each subquery's table by its id; None for a block without FROM, or one
+/// run as a statement of its own
+type BlockTables = SmallVec<[Option<Box<dyn Table>>; 2]>;
 
 /// The one row without columns a block without FROM reads
 struct OneRow {
@@ -3820,23 +4105,29 @@ struct BlockState {
     grouped: RefCell<Option<GroupedKeys>>,
     /// The VM a grouped block's calls read their inputs with
     feed_vm: RefCell<Option<ExprVM>>,
+    /// The row a primary key equality read by key, kept for the next call
+    point_rows: RefCell<RowVec>,
 }
 
 impl<'a> PreparedRunner<'a> {
-    /// Every subquery's table as `inner_ctx` reads it, or None when one no
-    /// longer holds the columns its programs were prepared for
+    /// Every subquery's table as `inner_ctx` reads it, through `through`
+    /// when given, or None when one no longer holds the columns its
+    /// programs were prepared for
     fn open_tables(
         executor: &Executor,
         prepared: &PreparedBlocks,
         inner_ctx: &ExecutionContext,
+        through: Option<&dyn Transaction>,
     ) -> Result<Option<BlockTables>> {
-        let mut tables = Vec::with_capacity(prepared.subqueries.len());
+        let mut tables = BlockTables::with_capacity(prepared.subqueries.len());
         for sq in &prepared.subqueries {
-            let Some(name) = &sq.table else {
+            // A block run as a statement of its own opens its table itself
+            let runs_alone = sq.grouping.as_ref().is_some_and(|g| g.statement.is_some());
+            let (Some(name), false) = (&sq.table, runs_alone) else {
                 tables.push(None);
                 continue;
             };
-            let table = executor.prepared_table(name, inner_ctx)?;
+            let table = executor.prepared_table(name, inner_ctx, through)?;
             if table.schema().columns != sq.schema.columns {
                 return Ok(None);
             }
@@ -3860,6 +4151,25 @@ impl<'a> PreparedRunner<'a> {
                 read: false,
             })),
         }
+    }
+
+    /// [`Self::scan`] through the block's own bound pushdown `expr`: a
+    /// primary key equality bound to an integer reads that key's row, the
+    /// whole pushdown its filter, so it passes the rows the scan would
+    fn point_or_scan(
+        &self,
+        index: usize,
+        expr: Option<&dyn StorageExpr>,
+    ) -> Result<Box<dyn Scanner>> {
+        let sq = &self.prepared.subqueries[index];
+        if let (Some(point), Some(expr), Some(table)) = (sq.point, expr, &self.tables[index]) {
+            let params = self.blocks[index].buffer.borrow();
+            if let Some(Value::Integer(key)) = sq.pushdown[point].value(&params) {
+                let rows = table.fetch_rows_by_ids(&[key], expr)?;
+                return Ok(Box::new(PointRows { rows, at: None }));
+            }
+        }
+        self.scan(index, expr)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3896,6 +4206,7 @@ impl<'a> PreparedRunner<'a> {
                     failed: RefCell::new(SmallVec::new()),
                     grouped: RefCell::new(None),
                     feed_vm: RefCell::new(None),
+                    point_rows: RefCell::new(RowVec::new()),
                 })
                 .collect(),
             base,
@@ -4392,7 +4703,7 @@ impl<'a> PreparedRunner<'a> {
         let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
+            self.point_or_scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
             self.scan(index, None)?
         };
@@ -4633,6 +4944,7 @@ impl<'a> PreparedRunner<'a> {
             block_key: existence.identity_key,
             scopes: &existence.scopes,
             params: statement.params(),
+            read: existence.params.as_deref(),
         };
         let key = origin.key();
         if let Some(stamp) = &stamp {
@@ -4789,40 +5101,84 @@ impl PreparedRunner<'_> {
         self.fill(index, &mut vm, caller, site)?;
         // Read-only from here on: a nested subquery copies these values
         let params = self.blocks[index].buffer.borrow();
+        let mut value = None;
+        // A WHERE that is one primary key equality reads that key's row
+        if let Some((table, key)) = self.point_key(index, sq, &params) {
+            let mut rows = self.blocks[index].point_rows.borrow_mut();
+            rows.clear();
+            table.fetch_rows_by_ids_into(&[key], &ConstBoolExpr::true_expr(), &mut rows)?;
+            for (_, row) in rows.iter() {
+                self.take_one(&mut vm, projection, row, &params, &mut value)?;
+            }
+            return Ok(value.unwrap_or_else(Value::null_unknown));
+        }
         // The scanner keeps what it needs of the expression, so the next
         // call may rebind it once this scan is set up
         let pushed = self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
+            self.point_or_scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
             self.scan(index, None)?
         };
         let filter = sq.filter.as_ref().filter(|_| !(pushed && sq.pushed_whole));
-        let mut value = None;
         let mut scanned = 0u64;
         while scanner.next() {
             scanned += 1;
             if scanned.is_multiple_of(100) {
                 self.ctx.check_cancelled()?;
             }
-            let exec =
-                ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                    .with_subquery_executor(self);
             if let Some(filter) = filter {
+                let exec =
+                    ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
+                        .with_subquery_executor(self);
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
                 }
             }
-            if value.is_some() {
-                return Err(more_than_one_row());
-            }
-            value = Some(vm.execute(projection, &exec)?);
+            self.take_one(&mut vm, projection, scanner.row(), &params, &mut value)?;
         }
         if let Some(err) = scanner.err() {
             return Err(err.clone());
         }
         Ok(value.unwrap_or_else(Value::null_unknown))
+    }
+
+    /// The table and key of block `index` when its WHERE is one equality
+    /// on the table's primary key, given this call's integer
+    fn point_key(
+        &self,
+        index: usize,
+        sq: &PreparedSubquery,
+        params: &[Value],
+    ) -> Option<(&dyn Table, i64)> {
+        let point = sq
+            .point
+            .filter(|_| sq.pushed_whole && sq.pushdown.len() == 1)?;
+        let table = self.tables[index].as_deref()?;
+        match sq.pushdown[point].value(params)? {
+            Value::Integer(key) => Some((table, key)),
+            _ => None,
+        }
+    }
+
+    /// `value` taking the SELECT expression over a candidate `row` that
+    /// passed; a second candidate is the scalar's error
+    fn take_one(
+        &self,
+        vm: &mut ExprVM,
+        projection: &SharedProgram,
+        row: &Row,
+        params: &[Value],
+        value: &mut Option<Value>,
+    ) -> Result<()> {
+        if value.is_some() {
+            return Err(more_than_one_row());
+        }
+        let exec = ExecuteContext::with_common_params(row, params, self.transaction_id)
+            .with_subquery_executor(self);
+        *value = Some(vm.execute(projection, &exec)?);
+        Ok(())
     }
 
     fn exists_answer(&self, index: usize, caller: &ExecuteContext, site: &HoleSet) -> Result<bool> {
@@ -5055,7 +5411,7 @@ impl PreparedRunner<'_> {
         let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
+            self.point_or_scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
             self.scan(index, None)?
         };
@@ -5407,12 +5763,18 @@ impl MemberFold {
 impl PreparedRunner<'_> {
     /// The first value of every row an uncorrelated block that aggregates
     /// gives, run as a statement of its own under the run's view
-    fn statement_values(&self, statement: &SelectStatement) -> Result<Vec<Value>> {
+    fn statement_values(&self, run: &StatementRun) -> Result<Vec<Value>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::Statement,
         );
-        let mut result = self.executor.execute_select(statement, &self.ctx)?;
+        let mut result = self.executor.execute_select_with_plan(
+            &run.statement,
+            &self.ctx,
+            Some(&run.classification),
+            Some(&run.compiled),
+            None,
+        )?;
         let mut values = Vec::new();
         while result.next() {
             let mut row = result.take_row().into_values();
@@ -5561,7 +5923,7 @@ impl PreparedRunner<'_> {
         let pushed = self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
+            self.point_or_scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
             self.scan(index, None)?
         };

@@ -606,13 +606,14 @@ pub enum BlockAnswer {
 }
 
 /// What a prepared EXISTS answer is of: the block as written, its key, the
-/// scopes around it its names bind in, and every parameter value of the
-/// statement
+/// scopes around it its names bind in, and the statement's parameter values
+/// it reads: those at `read`, or every one
 pub(crate) struct BlockOrigin<'a> {
     pub block: &'a Arc<crate::parser::ast::Expression>,
     pub block_key: super::expr_key::ExprKey,
     pub scopes: &'a Arc<str>,
     pub params: &'a [Value],
+    pub read: Option<&'a [usize]>,
 }
 
 /// An `BlockOrigin` as its cache entry keeps it
@@ -623,13 +624,24 @@ struct KeptBlockOrigin {
 }
 
 impl BlockOrigin<'_> {
+    /// The parameter values the answer depends on, in order
+    fn read_params(&self) -> impl Iterator<Item = &Value> {
+        let all = self.read.is_none().then_some(self.params.iter());
+        let read = self.read.into_iter().flatten().map(|at| {
+            self.params
+                .get(*at)
+                .unwrap_or(&crate::core::value::NULL_VALUE)
+        });
+        all.into_iter().flatten().chain(read)
+    }
+
     /// The cache key, taken without allocation
     pub fn key(&self) -> u64 {
         let mut hasher = rustc_hash::FxHasher::default();
         self.block_key.hash(&mut hasher);
         self.scopes.hash(&mut hasher);
-        self.params.len().hash(&mut hasher);
-        for value in self.params {
+        self.read_params().count().hash(&mut hasher);
+        for value in self.read_params() {
             hash_parameter(value, &mut hasher);
         }
         hasher.finish()
@@ -638,11 +650,11 @@ impl BlockOrigin<'_> {
     fn is(&self, kept: &KeptBlockOrigin) -> bool {
         (Arc::ptr_eq(self.block, &kept.block) || **self.block == *kept.block)
             && (Arc::ptr_eq(self.scopes, &kept.scopes) || **self.scopes == *kept.scopes)
-            && kept.params.len() == self.params.len()
+            && kept.params.len() == self.read_params().count()
             && kept
                 .params
                 .iter()
-                .zip(self.params)
+                .zip(self.read_params())
                 .all(|(kept, value)| same_parameter(kept, value))
     }
 }
@@ -692,7 +704,7 @@ pub(crate) fn cache_block_answer(
     let kept = KeptBlockOrigin {
         block: Arc::clone(origin.block),
         scopes: Arc::clone(origin.scopes),
-        params: origin.params.to_vec(),
+        params: origin.read_params().cloned().collect(),
     };
     BLOCK_ANSWER_CACHE.with(|cache| cache.borrow_mut().put(key, (kept, stamp, answer)));
 }

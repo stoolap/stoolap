@@ -3345,7 +3345,7 @@ impl Executor {
             feed.run_one(&mut groups, scanner.row(), ctx, &mut state)?;
         }
         if let Some(e) = scanner.err() {
-            return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+            return Err(e.clone());
         }
         scanner.close()?;
 

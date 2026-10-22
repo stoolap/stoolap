@@ -3332,7 +3332,7 @@ impl SegmentedTable {
         reader
             .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(&cold.volume)))
             .row(idx, &cold.mapping)
-            .map_err(|e| crate::core::Error::internal(format!("cold row read failed: {e}")))
+            .map_err(crate::core::Error::from)
     }
 
     /// One round over the rows named that no round prepared yet; the rest
@@ -3527,10 +3527,7 @@ impl SegmentedTable {
                 }
                 let old_row = old_rows
                     .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(vol)))
-                    .row(i, mapping)
-                    .map_err(|e| {
-                        crate::core::Error::internal(format!("cold row read failed: {e}"))
-                    })?;
+                    .row(i, mapping)?;
                 prep.deletes.push(ColdDelete {
                     row_id,
                     seg_id: *seg_id,
@@ -6732,7 +6729,7 @@ impl Table for SegmentedTable {
                         }
                     }
                     if let Some(e) = scanner.err() {
-                        return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+                        return Err(e.clone());
                     }
                 }
             }

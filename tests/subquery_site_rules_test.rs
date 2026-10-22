@@ -286,7 +286,7 @@ fn test_insert_values() {
 fn test_on_conflict_set() {
     write_site(
         "site_on_conflict",
-        Fails("step 5"),
+        Right,
         "INSERT INTO t VALUES (1, 0, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT MAX(x) FROM u)",
         "INSERT INTO t VALUES (1, 0, 0) ON CONFLICT (id) DO UPDATE SET b = 3",
     );

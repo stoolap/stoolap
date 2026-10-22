@@ -127,13 +127,30 @@ const CORPUS: &[(&str, &str)] = &[
         "INSERT INTO t VALUES (9, 9, CASE WHEN 4 IN (SELECT v FROM u) THEN 1 ELSE 0 END, 'i')",
         "SELECT 9, 9, CASE WHEN 4 IN (SELECT v FROM u) THEN 1 ELSE 0 END, 'i'",
     ),
+    (
+        "INSERT INTO t VALUES (2, 2, 0, 'n') ON CONFLICT (id) DO UPDATE SET x = (SELECT MAX(v) FROM u WHERE u.k = t.k)",
+        "SELECT id, k, CASE WHEN id = 2 THEN (SELECT MAX(v) FROM u WHERE u.k = t.k) ELSE x END, s FROM t ORDER BY id",
+    ),
+    (
+        "INSERT INTO t VALUES (1, 4, 0, 'n') ON CONFLICT (id) DO UPDATE SET x = (SELECT COUNT(*) FROM u WHERE u.k = excluded.k)",
+        "SELECT id, k, CASE WHEN id = 1 THEN (SELECT COUNT(*) FROM u WHERE u.k = 4) ELSE x END, s FROM t ORDER BY id",
+    ),
+    (
+        "INSERT INTO t VALUES (4, 4, 0, 'n') ON CONFLICT (id) DO UPDATE SET s = 'w' WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        "SELECT id, k, x, CASE WHEN id = 4 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k) THEN 'w' ELSE s END FROM t ORDER BY id",
+    ),
+    (
+        "INSERT INTO t VALUES (1, 0, 0, 'n'), (2, 0, 0, 'n') ON CONFLICT (id) DO UPDATE SET x = (SELECT SUM(t2.x) FROM t t2 WHERE t2.id <> t.id)",
+        "SELECT id, k, CASE WHEN id IN (1, 2) THEN (SELECT SUM(t2.x) FROM t t2 WHERE t2.id <> t.id) ELSE x END, s FROM t ORDER BY id",
+    ),
 ];
 
-/// The rows `expected` names: an UPDATE's whole rows, the rows of t whose
-/// id a DELETE's CASE marks 0, or t with the rows an INSERT adds after it
+/// The rows `expected` names: an UPDATE's or an upsert's whole rows, the
+/// rows of t whose id a DELETE's CASE marks 0, or t with the rows an INSERT
+/// adds after it
 fn expected_rows(db: &Database, dml: &str, expected: &str) -> Vec<String> {
     let rows = table(db, expected);
-    if dml.starts_with("INSERT") {
+    if dml.starts_with("INSERT") && !dml.contains("ON CONFLICT") {
         let mut all = table(db, ROWS);
         all.extend(rows);
         return all;
