@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString};
 use crate::core::predicate::PredicateSet;
-use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, Value};
+use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value};
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, GroupedAggregates};
 use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
@@ -3305,6 +3305,8 @@ pub(crate) struct JoinBlocks {
     pub(crate) sides: [Option<Expression>; 2],
     /// The same conditions as their side's scan reads them
     side_wheres: [Option<PreparedWhere>; 2],
+    /// The columns of each side the conditions above were prepared over
+    side_columns: [Vec<SchemaColumn>; 2],
     /// The scope's names for the left side's columns, then the right side's
     pub(crate) left: Vec<String>,
     pub(crate) right: Vec<String>,
@@ -3312,6 +3314,17 @@ pub(crate) struct JoinBlocks {
 }
 
 impl JoinBlocks {
+    /// SchemaChanged when `table`, opened for side `side`, no longer holds
+    /// the columns that side's conditions were prepared over
+    fn side_fits(&self, side: usize, table: &dyn Table) -> Result<()> {
+        if table.schema().columns == self.side_columns[side] {
+            return Ok(());
+        }
+        Err(Error::SchemaChanged {
+            table: table.name().to_string(),
+        })
+    }
+
     /// `on`, `cross` and the conditions on one side, `side_filters`, over the
     /// joined row of `sides`, each a name and its table's schema; None when
     /// the join's `width` columns do not line up
@@ -3383,9 +3396,11 @@ impl JoinBlocks {
         let (blocks, joined) = builder.finish(param_count, run_slots)?;
         let mut side_filters = [None, None];
         let mut side_wheres = [None, None];
+        let mut side_columns = [Vec::new(), Vec::new()];
         for (i, part) in side_parts.into_iter().enumerate() {
             if let Some((parts, program, joined_clause)) = part {
                 side_wheres[i] = Some(parts.prepare(program, &blocks));
+                side_columns[i] = sides[i].1.columns.clone();
                 side_filters[i] = Some(joined_clause);
             }
         }
@@ -3428,6 +3443,7 @@ impl JoinBlocks {
             cross,
             sides: side_filters,
             side_wheres,
+            side_columns,
             left,
             right,
             all: CompactArc::clone(&scope.columns),
@@ -3539,6 +3555,7 @@ impl Executor {
         else {
             return Ok(None);
         };
+        held.side_fits(side, table)?;
         Ok(
             match run.where_scan(where_, None, where_.narrowing_set, table, ctx)? {
                 None => Some(Some(Box::new(ConstBoolExpr::new(false)))),
@@ -3568,7 +3585,10 @@ impl Executor {
         let Some(where_) = &held.side_wheres[side] else {
             return Ok(None);
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::join_side_opening();
         let table = self.prepared_table(name, ctx, None)?;
+        held.side_fits(side, &*table)?;
         let token = table.layout_token();
         let columns = table.schema().column_names_arc();
         let extra = extra.map(|extra| strip_table_qualifier(extra, alias));

@@ -5625,6 +5625,10 @@ impl Executor {
 
                 if let Some(outer_idx) = outer_key_idx {
                     // Get inner table for schema and row fetching
+                    #[cfg(feature = "test-failpoints")]
+                    if statement_run.is_some() {
+                        crate::test_failpoints::join_side_opening();
+                    }
                     let Some(inner_table) = self.index_join_inner(
                         &snapshot,
                         ctx,

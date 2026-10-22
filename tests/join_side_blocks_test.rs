@@ -19,8 +19,11 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use stoolap::test_failpoints::{
-    bound_side_reads, bridge_compiles, inner_fetch_filters, join_paths_taken, program_compiles,
+    before_join_side_opened, bound_side_reads, bridge_compiles, join_paths_taken, program_compiles,
     reset_join_paths,
 };
 use stoolap::Database;
@@ -390,6 +393,7 @@ fn the_index_joins_answer_with_a_side_subquery_beside_their_own_rules() {
 #[cfg(not(feature = "test-filedb"))]
 #[test]
 fn an_index_join_fetches_its_inner_rows_through_their_conditions() {
+    use stoolap::test_failpoints::inner_fetch_filters;
     let db = Database::open("memory://join_side_blocks_inner_fetch").unwrap();
     fill(&db);
     db.execute("INSERT INTO s VALUES (91, NULL, 77), (92, 2, 77)", ())
@@ -483,5 +487,56 @@ fn a_side_whose_rows_need_the_where_streams_it_bound_to_its_sets() {
             ),
             _ => assert_eq!(got, want, "{plain}"),
         }
+    }
+}
+
+#[test]
+fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
+    for (name, condition, table) in [
+        (
+            "join_side_blocks_drop_outer",
+            "a.g IN (SELECT s.x FROM s)",
+            "a",
+        ),
+        (
+            "join_side_blocks_drop_inner",
+            "b.w IN (SELECT s.x FROM s)",
+            "b",
+        ),
+    ] {
+        let db = Database::open(&format!("memory://{name}")).unwrap();
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, pad INTEGER, k INTEGER, g INTEGER)",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, pad INTEGER, k INTEGER, w INTEGER)",
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, x INTEGER)",
+            "CREATE INDEX b_k ON b (k)",
+            "INSERT INTO a SELECT g.value, 0, g.value % 7, g.value % 5 FROM generate_series(1, 60) g",
+            "INSERT INTO b SELECT g.value, 0, g.value % 7, g.value % 5 FROM generate_series(1, 80) g",
+            "INSERT INTO s VALUES (1, 1), (2, 3)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let sql = format!("SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE {condition}");
+        let general = sql.replace(
+            "FROM a JOIN b",
+            "FROM (SELECT id, k, g FROM a) a JOIN (SELECT id, k, w FROM b) b",
+        );
+        let want = rows(&db, &general).unwrap();
+        assert!(!rows(&db, &sql).unwrap().is_empty(), "{sql}: prepared");
+        let writer = db.clone();
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        let alter = format!("ALTER TABLE {table} DROP COLUMN pad");
+        before_join_side_opened(move || {
+            writer.execute(&alter, ()).unwrap();
+            flag.set(true);
+        });
+        let got = rows(&db, &sql);
+        assert!(done.get(), "{sql}: the column dropped inside the statement");
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("schema changed")),
+            "{sql}: {got:?}"
+        );
+        assert_eq!(rows(&db, &sql).unwrap(), want, "{sql}: run again");
     }
 }

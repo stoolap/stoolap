@@ -2932,6 +2932,20 @@ pub(crate) fn hot_scan_checked() {
     run_hook(&HOT_SCAN_CHECKED_HOOK);
 }
 
+thread_local! {
+    static JOIN_SIDE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next join with prepared side
+/// conditions is about to open a side's table
+pub fn before_join_side_opened(hook: impl FnOnce() + 'static) {
+    JOIN_SIDE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_side_opening() {
+    run_hook(&JOIN_SIDE_HOOK);
+}
+
 /// Join side reads on this thread that streamed their rows through the
 /// WHERE bound to the sets the run read, so far
 pub fn bound_side_reads() -> usize {
