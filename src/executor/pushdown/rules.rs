@@ -478,7 +478,7 @@ impl PushdownRule for InListRule {
         };
 
         match in_list_filter(column, values, in_expr.not, ctx) {
-            Some(filter) => PushdownResult::Converted(filter),
+            Some(filter) => PushdownResult::Converted(Box::new(filter)),
             None => PushdownResult::CannotPush,
         }
     }
@@ -491,7 +491,7 @@ pub(crate) fn in_list_filter(
     values: impl IntoIterator<Item = Value>,
     not: bool,
     ctx: &PushdownContext<'_>,
-) -> Option<Box<dyn StorageExpr>> {
+) -> Option<InListExpr> {
     // Coerce values to column type
     let coerced_values: Vec<Value> = values
         .into_iter()
@@ -504,7 +504,7 @@ pub(crate) fn in_list_filter(
         InListExpr::new(column, coerced_values)
     };
     expr.prepare_for_schema(ctx.schema);
-    Some(Box::new(expr))
+    Some(expr)
 }
 
 // =============================================================================

@@ -31,7 +31,6 @@ use crate::functions::aggregate::{CallTemplate, ColumnsKey, GroupedAggregates};
 use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::expression::in_list::SEARCHED_FLOAT_MEMBERS;
 use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, Scanner, Table};
 
@@ -3811,6 +3810,9 @@ struct BlockState {
     /// A value block's members: an uncorrelated block's, or a keyed IN
     /// block's grouped by key
     members: RefCell<Option<BlockAnswer>>,
+    /// The error a read of the members or of the keyed set raised in this
+    /// run, which every row that needs them raises without reading again
+    read_error: RefCell<Option<Error>>,
     /// The slots whose value raised an error for this call, its parent's
     /// included: an EXISTS or value block raises one only on a candidate
     failed: RefCell<FailedSlots>,
@@ -3890,6 +3892,7 @@ impl<'a> PreparedRunner<'a> {
                     keyed_choice: std::cell::Cell::new(None),
                     keyed_set: RefCell::new(None),
                     members: RefCell::new(None),
+                    read_error: RefCell::new(None),
                     failed: RefCell::new(SmallVec::new()),
                     grouped: RefCell::new(None),
                     feed_vm: RefCell::new(None),
@@ -4068,24 +4071,23 @@ impl<'a> PreparedRunner<'a> {
             Some(filter) => SetScan::Filter(filter),
             None => SetScan::Program,
         };
-        // The scan compares a float with every member of a list
-        let long_floats = |members: usize| {
-            schema.columns[slot.column].data_type == DataType::Float
-                && members > SEARCHED_FLOAT_MEMBERS
+        let float_column = schema.columns[slot.column].data_type == DataType::Float;
+        let list = |values: &mut dyn Iterator<Item = Value>, negated: bool| {
+            match pushdown::in_list_filter(column(), values, negated, &scan) {
+                Some(list) if list.tests_cheaply(float_column) => SetScan::Filter(Box::new(list)),
+                _ => SetScan::Program,
+            }
         };
         Ok(match &set.set {
             MemberSet::In(set_of) => {
                 let members = set_of.members();
-                let values = members.iter().filter(|v| !v.is_null()).cloned();
+                let mut values = members.iter().filter(|v| !v.is_null()).cloned();
                 match (slot.negated, set_of.has_null()) {
                     // Over no member NOT IN holds for every value, NULL too
                     (true, _) if members.is_empty() => SetScan::Every,
                     (true, true) => SetScan::None,
                     (false, _) if members.iter().all(Value::is_null) => SetScan::None,
-                    _ if long_floats(members.len()) => SetScan::Program,
-                    (negated, _) => {
-                        filter(pushdown::in_list_filter(column(), values, negated, &scan))
-                    }
+                    (negated, _) => list(&mut values, negated),
                 }
             }
             MemberSet::Quantified(quantified) => {
@@ -4097,21 +4099,8 @@ impl<'a> PreparedRunner<'a> {
                         false => SetScan::None,
                     },
                     _ if values.is_empty() || (all && has_null) => SetScan::None,
-                    (CompareOp::Eq, false) | (CompareOp::Ne, true) if long_floats(values.len()) => {
-                        SetScan::Program
-                    }
-                    (CompareOp::Eq, false) => filter(pushdown::in_list_filter(
-                        column(),
-                        values.iter().cloned(),
-                        false,
-                        &scan,
-                    )),
-                    (CompareOp::Ne, true) => filter(pushdown::in_list_filter(
-                        column(),
-                        values.iter().cloned(),
-                        true,
-                        &scan,
-                    )),
+                    (CompareOp::Eq, false) => list(&mut values.iter().cloned(), false),
+                    (CompareOp::Ne, true) => list(&mut values.iter().cloned(), true),
                     _ => filter(pushdown::quantified_filter(
                         column(),
                         op,
@@ -4534,9 +4523,11 @@ impl<'a> PreparedRunner<'a> {
         if let Some(set) = self.blocks[index].keyed_set.borrow().as_ref() {
             return Ok(CompactArc::clone(set));
         }
-        let answer = self.kept(existence, || {
-            self.build_keyed_set(index, plan)
-                .map(|set| BlockAnswer::Keyed(CompactArc::new(set)))
+        let answer = self.read_once(index, || {
+            self.kept(existence, || {
+                self.build_keyed_set(index, plan)
+                    .map(|set| BlockAnswer::Keyed(CompactArc::new(set)))
+            })
         })?;
         let BlockAnswer::Keyed(set) = answer else {
             return Err(Error::internal("a value kept for a keyed set"));
@@ -5012,13 +5003,24 @@ impl PreparedRunner<'_> {
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::MemberSet,
         );
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
-        let answer = self.kept(kept, || {
-            self.collect_members(index, members, None)
-                .map(|set| BlockAnswer::Members(CompactArc::new(set)))
+        let answer = self.read_once(index, || {
+            self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
+            self.kept(kept, || {
+                self.collect_members(index, members, None)
+                    .map(|set| BlockAnswer::Members(CompactArc::new(set)))
+            })
         })?;
         *self.blocks[index].members.borrow_mut() = Some(answer);
         Ok(())
+    }
+
+    /// `read` of block `index`'s set, or the error a read of it raised
+    /// before in this run, which every row that needs the set raises
+    fn read_once<T>(&self, index: usize, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Some(e) = self.blocks[index].read_error.borrow().as_ref() {
+            return Err(e.clone());
+        }
+        read().inspect_err(|e| *self.blocks[index].read_error.borrow_mut() = Some(e.clone()))
     }
 
     /// The member a candidate's SELECT expression gives, read as the tested

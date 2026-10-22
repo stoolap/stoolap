@@ -20,8 +20,22 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use stoolap::core::Value;
+use stoolap::executor::Executor;
+use stoolap::functions::{
+    global_registry, FunctionDataType, FunctionInfo, FunctionRegistry, FunctionSignature,
+    FunctionType, ScalarFunction,
+};
+use stoolap::storage::mvcc::engine::MVCCEngine;
 use stoolap::test_failpoints::{prepared_strategy_runs, PreparedStrategy};
 use stoolap::Database;
+
+/// The strategy counts are process-wide: tests that read or move them take
+/// turns
+static COUNTED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// t: id 1..40, i INTEGER (NULL every 9th), f FLOAT, s TEXT; m holds the
 /// member sets, picked by `k`: 1 numbers, 2 numbers and a NULL, 3 NULL
@@ -69,6 +83,7 @@ fn ids(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
 
 #[test]
 fn a_scan_takes_a_set_conjunct_as_the_general_path_answers_it() {
+    let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
     let mut taken = 0;
     for sealed in [false, true] {
@@ -122,6 +137,7 @@ fn a_scan_takes_a_set_conjunct_as_the_general_path_answers_it() {
 
 #[test]
 fn a_block_error_belongs_to_the_row_that_needs_the_answer() {
+    let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://prepared_set_scan_errors").unwrap();
     fill(&db);
     db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, i INTEGER)", ())
@@ -167,21 +183,98 @@ fn a_block_error_belongs_to_the_row_that_needs_the_answer() {
     );
 }
 
+static TICKS: AtomicUsize = AtomicUsize::new(0);
+
+/// i64::MAX on its first call in a statement, 1 on its second, 0 after
+#[derive(Default)]
+struct Tick;
+
+impl ScalarFunction for Tick {
+    fn name(&self) -> &str {
+        "TICK"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "TICK",
+            FunctionType::Scalar,
+            "test volatile",
+            FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
+        )
+        .non_deterministic()
+    }
+    fn evaluate(&self, _args: &[Value]) -> stoolap::core::Result<Value> {
+        Ok(Value::Integer(
+            match TICKS.fetch_add(1, Ordering::Relaxed) {
+                0 => i64::MAX,
+                1 => 1,
+                _ => 0,
+            },
+        ))
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(Tick)
+    }
+}
+
 #[test]
-fn a_float_column_tests_a_large_set_as_the_program_does() {
+fn a_block_error_is_raised_again_without_reading_the_block_again() {
+    let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
+    // Aggregates resolve functions in the global registry; no other test
+    // here calls TICK
+    global_registry().register_scalar::<Tick>();
+    let registry = FunctionRegistry::new();
+    registry.register_scalar::<Tick>();
+    let mut engine = MVCCEngine::in_memory();
+    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER)",
+        "INSERT INTO t VALUES (1, 5), (2, 6)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO m VALUES (1, 1), (2, 2)",
+    ] {
+        executor.execute(sql).unwrap();
+    }
+    for test in ["> ANY", ">= ALL", "IN", "NOT IN", "= ANY", "<> ALL"] {
+        let sql = format!("SELECT id FROM t WHERE i {test} (SELECT SUM(TICK(v)) FROM m)");
+        TICKS.store(0, Ordering::Relaxed);
+        let error = match executor.execute(&sql) {
+            Err(e) => Some(e),
+            Ok(mut rows) => {
+                while rows.next() {}
+                rows.last_error()
+            }
+        };
+        assert!(
+            error
+                .as_ref()
+                .is_some_and(|e| e.to_string().contains("overflow")),
+            "{sql}: {error:?}"
+        );
+        assert_eq!(
+            TICKS.load(Ordering::Relaxed),
+            2,
+            "{sql}: the block ran once"
+        );
+    }
+}
+
+#[test]
+fn a_long_list_a_cell_searches_stays_the_programs() {
+    let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://prepared_set_scan_float").unwrap();
     for sql in [
-        "CREATE TABLE fl (id INTEGER PRIMARY KEY, f FLOAT)",
+        "CREATE TABLE fl (id INTEGER PRIMARY KEY, f FLOAT, i INTEGER)",
         "INSERT INTO fl SELECT g.value, CASE WHEN g.value % 13 = 0 THEN NULL \
-         ELSE (g.value % 400) * 0.5 END FROM generate_series(1, 3000) g",
+         ELSE (g.value % 400) * 0.5 END, g.value % 400 FROM generate_series(1, 3000) g",
         "CREATE TABLE fm (id INTEGER PRIMARY KEY, v FLOAT, n INTEGER)",
         "INSERT INTO fm SELECT g.value, g.value * 0.75, g.value FROM generate_series(1, 200) g",
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // Whether the scan takes each set: a float is compared with every
-    // member, so a long set stays the program's; a positive IN is read by
-    // its members' rows
+    // Whether the scan takes each set: a float, or an integer against a
+    // fractional member, is compared with every member, so a long set stays
+    // the program's; a positive IN is read by its members' rows
     for (condition, scan_takes) in [
         ("f IN (SELECT v FROM fm)", false),
         ("f NOT IN (SELECT v FROM fm)", false),
@@ -192,6 +285,11 @@ fn a_float_column_tests_a_large_set_as_the_program_does() {
         ("f IN (SELECT v FROM fm WHERE id <= 8)", false),
         ("f NOT IN (SELECT v FROM fm WHERE id <= 8)", true),
         ("f <> ALL (SELECT v FROM fm WHERE id <= 8)", true),
+        ("i NOT IN (SELECT v FROM fm)", false),
+        ("i <> ALL (SELECT v FROM fm WHERE id > 20)", false),
+        ("i NOT IN (SELECT n FROM fm)", true),
+        ("i NOT IN (SELECT v FROM fm WHERE id <= 8)", true),
+        ("i <> ALL (SELECT v * 4 FROM fm)", true),
     ] {
         let sql = format!("SELECT id FROM fl WHERE {condition}");
         let before = prepared_strategy_runs(PreparedStrategy::ScanTakesMembers);
@@ -209,6 +307,7 @@ fn a_float_column_tests_a_large_set_as_the_program_does() {
 
 #[test]
 fn a_set_conjunct_the_scan_takes_reaches_the_scan_strategy() {
+    let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://prepared_set_scan_reached").unwrap();
     fill(&db);
     db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, Score INTEGER)", ())

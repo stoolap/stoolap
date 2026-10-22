@@ -30,9 +30,9 @@ use super::{find_column_index, resolve_alias, Expression};
 use crate::common::I64Set;
 use crate::core::{Result, Row, Schema, Value};
 
-/// The most members a list over a FLOAT column holds for a scan to take
-/// it cheaply: a float is compared with every member, never hashed
-pub(crate) const SEARCHED_FLOAT_MEMBERS: usize = 8;
+/// The most members a list a cell is compared with one by one holds for a
+/// scan to take it cheaply
+const SEARCHED_MEMBERS: usize = 8;
 
 /// Pre-computed hash sets for O(1) IN list lookup
 #[derive(Debug, Clone)]
@@ -135,6 +135,13 @@ impl InListExpr {
     /// Get the values (alias for values(), for expression compilation)
     pub fn get_values(&self) -> &[Value] {
         &self.values
+    }
+
+    /// Whether a scan tests a prepared list cheaply: a cell of a FLOAT
+    /// column, or one whose members hash no set, is compared with each
+    pub(crate) fn tests_cheaply(&self, float_column: bool) -> bool {
+        self.values.len() <= SEARCHED_MEMBERS
+            || (!float_column && !matches!(self.hashed, HashedValues::None | HashedValues::Mixed))
     }
 
     /// Build hash sets for O(1) lookup
