@@ -2121,6 +2121,7 @@ thread_local! {
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static KEPT_MEMBER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_SCAN_STEP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ORDERED_VALUES_SORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2927,6 +2928,15 @@ pub fn after_hot_scan_checked(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn hot_scan_checked() {
     run_hook(&HOT_SCAN_CHECKED_HOOK);
+}
+
+/// Calls this thread made to an uncorrelated block for a member test, so far
+pub fn kept_member_calls() -> usize {
+    KEPT_MEMBER_CALLS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn kept_member_called() {
+    KEPT_MEMBER_CALLS.with(|n| n.set(n.get() + 1));
 }
 
 /// Rows this thread's hot scans read in steps, so far

@@ -589,6 +589,24 @@ pub struct KeptMembers {
     pub failed: Option<crate::core::Error>,
 }
 
+impl KeptMembers {
+    /// `value` tested against the members: a member that settles the test
+    /// (TRUE for IN and ANY, FALSE for ALL) wins; else the first error a
+    /// candidate raised; else what the members say
+    #[inline]
+    pub(crate) fn answer(&self, value: &crate::core::Value) -> crate::core::Result<Option<bool>> {
+        let (answer, decides) = match &self.set {
+            MemberSet::In(set) => (set.contains(value), true),
+            MemberSet::Quantified(members) => (members.answer(value), !members.parts().1),
+        };
+        match (&self.failed, answer) {
+            (_, Some(answer)) if answer == decides => Ok(Some(answer)),
+            (Some(e), _) => Err(e.clone()),
+            (None, answer) => Ok(answer),
+        }
+    }
+}
+
 /// A correlated IN block's members grouped by key
 pub type MemberKeys = FxHashMap<SmallVec<[Value; 1]>, KeptMembers>;
 
