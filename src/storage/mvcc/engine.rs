@@ -53,6 +53,7 @@ use crate::storage::mvcc::{
     TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, TxnTableStore,
     VersionStore, INVALID_TRANSACTION_ID,
 };
+use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 mod retype;
@@ -3165,7 +3166,13 @@ impl MVCCEngine {
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name, None, None)
+        EngineOperations::new(self).get_table_for_transaction(
+            txn_id,
+            table_name,
+            None,
+            None,
+            TableUse::Write,
+        )
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -9213,6 +9220,7 @@ impl TransactionEngineOperations for EngineOperations {
         table_name: &str,
         gate: Option<&super::txn_gate::GateRef>,
         view: Option<super::registry::StatementView>,
+        table_use: TableUse,
     ) -> Result<Box<dyn Table>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
@@ -9241,8 +9249,17 @@ impl TransactionEngineOperations for EngineOperations {
             };
             drop(cache);
 
+            // A store published later would not reach a read handle, so one
+            // is taken only where the statement cannot write
+            let reads_only = || match table_use {
+                TableUse::Write => false,
+                TableUse::Read => true,
+                TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
+            };
             if let Some(cached) = found {
-                (cached, None)
+                (Some(cached), None)
+            } else if reads_only() {
+                (None, None)
             } else {
                 // Upgrade to write lock and re-check (another thread may have inserted)
                 let mut cache = self.txn_version_stores().write().unwrap();
@@ -9251,7 +9268,7 @@ impl TransactionEngineOperations for EngineOperations {
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
                 {
-                    (Arc::clone(cached), None)
+                    (Some(Arc::clone(cached)), None)
                 } else {
                     let layout = version_store.layout();
                     let new_store = Arc::new(TxnTableStore::admitted_at(
@@ -9262,9 +9279,15 @@ impl TransactionEngineOperations for EngineOperations {
                         table_name_lower.clone().into_owned().into(),
                         Arc::clone(&new_store),
                     ));
-                    (new_store, Some(layout))
+                    (Some(new_store), Some(layout))
                 }
             }
+        };
+        let open = |version_store| match txn_versions {
+            Some(txn_versions) => {
+                MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
+            }
+            None => MVCCTable::new_for_read(txn_id, version_store),
         };
         #[cfg(feature = "test-failpoints")]
         if admitted.is_some() {
@@ -9294,18 +9317,16 @@ impl TransactionEngineOperations for EngineOperations {
                 Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
                 _ => {
                     drop(mgrs);
-                    let table =
-                        MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
-                            .with_txn_gate(gate.cloned())
-                            .with_view(view);
+                    let table = open(version_store)
+                        .with_txn_gate(gate.cloned())
+                        .with_view(view);
                     admit(&table)?;
                     return Ok(Box::new(table));
                 }
             }
         };
         let schema_generation = mgr.schema_generation();
-        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
-            .with_view(view.clone());
+        let table = open(version_store).with_view(view.clone());
         admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
         let snapshot_seq = (self.registry.get_isolation_level(txn_id)

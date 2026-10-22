@@ -34,6 +34,7 @@ use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr,
 };
+use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Scanner, Table, Transaction};
 
 use super::aggregation::{
@@ -3743,16 +3744,17 @@ impl Executor {
     ) -> Result<Box<dyn Table>> {
         use crate::storage::traits::transaction::StatementTable;
         let table = match through {
-            Some(tx) => tx.get_statement_table_at(name, ctx.scan_view(name)),
+            Some(tx) => tx.get_read_table_at(name, ctx.scan_view(name), ctx.table_use()),
             None => {
                 let active = self
                     .active_transaction
                     .lock()
                     .map_err(|_| Error::internal("active transaction lock poisoned"))?;
                 match active.as_ref() {
-                    Some(tx) => tx
-                        .transaction
-                        .get_statement_table_at(name, ctx.scan_view(name)),
+                    Some(tx) => {
+                        tx.transaction
+                            .get_read_table_at(name, ctx.scan_view(name), ctx.table_use())
+                    }
                     None => {
                         drop(active);
                         ctx.statement_snapshot()
@@ -3930,7 +3932,11 @@ impl Executor {
                     _ => false,
                 }
         };
-        let inner_ctx = ctx.with_incremented_query_depth();
+        // The statement writes its target, open before its blocks, and what
+        // its foreign keys cascade to
+        let inner_ctx = ctx
+            .with_incremented_query_depth()
+            .with_table_use(TableUse::ReadBesideWrites);
         // A column change between taking the plan and opening a block's
         // table prepares again, against the table as it now is
         let mut fresh = false;

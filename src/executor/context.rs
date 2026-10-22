@@ -19,7 +19,7 @@
 
 use crate::common::time_compat::Instant;
 use crate::storage::mvcc::registry::StatementView;
-use crate::storage::traits::transaction::StatementTable;
+use crate::storage::traits::transaction::{StatementTable, TableUse};
 use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -1130,7 +1130,8 @@ impl StatementSnapshot {
         self.statement_table_at(name, self.0.view.as_ref())
     }
 
-    /// The table read through `view`, None reading the newest committed state
+    /// The table read through `view`, None reading the newest committed state;
+    /// nothing writes through the snapshot's transaction
     pub(crate) fn statement_table_at(
         &self,
         name: &str,
@@ -1140,7 +1141,7 @@ impl StatementSnapshot {
             .transaction
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_statement_table_at(name, view)
+            .get_read_table_at(name, view, TableUse::Read)
     }
 
     /// Runs `f` on the table every correlated probe of the statement reads,
@@ -1234,6 +1235,9 @@ pub struct ExecutionContext {
     /// this query depth reads the newest state, the query's subqueries the
     /// view. Behind an Arc, as few statements set it and every one carries it
     newest_target: Option<Arc<(SmartString, usize)>>,
+    /// What the statement writes beside the tables its reads open: reads
+    /// open a handle that registers nothing where it cannot write
+    table_use: TableUse,
     /// A semantic cache miss at the statement's start, for its scan
     semantic_miss: Option<SemanticMiss>,
     /// The LIMIT and OFFSET subqueries a statement read before its rows,
@@ -1305,6 +1309,7 @@ impl ExecutionContext {
             statement_snapshot: None,
             statement_view: None,
             newest_target: None,
+            table_use: TableUse::Write,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1444,6 +1449,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1468,6 +1474,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1517,6 +1524,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1573,6 +1581,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: self.read_counts.clone(),
         }
@@ -1644,6 +1653,18 @@ impl ExecutionContext {
         let mut ctx = self.clone();
         ctx.newest_target = Some(Arc::new((SmartString::from(table), self.query_depth)));
         ctx
+    }
+
+    /// What the statement writes beside the tables its reads open
+    pub(crate) fn table_use(&self) -> TableUse {
+        self.table_use
+    }
+
+    /// This context for a statement that writes what `table_use` says,
+    /// beside the tables its reads open
+    pub(crate) fn with_table_use(mut self, table_use: TableUse) -> Self {
+        self.table_use = table_use;
+        self
     }
 
     /// The view a scan of `table` at this depth reads through: none for the
@@ -1721,6 +1742,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: self.semantic_miss.clone(),
             read_counts: self.read_counts.clone(),
         }

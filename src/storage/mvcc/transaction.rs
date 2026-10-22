@@ -25,7 +25,7 @@ use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
-use crate::storage::traits::transaction::StatementAccess;
+use crate::storage::traits::transaction::{StatementAccess, TableUse};
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
 
@@ -112,13 +112,15 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Get a table by name, initializing transaction-local version store;
     /// a handle given a `gate` admits its statements through it, and one
-    /// given a `view` reads through it
+    /// given a `view` reads through it. A read the transaction cannot write
+    /// beside, as `table_use` says, initializes none when it holds none
     fn get_table_for_transaction(
         &self,
         txn_id: i64,
         table_name: &str,
         gate: Option<&GateRef>,
         view: Option<StatementView>,
+        table_use: TableUse,
     ) -> Result<Box<dyn Table>>;
 
     /// Create a new table
@@ -822,7 +824,8 @@ impl Transaction for MvccTransaction {
         // Scope the borrow to allow later mutable operations
         let schema = {
             let ops = self.get_engine_ops()?;
-            let table = ops.get_table_for_transaction(self.id, name, None, None)?;
+            let table =
+                ops.get_table_for_transaction(self.id, name, None, None, TableUse::Write)?;
             table.schema().clone()
         };
 
@@ -859,13 +862,13 @@ impl Transaction for MvccTransaction {
             self.handed_out.store(true, Ordering::Relaxed);
             TxnGate::open()
         });
-        ops.get_table_for_transaction(self.id, name, Some(gate), None)
+        ops.get_table_for_transaction(self.id, name, Some(gate), None, TableUse::Write)
     }
 
     fn get_table_ungated(&self, name: &str, _access: StatementAccess) -> Result<Box<dyn Table>> {
         self.check_active()?;
         let ops = self.get_engine_ops()?;
-        ops.get_table_for_transaction(self.id, name, None, None)
+        ops.get_table_for_transaction(self.id, name, None, None, TableUse::Write)
     }
 
     fn get_table_ungated_with_view(
@@ -876,7 +879,23 @@ impl Transaction for MvccTransaction {
     ) -> Result<Box<dyn Table>> {
         self.check_view_allowed()?;
         let ops = self.get_engine_ops()?;
-        ops.get_table_for_transaction(self.id, name, None, Some(view))
+        ops.get_table_for_transaction(self.id, name, None, Some(view), TableUse::Write)
+    }
+
+    fn get_table_ungated_for(
+        &self,
+        name: &str,
+        _access: StatementAccess,
+        view: Option<StatementView>,
+        table_use: TableUse,
+    ) -> Result<Box<dyn Table>> {
+        if view.is_some() {
+            self.check_view_allowed()?;
+        } else {
+            self.check_active()?;
+        }
+        let ops = self.get_engine_ops()?;
+        ops.get_table_for_transaction(self.id, name, None, view, table_use)
     }
 
     fn get_table_with_view(&self, name: &str, view: StatementView) -> Result<Box<dyn Table>> {
@@ -886,7 +905,7 @@ impl Transaction for MvccTransaction {
             self.handed_out.store(true, Ordering::Relaxed);
             TxnGate::open()
         });
-        ops.get_table_for_transaction(self.id, name, Some(gate), Some(view))
+        ops.get_table_for_transaction(self.id, name, Some(gate), Some(view), TableUse::Write)
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {

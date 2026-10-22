@@ -133,6 +133,22 @@ pub trait Transaction: Send {
         self.get_table_with_view(name, view)
     }
 
+    /// [`Self::get_table_ungated`] through `view` when it has one, for a
+    /// statement that does `table_use` with the table
+    #[doc(hidden)]
+    fn get_table_ungated_for(
+        &self,
+        name: &str,
+        access: StatementAccess,
+        view: Option<StatementView>,
+        _table_use: TableUse,
+    ) -> Result<Box<dyn Table>> {
+        match view {
+            Some(view) => self.get_table_ungated_with_view(name, access, view),
+            None => self.get_table_ungated(name, access),
+        }
+    }
+
     /// Gets a table whose reads see `view`: the commits complete when it was
     /// taken, and this transaction's own writes. It is for reading only; a
     /// write takes its handle from `get_table`, which reads the newest state.
@@ -260,6 +276,18 @@ pub trait Transaction: Send {
 /// gate, for the query executor's own statements
 pub struct StatementAccess(());
 
+/// What the statement opening a table does with it
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableUse {
+    /// It may write the table
+    Write,
+    /// It writes no table
+    Read,
+    /// It writes other tables: by cascade only tables with a foreign key
+    ReadBesideWrites,
+}
+
 /// The query executor's table for its own statements on the thread that
 /// ends the transaction
 pub(crate) trait StatementTable {
@@ -270,6 +298,16 @@ pub(crate) trait StatementTable {
         &self,
         name: &str,
         view: Option<&StatementView>,
+    ) -> Result<Box<dyn Table>>;
+
+    /// The statement's table to read, through `view` when it has one; one
+    /// the transaction holds no rows of and cannot write while the
+    /// statement runs registers nothing
+    fn get_read_table_at(
+        &self,
+        name: &str,
+        view: Option<&StatementView>,
+        table_use: TableUse,
     ) -> Result<Box<dyn Table>>;
 }
 
@@ -289,6 +327,16 @@ impl<T: Transaction + ?Sized> StatementTable for T {
             Some(view) => self.get_table_ungated_with_view(name, StatementAccess(()), view.clone()),
             None => self.get_table_ungated(name, StatementAccess(())),
         }
+    }
+
+    #[inline]
+    fn get_read_table_at(
+        &self,
+        name: &str,
+        view: Option<&StatementView>,
+        table_use: TableUse,
+    ) -> Result<Box<dyn Table>> {
+        self.get_table_ungated_for(name, StatementAccess(()), view.cloned(), table_use)
     }
 }
 

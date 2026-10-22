@@ -102,6 +102,7 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
 use crate::parser::ast::{ParamSlots, Program, Statement};
 use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 pub(crate) use aggregation::{AggregatePath, AggregateSlots};
@@ -928,6 +929,11 @@ impl Executor {
                 let mut owned = ctx.into_owned();
                 if let Some(txn_id) = txn_id {
                     owned = owned.into_transaction_id(txn_id as u64);
+                }
+                // A SELECT writes no table; one given neither reads through
+                // a transaction of its own anyway
+                if select {
+                    owned = owned.with_table_use(TableUse::Read);
                 }
                 if let Some(view) = view {
                     owned = owned.into_statement_view(view);

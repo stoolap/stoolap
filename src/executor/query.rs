@@ -28,7 +28,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::common::SmartString;
-use crate::storage::traits::transaction::StatementTable;
+use crate::storage::traits::transaction::{StatementTable, TableUse};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
@@ -3051,7 +3051,7 @@ impl Executor {
             // Use the active transaction - this allows seeing uncommitted changes
             let table = tx_state
                 .transaction
-                .get_statement_table_at(table_name, ctx.scan_view(table_name))
+                .get_read_table_at(table_name, ctx.scan_view(table_name), ctx.table_use())
                 .map_err(|e| {
                     if matches!(e, Error::TableNotFound(_)) {
                         Error::TableOrViewNotFound(table_name.to_string())
@@ -3103,8 +3103,9 @@ impl Executor {
                     );
                 }
 
+                // The transaction is this read's own
                 let table = tx
-                    .get_statement_table_at(table_name, ctx.scan_view(table_name))
+                    .get_read_table_at(table_name, ctx.scan_view(table_name), TableUse::Read)
                     .map_err(|e| {
                         if matches!(e, Error::TableNotFound(_)) {
                             Error::TableOrViewNotFound(table_name.to_string())
@@ -8296,15 +8297,16 @@ impl Executor {
     /// The inner table of a join: from the explicit transaction when one is
     /// active, so the join sees what the transaction changed, otherwise from
     /// the statement snapshot the outer side reads through; through `view`,
-    /// the statement's
+    /// the statement's, which writes what `table_use` says beside it
     pub(super) fn join_table(
         &self,
         snapshot: &StatementSnapshot,
         name: &str,
         view: Option<&crate::storage::mvcc::registry::StatementView>,
+        table_use: TableUse,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
         if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
-            return active.transaction.get_statement_table_at(name, view);
+            return active.transaction.get_read_table_at(name, view, table_use);
         }
         snapshot.statement_table_at(name, view)
     }
@@ -8321,7 +8323,7 @@ impl Executor {
         inner_key_col: &str,
         first: Option<LayoutToken>,
     ) -> Result<Option<Box<dyn crate::storage::traits::Table>>> {
-        let table = self.join_table(snapshot, name, ctx.statement_view())?;
+        let table = self.join_table(snapshot, name, ctx.statement_view(), ctx.table_use())?;
         if first.is_some_and(|token| table.layout_token() != token) {
             return Err(Error::SchemaChanged {
                 table: name.to_string(),
@@ -11870,7 +11872,7 @@ impl Executor {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Get table schema
-        let table = tx.get_statement_table(table_name)?;
+        let table = tx.get_read_table_at(table_name, None, ctx.table_use())?;
         let schema = table.schema().clone();
         let all_columns: Vec<String> = schema.column_names_owned().to_vec();
         // The name the statement gives the source: its alias, or the table's
@@ -12789,7 +12791,9 @@ impl Executor {
 
         // Try to get the table and check for index or PK
         let txn = self.begin_transaction().ok()?;
-        let table = txn.get_statement_table(table_name_ref).ok()?;
+        let table = txn
+            .get_read_table_at(table_name_ref, None, TableUse::Read)
+            .ok()?;
         let schema = table.schema();
 
         // First check if inner column is the PRIMARY KEY (direct row_id lookup)

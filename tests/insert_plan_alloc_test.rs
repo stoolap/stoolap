@@ -163,7 +163,7 @@ fn test_prepared_insert_subqueries_keep_the_compiled_insert() {
         3_000,
     );
     assert!(
-        values <= plain + 6 && returning <= plain_returning + 4,
+        values <= plain + 3 && returning <= plain_returning + 1,
         "{values} allocations with a VALUES subquery, {plain} without; \
          {returning} with a RETURNING subquery, {plain_returning} without"
     );
