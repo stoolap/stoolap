@@ -74,6 +74,11 @@ const STATEMENTS: &[(&str, &str, &str)] = &[
         "10:11 11:5",
         "10:11 11:5",
     ),
+    (
+        "INSERT INTO t (b, id) VALUES ((SELECT MAX(b) FROM t), (SELECT COUNT(*) FROM t) + 10)",
+        "14:40",
+        "15:70",
+    ),
 ];
 
 #[test]

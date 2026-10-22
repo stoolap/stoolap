@@ -216,6 +216,10 @@ pub struct CompiledInsert {
     /// Whether the statement reads beyond its target, so its reads go
     /// through a statement view: a query source or a subquery
     pub reads_through_view: bool,
+    /// Whether its VALUES or RETURNING subqueries run as prepared blocks
+    pub reads_prepared: bool,
+    /// Those blocks, once prepared for the current schema
+    pub(crate) prepared: Option<Arc<super::prepared_select::PreparedDml>>,
 }
 
 /// Compiled parts of an INSERT that handles conflicts (ON DUPLICATE KEY

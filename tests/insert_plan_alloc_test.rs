@@ -131,3 +131,40 @@ fn test_values_subquery_answers_cost_a_bounded_count_per_row() {
     let per_row = (per_run(32) - per_run(8)) / 24;
     assert!(per_row <= 21, "{per_row} allocations per answered row");
 }
+
+#[test]
+fn test_prepared_insert_subqueries_keep_the_compiled_insert() {
+    let db = table("insert_plan_alloc_prepared_subqueries");
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+    let per_run = |sql: &str, first: i64| {
+        let insert = db.prepare(sql).unwrap();
+        let run = |id: i64| {
+            for row in insert.query((id,)).unwrap() {
+                row.unwrap();
+            }
+        };
+        run(first);
+        let before = allocations();
+        for id in first + 1..=first + ROWS {
+            run(id);
+        }
+        (allocations() - before) / ROWS as usize
+    };
+    let plain = per_run("INSERT INTO t VALUES ($1, 1, 'x')", 0);
+    let values = per_run(
+        "INSERT INTO t VALUES ($1, (SELECT x FROM u WHERE id = 1), 'x')",
+        1_000,
+    );
+    let plain_returning = per_run("INSERT INTO t VALUES ($1, 1, 'x') RETURNING id, v", 2_000);
+    let returning = per_run(
+        "INSERT INTO t VALUES ($1, 1, 'x') RETURNING id, (SELECT x FROM u WHERE u.id = t.v)",
+        3_000,
+    );
+    assert!(
+        values <= plain + 6 && returning <= plain_returning + 4,
+        "{values} allocations with a VALUES subquery, {plain} without; \
+         {returning} with a RETURNING subquery, {plain_returning} without"
+    );
+}
