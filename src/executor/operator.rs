@@ -719,6 +719,9 @@ impl Operator for QueryResultOperator {
         if self.result.next() {
             // Use take_row() to avoid clone - takes ownership of the row
             Ok(Some(RowRef::Owned(self.result.take_row())))
+        } else if let Some(error) = self.result.last_error() {
+            // A result that stopped on an error has not run out of rows
+            Err(error)
         } else {
             Ok(None)
         }

@@ -261,6 +261,10 @@ Based on the implementation and test files:
 - In FULL OUTER JOIN, unmatched rows from both sides are included with NULL padding
 - The IS NULL operator can be used in join conditions for special cases
 
+## Errors in JOIN Conditions
+
+An error a condition raises for a row the join returns, such as an integer overflow in the WHERE clause, is the statement's error on every join algorithm, as it is in a query on one table. A condition in the ON clause is asked only of the pairs the join keys form, so a row that forms no pair does not raise it. A WHERE condition on one table may be asked of that table's rows before they are joined, so a row that joins nothing can raise it too.
+
 ## Best Practices
 
 1. **Use Table Aliases**: Improves readability, especially in complex queries
