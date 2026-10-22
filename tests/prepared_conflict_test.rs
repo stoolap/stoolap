@@ -308,28 +308,59 @@ impl stoolap::functions::ScalarFunction for CommitOnCall {
 }
 
 #[test]
-fn a_conflict_block_run_as_a_statement_reads_at_the_statement_s_snapshot() {
-    let db = Database::open("memory://prepared_conflict_block_statement").unwrap();
-    setup(&db);
-    let functions = stoolap::functions::FunctionRegistry::new();
-    functions.register_scalar::<CommitOnCall>();
-    let executor = stoolap::Executor::with_function_registry(
-        std::sync::Arc::clone(db.engine()),
-        std::sync::Arc::new(functions),
-    );
-    executor
-        .execute("SET isolation_level = 'SNAPSHOT'")
-        .unwrap();
-    *COMMIT_ON_CALL.lock().unwrap() = Some(db.clone());
-    executor
-        .execute(
-            "INSERT INTO t VALUES (1, 7) ON CONFLICT (id) \
-             DO UPDATE SET b = COMMIT_ON_CALL(excluded.b) + (SELECT MAX(x) FROM u)",
-        )
-        .unwrap();
-    assert_eq!(
-        table(&db),
-        "1:9 2:20 3:30 4:40",
-        "the subquery read a commit that landed after the statement began"
-    );
+fn a_conflict_subquery_does_not_see_a_commit_made_during_the_statement() {
+    for level in ["READ COMMITTED", "SNAPSHOT"] {
+        let db = Database::open(&format!("memory://prepared_conflict_commit_{level}")).unwrap();
+        setup(&db);
+        let functions = stoolap::functions::FunctionRegistry::new();
+        functions.register_scalar::<CommitOnCall>();
+        let executor = stoolap::Executor::with_function_registry(
+            std::sync::Arc::clone(db.engine()),
+            std::sync::Arc::new(functions),
+        );
+        executor
+            .execute(&format!("SET isolation_level = '{level}'"))
+            .unwrap();
+        *COMMIT_ON_CALL.lock().unwrap() = Some(db.clone());
+        executor
+            .execute(
+                "INSERT INTO t VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET b = \
+                 COMMIT_ON_CALL(excluded.b) + (SELECT MAX(x) FROM u) \
+                 + (SELECT x FROM u WHERE u.id = excluded.id)",
+            )
+            .unwrap();
+        assert_eq!(
+            table(&db),
+            "1:10 2:20 3:30 4:40",
+            "{level}: a subquery read a commit that landed after the statement began"
+        );
+    }
+}
+
+#[test]
+fn a_kept_conflict_answer_is_not_one_read_before_a_commit() {
+    for level in ["READ COMMITTED", "SNAPSHOT"] {
+        let db = Database::open(&format!("memory://prepared_conflict_kept_{level}")).unwrap();
+        setup(&db);
+        let functions = stoolap::functions::FunctionRegistry::new();
+        functions.register_scalar::<CommitOnCall>();
+        let executor = stoolap::Executor::with_function_registry(
+            std::sync::Arc::clone(db.engine()),
+            std::sync::Arc::new(functions),
+        );
+        executor
+            .execute(&format!("SET isolation_level = '{level}'"))
+            .unwrap();
+        let upsert = "INSERT INTO t VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET b = \
+                      COMMIT_ON_CALL(excluded.b) + (SELECT MAX(x) FROM u)";
+        *COMMIT_ON_CALL.lock().unwrap() = Some(db.clone());
+        executor.execute(upsert).unwrap();
+        assert_eq!(table(&db), "1:9 2:20 3:30 4:40", "{level}: first statement");
+        executor.execute(upsert).unwrap();
+        assert_eq!(
+            table(&db),
+            "1:107 2:20 3:30 4:40",
+            "{level}: the second statement took an answer read before the commit"
+        );
+    }
 }

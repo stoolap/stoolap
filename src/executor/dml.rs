@@ -726,6 +726,19 @@ impl Executor {
             }
             None => ctx,
         };
+        // Without a view the prepared subqueries read a snapshot taken before the write
+        let snapshot_ctx;
+        let ctx = if reads_prepared
+            && active_txn_id.is_none()
+            && ctx.statement_view().is_none()
+            && ctx.statement_snapshot().is_none()
+        {
+            let snapshot = self.new_statement_snapshot(self.isolation_level(), None)?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
 
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
@@ -786,7 +799,9 @@ impl Executor {
                 &[],
                 &stmt.values,
                 sites.as_ref(),
-                standalone_tx.as_deref(),
+                standalone_tx
+                    .as_deref()
+                    .filter(|_| ctx.statement_snapshot().is_none()),
                 ctx,
             )?;
             prepared = plan;

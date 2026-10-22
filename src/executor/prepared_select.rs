@@ -3343,19 +3343,6 @@ impl Executor {
     }
 }
 
-impl PreparedDml {
-    /// Whether a block reads beside the statement's own transaction: one
-    /// read for each conflict reads the target, or one runs as a statement
-    fn reads_beside_the_statement(&self) -> bool {
-        self.conflict.as_ref().is_some_and(|c| c.reads_target)
-            || self.blocks.subqueries.iter().any(|sq| {
-                sq.grouping
-                    .as_ref()
-                    .is_some_and(|grouping| grouping.statement.is_some())
-            })
-    }
-}
-
 /// The tables a prepared UPDATE's or DELETE's blocks read, opened before
 /// the statement writes, and the context they read under
 pub(crate) struct DmlTables {
@@ -3868,10 +3855,11 @@ impl Executor {
                     prepared
                 }
             };
-            // A block that would see the statement's writes or opens its own
-            // tables reads through a snapshot taken before the first write
+            // A block read for each conflict that reads the target would see
+            // the statement's writes: it reads a snapshot taken before them
+            let reads_target = prepared.conflict.as_ref().is_some_and(|c| c.reads_target);
             let snapshot_ctx = match through {
-                Some(_) if prepared.reads_beside_the_statement() => {
+                Some(_) if reads_target => {
                     let snapshot = self.new_statement_snapshot(
                         self.isolation_level(),
                         inner_ctx.statement_view(),
