@@ -180,7 +180,7 @@ impl PushdownRule for QuantifiedSetRule {
     }
 
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
-        use crate::executor::expression::{CompareOp, QuantifiedMembers};
+        use crate::executor::expression::QuantifiedMembers;
         let ast::Expression::QuantifiedSet(quantified) = expr else {
             return PushdownResult::NotApplicable;
         };
@@ -194,31 +194,43 @@ impl PushdownRule for QuantifiedSetRule {
         let Some(op) = QuantifiedMembers::operator(&quantified.operator) else {
             return PushdownResult::CannotPush;
         };
-        // Only a number column orders as the bound does; a NaN fails both here and in storage
-        let column_type = ctx.column_type(&column);
-        if !matches!(
-            column_type,
-            Some(crate::core::DataType::Integer | crate::core::DataType::Float)
-        ) {
-            return PushdownResult::CannotPush;
+        match quantified_filter(column, op, quantified.all, &quantified.members, ctx) {
+            Some(filter) => PushdownResult::Converted(filter),
+            None => PushdownResult::CannotPush,
         }
-        let Some(bound) = QuantifiedMembers::bound(op, quantified.all, &quantified.members) else {
-            return PushdownResult::CannotPush;
-        };
-        let Some(bound) = super::coerce_constant(column_type, bound) else {
-            return PushdownResult::CannotPush;
-        };
-        let operator = match op {
-            CompareOp::Lt => Operator::Lt,
-            CompareOp::Le => Operator::Lte,
-            CompareOp::Gt => Operator::Gt,
-            CompareOp::Ge => Operator::Gte,
-            CompareOp::Eq | CompareOp::Ne => return PushdownResult::CannotPush,
-        };
-        let mut comparison = ComparisonExpr::new(column, operator, bound);
-        comparison.prepare_for_schema(ctx.schema);
-        PushdownResult::Converted(Box::new(comparison))
     }
+}
+
+/// `column op ANY|ALL (members)`, the members holding no NULL, as the scan
+/// takes it: `column op bound` over a number column; None when it cannot
+pub(crate) fn quantified_filter(
+    column: String,
+    op: crate::executor::expression::CompareOp,
+    all: bool,
+    members: &[Value],
+    ctx: &PushdownContext<'_>,
+) -> Option<Box<dyn StorageExpr>> {
+    use crate::executor::expression::{CompareOp, QuantifiedMembers};
+    // Only a number column orders as the bound does; a NaN fails both here and in storage
+    let column_type = ctx.column_type(&column);
+    if !matches!(
+        column_type,
+        Some(crate::core::DataType::Integer | crate::core::DataType::Float)
+    ) {
+        return None;
+    }
+    let bound = QuantifiedMembers::bound(op, all, members)?;
+    let bound = super::coerce_constant(column_type, bound)?;
+    let operator = match op {
+        CompareOp::Lt => Operator::Lt,
+        CompareOp::Le => Operator::Lte,
+        CompareOp::Gt => Operator::Gt,
+        CompareOp::Ge => Operator::Gte,
+        CompareOp::Eq | CompareOp::Ne => return None,
+    };
+    let mut comparison = ComparisonExpr::new(column, operator, bound);
+    comparison.prepare_for_schema(ctx.schema);
+    Some(Box::new(comparison))
 }
 
 // =============================================================================
@@ -465,24 +477,34 @@ impl PushdownRule for InListRule {
             _ => return PushdownResult::CannotPush,
         };
 
-        // Coerce values to column type
-        let coerced_values: Vec<Value> = match values
-            .into_iter()
-            .map(|v| ctx.coerce_to_column_type(&column, v))
-            .collect()
-        {
-            Some(v) => v,
-            None => return PushdownResult::CannotPush,
-        };
-
-        let mut expr = if in_expr.not {
-            InListExpr::not_in(column, coerced_values)
-        } else {
-            InListExpr::new(column, coerced_values)
-        };
-        expr.prepare_for_schema(ctx.schema);
-        PushdownResult::Converted(Box::new(expr))
+        match in_list_filter(column, values, in_expr.not, ctx) {
+            Some(filter) => PushdownResult::Converted(filter),
+            None => PushdownResult::CannotPush,
+        }
     }
+}
+
+/// `column [NOT] IN (values)` as the scan takes it, each value read as the
+/// column's type; None when one cannot be
+pub(crate) fn in_list_filter(
+    column: String,
+    values: impl IntoIterator<Item = Value>,
+    not: bool,
+    ctx: &PushdownContext<'_>,
+) -> Option<Box<dyn StorageExpr>> {
+    // Coerce values to column type
+    let coerced_values: Vec<Value> = values
+        .into_iter()
+        .map(|v| ctx.coerce_to_column_type(&column, v))
+        .collect::<Option<_>>()?;
+
+    let mut expr = if not {
+        InListExpr::not_in(column, coerced_values)
+    } else {
+        InListExpr::new(column, coerced_values)
+    };
+    expr.prepare_for_schema(ctx.schema);
+    Some(Box::new(expr))
 }
 
 // =============================================================================

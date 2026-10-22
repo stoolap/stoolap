@@ -1144,12 +1144,42 @@ struct PreparedWhere {
     program: SharedProgram,
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
-    /// Every conjunct is in `pushdown`: a scan that takes it whole passes
-    /// only rows the WHERE passes
-    pushed_whole: bool,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
     /// set's keys name the rows the WHERE may pass
     narrowing: Option<Narrowing>,
+    /// The top-level conjuncts testing a column against an uncorrelated
+    /// block's members, which the scan takes once the run read them
+    sets: Vec<SetSlot>,
+    /// The narrowing's own set conjunct, the scan's when it declines
+    narrowing_set: Option<SetSlot>,
+    /// How many conjuncts `pushdown` holds, of the WHERE's `conjuncts`
+    pushed: usize,
+    conjuncts: usize,
+}
+
+/// `column [NOT] IN (block)` or `column op ANY|ALL (block)` at the top of
+/// a WHERE, over an uncorrelated block
+#[derive(Debug, Clone, Copy)]
+struct SetSlot {
+    id: u16,
+    column: usize,
+    negated: bool,
+}
+
+/// The filter a scan of a prepared WHERE takes, and whether it is the
+/// whole WHERE
+type WhereScan = (Option<Box<dyn StorageExpr>>, bool);
+
+/// What a set slot's members make of its conjunct for one run
+enum SetScan {
+    /// The scan takes it as this filter
+    Filter(Box<dyn StorageExpr>),
+    /// Every row passes it
+    Every,
+    /// No row passes it
+    None,
+    /// The program asks it of each row
+    Program,
 }
 
 /// How a prepared WHERE's rows were read
@@ -1201,11 +1231,37 @@ impl WhereParts {
                 members,
             })
         });
+        let slot = |&(id, negated, column): &(u16, bool, Option<usize>)| {
+            let sq = &blocks.subqueries[id as usize];
+            let column = column.filter(|_| sq.uncorrelated)?;
+            matches!(sq.answer, Answer::Members(..)).then_some(SetSlot {
+                id,
+                column,
+                negated,
+            })
+        };
+        // The block a narrowing reads the rows by is the scan's only when
+        // the narrowing declines
+        let narrowed = |id: u16| narrowing.is_some_and(|n| n.id == id);
+        let sets = self
+            .set_tests
+            .iter()
+            .filter(|test| !narrowed(test.0))
+            .filter_map(slot)
+            .collect();
+        let narrowing_set = self
+            .set_tests
+            .iter()
+            .filter(|test| narrowed(test.0))
+            .find_map(slot);
         PreparedWhere {
             program,
-            pushed_whole: self.pushed.len() == self.conjuncts,
+            pushed: self.pushed.len(),
+            conjuncts: self.conjuncts,
             pushdown: conjunction(self.pushed),
             narrowing,
+            sets,
+            narrowing_set,
         }
     }
 }
@@ -3193,15 +3249,23 @@ impl<'a> DmlRunner<'a> {
         let Some(where_) = &self.prepared.where_ else {
             return Ok(Candidates::Scan(None));
         };
-        let Some((storage_expr, _)) = self.runner.where_scan(where_, table, ctx) else {
+        let Some(scan) = self.runner.where_scan(where_, None, table, ctx)? else {
             return Ok(Candidates::Pruned);
         };
-        Ok(
-            match self.runner.narrowed_rows(where_.narrowing, table, None)? {
-                Some((rows, _)) => Candidates::Keyed(rows.into_iter().map(|(id, _)| id).collect()),
-                None => Candidates::Scan(storage_expr),
-            },
-        )
+        if let Some((rows, _)) = self.runner.narrowed_rows(where_.narrowing, table, None)? {
+            return Ok(Candidates::Keyed(
+                rows.into_iter().map(|(id, _)| id).collect(),
+            ));
+        }
+        // The scan takes the narrowing's own set once it declined
+        let scan = match where_.narrowing_set {
+            Some(slot) => self.runner.where_scan(where_, Some(slot), table, ctx)?,
+            None => Some(scan),
+        };
+        Ok(match scan {
+            Some((storage_expr, _)) => Candidates::Scan(storage_expr),
+            None => Candidates::Pruned,
+        })
     }
 
     /// Hand `keep` the row id and row of each row of `table` the WHERE
@@ -3293,6 +3357,9 @@ impl Builder<'_> {
                         .map(|&column| (&mark.subquery, in_expr.not, Some(column))),
                     _ => None,
                 },
+                Expression::AllAny(all_any) => bound_column(&all_any.left)
+                    .and_then(|name| schema.column_index_map().get(name).copied())
+                    .map(|column| (&all_any.subquery, false, Some(column))),
                 _ => None,
             };
             if let Some((mark, negated, column)) = set_test {
@@ -3875,15 +3942,18 @@ impl<'a> PreparedRunner<'a> {
         }
     }
 
-    /// The scan `where_`'s conjuncts without a subquery narrow, with
-    /// whether it takes the whole WHERE; None when it proves no row passes
+    /// The scan `where_`'s conjuncts without a subquery narrow, and its set
+    /// conjuncts once their members are read, the `narrowed` one too when
+    /// given, with whether it takes the whole WHERE; None when it proves no
+    /// row passes
     fn where_scan(
         &self,
         where_: &PreparedWhere,
+        narrowed: Option<SetSlot>,
         table: &dyn Table,
         ctx: &ExecutionContext,
-    ) -> Option<(Option<Box<dyn StorageExpr>>, bool)> {
-        let (storage_expr, residual) = match &where_.pushdown {
+    ) -> Result<Option<WhereScan>> {
+        let (mut storage_expr, residual) = match &where_.pushdown {
             Some(pushdown) if self.prepared.run_slots.is_empty() => {
                 pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
             }
@@ -3894,18 +3964,150 @@ impl<'a> PreparedRunner<'a> {
             }
             None => (None, true),
         };
+        // The conjuncts the scan takes whole, of the WHERE's
+        let static_whole = where_.pushdown.is_none() || (storage_expr.is_some() && !residual);
+        let mut taken = if where_.pushdown.is_some() && static_whole {
+            where_.pushed
+        } else {
+            0
+        };
+        if !where_.sets.is_empty() || narrowed.is_some() {
+            let slots = where_.sets.iter().chain(narrowed.as_ref());
+            match self.with_sets(slots, storage_expr.take(), &mut taken, table, ctx)? {
+                Some(expr) => storage_expr = expr,
+                None => return Ok(None),
+            }
+        }
         if let Some(expr) = &storage_expr {
             if self
                 .executor
                 .get_query_planner()
                 .can_prune_entire_scan(table, expr.as_ref())
             {
-                return None;
+                return Ok(None);
             }
         }
         // The scan took the whole WHERE: its rows need no second look
-        let scanned_whole = where_.pushed_whole && storage_expr.is_some() && !residual;
-        Some((storage_expr, scanned_whole))
+        let scanned_whole = static_whole && taken == where_.conjuncts;
+        Ok(Some((storage_expr, scanned_whole)))
+    }
+
+    /// `storage_expr` with the filters the set conjuncts of `slots` make
+    /// for this run, each one the scan takes counted in `taken`; None when
+    /// one keeps no row
+    fn with_sets<'s>(
+        &self,
+        slots: impl Iterator<Item = &'s SetSlot>,
+        storage_expr: Option<Box<dyn StorageExpr>>,
+        taken: &mut usize,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Option<Box<dyn StorageExpr>>>> {
+        let mut filters: SmallVec<[Box<dyn StorageExpr>; 2]> = storage_expr.into_iter().collect();
+        for slot in slots {
+            let scan = self.set_scan(slot, table, ctx)?;
+            #[cfg(feature = "test-failpoints")]
+            if !matches!(scan, SetScan::Program) {
+                crate::test_failpoints::prepared_strategy_ran(
+                    crate::test_failpoints::PreparedStrategy::ScanTakesMembers,
+                );
+            }
+            match scan {
+                SetScan::Filter(filter) => {
+                    filters.push(filter);
+                    *taken += 1;
+                }
+                SetScan::Every => *taken += 1,
+                SetScan::None => return Ok(None),
+                SetScan::Program => {}
+            }
+        }
+        Ok(Some(match filters.len() {
+            0 | 1 => filters.pop(),
+            _ => Some(Box::new(AndExpr::new(filters.into_vec()))),
+        }))
+    }
+
+    /// What `slot`'s members make of its conjunct for this run, read now,
+    /// before the scan: by the three-valued rule, an UNKNOWN keeps no row
+    fn set_scan(
+        &self,
+        slot: &SetSlot,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<SetScan> {
+        let index = slot.id as usize;
+        let Answer::Members(kept, members) = &self.prepared.subqueries[index].answer else {
+            return Ok(SetScan::Program);
+        };
+        let empty = Row::new();
+        self.read_members(
+            index,
+            kept,
+            members,
+            &ExecuteContext::new(&empty),
+            self.holes,
+        )?;
+        let sets = self.blocks[index].members.borrow();
+        let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
+            return Ok(SetScan::Program);
+        };
+        if set.failed.is_some() {
+            return Ok(SetScan::Program);
+        }
+        let schema = table.schema();
+        let column = || schema.columns[slot.column].name_lower.clone();
+        let scan = pushdown::PushdownContext::new(schema, Some(ctx));
+        let filter = |filter: Option<Box<dyn StorageExpr>>| match filter {
+            Some(filter) => SetScan::Filter(filter),
+            None => SetScan::Program,
+        };
+        Ok(match &set.set {
+            MemberSet::In(set_of) => {
+                let members = set_of.members();
+                let values = members.iter().filter(|v| !v.is_null()).cloned();
+                match (slot.negated, set_of.has_null()) {
+                    // Over no member NOT IN holds for every value, NULL too
+                    (true, _) if members.is_empty() => SetScan::Every,
+                    (true, true) => SetScan::None,
+                    (true, false) => {
+                        filter(pushdown::in_list_filter(column(), values, true, &scan))
+                    }
+                    (false, _) if members.iter().all(Value::is_null) => SetScan::None,
+                    (false, _) => filter(pushdown::in_list_filter(column(), values, false, &scan)),
+                }
+            }
+            MemberSet::Quantified(quantified) => {
+                let (op, all, values, has_null) = quantified.parts();
+                match (op, all) {
+                    // Over no member ALL holds for every value and ANY for none
+                    _ if values.is_empty() && !has_null => match all {
+                        true => SetScan::Every,
+                        false => SetScan::None,
+                    },
+                    _ if values.is_empty() || (all && has_null) => SetScan::None,
+                    (CompareOp::Eq, false) => filter(pushdown::in_list_filter(
+                        column(),
+                        values.iter().cloned(),
+                        false,
+                        &scan,
+                    )),
+                    (CompareOp::Ne, true) => filter(pushdown::in_list_filter(
+                        column(),
+                        values.iter().cloned(),
+                        true,
+                        &scan,
+                    )),
+                    _ => filter(pushdown::quantified_filter(
+                        column(),
+                        op,
+                        all,
+                        values,
+                        &scan,
+                    )),
+                }
+            }
+        })
     }
 
     /// Hand `keep` each row of `table` that passes `where_`, with its row
@@ -3921,7 +4123,9 @@ impl<'a> PreparedRunner<'a> {
         target: Option<usize>,
         mut keep: impl FnMut(i64, u64, Row) -> bool,
     ) -> Result<Passing> {
-        let Some((storage_expr, scanned_whole)) = self.where_scan(where_, table, ctx) else {
+        let Some((mut storage_expr, mut scanned_whole)) =
+            self.where_scan(where_, None, table, ctx)?
+        else {
             return Ok(Passing::Pruned);
         };
         if target == Some(0) {
@@ -3932,7 +4136,7 @@ impl<'a> PreparedRunner<'a> {
         // The rows the statement reads: the ones its narrowing names, which
         // the conjuncts the scan would take still judge; the scan's answers
         // up to the LIMIT when it takes the whole WHERE, which are the rows;
-        // or the scan
+        // or the scan, which takes the narrowing's own set when it declined
         let (mut listed, mut scanner, judged, passed) =
             match self.narrowed_rows(where_.narrowing, table, target)? {
                 Some((candidates, passed)) => {
@@ -3942,23 +4146,31 @@ impl<'a> PreparedRunner<'a> {
                     );
                     (Some(candidates.into_iter()), None, true, passed)
                 }
-                None => match target.filter(|_| scanned_whole) {
-                    Some(target) => {
-                        let answers = table.collect_rows_with_limit_unordered(
-                            storage_expr.as_deref(),
-                            target,
-                            0,
-                        )?;
-                        // A read that checks for no cancel is the statement's all the same
-                        ctx.check_cancelled()?;
-                        return Ok(Passing::Answers(answers));
+                None => {
+                    if let Some(slot) = where_.narrowing_set {
+                        let Some(scan) = self.where_scan(where_, Some(slot), table, ctx)? else {
+                            return Ok(Passing::Pruned);
+                        };
+                        (storage_expr, scanned_whole) = scan;
                     }
-                    None => {
-                        let all: Vec<usize> = (0..table.schema().columns.len()).collect();
-                        let scan = table.scan(&all, storage_expr.as_deref())?;
-                        (None, Some(scan), false, scanned_whole)
+                    match target.filter(|_| scanned_whole) {
+                        Some(target) => {
+                            let answers = table.collect_rows_with_limit_unordered(
+                                storage_expr.as_deref(),
+                                target,
+                                0,
+                            )?;
+                            // A read that checks for no cancel is the statement's all the same
+                            ctx.check_cancelled()?;
+                            return Ok(Passing::Answers(answers));
+                        }
+                        None => {
+                            let all: Vec<usize> = (0..table.schema().columns.len()).collect();
+                            let scan = table.scan(&all, storage_expr.as_deref())?;
+                            (None, Some(scan), false, scanned_whole)
+                        }
                     }
-                },
+                }
             };
         loop {
             let (id, row) = match (&mut listed, &mut scanner) {
@@ -4727,7 +4939,10 @@ impl PreparedRunner<'_> {
         };
         let decides = members.test.decides();
         if sq.uncorrelated {
-            self.read_members(index, kept, members, caller, site)?;
+            // Read on the first row; every row after takes the kept members
+            if self.blocks[index].members.borrow().is_none() {
+                self.read_members(index, kept, members, caller, site)?;
+            }
             let sets = self.blocks[index].members.borrow();
             let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
                 return Err(Error::internal("a value block's members not kept"));
