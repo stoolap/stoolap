@@ -277,6 +277,9 @@ fn an_upsert_with_a_conflict_subquery_returns_the_row_it_wrote() {
 
 static COMMIT_ON_CALL: std::sync::Mutex<Option<Database>> = std::sync::Mutex::new(None);
 
+/// The tests that arm `COMMIT_ON_CALL` take turns, as they share it
+static COMMIT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Default)]
 struct CommitOnCall;
 
@@ -309,6 +312,7 @@ impl stoolap::functions::ScalarFunction for CommitOnCall {
 
 #[test]
 fn a_conflict_subquery_does_not_see_a_commit_made_during_the_statement() {
+    let _turn = COMMIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     for level in ["READ COMMITTED", "SNAPSHOT"] {
         let db = Database::open(&format!("memory://prepared_conflict_commit_{level}")).unwrap();
         setup(&db);
@@ -339,6 +343,7 @@ fn a_conflict_subquery_does_not_see_a_commit_made_during_the_statement() {
 
 #[test]
 fn a_kept_conflict_answer_is_not_one_read_before_a_commit() {
+    let _turn = COMMIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     for level in ["READ COMMITTED", "SNAPSHOT"] {
         let db = Database::open(&format!("memory://prepared_conflict_kept_{level}")).unwrap();
         setup(&db);
