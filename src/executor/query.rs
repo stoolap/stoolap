@@ -5363,22 +5363,17 @@ impl Executor {
                 token: dummy_token("FALSE", TokenType::Keyword),
                 value: false,
             });
-            let (_, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
-                &join_source.left,
-                ctx,
-                Some(&none),
-                Some(0),
-                0,
-                None,
-            )?;
-            let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
-                &join_source.right,
-                ctx,
-                Some(&none),
-                Some(0),
-                0,
-                None,
-            )?;
+            // Each read as the blocks check it, without the side's own filter
+            let columns_of = |expr: &Expression, side: SideRead<'_>| {
+                let side = SideRead {
+                    filter: None,
+                    ..side
+                };
+                self.read_join_side(expr, ctx, side, Some(&none), Some(0), 0)
+                    .map(|(_, columns, _, _)| columns)
+            };
+            let left_cols = columns_of(&join_source.left, left_read)?;
+            let right_cols = columns_of(&join_source.right, right_read)?;
             if let Some(where_clause) = &where_for_join {
                 let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
                 Self::bind_empty_where(stmt, where_clause, &joined)?;

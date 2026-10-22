@@ -23,8 +23,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    before_join_side_opened, bridge_compiles, general_path_hits, join_paths_taken,
-    program_compiles, reset_join_paths, GeneralPath,
+    after_select_table_opened, before_join_side_opened, bridge_compiles, general_path_hits,
+    join_paths_taken, program_compiles, reset_join_paths, GeneralPath,
 };
 use stoolap::Database;
 
@@ -396,6 +396,12 @@ fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
             &["ALTER TABLE r DROP COLUMN pad"],
         ),
         (
+            "join_output_blocks_drop_never",
+            "SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id \
+             WHERE FALSE",
+            &["ALTER TABLE r DROP COLUMN pad"],
+        ),
+        (
             "join_output_blocks_rename_swap",
             "SELECT l.k, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id LIMIT 1",
             &[
@@ -431,14 +437,23 @@ fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
         let done = Rc::new(Cell::new(false));
         let flag = Rc::clone(&done);
         let changes = changes.to_vec();
-        before_join_side_opened(move || {
+        let change = move || {
             for change in changes {
                 writer.execute(change, ()).unwrap();
             }
             flag.set(true);
-        });
+        };
+        // A join that reads no row opens its sides only for their columns:
+        // the right one changes once the left one is open
+        match name.ends_with("never") {
+            true => after_select_table_opened(change),
+            false => before_join_side_opened(change),
+        }
         let got = rows(&db, sql);
-        assert!(done.get(), "{sql}: the columns changed inside the statement");
+        assert!(
+            done.get(),
+            "{sql}: the columns changed inside the statement"
+        );
         assert!(
             got.as_ref().is_err_and(|e| e.contains("schema changed")),
             "{sql}: {got:?}"
