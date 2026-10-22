@@ -3047,11 +3047,14 @@ impl PreparedDml {
             .map(|sites| {
                 let width = sites.schema.columns.len();
                 let excluded = SmartString::from("excluded");
+                // `excluded` names the excluded row, also when the target bears that name
+                let target = if *sites.table == excluded {
+                    SmartString::default()
+                } else {
+                    sites.table.clone()
+                };
                 ScopeTable::joined(
-                    [
-                        (sites.table.clone(), sites.schema),
-                        (excluded, sites.schema),
-                    ],
+                    [(target, sites.schema), (excluded, sites.schema)],
                     2 * width,
                 )
                 .ok_or_else(|| Error::internal("an ON CONFLICT row that does not line up"))

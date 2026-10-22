@@ -364,3 +364,32 @@ fn a_kept_conflict_answer_is_not_one_read_before_a_commit() {
         );
     }
 }
+
+#[test]
+fn excluded_names_the_excluded_row_when_the_target_bears_that_name() {
+    let db = Database::open("memory://prepared_conflict_excluded_target").unwrap();
+    db.execute(
+        "CREATE TABLE excluded (id INTEGER PRIMARY KEY, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    for (set, want) in [
+        ("b = (SELECT excluded.b)", "1:5"),
+        ("b = (SELECT b + excluded.b)", "1:15"),
+        ("b = b + excluded.b", "1:15"),
+    ] {
+        db.execute("DELETE FROM excluded", ()).unwrap();
+        db.execute("INSERT INTO excluded VALUES (1, 10)", ())
+            .unwrap();
+        db.execute(
+            &format!("INSERT INTO excluded VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET {set}"),
+            (),
+        )
+        .unwrap();
+        assert_eq!(
+            rows(db.query("SELECT id, b FROM excluded", ())),
+            want,
+            "{set}"
+        );
+    }
+}
