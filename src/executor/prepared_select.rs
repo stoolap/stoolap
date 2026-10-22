@@ -3893,7 +3893,7 @@ impl Executor {
     /// `schema`, named `scope_name`, with its blocks' tables open, through
     /// the statement's own transaction `through` when given; prepared now
     /// when the plan holds none for this schema, these columns and this
-    /// parameter count
+    /// parameter count; a compiled INSERT keeps it beside its own parts
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_prepared_dml(
         &self,
@@ -3940,6 +3940,9 @@ impl Executor {
                 .and_then(|slot| slot.read().ok())
                 .and_then(|guard| match &*guard {
                     CompiledExecution::PreparedDml(p) if fits(p) => Some(Arc::clone(p)),
+                    CompiledExecution::Insert(insert) => {
+                        insert.prepared.as_ref().filter(|p| fits(p)).cloned()
+                    }
                     _ => None,
                 });
             let prepared = match held {
@@ -3960,13 +3963,16 @@ impl Executor {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_dml_was_built();
                     if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
-                        if matches!(
-                            &*guard,
+                        match &mut *guard {
+                            CompiledExecution::Insert(insert) => {
+                                insert.prepared = Some(Arc::clone(&prepared));
+                            }
                             CompiledExecution::Unknown
-                                | CompiledExecution::NotOptimizable(_)
-                                | CompiledExecution::PreparedDml(_)
-                        ) {
-                            *guard = CompiledExecution::PreparedDml(Arc::clone(&prepared));
+                            | CompiledExecution::NotOptimizable(_)
+                            | CompiledExecution::PreparedDml(_) => {
+                                *guard = CompiledExecution::PreparedDml(Arc::clone(&prepared));
+                            }
+                            _ => {}
                         }
                     }
                     prepared

@@ -285,6 +285,9 @@ struct ConflictRun<'r, 'a> {
     joined: std::cell::RefCell<Row>,
 }
 
+/// The answers of an INSERT's VALUES subqueries, each at its row and position
+type ValueAnswers = SmallVec<[((usize, usize), Value); 4]>;
+
 /// The CHECK programs of a table without CHECK constraints, shared
 static NO_CHECKS: std::sync::LazyLock<Arc<Vec<CompiledCheck>>> =
     std::sync::LazyLock::new(|| Arc::new(Vec::new()));
@@ -689,23 +692,47 @@ impl Executor {
         )
     }
 
-    /// VALUES or RETURNING holding a subquery go the uncached way, whose plan slot keeps
-    /// the prepared statement; the rollback is disarmed on success, so it
-    /// takes back nothing the inner statement wrote
-    #[cold]
-    #[inline(never)]
-    fn insert_values_read_uncached(
-        &self,
-        stmt: &InsertStatement,
-        ctx: &ExecutionContext,
-        compiled_cache: &Arc<RwLock<CompiledExecution>>,
-        table: Box<dyn Table>,
-        standalone_tx: Option<Box<dyn Transaction>>,
-        statement_rollback: StatementRollback<'_>,
-    ) -> Result<Box<dyn QueryResult>> {
-        drop(table);
-        drop(standalone_tx);
-        statement_rollback.finish(self.execute_insert(stmt, ctx, Some(compiled_cache)))
+    /// Refuse an INSERT whose block read for each conflict or row returned
+    /// reads the target inside a transaction, where it would see the
+    /// statement's writes
+    fn refuse_target_reads_in_transaction(
+        run: &super::prepared_select::DmlRunner,
+        in_transaction: bool,
+    ) -> Result<()> {
+        if in_transaction && run.conflict_reads_target() {
+            return Err(Error::invalid_argument(
+                "an ON CONFLICT subquery that reads the row met or the excluded row \
+                 cannot read the target table inside a transaction",
+            ));
+        }
+        if in_transaction && run.returning_reads_target() {
+            return Err(Self::returning_reads_target());
+        }
+        Ok(())
+    }
+
+    /// The answer of each VALUES subquery with its row and position, all
+    /// read before the statement writes a row
+    fn insert_value_answers(run: &super::prepared_select::DmlRunner) -> Result<ValueAnswers> {
+        let mut answers = ValueAnswers::new();
+        if !run.values().iter().flatten().any(Option::is_some) {
+            return Ok(answers);
+        }
+        let mut vm = super::expression::ExprVM::new();
+        let no_row = Row::new();
+        let exec = run.context(&no_row);
+        for (row, programs) in run.values().iter().enumerate() {
+            for (at, program) in programs.iter().enumerate() {
+                if let Some(program) = program {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_dml_site_ran(
+                        crate::test_failpoints::PreparedDmlSite::InsertValues,
+                    );
+                    answers.push(((row, at), vm.execute_cow(program, &exec)?));
+                }
+            }
+        }
+        Ok(answers)
     }
 
     /// Execute an INSERT statement
@@ -834,34 +861,16 @@ impl Executor {
             let run = &*runner.insert(super::prepared_select::DmlRunner::new(
                 self, &prepared, ctx, tables, 0,
             )?);
-            if active_txn_id.is_some() && run.conflict_reads_target() {
-                return Err(Error::invalid_argument(
-                    "an ON CONFLICT subquery that reads the row met or the excluded row \
-                     cannot read the target table inside a transaction",
-                ));
-            }
-            if active_txn_id.is_some() && run.returning_reads_target() {
-                return Err(Self::returning_reads_target());
-            }
+            Self::refuse_target_reads_in_transaction(run, active_txn_id.is_some())?;
             // The statement is copied only for the VALUES answers it takes
             let mut answered_ctx = std::borrow::Cow::Borrowed(ctx);
             let mut answered = std::borrow::Cow::Borrowed(stmt);
-            if run.values().iter().flatten().any(Option::is_some) {
-                let mut vm = super::expression::ExprVM::new();
-                let no_row = Row::new();
-                let exec = run.context(&no_row);
+            let answers = Self::insert_value_answers(run)?;
+            if !answers.is_empty() {
                 let (answered_ctx, answered) = (answered_ctx.to_mut(), answered.to_mut());
-                for (row, programs) in answered.values.iter_mut().zip(run.values()) {
-                    for (value, program) in row.iter_mut().zip(programs) {
-                        if let Some(program) = program {
-                            #[cfg(feature = "test-failpoints")]
-                            crate::test_failpoints::prepared_dml_site_ran(
-                                crate::test_failpoints::PreparedDmlSite::InsertValues,
-                            );
-                            answered_ctx.add_param(vm.execute_cow(program, &exec)?);
-                            *value = answer_parameter(answered_ctx.params().len());
-                        }
-                    }
+                for ((row, at), answer) in answers {
+                    answered_ctx.add_param(answer);
+                    answered.values[row][at] = answer_parameter(answered_ctx.params().len());
                 }
             }
             written_ctx = answered_ctx;
@@ -1703,10 +1712,65 @@ impl Executor {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
 
+        // The plan is read before the transaction begins, which a snapshot
+        // for prepared subqueries must precede
+        let current_epoch = self.engine.schema_epoch();
+        let cached_insert = match &*compiled_cache.read().unwrap() {
+            CompiledExecution::Insert(cached)
+                if cached.cached_epoch == current_epoch && *cached.table_name == *table_name =>
+            {
+                Some(cached.clone())
+            }
+            _ => None,
+        };
+        let (reads_through_view, reads_prepared) = match &cached_insert {
+            Some(cached) => (cached.reads_through_view, cached.reads_prepared),
+            None => {
+                let reads_through_view = super::insert_reads_through_a_view(stmt);
+                let reads_prepared =
+                    reads_through_view && self.insert_reads_prepared(stmt, ctx, None);
+                (reads_through_view, reads_prepared)
+            }
+        };
+
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
         let active_txn_id = (*active_tx).as_ref().map(|t| t.transaction.id());
+
+        // INSERT is dispatched before the dispatcher puts the transaction
+        // id in the context, so the expressions are given it here
+        let ctx_with_txn;
+        let ctx = match active_txn_id {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
+            }
+            None => ctx,
+        };
+        // Its query and subqueries read through one view, taken before them;
+        // the target keeps the newest
+        let ctx_with_view;
+        let ctx = match self.statement_view(reads_through_view, ctx, active_txn_id) {
+            Some(view) => {
+                ctx_with_view = ctx.with_statement_view(view);
+                &ctx_with_view
+            }
+            None => ctx,
+        };
+        // Without a view the prepared subqueries read a snapshot taken before the write
+        let snapshot_ctx;
+        let ctx = if reads_prepared
+            && active_txn_id.is_none()
+            && ctx.statement_view().is_none()
+            && ctx.statement_snapshot().is_none()
+        {
+            let snapshot = self.new_statement_snapshot(self.isolation_level(), None)?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -1734,26 +1798,10 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::dml_table_opened();
 
-        // Try to get cached compilation, or compile fresh if needed
-        let current_epoch = self.engine.schema_epoch();
+        // Use cached metadata or compile fresh; a rename since the plan was
+        // read keeps the token but not the epoch
         let token = table.layout_token();
-        let cached_insert = {
-            let cache_read = compiled_cache.read().unwrap();
-            if let CompiledExecution::Insert(ref cached) = *cache_read {
-                if cached.cached_epoch == current_epoch
-                    && cached.token == token
-                    && *cached.table_name == *table_name
-                {
-                    Some(cached.clone())
-                } else {
-                    None // Stale cache
-                }
-            } else {
-                None
-            }
-        };
-
-        // Use cached metadata or compile fresh
+        let opened_epoch = self.engine.schema_epoch();
         let (
             column_indices,
             column_types,
@@ -1762,8 +1810,9 @@ impl Executor {
             default_programs,
             default_row_template,
             compiled_checks,
-            reads_through_view,
-        ) = if let Some(cached) = cached_insert {
+        ) = if let Some(cached) = cached_insert
+            .filter(|cached| cached.token == token && cached.cached_epoch == opened_epoch)
+        {
             // Use cached values (Arc clone is cheap)
             (
                 cached.column_indices,
@@ -1773,23 +1822,8 @@ impl Executor {
                 cached.default_programs,
                 cached.default_row_template,
                 cached.compiled_checks,
-                cached.reads_through_view,
             )
         } else {
-            let reads_through_view = super::insert_reads_through_a_view(stmt);
-            if reads_through_view
-                && (stmt.values.iter().flatten().any(Self::has_subqueries)
-                    || stmt.returning.iter().any(Self::has_subqueries))
-            {
-                return self.insert_values_read_uncached(
-                    stmt,
-                    ctx,
-                    compiled_cache,
-                    table,
-                    standalone_tx,
-                    statement_rollback,
-                );
-            }
             // Compile and cache
             let schema = table.schema();
             let schema_column_count = schema.columns.len();
@@ -1861,6 +1895,8 @@ impl Executor {
                 cached_epoch: current_epoch,
                 token,
                 reads_through_view,
+                reads_prepared,
+                prepared: None,
             };
 
             // Update the cache
@@ -1876,30 +1912,49 @@ impl Executor {
                 Arc::new(default_programs),
                 Arc::new(default_row_template),
                 Arc::new(compiled_checks),
-                reads_through_view,
             )
         };
 
-        // INSERT is dispatched before the dispatcher puts the transaction
-        // id in the context, so the expressions are given it here
-        let ctx_with_txn;
-        let ctx = match active_txn_id {
-            Some(txn_id) => {
-                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
-                &ctx_with_txn
+        // Prepared subqueries are read before the first write, through this
+        // statement's transaction
+        let prepared;
+        let mut runner = None;
+        let mut answers = ValueAnswers::new();
+        if reads_prepared {
+            let target = table.schema_arc();
+            let returning = stmt.returning.iter().any(Self::has_subqueries).then(|| {
+                super::prepared_select::ReturningSites {
+                    table: table_name,
+                    schema: &target,
+                    values: &stmt.returning,
+                }
+            });
+            // A VALUES row has no target row: its scope is a table without columns
+            let (plan, tables) = self.open_prepared_dml(
+                Some(compiled_cache),
+                &super::prepared_select::NO_COLUMNS,
+                table_name,
+                None,
+                &[],
+                &stmt.values,
+                None,
+                returning.as_ref(),
+                standalone_tx
+                    .as_deref()
+                    .filter(|_| ctx.statement_snapshot().is_none()),
+                ctx,
+            )?;
+            prepared = plan;
+            let run = &*runner.insert(super::prepared_select::DmlRunner::new(
+                self, &prepared, ctx, tables, 0,
+            )?);
+            Self::refuse_target_reads_in_transaction(run, active_txn_id.is_some())?;
+            answers = Self::insert_value_answers(run)?;
+            if run.returning().is_none() {
+                // Every value is read: the blocks' tables close before a row is written
+                drop(runner.take());
             }
-            None => ctx,
-        };
-        // Its query and subqueries read through one view, taken before them;
-        // the target keeps the newest
-        let ctx_with_view;
-        let ctx = match self.statement_view(reads_through_view, ctx, active_txn_id) {
-            Some(view) => {
-                ctx_with_view = ctx.with_statement_view(view);
-                &ctx_with_view
-            }
-            None => ctx,
-        };
+        }
 
         // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
         let fk_schema = if !table.schema().foreign_keys.is_empty() {
@@ -2024,7 +2079,7 @@ impl Executor {
             }
         } else {
             // Regular INSERT with VALUES
-            for value_list in &stmt.values {
+            for (row, value_list) in stmt.values.iter().enumerate() {
                 if value_list.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values provided",
@@ -2053,6 +2108,10 @@ impl Executor {
                             // resolve directly (avoids VM compilation)
                             let value = if let Some(simple) = try_extract_simple_value(expr, ctx) {
                                 simple
+                            } else if let Ok(at) =
+                                answers.binary_search_by_key(&(row, value_pos), |(at, _)| *at)
+                            {
+                                std::mem::replace(&mut answers[at].1, Value::null_unknown())
                             } else {
                                 // Fall back to VM evaluation for complex expressions
                                 let program = compile_expression(expr, &[])?;
@@ -2121,7 +2180,7 @@ impl Executor {
                 column_names,
                 ctx,
                 standalone_tx,
-                None,
+                runner.as_ref(),
             ));
         }
 
