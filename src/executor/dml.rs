@@ -2131,6 +2131,33 @@ impl Executor {
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
+        // Without a view the prepared subqueries read a snapshot taken before the write
+        let snapshot_ctx;
+        let ctx = if active_tx.is_none()
+            && ctx.statement_view().is_none()
+            && ctx.statement_snapshot().is_none()
+            && (stmt
+                .where_clause
+                .as_deref()
+                .is_some_and(Self::has_subqueries)
+                || stmt.updates.values().any(Self::has_subqueries))
+            && self
+                .dml_family(
+                    stmt.where_clause.as_deref(),
+                    stmt.updates
+                        .values()
+                        .filter(|e| !matches!(e, Expression::Default(_))),
+                    ctx,
+                )
+                .is_ok()
+        {
+            let snapshot = self.new_statement_snapshot(self.isolation_level(), None)?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
+
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
@@ -2306,15 +2333,6 @@ impl Executor {
                 .dml_family(stmt.where_clause.as_deref(), stmt.updates.values(), ctx)
                 .is_ok();
         let where_prepared = in_family && where_has_subqueries;
-        let snapshot_ctx;
-        let ctx = if in_family && should_auto_commit && ctx.statement_snapshot().is_none() {
-            let snapshot =
-                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
-            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
-            &snapshot_ctx
-        } else {
-            ctx
-        };
         let held_dml;
         let dml_run = if in_family {
             let col_map = schema.column_index_map();
@@ -2335,7 +2353,9 @@ impl Executor {
                 &sets,
                 &[] as &[Vec<Expression>],
                 None,
-                None,
+                standalone_tx
+                    .as_deref()
+                    .filter(|_| ctx.statement_snapshot().is_none()),
                 ctx,
             )?;
             held_dml = prepared;
@@ -3163,6 +3183,29 @@ impl Executor {
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
+        // A WHERE whose subqueries are of the prepared family runs through
+        // one runner, which reads the tables as the statement found them
+        let where_prepared = stmt
+            .where_clause
+            .as_deref()
+            .is_some_and(Self::has_subqueries)
+            && self
+                .dml_family(stmt.where_clause.as_deref(), [], ctx)
+                .is_ok();
+        // Without a view the prepared subqueries read a snapshot taken before the write
+        let snapshot_ctx;
+        let ctx = if where_prepared
+            && active_tx.is_none()
+            && ctx.statement_view().is_none()
+            && ctx.statement_snapshot().is_none()
+        {
+            let snapshot = self.new_statement_snapshot(self.isolation_level(), None)?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
+
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
@@ -3198,24 +3241,6 @@ impl Executor {
         // If that fails (complex expression like a + b > 100), fall back to in-memory filtering
         let schema = table.schema();
 
-        // A WHERE whose subqueries are of the prepared family runs through
-        // one runner, which reads the tables as the statement found them
-        let where_prepared = stmt
-            .where_clause
-            .as_deref()
-            .is_some_and(Self::has_subqueries)
-            && self
-                .dml_family(stmt.where_clause.as_deref(), [], ctx)
-                .is_ok();
-        let snapshot_ctx;
-        let ctx = if where_prepared && should_auto_commit && ctx.statement_snapshot().is_none() {
-            let snapshot =
-                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
-            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
-            &snapshot_ctx
-        } else {
-            ctx
-        };
         let held_dml;
         let dml_run = if where_prepared {
             let (prepared, tables) = self.open_prepared_dml(
@@ -3226,7 +3251,9 @@ impl Executor {
                 &[],
                 &[] as &[Vec<Expression>],
                 None,
-                None,
+                standalone_tx
+                    .as_deref()
+                    .filter(|_| ctx.statement_snapshot().is_none()),
                 ctx,
             )?;
             held_dml = prepared;
