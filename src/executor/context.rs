@@ -1075,6 +1075,9 @@ struct SnapshotState {
     reads_latest: bool,
     /// The statement view its tables are read through
     view: Option<StatementView>,
+    /// What is written through its transaction: nothing for the executor's
+    /// own, maybe anything for one a caller gave through `get_table`
+    table_use: TableUse,
     /// The first table the statement's correlated probes read, read without a lock
     first_probe_table: std::sync::OnceLock<ProbeTable>,
     /// Any further tables they read, taken once each
@@ -1091,10 +1094,30 @@ impl StatementSnapshot {
         isolation: crate::core::IsolationLevel,
         view: Option<StatementView>,
     ) -> Self {
+        Self::with_use(transaction, isolation, view, TableUse::Write)
+    }
+
+    /// [`Self::new`] for the executor's own reads: nothing writes through
+    /// the transaction, so its tables open without a local store
+    pub(crate) fn for_reads(
+        transaction: Box<dyn crate::storage::traits::Transaction>,
+        isolation: crate::core::IsolationLevel,
+        view: Option<StatementView>,
+    ) -> Self {
+        Self::with_use(transaction, isolation, view, TableUse::Read)
+    }
+
+    fn with_use(
+        transaction: Box<dyn crate::storage::traits::Transaction>,
+        isolation: crate::core::IsolationLevel,
+        view: Option<StatementView>,
+        table_use: TableUse,
+    ) -> Self {
         Self(Arc::new(SnapshotState {
             transaction: Mutex::new(transaction),
             reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
             view,
+            table_use,
             first_probe_table: std::sync::OnceLock::new(),
             probe_tables: Mutex::new(SmallVec::new()),
         }))
@@ -1130,8 +1153,7 @@ impl StatementSnapshot {
         self.statement_table_at(name, self.0.view.as_ref())
     }
 
-    /// The table read through `view`, None reading the newest committed state;
-    /// nothing writes through the snapshot's transaction
+    /// The table read through `view`, None reading the newest committed state
     pub(crate) fn statement_table_at(
         &self,
         name: &str,
@@ -1141,7 +1163,7 @@ impl StatementSnapshot {
             .transaction
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_read_table_at(name, view, TableUse::Read)
+            .get_read_table_at(name, view, self.0.table_use)
     }
 
     /// Runs `f` on the table every correlated probe of the statement reads,

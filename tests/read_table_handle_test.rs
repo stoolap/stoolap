@@ -54,6 +54,51 @@ fn a_select_in_a_transaction_registers_no_store_until_a_write() {
 }
 
 #[test]
+fn a_probe_through_a_given_snapshot_sees_a_write_made_through_it_later() {
+    use stoolap::core::{Row, Value};
+    use stoolap::executor::context::StatementSnapshot;
+    use stoolap::storage::traits::Engine;
+    let db = Database::open("memory://read_table_handle_given_snapshot").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE INDEX wx ON w (x)",
+        "INSERT INTO s VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let engine = db.engine();
+    let snapshot = StatementSnapshot::new(
+        engine.begin_transaction().unwrap(),
+        stoolap::core::IsolationLevel::ReadCommitted,
+        Some(engine.registry().capture_view()),
+    );
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(engine));
+    let ctx = stoolap::ExecutionContext::new().with_statement_snapshot(snapshot.clone());
+    let ids = || {
+        let sql = "SELECT DISTINCT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) \
+                   ORDER BY id LIMIT 10";
+        let mut result = executor.execute_with_context(sql, &ctx).unwrap();
+        let mut ids = Vec::new();
+        while result.next() {
+            ids.push(result.row().get(0).and_then(|v| v.as_int64()).unwrap());
+        }
+        ids
+    };
+    let before = ids();
+    snapshot
+        .get_table("w")
+        .unwrap()
+        .insert(Row::from(vec![Value::Integer(1), Value::Integer(1)]))
+        .unwrap();
+    assert_eq!(
+        (before, ids()),
+        (vec![], vec![1]),
+        "the ids before and after the snapshot's transaction wrote w"
+    );
+}
+
+#[test]
 fn a_returning_block_reading_a_cascaded_table_sees_the_cascade() {
     let db = Database::open("memory://read_table_handle_cascade").unwrap();
     for sql in [
