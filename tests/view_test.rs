@@ -1028,3 +1028,22 @@ fn test_show_create_view_complex() {
     assert!(create_stmt.contains("COUNT"));
     assert!(create_stmt.contains("AVG"));
 }
+
+#[test]
+fn test_rename_table_to_a_view_name_is_refused() {
+    let db = Database::open_in_memory().expect("Failed to open database");
+    db.execute("CREATE VIEW v AS SELECT 1 AS id", ()).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2)", ()).unwrap();
+    let err = db
+        .execute("ALTER TABLE t RENAME TO V", ())
+        .expect_err("a view holds the name");
+    assert!(
+        err.to_string().contains("a view with the same name exists"),
+        "{err}"
+    );
+    let id = |sql: &str| -> i64 { db.query_one(sql, ()).unwrap() };
+    assert_eq!(id("SELECT id FROM t"), 2, "the table keeps its name");
+    assert_eq!(id("SELECT id FROM v"), 1, "the view still answers");
+}

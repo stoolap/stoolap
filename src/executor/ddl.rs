@@ -1286,6 +1286,12 @@ impl Executor {
             }
             AlterTableOperation::RenameTable => {
                 if let Some(ref new_name) = stmt.new_table_name {
+                    if self.engine.view_exists(&new_name.value)? {
+                        return Err(Error::internal(format!(
+                            "cannot rename table '{}' to '{}': a view with the same name exists",
+                            table_name, new_name.value
+                        )));
+                    }
                     tx.rename_table(table_name, &new_name.value)?;
 
                     // Record ALTER TABLE RENAME TO WAL for persistence
