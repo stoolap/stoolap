@@ -671,16 +671,6 @@ pub(crate) struct CallInputs {
 }
 
 impl CallInputs {
-    /// The inputs of every call, compiled over the input row's columns
-    pub(crate) fn compile(
-        aggregations: &[SqlAggregateFunction],
-        columns: &[String],
-    ) -> Result<Vec<CallInputs>> {
-        Self::compile_with(aggregations, |expr| {
-            super::expression::compile_expression(expr, columns)
-        })
-    }
-
     /// The inputs of every call, each program made by `compile`
     pub(crate) fn compile_with(
         aggregations: &[SqlAggregateFunction],
@@ -807,6 +797,35 @@ struct FeedState {
     key: Vec<Value>,
 }
 
+/// What each row a pass feeds reads beside itself, taken once for the pass:
+/// the parameters, and the blocks answering its subqueries
+#[derive(Clone, Copy)]
+struct RowReads<'b> {
+    params: &'b [Value],
+    blocks: Option<&'b dyn SubqueryExecutor>,
+}
+
+impl<'b> RowReads<'b> {
+    fn of(ctx: &'b ExecutionContext, blocks: Option<&'b dyn SubqueryExecutor>) -> Self {
+        Self {
+            params: slot_params(ctx, blocks),
+            blocks,
+        }
+    }
+
+    #[inline(always)]
+    fn exec<'a>(self, row: &'a Row) -> super::expression::ExecuteContext<'a>
+    where
+        'b: 'a,
+    {
+        let exec = super::expression::ExecuteContext::new(row).with_params(self.params);
+        match self.blocks {
+            Some(blocks) => exec.with_subquery_executor(blocks),
+            None => exec,
+        }
+    }
+}
+
 /// What an aggregation reads from each input row, compiled once over the
 /// input's columns: the group key, and each call's column or inputs
 struct RowFeed<'a> {
@@ -822,12 +841,35 @@ struct RowFeed<'a> {
 }
 
 impl<'a> RowFeed<'a> {
+    /// The feed of `aggregations` grouped by `group_items` over `columns`,
+    /// for this execution of `ctx`'s statement: its subqueries run as the
+    /// statement's `blocks`, each set they read tested in place, and what
+    /// reads a parameter folds it
     fn new(
         aggregations: &'a [SqlAggregateFunction],
         group_items: &[GroupByItem],
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Self> {
+        let compile = |expr: &Expression| {
+            if blocks.is_none() && !super::utils::expression_has_parameters(expr) {
+                return super::expression::compile_expression(expr, columns);
+            }
+            let program = compile_over_slots(
+                expr,
+                columns,
+                crate::functions::registry::global_registry(),
+                None,
+                None,
+                blocks.is_some(),
+                Some(slot_params(ctx, blocks)),
+            )?;
+            Ok(blocks
+                .and_then(|blocks| blocks.bind_members(&program))
+                .unwrap_or(program))
+        };
         let items = group_items
             .iter()
             .map(|item| {
@@ -838,9 +880,7 @@ impl<'a> RowFeed<'a> {
                             None => KeyItem::Null,
                         }
                     }
-                    GroupByItem::Expression { expr, .. } => {
-                        KeyItem::Program(super::expression::compile_expression(expr, columns)?)
-                    }
+                    GroupByItem::Expression { expr, .. } => KeyItem::Program(compile(expr)?),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -857,7 +897,7 @@ impl<'a> RowFeed<'a> {
                 .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
         Ok(Self {
             aggregations,
-            inputs: CallInputs::compile(aggregations, columns)?,
+            inputs: CallInputs::compile_with(aggregations, compile)?,
             columns: aggregations
                 .iter()
                 .map(|agg| {
@@ -948,14 +988,14 @@ impl<'a> RowFeed<'a> {
         &self,
         groups: &mut GroupedAggregates,
         row: &Row,
-        ctx: &ExecutionContext,
+        reads: &RowReads<'_>,
         state: &mut FeedState,
     ) -> Result<()> {
         if let (false, Some(columns)) = (self.programs, &self.key_columns) {
             self.run_columns(groups, row, columns);
             return Ok(());
         }
-        let exec = super::expression::ExecuteContext::new(row).with_params(ctx.params());
+        let exec = reads.exec(row);
         let group = match &self.key_columns {
             Some(columns) => groups.group(&ColumnsKey {
                 values: row.as_slice(),
@@ -972,24 +1012,31 @@ impl<'a> RowFeed<'a> {
         }
     }
 
-    /// Runs every row into its group; a large input whose calls all merge
-    /// is split, and its parts merge in input order
+    /// Runs every row into its group, its subqueries answered by `blocks`;
+    /// a large input whose calls all merge is split, and its parts merge in
+    /// input order
     fn run_rows(
         &self,
         groups: &mut GroupedAggregates,
         rows: &[(i64, Row)],
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<()> {
         #[cfg(feature = "parallel")]
         if rows.len() >= PARALLEL_ROWS && !self.programs && groups.can_merge() {
             let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
+            let params = ctx.params();
             let parts: Vec<GroupedAggregates> = rows
                 .par_chunks(chunk_size)
                 .map(|chunk| {
                     let mut part = groups.empty_like();
                     let mut state = FeedState::default();
+                    let reads = RowReads {
+                        params,
+                        blocks: None,
+                    };
                     for (_, row) in chunk {
-                        self.run_one(&mut part, row, ctx, &mut state)?;
+                        self.run_one(&mut part, row, &reads, &mut state)?;
                     }
                     Ok(part)
                 })
@@ -1015,24 +1062,27 @@ impl<'a> RowFeed<'a> {
             return Ok(());
         }
         let mut state = FeedState::default();
+        let reads = RowReads::of(ctx, blocks);
         for (_, row) in rows {
-            self.run_one(groups, row, ctx, &mut state)?;
+            self.run_one(groups, row, &reads, &mut state)?;
         }
         Ok(())
     }
 
     /// Runs every row into its group in each grouping set, `picks` naming
-    /// the key items each set groups by
+    /// the key items each set groups by, its subqueries answered by `blocks`
     fn run_sets(
         &self,
         sets: &mut [GroupedAggregates],
         picks: &[Vec<usize>],
         rows: &[(i64, Row)],
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<()> {
         let mut state = FeedState::default();
+        let reads = RowReads::of(ctx, blocks);
         for (_, row) in rows {
-            let exec = super::expression::ExecuteContext::new(row).with_params(ctx.params());
+            let exec = reads.exec(row);
             self.read_key(row, &exec, &mut state)?;
             for (groups, picks) in sets.iter_mut().zip(picks) {
                 let key = Picked {
@@ -1131,6 +1181,7 @@ impl Executor {
                 base_columns,
                 &col_index_map,
                 ctx,
+                blocks,
             )?
         } else if stmt.group_by.modifier != GroupByModifier::None {
             // ROLLUP or CUBE aggregation
@@ -1142,6 +1193,7 @@ impl Executor {
                 &col_index_map,
                 stmt,
                 ctx,
+                blocks,
             )?
         } else {
             // Regular grouped aggregation - pass limit for early termination
@@ -1153,6 +1205,7 @@ impl Executor {
                 &col_index_map,
                 ctx,
                 aggregation_limit,
+                blocks,
             )?
         };
 
@@ -2002,6 +2055,7 @@ impl Executor {
                 base_columns,
                 &col_index_map,
                 ctx,
+                None,
             )?
         } else {
             // Grouped aggregation - no limit since window functions need all groups
@@ -2013,6 +2067,7 @@ impl Executor {
                 &col_index_map,
                 ctx,
                 None, // Window functions need all groups
+                None,
             )?
         };
 
@@ -2584,12 +2639,14 @@ impl Executor {
         columns: &[String],
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
         let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
-        RowFeed::new(aggregations, &[], columns, col_index_map)?.run_rows(
+        RowFeed::new(aggregations, &[], columns, col_index_map, ctx, blocks)?.run_rows(
             &mut groups,
             rows,
             ctx,
+            blocks,
         )?;
         let result_columns = aggregations.iter().map(|a| a.get_column_name()).collect();
         Ok((result_columns, groups.into_rows()?))
@@ -2607,17 +2664,22 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         limit: Option<usize>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
         let mut groups =
             GroupedAggregates::new(self.call_templates(aggregations)?, group_by_items.len());
         if let Some(limit) = limit {
             groups = groups.with_group_cap(limit);
         }
-        RowFeed::new(aggregations, group_by_items, columns, col_index_map)?.run_rows(
-            &mut groups,
-            rows,
+        RowFeed::new(
+            aggregations,
+            group_by_items,
+            columns,
+            col_index_map,
             ctx,
-        )?;
+            blocks,
+        )?
+        .run_rows(&mut groups, rows, ctx, blocks)?;
 
         let mut result_columns: Vec<String> =
             self.resolve_group_by_column_names_new(group_by_items, columns, col_index_map);
@@ -2645,6 +2707,7 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
         // Generate grouping sets based on modifier type
         let grouping_sets = match &stmt.group_by.modifier {
@@ -2661,7 +2724,14 @@ impl Executor {
             }
         };
 
-        let feed = RowFeed::new(aggregations, group_by_items, columns, col_index_map)?;
+        let feed = RowFeed::new(
+            aggregations,
+            group_by_items,
+            columns,
+            col_index_map,
+            ctx,
+            blocks,
+        )?;
         let picks: Vec<Vec<usize>> = grouping_sets
             .iter()
             .map(|set| {
@@ -2683,7 +2753,7 @@ impl Executor {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        feed.run_sets(&mut sets, &picks, rows, ctx)?;
+        feed.run_sets(&mut sets, &picks, rows, ctx, blocks)?;
 
         // Each group's items where its set groups by them and NULL where the
         // set rolls them up, then its aggregates, then the GROUPING flags
@@ -3431,11 +3501,12 @@ impl Executor {
 
         // Otherwise the one group of the grouped path, fed by a scan
         let mut groups = GroupedAggregates::global(self.call_templates(&aggregations)?);
-        let feed = RowFeed::new(&aggregations, &[], &schema_lower, &col_index_map)?;
+        let feed = RowFeed::new(&aggregations, &[], &schema_lower, &col_index_map, ctx, None)?;
         let mut state = FeedState::default();
+        let reads = RowReads::of(ctx, None);
         let mut scanner = table.scan(&[], None)?;
         while scanner.next() {
-            feed.run_one(&mut groups, scanner.row(), ctx, &mut state)?;
+            feed.run_one(&mut groups, scanner.row(), &reads, &mut state)?;
         }
         if let Some(e) = scanner.err() {
             return Err(e.clone());
@@ -3578,10 +3649,18 @@ impl Executor {
 
         let group_items = [GroupByItem::Column(group_col_name)];
         let mut groups = GroupedAggregates::new(self.call_templates(&aggregations)?, 1);
-        let feed = RowFeed::new(&aggregations, &group_items, &source_columns, &col_index_map)?;
+        let feed = RowFeed::new(
+            &aggregations,
+            &group_items,
+            &source_columns,
+            &col_index_map,
+            ctx,
+            None,
+        )?;
         let mut state = FeedState::default();
+        let reads = RowReads::of(ctx, None);
         while result.next() {
-            feed.run_one(&mut groups, result.row(), ctx, &mut state)?;
+            feed.run_one(&mut groups, result.row(), &reads, &mut state)?;
         }
         if let Some(err) = result.last_error() {
             return Err(err);

@@ -224,7 +224,7 @@ fn test_correlated_join_on() {
 fn test_group_by_expression() {
     site(
         "site_group_by",
-        Fails("step 4"),
+        Right,
         "SELECT COUNT(*) FROM t GROUP BY id > (SELECT MAX(x) FROM u) ORDER BY 1",
         "SELECT COUNT(*) FROM t GROUP BY id > 3 ORDER BY 1",
     );

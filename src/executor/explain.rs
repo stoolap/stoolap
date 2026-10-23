@@ -686,10 +686,10 @@ impl Executor {
                     .order_by
                     .iter()
                     .any(|ob| Self::has_subqueries(&ob.expression)));
-        let grouped_output = join.is_none()
-            && get_classification(select).has_aggregation
-            && (select.columns.iter().any(Self::has_subqueries)
-                || select.having.as_deref().is_some_and(Self::has_subqueries));
+        let grouped_output = join.is_none() && {
+            let classification = get_classification(select);
+            classification.has_aggregation && classification.grouped_has_subqueries
+        };
         if on_subqueries
             || output_subqueries
             || grouped_output

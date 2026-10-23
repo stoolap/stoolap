@@ -21,7 +21,10 @@ use ahash::AHasher;
 use rustc_hash::FxHasher;
 
 use crate::core::Value;
-use crate::parser::ast::{Expression, FunctionCall, OrderByExpression};
+use crate::parser::ast::{
+    AllAnyType, Expression, FunctionCall, GroupByModifier, Identifier, OrderByExpression,
+    SelectStatement,
+};
 
 /// Two expressions share a key when they are the same computation. The key
 /// is two independent 64-bit hashes of the tree, so two different trees
@@ -236,10 +239,10 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             hasher.write_i64(lit.quantity);
             hasher.name(&lit.unit);
         }
-        // By name: every `?` reads alike, as a bound value is the same where it repeats
+        // By slot: two `?` are two values, `$1` and a repeated name one
         Expression::Parameter(param) => {
             hasher.tag(b'P');
-            hasher.text(&param.name);
+            hasher.write_usize(param.index);
         }
         Expression::Prefix(prefix) => {
             hasher.tag(b'u');
@@ -344,11 +347,152 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b'q');
             hasher.name(&star.qualifier);
         }
-        // Subqueries and table sources read the same when they print the same
+        Expression::ScalarSubquery(sq) => {
+            hasher.tag(b'k');
+            write_statement(&sq.subquery, hasher);
+        }
+        Expression::Exists(exists) => {
+            hasher.tag(b'e');
+            write_statement(&exists.subquery, hasher);
+        }
+        Expression::AllAny(all_any) => {
+            hasher.tag(b'y');
+            hasher.name(&all_any.operator);
+            hasher.flag(matches!(all_any.all_any_type, AllAnyType::All));
+            write_expr(&all_any.left, hasher);
+            write_statement(&all_any.subquery, hasher);
+        }
+        // Table sources read the same when they print the same
         other => {
             hasher.tag(b'?');
             hasher.text(&other.to_string());
         }
+    }
+}
+
+/// A subquery: a prepared block by its id, as every mark prints alike, a
+/// written one by its parts, so each parameter in it reads by its slot
+fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
+    hasher.flag(stmt.prepared.is_some());
+    if let Some(id) = stmt.prepared {
+        id.hash(hasher);
+        return;
+    }
+    hasher.flag(stmt.distinct);
+    write_list(&stmt.distinct_on, hasher);
+    // A column's alias names what the statement around it reads
+    hasher.write_usize(stmt.columns.len());
+    for column in &stmt.columns {
+        match column {
+            Expression::Aliased(aliased) => {
+                hasher.tag(b'a');
+                hasher.name(&aliased.alias.value);
+                write_expr(&aliased.expression, hasher);
+            }
+            column => write_expr(column, hasher),
+        }
+    }
+    hasher.flag(stmt.with.is_some());
+    if let Some(with) = &stmt.with {
+        hasher.flag(with.is_recursive);
+        hasher.write_usize(with.ctes.len());
+        for cte in &with.ctes {
+            hasher.name(&cte.name.value);
+            hasher.write_usize(cte.column_names.len());
+            for column in &cte.column_names {
+                hasher.name(&column.value);
+            }
+            write_statement(&cte.query, hasher);
+        }
+    }
+    hasher.flag(stmt.table_expr.is_some());
+    if let Some(source) = stmt.table_expr.as_deref() {
+        write_source(source, hasher);
+    }
+    write_optional(stmt.where_clause.as_deref(), hasher);
+    write_list(&stmt.group_by.columns, hasher);
+    match &stmt.group_by.modifier {
+        GroupByModifier::None => hasher.tag(b'n'),
+        GroupByModifier::Rollup => hasher.tag(b'r'),
+        GroupByModifier::Cube => hasher.tag(b'c'),
+        GroupByModifier::GroupingSets(sets) => {
+            hasher.tag(b'g');
+            hasher.write_usize(sets.len());
+            for set in sets {
+                write_list(set, hasher);
+            }
+        }
+    }
+    write_optional(stmt.having.as_deref(), hasher);
+    hasher.write_usize(stmt.window_defs.len());
+    for window in &stmt.window_defs {
+        hasher.name(&window.name);
+        write_list(&window.partition_by, hasher);
+        write_order_by(&window.order_by, hasher);
+        hasher.flag(window.frame.is_some());
+        if let Some(frame) = &window.frame {
+            hasher.text(&frame.to_string());
+        }
+    }
+    write_order_by(&stmt.order_by, hasher);
+    write_optional(stmt.limit.as_deref(), hasher);
+    write_optional(stmt.offset.as_deref(), hasher);
+    hasher.write_usize(stmt.set_operations.len());
+    for operation in &stmt.set_operations {
+        hasher.text(&operation.operation.to_string());
+        write_statement(&operation.right, hasher);
+    }
+}
+
+/// A source's alias and the names of its columns
+fn write_names(alias: Option<&Identifier>, columns: &[Identifier], hasher: &mut KeyHasher) {
+    hasher.flag(alias.is_some());
+    if let Some(alias) = alias {
+        hasher.name(&alias.value);
+    }
+    hasher.write_usize(columns.len());
+    for column in columns {
+        hasher.name(&column.value);
+    }
+}
+
+/// A FROM source of a subquery, each expression in it by its parts
+fn write_source(source: &Expression, hasher: &mut KeyHasher) {
+    match source {
+        Expression::SubquerySource(sub) => {
+            hasher.tag(b's');
+            hasher.flag(sub.alias.is_some());
+            if let Some(alias) = &sub.alias {
+                hasher.name(&alias.value);
+            }
+            write_statement(&sub.subquery, hasher);
+        }
+        Expression::JoinSource(join) => {
+            hasher.tag(b'j');
+            write_source(&join.left, hasher);
+            hasher.name(&join.join_type);
+            write_source(&join.right, hasher);
+            write_optional(join.condition.as_deref(), hasher);
+            hasher.write_usize(join.using_columns.len());
+            for column in &join.using_columns {
+                hasher.name(&column.value);
+            }
+        }
+        Expression::ValuesSource(values) => {
+            hasher.tag(b'v');
+            hasher.write_usize(values.rows.len());
+            for row in &values.rows {
+                write_list(row, hasher);
+            }
+            write_names(values.alias.as_ref(), &values.column_aliases, hasher);
+        }
+        Expression::FunctionTableSource(function) => {
+            hasher.tag(b'f');
+            hasher.name(&function.function.value);
+            write_list(&function.arguments, hasher);
+            write_names(function.alias.as_ref(), &function.column_aliases, hasher);
+        }
+        other => write_expr(other, hasher),
     }
 }
 
@@ -407,5 +551,69 @@ mod tests {
     fn test_a_column_key_is_the_identifier_key() {
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
         assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
+    }
+
+    #[test]
+    fn test_a_prepared_block_reads_as_its_id() {
+        let marked = |sql: &str, id: u16| {
+            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            let Statement::Select(select) = &statements[0] else {
+                panic!("not a SELECT");
+            };
+            let mut expr = select.columns[0].clone();
+            match &mut expr {
+                Expression::ScalarSubquery(sq) => sq.subquery.prepared = Some(id),
+                Expression::Exists(exists) => exists.subquery.prepared = Some(id),
+                Expression::AllAny(all_any) => all_any.subquery.prepared = Some(id),
+                other => panic!("not a subquery: {other:?}"),
+            }
+            ExprKey::of(&expr)
+        };
+        for sql in [
+            "(SELECT 1 FROM u)",
+            "EXISTS (SELECT 1 FROM u)",
+            "a > ANY (SELECT x FROM u)",
+        ] {
+            assert_ne!(marked(sql, 0), marked(sql, 1), "{sql}: two blocks");
+            assert_eq!(marked(sql, 1), marked(sql, 1), "{sql}: one block");
+        }
+        assert_ne!(
+            marked("a > ANY (SELECT x FROM u)", 1),
+            marked("b > ANY (SELECT x FROM u)", 1),
+            "the left side reads too"
+        );
+    }
+
+    #[test]
+    fn test_parameters_and_subqueries_read_by_what_they_hold() {
+        let pair = |sql: &str| {
+            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            let Statement::Select(select) = &statements[0] else {
+                panic!("not a SELECT");
+            };
+            (
+                ExprKey::of(&select.columns[0]),
+                ExprKey::of(&select.columns[1]),
+            )
+        };
+        for sql in [
+            "a + $1, a + $1",
+            "a + :n, a + :n",
+            "(SELECT p FROM (SELECT x AS p FROM u) s), (SELECT p FROM (SELECT x AS p FROM u) s)",
+        ] {
+            let (a, b) = pair(sql);
+            assert_eq!(a, b, "{sql}: one expression");
+        }
+        for sql in [
+            "a + ?, a + ?",
+            "a + $1, a + $2",
+            "(SELECT ?), (SELECT ?)",
+            "(SELECT 1 FROM u WHERE v = 1), (SELECT 1 FROM u WHERE v = 2)",
+            "(SELECT p FROM (SELECT x AS p, y AS q FROM u) s), \
+             (SELECT p FROM (SELECT y AS p, x AS q FROM u) s)",
+        ] {
+            let (a, b) = pair(sql);
+            assert_ne!(a, b, "{sql}: two expressions");
+        }
     }
 }
