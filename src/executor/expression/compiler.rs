@@ -181,6 +181,9 @@ pub struct CompileContext<'a> {
 
     /// Values read as the type of the column they are compared with, by node address
     read_as: Option<&'a FxHashMap<usize, DataType>>,
+
+    /// The parameters of the one execution the program serves, which folding reads
+    params: Option<&'a [Value]>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -220,6 +223,7 @@ impl<'a> CompileContext<'a> {
             prepared_subqueries: false,
             row2_bindings: None,
             read_as: None,
+            params: None,
         }
     }
 
@@ -297,6 +301,13 @@ impl<'a> CompileContext<'a> {
     /// a value compared with a column of that type as
     pub fn with_read_as(mut self, read_as: &'a FxHashMap<usize, DataType>) -> Self {
         self.read_as = Some(read_as);
+        self
+    }
+
+    /// Fold what reads only `params` and constants, for a program compiled
+    /// for one execution and dropped with it; a fold that errors is not taken
+    pub fn with_params(mut self, params: &'a [Value]) -> Self {
+        self.params = Some(params);
         self
     }
 
@@ -484,6 +495,7 @@ impl<'a> ExprCompiler<'a> {
         thread_local! {
             static FOLD_VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
             static FOLD_ROW: Row = Row::new();
+            static FOLD_OPS: RefCell<Vec<Op>> = const { RefCell::new(Vec::new()) };
         }
 
         self.folding.set(true);
@@ -493,7 +505,8 @@ impl<'a> ExprCompiler<'a> {
         let compiler = ExprCompiler::new(&ctx);
         compiler.folding.set(true);
 
-        let mut builder = ProgramBuilder::new();
+        let ops = FOLD_OPS.with(|ops| std::mem::take(&mut *ops.borrow_mut()));
+        let mut builder = ProgramBuilder::reusing(ops);
         let ok = compiler.compile_expr(expr, &mut builder);
         self.folding.set(false);
 
@@ -501,13 +514,16 @@ impl<'a> ExprCompiler<'a> {
         builder.emit(Op::Return);
         let program = builder.build_unoptimized();
 
-        FOLD_ROW.with(|empty_row| {
-            let exec_ctx = ExecuteContext::new(empty_row);
+        let value = FOLD_ROW.with(|empty_row| {
+            let exec_ctx =
+                ExecuteContext::new(empty_row).with_params(self.ctx.params.unwrap_or(&[]));
             FOLD_VM.with(|vm_cell| {
                 let mut vm = vm_cell.borrow_mut();
                 vm.execute(&program, &exec_ctx).ok()
             })
-        })
+        });
+        FOLD_OPS.with(|ops| *ops.borrow_mut() = program.into_ops());
+        value
     }
 
     /// Compile an expression, emitting ops to the builder
@@ -553,7 +569,9 @@ impl<'a> ExprCompiler<'a> {
         // This optimizes deterministic expressions like ABS(-5) + 1 or UPPER('text').
         // Non-deterministic functions (NOW, RANDOM, etc.) are excluded by is_foldable_expr
         // and handled separately by pushdown's try_eval_constant_expr at query time.
-        if !self.folding.get() && is_foldable_expr(expr, self.ctx.functions) {
+        if !self.folding.get()
+            && is_foldable_expr(expr, self.ctx.functions, self.ctx.params.is_some())
+        {
             if let Some(value) = self.try_fold_constant(expr) {
                 builder.emit(Op::LoadConst(value));
                 return Ok(());
@@ -608,7 +626,13 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === PARAMETERS ===
-            Expression::Parameter(param) => builder.emit(Op::LoadParam(parameter_slot(param)?)),
+            Expression::Parameter(param) => {
+                let slot = parameter_slot(param)?;
+                match self.ctx.params.and_then(|params| params.get(slot as usize)) {
+                    Some(value) => builder.emit(Op::LoadConst(value.clone())),
+                    None => builder.emit(Op::LoadParam(slot)),
+                }
+            }
 
             // === INFIX EXPRESSIONS ===
             Expression::Infix(infix) => {
@@ -1581,7 +1605,7 @@ impl<'a> ExprCompiler<'a> {
             None => None,
             Some(Expression::StringLiteral(lit)) => lit.value.chars().next(),
             Some(escape_expr) => {
-                match may_fold(escape_expr, self.ctx.functions)
+                match may_fold(escape_expr, self.ctx.functions, self.ctx.params.is_some())
                     .then(|| self.try_fold_constant(escape_expr))
                     .flatten()
                 {
@@ -1876,24 +1900,26 @@ impl<'a> ExprCompiler<'a> {
 
 /// Whether `expr` is worth folding into a constant and may be: an operator,
 /// call or cast (a literal is a constant already)
-fn is_foldable_expr(expr: &Expression, registry: &FunctionRegistry) -> bool {
+fn is_foldable_expr(expr: &Expression, registry: &FunctionRegistry, params: bool) -> bool {
     matches!(
         expr,
         Expression::Infix(_)
             | Expression::Prefix(_)
             | Expression::FunctionCall(_)
             | Expression::Cast(_)
-    ) && may_fold(expr, registry)
+    ) && may_fold(expr, registry, params)
 }
 
-/// Whether `expr` may be folded into a constant: it reads no column and
-/// answers the same every time, as a program outlives its statement
-fn may_fold(expr: &Expression, registry: &FunctionRegistry) -> bool {
-    is_column_free(expr) && expression_volatility(expr, registry) == Volatility::Fixed
+/// Whether `expr` may be folded into a constant: it reads no column, and no
+/// parameter unless `params` are known, and answers the same every time
+fn may_fold(expr: &Expression, registry: &FunctionRegistry, params: bool) -> bool {
+    is_column_free(expr, params) && expression_volatility(expr, registry) == Volatility::Fixed
 }
 
-/// Check if an expression references no columns (is entirely self-contained).
-fn is_column_free(expr: &Expression) -> bool {
+/// Check if an expression references no columns (is entirely self-contained);
+/// a parameter counts as one unless `params` are known
+fn is_column_free(expr: &Expression, params: bool) -> bool {
+    let is_column_free = |expr: &Expression| is_column_free(expr, params);
     match expr {
         // Literals are always column-free
         Expression::IntegerLiteral(_)
@@ -1906,8 +1932,8 @@ fn is_column_free(expr: &Expression) -> bool {
         // Identifiers reference columns (not column-free)
         Expression::Identifier(_) | Expression::QualifiedIdentifier { .. } => false,
 
-        // Parameters: values aren't known at compile time
-        Expression::Parameter(_) => false,
+        // Parameters: known only for a program that serves one execution
+        Expression::Parameter(_) => params,
 
         // Binary operations
         Expression::Infix(infix) => is_column_free(&infix.left) && is_column_free(&infix.right),

@@ -91,6 +91,11 @@ impl Program {
         }
     }
 
+    /// The program's ops, for a builder to reuse
+    pub fn into_ops(self) -> Vec<Op> {
+        self.ops
+    }
+
     /// Create a new program without peephole optimization.
     /// Use this for testing or when optimization is not desired.
     pub fn new_unoptimized(ops: Vec<Op>) -> Self {
@@ -628,6 +633,12 @@ impl ProgramBuilder {
         Self {
             ops: Vec::with_capacity(32),
         }
+    }
+
+    /// A builder emitting into `ops`, emptied, to reuse its capacity
+    pub fn reusing(mut ops: Vec<Op>) -> Self {
+        ops.clear();
+        Self { ops }
     }
 
     /// Emit an operation

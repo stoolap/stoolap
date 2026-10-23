@@ -134,7 +134,8 @@ pub(crate) struct AggregateSlots<'a> {
 
 /// A program over aggregate slot rows: `aliases` read a group item or
 /// aggregate from its slot by identity, `outer_columns` the outer row by name;
-/// its subqueries run as the statement's blocks when `blocks`
+/// its subqueries run as the statement's blocks when `blocks`, and `params`
+/// fold when it serves only the execution they belong to
 pub(crate) fn compile_over_slots(
     expr: &Expression,
     columns: &[String],
@@ -142,10 +143,14 @@ pub(crate) fn compile_over_slots(
     aliases: Option<&FxHashMap<ExprKey, usize>>,
     outer_columns: Option<&[String]>,
     blocks: bool,
+    params: Option<&[Value]>,
 ) -> Result<super::expression::SharedProgram> {
     let mut compile = super::expression::CompileContext::new(columns, registry);
     if blocks {
         compile = compile.with_prepared_subqueries();
+    }
+    if let Some(params) = params {
+        compile = compile.with_params(params);
     }
     if let Some(aliases) = aliases {
         compile = compile.with_expression_aliases(
@@ -178,6 +183,17 @@ pub(crate) fn slot_context<'a>(
         Some(outer) => exec.with_outer_row(outer),
         None => exec,
     }
+}
+
+/// The parameters a slot row's programs read: the `blocks`' when the
+/// statement has them, as `with_blocks` gives them, else the statement's
+fn slot_params<'a>(
+    ctx: &'a ExecutionContext,
+    blocks: Option<&'a dyn SubqueryExecutor>,
+) -> &'a [Value] {
+    blocks
+        .and_then(|blocks| blocks.params())
+        .unwrap_or(ctx.params())
 }
 
 /// `exec` with its subqueries answered by the statement's `blocks`, which
@@ -1724,6 +1740,7 @@ impl Executor {
                     Some(&slot_keys),
                     outer_columns.as_deref(),
                     blocks.is_some(),
+                    Some(slot_params(ctx, blocks)),
                 )
                 .map(Some),
                 _ => Ok(None),
@@ -1785,6 +1802,7 @@ impl Executor {
                                     None,
                                     outer.as_deref(),
                                     false,
+                                    None,
                                 )?;
                                 vm.execute_cow(&program, &slot_context(&row, &correlated_ctx))
                             });
@@ -2009,6 +2027,7 @@ impl Executor {
                 Some(&slots),
                 None,
                 false,
+                Some(ctx.params()),
             )?;
             let mut vm = ExprVM::new();
             for (id, row) in result_rows {
@@ -2883,6 +2902,7 @@ impl Executor {
                     Some(slots),
                     None,
                     false,
+                    None,
                 )?;
                 if vm.execute_bool_checked(&filter, &slot_context(&row, &correlated_ctx))? {
                     filtered_rows.push((new_id, row));
@@ -2902,6 +2922,7 @@ impl Executor {
             Some(slots),
             None,
             blocks.is_some(),
+            Some(slot_params(ctx, blocks)),
         )?;
         let mut filtered_rows = RowVec::new();
         let mut new_id = 0i64;
