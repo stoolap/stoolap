@@ -519,8 +519,10 @@ impl Program {
                     && !jump_targets.contains(&(i + 2));
 
                 if is_safe {
-                    if let (Op::LoadColumn(col_idx), Op::LoadConst(const_val)) =
-                        (&ops[i], &ops[i + 1])
+                    if let (
+                        Op::LoadColumn(col_idx) | Op::LoadAggregateResult(col_idx),
+                        Op::LoadConst(const_val),
+                    ) = (&ops[i], &ops[i + 1])
                     {
                         let fused = match &ops[i + 2] {
                             Op::Eq => Some(Op::EqColumnConst(*col_idx, const_val.clone())),
