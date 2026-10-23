@@ -74,7 +74,7 @@ Rename an entire table:
 ALTER TABLE users RENAME TO system_users;
 ```
 
-All data is accessible via the new name. The old table name is no longer valid.
+All data is accessible via the new name. The old table name is no longer valid. The new name may not be one a table or a view already holds.
 
 ## Persistence
 

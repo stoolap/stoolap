@@ -163,6 +163,30 @@ fn test_schema_change_prepares_again() {
 }
 
 #[test]
+fn test_a_table_rename_prepares_again() {
+    let _guard = serial();
+    let db = setup("prepared_rename");
+    let statement = db.prepare(S1).unwrap();
+    let run = || -> Vec<i64> {
+        statement
+            .query((1,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    assert_eq!(run(), vec![1]);
+    let built = prepared_selects_built();
+    db.execute("ALTER TABLE t RENAME TO t_moved", ()).unwrap();
+    db.execute("ALTER TABLE t_moved RENAME TO t", ()).unwrap();
+    assert_eq!(run(), vec![1]);
+    assert_eq!(
+        prepared_selects_built() - built,
+        1,
+        "a rename changes the schema the plan was prepared for"
+    );
+}
+
+#[test]
 fn test_used_columns_moved_or_retyped_prepare_again() {
     let _guard = serial();
     let db = Database::open("memory://prepared_moved").unwrap();

@@ -4497,131 +4497,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-
-        let old_name_lower = old_name.to_lowercase();
-        let new_name_lower = new_name.to_lowercase();
-
-        // Atomically check-and-rename under write lock to prevent TOCTOU race
-        {
-            let mut schemas = self.schemas.write().unwrap();
-            if !schemas.contains_key(&old_name_lower) {
-                return Err(Error::TableNotFound(old_name_lower.to_string()));
-            }
-            if schemas.contains_key(&new_name_lower) {
-                return Err(Error::TableAlreadyExists(new_name_lower.to_string()));
-            }
-            if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
-                let schema = CompactArc::make_mut(&mut schema_arc);
-                schema.table_name = new_name.to_string();
-                schema.table_name_lower = new_name_lower.clone();
-                schemas.insert(new_name_lower.clone(), schema_arc);
-            }
-        }
-
-        // Update version_stores map
-        {
-            let mut stores = self.version_stores.write().unwrap();
-            if let Some(store) = stores.remove(&old_name_lower) {
-                // Update the schema's table name within the store
-                {
-                    let mut vs_schema_guard = store.schema_mut();
-                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                    schema.table_name = new_name.to_string();
-                    schema.table_name_lower = new_name_lower.clone();
-                }
-                stores.insert(new_name_lower.clone(), store);
-            }
-        }
-
-        // Move segment manager to new name and update its manifest table_name
-        // (persist() uses manifest.table_name for the on-disk directory)
-        {
-            let mut mgrs = self.segment_managers.write().unwrap();
-            if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgrs.insert(new_name_lower.clone(), mgr);
-            }
-        }
-        // The manager takes the new name with the files: a table whose
-        // files are not moved takes it here
-        let files_to_move = (*self.persistence)
-            .as_ref()
-            .filter(|pm| pm.is_enabled())
-            .map(|pm| pm.path().join("volumes").join(&old_name_lower))
-            .is_some_and(|old_dir| old_dir.exists());
-        if !files_to_move {
-            if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
-                mgr.rename(new_name_lower.as_str());
-            }
-        }
-        // Rename on-disk volume directory and tombstones so they survive restart
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                let vol_dir = pm.path().join("volumes");
-                let old_dir = vol_dir.join(&old_name_lower);
-                let new_dir = vol_dir.join(&new_name_lower);
-                if old_dir.exists() {
-                    // The directory moves and every holder of a file in it
-                    // moves with it, under the manager's reload lock, the
-                    // name changing only once the move succeeded
-                    let move_dir = || {
-                        crate::storage::volume::writer::VolumeFile::relocate(
-                            &old_dir,
-                            &new_dir,
-                            || std::fs::rename(&old_dir, &new_dir),
-                        )
-                    };
-                    let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
-                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
-                        None => move_dir(),
-                    };
-                    if let Err(e) = moved {
-                        // Revert in-memory segment manager rename on disk failure
-                        let mut mgrs = self.segment_managers.write().unwrap();
-                        if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                            mgrs.insert(old_name_lower.clone(), mgr);
-                        }
-                        drop(mgrs);
-                        // Revert version stores
-                        let mut stores = self.version_stores.write().unwrap();
-                        if let Some(store) = stores.remove(&new_name_lower) {
-                            {
-                                let mut vs_schema_guard = store.schema_mut();
-                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                                schema.table_name = old_name.to_string();
-                                schema.table_name_lower = old_name_lower.clone();
-                            }
-                            stores.insert(old_name_lower.clone(), store);
-                        }
-                        drop(stores);
-                        // Revert schemas
-                        let mut schemas = self.schemas.write().unwrap();
-                        if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
-                            let schema = CompactArc::make_mut(&mut schema_arc);
-                            schema.table_name = old_name.to_string();
-                            schema.table_name_lower = old_name_lower.clone();
-                            schemas.insert(old_name_lower, schema_arc);
-                        }
-                        drop(schemas);
-                        return Err(Error::Internal {
-                            message: format!("Failed to rename volume directory: {}", e),
-                        });
-                    }
-                }
-                let snap_dir = pm.path().join("snapshots");
-                let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
-                let new_ts_dir = snap_dir.join(&new_name_lower);
-                let new_ts = new_ts_dir.join("tombstones.dat");
-                if old_ts.exists() {
-                    let _ = std::fs::create_dir_all(&new_ts_dir);
-                    let _ = std::fs::rename(&old_ts, &new_ts);
-                }
-            }
-        }
-
-        // Increment schema epoch for cache invalidation
-        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
-
-        Ok(())
+        EngineOperations::new(self).rename_table(old_name, new_name)
     }
 
     /// Validates a schema
@@ -9563,6 +9439,9 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
         }
+
+        // Increment schema epoch for cache invalidation
+        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
