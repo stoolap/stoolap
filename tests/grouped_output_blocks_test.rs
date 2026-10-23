@@ -502,6 +502,32 @@ fn a_having_name_reads_the_alias_the_grouped_path_reads() {
     let want = rows(&db, &sql.replace(" FROM v", " FROM (SELECT * FROM v) v"));
     assert_eq!(rows(&db, sql), want, "{sql}");
     assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    // A name inside a group item or an aggregate's argument is not an alias
+    db.execute(
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO w VALUES (1, 1, 2)", ()).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT SUM(a) AS b FROM w HAVING SUM(b) > (SELECT 0)",
+            "Integer(1)",
+        ),
+        (
+            "SELECT a + 1 AS a FROM w GROUP BY a + 1 HAVING a + 1 = (SELECT 2)",
+            "Integer(2)",
+        ),
+    ] {
+        let general = rows(&db, &sql.replace(" FROM w", " FROM (SELECT * FROM w) w"));
+        assert_eq!(
+            general,
+            Ok(vec![want.to_string()]),
+            "{sql}: the general path"
+        );
+        assert_eq!(rows(&db, sql), general, "{sql}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
     // A subquery that groups reads its own HAVING's aliases the same way
     let sql = "SELECT id FROM u WHERE EXISTS (SELECT t.a AS k, t.b AS k FROM t \
                WHERE t.a = u.x GROUP BY t.a, t.b HAVING k = 1) ORDER BY id";

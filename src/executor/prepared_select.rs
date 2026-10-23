@@ -549,6 +549,7 @@ impl Executor {
             executor: self,
             ctx,
             tables: RefCell::new(SmallVec::new()),
+            statement_table: std::cell::Cell::new(None),
         };
         let mut found = false;
         for column in &stmt.columns {
@@ -1265,18 +1266,26 @@ fn grouped_having(
             _ => None,
         })
     };
+    // A group item or aggregate is read from its slot whole, and an
+    // aggregate's arguments read the input row, as the grouped compile reads them
+    let bound = |expr: &Expression| match expr {
+        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => true,
+        _ => slots.contains_key(&ExprKey::of(expr)),
+    };
     fn open<'s>(
         expr: &Expression,
         aliased: &impl Fn(&str) -> Option<&'s Expression>,
+        bound: &impl Fn(&Expression) -> bool,
     ) -> Result<Expression> {
         match expr {
             Expression::Identifier(id) => Ok(aliased(&id.value_lower)
                 .cloned()
                 .unwrap_or_else(|| expr.clone())),
-            other => rebuild(other, &mut |child| open(child, aliased)),
+            _ if bound(expr) => Ok(expr.clone()),
+            other => rebuild(other, &mut |child| open(child, aliased, bound)),
         }
     }
-    open(having, &aliased)
+    open(having, &aliased, &bound)
 }
 
 /// Whether a bare name outside any subquery of `expr` passes `matches`
