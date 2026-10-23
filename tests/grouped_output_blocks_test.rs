@@ -606,6 +606,30 @@ fn two_anonymous_parameters_in_grouped_items_stay_two() {
 }
 
 #[test]
+fn a_grouped_item_named_by_alias_or_position_is_read_wherever_it_is_written() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_named_item").unwrap();
+    fill(&db);
+    for (sql, literal) in [
+        (
+            "SELECT a + (SELECT 1) AS g, COUNT(*) FROM t GROUP BY g \
+             HAVING a + (SELECT 1) > 3 ORDER BY 1",
+            "SELECT a + 1 AS g, COUNT(*) FROM t GROUP BY g HAVING a + 1 > 3 ORDER BY 1",
+        ),
+        (
+            "SELECT a + (SELECT 1), COUNT(*), (a + (SELECT 1)) * 2 FROM t GROUP BY 1 \
+             HAVING a + (SELECT 1) > 3 ORDER BY 1",
+            "SELECT a + 1, COUNT(*), (a + 1) * 2 FROM t GROUP BY 1 HAVING a + 1 > 3 ORDER BY 1",
+        ),
+    ] {
+        let got = rows(&db, sql);
+        assert!(got.as_ref().is_ok_and(|rows| !rows.is_empty()), "{sql}: {got:?}");
+        assert_eq!(got, rows(&db, literal), "{sql}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+}
+
+#[test]
 fn a_where_naming_a_select_alias_reads_that_item() {
     let _guard = serial();
     let db = Database::open("memory://grouped_input_blocks_where_alias").unwrap();

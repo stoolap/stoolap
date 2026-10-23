@@ -3397,9 +3397,22 @@ impl PreparedGrouped {
                 keys[key] = true;
             }
         }
-        // A GROUP BY expression holding a subquery is rewritten where it is
-        // written; a SELECT item or HAVING reads the first of one identity
+        // A grouped SELECT item or GROUP BY expression holding a subquery is
+        // rewritten where it is written; a SELECT item or HAVING written as
+        // one reads the first of that identity
         let mut items = FxHashMap::default();
+        let mut grouped = vec![None; stmt.columns.len()];
+        for ((column, &key), slot) in stmt.columns.iter().zip(&keys).zip(&mut grouped) {
+            if key {
+                let item = unaliased(column);
+                let rewritten =
+                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, item)?;
+                items
+                    .entry(ExprKey::of(item))
+                    .or_insert_with(|| rewritten.clone());
+                *slot = Some(rewritten);
+            }
+        }
         let mut group_by = Vec::with_capacity(stmt.group_by.columns.len());
         for item in &stmt.group_by.columns {
             if !mentions_subquery(item) {
@@ -3412,11 +3425,11 @@ impl PreparedGrouped {
                 .or_insert_with(|| rewritten.clone());
             group_by.push(rewritten);
         }
-        // An item the GROUP BY names is read for each input row, any other
-        // for each group
-        let mut output = |expr: &Expression, key: bool| -> Result<Expression> {
-            if key {
-                return input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr);
+        // An item the GROUP BY names is read for each input row, as rewritten
+        // above; any other for each group
+        let mut output = |expr: &Expression, key: Option<&Expression>| -> Result<Expression> {
+            if let Some(rewritten) = key {
+                return Ok(rewritten.clone());
             }
             let read = read_inputs(expr, &items, &mut |call| {
                 input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
@@ -3425,7 +3438,8 @@ impl PreparedGrouped {
         };
         // An item holding a subquery keeps the name it is written under
         let mut columns = Vec::with_capacity(stmt.columns.len());
-        for (column, &key) in stmt.columns.iter().zip(&keys) {
+        for (column, key) in stmt.columns.iter().zip(&grouped) {
+            let key = key.as_ref();
             columns.push(match column {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
@@ -3447,7 +3461,7 @@ impl PreparedGrouped {
             });
         }
         let having = match (&opened_having, stmt.having.as_deref()) {
-            (Some(opened), _) => Some(Box::new(output(opened, false)?)),
+            (Some(opened), _) => Some(Box::new(output(opened, None)?)),
             (None, other) => other.map(|having| Box::new(having.clone())),
         };
         let blocks_read = builder.subqueries.len();
