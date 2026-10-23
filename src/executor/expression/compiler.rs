@@ -519,7 +519,9 @@ impl<'a> ExprCompiler<'a> {
                 ExecuteContext::new(empty_row).with_params(self.ctx.params.unwrap_or(&[]));
             FOLD_VM.with(|vm_cell| {
                 let mut vm = vm_cell.borrow_mut();
-                vm.execute(&program, &exec_ctx).ok()
+                let value = vm.execute(&program, &exec_ctx).ok();
+                vm.release_values();
+                value
             })
         });
         let mut spent = program.into_ops();

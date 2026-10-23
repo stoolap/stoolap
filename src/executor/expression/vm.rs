@@ -285,6 +285,17 @@ impl ExprVM {
         }
     }
 
+    /// Drop every value a run left behind, its stack, arguments and cached
+    /// patterns, keeping the buffers' capacity
+    pub(crate) fn release_values(&mut self) {
+        self.stack.clear();
+        self.args_buffer.clear();
+        self.cached_like = None;
+        self.cached_glob = None;
+        self.cached_regexp = None;
+        self.bool_error = None;
+    }
+
     /// Execute a program and return the result
     #[inline]
     /// Match a runtime pattern, caching the compiled form per (pattern, case, escape).
@@ -5487,5 +5498,25 @@ mod tests {
                 "{op:?}: a subquery without its prepared plan is an error"
             );
         }
+    }
+
+    #[test]
+    fn released_values_leave_nothing_of_the_run_behind() {
+        let statements =
+            crate::parser::parse_sql("SELECT * FROM t WHERE POSITION('x', c) > 0").unwrap();
+        let crate::parser::ast::Statement::Select(select) = &statements[0] else {
+            panic!("not a SELECT");
+        };
+        let columns = ["c".to_string()];
+        let ctx = super::super::compiler::CompileContext::with_global_registry(&columns);
+        let program = super::super::compiler::ExprCompiler::new(&ctx)
+            .compile(select.where_clause.as_deref().unwrap())
+            .unwrap();
+        let row = Row::from_values(vec![Value::text("y".repeat(4096))]);
+        let mut vm = ExprVM::new();
+        vm.execute(&program, &ExecuteContext::new(&row)).unwrap();
+        assert!(!vm.args_buffer.is_empty(), "a call keeps its arguments");
+        vm.release_values();
+        assert!(vm.args_buffer.is_empty() && vm.stack.is_empty());
     }
 }
