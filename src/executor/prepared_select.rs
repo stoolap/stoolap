@@ -4871,9 +4871,9 @@ impl<'a> DmlRunner<'a> {
     }
 }
 
-/// The conjuncts of a block's `where_clause` comparing a column of its table
-/// function `name` with a value that reads no column: they narrow the range
-/// it generates, as a statement's WHERE narrows its own
+/// The conjuncts of a block's `where_clause` that read no column, or compare
+/// a column of its table function `name` with a value that reads none: they
+/// narrow the range it generates, or skip it, as a statement's WHERE does
 fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<Expression>> {
     let own = |expr: &Expression| match expr {
         Expression::Identifier(_) => true,
@@ -4884,18 +4884,21 @@ fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<E
     conjuncts(where_clause?, &mut parts);
     let range = parts
         .into_iter()
-        .filter(|part| match part {
-            Expression::Infix(infix) => {
-                (own(&infix.left) && !mentions_column(&infix.right))
-                    || (own(&infix.right) && !mentions_column(&infix.left))
-            }
-            Expression::Between(between) => {
-                !between.not
-                    && own(&between.expr)
-                    && !mentions_column(&between.lower)
-                    && !mentions_column(&between.upper)
-            }
-            _ => false,
+        .filter(|part| {
+            !mentions_column(part)
+                || match part {
+                    Expression::Infix(infix) => {
+                        (own(&infix.left) && !mentions_column(&infix.right))
+                            || (own(&infix.right) && !mentions_column(&infix.left))
+                    }
+                    Expression::Between(between) => {
+                        !between.not
+                            && own(&between.expr)
+                            && !mentions_column(&between.lower)
+                            && !mentions_column(&between.upper)
+                    }
+                    _ => false,
+                }
         })
         .cloned()
         .collect();
@@ -5303,12 +5306,28 @@ impl Executor {
                     _ => None,
                 });
             let mut first = FirstReads::new();
+            let mut snapshot = None;
             let prepared = match held {
                 Some(prepared) => prepared,
                 None => {
+                    // A block reading the target opens under a snapshot: taken
+                    // first, so a view read while preparing is read under it
+                    let snapshot_ctx;
+                    let prepare_ctx = match through {
+                        Some(_) if conflict.is_some() || returning.is_some() => {
+                            let taken = self.new_statement_snapshot(
+                                self.isolation_level(),
+                                inner_ctx.statement_view(),
+                            )?;
+                            snapshot_ctx = ctx.with_statement_snapshot(taken.clone());
+                            snapshot = Some(taken);
+                            &snapshot_ctx
+                        }
+                        _ => ctx,
+                    };
                     let prepared = Arc::new(PreparedDml::prepare(
                         self,
-                        ctx,
+                        prepare_ctx,
                         schema,
                         scope_name,
                         where_clause,
@@ -5344,20 +5363,19 @@ impl Executor {
                 || prepared.returning.as_ref().is_some_and(|r| r.reads_target);
             let snapshot_ctx = match through {
                 Some(_) if reads_target => {
-                    let snapshot = self.new_statement_snapshot(
-                        self.isolation_level(),
-                        inner_ctx.statement_view(),
-                    )?;
+                    let snapshot = match snapshot {
+                        Some(snapshot) => snapshot,
+                        None => self.new_statement_snapshot(
+                            self.isolation_level(),
+                            inner_ctx.statement_view(),
+                        )?,
+                    };
                     Some(inner_ctx.with_statement_snapshot(snapshot))
                 }
                 _ => None,
             };
             let block_ctx = snapshot_ctx.as_ref().unwrap_or(&inner_ctx);
             let through = through.filter(|_| snapshot_ctx.is_none());
-            // Rows read under a snapshot other than the blocks' are read again
-            if snapshot_ctx.is_some() {
-                first.clear();
-            }
             if let Some(tables) =
                 PreparedRunner::open_tables(self, &prepared.blocks, block_ctx, through, &first)?
             {

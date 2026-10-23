@@ -2503,6 +2503,16 @@ fn test_a_block_s_table_function_generates_only_the_range_its_where_allows() {
     let before = tvf_rows();
     assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6]);
     assert_eq!(tvf_rows() - before, 2, "the rows below 3, of ten million");
+    for none in ["FALSE", "NULL", "1 = 0"] {
+        let sql = format!(
+            "SELECT id FROM t WHERE EXISTS \
+             (SELECT 1 FROM generate_series(1, 10000001) AS s(n) WHERE {none})"
+        );
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{none}");
+        let before = tvf_rows();
+        assert_eq!(ids(&db, &sql, ()).0, Vec::<i64>::new(), "{none}");
+        assert_eq!(tvf_rows() - before, 0, "WHERE {none} generates nothing");
+    }
     const OUTER: &str = "SELECT id FROM t WHERE \
                          (SELECT COUNT(*) FROM generate_series(1, 10) AS s(a) WHERE t.a = 10) = 10 ORDER BY id";
     assert_eq!(prepared_line(&db, OUTER), "Prepared: yes");
@@ -2531,4 +2541,31 @@ fn test_a_block_s_view_runs_once_in_the_run_that_prepares_it() {
         );
     }
     assert_eq!(prepared_selects_built() - built, 1);
+}
+
+#[test]
+fn test_a_returning_block_s_view_over_the_target_runs_once_in_the_run_that_prepares_it() {
+    let _guard = serial();
+    let db = setup("prepared_returning_view_once");
+    db.execute(
+        "CREATE VIEW rv AS SELECT id, RANDOM() AS n FROM t WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    const SQL: &str =
+        "UPDATE t SET b = 11 WHERE id = 1 RETURNING id, (SELECT rv.n FROM rv WHERE rv.id = t.id)";
+    for run in ["prepares", "keeps its plan"] {
+        let before = random_draws();
+        let found: Vec<i64> = db
+            .query(SQL, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(found, vec![1], "{run}");
+        assert_eq!(
+            random_draws() - before,
+            1,
+            "the run that {run} reads the view once"
+        );
+    }
 }
