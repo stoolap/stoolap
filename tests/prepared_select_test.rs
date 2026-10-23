@@ -21,7 +21,7 @@ use std::sync::{Mutex, MutexGuard};
 use stoolap::test_failpoints::{
     after_prepared_plan_taken, after_select_table_opened, before_prepared_scalar,
     general_path_hits, prepared_projection_runs, prepared_scalar_runs, prepared_selects_built,
-    random_draws, GeneralPath,
+    random_draws, tvf_rows, GeneralPath,
 };
 use stoolap::{Database, Params};
 
@@ -2348,4 +2348,40 @@ fn test_a_cte_reads_the_ctes_and_views_around_it() {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
         assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
     }
+}
+
+#[test]
+fn test_a_table_function_runs_prepared_over_its_rows() {
+    let _guard = serial();
+    let db = setup("prepared_tvf");
+    const SERIES: &str = "SELECT s.id FROM generate_series(1, $1) AS s(id) \
+                          WHERE s.id * 10 > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    assert_eq!(prepared_line(&db, SERIES), "Prepared: yes");
+    let built = prepared_selects_built();
+    let general = general_hits();
+    for (stop, want) in [(6, vec![1, 6]), (3, vec![1]), (6, vec![1, 6])] {
+        let (found, runs) = ids(&db, SERIES, (stop,));
+        assert_eq!(found, want, "generate_series(1, {stop})");
+        assert_eq!(runs, stop as usize, "the block runs once per generated row");
+    }
+    assert_eq!(
+        prepared_selects_built() - built,
+        1,
+        "prepared once across three runs"
+    );
+    assert_eq!(general_hits(), general, "no general path ran");
+    let columns = db.query(SERIES, (6,)).unwrap().columns().to_vec();
+    assert_eq!(columns, vec!["id".to_string()], "the column's name");
+}
+
+#[test]
+fn test_a_table_function_generates_only_the_range_its_where_allows() {
+    let _guard = serial();
+    let db = setup("prepared_tvf_range");
+    const SERIES: &str = "SELECT s.id FROM generate_series(1, 1000000) AS s(id) \
+                          WHERE s.id < 4 AND s.id IN (SELECT id FROM u) ORDER BY s.id";
+    assert_eq!(prepared_line(&db, SERIES), "Prepared: yes");
+    let before = tvf_rows();
+    assert_eq!(ids(&db, SERIES, ()).0, vec![1, 2, 3]);
+    assert_eq!(tvf_rows() - before, 3, "the rows below 4, of a million");
 }

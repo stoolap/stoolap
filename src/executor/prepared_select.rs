@@ -105,9 +105,9 @@ impl<'a> Family<'a> {
         Ok(())
     }
 
-    /// The statement's FROM: one table, view or CTE, a derived table, or a
-    /// VALUES list; the statement of a view, a CTE or a derived table runs as
-    /// any statement does
+    /// The statement's FROM: one table, view or CTE, a derived table, a
+    /// VALUES list or a table function; the statement of a view, a CTE or a
+    /// derived table runs as any statement does
     fn statement_from(
         &self,
         table_expr: Option<&'a Expression>,
@@ -117,6 +117,12 @@ impl<'a> Family<'a> {
             Some(Expression::ValuesSource(values)) => {
                 match values.rows.iter().flatten().any(Executor::has_subqueries) {
                     true => Err("a VALUES row holding a subquery"),
+                    false => Ok(()),
+                }
+            }
+            Some(Expression::FunctionTableSource(function)) => {
+                match function.arguments.iter().any(Executor::has_subqueries) {
+                    true => Err("a table function argument holding a subquery"),
                     false => Ok(()),
                 }
             }
@@ -4898,6 +4904,17 @@ impl Executor {
                     .as_ref()
                     .map_or(&unnamed, |alias| &alias.value_lower),
             ),
+            Some(Expression::FunctionTableSource(function)) => {
+                let (rows, columns) =
+                    Self::tvf_rows(function, stmt.where_clause.as_deref(), None, ctx)?;
+                (
+                    StatementSource::Rows(columns, rows),
+                    function
+                        .alias
+                        .as_ref()
+                        .map_or(&function.function.value_lower, |alias| &alias.value_lower),
+                )
+            }
             _ => return Err(Error::internal("a prepared statement without one table")),
         };
         let table_columns;
