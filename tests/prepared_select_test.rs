@@ -2257,3 +2257,50 @@ fn test_a_values_row_holding_a_subquery_is_not_prepared() {
         "Prepared: no (a VALUES row holding a subquery)"
     );
 }
+
+#[test]
+fn test_a_cte_runs_prepared_over_its_rows_and_keeps_its_plan() {
+    let _guard = serial();
+    let db = setup("prepared_cte");
+    const WHERE: &str =
+        "SELECT s.id FROM s WHERE s.b = $1 AND s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    for (cte, with) in [
+        (
+            "materialized",
+            "WITH s(id, a, b) AS (SELECT id, a, b FROM t) ",
+        ),
+        ("inlined", "WITH s AS (SELECT id, a, b FROM t) "),
+    ] {
+        let sql = format!("{with}{WHERE}");
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{cte}");
+        let built = prepared_selects_built();
+        let general = general_hits();
+        for (param, want) in [(1, vec![1]), (2, vec![6]), (1, vec![1])] {
+            let (found, runs) = ids(&db, &sql, (param,));
+            assert_eq!(found, want, "{cte}: b = {param}");
+            assert_eq!(runs, 3, "{cte}: b = {param} runs once per CTE row");
+        }
+        assert_eq!(
+            prepared_selects_built() - built,
+            1,
+            "{cte}: prepared once across three runs"
+        );
+        assert_eq!(general_hits(), general, "{cte}: no general path ran");
+        let columns = db.query(&sql, (1,)).unwrap().columns().to_vec();
+        assert_eq!(columns, vec!["id".to_string()], "{cte}: the column's name");
+    }
+}
+
+#[test]
+fn test_a_block_reading_a_cte_is_not_prepared() {
+    let _guard = serial();
+    let db = setup("prepared_cte_block");
+    assert_eq!(
+        prepared_line(
+            &db,
+            "WITH s AS (SELECT id, a FROM t) SELECT x.id FROM s AS x \
+             WHERE x.a > (SELECT MIN(a) FROM s)"
+        ),
+        "Prepared: no (FROM names a CTE)"
+    );
+}
