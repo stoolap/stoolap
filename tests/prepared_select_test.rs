@@ -2569,3 +2569,53 @@ fn test_a_returning_block_s_view_over_the_target_runs_once_in_the_run_that_prepa
         );
     }
 }
+
+/// Two rows in a column named `n`
+struct NamedRows;
+
+impl stoolap::functions::tvf::TableValuedFunction for NamedRows {
+    fn name(&self) -> &str {
+        "NAMED_ROWS"
+    }
+    fn column_names(&self) -> Vec<String> {
+        vec!["n".to_string()]
+    }
+    fn generate(
+        &self,
+        _args: &[stoolap::core::Value],
+        _limit: Option<usize>,
+    ) -> stoolap::core::Result<stoolap::core::RowVec> {
+        let mut rows = stoolap::core::RowVec::new();
+        for n in [1i64, 2] {
+            rows.push((n, stoolap::core::Row::from_values(vec![n.into()])));
+        }
+        Ok(rows)
+    }
+}
+
+#[test]
+fn test_a_table_function_generating_nothing_keeps_its_column_names() {
+    let _guard = serial();
+    stoolap::functions::global_registry()
+        .register_tvf("NAMED_ROWS", std::sync::Arc::new(|| Box::new(NamedRows)));
+    let db = setup("prepared_tvf_named_columns");
+    for (sql, want) in [
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM named_rows() WHERE FALSE)",
+            vec![],
+        ),
+        (
+            "SELECT id FROM t WHERE id IN (SELECT n FROM named_rows() WHERE n > 1)",
+            vec![2],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+    }
+    let columns = db
+        .query("SELECT * FROM named_rows() WHERE FALSE", ())
+        .unwrap()
+        .columns()
+        .to_vec();
+    assert_eq!(columns, vec!["n".to_string()]);
+}

@@ -2264,16 +2264,7 @@ impl Executor {
         // skip TVF generation entirely and return empty result.
         if let Some(where_clause) = where_clause {
             if true_for_no_row(where_clause, ctx) {
-                let columns = if !tvf_source.column_aliases.is_empty() {
-                    tvf_source
-                        .column_aliases
-                        .iter()
-                        .map(|id| id.value.to_string())
-                        .collect()
-                } else {
-                    vec!["value".to_string()]
-                };
-                return Ok((RowVec::new(), columns));
+                return Ok((RowVec::new(), Self::tvf_columns(tvf_source)?));
             }
         }
 
