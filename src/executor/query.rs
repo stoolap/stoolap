@@ -8678,14 +8678,21 @@ impl Executor {
         let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
             return Err(Error::internal("a grouped statement without its table"));
         };
-        self.execute_simple_table_scan(
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::grouped_table_opening();
+        let mut read = None;
+        let result = self.execute_simple_table_scan(
             table_source,
             &held.stmt,
             ctx,
             &held.classification,
-            None,
+            Some(&mut read),
             Some(&run),
-        )
+        );
+        if let Some((_, schema)) = &read {
+            held.table_fits(schema)?;
+        }
+        result
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
@@ -12628,6 +12635,13 @@ impl Executor {
                 left: Box::new(Self::substitute_aliases(&in_expr.left, alias_map)),
                 right: Box::new(Self::substitute_aliases(&in_expr.right, alias_map)),
                 not: in_expr.not,
+            }),
+            Expression::AllAny(all_any) => Expression::AllAny(AllAnyExpression {
+                token: all_any.token.clone(),
+                left: Box::new(Self::substitute_aliases(&all_any.left, alias_map)),
+                operator: all_any.operator.clone(),
+                all_any_type: all_any.all_any_type,
+                subquery: all_any.subquery.clone(),
             }),
             Expression::FunctionCall(func) => Expression::FunctionCall(Box::new(FunctionCall {
                 token: func.token.clone(),

@@ -530,8 +530,30 @@ impl Executor {
             return Err("a statement that does not group");
         }
         let held = |expr: Option<&Expression>| expr.is_some_and(mentions_subquery);
+        // A GROUP BY item naming a SELECT alias or position groups that item
+        let grouped_item = |item: &Expression| match item {
+            Expression::Identifier(id) => stmt.columns.iter().find_map(|column| match column {
+                Expression::Aliased(aliased)
+                    if aliased.alias.value_lower == id.value_lower
+                        && !expression_contains_aggregate(&aliased.expression) =>
+                {
+                    Some(&*aliased.expression)
+                }
+                _ => None,
+            }),
+            Expression::IntegerLiteral(position) => usize::try_from(position.value)
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .and_then(|position| stmt.columns.get(position))
+                .map(unaliased),
+            _ => None,
+        };
         if held(stmt.where_clause.as_deref())
-            || stmt.group_by.columns.iter().any(|item| held(Some(item)))
+            || stmt
+                .group_by
+                .columns
+                .iter()
+                .any(|item| held(Some(item)) || held(grouped_item(item)))
             || stmt.order_by.iter().any(|ob| held(Some(&ob.expression)))
         {
             return Err("a WHERE, GROUP BY or ORDER BY holding a subquery");
@@ -2065,61 +2087,33 @@ impl Builder<'_> {
         }
     }
 
-    /// `expr`, rewritten for the statement's row, with each value in it that
-    /// holds a block and reads neither the row nor a group a run slot
+    /// `expr`, rewritten for the statement's row, with each uncorrelated
+    /// block it reads for a value or an existence test a run slot
     fn slotted(
         &mut self,
         expr: &Expression,
         run_slots: &mut Vec<(usize, Expression)>,
     ) -> Result<Expression> {
-        if mentions_subquery(expr)
-            && self.reads_once(expr)
-            && !volatile(expr, &self.executor.function_registry)
-        {
-            let slot = self.slot();
-            run_slots.push((slot, expr.clone()));
-            return Ok(slot_parameter(slot));
-        }
-        match expr {
-            Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(expr.clone()),
-            other => rebuild(other, &mut |child| self.slotted(child, run_slots)),
-        }
-    }
-
-    /// Whether `expr`, rewritten for the statement's row, reads none of its
-    /// columns and no aggregate of its groups: every block it holds reads no
-    /// enclosing scope
-    fn reads_once(&self, expr: &Expression) -> bool {
-        let once = |id: Option<u16>, members: bool| {
-            id.and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
-                .is_some_and(|sq| {
-                    sq.uncorrelated
-                        && sq.parent.is_none()
-                        && matches!(sq.answer, Answer::Members(..)) == members
-                })
+        let block = match expr {
+            Expression::ScalarSubquery(sq) => sq.subquery.prepared,
+            Expression::Exists(exists) => exists.subquery.prepared,
+            _ => None,
         };
-        match expr {
-            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => false,
-            Expression::FunctionCall(call) if is_aggregate_function(&call.function) => false,
-            Expression::ScalarSubquery(sq) => once(sq.subquery.prepared, false),
-            Expression::Exists(exists) => once(exists.subquery.prepared, false),
-            Expression::In(in_expr) if matches!(*in_expr.right, Expression::ScalarSubquery(_)) => {
-                let Expression::ScalarSubquery(sq) = &*in_expr.right else {
-                    return false;
-                };
-                once(sq.subquery.prepared, true) && self.reads_once(&in_expr.left)
+        let once = block
+            .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
+            .is_some_and(|sq| {
+                sq.uncorrelated
+                    && sq.parent.is_none()
+                    && matches!(sq.answer, Answer::Value(..) | Answer::Exists(_))
+            });
+        match (block, once) {
+            (Some(_), true) => {
+                let slot = self.slot();
+                run_slots.push((slot, expr.clone()));
+                Ok(slot_parameter(slot))
             }
-            Expression::AllAny(all_any) => {
-                once(all_any.subquery.prepared, true) && self.reads_once(&all_any.left)
-            }
-            other => {
-                let mut reads = true;
-                let _ = for_each_child(other, &mut |child| {
-                    reads &= self.reads_once(child);
-                    Ok(())
-                });
-                reads
-            }
+            (Some(_), false) => Ok(expr.clone()),
+            (None, _) => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
         }
     }
 
@@ -3194,6 +3188,8 @@ impl PreparedSelect {
 #[derive(Debug)]
 pub struct PreparedGrouped {
     cached_epoch: u64,
+    /// The table's schema the clauses were prepared over
+    schema: CompactArc<Schema>,
     blocks: PreparedBlocks,
     /// Each block's holes, read from the GROUP BY items of its group's row
     holes: HoleSet,
@@ -3212,12 +3208,12 @@ impl PreparedGrouped {
     fn prepare(
         executor: &Executor,
         stmt: &SelectStatement,
-        schema: &Schema,
+        schema: CompactArc<Schema>,
         scope_name: &SmartString,
         param_count: usize,
         epoch: u64,
     ) -> Result<Option<Self>> {
-        let scope = ScopeTable::of(scope_name.clone(), schema);
+        let scope = ScopeTable::of(scope_name.clone(), &schema);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -3256,7 +3252,10 @@ impl PreparedGrouped {
             });
         }
         let having = match stmt.having.as_deref() {
-            Some(having) if mentions_subquery(having) => Some(Box::new(rewrite(having)?)),
+            Some(having) if mentions_subquery(having) => {
+                let opened = with_aliases(having, &stmt.columns, &scope.columns);
+                Some(Box::new(rewrite(&opened)?))
+            }
             other => other.map(|having| Box::new(having.clone())),
         };
         let blocks_read = builder.subqueries.len();
@@ -3331,6 +3330,7 @@ impl PreparedGrouped {
         .then(|| RwLock::new(CompiledExecution::Unknown));
         Ok(Some(Self {
             cached_epoch: epoch,
+            schema,
             blocks,
             holes: HoleSet { holes },
             ahead,
@@ -3338,6 +3338,17 @@ impl PreparedGrouped {
             stmt,
             runs_alone,
         }))
+    }
+
+    /// SchemaChanged when `schema`, which the table's rows were read with,
+    /// does not hold the columns the clauses were prepared over
+    pub(crate) fn table_fits(&self, schema: &CompactArc<Schema>) -> Result<()> {
+        if CompactArc::ptr_eq(&self.schema, schema) || self.schema.columns == schema.columns {
+            return Ok(());
+        }
+        Err(Error::SchemaChanged {
+            table: schema.table_name.clone(),
+        })
     }
 }
 
@@ -3376,7 +3387,7 @@ impl Executor {
         let Some(prepared) = PreparedGrouped::prepare(
             self,
             stmt,
-            table.schema(),
+            table.schema_arc(),
             scope_name,
             ctx.params().len(),
             epoch,

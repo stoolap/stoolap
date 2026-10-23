@@ -19,10 +19,13 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    aggregate_paths_taken, general_path_hits, reset_aggregate_paths, GeneralPath,
+    aggregate_paths_taken, before_grouped_table_opened, general_path_hits, reset_aggregate_paths,
+    GeneralPath,
 };
 use stoolap::Database;
 
@@ -89,6 +92,14 @@ const CASES: &[(&str, Option<&str>)] = &[
         None,
     ),
     (
+        "SELECT a, SUM(b) > ANY (SELECT u.k * 12 FROM u WHERE u.x = t.a) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) FROM t GROUP BY a HAVING COUNT(*) IN (SELECT u.k * 2 + 2 FROM u) ORDER BY a",
+        None,
+    ),
+    (
         "SELECT a, b, (SELECT COUNT(*) FROM u WHERE u.k = t.a AND u.x = t.b) FROM t \
          GROUP BY a, b ORDER BY a, b",
         None,
@@ -104,6 +115,16 @@ const CASES: &[(&str, Option<&str>)] = &[
     ),
     (
         "SELECT a, SUM(b) FROM t GROUP BY a HAVING a IN (SELECT u.k FROM u WHERE u.x > 3) ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a AS g, COUNT(*) FROM t GROUP BY a HAVING g IN (SELECT u.k FROM u WHERE u.x > 3) \
+         ORDER BY g",
+        None,
+    ),
+    (
+        "SELECT a AS g, SUM(b) FROM t GROUP BY a HAVING g > ANY (SELECT u.k FROM u WHERE u.x = t.a) \
+         ORDER BY g",
         None,
     ),
     (
@@ -290,6 +311,21 @@ fn an_uncorrelated_grouped_subquery_is_read_before_any_group() {
 }
 
 #[test]
+fn a_value_around_an_uncorrelated_grouped_subquery_is_computed_only_for_a_group() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_around").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a, 9223372036854775807 + (SELECT 1) FROM t WHERE a < 0 GROUP BY a",
+        "SELECT a FROM t WHERE a < 0 GROUP BY a HAVING 9223372036854775807 + (SELECT 1) > 0",
+    ] {
+        assert_eq!(rows(&db, sql), Ok(Vec::new()), "{sql}");
+        assert_eq!(rows(&db, &general(sql)), Ok(Vec::new()), "{sql}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+}
+
+#[test]
 fn a_correlated_grouped_subquery_raises_its_error_for_the_group_that_reaches_it() {
     let _guard = serial();
     let db = Database::open("memory://grouped_output_blocks_errors").unwrap();
@@ -374,4 +410,70 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn a_grouped_statement_keyed_by_an_item_holding_a_subquery_stays_outside_the_blocks() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_keyed").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a IN (SELECT u.k FROM u WHERE u.k < 4) AS g, COUNT(*) FROM t GROUP BY g",
+        "SELECT a IN (SELECT u.k FROM u WHERE u.k < 4), COUNT(*) FROM t GROUP BY 1",
+    ] {
+        assert_eq!(
+            prepared_line(&db, sql),
+            "Prepared: no (a WHERE, GROUP BY or ORDER BY holding a subquery)",
+            "{sql}"
+        );
+        let sorted = |sql: &str| {
+            rows(&db, sql).map(|mut rows| {
+                rows.sort();
+                rows
+            })
+        };
+        let got = sorted(sql);
+        assert!(
+            got.as_ref().is_ok_and(|rows| rows.len() == 2) && got == sorted(&general(sql)),
+            "{sql}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn a_table_whose_columns_changed_after_preparing_raises_schema_changed() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_retype").unwrap();
+    for setup in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a TEXT)",
+        "INSERT INTO t VALUES (1, 1)",
+        "INSERT INTO u VALUES (1, '01')",
+    ] {
+        db.execute(setup, ()).unwrap();
+    }
+    let sql = "SELECT k, k IN (SELECT u.a FROM u) FROM t GROUP BY k";
+    // Twice, so the second run reads the plan the first one held
+    for _ in 0..2 {
+        assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: prepared");
+    }
+    let writer = db.clone();
+    let done = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&done);
+    before_grouped_table_opened(move || {
+        writer
+            .execute("ALTER TABLE t MODIFY COLUMN k TEXT", ())
+            .unwrap();
+        flag.set(true);
+    });
+    let got = rows(&db, sql);
+    assert!(
+        done.get(),
+        "{sql}: the columns changed inside the statement"
+    );
+    assert!(
+        got.as_ref().is_err_and(|e| e.contains("schema changed")),
+        "{sql}: {got:?}"
+    );
+    assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: run again");
 }

@@ -2946,6 +2946,20 @@ pub(crate) fn join_side_opening() {
     run_hook(&JOIN_SIDE_HOOK);
 }
 
+thread_local! {
+    static GROUPED_TABLE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next grouped statement with prepared
+/// blocks has opened their tables and is about to open its own
+pub fn before_grouped_table_opened(hook: impl FnOnce() + 'static) {
+    GROUPED_TABLE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn grouped_table_opening() {
+    run_hook(&GROUPED_TABLE_HOOK);
+}
+
 /// Join side reads on this thread that streamed their rows through the
 /// WHERE bound to the sets the run read, so far
 pub fn bound_side_reads() -> usize {

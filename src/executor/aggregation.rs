@@ -2216,6 +2216,22 @@ impl Executor {
             Expression::QuantifiedSet(set) => {
                 self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns, ctx)?;
             }
+            Expression::In(in_expr) if expression_contains_aggregate(&in_expr.left) => {
+                self.extract_aggregates_from_expr(
+                    &in_expr.left,
+                    aggregations,
+                    non_agg_columns,
+                    ctx,
+                )?;
+            }
+            Expression::AllAny(all_any) if expression_contains_aggregate(&all_any.left) => {
+                self.extract_aggregates_from_expr(
+                    &all_any.left,
+                    aggregations,
+                    non_agg_columns,
+                    ctx,
+                )?;
+            }
             // An aggregate a window function takes as its argument, or
             // partitions or orders by, is computed like any other
             Expression::Window(window) => {
