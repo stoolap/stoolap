@@ -623,7 +623,10 @@ fn a_grouped_item_named_by_alias_or_position_is_read_wherever_it_is_written() {
         ),
     ] {
         let got = rows(&db, sql);
-        assert!(got.as_ref().is_ok_and(|rows| !rows.is_empty()), "{sql}: {got:?}");
+        assert!(
+            got.as_ref().is_ok_and(|rows| !rows.is_empty()),
+            "{sql}: {got:?}"
+        );
         assert_eq!(got, rows(&db, literal), "{sql}");
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
