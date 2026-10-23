@@ -4889,16 +4889,13 @@ impl Executor {
                         .map_or(&unnamed, |alias| &alias.value_lower),
                 )
             }
-            Some(Expression::ValuesSource(values)) => {
-                let (columns, rows) = Self::values_rows(values, ctx)?;
-                (
-                    StatementSource::Rows(columns, rows),
-                    values
-                        .alias
-                        .as_ref()
-                        .map_or(&unnamed, |alias| &alias.value_lower),
-                )
-            }
+            Some(Expression::ValuesSource(values)) => (
+                StatementSource::Values(Self::values_columns(values), values),
+                values
+                    .alias
+                    .as_ref()
+                    .map_or(&unnamed, |alias| &alias.value_lower),
+            ),
             _ => return Err(Error::internal("a prepared statement without one table")),
         };
         let table_columns;
@@ -4907,11 +4904,11 @@ impl Executor {
                 table_columns = table.schema().column_names_arc();
                 &table_columns
             }
-            StatementSource::Rows(columns, _) => columns,
+            StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => columns,
         };
         let schema = || match &source {
             StatementSource::Table(table) => std::borrow::Cow::Borrowed(table.schema()),
-            StatementSource::Rows(columns, _) => {
+            StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => {
                 std::borrow::Cow::Owned(untyped_schema(scope_name, columns))
             }
         };
@@ -4942,6 +4939,7 @@ impl Executor {
         let statement_rows = match &source {
             StatementSource::Table(table) => table.row_count_hint(),
             StatementSource::Rows(_, rows) => rows.len(),
+            StatementSource::Values(_, values) => values.rows.len(),
         };
         let mut runner = PreparedRunner::new(
             self,
@@ -4960,8 +4958,10 @@ impl Executor {
             }
         }
         let output_columns = CompactArc::clone(&prepared.output_columns);
+        // Every value of a VALUES list is evaluated, as the general path does
         let target = limit
             .filter(|_| stmt.order_by.is_empty())
+            .filter(|_| !matches!(source, StatementSource::Values(..)))
             .map(|limit| limit.saturating_add(offset));
         // Made on the first row: the scan's own answers need none
         let mut kept: Option<RowVec> = None;
@@ -4980,9 +4980,22 @@ impl Executor {
                 false,
                 &mut keep,
             ),
-            StatementSource::Rows(_, rows) => {
-                runner.rows_passing(&prepared.where_, rows, ctx, target, &mut keep)
-            }
+            StatementSource::Rows(_, rows) => runner.rows_passing(
+                &prepared.where_,
+                rows.into_iter().map(Ok),
+                ctx,
+                target,
+                &mut keep,
+            ),
+            StatementSource::Values(_, values) => runner.rows_passing(
+                &prepared.where_,
+                (0i64..)
+                    .zip(&values.rows)
+                    .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
+                ctx,
+                target,
+                &mut keep,
+            ),
         };
         let mut rows = match read? {
             Passing::Pruned => {
@@ -5024,10 +5037,12 @@ impl Executor {
 }
 
 /// What a prepared statement reads its rows from
-enum StatementSource {
+enum StatementSource<'s> {
     Table(Box<dyn Table>),
     /// A derived table's columns and rows, read once
     Rows(Vec<String>, RowVec),
+    /// A VALUES list's columns and rows, each evaluated as the WHERE reads it
+    Values(Vec<String>, &'s ValuesTableSource),
 }
 
 /// A derived table's columns as its scope's schema: their names and no
@@ -5609,7 +5624,7 @@ impl<'a> PreparedRunner<'a> {
     fn rows_passing(
         &self,
         where_: &PreparedWhere,
-        rows: RowVec,
+        rows: impl IntoIterator<Item = Result<(i64, Row)>>,
         ctx: &ExecutionContext,
         target: Option<usize>,
         mut keep: impl FnMut(i64, u64, Row) -> bool,
@@ -5618,10 +5633,11 @@ impl<'a> PreparedRunner<'a> {
             return Ok(Passing::Read);
         }
         let mut vm = ExprVM::new();
-        for (scanned, (id, row)) in (1u64..).zip(rows) {
+        for (scanned, read) in (1u64..).zip(rows) {
             if scanned.is_multiple_of(100) {
                 ctx.check_cancelled()?;
             }
+            let (id, row) = read?;
             if self.matches(&mut vm, &where_.program, &row)? && !keep(id, scanned, row) {
                 break;
             }

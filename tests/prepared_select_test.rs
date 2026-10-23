@@ -2229,6 +2229,23 @@ fn test_a_values_list_runs_prepared_over_its_rows() {
 }
 
 #[test]
+fn test_a_values_list_evaluates_every_value_under_a_limit() {
+    let _guard = serial();
+    let db = setup("prepared_values_limit");
+    const FROM: &str = "FROM (VALUES (1), (9223372036854775807 + 1)) AS s(x)";
+    let general = format!("SELECT x {FROM} WHERE x > 0 LIMIT 1");
+    let prepared = format!("SELECT x {FROM} WHERE x > 0 AND EXISTS (SELECT 1 FROM u) LIMIT 1");
+    assert_eq!(prepared_line(&db, &prepared), "Prepared: yes");
+    let (general_err, _) = error(&db, &general, ());
+    let (prepared_err, _) = error(&db, &prepared, ());
+    assert!(general_err.contains("overflow"), "{general_err}");
+    assert_eq!(
+        prepared_err, general_err,
+        "both paths evaluate the second row"
+    );
+}
+
+#[test]
 fn test_a_values_row_holding_a_subquery_is_not_prepared() {
     let _guard = serial();
     let db = setup("prepared_values_row_subquery");
