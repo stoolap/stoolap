@@ -1740,6 +1740,14 @@ impl ExecutionContext {
         counts.find(|read| read.key == key).map(|read| read.count)
     }
 
+    /// This context reading `params`: the statement's own, then the values
+    /// its run computed once
+    pub(crate) fn with_slot_params(&self, params: ParamVec) -> Self {
+        let mut ctx = self.clone();
+        ctx.params = CompactArc::new(params);
+        ctx
+    }
+
     /// This context carrying `counts`, read for a statement at its depth
     pub(crate) fn with_read_counts(&self, counts: ReadCounts) -> Self {
         let mut ctx = self.clone();

@@ -312,6 +312,8 @@ pub enum CompiledExecution {
     PreparedSelect(Arc<super::prepared_select::PreparedSelect>),
     /// An UPDATE or DELETE whose subqueries run prepared
     PreparedDml(Arc<super::prepared_select::PreparedDml>),
+    /// A grouped statement whose SELECT list or HAVING subqueries run prepared
+    PreparedGrouped(Arc<super::prepared_select::PreparedGrouped>),
 }
 
 /// Default cache size (number of cached plans)

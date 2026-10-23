@@ -1223,13 +1223,21 @@ impl Executor {
         let in_family = classification.where_has_subqueries
             && (self.holds_prepared_select(compiled, ctx)
                 || self.prepared_family(stmt, Some(ctx)).is_ok());
+        // A grouped statement whose SELECT list or HAVING holds subqueries
+        // runs them as its blocks
+        let grouped_family = classification.has_aggregation
+            && classification.output_has_subqueries
+            && !in_family
+            && (self.holds_prepared_grouped(compiled, ctx)
+                || self.grouped_family(stmt, Some(ctx)).is_ok());
 
         // Correlated probes read the statement's tables through one transaction
         let snapshot_ctx;
         let ctx = if (classification.where_has_correlated_subqueries
             || classification.select_has_correlated_subqueries
             || classification.order_by_has_correlated_subqueries
-            || in_family)
+            || in_family
+            || grouped_family)
             && ctx.statement_snapshot().is_none()
             && self.active_transaction.lock().unwrap().is_none()
         {
@@ -1248,7 +1256,11 @@ impl Executor {
         let bound_stmt;
         // A statement holding this execution's values keeps nothing in its plan
         let mut folded_select = false;
-        let stmt = if Self::folds_select_subqueries(stmt, &classification) {
+        let grouped = match grouped_family {
+            true => self.prepared_grouped(compiled, stmt, ctx)?,
+            false => None,
+        };
+        let stmt = if grouped.is_none() && Self::folds_select_subqueries(stmt, &classification) {
             match self.try_process_select_subqueries(&stmt.columns, ctx)? {
                 Some(columns) => {
                     bound_stmt = SelectStatement {
@@ -1323,6 +1335,8 @@ impl Executor {
                 visible: None,
             };
             (result, columns, applied, Some(shape))
+        } else if let Some(grouped) = grouped.as_deref() {
+            self.execute_prepared_grouped(grouped, ctx)?
         } else {
             let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, &classification, compiled)?
@@ -2089,7 +2103,7 @@ impl Executor {
                 if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
                     return self.execute_view_query(&view_def, stmt, ctx, classification);
                 }
-                self.execute_simple_table_scan(table_source, stmt, ctx, classification, None)
+                self.execute_simple_table_scan(table_source, stmt, ctx, classification, None, None)
             }
             Expression::JoinSource(join_source) => {
                 self.execute_join_source(join_source, stmt, ctx, classification, compiled)
@@ -3025,6 +3039,7 @@ impl Executor {
         all_columns_lower: &[String],
         table_alias: Option<&str>,
         classification: &QueryClassification,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> SelectResult {
         let (result, layout) = match (
             classification.has_aggregation,
@@ -3055,6 +3070,7 @@ impl Executor {
                 classification,
                 RowVec::new(),
                 all_columns,
+                blocks,
                 |out| Self::shared_result_layout(stmt, all_columns, table_alias, out),
             )?,
         };
@@ -3070,6 +3086,7 @@ impl Executor {
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
         read_out: Option<&mut Option<ReadSchema>>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> SelectResult {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
@@ -3213,6 +3230,7 @@ impl Executor {
                 &all_columns_lower,
                 table_alias.as_deref(),
                 classification,
+                blocks,
             );
         }
 
@@ -3470,6 +3488,7 @@ impl Executor {
                         &all_columns_lower,
                         table_alias.as_deref(),
                         classification,
+                        blocks,
                     );
                 }
             }
@@ -4692,10 +4711,15 @@ impl Executor {
         let has_agg = classification.has_aggregation;
 
         if has_agg {
-            let (result, layout) =
-                self.group_and_window_rows(stmt, ctx, classification, rows, &all_columns, |out| {
-                    Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out)
-                })?;
+            let (result, layout) = self.group_and_window_rows(
+                stmt,
+                ctx,
+                classification,
+                rows,
+                &all_columns,
+                blocks,
+                |out| Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out),
+            )?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
@@ -7130,7 +7154,8 @@ impl Executor {
                 return Err(err);
             }
 
-            let agg_result = self.execute_select_with_aggregation(stmt, ctx, rows, &columns)?;
+            let agg_result =
+                self.execute_select_with_aggregation(stmt, ctx, rows, &columns, None)?;
             let out_columns = CompactArc::new(agg_result.columns().to_vec());
             let alias = subquery_source
                 .alias
@@ -8159,6 +8184,7 @@ impl Executor {
                     ctx,
                     &classification,
                     read_out,
+                    None,
                 )?;
 
                 // Prefix column names with table alias (or table name if no alias)
@@ -8444,6 +8470,7 @@ impl Executor {
                 ctx,
                 &classification,
                 Some(&mut opened),
+                None,
             )?;
             let token = opened.as_ref().map(|(token, _)| *token);
             if let Some(out) = read_out {
@@ -8579,7 +8606,9 @@ impl Executor {
     /// The aggregation and window functions of `stmt` over a source's rows,
     /// the one dispatch every source hands its rows to: GROUP BY and then
     /// the windows over the groups, the windows alone, or the aggregation
-    /// alone, whose layout `aggregate_layout` builds from its columns
+    /// alone, whose layout `aggregate_layout` builds from its columns, its
+    /// SELECT list and HAVING subqueries answered by the statement's `blocks`
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn group_and_window_rows(
         &self,
         stmt: &SelectStatement,
@@ -8587,6 +8616,7 @@ impl Executor {
         classification: &QueryClassification,
         rows: RowVec,
         columns: &[String],
+        blocks: Option<&dyn SubqueryExecutor>,
         aggregate_layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
     ) -> Result<WindowOutput> {
         match (
@@ -8596,7 +8626,8 @@ impl Executor {
             (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns),
             (false, true) => self.execute_select_with_window_functions(stmt, ctx, &rows, columns),
             _ => {
-                let result = self.execute_select_with_aggregation(stmt, ctx, rows, columns)?;
+                let result =
+                    self.execute_select_with_aggregation(stmt, ctx, rows, columns, blocks)?;
                 let layout = aggregate_layout(result.columns());
                 Ok((result, layout))
             }
@@ -8615,11 +8646,46 @@ impl Executor {
         table_alias: Option<&str>,
     ) -> SelectResult {
         let (result, layout) =
-            self.group_and_window_rows(stmt, ctx, classification, rows, columns, |out| {
+            self.group_and_window_rows(stmt, ctx, classification, rows, columns, None, |out| {
                 Self::result_layout(stmt, columns, table_alias, out)
             })?;
         let columns = CompactArc::new(result.columns().to_vec());
         Ok((result, columns, false, SelectShape::laid_out(layout)))
+    }
+
+    /// A grouped statement whose SELECT list or HAVING subqueries run as
+    /// `held` prepared them: with every one a run slot, as any grouped
+    /// statement reading them as parameters; else over its table's rows,
+    /// the general aggregation asking the blocks of each group
+    fn execute_prepared_grouped(
+        &self,
+        held: &super::prepared_select::PreparedGrouped,
+        ctx: &ExecutionContext,
+    ) -> SelectResult {
+        let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
+            Error::internal("a table's columns changed while the statement prepared")
+        })?;
+        if let Some(plan) = &held.runs_alone {
+            let params = run.params().unwrap_or_default().iter().cloned().collect();
+            let ctx = ctx.with_slot_params(params);
+            return self.execute_select_internal(
+                &held.stmt,
+                &ctx,
+                &held.classification,
+                Some(plan),
+            );
+        }
+        let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
+            return Err(Error::internal("a grouped statement without its table"));
+        };
+        self.execute_simple_table_scan(
+            table_source,
+            &held.stmt,
+            ctx,
+            &held.classification,
+            None,
+            Some(&run),
+        )
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
@@ -9174,6 +9240,7 @@ impl Executor {
             &aggregations,
             result_columns,
             groups,
+            None,
         )?;
         let mut rows = final_rows.into_vec();
         rows.drain(..plan.offset.min(rows.len()));
@@ -13580,6 +13647,7 @@ impl Executor {
                     crate::functions::registry::global_registry(),
                     Some(&slots),
                     None,
+                    false,
                 )?;
                 use crate::executor::expression::Op;
                 if filter
@@ -13712,6 +13780,7 @@ impl Executor {
             aggregations: &aggregations,
             group_by_count: 1,
             source_columns: all_columns,
+            blocks: None,
         };
         let result = self.finish_aggregation(
             crate::executor::AggregatePath::StreamingGroupBy,
