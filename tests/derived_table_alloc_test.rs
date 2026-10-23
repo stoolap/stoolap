@@ -103,10 +103,11 @@ fn a_derived_table_or_view_costs_what_its_table_does_plus_a_bounded_count() {
         );
         costs.push((rows, table, derived, view));
     }
+    // The set conjunct's program, bound once per run to the members read
     assert!(
         costs
             .iter()
-            .all(|&(_, table, derived, view)| derived <= table + 12 && view <= table + 12),
+            .all(|&(_, table, derived, view)| derived <= table + 16 && view <= table + 16),
         "(rows, allocations over the table, the derived table, the view): {costs:?}"
     );
 }
