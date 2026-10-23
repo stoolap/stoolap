@@ -6409,18 +6409,18 @@ fn more_than_one_row() -> Error {
 /// `values` as `test` asks them, NULL members included
 fn member_set(test: MemberTest, values: Vec<Value>) -> MemberSet {
     match test {
-        MemberTest::In => MemberSet::In(PredicateSet::of(CompactArc::new(
+        MemberTest::In => MemberSet::In(CompactArc::new(PredicateSet::of(CompactArc::new(
             values.into_iter().collect(),
-        ))),
+        )))),
         MemberTest::Quantified(op, all) => {
             let has_null = values.iter().any(Value::is_null);
             let members: Vec<Value> = values.into_iter().filter(|v| !v.is_null()).collect();
-            MemberSet::Quantified(QuantifiedMembers::new(
+            MemberSet::Quantified(CompactArc::new(QuantifiedMembers::new(
                 op,
                 all,
                 CompactArc::new(members),
                 has_null,
-            ))
+            )))
         }
     }
 }
@@ -6584,8 +6584,8 @@ impl PreparedRunner<'_> {
             return None;
         }
         Some(match &set.set {
-            MemberSet::In(set) => Op::InSet(CompactArc::new(set.clone())),
-            MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
+            MemberSet::In(set) => Op::InSet(CompactArc::clone(set)),
+            MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::clone(set)),
         })
     }
 

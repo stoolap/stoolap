@@ -574,11 +574,12 @@ pub struct ExistsKeys {
     pub failed: bool,
 }
 
-/// A value block's members as one test asks them
+/// A value block's members as one test asks them, shared with the member
+/// tests a program is bound to
 #[derive(Debug)]
 pub enum MemberSet {
-    In(PredicateSet),
-    Quantified(super::expression::QuantifiedMembers),
+    In(CompactArc<PredicateSet>),
+    Quantified(CompactArc<super::expression::QuantifiedMembers>),
 }
 
 /// A value block's members for a whole run, and the first error one of
