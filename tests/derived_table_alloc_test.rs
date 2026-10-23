@@ -121,6 +121,39 @@ fn a_derived_table_or_view_costs_what_its_table_does_plus_a_bounded_count() {
 }
 
 #[test]
+fn a_single_use_cte_costs_what_its_derived_table_does() {
+    let mut costs = Vec::new();
+    for rows in [100, 400] {
+        let db = Database::open(&format!("memory://single_use_cte_alloc_{rows}")).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+            .unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)", ())
+            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t SELECT value, value % 7 FROM generate_series(1, {rows})"),
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+        // Computed rows, every one passing the WHERE
+        let derived = per_run(
+            &db,
+            "SELECT * FROM (SELECT id + 1 AS id, a FROM t) AS s WHERE EXISTS (SELECT x FROM u)",
+        );
+        let cte = per_run(
+            &db,
+            "WITH s AS (SELECT id + 1 AS id, a FROM t) SELECT * FROM s WHERE EXISTS (SELECT x FROM u)",
+        );
+        costs.push((rows, derived, cte));
+    }
+    // The statement the CTE inlines into, built again each run
+    assert!(
+        costs.iter().all(|&(_, derived, cte)| cte <= derived + 32),
+        "(rows, allocations over the derived table, the CTE): {costs:?}"
+    );
+}
+
+#[test]
 fn a_set_the_rows_test_is_shared_not_copied_per_run() {
     let bytes = || BYTES.with(Cell::get);
     // A number meets the numbers the TEXT members read as, built with the

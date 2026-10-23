@@ -1198,7 +1198,8 @@ impl Executor {
 
         // Check for CTEs (WITH clause). A statement with one keeps every
         // subquery for the aggregation entry, which runs with the CTEs bound
-        // A statement of the prepared family reads its CTEs from the context,
+        // A statement of the prepared family keeps its plan: its CTEs inline
+        // as the CTE path inlines them, or are read from the context,
         // materialized under the snapshot its subqueries read
         let ctes_ctx;
         let ctx = if self.has_cte(stmt) {
@@ -1207,15 +1208,18 @@ impl Executor {
             {
                 return self.execute_select_with_ctes(stmt, ctx);
             }
+            let with = stmt
+                .with
+                .as_ref()
+                .ok_or_else(|| Error::internal("a statement with CTEs without WITH"))?;
+            if let Some(inlined) = self.try_inline_ctes(stmt, with) {
+                return self.execute_select_with_plan(&inlined, ctx, None, compiled, None);
+            }
             let snapshot = match ctx.statement_snapshot() {
                 Some(_) => None,
                 None => self.with_counts_snapshot(ctx)?,
             };
             let ctx = snapshot.as_ref().unwrap_or(ctx);
-            let with = stmt
-                .with
-                .as_ref()
-                .ok_or_else(|| Error::internal("a statement with CTEs without WITH"))?;
             ctes_ctx = ctx.with_cte_data(self.materialize_ctes(with, ctx, None)?.data());
             &ctes_ctx
         } else {

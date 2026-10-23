@@ -2304,3 +2304,21 @@ fn test_a_block_reading_a_cte_is_not_prepared() {
         "Prepared: no (FROM names a CTE)"
     );
 }
+
+#[test]
+fn test_a_cte_the_statement_does_not_read_does_not_run() {
+    let _guard = serial();
+    let db = setup("prepared_cte_unused");
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO m VALUES (1, -9223372036854775808)", ())
+        .unwrap();
+    const UNUSED: &str = "WITH unused AS (SELECT ABS(x) FROM m), s AS (SELECT id FROM t) \
+                          SELECT id FROM s WHERE id < (SELECT MIN(id) FROM u) + 2 ORDER BY id";
+    assert_eq!(prepared_line(&db, UNUSED), "Prepared: yes");
+    assert_eq!(
+        ids(&db, UNUSED, ()).0,
+        vec![1, 2],
+        "ABS of its row would overflow"
+    );
+}
