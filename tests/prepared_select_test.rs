@@ -2146,8 +2146,8 @@ fn test_a_redefined_view_answers_from_its_new_body() {
     let built = prepared_selects_built();
     for (body, want, prepared) in [
         ("SELECT id, a FROM t WHERE b = 1", vec![1], 1),
-        ("SELECT id, a FROM t WHERE b = 2", vec![6], 1),
-        ("SELECT a, id FROM t", vec![1, 6], 2),
+        ("SELECT id, a FROM t WHERE b = 2", vec![6], 2),
+        ("SELECT a, id FROM t", vec![1, 6], 3),
     ] {
         db.execute("DROP VIEW IF EXISTS tv", ()).unwrap();
         db.execute(&format!("CREATE VIEW tv AS {body}"), ())
@@ -2156,7 +2156,7 @@ fn test_a_redefined_view_answers_from_its_new_body() {
         assert_eq!(
             prepared_selects_built() - built,
             prepared,
-            "{body}: the plan is kept while the view's columns are"
+            "{body}: a view defined again prepares the plan again"
         );
     }
 }
@@ -2437,8 +2437,8 @@ fn test_a_block_over_a_redefined_view_reads_its_new_body() {
     let built = prepared_selects_built();
     for (body, want, prepared) in [
         ("SELECT id, v FROM u", vec![1, 6], 1),
-        ("SELECT id, v + 100 AS v FROM u", vec![], 1),
-        ("SELECT v, id FROM u", vec![1, 6], 2),
+        ("SELECT id, v + 100 AS v FROM u", vec![], 2),
+        ("SELECT v, id FROM u", vec![1, 6], 3),
     ] {
         db.execute("DROP VIEW IF EXISTS uv", ()).unwrap();
         db.execute(&format!("CREATE VIEW uv AS {body}"), ())
@@ -2447,7 +2447,7 @@ fn test_a_block_over_a_redefined_view_reads_its_new_body() {
         assert_eq!(
             prepared_selects_built() - built,
             prepared,
-            "{body}: the plan is kept while the view's columns are"
+            "{body}: a view defined again prepares the plan again"
         );
     }
 }
@@ -2491,4 +2491,44 @@ fn test_a_block_source_is_read_before_the_statement_s_rows() {
             "{sql}: the source's error, though no row reaches the block"
         );
     }
+}
+
+#[test]
+fn test_a_block_s_table_function_generates_only_the_range_its_where_allows() {
+    let _guard = serial();
+    let db = setup("prepared_block_tvf_range");
+    const SQL: &str = "SELECT id FROM t WHERE a > \
+                       (SELECT MAX(value) FROM generate_series(1, 10000001) WHERE value < 3) ORDER BY id";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
+    let before = tvf_rows();
+    assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(tvf_rows() - before, 2, "the rows below 3, of ten million");
+    const OUTER: &str = "SELECT id FROM t WHERE \
+                         (SELECT COUNT(*) FROM generate_series(1, 10) AS s(a) WHERE t.a = 10) = 10 ORDER BY id";
+    assert_eq!(prepared_line(&db, OUTER), "Prepared: yes");
+    assert_eq!(
+        ids(&db, OUTER, ()).0,
+        vec![1],
+        "a comparison of an enclosing column narrows nothing"
+    );
+}
+
+#[test]
+fn test_a_block_s_view_runs_once_in_the_run_that_prepares_it() {
+    let _guard = serial();
+    let db = setup("prepared_block_view_once");
+    db.execute("CREATE VIEW rv AS SELECT RANDOM() AS n", ())
+        .unwrap();
+    const SQL: &str = "SELECT id FROM t WHERE a > (SELECT MAX(n) FROM rv) ORDER BY id";
+    let built = prepared_selects_built();
+    for run in ["prepares", "keeps its plan"] {
+        let before = random_draws();
+        assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6], "{run}");
+        assert_eq!(
+            random_draws() - before,
+            1,
+            "the run that {run} reads the view once"
+        );
+    }
+    assert_eq!(prepared_selects_built() - built, 1);
 }

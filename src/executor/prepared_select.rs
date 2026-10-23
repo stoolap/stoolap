@@ -56,8 +56,8 @@ use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
 use super::result::{ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
-    expression_contains_aggregate, extract_literal_value, flip_operator, infix_to_operator,
-    is_aggregate_function, strip_table_qualifier,
+    combine_predicates_with_and, expression_contains_aggregate, extract_literal_value,
+    flip_operator, infix_to_operator, is_aggregate_function, strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -1628,8 +1628,16 @@ enum BlockSource {
     View(SmartString, Option<Vec<SmartString>>),
     Cte(SmartString),
     Values(Box<ValuesTableSource>),
-    Function(Box<FunctionTableSource>),
+    /// A table function, with the WHERE's conjuncts that narrow its range
+    Function(Box<FunctionTableSource>, Option<Box<Expression>>),
 }
+
+/// The rows of the views blocks read while the statement prepared, by block
+/// id, which the run that prepared it opens in place of reading them again
+pub(crate) type FirstReads = SmallVec<[(u16, SourceRows); 1]>;
+
+/// A source a block's FROM names, its columns, and the rows read for them
+type NamedSource = (BlockSource, Vec<String>, Option<SourceRows>);
 
 #[derive(Debug, Clone, Copy)]
 struct Narrowing {
@@ -2057,6 +2065,8 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
+    /// The rows of the views read for their columns
+    first_reads: FirstReads,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -2080,12 +2090,14 @@ struct Rewritten {
 impl Builder<'_> {
     /// The blocks prepared for a statement taking `param_count` positional
     /// parameters, with its run slots compiled, and the holes of its own
-    /// blocks over the statement's row
+    /// blocks over the statement's row; the views' rows go to `first`
     fn finish(
         self,
         param_count: usize,
         run_slots: Vec<(usize, SharedProgram)>,
+        first: &mut FirstReads,
     ) -> Result<(PreparedBlocks, HoleSet)> {
+        *first = self.first_reads;
         // Slots are numbered after the values given, so a value not given would read one
         if self.max_param > param_count {
             return Err(Error::internal(format!(
@@ -2481,19 +2493,21 @@ impl Builder<'_> {
 
     /// The CTE or view a block's FROM names, a CTE before a view as the
     /// general path reads them, with its columns; None for a table. A view's
-    /// query runs here once for its columns
-    fn named_source(&self, name: &str) -> Result<Option<(BlockSource, Vec<String>)>> {
+    /// query runs here, and its rows are the ones this run opens
+    fn named_source(&self, name: &str) -> Result<Option<NamedSource>> {
         if let Some((columns, _)) = self.ctx.get_cte_by_lower(name) {
-            return Ok(Some((BlockSource::Cte(name.into()), columns.to_vec())));
+            return Ok(Some((
+                BlockSource::Cte(name.into()),
+                columns.to_vec(),
+                None,
+            )));
         }
         let Some(view) = self.executor.engine.get_view_lowercase(name)? else {
             return Ok(None);
         };
-        let columns = self
-            .executor
-            .execute_view_body(&view, self.ctx)?
-            .columns()
-            .to_vec();
+        let result = self.executor.execute_view_body(&view, self.ctx)?;
+        let columns = result.columns().to_vec();
+        let rows = CompactArc::new(Executor::materialize_result(result)?.into_vec());
         // The tables its query reads, unknown when one of them is a view
         let parsed = self.executor.parse_view_statement(&view.query)?;
         let tables = match parsed.as_ref() {
@@ -2511,7 +2525,11 @@ impl Builder<'_> {
                 .map(|table| SmartString::from(&**table))
                 .collect()
         });
-        Ok(Some((BlockSource::View(name.into(), tables), columns)))
+        Ok(Some((
+            BlockSource::View(name.into(), tables),
+            columns,
+            Some(rows),
+        )))
     }
 
     /// Prepare `sq`, run once per row of the scope `outer[0]`, as `form`
@@ -2534,11 +2552,15 @@ impl Builder<'_> {
             let scope = ScopeTable::of(name, &schema);
             (None, Some(source), schema, scope)
         };
+        let mut first_read = None;
         let (table, source, schema, scope) = match sq.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
                 match self.named_source(&ts.name.value_lower)? {
-                    Some((source, columns)) => over_source(name, source, columns),
+                    Some((source, columns, rows)) => {
+                        first_read = rows;
+                        over_source(name, source, columns)
+                    }
                     None => {
                         let schema = executor
                             .engine
@@ -2563,16 +2585,19 @@ impl Builder<'_> {
                 BlockSource::Values(values.clone()),
                 Executor::values_columns(values),
             ),
-            Some(Expression::FunctionTableSource(function)) => over_source(
-                function
+            Some(Expression::FunctionTableSource(function)) => {
+                let name = &function
                     .alias
                     .as_ref()
                     .unwrap_or(&function.function)
-                    .value_lower
-                    .clone(),
-                BlockSource::Function(function.clone()),
-                Executor::tvf_columns(function)?,
-            ),
+                    .value_lower;
+                let range = function_range(sq.where_clause.as_deref(), name);
+                over_source(
+                    name.clone(),
+                    BlockSource::Function(function.clone(), range),
+                    Executor::tvf_columns(function)?,
+                )
+            }
             // A block without FROM reads one row without columns, under no name
             None => (
                 None,
@@ -2585,6 +2610,9 @@ impl Builder<'_> {
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
         self.subqueries.push(None);
+        if let Some(rows) = first_read {
+            self.first_reads.push((id, rows));
+        }
 
         let mut scopes: Vec<&ScopeTable> = Vec::with_capacity(outer.len() + 1);
         scopes.push(&scope);
@@ -3325,6 +3353,7 @@ impl PreparedProjection {
 impl PreparedSelect {
     /// Prepare `stmt` over its table, named `scope_name` and holding
     /// `columns`, for executions with `param_count` positional parameters
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
@@ -3333,6 +3362,7 @@ impl PreparedSelect {
         scope_name: &SmartString,
         param_count: usize,
         epoch: u64,
+        first: &mut FirstReads,
     ) -> Result<Self> {
         let registry = &executor.function_registry;
         let scope = ScopeTable::of(scope_name.clone(), schema);
@@ -3345,6 +3375,7 @@ impl PreparedSelect {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            first_reads: FirstReads::new(),
         };
         let where_clause = stmt
             .where_clause
@@ -3375,7 +3406,7 @@ impl PreparedSelect {
         {
             builder.note_params(unaliased(column));
         }
-        let (blocks, holes) = builder.finish(param_count, run_slots)?;
+        let (blocks, holes) = builder.finish(param_count, run_slots, first)?;
         // Over one table `t.*` is `*`, the projection's expansion; the
         // names' prefix rule for a joined `t.*` would drop columns
         let select: std::borrow::Cow<[Expression]> = if stmt
@@ -3447,6 +3478,7 @@ pub struct PreparedGrouped {
 impl PreparedGrouped {
     /// Prepare `stmt` over its table, named `scope_name`; None when a block
     /// reads a column of the row that is not a GROUP BY item
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
@@ -3455,6 +3487,7 @@ impl PreparedGrouped {
         scope_name: &SmartString,
         param_count: usize,
         epoch: u64,
+        first: &mut FirstReads,
     ) -> Result<Option<Self>> {
         let scope = ScopeTable::of(scope_name.clone(), &schema);
         let scopes = [&scope];
@@ -3466,6 +3499,7 @@ impl PreparedGrouped {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: true,
+            first_reads: FirstReads::new(),
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -3641,7 +3675,7 @@ impl PreparedGrouped {
             .as_ref()
             .map(|parts| compile_with(&own, &parts.clause))
             .transpose()?;
-        let (blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
+        let (blocks, mut row_holes) = builder.finish(param_count, run_slots, first)?;
         let where_clause = where_parts.as_ref().map(|parts| parts.clause.clone());
         let where_ = where_parts
             .zip(where_program)
@@ -3780,14 +3814,15 @@ impl PreparedGrouped {
 
 impl Executor {
     /// The plan's prepared grouped statement over `table`, prepared now when
-    /// it holds none for this schema and parameter count; None when the
-    /// statement's blocks read a column outside its groups
+    /// it holds none for this schema and parameter count, with the views'
+    /// rows preparing read; None when the statement's blocks read a column
+    /// outside its groups
     pub(crate) fn prepared_grouped(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-    ) -> Result<Option<Arc<PreparedGrouped>>> {
+    ) -> Result<Option<(Arc<PreparedGrouped>, FirstReads)>> {
         let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
             return Err(Error::internal("a grouped statement without one table"));
         };
@@ -3802,14 +3837,15 @@ impl Executor {
                 }
                 _ => None,
             });
-        if held.is_some() {
-            return Ok(held);
+        if let Some(held) = held {
+            return Ok(Some((held, FirstReads::new())));
         }
         let table = self.prepared_table(&ts.name.value_lower, ctx, None)?;
         let scope_name = ts
             .alias
             .as_ref()
             .map_or(&ts.name.value_lower, |alias| &alias.value_lower);
+        let mut first = FirstReads::new();
         let Some(prepared) = PreparedGrouped::prepare(
             self,
             ctx,
@@ -3818,6 +3854,7 @@ impl Executor {
             scope_name,
             ctx.params().len(),
             epoch,
+            &mut first,
         )?
         else {
             return Ok(None);
@@ -3833,7 +3870,7 @@ impl Executor {
                 *guard = CompiledExecution::PreparedGrouped(Arc::clone(&prepared));
             }
         }
-        Ok(Some(prepared))
+        Ok(Some((prepared, first)))
     }
 
     /// Whether the plan holds a grouped statement prepared for the current
@@ -3861,10 +3898,12 @@ impl Executor {
     pub(crate) fn grouped_runner<'a>(
         &'a self,
         held: &'a PreparedGrouped,
+        first: &FirstReads,
         ctx: &'a ExecutionContext,
     ) -> Result<Option<PreparedRunner<'a>>> {
         let inner_ctx = ctx.with_incremented_query_depth();
-        let Some(tables) = PreparedRunner::open_tables(self, &held.blocks, &inner_ctx, None)?
+        let Some(tables) =
+            PreparedRunner::open_tables(self, &held.blocks, &inner_ctx, None, first)?
         else {
             return Ok(None);
         };
@@ -3977,6 +4016,7 @@ impl PreparedDml {
         returning: Option<&ReturningSites<'_>>,
         param_count: usize,
         epoch: u64,
+        first: &mut FirstReads,
     ) -> Result<Self> {
         let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
@@ -3988,6 +4028,7 @@ impl PreparedDml {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            first_reads: FirstReads::new(),
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -4205,7 +4246,7 @@ impl PreparedDml {
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let (blocks, holes) = builder.finish(param_count, run_slots)?;
+        let (blocks, holes) = builder.finish(param_count, run_slots, first)?;
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks));
@@ -4290,6 +4331,7 @@ impl JoinBlocks {
         sides: [(SmartString, &Schema); 2],
         width: usize,
         param_count: usize,
+        first: &mut FirstReads,
     ) -> Result<Option<Self>> {
         let left_width = sides[0].1.columns.len();
         let Some(scope) = ScopeTable::joined(sides.clone(), width) else {
@@ -4304,6 +4346,7 @@ impl JoinBlocks {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            first_reads: FirstReads::new(),
         };
         let mut rewrite = |clause: Option<&Expression>| {
             clause
@@ -4367,7 +4410,7 @@ impl JoinBlocks {
             .iter()
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let (blocks, joined) = builder.finish(param_count, run_slots)?;
+        let (blocks, joined) = builder.finish(param_count, run_slots, first)?;
         let ahead = output_blocks
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
@@ -4490,8 +4533,9 @@ impl Executor {
         sides: [(SmartString, &Schema); 2],
         width: usize,
         ctx: &ExecutionContext,
-    ) -> Result<Option<JoinBlocks>> {
-        JoinBlocks::prepare(
+    ) -> Result<Option<(JoinBlocks, FirstReads)>> {
+        let mut first = FirstReads::new();
+        let blocks = JoinBlocks::prepare(
             self,
             ctx,
             on,
@@ -4501,7 +4545,9 @@ impl Executor {
             sides,
             width,
             ctx.params().len(),
-        )
+            &mut first,
+        )?;
+        Ok(blocks.map(|blocks| (blocks, first)))
     }
 
     /// One execution's run of a join statement's blocks, its rows unknown
@@ -4510,11 +4556,13 @@ impl Executor {
     pub(crate) fn join_runner<'a>(
         &'a self,
         held: &'a JoinBlocks,
+        first: &FirstReads,
         ctx: &'a ExecutionContext,
     ) -> Result<Option<PreparedRunner<'a>>> {
         let (blocks, holes) = (&held.blocks, &held.joined);
         let inner_ctx = ctx.with_incremented_query_depth();
-        let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx, None)? else {
+        let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx, None, first)?
+        else {
             return Ok(None);
         };
         let mut runner =
@@ -4823,6 +4871,37 @@ impl<'a> DmlRunner<'a> {
     }
 }
 
+/// The conjuncts of a block's `where_clause` comparing a column of its table
+/// function `name` with a value that reads no column: they narrow the range
+/// it generates, as a statement's WHERE narrows its own
+fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<Expression>> {
+    let own = |expr: &Expression| match expr {
+        Expression::Identifier(_) => true,
+        Expression::QualifiedIdentifier(qi) => qi.qualifier.value_lower == name,
+        _ => false,
+    };
+    let mut parts = Vec::new();
+    conjuncts(where_clause?, &mut parts);
+    let range = parts
+        .into_iter()
+        .filter(|part| match part {
+            Expression::Infix(infix) => {
+                (own(&infix.left) && !mentions_column(&infix.right))
+                    || (own(&infix.right) && !mentions_column(&infix.left))
+            }
+            Expression::Between(between) => {
+                !between.not
+                    && own(&between.expr)
+                    && !mentions_column(&between.lower)
+                    && !mentions_column(&between.upper)
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    combine_predicates_with_and(range).map(Box::new)
+}
+
 fn mentions_subquery(expr: &Expression) -> bool {
     match expr {
         Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => true,
@@ -4990,8 +5069,8 @@ impl Executor {
                 }
                 (Self::values_columns(values), rows)
             }
-            BlockSource::Function(function) => {
-                let (rows, columns) = Self::tvf_rows(function, None, None, ctx)?;
+            BlockSource::Function(function, range) => {
+                let (rows, columns) = Self::tvf_rows(function, range.as_deref(), None, ctx)?;
                 (columns, rows)
             }
         };
@@ -5042,7 +5121,7 @@ impl Executor {
 
     /// The plan's prepared statement, prepared now over the source `schema`
     /// gives when the plan holds none for this schema, these `columns` and
-    /// this parameter count
+    /// this parameter count, with the views' rows preparing read
     #[allow(clippy::too_many_arguments)]
     fn prepared_for<'s>(
         &self,
@@ -5053,7 +5132,7 @@ impl Executor {
         scope_name: &SmartString,
         ctx: &ExecutionContext,
         fresh: bool,
-    ) -> Result<Arc<PreparedSelect>> {
+    ) -> Result<(Arc<PreparedSelect>, FirstReads)> {
         let epoch = self.engine.schema_epoch();
         let fits = |p: &PreparedSelect| {
             p.cached_epoch == epoch
@@ -5064,11 +5143,12 @@ impl Executor {
             if let Ok(guard) = slot.read() {
                 if let CompiledExecution::PreparedSelect(p) = &*guard {
                     if fits(p) {
-                        return Ok(Arc::clone(p));
+                        return Ok((Arc::clone(p), FirstReads::new()));
                     }
                 }
             }
         }
+        let mut first = FirstReads::new();
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
             ctx,
@@ -5077,6 +5157,7 @@ impl Executor {
             scope_name,
             ctx.params().len(),
             epoch,
+            &mut first,
         )?);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_select_built();
@@ -5092,7 +5173,7 @@ impl Executor {
                 }
             }
         }
-        Ok(prepared)
+        Ok((prepared, first))
     }
 
     /// Whether the plan holds a statement prepared for the current schema,
@@ -5221,6 +5302,7 @@ impl Executor {
                     }
                     _ => None,
                 });
+            let mut first = FirstReads::new();
             let prepared = match held {
                 Some(prepared) => prepared,
                 None => {
@@ -5236,6 +5318,7 @@ impl Executor {
                         returning,
                         ctx.params().len(),
                         epoch,
+                        &mut first,
                     )?);
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_dml_was_built();
@@ -5271,8 +5354,12 @@ impl Executor {
             };
             let block_ctx = snapshot_ctx.as_ref().unwrap_or(&inner_ctx);
             let through = through.filter(|_| snapshot_ctx.is_none());
+            // Rows read under a snapshot other than the blocks' are read again
+            if snapshot_ctx.is_some() {
+                first.clear();
+            }
             if let Some(tables) =
-                PreparedRunner::open_tables(self, &prepared.blocks, block_ctx, through)?
+                PreparedRunner::open_tables(self, &prepared.blocks, block_ctx, through, &first)?
             {
                 let inner_ctx = snapshot_ctx.unwrap_or(inner_ctx);
                 return Ok((prepared, DmlTables { tables, inner_ctx }));
@@ -5373,12 +5460,12 @@ impl Executor {
         // table prepares again, against the table as it now is
         let mut fresh = false;
         let (prepared, tables) = loop {
-            let prepared =
+            let (prepared, first) =
                 self.prepared_for(compiled, stmt, columns, schema, scope_name, ctx, fresh)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_plan_taken();
             if let Some(tables) =
-                PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx, None)?
+                PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx, None, &first)?
             {
                 break (prepared, tables);
             }
@@ -5697,12 +5784,18 @@ impl<'a> PreparedRunner<'a> {
         prepared: &PreparedBlocks,
         inner_ctx: &ExecutionContext,
         through: Option<&dyn Transaction>,
+        first: &FirstReads,
     ) -> Result<Option<BlockTables>> {
         let mut tables = BlockTables::with_capacity(prepared.subqueries.len());
-        for sq in &prepared.subqueries {
+        for (id, sq) in prepared.subqueries.iter().enumerate() {
             if let Some(source) = &sq.source {
-                let Some(rows) = executor.source_rows(source, &sq.schema, inner_ctx)? else {
-                    return Ok(None);
+                let read = first.iter().find(|(read, _)| *read as usize == id);
+                let rows = match read {
+                    Some((_, rows)) => CompactArc::clone(rows),
+                    None => match executor.source_rows(source, &sq.schema, inner_ctx)? {
+                        Some(rows) => rows,
+                        None => return Ok(None),
+                    },
                 };
                 tables.push(Some(BlockInput::Rows(rows)));
                 continue;

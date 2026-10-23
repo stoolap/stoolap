@@ -333,3 +333,32 @@ fn a_failing_returning_read_writes_nothing() {
         assert_eq!(left.unwrap(), "1:10 2:20 3:30 4:40", "{context}");
     }
 }
+
+#[test]
+fn a_view_defined_again_decides_whether_returning_reads_the_target() {
+    let db = Database::open("memory://prepared_returning_view_redefined").unwrap();
+    setup(&db);
+    const SQL: &str =
+        "UPDATE t SET b = 11 WHERE id = 1 RETURNING id, (SELECT v.b FROM v WHERE v.id = t.id)";
+    for (first, then, refused) in [
+        ("SELECT id, b FROM t", "SELECT id, x AS b FROM u", false),
+        ("SELECT id, x AS b FROM u", "SELECT id, b FROM t", true),
+    ] {
+        db.execute("DROP VIEW IF EXISTS v", ()).unwrap();
+        db.execute(&format!("CREATE VIEW v AS {first}"), ())
+            .unwrap();
+        rows(db.query(SQL, ())).unwrap();
+        db.execute("DROP VIEW v", ()).unwrap();
+        db.execute(&format!("CREATE VIEW v AS {then}"), ()).unwrap();
+        db.execute("BEGIN", ()).unwrap();
+        let got = rows(db.query(SQL, ())).map_err(|e| e.to_string());
+        db.execute("ROLLBACK", ()).unwrap();
+        match refused {
+            true => assert!(
+                got.as_ref().is_err_and(|e| e.contains(REFUSED)),
+                "{then}: {got:?}"
+            ),
+            false => assert_eq!(got, Ok("1:1".to_string()), "{then}"),
+        }
+    }
+}

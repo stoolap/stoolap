@@ -1360,8 +1360,8 @@ impl Executor {
                 visible: None,
             };
             (result, columns, applied, Some(shape))
-        } else if let Some(grouped) = grouped.as_deref() {
-            self.execute_prepared_grouped(grouped, ctx)?
+        } else if let Some((grouped, first)) = grouped.as_ref() {
+            self.execute_prepared_grouped(grouped, first, ctx)?
         } else {
             let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, &classification, compiled)?
@@ -5092,7 +5092,8 @@ impl Executor {
 
     /// The statement's blocks, prepared once with its plan from its ON, the
     /// WHERE `cross` it asks of the joined rows and the WHERE's conditions on
-    /// one side, `side_filters`; none without them
+    /// one side, `side_filters`, with the views' rows preparing read; none
+    /// without them
     #[allow(clippy::too_many_arguments)]
     fn statement_blocks(
         &self,
@@ -5104,7 +5105,12 @@ impl Executor {
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         (left_schema, right_schema): (Option<&Schema>, Option<&Schema>),
         ctx: &ExecutionContext,
-    ) -> Result<Option<std::sync::Arc<JoinBlocks>>> {
+    ) -> Result<
+        Option<(
+            std::sync::Arc<JoinBlocks>,
+            super::prepared_select::FirstReads,
+        )>,
+    > {
         let (
             Some(prepared),
             Some(left_alias),
@@ -5357,10 +5363,14 @@ impl Executor {
             )?,
             false => None,
         };
+        let (blocks, first) = blocks.unzip();
         let blocks_run = match blocks.as_deref() {
-            Some(blocks) => Some(self.join_runner(blocks, ctx)?.ok_or_else(|| {
-                Error::internal("a table's columns changed while the statement prepared")
-            })?),
+            Some(blocks) => Some(
+                self.join_runner(blocks, &first.unwrap_or_default(), ctx)?
+                    .ok_or_else(|| {
+                        Error::internal("a table's columns changed while the statement prepared")
+                    })?,
+            ),
             None => None,
         };
         let statement_run = match (blocks.as_deref(), blocks_run.as_ref()) {
@@ -8714,9 +8724,10 @@ impl Executor {
     fn execute_prepared_grouped(
         &self,
         held: &super::prepared_select::PreparedGrouped,
+        first: &super::prepared_select::FirstReads,
         ctx: &ExecutionContext,
     ) -> SelectResult {
-        let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
+        let run = self.grouped_runner(held, first, ctx)?.ok_or_else(|| {
             Error::internal("a table's columns changed while the statement prepared")
         })?;
         if let Some(plan) = &held.runs_alone {

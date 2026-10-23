@@ -4575,6 +4575,8 @@ impl MVCCEngine {
         // Create the view definition wrapped in Arc for cheap cloning
         let view_def = Arc::new(ViewDefinition::new(name, query));
         views.insert(name_lower.clone(), Arc::clone(&view_def));
+        // A plan reading a view of this name prepares again
+        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
 
         // Release the lock before recording to WAL
         drop(views);
@@ -4603,6 +4605,7 @@ impl MVCCEngine {
             }
             return Err(Error::ViewNotFound(name.to_string()));
         }
+        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
 
         // Release the lock before recording to WAL
         drop(views);
