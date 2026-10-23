@@ -87,6 +87,8 @@ struct Family<'a> {
     ctx: Option<&'a ExecutionContext>,
     /// Every FROM met, checked against the catalog once the syntax passed
     tables: RefCell<SmallVec<[&'a SimpleTableSource; 4]>>,
+    /// The statement's own FROM when it names a table or a view
+    statement_table: std::cell::Cell<Option<&'a SimpleTableSource>>,
 }
 
 impl<'a> Family<'a> {
@@ -102,14 +104,18 @@ impl<'a> Family<'a> {
         Ok(())
     }
 
-    /// The statement's FROM: one table as a block's, or a derived table,
-    /// whose own statement runs as any statement does
+    /// The statement's FROM: one table or view, or a derived table; a view's
+    /// or a derived table's own statement runs as any statement does
     fn statement_from(
         &self,
         table_expr: Option<&'a Expression>,
     ) -> std::result::Result<(), OutOfFamily> {
         match table_expr {
             Some(Expression::SubquerySource(_)) => Ok(()),
+            Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
+                self.statement_table.set(Some(ts));
+                Ok(())
+            }
             other => self.from(other),
         }
     }
@@ -125,8 +131,17 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// Every FROM met names a base table, not a CTE or a view
+    /// Every FROM met names a base table, not a CTE or a view; the
+    /// statement's own may name a view
     fn catalog(&self) -> std::result::Result<(), OutOfFamily> {
+        if let Some(ts) = self.statement_table.get() {
+            if self
+                .ctx
+                .is_some_and(|ctx| ctx.has_cte_by_lower(&ts.name.value_lower))
+            {
+                return Err("FROM names a CTE");
+            }
+        }
         for ts in self.tables.borrow().iter() {
             let name = ts.name.value_lower.as_str();
             if self.ctx.is_some_and(|ctx| ctx.has_cte_by_lower(name)) {
@@ -472,6 +487,7 @@ impl Executor {
             executor: self,
             ctx,
             tables: RefCell::new(SmallVec::new()),
+            statement_table: std::cell::Cell::new(None),
         };
         let mut found = false;
         if let Some(where_clause) = stmt.where_clause.as_deref() {
@@ -3605,6 +3621,7 @@ impl Executor {
             executor: self,
             ctx,
             tables: RefCell::new(SmallVec::new()),
+            statement_table: std::cell::Cell::new(None),
         };
         let mut found = false;
         family.expression(clause, 1, Site::Subqueries, &mut found)?;
@@ -4235,6 +4252,7 @@ impl Executor {
             executor: self,
             ctx: Some(ctx),
             tables: RefCell::new(SmallVec::new()),
+            statement_table: std::cell::Cell::new(None),
         };
         let mut found = false;
         for expr in where_clause.into_iter().chain(sets) {
@@ -4384,15 +4402,30 @@ impl Executor {
     ) -> Result<PreparedOutput> {
         let inner_ctx = ctx.with_incremented_query_depth();
         let unnamed = SmartString::new("");
-        // A derived table's rows are read once, under the statement's
-        // snapshot, before the plan is taken
+        // A view's or a derived table's rows are read once, under the
+        // statement's snapshot, before the plan is taken
         let (source, scope_name) = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => (
-                StatementSource::Table(self.prepared_table(&ts.name.value_lower, ctx, None)?),
-                ts.alias
-                    .as_ref()
-                    .map_or(&ts.name.value_lower, |alias| &alias.value_lower),
-            ),
+            Some(Expression::TableSource(ts)) => {
+                let name = &ts.name.value_lower;
+                // A view never shares its name with a table
+                let source = match self.prepared_table(name, ctx, None) {
+                    Ok(table) => StatementSource::Table(table),
+                    Err(Error::TableOrViewNotFound(missing)) => {
+                        let view = self
+                            .engine
+                            .get_view_lowercase(name)?
+                            .ok_or(Error::TableOrViewNotFound(missing))?;
+                        let result = self.execute_view_body(&view, &inner_ctx)?;
+                        let columns = result.columns().to_vec();
+                        StatementSource::Rows(columns, Self::materialize_result(result)?)
+                    }
+                    Err(e) => return Err(e),
+                };
+                (
+                    source,
+                    ts.alias.as_ref().map_or(name, |alias| &alias.value_lower),
+                )
+            }
             Some(Expression::SubquerySource(ss)) => {
                 let result = self.execute_select(&ss.subquery, &inner_ctx)?;
                 let columns = result.columns().to_vec();

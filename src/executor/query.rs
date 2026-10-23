@@ -7318,17 +7318,12 @@ impl Executor {
         Ok(stmt_arc)
     }
 
-    /// Execute a view as a subquery
-    fn execute_view_query(
+    /// The rows of a view's own query, one view deeper than `ctx`
+    pub(super) fn execute_view_body(
         &self,
         view_def: &ViewDefinition,
-        stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> SelectResult {
-        // classification is passed from caller for the outer stmt
-        // Note: The view's inner query will get its own classification via execute_select
-
+    ) -> Result<Box<dyn QueryResult>> {
         // Check view depth to prevent stack overflow from deeply nested views
         let depth = ctx.view_depth();
         if depth >= MAX_VIEW_DEPTH {
@@ -7347,7 +7342,20 @@ impl Executor {
 
         // Execute the view's query with incremented depth
         let nested_ctx = ctx.with_incremented_view_depth();
-        let result = self.execute_select(view_select, &nested_ctx)?;
+        self.execute_select(view_select, &nested_ctx)
+    }
+
+    /// Execute a view as a subquery
+    fn execute_view_query(
+        &self,
+        view_def: &ViewDefinition,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
+    ) -> SelectResult {
+        // classification is passed from caller for the outer stmt
+        // Note: The view's inner query will get its own classification via execute_select
+        let result = self.execute_view_body(view_def, ctx)?;
         let view_columns = result.columns().to_vec();
 
         // Apply outer query's WHERE clause if present
@@ -8096,25 +8104,7 @@ impl Executor {
 
                 // Check if this is actually a view (for JOINs that reference views)
                 if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
-                    // Check view depth to prevent stack overflow
-                    let depth = ctx.view_depth();
-                    if depth >= MAX_VIEW_DEPTH {
-                        return Err(Error::InvalidArgument(format!(
-                            "Maximum view nesting depth ({}) exceeded",
-                            MAX_VIEW_DEPTH
-                        )));
-                    }
-
-                    // Parse view query using cache (returns Arc<Statement>, no clone)
-                    let view_stmt = self.parse_view_statement(&view_def.query)?;
-                    let view_select = match view_stmt.as_ref() {
-                        Statement::Select(s) => s,
-                        _ => unreachable!("parse_view_statement validates this is a SELECT"),
-                    };
-
-                    // Execute with incremented depth
-                    let nested_ctx = ctx.with_incremented_view_depth();
-                    let result = self.execute_select(view_select, &nested_ctx)?;
+                    let result = self.execute_view_body(&view_def, ctx)?;
                     let columns = result.columns().to_vec();
 
                     // Prefix column names with view alias (or view name if no alias)
