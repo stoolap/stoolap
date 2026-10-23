@@ -4407,19 +4407,14 @@ impl Executor {
         let (source, scope_name) = match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = &ts.name.value_lower;
-                // A view never shares its name with a table
-                let source = match self.prepared_table(name, ctx, None) {
-                    Ok(table) => StatementSource::Table(table),
-                    Err(Error::TableOrViewNotFound(missing)) => {
-                        let view = self
-                            .engine
-                            .get_view_lowercase(name)?
-                            .ok_or(Error::TableOrViewNotFound(missing))?;
+                // A view comes before a table of its name, as the general path reads it
+                let source = match self.engine.get_view_lowercase(name)? {
+                    Some(view) => {
                         let result = self.execute_view_body(&view, &inner_ctx)?;
                         let columns = result.columns().to_vec();
                         StatementSource::Rows(columns, Self::materialize_result(result)?)
                     }
-                    Err(e) => return Err(e),
+                    None => StatementSource::Table(self.prepared_table(name, ctx, None)?),
                 };
                 (
                     source,
