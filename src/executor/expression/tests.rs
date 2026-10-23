@@ -571,3 +571,32 @@ fn test_a_block_outside_a_prepared_plan_does_not_compile() {
         );
     }
 }
+
+#[test]
+fn arithmetic_answers_alike_on_the_borrowing_and_the_owned_vm() {
+    let epoch = chrono::DateTime::from_timestamp(86_400 * 30, 0).unwrap();
+    let values = [
+        Value::Integer(7),
+        Value::Integer(-3),
+        Value::Integer(0),
+        Value::Integer(i64::MAX),
+        Value::Float(2.5),
+        Value::Null(crate::core::DataType::Integer),
+        Value::Timestamp(epoch),
+        Value::Text(SmartString::from("1 day")),
+    ];
+    let mut vm = ExprVM::new();
+    for op in [Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod] {
+        let program = Program::new(vec![Op::LoadColumn(0), Op::LoadColumn(1), op, Op::Return]);
+        assert!(program.cow_supported(), "{program:?}");
+        for a in &values {
+            for b in &values {
+                let row = Row::from_values(vec![a.clone(), b.clone()]);
+                let ctx = ExecuteContext::new(&row);
+                let owned = format!("{:?}", vm.execute(&program, &ctx));
+                let borrowed = format!("{:?}", vm.execute_cow(&program, &ctx));
+                assert_eq!(borrowed, owned, "{program:?} over {a:?} and {b:?}");
+            }
+        }
+    }
+}

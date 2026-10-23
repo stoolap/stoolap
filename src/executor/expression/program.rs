@@ -393,6 +393,11 @@ impl Program {
                     | Op::Le
                     | Op::Gt
                     | Op::Ge
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Mod
                     | Op::EqColumnConst(..)
                     | Op::LtColumnConst(..)
                     | Op::GtColumnConst(..)

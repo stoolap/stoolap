@@ -808,17 +808,7 @@ impl ExprVM {
                 Op::Add => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // Handle timestamp + interval or timestamp + integer (days)
-                    let result = match (&a, &b) {
-                        (Value::Timestamp(t), Value::Integer(days))
-                        | (Value::Integer(days), Value::Timestamp(t)) => {
-                            Self::timestamp_add_days(*t, *days, false)?
-                        }
-                        (Value::Timestamp(_), Value::Text(_)) => {
-                            Self::timestamp_add_interval(&a, &b, false)?
-                        }
-                        _ => Self::arithmetic_op(&a, &b, IntegerOp::Add, |x, y| x + y)?,
-                    };
+                    let result = Self::add_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -826,23 +816,7 @@ impl ExprVM {
                 Op::Sub => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // Handle timestamp - interval, timestamp - integer (days), or timestamp - timestamp
-                    let result = match (&a, &b) {
-                        (Value::Timestamp(t1), Value::Timestamp(t2)) => {
-                            // Return interval text
-                            let duration = t1.signed_duration_since(*t2);
-                            Value::Text(SmartString::from_string(
-                                self.format_duration_as_interval(duration),
-                            ))
-                        }
-                        (Value::Timestamp(t), Value::Integer(days)) => {
-                            Self::timestamp_add_days(*t, *days, true)?
-                        }
-                        (Value::Timestamp(_), Value::Text(_)) => {
-                            Self::timestamp_add_interval(&a, &b, true)?
-                        }
-                        _ => Self::arithmetic_op(&a, &b, IntegerOp::Sub, |x, y| x - y)?,
-                    };
+                    let result = self.sub_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -850,7 +824,7 @@ impl ExprVM {
                 Op::Mul => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::arithmetic_op(&a, &b, IntegerOp::Mul, |x, y| x * y)?;
+                    let result = Self::mul_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -2356,6 +2330,41 @@ impl ExprVM {
                 }
 
                 // STRING CONCATENATION
+                Op::Add => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::add_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Sub => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(self.sub_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Mul => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::mul_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Div => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::div_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Mod => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::mod_op(&a, &b)?));
+                    pc += 1;
+                }
+
                 Op::Concat => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
@@ -3277,6 +3286,43 @@ impl ExprVM {
             _ if a.is_null() || b.is_null() => Ok(Value::Null(DataType::Float)),
             _ => Ok(Value::Null(DataType::Null)),
         }
+    }
+
+    /// `a + b`, with a timestamp plus days or an interval
+    #[inline]
+    fn add_op(a: &Value, b: &Value) -> Result<Value> {
+        match (a, b) {
+            (Value::Timestamp(t), Value::Integer(days))
+            | (Value::Integer(days), Value::Timestamp(t)) => {
+                Self::timestamp_add_days(*t, *days, false)
+            }
+            (Value::Timestamp(_), Value::Text(_)) => Self::timestamp_add_interval(a, b, false),
+            _ => Self::arithmetic_op(a, b, IntegerOp::Add, |x, y| x + y),
+        }
+    }
+
+    /// `a - b`, with a timestamp minus days or an interval, and the interval
+    /// text between two timestamps
+    #[inline]
+    fn sub_op(&self, a: &Value, b: &Value) -> Result<Value> {
+        match (a, b) {
+            (Value::Timestamp(t1), Value::Timestamp(t2)) => {
+                let duration = t1.signed_duration_since(*t2);
+                Ok(Value::Text(SmartString::from_string(
+                    self.format_duration_as_interval(duration),
+                )))
+            }
+            (Value::Timestamp(t), Value::Integer(days)) => {
+                Self::timestamp_add_days(*t, *days, true)
+            }
+            (Value::Timestamp(_), Value::Text(_)) => Self::timestamp_add_interval(a, b, true),
+            _ => Self::arithmetic_op(a, b, IntegerOp::Sub, |x, y| x - y),
+        }
+    }
+
+    #[inline]
+    fn mul_op(a: &Value, b: &Value) -> Result<Value> {
+        Self::arithmetic_op(a, b, IntegerOp::Mul, |x, y| x * y)
     }
 
     #[inline]
