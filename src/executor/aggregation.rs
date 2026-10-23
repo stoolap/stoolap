@@ -1023,7 +1023,7 @@ impl<'a> RowFeed<'a> {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<()> {
         #[cfg(feature = "parallel")]
-        if rows.len() >= PARALLEL_ROWS && !self.programs && blocks.is_none() && groups.can_merge() {
+        if rows.len() >= PARALLEL_ROWS && !self.programs && groups.can_merge() {
             let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
             let params = ctx.params();
             let parts: Vec<GroupedAggregates> = rows

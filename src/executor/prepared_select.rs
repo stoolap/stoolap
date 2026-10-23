@@ -3322,10 +3322,11 @@ impl PreparedGrouped {
         let mut work = Rewritten::default();
         let where_parts = match stmt.where_clause.as_deref() {
             Some(where_clause) if mentions_subquery(where_clause) => {
+                let where_clause = with_aliases(where_clause, &stmt.columns, &scope.columns);
                 Some(builder.statement_where(
                     &chain,
                     &schema,
-                    where_clause,
+                    &where_clause,
                     &mut work,
                     &mut run_slots,
                 )?)
@@ -3352,35 +3353,71 @@ impl PreparedGrouped {
             input.resize(builder.subqueries.len(), true);
             Ok(rewritten)
         }
-        // A GROUP BY item holding a subquery is rewritten once, and the SELECT
-        // list and HAVING read it as that wherever they write it
-        let mut items = FxHashMap::default();
-        for item in executor.parse_group_by(stmt, &[])? {
-            let GroupByItem::Expression { expr, .. } = item else {
-                continue;
+        // A SELECT item the GROUP BY names by its alias or position groups the
+        // rows, found by asking parse_group_by of the list with each marked
+        let mark = |i: usize| format!("\0select item {i}");
+        let marked = SelectStatement {
+            columns: stmt
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| {
+                    let item = unaliased(column);
+                    if !mentions_subquery(item) || expression_contains_aggregate(item) {
+                        return column.clone();
+                    }
+                    let name = mark(i);
+                    let id = Expression::Identifier(Identifier::new(
+                        Token::new(TokenType::Identifier, &name, Position::default()),
+                        &name,
+                    ));
+                    match column {
+                        Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
+                            token: aliased.token.clone(),
+                            expression: Box::new(id),
+                            alias: aliased.alias.clone(),
+                        }),
+                        _ => id,
+                    }
+                })
+                .collect(),
+            ..stmt.clone()
+        };
+        let mut keys = vec![false; stmt.columns.len()];
+        for item in executor.parse_group_by(&marked, &[])? {
+            let name = match &item {
+                GroupByItem::Column(name) => name.as_str(),
+                GroupByItem::Expression {
+                    expr: Expression::Identifier(id),
+                    ..
+                } => id.value.as_str(),
+                GroupByItem::Expression { .. } => continue,
             };
-            if !mentions_subquery(&expr) {
-                continue;
-            }
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                items.entry(ExprKey::of(&expr))
-            {
-                let rewritten =
-                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, &expr)?;
-                entry.insert(rewritten);
+            if let Some(key) = (0..keys.len()).find(|&i| name == mark(i)) {
+                keys[key] = true;
             }
         }
-        let group_by = stmt
-            .group_by
-            .columns
-            .iter()
-            .map(|item| {
-                read_inputs(item, &items, &mut |call| {
-                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut output = |expr: &Expression| -> Result<Expression> {
+        // A GROUP BY expression holding a subquery is rewritten where it is
+        // written; a SELECT item or HAVING reads the first of one identity
+        let mut items = FxHashMap::default();
+        let mut group_by = Vec::with_capacity(stmt.group_by.columns.len());
+        for item in &stmt.group_by.columns {
+            if !mentions_subquery(item) {
+                group_by.push(item.clone());
+                continue;
+            }
+            let rewritten = input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, item)?;
+            items
+                .entry(ExprKey::of(item))
+                .or_insert_with(|| rewritten.clone());
+            group_by.push(rewritten);
+        }
+        // An item the GROUP BY names is read for each input row, any other
+        // for each group
+        let mut output = |expr: &Expression, key: bool| -> Result<Expression> {
+            if key {
+                return input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr);
+            }
             let read = read_inputs(expr, &items, &mut |call| {
                 input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
             })?;
@@ -3388,19 +3425,19 @@ impl PreparedGrouped {
         };
         // An item holding a subquery keeps the name it is written under
         let mut columns = Vec::with_capacity(stmt.columns.len());
-        for column in &stmt.columns {
+        for (column, &key) in stmt.columns.iter().zip(&keys) {
             columns.push(match column {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
-                    expression: Box::new(output(&aliased.expression)?),
+                    expression: Box::new(output(&aliased.expression, key)?),
                     alias: aliased.alias.clone(),
                 }),
                 column => {
                     let name = executor.grouped_item_name(column);
                     Expression::Aliased(AliasedExpression {
                         token: Token::new(TokenType::Identifier, &name, Position::default()),
-                        expression: Box::new(output(column)?),
+                        expression: Box::new(output(column, key)?),
                         alias: Identifier::new(
                             Token::new(TokenType::Identifier, &name, Position::default()),
                             &name,
@@ -3410,7 +3447,7 @@ impl PreparedGrouped {
             });
         }
         let having = match (&opened_having, stmt.having.as_deref()) {
-            (Some(opened), _) => Some(Box::new(output(opened)?)),
+            (Some(opened), _) => Some(Box::new(output(opened, false)?)),
             (None, other) => other.map(|having| Box::new(having.clone())),
         };
         let blocks_read = builder.subqueries.len();

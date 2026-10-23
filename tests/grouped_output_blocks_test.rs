@@ -570,6 +570,62 @@ fn an_input_row_subquery_raises_its_error_only_for_a_row_that_reaches_it() {
 }
 
 #[test]
+fn two_anonymous_parameters_in_grouped_items_stay_two() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_anonymous").unwrap();
+    fill(&db);
+    for (sql, literal) in [
+        (
+            "SELECT a + (SELECT ?) AS x, a + (SELECT ?) AS y, COUNT(*) FROM t GROUP BY 1, 2 \
+             ORDER BY 1, 2",
+            "SELECT a + 1 AS x, a + 2 AS y, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 1, 2",
+        ),
+        (
+            "SELECT a + (SELECT ?) AS x, a + (SELECT ?) AS y, COUNT(*) FROM t GROUP BY x, y \
+             ORDER BY 1, 2",
+            "SELECT a + 1 AS x, a + 2 AS y, COUNT(*) FROM t GROUP BY x, y ORDER BY 1, 2",
+        ),
+        (
+            "SELECT COUNT(*), MIN(a) FROM t GROUP BY a + (SELECT ?), a - (SELECT ?) ORDER BY 1, 2",
+            "SELECT COUNT(*), MIN(a) FROM t GROUP BY a + 1, a - 2 ORDER BY 1, 2",
+        ),
+    ] {
+        let got: Vec<String> = db
+            .query(sql, (1i64, 2i64))
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        assert_eq!(Ok(got), rows(&db, literal), "{sql}");
+    }
+}
+
+#[test]
+fn a_where_naming_a_select_alias_reads_that_item() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_where_alias").unwrap();
+    fill(&db);
+    let sql = "SELECT a AS z, (SELECT MAX(u.x) FROM u) FROM t WHERE z IN (SELECT u.k FROM u \
+               WHERE u.x > 3) GROUP BY a ORDER BY 1";
+    let got = rows(&db, sql);
+    assert!(
+        got.as_ref().is_ok_and(|rows| !rows.is_empty()),
+        "{sql}: {got:?}"
+    );
+    assert_eq!(
+        got,
+        rows(&db, &sql.replace("WHERE z IN", "WHERE a IN")),
+        "{sql}"
+    );
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+}
+
+#[test]
 fn a_grouped_statement_s_subqueries_read_parameters_and_the_transaction_s_writes() {
     let _guard = serial();
     let db = Database::open("memory://grouped_output_blocks_params").unwrap();
