@@ -5469,7 +5469,9 @@ impl<'a> PreparedRunner<'a> {
             }
         };
         Ok(match &set.set {
-            MemberSet::In(set_of) => {
+            // A key's set is a correlated block's, which no scan takes
+            MemberSet::In(_) => SetScan::Program,
+            MemberSet::SharedIn(set_of) => {
                 let members = set_of.members();
                 let mut values = members.iter().filter(|v| !v.is_null()).cloned();
                 match (slot.negated, set_of.has_null()) {
@@ -5620,7 +5622,8 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// Hand `keep` each of `rows` that passes `where_`, with the count of
-    /// rows read so far, until `keep` says stop
+    /// rows read so far, until `keep` says stop. The set conjuncts test the
+    /// members read before the first row, as a table's scan does
     fn rows_passing(
         &self,
         where_: &PreparedWhere,
@@ -5633,12 +5636,27 @@ impl<'a> PreparedRunner<'a> {
             return Ok(Passing::Read);
         }
         let mut vm = ExprVM::new();
+        let mut program = None;
         for (scanned, read) in (1u64..).zip(rows) {
             if scanned.is_multiple_of(100) {
                 ctx.check_cancelled()?;
             }
             let (id, row) = read?;
-            if self.matches(&mut vm, &where_.program, &row)? && !keep(id, scanned, row) {
+            // Rows read in no table are narrowed by no key: the narrowing's
+            // set is a set conjunct like the others
+            let program = program.get_or_insert_with(|| {
+                let slots: SmallVec<[SetSlot; 2]> = where_
+                    .sets
+                    .iter()
+                    .copied()
+                    .chain(where_.narrowing_set)
+                    .collect();
+                match slots.is_empty() {
+                    true => CompactArc::clone(&where_.program),
+                    false => self.with_bound_sets(&where_.program, &slots),
+                }
+            });
+            if self.matches(&mut vm, program, &row)? && !keep(id, scanned, row) {
                 break;
             }
         }
@@ -6390,12 +6408,17 @@ fn more_than_one_row() -> Error {
     }
 }
 
-/// `values` as `test` asks them, NULL members included
-fn member_set(test: MemberTest, values: Vec<Value>) -> MemberSet {
+/// `values` as `test` asks them, NULL members included; an uncorrelated
+/// block's IN set `shared`, a key's kept in place
+fn member_set(test: MemberTest, values: Vec<Value>, shared: bool) -> MemberSet {
     match test {
-        MemberTest::In => MemberSet::In(PredicateSet::of(CompactArc::new(
-            values.into_iter().collect(),
-        ))),
+        MemberTest::In => {
+            let set = PredicateSet::of(CompactArc::new(values.into_iter().collect()));
+            match shared {
+                true => MemberSet::SharedIn(CompactArc::new(set)),
+                false => MemberSet::In(set),
+            }
+        }
         MemberTest::Quantified(op, all) => {
             let has_null = values.iter().any(Value::is_null);
             let members: Vec<Value> = values.into_iter().filter(|v| !v.is_null()).collect();
@@ -6503,8 +6526,6 @@ impl PreparedRunner<'_> {
         if !program.has_subqueries() {
             return Some(CompactArc::clone(program));
         }
-        let empty = Row::new();
-        let caller = ExecuteContext::new(&empty);
         let mut ops = Vec::with_capacity(program.len());
         for op in program.ops() {
             let index = match op {
@@ -6515,27 +6536,65 @@ impl PreparedRunner<'_> {
                     continue;
                 }
             };
-            let sq = self.prepared.subqueries.get(index)?;
-            let Answer::Members(kept, members) = &sq.answer else {
-                return None;
-            };
-            if !sq.uncorrelated {
-                return None;
-            }
-            self.read_members(index, kept, members, &caller, self.holes)
-                .ok()?;
-            let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
-                return None;
-            };
-            if set.failed.is_some() {
-                return None;
-            }
-            ops.push(match &set.set {
-                MemberSet::In(set) => Op::InSet(CompactArc::new(set.clone())),
-                MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
-            });
+            ops.push(self.bound_set(index)?);
         }
         Some(CompactArc::new(super::expression::Program::new(ops)))
+    }
+
+    /// `program` with the member tests of `slots` bound to the sets this run
+    /// read; a test whose set is not read stays one the run answers
+    fn with_bound_sets(&self, program: &SharedProgram, slots: &[SetSlot]) -> SharedProgram {
+        let ops = program.ops().iter().map(|op| match op {
+            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..)
+                if slots.iter().any(|slot| slot.id == *index) =>
+            {
+                match self.bound_set(*index as usize) {
+                    Some(bound) => {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::prepared_strategy_ran(
+                            crate::test_failpoints::PreparedStrategy::RowsTakeMembers,
+                        );
+                        bound
+                    }
+                    None => op.clone(),
+                }
+            }
+            op => op.clone(),
+        });
+        CompactArc::new(super::expression::Program::new(ops.collect()))
+    }
+
+    /// The test over the members uncorrelated block `index` holds for this
+    /// run, read now; None when the read fails or a candidate failed, whose
+    /// error stays with the row that needs it
+    fn bound_set(&self, index: usize) -> Option<Op> {
+        let sq = self.prepared.subqueries.get(index)?;
+        let Answer::Members(kept, members) = &sq.answer else {
+            return None;
+        };
+        if !sq.uncorrelated {
+            return None;
+        }
+        let empty = Row::new();
+        self.read_members(
+            index,
+            kept,
+            members,
+            &ExecuteContext::new(&empty),
+            self.holes,
+        )
+        .ok()?;
+        let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
+            return None;
+        };
+        if set.failed.is_some() {
+            return None;
+        }
+        Some(match &set.set {
+            MemberSet::SharedIn(set) => Op::InSet(CompactArc::clone(set)),
+            MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
+            MemberSet::In(_) => return None,
+        })
     }
 
     /// `read` of block `index`'s set, or the error a read of it raised
@@ -6639,7 +6698,7 @@ impl PreparedRunner<'_> {
                     None => values,
                 };
                 return Ok(KeptMembers {
-                    set: member_set(members.test, values),
+                    set: member_set(members.test, values, true),
                     failed: None,
                 });
             }
@@ -6662,13 +6721,13 @@ impl PreparedRunner<'_> {
                 }
             }
             return Ok(KeptMembers {
-                set: member_set(members.test, values),
+                set: member_set(members.test, values, true),
                 failed,
             });
         }
         let mut grouped = self.group_members(index, members, plan)?;
         Ok(grouped.remove(&[][..]).unwrap_or_else(|| KeptMembers {
-            set: member_set(members.test, Vec::new()),
+            set: member_set(members.test, Vec::new(), true),
             failed: None,
         }))
     }
@@ -6746,7 +6805,7 @@ impl PreparedRunner<'_> {
                 (
                     key,
                     KeptMembers {
-                        set: member_set(members.test, values),
+                        set: member_set(members.test, values, plan.is_none()),
                         failed,
                     },
                 )
@@ -6787,7 +6846,7 @@ impl PreparedRunner<'_> {
         let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
             return Ok(None);
         };
-        let MemberSet::In(set_of) = &set.set else {
+        let MemberSet::SharedIn(set_of) = &set.set else {
             return Ok(None);
         };
         if set.failed.is_some() {

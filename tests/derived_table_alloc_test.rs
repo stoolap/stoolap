@@ -28,13 +28,15 @@ struct ThreadCounting;
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for ThreadCounting {
-    // SAFETY: forwards to the system allocator; the counter is a const
-    // thread-local Cell, which never allocates
+    // SAFETY: forwards to the system allocator; the counters are const
+    // thread-local Cells, which never allocate
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.with(|a| a.set(a.get() + 1));
+        BYTES.with(|b| b.set(b.get() + layout.size()));
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -42,6 +44,7 @@ unsafe impl GlobalAlloc for ThreadCounting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.with(|a| a.set(a.get() + 1));
+        BYTES.with(|b| b.set(b.get() + new_size));
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -57,6 +60,11 @@ fn allocations() -> usize {
 
 /// The allocations of one run of `sql`, prepared, after a first run
 fn per_run(db: &Database, sql: &str) -> usize {
+    per_run_counted(db, sql, allocations)
+}
+
+/// What `count` counts over one run of `sql`, prepared, after a first run
+fn per_run_counted(db: &Database, sql: &str, count: fn() -> usize) -> usize {
     let statement = db.prepare(sql).unwrap();
     let run = || {
         for row in statement.query(()).unwrap() {
@@ -64,11 +72,11 @@ fn per_run(db: &Database, sql: &str) -> usize {
         }
     };
     run();
-    let before = allocations();
+    let before = count();
     for _ in 0..RUNS {
         run();
     }
-    (allocations() - before) / RUNS
+    (count() - before) / RUNS
 }
 
 #[test]
@@ -103,10 +111,52 @@ fn a_derived_table_or_view_costs_what_its_table_does_plus_a_bounded_count() {
         );
         costs.push((rows, table, derived, view));
     }
+    // The set conjunct's program, bound once per run to the members read
     assert!(
         costs
             .iter()
-            .all(|&(_, table, derived, view)| derived <= table + 12 && view <= table + 12),
+            .all(|&(_, table, derived, view)| derived <= table + 16 && view <= table + 16),
         "(rows, allocations over the table, the derived table, the view): {costs:?}"
     );
+}
+
+#[test]
+fn a_set_the_rows_test_is_shared_not_copied_per_run() {
+    let bytes = || BYTES.with(Cell::get);
+    // A number meets the numbers the TEXT members read as, built with the
+    // set; a TIMESTAMP the timestamps they read as, taken on its first test
+    for (probe, member) in [
+        ("1", "{i}"),
+        ("CAST('1001-01-01' AS TIMESTAMP)", "{year}-01-01"),
+    ] {
+        let mut costs = Vec::new();
+        for members in [200, 4000] {
+            let db = Database::open(&format!(
+                "memory://rows_set_bytes_{members}_{}",
+                probe.len()
+            ))
+            .unwrap();
+            db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, s TEXT)", ())
+                .unwrap();
+            let insert = db.prepare("INSERT INTO m VALUES ($1, $2)").unwrap();
+            for i in 1..=members {
+                let text = member
+                    .replace("{i}", &i.to_string())
+                    .replace("{year}", &(1000 + i).to_string());
+                insert.execute((i, text)).unwrap();
+            }
+            let per_run = per_run_counted(
+                &db,
+                &format!(
+                    "SELECT q.x FROM (VALUES ({probe})) AS q(x) WHERE q.x IN (SELECT s FROM m)"
+                ),
+                bytes,
+            );
+            costs.push((members, per_run));
+        }
+        assert!(
+            costs[1].1 < costs[0].1 + 4096,
+            "{probe}: (TEXT members, bytes allocated per run): {costs:?}"
+        );
+    }
 }

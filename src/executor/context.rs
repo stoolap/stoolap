@@ -577,7 +577,11 @@ pub struct ExistsKeys {
 /// A value block's members as one test asks them
 #[derive(Debug)]
 pub enum MemberSet {
+    /// The IN members of one key of a correlated block
     In(PredicateSet),
+    /// An uncorrelated block's IN members, shared with the member tests a
+    /// program is bound to
+    SharedIn(CompactArc<PredicateSet>),
     Quantified(super::expression::QuantifiedMembers),
 }
 
@@ -597,6 +601,7 @@ impl KeptMembers {
     pub(crate) fn answer(&self, value: &crate::core::Value) -> crate::core::Result<Option<bool>> {
         let (answer, decides) = match &self.set {
             MemberSet::In(set) => (set.contains(value), true),
+            MemberSet::SharedIn(set) => (set.contains(value), true),
             MemberSet::Quantified(members) => (members.answer(value), !members.parts().1),
         };
         match (&self.failed, answer) {
