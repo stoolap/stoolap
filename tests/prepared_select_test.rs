@@ -2005,3 +2005,93 @@ fn test_rewritten_columns_never_read_as_literals() {
         assert_eq!(found, vec![7], "{shape}: a column, not a literal");
     }
 }
+
+#[test]
+fn test_a_derived_table_runs_prepared_over_its_rows() {
+    let _guard = serial();
+    let db = setup("prepared_derived");
+    const DERIVED: &str = "SELECT s.id FROM (SELECT id, a, b FROM t) AS s \
+                           WHERE s.b = $1 AND s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    assert_eq!(prepared_line(&db, DERIVED), "Prepared: yes");
+    let built = prepared_selects_built();
+    let general = general_hits();
+    for (param, want) in [(1, vec![1]), (2, vec![6]), (1, vec![1])] {
+        let (found, runs) = ids(&db, DERIVED, (param,));
+        assert_eq!(found, want, "b = {param}");
+        assert_eq!(runs, 3, "b = {param} runs once per derived row");
+    }
+    assert_eq!(
+        prepared_selects_built() - built,
+        1,
+        "prepared once across three runs"
+    );
+    assert_eq!(general_hits(), general, "no general path ran");
+}
+
+#[test]
+fn test_a_derived_table_repeating_a_name_reads_star_by_position() {
+    let _guard = serial();
+    let db = setup("prepared_derived_repeated_star");
+    const STAR: &str = "SELECT * FROM (SELECT id, 10 AS x, 20 AS x FROM t) AS s \
+                        WHERE s.id < 3 AND EXISTS (SELECT 1 FROM u WHERE u.id = s.id) ORDER BY 1";
+    assert_eq!(prepared_line(&db, STAR), "Prepared: yes");
+    let rows: Vec<(i64, i64, i64)> = db
+        .query(STAR, ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(rows, vec![(1, 10, 20), (2, 10, 20)], "each x by position");
+}
+
+#[test]
+fn test_a_name_a_derived_table_repeats_is_ambiguous() {
+    let _guard = serial();
+    let db = setup("prepared_derived_repeated_name");
+    const FROM: &str = "FROM (SELECT id, 10 AS x, 20 AS x FROM t) AS s";
+    const EXISTS: &str = "EXISTS (SELECT 1 FROM u WHERE u.id = s.id)";
+    for (site, sql) in [
+        (
+            "WHERE",
+            format!("SELECT s.id {FROM} WHERE s.x = 20 AND {EXISTS}"),
+        ),
+        (
+            "bare WHERE",
+            format!("SELECT s.id {FROM} WHERE x = 20 AND {EXISTS}"),
+        ),
+        ("select list", format!("SELECT s.x {FROM} WHERE {EXISTS}")),
+        (
+            "ORDER BY",
+            format!("SELECT s.id {FROM} WHERE {EXISTS} ORDER BY s.x"),
+        ),
+        (
+            "ORDER BY expression over an alias of the name",
+            format!("SELECT s.id AS x {FROM} WHERE {EXISTS} ORDER BY x + 0"),
+        ),
+        (
+            "correlated block",
+            format!("SELECT s.id {FROM} WHERE EXISTS (SELECT 1 FROM u WHERE u.id = s.x)"),
+        ),
+    ] {
+        let (err, _) = error(&db, &sql, ());
+        assert!(err.contains("is ambiguous"), "{site}: {err}");
+    }
+    for (site, sql) in [
+        (
+            "bare ORDER BY alias",
+            format!("SELECT s.id AS x {FROM} WHERE {EXISTS} ORDER BY x DESC"),
+        ),
+        (
+            "ORDER BY expression over an alias no column has",
+            format!("SELECT s.id AS y {FROM} WHERE {EXISTS} ORDER BY 0 - y"),
+        ),
+    ] {
+        assert_eq!(ids(&db, &sql, ()).0, vec![6, 5, 3, 2, 1], "{site}");
+    }
+}
