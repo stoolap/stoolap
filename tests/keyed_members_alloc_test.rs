@@ -50,54 +50,68 @@ static COUNTING: ThreadCounting = ThreadCounting;
 
 const RUNS: usize = 20;
 
-#[test]
-fn a_keyed_member_set_costs_four_allocations_per_key_not_five() {
-    let mut costs = Vec::new();
-    for keys in [100, 200] {
-        let db = Database::open(&format!("memory://keyed_members_alloc_{keys}")).unwrap();
-        db.execute(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
-            (),
-        )
+/// The allocations per run of a correlated IN over `keys` keys, its values
+/// of `kind`
+fn per_run(kind: &str, keys: usize) -> usize {
+    let db = Database::open(&format!("memory://keyed_members_alloc_{kind}_{keys}")).unwrap();
+    db.execute(
+        &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, x {kind})"),
+        (),
+    )
+    .unwrap();
+    db.execute(
+        &format!("CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v {kind})"),
+        (),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO t SELECT value, value, CAST(value AS {kind}) FROM generate_series(1, {keys})"
+        ),
+        (),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO u SELECT value, value % {keys}, CAST(value AS {kind}) \
+             FROM generate_series(1, {})",
+            keys * 3
+        ),
+        (),
+    )
+    .unwrap();
+    let statement = db
+        .prepare("SELECT id FROM t WHERE x IN (SELECT v FROM u WHERE u.k = t.k)")
         .unwrap();
-        db.execute(
-            "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
-            (),
-        )
-        .unwrap();
-        db.execute(
-            &format!("INSERT INTO t SELECT value, value, value FROM generate_series(1, {keys})"),
-            (),
-        )
-        .unwrap();
-        db.execute(
-            &format!(
-                "INSERT INTO u SELECT value, value % {keys}, value FROM generate_series(1, {})",
-                keys * 3
-            ),
-            (),
-        )
-        .unwrap();
-        let statement = db
-            .prepare("SELECT id FROM t WHERE x IN (SELECT v FROM u WHERE u.k = t.k)")
-            .unwrap();
-        // A transaction keeps no answer between runs: each one groups again
-        db.execute("BEGIN", ()).unwrap();
-        let run = || {
-            for row in statement.query(()).unwrap() {
-                row.unwrap();
-            }
-        };
-        run();
-        let before = ALLOCATIONS.with(Cell::get);
-        for _ in 0..RUNS {
-            run();
+    // A transaction keeps no answer between runs: each one groups again
+    db.execute("BEGIN", ()).unwrap();
+    let run = || {
+        for row in statement.query(()).unwrap() {
+            row.unwrap();
         }
-        costs.push((keys, (ALLOCATIONS.with(Cell::get) - before) / RUNS));
-        db.execute("COMMIT", ()).unwrap();
+    };
+    run();
+    let before = ALLOCATIONS.with(Cell::get);
+    for _ in 0..RUNS {
+        run();
     }
+    let cost = (ALLOCATIONS.with(Cell::get) - before) / RUNS;
+    db.execute("COMMIT", ()).unwrap();
+    cost
+}
+
+#[test]
+fn a_keyed_member_set_costs_no_more_per_key_than_its_members() {
+    // The allocations each further key costs: an INTEGER set, and a TEXT set
+    // with the numbers its members read as
+    let costs: Vec<(&str, usize, [usize; 2])> = [("INTEGER", 4), ("TEXT", 5)]
+        .into_iter()
+        .map(|(kind, per_key)| (kind, per_key, [per_run(kind, 100), per_run(kind, 200)]))
+        .collect();
     assert!(
-        costs[1].1 - costs[0].1 < 450,
-        "(keys, allocations per run): {costs:?}"
+        costs
+            .iter()
+            .all(|&(_, per_key, [few, many])| many - few < (2 * per_key + 1) * 100 / 2),
+        "(kind, allocations per key, per run over 100 and 200 keys): {costs:?}"
     );
 }

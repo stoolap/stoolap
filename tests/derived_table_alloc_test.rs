@@ -123,25 +123,40 @@ fn a_derived_table_or_view_costs_what_its_table_does_plus_a_bounded_count() {
 #[test]
 fn a_set_the_rows_test_is_shared_not_copied_per_run() {
     let bytes = || BYTES.with(Cell::get);
-    let mut costs = Vec::new();
-    for members in [200, 4000] {
-        let db = Database::open(&format!("memory://rows_set_bytes_{members}")).unwrap();
-        db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, s TEXT)", ())
+    // A number meets the numbers the TEXT members read as, built with the
+    // set; a TIMESTAMP the timestamps they read as, taken on its first test
+    for (probe, member) in [
+        ("1", "{i}"),
+        ("CAST('1001-01-01' AS TIMESTAMP)", "{year}-01-01"),
+    ] {
+        let mut costs = Vec::new();
+        for members in [200, 4000] {
+            let db = Database::open(&format!(
+                "memory://rows_set_bytes_{members}_{}",
+                probe.len()
+            ))
             .unwrap();
-        db.execute(
-            &format!("INSERT INTO m SELECT value, CAST(value AS TEXT) FROM generate_series(1, {members})"),
-            (),
-        )
-        .unwrap();
-        let per_run = per_run_counted(
-            &db,
-            "SELECT q.x FROM (VALUES (1)) AS q(x) WHERE q.x IN (SELECT s FROM m)",
-            bytes,
+            db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, s TEXT)", ())
+                .unwrap();
+            let insert = db.prepare("INSERT INTO m VALUES ($1, $2)").unwrap();
+            for i in 1..=members {
+                let text = member
+                    .replace("{i}", &i.to_string())
+                    .replace("{year}", &(1000 + i).to_string());
+                insert.execute((i, text)).unwrap();
+            }
+            let per_run = per_run_counted(
+                &db,
+                &format!(
+                    "SELECT q.x FROM (VALUES ({probe})) AS q(x) WHERE q.x IN (SELECT s FROM m)"
+                ),
+                bytes,
+            );
+            costs.push((members, per_run));
+        }
+        assert!(
+            costs[1].1 < costs[0].1 + 4096,
+            "{probe}: (TEXT members, bytes allocated per run): {costs:?}"
         );
-        costs.push((members, per_run));
     }
-    assert!(
-        costs[1].1 < costs[0].1 + 4096,
-        "(TEXT members, bytes allocated per run): {costs:?}"
-    );
 }

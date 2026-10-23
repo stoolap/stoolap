@@ -344,12 +344,11 @@ struct TextReads {
 #[derive(Debug, Clone)]
 pub struct PredicateSet {
     members: CompactArc<ValueSet>,
-    /// The numbers the TEXT members read as, None without one; shared, as
-    /// the readings are, by a clone
-    numbers_in_text: Option<CompactArc<ValueSet>>,
+    /// The numbers the TEXT members read as
+    numbers_in_text: ValueSet,
     /// The BOOLEAN and TIMESTAMP readings of the TEXT members, taken when a
     /// probe of that type first meets them
-    text_reads: [std::sync::OnceLock<CompactArc<TextReads>>; 2],
+    text_reads: [std::sync::OnceLock<Box<TextReads>>; 2],
     has_null: bool,
     has_numbers: bool,
     /// A member that is neither TEXT nor NULL
@@ -383,8 +382,7 @@ impl PredicateSet {
         }
         Self {
             members,
-            numbers_in_text: (!numbers_in_text.is_empty())
-                .then(|| CompactArc::new(numbers_in_text)),
+            numbers_in_text,
             text_reads: Default::default(),
             has_null,
             has_numbers,
@@ -419,7 +417,7 @@ impl PredicateSet {
 
     /// Whether a member is a TEXT
     pub fn has_text(&self) -> bool {
-        self.has_unreadable_text || self.numbers_in_text.is_some()
+        self.has_unreadable_text || !self.numbers_in_text.is_empty()
     }
 
     /// Whether a member is neither TEXT nor NULL
@@ -461,11 +459,7 @@ impl PredicateSet {
         let read_kinds = kind::BOOLEAN | kind::TIMESTAMP;
         match probe {
             Value::Integer(_) | Value::Float(_) => {
-                if self
-                    .numbers_in_text
-                    .as_ref()
-                    .is_some_and(|numbers| numbers.contains(probe))
-                {
+                if self.numbers_in_text.contains(probe) {
                     return Some(true);
                 }
                 unknown |= self.has_unreadable_text;
@@ -531,7 +525,7 @@ impl PredicateSet {
                     }
                 }
             }
-            CompactArc::new(reads)
+            Box::new(reads)
         })
     }
 }

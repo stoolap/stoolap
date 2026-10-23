@@ -5469,7 +5469,9 @@ impl<'a> PreparedRunner<'a> {
             }
         };
         Ok(match &set.set {
-            MemberSet::In(set_of) => {
+            // A key's set is a correlated block's, which no scan takes
+            MemberSet::In(_) => SetScan::Program,
+            MemberSet::SharedIn(set_of) => {
                 let members = set_of.members();
                 let mut values = members.iter().filter(|v| !v.is_null()).cloned();
                 match (slot.negated, set_of.has_null()) {
@@ -6406,12 +6408,17 @@ fn more_than_one_row() -> Error {
     }
 }
 
-/// `values` as `test` asks them, NULL members included
-fn member_set(test: MemberTest, values: Vec<Value>) -> MemberSet {
+/// `values` as `test` asks them, NULL members included; an uncorrelated
+/// block's IN set `shared`, a key's kept in place
+fn member_set(test: MemberTest, values: Vec<Value>, shared: bool) -> MemberSet {
     match test {
-        MemberTest::In => MemberSet::In(PredicateSet::of(CompactArc::new(
-            values.into_iter().collect(),
-        ))),
+        MemberTest::In => {
+            let set = PredicateSet::of(CompactArc::new(values.into_iter().collect()));
+            match shared {
+                true => MemberSet::SharedIn(CompactArc::new(set)),
+                false => MemberSet::In(set),
+            }
+        }
         MemberTest::Quantified(op, all) => {
             let has_null = values.iter().any(Value::is_null);
             let members: Vec<Value> = values.into_iter().filter(|v| !v.is_null()).collect();
@@ -6584,8 +6591,9 @@ impl PreparedRunner<'_> {
             return None;
         }
         Some(match &set.set {
-            MemberSet::In(set) => Op::InSet(CompactArc::new(set.clone())),
+            MemberSet::SharedIn(set) => Op::InSet(CompactArc::clone(set)),
             MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
+            MemberSet::In(_) => return None,
         })
     }
 
@@ -6690,7 +6698,7 @@ impl PreparedRunner<'_> {
                     None => values,
                 };
                 return Ok(KeptMembers {
-                    set: member_set(members.test, values),
+                    set: member_set(members.test, values, true),
                     failed: None,
                 });
             }
@@ -6713,13 +6721,13 @@ impl PreparedRunner<'_> {
                 }
             }
             return Ok(KeptMembers {
-                set: member_set(members.test, values),
+                set: member_set(members.test, values, true),
                 failed,
             });
         }
         let mut grouped = self.group_members(index, members, plan)?;
         Ok(grouped.remove(&[][..]).unwrap_or_else(|| KeptMembers {
-            set: member_set(members.test, Vec::new()),
+            set: member_set(members.test, Vec::new(), true),
             failed: None,
         }))
     }
@@ -6797,7 +6805,7 @@ impl PreparedRunner<'_> {
                 (
                     key,
                     KeptMembers {
-                        set: member_set(members.test, values),
+                        set: member_set(members.test, values, plan.is_none()),
                         failed,
                     },
                 )
@@ -6838,7 +6846,7 @@ impl PreparedRunner<'_> {
         let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
             return Ok(None);
         };
-        let MemberSet::In(set_of) = &set.set else {
+        let MemberSet::SharedIn(set_of) = &set.set else {
             return Ok(None);
         };
         if set.failed.is_some() {
