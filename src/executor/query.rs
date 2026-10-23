@@ -7707,6 +7707,40 @@ impl Executor {
         ))
     }
 
+    /// The column names of a VALUES source
+    pub(super) fn values_columns(values_source: &ValuesTableSource) -> Vec<String> {
+        // Determine column names
+        let num_columns = if values_source.rows.is_empty() {
+            0
+        } else {
+            values_source.rows[0].len()
+        };
+
+        if !values_source.column_aliases.is_empty() {
+            // Use provided column aliases
+            values_source
+                .column_aliases
+                .iter()
+                .map(|id| id.value.to_string())
+                .collect()
+        } else {
+            // Generate default column names: column1, column2, ...
+            (1..=num_columns).map(|i| format!("column{}", i)).collect()
+        }
+    }
+
+    /// One row of a VALUES source, each value evaluated
+    pub(super) fn values_row(row_exprs: &[Expression], ctx: &ExecutionContext) -> Result<Row> {
+        let mut row_values = Vec::with_capacity(row_exprs.len());
+        for expr in row_exprs {
+            let value = ExpressionEval::compile(expr, &[])?
+                .with_context(ctx)
+                .eval_slice(&Row::new())?;
+            row_values.push(value);
+        }
+        Ok(Row::from_values(row_values))
+    }
+
     /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
     fn execute_values_source(
         &self,
@@ -7717,13 +7751,6 @@ impl Executor {
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
-        // Determine column names
-        let num_columns = if values_source.rows.is_empty() {
-            0
-        } else {
-            values_source.rows[0].len()
-        };
-
         // Get the table alias for qualified name resolution
         let table_alias = values_source
             .alias
@@ -7731,17 +7758,7 @@ impl Executor {
             .map(|a| a.value.to_string())
             .unwrap_or_default();
 
-        let column_names: Vec<String> = if !values_source.column_aliases.is_empty() {
-            // Use provided column aliases
-            values_source
-                .column_aliases
-                .iter()
-                .map(|id| id.value.to_string())
-                .collect()
-        } else {
-            // Generate default column names: column1, column2, ...
-            (1..=num_columns).map(|i| format!("column{}", i)).collect()
-        };
+        let column_names = Self::values_columns(values_source);
 
         // Build a map of both simple and qualified column names to indices
         let mut col_index_map = build_column_index_map(&column_names);
@@ -7781,14 +7798,7 @@ impl Executor {
         let mut result_rows = RowVec::with_capacity(values_source.rows.len());
         let mut row_id = 0i64;
         for row_exprs in &values_source.rows {
-            let mut row_values = Vec::with_capacity(row_exprs.len());
-            for expr in row_exprs {
-                let value = ExpressionEval::compile(expr, &[])?
-                    .with_context(ctx)
-                    .eval_slice(&Row::new())?;
-                row_values.push(value);
-            }
-            let row = Row::from_values(row_values);
+            let row = Self::values_row(row_exprs, ctx)?;
 
             // Apply WHERE clause filtering
             if let (Some(wf), Some(qf)) = (&where_filter, &qualified_filter) {

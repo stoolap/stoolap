@@ -354,7 +354,7 @@ fn test_derived_table_where() {
 fn test_values_source_where() {
     site(
         "site_values_where",
-        Fails("step 6"),
+        Right,
         "SELECT n FROM (VALUES (1), (5)) AS w(n) WHERE n > (SELECT MAX(x) FROM u)",
         "SELECT n FROM (VALUES (1), (5)) AS w(n) WHERE n > 3",
     );

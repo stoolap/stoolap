@@ -424,15 +424,7 @@ fn state(source: &str, cell: &str) -> State {
         ("view" | "derived" | "cte" | "cte_columns", "body_join_on") => STEP_6,
         ("values", "body_row") => STEP_6,
         ("view" | "derived" | "series" | "values", "insert_values" | "on_conflict_set") => STEP_6,
-        (
-            "values",
-            "insert_select" | "where_scalar" | "where_in" | "where_not_in" | "where_all",
-        ) => STEP_6,
         ("view", "select_scalar") => STEP_6,
-        (
-            "values",
-            "where_both" | "where_correlated_scalar" | "where_exists" | "where_series_exists",
-        ) => STEP_6,
         _ => Right,
     }
 }
