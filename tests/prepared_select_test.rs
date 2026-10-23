@@ -2180,3 +2180,28 @@ fn test_a_view_reading_itself_stops_at_the_nesting_limit() {
     );
     assert!(err.contains("Maximum view nesting depth"), "{err}");
 }
+
+#[test]
+fn test_a_view_comes_before_a_table_of_its_name() {
+    let _guard = serial();
+    let db = setup("prepared_view_and_table");
+    db.execute(
+        "CREATE VIEW tv AS SELECT id + 100 AS id FROM u WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE pair (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO pair VALUES (2)", ()).unwrap();
+    // Only the engine renames a table into a view's name, as a database
+    // an older release wrote can hold one
+    db.engine().rename_table("pair", "tv").unwrap();
+    const VIEW: &str = "SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)";
+    assert_eq!(prepared_line(&db, VIEW), "Prepared: yes");
+    assert_eq!(
+        ids(&db, "SELECT id FROM tv", ()).0,
+        vec![101],
+        "the general path"
+    );
+    assert_eq!(ids(&db, VIEW, ()).0, vec![101], "the prepared path");
+}
