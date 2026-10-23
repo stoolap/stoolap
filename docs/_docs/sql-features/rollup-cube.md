@@ -64,7 +64,7 @@ For `ROLLUP(region, category)`, it produces:
 2. Region subtotals: `(region, NULL)` - totals per region
 3. Grand total: `(NULL, NULL)` - overall total
 
-The NULL values indicate the aggregation level.
+The NULL values indicate the aggregation level. An expression that holds a rolled up item reads it as NULL on those rows, even when the item reads only constants or parameters: on the grand total row of `GROUP BY ROLLUP(7 + 0)`, `(7 + 0) + 1` is NULL.
 
 ### Column Order Matters
 

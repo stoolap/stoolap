@@ -600,3 +600,20 @@ fn arithmetic_answers_alike_on_the_borrowing_and_the_owned_vm() {
         }
     }
 }
+
+#[test]
+fn a_program_deeper_than_the_inline_stack_runs_owned() {
+    let mut ops = Vec::new();
+    for i in 0..17 {
+        ops.extend([Op::LoadColumn(0), Op::LoadConst(Value::Integer(i)), Op::Add]);
+    }
+    ops.extend([Op::Greatest(17), Op::Return]);
+    assert!(!Program::new(ops).cow_supported(), "17 values on the stack");
+    let shallow = Program::new(vec![
+        Op::LoadColumn(0),
+        Op::LoadConst(Value::Integer(1)),
+        Op::Add,
+        Op::Return,
+    ]);
+    assert!(shallow.cow_supported(), "two values on the stack");
+}

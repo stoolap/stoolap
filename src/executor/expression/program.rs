@@ -77,7 +77,7 @@ impl Program {
             )
         });
 
-        let cow_supported = Self::compute_cow_supported(&ops);
+        let cow_supported = Self::compute_cow_supported(&ops, max_stack_depth);
 
         Self {
             ops,
@@ -112,7 +112,7 @@ impl Program {
             )
         });
 
-        let cow_supported = Self::compute_cow_supported(&ops);
+        let cow_supported = Self::compute_cow_supported(&ops, max_stack_depth);
 
         Self {
             ops,
@@ -370,7 +370,7 @@ impl Program {
         self.ops = Self::peephole_optimize(self.ops);
         // Recalculate metadata after optimization
         self.max_stack_depth = Self::compute_stack_depth(&self.ops);
-        self.cow_supported = Self::compute_cow_supported(&self.ops);
+        self.cow_supported = Self::compute_cow_supported(&self.ops, self.max_stack_depth);
         self
     }
 
@@ -381,8 +381,12 @@ impl Program {
     }
 
     /// Mirrors the op set ExprVM::execute_cow handles; keep the two in
-    /// sync (drift only costs performance, the cow catch-all stays)
-    fn compute_cow_supported(ops: &[Op]) -> bool {
+    /// sync (drift only costs performance, the cow catch-all stays). A
+    /// program deeper than its inline stack runs owned, which keeps its stack
+    fn compute_cow_supported(ops: &[Op], max_stack_depth: usize) -> bool {
+        if max_stack_depth > super::vm::STACK_INLINE_CAPACITY {
+            return false;
+        }
         ops.iter().all(|op| {
             matches!(
                 op,

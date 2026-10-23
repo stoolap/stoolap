@@ -76,7 +76,7 @@ fn between_cell(value: &Value, low: &Value, high: &Value) -> Option<bool> {
 
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots, so 8 covers the common case.
-const STACK_INLINE_CAPACITY: usize = 16;
+pub(super) const STACK_INLINE_CAPACITY: usize = 16;
 
 /// Execution context for the VM
 ///

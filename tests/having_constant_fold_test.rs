@@ -109,3 +109,38 @@ fn a_folded_having_raises_its_error_only_for_a_group_and_reads_each_execution_s_
     assert_eq!(low.len(), 7, "{low:?}");
     assert!(high.len() < low.len(), "{high:?}");
 }
+
+#[test]
+fn a_fold_keeps_the_group_item_it_holds() {
+    let db = Database::open("memory://having_constant_fold_rollup").unwrap();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO r VALUES (1)", ()).unwrap();
+    let seven = || vec![Value::Integer(7)];
+    for (sql, params) in [
+        (
+            "SELECT ($1 + 0) + 1, COUNT(*) FROM r GROUP BY ROLLUP($1 + 0) ORDER BY 1",
+            seven(),
+        ),
+        (
+            "SELECT (7 + 0) + 1, COUNT(*) FROM r GROUP BY ROLLUP(7 + 0) ORDER BY 1",
+            Vec::new(),
+        ),
+    ] {
+        let mut got = rows(&db, sql, params).unwrap();
+        got.sort();
+        assert!(
+            got.len() == 2
+                && got[0] == "Integer(8)|Integer(1)"
+                && got[1].starts_with("Null(")
+                && got[1].ends_with("|Integer(1)"),
+            "{sql}: the total row reads the rolled up item as NULL, got {got:?}"
+        );
+    }
+    let sql = "SELECT COUNT(*) FROM r GROUP BY ROLLUP($1 + 0) HAVING ($1 + 0) + 1 IS NULL";
+    assert_eq!(
+        rows(&db, sql, seven()),
+        Ok(vec!["Integer(1)".to_string()]),
+        "{sql}: only the total row"
+    );
+}

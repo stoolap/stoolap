@@ -522,7 +522,9 @@ impl<'a> ExprCompiler<'a> {
                 vm.execute(&program, &exec_ctx).ok()
             })
         });
-        FOLD_OPS.with(|ops| *ops.borrow_mut() = program.into_ops());
+        let mut spent = program.into_ops();
+        spent.clear();
+        FOLD_OPS.with(|ops| *ops.borrow_mut() = spent);
         value
     }
 
@@ -569,9 +571,7 @@ impl<'a> ExprCompiler<'a> {
         // This optimizes deterministic expressions like ABS(-5) + 1 or UPPER('text').
         // Non-deterministic functions (NOW, RANDOM, etc.) are excluded by is_foldable_expr
         // and handled separately by pushdown's try_eval_constant_expr at query time.
-        if !self.folding.get()
-            && is_foldable_expr(expr, self.ctx.functions, self.ctx.params.is_some())
-        {
+        if !self.folding.get() && is_foldable_expr(expr, self.ctx) {
             if let Some(value) = self.try_fold_constant(expr) {
                 builder.emit(Op::LoadConst(value));
                 return Ok(());
@@ -1605,7 +1605,7 @@ impl<'a> ExprCompiler<'a> {
             None => None,
             Some(Expression::StringLiteral(lit)) => lit.value.chars().next(),
             Some(escape_expr) => {
-                match may_fold(escape_expr, self.ctx.functions, self.ctx.params.is_some())
+                match may_fold(escape_expr, self.ctx)
                     .then(|| self.try_fold_constant(escape_expr))
                     .flatten()
                 {
@@ -1900,26 +1900,32 @@ impl<'a> ExprCompiler<'a> {
 
 /// Whether `expr` is worth folding into a constant and may be: an operator,
 /// call or cast (a literal is a constant already)
-fn is_foldable_expr(expr: &Expression, registry: &FunctionRegistry, params: bool) -> bool {
+fn is_foldable_expr(expr: &Expression, ctx: &CompileContext) -> bool {
     matches!(
         expr,
         Expression::Infix(_)
             | Expression::Prefix(_)
             | Expression::FunctionCall(_)
             | Expression::Cast(_)
-    ) && may_fold(expr, registry, params)
+    ) && may_fold(expr, ctx)
 }
 
-/// Whether `expr` may be folded into a constant: it reads no column, and no
-/// parameter unless `params` are known, and answers the same every time
-fn may_fold(expr: &Expression, registry: &FunctionRegistry, params: bool) -> bool {
-    is_column_free(expr, params) && expression_volatility(expr, registry) == Volatility::Fixed
+/// Whether `expr` may be folded into a constant under `ctx`: it reads no
+/// column, no slot and no parameter `ctx` does not hold, and answers the
+/// same every time
+fn may_fold(expr: &Expression, ctx: &CompileContext) -> bool {
+    is_column_free(expr, ctx) && expression_volatility(expr, ctx.functions) == Volatility::Fixed
 }
 
 /// Check if an expression references no columns (is entirely self-contained);
-/// a parameter counts as one unless `params` are known
-fn is_column_free(expr: &Expression, params: bool) -> bool {
-    let is_column_free = |expr: &Expression| is_column_free(expr, params);
+/// a part read from an aggregated row's slot counts as one, and so does a
+/// parameter unless `ctx` holds the values
+fn is_column_free(expr: &Expression, ctx: &CompileContext) -> bool {
+    if ctx.check_expression_alias(expr).is_some() {
+        return false;
+    }
+    let params = ctx.params.is_some();
+    let is_column_free = |expr: &Expression| is_column_free(expr, ctx);
     match expr {
         // Literals are always column-free
         Expression::IntegerLiteral(_)
