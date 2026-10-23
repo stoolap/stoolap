@@ -128,6 +128,11 @@ const CASES: &[(&str, Option<&str>)] = &[
         None,
     ),
     (
+        "SELECT a AS k, b AS k, COUNT(*) FROM t GROUP BY a, b \
+         HAVING k = (SELECT MIN(u.k) + 1 FROM u) ORDER BY 1, 2",
+        Some("SELECT a AS k, b AS k, COUNT(*) FROM t GROUP BY a, b HAVING k = 1 ORDER BY 1, 2"),
+    ),
+    (
         "SELECT a, (SELECT MAX(u.x) FROM u), (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM t \
          GROUP BY a ORDER BY a",
         None,
@@ -420,6 +425,7 @@ fn a_grouped_statement_keyed_by_an_item_holding_a_subquery_stays_outside_the_blo
     for sql in [
         "SELECT a IN (SELECT u.k FROM u WHERE u.k < 4) AS g, COUNT(*) FROM t GROUP BY g",
         "SELECT a IN (SELECT u.k FROM u WHERE u.k < 4), COUNT(*) FROM t GROUP BY 1",
+        "SELECT 0 AS g, a IN (SELECT u.k FROM u WHERE u.k < 4) AS g, COUNT(*) FROM t GROUP BY g",
     ] {
         assert_eq!(
             prepared_line(&db, sql),
@@ -476,4 +482,36 @@ fn a_table_whose_columns_changed_after_preparing_raises_schema_changed() {
         "{sql}: {got:?}"
     );
     assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: run again");
+}
+
+#[test]
+fn a_having_name_reads_the_alias_the_grouped_path_reads() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_having_names").unwrap();
+    fill(&db);
+    for setup in [
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, g INTEGER, b BOOLEAN)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, s TEXT)",
+        "INSERT INTO v VALUES (1, 1, TRUE), (2, 1, FALSE), (3, 2, TRUE)",
+        "INSERT INTO m VALUES (1, '2')",
+    ] {
+        db.execute(setup, ()).unwrap();
+    }
+    let sql =
+        "SELECT g, COUNT(*) AS b FROM v GROUP BY g HAVING b IN (SELECT m.s FROM m) ORDER BY g";
+    let want = rows(&db, &sql.replace(" FROM v", " FROM (SELECT * FROM v) v"));
+    assert_eq!(rows(&db, sql), want, "{sql}");
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    // A subquery that groups reads its own HAVING's aliases the same way
+    let sql = "SELECT id FROM u WHERE EXISTS (SELECT t.a AS k, t.b AS k FROM t \
+               WHERE t.a = u.x GROUP BY t.a, t.b HAVING k = 1) ORDER BY id";
+    assert_eq!(
+        rows(&db, sql),
+        Ok(["1", "8", "15", "22", "29", "36"]
+            .iter()
+            .map(|id| format!("Integer({id})"))
+            .collect()),
+        "{sql}: k is t.a, the first item named k"
+    );
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
 }

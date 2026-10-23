@@ -39,7 +39,8 @@ use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Scanner, Table, Transaction};
 
 use super::aggregation::{
-    ungrouped_column, AggregatePath, CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
+    aggregate_slot_keys, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
+    SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, BlockAnswer, BlockOrigin, ExecutionContext,
@@ -531,29 +532,15 @@ impl Executor {
         }
         let held = |expr: Option<&Expression>| expr.is_some_and(mentions_subquery);
         // A GROUP BY item naming a SELECT alias or position groups that item
-        let grouped_item = |item: &Expression| match item {
-            Expression::Identifier(id) => stmt.columns.iter().find_map(|column| match column {
-                Expression::Aliased(aliased)
-                    if aliased.alias.value_lower == id.value_lower
-                        && !expression_contains_aggregate(&aliased.expression) =>
-                {
-                    Some(&*aliased.expression)
-                }
-                _ => None,
-            }),
-            Expression::IntegerLiteral(position) => usize::try_from(position.value)
-                .ok()
-                .and_then(|position| position.checked_sub(1))
-                .and_then(|position| stmt.columns.get(position))
-                .map(unaliased),
-            _ => None,
-        };
+        let items = self
+            .parse_group_by(stmt, &[])
+            .map_err(|_| "a GROUP BY position outside the SELECT list")?;
         if held(stmt.where_clause.as_deref())
-            || stmt
-                .group_by
-                .columns
-                .iter()
-                .any(|item| held(Some(item)) || held(grouped_item(item)))
+            || stmt.group_by.columns.iter().any(|item| held(Some(item)))
+            || items.iter().any(|item| match item {
+                GroupByItem::Expression { expr, .. } => mentions_subquery(expr),
+                GroupByItem::Column(_) => false,
+            })
             || stmt.order_by.iter().any(|ob| held(Some(&ob.expression)))
         {
             return Err("a WHERE, GROUP BY or ORDER BY holding a subquery");
@@ -1254,6 +1241,42 @@ fn with_aliases<'e>(
         return std::borrow::Cow::Borrowed(where_clause);
     }
     std::borrow::Cow::Owned(Executor::substitute_aliases(where_clause, &alias_map))
+}
+
+/// `having` of the grouped `stmt`, each bare name outside its subqueries
+/// that the grouped path reads as a SELECT alias spelled as that item
+fn grouped_having(
+    executor: &Executor,
+    stmt: &SelectStatement,
+    having: &Expression,
+) -> Result<Expression> {
+    let (aggregations, _) = executor.parse_aggregations(stmt, None)?;
+    let items = executor.parse_group_by(stmt, &[])?;
+    let slots = aggregate_slot_keys(&items, &aggregations, &stmt.columns);
+    let aliased = |name: &str| {
+        let slot = slots.get(&ExprKey::column(name))?;
+        stmt.columns.iter().find_map(|column| match column {
+            Expression::Aliased(aliased)
+                if aliased.alias.value_lower == name
+                    && slots.get(&ExprKey::of(&aliased.expression)) == Some(slot) =>
+            {
+                Some(&*aliased.expression)
+            }
+            _ => None,
+        })
+    };
+    fn open<'s>(
+        expr: &Expression,
+        aliased: &impl Fn(&str) -> Option<&'s Expression>,
+    ) -> Result<Expression> {
+        match expr {
+            Expression::Identifier(id) => Ok(aliased(&id.value_lower)
+                .cloned()
+                .unwrap_or_else(|| expr.clone())),
+            other => rebuild(other, &mut |child| open(child, aliased)),
+        }
+    }
+    open(having, &aliased)
 }
 
 /// Whether a bare name outside any subquery of `expr` passes `matches`
@@ -2612,7 +2635,7 @@ impl Builder<'_> {
         }
         let having = match sq.having.as_deref() {
             Some(having) => {
-                let having = with_aliases(having, &sq.columns, &scope.columns);
+                let having = grouped_having(executor, sq, having)?;
                 Some(self.rewrite(chain, Some(id), &having, work)?)
             }
             None => None,
@@ -3253,7 +3276,7 @@ impl PreparedGrouped {
         }
         let having = match stmt.having.as_deref() {
             Some(having) if mentions_subquery(having) => {
-                let opened = with_aliases(having, &stmt.columns, &scope.columns);
+                let opened = grouped_having(executor, stmt, having)?;
                 Some(Box::new(rewrite(&opened)?))
             }
             other => other.map(|having| Box::new(having.clone())),
