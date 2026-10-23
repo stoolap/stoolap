@@ -2243,9 +2243,26 @@ impl Executor {
             None
         };
 
+        let (result_rows, columns) =
+            Self::tvf_rows(tvf_source, stmt.where_clause.as_deref(), limit_hint, ctx)?;
+
+        // Delegate to execute_query_on_memory_result which handles
+        // WHERE, ORDER BY, LIMIT, GROUP BY, aggregation, window functions
+        self.execute_query_on_memory_result(stmt, ctx, columns, result_rows)
+    }
+
+    /// The rows and columns a TVF source gives a statement whose WHERE is
+    /// `where_clause`: none when it holds for no row, else the range its
+    /// conjuncts on the TVF's column allow, up to `limit`
+    pub(super) fn tvf_rows(
+        tvf_source: &FunctionTableSource,
+        where_clause: Option<&Expression>,
+        limit: Option<usize>,
+        ctx: &ExecutionContext,
+    ) -> Result<(RowVec, Vec<String>)> {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
-        if let Some(ref where_clause) = stmt.where_clause {
+        if let Some(where_clause) = where_clause {
             if true_for_no_row(where_clause, ctx) {
                 let columns = if !tvf_source.column_aliases.is_empty() {
                     tvf_source
@@ -2256,38 +2273,23 @@ impl Executor {
                 } else {
                     vec!["value".to_string()]
                 };
-                return self.execute_query_on_memory_result(stmt, ctx, columns, RowVec::new());
+                return Ok((RowVec::new(), columns));
             }
         }
 
         // Extract range bounds from WHERE clause to narrow TVF generation range.
         // This avoids materializing millions of rows when a selective predicate exists.
-        let range_hint = Self::extract_tvf_range_hint(tvf_source, stmt, ctx);
+        let range_hint = where_clause.and_then(|where_clause| {
+            // Determine the TVF value column name (from alias or default "value")
+            let col_name: SmartString = if !tvf_source.column_aliases.is_empty() {
+                tvf_source.column_aliases[0].value_lower.clone()
+            } else {
+                SmartString::from("value")
+            };
+            Self::tvf_range_hint(where_clause, &col_name, ctx)
+        });
 
-        let (result_rows, columns) =
-            Self::evaluate_tvf_with_range(tvf_source, ctx, limit_hint, range_hint)?;
-
-        // Delegate to execute_query_on_memory_result which handles
-        // WHERE, ORDER BY, LIMIT, GROUP BY, aggregation, window functions
-        self.execute_query_on_memory_result(stmt, ctx, columns, result_rows)
-    }
-
-    /// Extract the integer range the WHERE clause allows a TVF to generate
-    fn extract_tvf_range_hint(
-        tvf_source: &FunctionTableSource,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-    ) -> Option<Resolved> {
-        let where_clause = stmt.where_clause.as_ref()?;
-
-        // Determine the TVF value column name (from alias or default "value")
-        let col_name: SmartString = if !tvf_source.column_aliases.is_empty() {
-            tvf_source.column_aliases[0].value_lower.clone()
-        } else {
-            SmartString::from("value")
-        };
-
-        Self::tvf_range_hint(where_clause, &col_name, ctx)
+        Self::evaluate_tvf_with_range(tvf_source, ctx, limit, range_hint)
     }
 
     /// The integers the conjuncts of `filter` on the TVF's column allow it to
