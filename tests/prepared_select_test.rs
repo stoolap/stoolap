@@ -2257,3 +2257,95 @@ fn test_a_values_row_holding_a_subquery_is_not_prepared() {
         "Prepared: no (a VALUES row holding a subquery)"
     );
 }
+
+#[test]
+fn test_a_cte_runs_prepared_over_its_rows_and_keeps_its_plan() {
+    let _guard = serial();
+    let db = setup("prepared_cte");
+    const WHERE: &str =
+        "SELECT s.id FROM s WHERE s.b = $1 AND s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    for (cte, with) in [
+        (
+            "materialized",
+            "WITH s(id, a, b) AS (SELECT id, a, b FROM t) ",
+        ),
+        ("inlined", "WITH s AS (SELECT id, a, b FROM t) "),
+    ] {
+        let sql = format!("{with}{WHERE}");
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{cte}");
+        let built = prepared_selects_built();
+        let general = general_hits();
+        for (param, want) in [(1, vec![1]), (2, vec![6]), (1, vec![1])] {
+            let (found, runs) = ids(&db, &sql, (param,));
+            assert_eq!(found, want, "{cte}: b = {param}");
+            assert_eq!(runs, 3, "{cte}: b = {param} runs once per CTE row");
+        }
+        assert_eq!(
+            prepared_selects_built() - built,
+            1,
+            "{cte}: prepared once across three runs"
+        );
+        assert_eq!(general_hits(), general, "{cte}: no general path ran");
+        let columns = db.query(&sql, (1,)).unwrap().columns().to_vec();
+        assert_eq!(columns, vec!["id".to_string()], "{cte}: the column's name");
+    }
+}
+
+#[test]
+fn test_a_block_reading_a_cte_is_not_prepared() {
+    let _guard = serial();
+    let db = setup("prepared_cte_block");
+    assert_eq!(
+        prepared_line(
+            &db,
+            "WITH s AS (SELECT id, a FROM t) SELECT x.id FROM s AS x \
+             WHERE x.a > (SELECT MIN(a) FROM s)"
+        ),
+        "Prepared: no (FROM names a CTE)"
+    );
+}
+
+#[test]
+fn test_a_cte_the_statement_does_not_read_does_not_run() {
+    let _guard = serial();
+    let db = setup("prepared_cte_unused");
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO m VALUES (1, -9223372036854775808)", ())
+        .unwrap();
+    const UNUSED: &str = "WITH unused AS (SELECT ABS(x) FROM m), s AS (SELECT id FROM t) \
+                          SELECT id FROM s WHERE id < (SELECT MIN(id) FROM u) + 2 ORDER BY id";
+    assert_eq!(prepared_line(&db, UNUSED), "Prepared: yes");
+    assert_eq!(
+        ids(&db, UNUSED, ()).0,
+        vec![1, 2],
+        "ABS of its row would overflow"
+    );
+}
+
+#[test]
+fn test_a_cte_reads_the_ctes_and_views_around_it() {
+    let _guard = serial();
+    let db = setup("prepared_cte_scope");
+    db.execute(
+        "CREATE VIEW tv AS WITH w AS (SELECT id FROM t WHERE b = 2) SELECT id FROM w",
+        (),
+    )
+    .unwrap();
+    for (sql, want) in [
+        (
+            // Chained CTEs do not inline: c is materialized for s to read
+            "WITH c(id) AS (SELECT id FROM t WHERE b = 1), s AS (SELECT id FROM c) \
+             SELECT s.id FROM s WHERE s.id > (SELECT MIN(id) FROM u) ORDER BY s.id",
+            vec![2, 5],
+        ),
+        (
+            "WITH c(id) AS (SELECT 1) SELECT tv.id FROM tv \
+             WHERE tv.id > (SELECT MIN(id) FROM u) ORDER BY tv.id",
+            vec![3, 4, 6],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+    }
+}

@@ -393,7 +393,7 @@ fn state(source: &str, cell: &str) -> State {
     match (source, cell) {
         ("values", "block_outer_arithmetic" | "statement_point") => Wrong("#578"),
         (
-            "cte_columns" | "recursive" | "series",
+            "series",
             "where_scalar"
             | "where_in"
             | "where_not_in"
@@ -401,11 +401,11 @@ fn state(source: &str, cell: &str) -> State {
             | "where_exists"
             | "where_correlated_scalar"
             | "where_both"
-            | "where_series_exists"
-            | "select_scalar"
-            | "select_correlated"
-            | "order_by_correlated"
-            | "limit",
+            | "where_series_exists",
+        ) => WrongNames("#581"),
+        (
+            "cte_columns" | "recursive" | "series",
+            "select_scalar" | "select_correlated" | "order_by_correlated" | "limit",
         ) => WrongNames("#581"),
         (
             "values",

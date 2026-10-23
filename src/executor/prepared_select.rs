@@ -88,8 +88,8 @@ struct Family<'a> {
     ctx: Option<&'a ExecutionContext>,
     /// Every FROM met, checked against the catalog once the syntax passed
     tables: RefCell<SmallVec<[&'a SimpleTableSource; 4]>>,
-    /// The statement's own FROM when it names a table or a view
-    statement_table: std::cell::Cell<Option<&'a SimpleTableSource>>,
+    /// The statement's own CTEs, which its FROM may name and no block may
+    with: Option<&'a WithClause>,
 }
 
 impl<'a> Family<'a> {
@@ -105,9 +105,9 @@ impl<'a> Family<'a> {
         Ok(())
     }
 
-    /// The statement's FROM: one table or view, a derived table, or a VALUES
-    /// list; a view's or a derived table's own statement runs as any
-    /// statement does
+    /// The statement's FROM: one table, view or CTE, a derived table, or a
+    /// VALUES list; the statement of a view, a CTE or a derived table runs as
+    /// any statement does
     fn statement_from(
         &self,
         table_expr: Option<&'a Expression>,
@@ -120,10 +120,7 @@ impl<'a> Family<'a> {
                     false => Ok(()),
                 }
             }
-            Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
-                self.statement_table.set(Some(ts));
-                Ok(())
-            }
+            Some(Expression::TableSource(ts)) if ts.as_of.is_none() => Ok(()),
             other => self.from(other),
         }
     }
@@ -139,20 +136,15 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// Every FROM met names a base table, not a CTE or a view; the
-    /// statement's own may name a view
+    /// Every block's FROM names a base table, not a CTE or a view
     fn catalog(&self) -> std::result::Result<(), OutOfFamily> {
-        if let Some(ts) = self.statement_table.get() {
-            if self
-                .ctx
-                .is_some_and(|ctx| ctx.has_cte_by_lower(&ts.name.value_lower))
-            {
-                return Err("FROM names a CTE");
-            }
-        }
+        let own_cte = |name: &str| {
+            self.with
+                .is_some_and(|with| with.ctes.iter().any(|cte| cte.name.value_lower == name))
+        };
         for ts in self.tables.borrow().iter() {
             let name = ts.name.value_lower.as_str();
-            if self.ctx.is_some_and(|ctx| ctx.has_cte_by_lower(name)) {
+            if own_cte(name) || self.ctx.is_some_and(|ctx| ctx.has_cte_by_lower(name)) {
                 return Err("FROM names a CTE");
             }
             match self.executor.engine.get_view_lowercase(name) {
@@ -459,14 +451,20 @@ fn is_tuple(expr: &Expression) -> bool {
 }
 
 /// No WITH, set operation, DISTINCT, GROUP BY, HAVING or WINDOW
-fn plain_block(stmt: &SelectStatement) -> bool {
-    block_clauses(stmt) && stmt.group_by.columns.is_empty() && stmt.having.is_none()
+/// A statement of the family's clauses: its WITH runs before it, as its own
+/// statements
+fn plain_statement(stmt: &SelectStatement) -> bool {
+    statement_clauses(stmt) && stmt.group_by.columns.is_empty() && stmt.having.is_none()
 }
 
 /// No WITH, set operation, DISTINCT, grouping set or WINDOW
 fn block_clauses(stmt: &SelectStatement) -> bool {
-    stmt.with.is_none()
-        && stmt.set_operations.is_empty()
+    stmt.with.is_none() && statement_clauses(stmt)
+}
+
+/// No set operation, DISTINCT, grouping set or WINDOW
+fn statement_clauses(stmt: &SelectStatement) -> bool {
+    stmt.set_operations.is_empty()
         && !stmt.distinct
         && stmt.distinct_on.is_empty()
         && matches!(stmt.group_by.modifier, GroupByModifier::None)
@@ -491,14 +489,14 @@ impl Executor {
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
-        if !plain_block(stmt) {
+        if !plain_statement(stmt) {
             return Err("a clause outside the family");
         }
         let family = Family {
             executor: self,
             ctx,
             tables: RefCell::new(SmallVec::new()),
-            statement_table: std::cell::Cell::new(None),
+            with: stmt.with.as_ref(),
         };
         let mut found = false;
         if let Some(where_clause) = stmt.where_clause.as_deref() {
@@ -556,7 +554,7 @@ impl Executor {
             executor: self,
             ctx,
             tables: RefCell::new(SmallVec::new()),
-            statement_table: std::cell::Cell::new(None),
+            with: None,
         };
         let mut found = false;
         for column in &stmt.columns {
@@ -4078,7 +4076,7 @@ impl Executor {
             executor: self,
             ctx,
             tables: RefCell::new(SmallVec::new()),
-            statement_table: std::cell::Cell::new(None),
+            with: None,
         };
         let mut found = false;
         family.expression(clause, 1, Site::Subqueries, &mut found)?;
@@ -4709,7 +4707,7 @@ impl Executor {
             executor: self,
             ctx: Some(ctx),
             tables: RefCell::new(SmallVec::new()),
-            statement_table: std::cell::Cell::new(None),
+            with: None,
         };
         let mut found = false;
         for expr in where_clause.into_iter().chain(sets) {
@@ -4864,14 +4862,18 @@ impl Executor {
         let (source, scope_name) = match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = &ts.name.value_lower;
-                // A view comes before a table of its name, as the general path reads it
-                let source = match self.engine.get_view_lowercase(name)? {
-                    Some(view) => {
-                        let result = self.execute_view_body(&view, &inner_ctx)?;
-                        let columns = result.columns().to_vec();
-                        StatementSource::Rows(columns, Self::materialize_result(result)?)
-                    }
-                    None => StatementSource::Table(self.prepared_table(name, ctx, None)?),
+                // A CTE comes before a view, and a view before a table, of
+                // one name, as the general path reads them
+                let source = match ctx.get_cte_by_lower(name) {
+                    Some(cte) => StatementSource::Cte(cte),
+                    None => match self.engine.get_view_lowercase(name)? {
+                        Some(view) => {
+                            let result = self.execute_view_body(&view, &inner_ctx)?;
+                            let columns = result.columns().to_vec();
+                            StatementSource::Rows(columns, Self::materialize_result(result)?)
+                        }
+                        None => StatementSource::Table(self.prepared_table(name, ctx, None)?),
+                    },
                 };
                 (
                     source,
@@ -4905,10 +4907,11 @@ impl Executor {
                 &table_columns
             }
             StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => columns,
+            StatementSource::Cte((columns, _)) => columns,
         };
         let schema = || match &source {
             StatementSource::Table(table) => std::borrow::Cow::Borrowed(table.schema()),
-            StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => {
+            StatementSource::Rows(..) | StatementSource::Values(..) | StatementSource::Cte(_) => {
                 std::borrow::Cow::Owned(untyped_schema(scope_name, columns))
             }
         };
@@ -4940,6 +4943,7 @@ impl Executor {
             StatementSource::Table(table) => table.row_count_hint(),
             StatementSource::Rows(_, rows) => rows.len(),
             StatementSource::Values(_, values) => values.rows.len(),
+            StatementSource::Cte((_, rows)) => rows.len(),
         };
         let mut runner = PreparedRunner::new(
             self,
@@ -4996,6 +5000,13 @@ impl Executor {
                 target,
                 &mut keep,
             ),
+            StatementSource::Cte((_, rows)) => runner.rows_passing(
+                &prepared.where_,
+                rows.iter().map(|(id, row)| Ok((*id, row))),
+                ctx,
+                target,
+                &mut keep,
+            ),
         };
         let mut rows = match read? {
             Passing::Pruned => {
@@ -5036,6 +5047,31 @@ impl Executor {
     }
 }
 
+/// A row a source hands the runner: its own, or one it lends, copied only
+/// when the WHERE keeps it
+trait SourceRow {
+    fn row(&self) -> &Row;
+    fn into_row(self) -> Row;
+}
+
+impl SourceRow for Row {
+    fn row(&self) -> &Row {
+        self
+    }
+    fn into_row(self) -> Row {
+        self
+    }
+}
+
+impl SourceRow for &Row {
+    fn row(&self) -> &Row {
+        self
+    }
+    fn into_row(self) -> Row {
+        self.clone()
+    }
+}
+
 /// What a prepared statement reads its rows from
 enum StatementSource<'s> {
     Table(Box<dyn Table>),
@@ -5043,6 +5079,8 @@ enum StatementSource<'s> {
     Rows(Vec<String>, RowVec),
     /// A VALUES list's columns and rows, each evaluated as the WHERE reads it
     Values(Vec<String>, &'s ValuesTableSource),
+    /// A CTE's columns and rows, materialized by the statement's WITH
+    Cte(&'s super::cte::CteData),
 }
 
 /// A derived table's columns as its scope's schema: their names and no
@@ -5622,12 +5660,13 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// Hand `keep` each of `rows` that passes `where_`, with the count of
-    /// rows read so far, until `keep` says stop. The set conjuncts test the
-    /// members read before the first row, as a table's scan does
-    fn rows_passing(
+    /// rows read so far, until `keep` says stop; a borrowed row is copied
+    /// only when it passes. The set conjuncts test the members read before
+    /// the first row, as a table's scan does
+    fn rows_passing<R: SourceRow>(
         &self,
         where_: &PreparedWhere,
-        rows: impl IntoIterator<Item = Result<(i64, Row)>>,
+        rows: impl IntoIterator<Item = Result<(i64, R)>>,
         ctx: &ExecutionContext,
         target: Option<usize>,
         mut keep: impl FnMut(i64, u64, Row) -> bool,
@@ -5656,7 +5695,7 @@ impl<'a> PreparedRunner<'a> {
                     false => self.with_bound_sets(&where_.program, &slots),
                 }
             });
-            if self.matches(&mut vm, program, &row)? && !keep(id, scanned, row) {
+            if self.matches(&mut vm, program, row.row())? && !keep(id, scanned, row.into_row()) {
                 break;
             }
         }
