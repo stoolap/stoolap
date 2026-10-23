@@ -110,6 +110,16 @@ const STATEMENTS: &[(&str, &str, Option<&str>)] = &[
         "1:3 2:4 3:30 4:40",
         Some("1:3 2:4 3:30 4:40 7:70"),
     ),
+    (
+        "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT MAX(b) FROM tv)",
+        "1:40 2:20 3:30 4:40",
+        Some("1:70 2:20 3:30 4:40 7:70"),
+    ),
+    (
+        "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT COUNT(*) FROM tv AS o WHERE o.b > t.b)",
+        "1:3 2:20 3:30 4:40",
+        None,
+    ),
 ];
 
 #[test]
@@ -125,6 +135,8 @@ fn an_on_conflict_subquery_reads_the_tables_as_the_statement_found_them() {
                     Database::open("memory://prepared_conflict_statements").unwrap()
                 };
                 setup(&db);
+                db.execute("CREATE VIEW tv AS SELECT id, b FROM t", ())
+                    .unwrap();
                 if sealed {
                     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
                 }
@@ -159,6 +171,7 @@ fn an_on_conflict_subquery_reads_the_tables_as_the_statement_found_them() {
                         "{sql} (sealed: {sealed}, {context}): {got:?}, want {want:?}"
                     ));
                 }
+                db.execute("DROP VIEW tv", ()).unwrap();
                 db.execute("DROP TABLE t", ()).unwrap();
                 db.execute("DROP TABLE u", ()).unwrap();
             }

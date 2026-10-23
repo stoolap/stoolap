@@ -616,7 +616,6 @@ impl Executor {
                 get_table_alias_from_expr(&join.right).as_deref(),
             ),
             (left_schema.as_deref(), right_schema.as_deref()),
-            None,
         )
     }
 

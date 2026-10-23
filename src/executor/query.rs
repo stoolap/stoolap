@@ -2350,18 +2350,48 @@ impl Executor {
     }
 
     /// Evaluate a TVF with optional range clamping on start/stop args.
+    /// The table-valued function a TVF source calls
+    fn tvf_of(
+        tvf_source: &FunctionTableSource,
+    ) -> Result<Box<dyn crate::functions::tvf::TableValuedFunction>> {
+        let func_name = &tvf_source.function.value;
+        crate::functions::global_registry()
+            .get_tvf(func_name)
+            .ok_or_else(|| {
+                Error::NotSupported(format!("Unknown table-valued function: {}", func_name))
+            })
+    }
+
+    /// The columns a TVF source gives: its aliases, or the function's own
+    pub(super) fn tvf_columns(tvf_source: &FunctionTableSource) -> Result<Vec<String>> {
+        Ok(Self::tvf_source_columns(
+            tvf_source,
+            &*Self::tvf_of(tvf_source)?,
+        ))
+    }
+
+    fn tvf_source_columns(
+        tvf_source: &FunctionTableSource,
+        tvf: &dyn crate::functions::tvf::TableValuedFunction,
+    ) -> Vec<String> {
+        if !tvf_source.column_aliases.is_empty() {
+            tvf_source
+                .column_aliases
+                .iter()
+                .map(|id| id.value.to_string())
+                .collect()
+        } else {
+            tvf.column_names()
+        }
+    }
+
     fn evaluate_tvf_with_range(
         tvf_source: &FunctionTableSource,
         ctx: &ExecutionContext,
         limit: Option<usize>,
         range_hint: Option<Resolved>,
     ) -> Result<(RowVec, Vec<String>)> {
-        use crate::functions::global_registry;
-
-        let func_name = &tvf_source.function.value;
-        let tvf = global_registry().get_tvf(func_name).ok_or_else(|| {
-            Error::NotSupported(format!("Unknown table-valued function: {}", func_name))
-        })?;
+        let tvf = Self::tvf_of(tvf_source)?;
 
         // Evaluate arguments to Values
         let mut arg_values = Vec::with_capacity(tvf_source.arguments.len());
@@ -2384,17 +2414,7 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::tvf_rows_generated(result_rows.len());
 
-        let columns: Vec<String> = if !tvf_source.column_aliases.is_empty() {
-            tvf_source
-                .column_aliases
-                .iter()
-                .map(|id| id.value.to_string())
-                .collect()
-        } else {
-            tvf.column_names()
-        };
-
-        Ok((result_rows, columns))
+        Ok((result_rows, Self::tvf_source_columns(tvf_source, &*tvf)))
     }
 
     /// Execute SELECT without FROM (expressions only)
@@ -4934,8 +4954,7 @@ impl Executor {
     }
 
     /// Whether a join of two base tables holds subqueries in its ON or its
-    /// WHERE, all of the forms the prepared blocks run, or why not. `ctx`
-    /// names the CTEs the subqueries read, when the statement runs
+    /// WHERE, all of the forms the prepared blocks run, or why not
     pub(crate) fn join_blocks_family(
         &self,
         stmt: &SelectStatement,
@@ -4943,7 +4962,6 @@ impl Executor {
         join_type: &str,
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         schemas: (Option<&Schema>, Option<&Schema>),
-        ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
         let plain_table =
             |side: &Expression| matches!(side, Expression::TableSource(ts) if ts.as_of.is_none());
@@ -4956,9 +4974,9 @@ impl Executor {
         let on = join_source.condition.as_deref();
         let on_subqueries = on.is_some_and(Self::has_subqueries);
         if let Some(on) = on.filter(|_| on_subqueries) {
-            self.join_where_family(on, ctx)?;
+            self.join_where_family(on)?;
         }
-        let output_subqueries = self.join_output_family(stmt, join_source, join_type, ctx)?;
+        let output_subqueries = self.join_output_family(stmt, join_source, join_type)?;
         let Some(where_clause) = stmt.where_clause.as_deref() else {
             return match on_subqueries || output_subqueries {
                 true => Ok(()),
@@ -4982,7 +5000,7 @@ impl Executor {
         let mut subqueries = on_subqueries || output_subqueries;
         for part in parts.iter().flatten() {
             if Self::has_subqueries(part) {
-                self.join_where_family(part, ctx)?;
+                self.join_where_family(part)?;
                 subqueries = true;
             }
         }
@@ -5000,7 +5018,6 @@ impl Executor {
         stmt: &SelectStatement,
         join_source: &JoinTableSource,
         join_type: &str,
-        ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<bool, OutOfFamily> {
         let items = stmt
             .columns
@@ -5011,7 +5028,7 @@ impl Executor {
         let mut found = false;
         for expr in items.chain(keys) {
             if Self::has_subqueries(expr) {
-                self.join_where_family(expr, ctx)?;
+                self.join_where_family(expr)?;
                 found = true;
             }
         }
@@ -5225,7 +5242,6 @@ impl Executor {
                             &join_type,
                             (left_alias.as_deref(), right_alias.as_deref()),
                             (left_schema.as_deref(), right_schema.as_deref()),
-                            Some(ctx),
                         )
                         .is_ok()
                     })
@@ -7324,7 +7340,7 @@ impl Executor {
     /// Parse a view's SQL query and return the cached Statement.
     /// Uses the query cache to avoid re-parsing the same view query multiple times.
     /// Returns Arc<Statement> - caller should extract SelectStatement via pattern match.
-    fn parse_view_statement(&self, view_query: &str) -> Result<Arc<Statement>> {
+    pub(super) fn parse_view_statement(&self, view_query: &str) -> Result<Arc<Statement>> {
         // Try to get from cache first (cheap Arc clone, no Statement clone)
         if let Some(cached) = self.query_cache.get(view_query) {
             // Validate it's a SELECT statement

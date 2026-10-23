@@ -386,7 +386,7 @@ fn test_view_where_and_select_list() {
 fn test_cte_block_reading_the_grandparent_row() {
     site(
         "site_cte_grandparent",
-        Fails("step 6"),
+        Right,
         "WITH c AS (SELECT 1 AS x) SELECT id FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.x IN (SELECT u.x FROM u WHERE u.id = t.a)) ORDER BY id",
         "SELECT id FROM t WHERE a = 1 ORDER BY id",
     );
