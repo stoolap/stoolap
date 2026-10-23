@@ -48,12 +48,31 @@ fn fill(db: &Database) {
         "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w TEXT)",
         "INSERT INTO m VALUES (1, 1, 3, '3'), (2, 1, 7, '7'), (3, 2, 4, '4'), (4, 2, NULL, NULL), \
          (5, 3, NULL, NULL), (6, 4, 2, '2'), (7, 4, 9, '9')",
+        "CREATE VIEW tv AS SELECT id, i, f, s FROM t",
     ] {
         db.execute(sql, ()).unwrap();
     }
 }
 
 const COLUMNS: &[&str] = &["i", "f", "s"];
+
+/// The statement's source and the strategy that takes its set conjuncts:
+/// the table's scan, or the rows of a source that is no table, the last
+/// one untyped and mixing numbers of both kinds with NULLs and TEXT
+const SOURCES: &[(&str, PreparedStrategy)] = &[
+    ("t", PreparedStrategy::ScanTakesMembers),
+    (
+        "(SELECT id, i, f, s FROM t) AS t",
+        PreparedStrategy::RowsTakeMembers,
+    ),
+    ("tv AS t", PreparedStrategy::RowsTakeMembers),
+    (
+        "(VALUES (1, 3, 1.5, '3'), (2, 3.0, 0.0, '2'), (3, NULL, 4.5, NULL), (4, 7, 3.0, '7'), \
+         (5, 4.0, 6.0, '4'), (6, 9, 1.5, '9'), (7, 2, 3.0, 'x'), (8, 2.5, NULL, '2.5')) \
+         AS t(id, i, f, s)",
+        PreparedStrategy::RowsTakeMembers,
+    ),
+];
 
 const TESTS: &[&str] = &[
     "IN", "NOT IN", "= ANY", "<> ALL", "> ANY", "< ALL", ">= ALL", "<= ANY", "<> ANY", "= ALL",
@@ -85,7 +104,7 @@ fn ids(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
 fn a_scan_takes_a_set_conjunct_as_the_general_path_answers_it() {
     let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
-    let mut taken = 0;
+    let mut taken = [0; SOURCES.len()];
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = if sealed {
@@ -98,28 +117,29 @@ fn a_scan_takes_a_set_conjunct_as_the_general_path_answers_it() {
             fill(&db);
             db
         };
-        for column in COLUMNS {
-            for test in TESTS {
-                for block in BLOCKS {
-                    let condition = format!("{column} {test} ({block})");
-                    for shape in [
-                        "SELECT id FROM {t} WHERE {c}",
-                        "SELECT id FROM {t} WHERE id > 5 AND {c}",
-                        "SELECT id FROM {t} WHERE {c} ORDER BY id LIMIT 4 OFFSET 2",
-                    ] {
-                        let plain = shape.replace("{c}", &condition).replace("{t}", "t");
-                        let per_row = shape
-                            .replace("{c}", &format!("({condition} OR id < 0)"))
-                            .replace("{t}", "t");
-                        let before = prepared_strategy_runs(PreparedStrategy::ScanTakesMembers);
-                        let got = ids(&db, &plain);
-                        taken +=
-                            prepared_strategy_runs(PreparedStrategy::ScanTakesMembers) - before;
-                        let want = ids(&db, &per_row);
-                        if got != want {
-                            wrong.push(format!(
-                                "sealed {sealed}: {plain}: {got:?}, per row {want:?}"
-                            ));
+        for ((source, strategy), taken) in SOURCES.iter().zip(taken.iter_mut()) {
+            for column in COLUMNS {
+                for test in TESTS {
+                    for block in BLOCKS {
+                        let condition = format!("{column} {test} ({block})");
+                        for shape in [
+                            "SELECT id FROM {t} WHERE {c}",
+                            "SELECT id FROM {t} WHERE id > 5 AND {c}",
+                            "SELECT id FROM {t} WHERE {c} ORDER BY id LIMIT 4 OFFSET 2",
+                        ] {
+                            let plain = shape.replace("{c}", &condition).replace("{t}", source);
+                            let per_row = shape
+                                .replace("{c}", &format!("({condition} OR id < 0)"))
+                                .replace("{t}", source);
+                            let before = prepared_strategy_runs(*strategy);
+                            let got = ids(&db, &plain);
+                            *taken += prepared_strategy_runs(*strategy) - before;
+                            let want = ids(&db, &per_row);
+                            if got != want {
+                                wrong.push(format!(
+                                    "sealed {sealed}: {plain}: {got:?}, per row {want:?}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -132,7 +152,9 @@ fn a_scan_takes_a_set_conjunct_as_the_general_path_answers_it() {
         wrong.len(),
         wrong.join("\n")
     );
-    assert!(taken > 0, "no statement reached the set scan");
+    for ((source, strategy), taken) in SOURCES.iter().zip(taken) {
+        assert!(taken > 0, "no statement over {source} reached {strategy:?}");
+    }
 }
 
 #[test]
@@ -151,16 +173,21 @@ fn a_block_error_belongs_to_the_row_that_needs_the_answer() {
         "(SELECT SUM(v) FROM o)",
     ] {
         for test in ["IN", "NOT IN", "> ANY", ">= ALL", "= ANY", "<> ALL"] {
-            let empty = format!("SELECT id FROM e WHERE i {test} {block}");
-            assert_eq!(ids(&db, &empty), Ok(vec![]), "{empty}: no row needs it");
-            let rows = format!("SELECT id FROM t WHERE i {test} {block}");
-            let got = ids(&db, &rows);
-            let per_row = ids(&db, &rows.replace("WHERE i", "WHERE id < 0 OR i"));
-            assert!(
-                got.as_ref().is_err_and(|e| e.contains("overflow")),
-                "{rows}: {got:?}"
-            );
-            assert_eq!(got, per_row, "{rows}: as it errs asked of each row");
+            for (none, some) in [
+                ("e", "t"),
+                ("(SELECT id, i FROM e) AS e", "(SELECT id, i FROM t) AS t"),
+            ] {
+                let empty = format!("SELECT id FROM {none} WHERE i {test} {block}");
+                assert_eq!(ids(&db, &empty), Ok(vec![]), "{empty}: no row needs it");
+                let rows = format!("SELECT id FROM {some} WHERE i {test} {block}");
+                let got = ids(&db, &rows);
+                let per_row = ids(&db, &rows.replace("WHERE i", "WHERE id < 0 OR i"));
+                assert!(
+                    got.as_ref().is_err_and(|e| e.contains("overflow")),
+                    "{rows}: {got:?}"
+                );
+                assert_eq!(got, per_row, "{rows}: as it errs asked of each row");
+            }
         }
     }
     let exists = "EXISTS (SELECT 1 FROM o WHERE o.id = {t}.id AND o.v * 2 > 0)";

@@ -5620,7 +5620,8 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// Hand `keep` each of `rows` that passes `where_`, with the count of
-    /// rows read so far, until `keep` says stop
+    /// rows read so far, until `keep` says stop. The set conjuncts test the
+    /// members read before the first row, as a table's scan does
     fn rows_passing(
         &self,
         where_: &PreparedWhere,
@@ -5633,12 +5634,27 @@ impl<'a> PreparedRunner<'a> {
             return Ok(Passing::Read);
         }
         let mut vm = ExprVM::new();
+        let mut program = None;
         for (scanned, read) in (1u64..).zip(rows) {
             if scanned.is_multiple_of(100) {
                 ctx.check_cancelled()?;
             }
             let (id, row) = read?;
-            if self.matches(&mut vm, &where_.program, &row)? && !keep(id, scanned, row) {
+            // Rows read in no table are narrowed by no key: the narrowing's
+            // set is a set conjunct like the others
+            let program = program.get_or_insert_with(|| {
+                let slots: SmallVec<[SetSlot; 2]> = where_
+                    .sets
+                    .iter()
+                    .copied()
+                    .chain(where_.narrowing_set)
+                    .collect();
+                match slots.is_empty() {
+                    true => CompactArc::clone(&where_.program),
+                    false => self.with_bound_sets(&where_.program, &slots),
+                }
+            });
+            if self.matches(&mut vm, program, &row)? && !keep(id, scanned, row) {
                 break;
             }
         }
@@ -6503,8 +6519,6 @@ impl PreparedRunner<'_> {
         if !program.has_subqueries() {
             return Some(CompactArc::clone(program));
         }
-        let empty = Row::new();
-        let caller = ExecuteContext::new(&empty);
         let mut ops = Vec::with_capacity(program.len());
         for op in program.ops() {
             let index = match op {
@@ -6515,27 +6529,64 @@ impl PreparedRunner<'_> {
                     continue;
                 }
             };
-            let sq = self.prepared.subqueries.get(index)?;
-            let Answer::Members(kept, members) = &sq.answer else {
-                return None;
-            };
-            if !sq.uncorrelated {
-                return None;
-            }
-            self.read_members(index, kept, members, &caller, self.holes)
-                .ok()?;
-            let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
-                return None;
-            };
-            if set.failed.is_some() {
-                return None;
-            }
-            ops.push(match &set.set {
-                MemberSet::In(set) => Op::InSet(CompactArc::new(set.clone())),
-                MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
-            });
+            ops.push(self.bound_set(index)?);
         }
         Some(CompactArc::new(super::expression::Program::new(ops)))
+    }
+
+    /// `program` with the member tests of `slots` bound to the sets this run
+    /// read; a test whose set is not read stays one the run answers
+    fn with_bound_sets(&self, program: &SharedProgram, slots: &[SetSlot]) -> SharedProgram {
+        let ops = program.ops().iter().map(|op| match op {
+            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..)
+                if slots.iter().any(|slot| slot.id == *index) =>
+            {
+                match self.bound_set(*index as usize) {
+                    Some(bound) => {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::prepared_strategy_ran(
+                            crate::test_failpoints::PreparedStrategy::RowsTakeMembers,
+                        );
+                        bound
+                    }
+                    None => op.clone(),
+                }
+            }
+            op => op.clone(),
+        });
+        CompactArc::new(super::expression::Program::new(ops.collect()))
+    }
+
+    /// The test over the members uncorrelated block `index` holds for this
+    /// run, read now; None when the read fails or a candidate failed, whose
+    /// error stays with the row that needs it
+    fn bound_set(&self, index: usize) -> Option<Op> {
+        let sq = self.prepared.subqueries.get(index)?;
+        let Answer::Members(kept, members) = &sq.answer else {
+            return None;
+        };
+        if !sq.uncorrelated {
+            return None;
+        }
+        let empty = Row::new();
+        self.read_members(
+            index,
+            kept,
+            members,
+            &ExecuteContext::new(&empty),
+            self.holes,
+        )
+        .ok()?;
+        let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
+            return None;
+        };
+        if set.failed.is_some() {
+            return None;
+        }
+        Some(match &set.set {
+            MemberSet::In(set) => Op::InSet(CompactArc::new(set.clone())),
+            MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
+        })
     }
 
     /// `read` of block `index`'s set, or the error a read of it raised
