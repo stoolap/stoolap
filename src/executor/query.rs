@@ -2594,8 +2594,9 @@ impl Executor {
                     ) && !Self::has_subqueries(other) =>
                 {
                     let name = other.to_string();
+                    let key = ExprKey::of(other);
                     let aliased = stmt.columns.iter().any(|expr| match expr {
-                        Expression::Aliased(a) => a.expression.to_string() == name,
+                        Expression::Aliased(a) => ExprKey::of(&a.expression) == key,
                         _ => false,
                     });
                     if !aliased && !select_columns.contains(name.to_lowercase().as_str()) {
@@ -10947,10 +10948,11 @@ impl Executor {
                     } =>
                 {
                     let name = other.to_string();
+                    let key = ExprKey::of(other);
                     if !select_column_names
                         .iter()
                         .any(|s| s.eq_ignore_ascii_case(&name))
-                        && !computed_order_by.iter().any(|e| e.to_string() == name)
+                        && !computed_order_by.iter().any(|e| ExprKey::of(e) == key)
                     {
                         computed_order_by.push(other);
                     }

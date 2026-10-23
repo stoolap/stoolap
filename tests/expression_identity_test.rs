@@ -306,21 +306,132 @@ fn test_a_name_in_a_sort_expression_reads_the_table_column_first() {
     );
 }
 
+fn pairs(result: stoolap::Result<stoolap::Rows>) -> Result<Vec<(i64, i64)>, String> {
+    let mut out = Vec::new();
+    for row in result.map_err(|e| e.to_string())? {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
+    }
+    Ok(out)
+}
+
 #[test]
-fn test_unnamed_parameters_match_across_clauses() {
-    let db = setup("identity_unnamed_parameters");
-    let found: Vec<(i64, i64)> = db
-        .query(
-            "SELECT g + ?, COUNT(*) FROM t GROUP BY g + ? ORDER BY 1",
-            (10, 10),
-        )
-        .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
-        })
-        .collect();
-    assert_eq!(found, vec![(11, 2), (12, 1)], "g + ? is the group key");
+fn test_a_parameter_is_one_expression_by_its_slot() {
+    let db = setup("identity_parameter_slots");
+    let grouped = Ok(vec![(11, 2), (12, 1)]);
+    assert_eq!(
+        pairs(db.query(
+            "SELECT g + $1, COUNT(*) FROM t GROUP BY g + $1 ORDER BY 1",
+            (10,)
+        )),
+        grouped,
+        "g + $1 is the group key"
+    );
+    assert_eq!(
+        pairs(db.query_named(
+            "SELECT g + :n, COUNT(*) FROM t GROUP BY g + :n ORDER BY 1",
+            stoolap::named_params! { n: 10 },
+        )),
+        grouped,
+        "a name written twice is one slot"
+    );
+    let two = pairs(db.query(
+        "SELECT g + ?, COUNT(*) FROM t GROUP BY g + ? ORDER BY 1",
+        (10, 10),
+    ));
+    assert!(
+        two.as_ref().is_err_and(|e| e.contains("'g'")),
+        "two ? are two expressions, so g is not grouped: {two:?}"
+    );
+}
+
+#[test]
+fn test_two_anonymous_parameters_are_two_expressions() {
+    let rows_of = |db: &Database, sql: &str, params: (i64, i64)| -> Vec<Vec<String>> {
+        db.query(sql, params)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect()
+            })
+            .collect()
+    };
+    let cases: &[(&str, (i64, i64), &str)] = &[
+        (
+            "SELECT g + ? AS x, g + ? AS y, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 1, 2",
+            (1, 2),
+            "SELECT g + 1 AS x, g + 2 AS y, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 1, 2",
+        ),
+        (
+            "SELECT g + ? AS x, g + ? AS y, COUNT(*) FROM t GROUP BY 1, 2 HAVING y > 3 ORDER BY 1",
+            (1, 2),
+            "SELECT g + 1 AS x, g + 2 AS y, COUNT(*) FROM t GROUP BY 1, 2 HAVING y > 3 ORDER BY 1",
+        ),
+        (
+            "SELECT SUM(a + ?), SUM(a + ?) FROM t",
+            (1, 2),
+            "SELECT SUM(a + 1), SUM(a + 2) FROM t",
+        ),
+        (
+            "SELECT g, SUM(a * ?), SUM(a * ?) FROM t GROUP BY g ORDER BY g",
+            (1, 2),
+            "SELECT g, SUM(a * 1), SUM(a * 2) FROM t GROUP BY g ORDER BY g",
+        ),
+        (
+            "SELECT g * ? AS x, a FROM t ORDER BY g * ?, a",
+            (1, -1),
+            "SELECT g * 1 AS x, a FROM t ORDER BY g * -1, a",
+        ),
+        (
+            "SELECT g * ?, a FROM t ORDER BY g * ?, a",
+            (1, -1),
+            "SELECT g * 1, a FROM t ORDER BY g * -1, a",
+        ),
+        (
+            "SELECT a FROM t ORDER BY g * ?, g * ?, a DESC",
+            (0, -1),
+            "SELECT a FROM t ORDER BY g * 0, g * -1, a DESC",
+        ),
+        (
+            "SELECT a, SUM(a) OVER (PARTITION BY g * ?), SUM(a) OVER (PARTITION BY g * ?) \
+             FROM t ORDER BY a",
+            (1, 0),
+            "SELECT a, SUM(a) OVER (PARTITION BY g * 1), SUM(a) OVER (PARTITION BY g * 0) \
+             FROM t ORDER BY a",
+        ),
+        (
+            "SELECT g + (SELECT ?) AS x, g + (SELECT ?) AS y, COUNT(*) FROM t GROUP BY 1, 2 \
+             HAVING y > (SELECT 3) ORDER BY 1",
+            (1, 2),
+            "SELECT g + 1 AS x, g + 2 AS y, COUNT(*) FROM t GROUP BY 1, 2 HAVING y > 3 ORDER BY 1",
+        ),
+    ];
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = match sealed {
+            true => {
+                let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+                for sql in [
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, a INTEGER)",
+                    "INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 2, 10)",
+                    "PRAGMA CHECKPOINT",
+                ] {
+                    db.execute(sql, ()).unwrap();
+                }
+                db
+            }
+            false => setup("identity_two_anonymous_parameters"),
+        };
+        for (sql, params, literal) in cases {
+            assert_eq!(
+                rows_of(&db, sql, *params),
+                rows(&db, literal),
+                "sealed {sealed}: {sql} with {params:?}"
+            );
+        }
+    }
 }
 
 #[test]
