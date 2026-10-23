@@ -391,28 +391,25 @@ fn state(source: &str, cell: &str) -> State {
     const STEP_6: State = Fails("step 6");
     const GRAMMAR: State = Fails("step 6, grammar first");
     match (source, cell) {
-        ("values", "block_outer_arithmetic" | "statement_point") => Wrong("#578"),
+        ("values", "block_outer_arithmetic") => Wrong("#578"),
         (
             "cte_columns" | "recursive" | "series",
             "select_scalar" | "select_correlated" | "order_by_correlated" | "limit",
         ) => WrongNames("#581"),
-        (
-            "values",
-            "block_exists"
-            | "block_scalar"
-            | "block_select_list"
-            | "delete_where_exists"
-            | "update_set_correlated",
-        ) => Fails("#578"),
+        ("values", "block_select_list") => Fails("#578"),
         ("series", "body_argument") => GRAMMAR,
         ("cte" | "cte_columns", "insert_values" | "on_conflict_set") => GRAMMAR,
+        (_, "join_on_correlated") => STEP_6,
         (
-            _,
-            "block_grandparent" | "block_unqualified_outer" | "join_on_correlated" | "returning",
+            "derived",
+            "block_grandparent"
+            | "block_unqualified_outer"
+            | "returning"
+            | "insert_values"
+            | "on_conflict_set",
         ) => STEP_6,
         ("view" | "derived" | "cte" | "cte_columns", "body_join_on") => STEP_6,
         ("values", "body_row") => STEP_6,
-        ("view" | "derived" | "series" | "values", "insert_values" | "on_conflict_set") => STEP_6,
         ("view", "select_scalar") => STEP_6,
         _ => Right,
     }

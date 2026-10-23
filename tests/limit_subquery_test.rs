@@ -113,6 +113,14 @@ const TWINS: &[(&str, &str)] = &[
         "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT (SELECT 3) OFFSET (SELECT 1)",
         "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT 3 OFFSET 1",
     ),
+    (
+        "WITH c AS (SELECT id FROM t WHERE id < 3) SELECT id FROM c ORDER BY id LIMIT (SELECT COUNT(*) FROM c) - 1",
+        "WITH c AS (SELECT id FROM t WHERE id < 3) SELECT id FROM c ORDER BY id LIMIT 1",
+    ),
+    (
+        "WITH u AS (SELECT 1 AS x) SELECT id FROM t ORDER BY id LIMIT (SELECT COUNT(*) FROM u)",
+        "WITH u AS (SELECT 1 AS x) SELECT id FROM t ORDER BY id LIMIT 1",
+    ),
 ];
 
 #[test]
@@ -183,14 +191,6 @@ fn a_limit_subquery_takes_the_rule_of_a_count() {
             "a row of an enclosing statement",
         ),
         ("SELECT id FROM t LIMIT (SELECT a)", "column 'a' not found"),
-        (
-            "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT (SELECT COUNT(*) FROM c)",
-            "FROM names a CTE",
-        ),
-        (
-            "WITH u AS (SELECT 1 AS x) SELECT id FROM t ORDER BY id LIMIT (SELECT COUNT(*) FROM u)",
-            "FROM names a CTE",
-        ),
     ] {
         let got = answer(db.query(sql, ()));
         assert!(

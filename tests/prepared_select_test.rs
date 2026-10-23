@@ -1011,6 +1011,7 @@ fn test_classifier_rules() {
         format!("SELECT id FROM t WHERE ABS({sq}) > 1 AND NOT (b = 2) AND -a < 0"),
         "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = 2)".to_string(),
         format!("SELECT id FROM t WHERE a > (SELECT {sq} FROM u WHERE u.id = 1)"),
+        "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)".to_string(),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1078,10 +1079,6 @@ fn test_classifier_rules() {
         (
             format!("SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > {sq}"),
             "a side that is not a table read without AS OF",
-        ),
-        (
-            "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)".to_string(),
-            "FROM names a view",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"
@@ -2149,8 +2146,8 @@ fn test_a_redefined_view_answers_from_its_new_body() {
     let built = prepared_selects_built();
     for (body, want, prepared) in [
         ("SELECT id, a FROM t WHERE b = 1", vec![1], 1),
-        ("SELECT id, a FROM t WHERE b = 2", vec![6], 1),
-        ("SELECT a, id FROM t", vec![1, 6], 2),
+        ("SELECT id, a FROM t WHERE b = 2", vec![6], 2),
+        ("SELECT a, id FROM t", vec![1, 6], 3),
     ] {
         db.execute("DROP VIEW IF EXISTS tv", ()).unwrap();
         db.execute(&format!("CREATE VIEW tv AS {body}"), ())
@@ -2159,7 +2156,7 @@ fn test_a_redefined_view_answers_from_its_new_body() {
         assert_eq!(
             prepared_selects_built() - built,
             prepared,
-            "{body}: the plan is kept while the view's columns are"
+            "{body}: a view defined again prepares the plan again"
         );
     }
 }
@@ -2301,7 +2298,7 @@ fn test_a_block_reading_a_cte_is_not_prepared() {
             "WITH s AS (SELECT id, a FROM t) SELECT x.id FROM s AS x \
              WHERE x.a > (SELECT MIN(a) FROM s)"
         ),
-        "Prepared: no (FROM names a CTE)"
+        "Prepared: no (a subquery's FROM names a CTE of the statement's WITH)"
     );
 }
 
@@ -2384,4 +2381,241 @@ fn test_a_table_function_generates_only_the_range_its_where_allows() {
     let before = tvf_rows();
     assert_eq!(ids(&db, SERIES, ()).0, vec![1, 2, 3]);
     assert_eq!(tvf_rows() - before, 3, "the rows below 4, of a million");
+}
+
+#[test]
+fn test_a_block_reads_a_view_values_list_or_table_function() {
+    let _guard = serial();
+    let db = setup("prepared_block_sources");
+    db.execute("CREATE VIEW uv AS SELECT id, v FROM u", ())
+        .unwrap();
+    for (sql, want, runs) in [
+        (
+            "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id) ORDER BY id",
+            vec![1, 6],
+            6,
+        ),
+        (
+            "SELECT id FROM t WHERE a >= (SELECT MAX(v) FROM uv) ORDER BY id",
+            vec![6],
+            1,
+        ),
+        (
+            "SELECT id FROM t WHERE a > (SELECT w.x FROM (VALUES (1, 5), (2, 25), (6, 7)) AS w(k, x) \
+             WHERE w.k = t.id) ORDER BY id",
+            vec![1, 6],
+            6,
+        ),
+        (
+            "SELECT id FROM t WHERE a > (SELECT MAX(s.x) * 10 FROM generate_series(1, 3) AS s(x)) \
+             ORDER BY id",
+            vec![4, 5, 6],
+            1,
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert_eq!(ids(&db, sql, ()), (want, runs), "{sql}");
+    }
+}
+
+#[test]
+fn test_a_block_reads_a_cte_around_its_statement() {
+    let _guard = serial();
+    let db = setup("prepared_block_cte");
+    const SQL: &str = "WITH c AS (SELECT id, v FROM u), \
+                       s AS (SELECT id FROM t WHERE a > (SELECT v FROM c WHERE c.id = t.id)) \
+                       SELECT id FROM s ORDER BY id";
+    assert_eq!(ids(&db, SQL, ()), (vec![1, 6], 6));
+}
+
+#[test]
+fn test_a_block_over_a_redefined_view_reads_its_new_body() {
+    let _guard = serial();
+    let db = setup("prepared_block_view_redefined");
+    const SQL: &str =
+        "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id) ORDER BY id";
+    let built = prepared_selects_built();
+    for (body, want, prepared) in [
+        ("SELECT id, v FROM u", vec![1, 6], 1),
+        ("SELECT id, v + 100 AS v FROM u", vec![], 2),
+        ("SELECT v, id FROM u", vec![1, 6], 3),
+    ] {
+        db.execute("DROP VIEW IF EXISTS uv", ()).unwrap();
+        db.execute(&format!("CREATE VIEW uv AS {body}"), ())
+            .unwrap();
+        assert_eq!(ids(&db, SQL, ()).0, want, "{body}");
+        assert_eq!(
+            prepared_selects_built() - built,
+            prepared,
+            "{body}: a view defined again prepares the plan again"
+        );
+    }
+}
+
+#[test]
+fn test_a_block_over_a_view_or_cte_reads_each_statement_s_rows() {
+    let _guard = serial();
+    let db = setup("prepared_block_source_fresh");
+    db.execute("CREATE VIEW uv AS SELECT id, v FROM u", ())
+        .unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE a >= (SELECT MAX(v) FROM uv) ORDER BY id",
+        "WITH c AS (SELECT v FROM u), s AS (SELECT id, a FROM t WHERE a >= (SELECT MAX(v) FROM c)) \
+         SELECT id FROM s ORDER BY id",
+    ] {
+        db.execute("UPDATE u SET v = 60 WHERE id = 5", ()).unwrap();
+        assert_eq!(ids(&db, sql, ()).0, vec![6], "{sql}");
+        db.execute("UPDATE u SET v = 30 WHERE id = 5", ()).unwrap();
+        assert_eq!(ids(&db, sql, ()).0, vec![3, 4, 5, 6], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_block_source_is_read_before_the_statement_s_rows() {
+    let _guard = serial();
+    let db = setup("prepared_block_source_error");
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO m VALUES (1, -9223372036854775808)", ())
+        .unwrap();
+    db.execute("CREATE VIEW mv AS SELECT id, ABS(x) AS x FROM m", ())
+        .unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE id > 100 AND a > (SELECT x FROM mv WHERE mv.id = t.id)",
+        "SELECT id FROM t WHERE id > 100 AND a > \
+         (SELECT w.x FROM (VALUES (1, ABS(-9223372036854775808))) AS w(k, x) WHERE w.k = t.id)",
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert!(
+            error(&db, sql, ()).0.contains("overflow"),
+            "{sql}: the source's error, though no row reaches the block"
+        );
+    }
+}
+
+#[test]
+fn test_a_block_s_table_function_generates_only_the_range_its_where_allows() {
+    let _guard = serial();
+    let db = setup("prepared_block_tvf_range");
+    const SQL: &str = "SELECT id FROM t WHERE a > \
+                       (SELECT MAX(value) FROM generate_series(1, 10000001) WHERE value < 3) ORDER BY id";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
+    let before = tvf_rows();
+    assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(tvf_rows() - before, 2, "the rows below 3, of ten million");
+    for none in ["FALSE", "NULL", "1 = 0"] {
+        let sql = format!(
+            "SELECT id FROM t WHERE EXISTS \
+             (SELECT 1 FROM generate_series(1, 10000001) AS s(n) WHERE {none})"
+        );
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{none}");
+        let before = tvf_rows();
+        assert_eq!(ids(&db, &sql, ()).0, Vec::<i64>::new(), "{none}");
+        assert_eq!(tvf_rows() - before, 0, "WHERE {none} generates nothing");
+    }
+    const OUTER: &str = "SELECT id FROM t WHERE \
+                         (SELECT COUNT(*) FROM generate_series(1, 10) AS s(a) WHERE t.a = 10) = 10 ORDER BY id";
+    assert_eq!(prepared_line(&db, OUTER), "Prepared: yes");
+    assert_eq!(
+        ids(&db, OUTER, ()).0,
+        vec![1],
+        "a comparison of an enclosing column narrows nothing"
+    );
+}
+
+#[test]
+fn test_a_block_s_view_runs_once_in_the_run_that_prepares_it() {
+    let _guard = serial();
+    let db = setup("prepared_block_view_once");
+    db.execute("CREATE VIEW rv AS SELECT RANDOM() AS n", ())
+        .unwrap();
+    const SQL: &str = "SELECT id FROM t WHERE a > (SELECT MAX(n) FROM rv) ORDER BY id";
+    let built = prepared_selects_built();
+    for run in ["prepares", "keeps its plan"] {
+        let before = random_draws();
+        assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6], "{run}");
+        assert_eq!(
+            random_draws() - before,
+            1,
+            "the run that {run} reads the view once"
+        );
+    }
+    assert_eq!(prepared_selects_built() - built, 1);
+}
+
+#[test]
+fn test_a_returning_block_s_view_over_the_target_runs_once_in_the_run_that_prepares_it() {
+    let _guard = serial();
+    let db = setup("prepared_returning_view_once");
+    db.execute(
+        "CREATE VIEW rv AS SELECT id, RANDOM() AS n FROM t WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    const SQL: &str =
+        "UPDATE t SET b = 11 WHERE id = 1 RETURNING id, (SELECT rv.n FROM rv WHERE rv.id = t.id)";
+    for run in ["prepares", "keeps its plan"] {
+        let before = random_draws();
+        let found: Vec<i64> = db
+            .query(SQL, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(found, vec![1], "{run}");
+        assert_eq!(
+            random_draws() - before,
+            1,
+            "the run that {run} reads the view once"
+        );
+    }
+}
+
+/// Two rows in a column named `n`
+struct NamedRows;
+
+impl stoolap::functions::tvf::TableValuedFunction for NamedRows {
+    fn name(&self) -> &str {
+        "NAMED_ROWS"
+    }
+    fn column_names(&self) -> Vec<String> {
+        vec!["n".to_string()]
+    }
+    fn generate(
+        &self,
+        _args: &[stoolap::core::Value],
+        _limit: Option<usize>,
+    ) -> stoolap::core::Result<stoolap::core::RowVec> {
+        let mut rows = stoolap::core::RowVec::new();
+        for n in [1i64, 2] {
+            rows.push((n, stoolap::core::Row::from_values(vec![n.into()])));
+        }
+        Ok(rows)
+    }
+}
+
+#[test]
+fn test_a_table_function_generating_nothing_keeps_its_column_names() {
+    let _guard = serial();
+    stoolap::functions::global_registry()
+        .register_tvf("NAMED_ROWS", std::sync::Arc::new(|| Box::new(NamedRows)));
+    let db = setup("prepared_tvf_named_columns");
+    for (sql, want) in [
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM named_rows() WHERE FALSE)",
+            vec![],
+        ),
+        (
+            "SELECT id FROM t WHERE id IN (SELECT n FROM named_rows() WHERE n > 1)",
+            vec![2],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+    }
+    let columns = db
+        .query("SELECT * FROM named_rows() WHERE FALSE", ())
+        .unwrap()
+        .columns()
+        .to_vec();
+    assert_eq!(columns, vec!["n".to_string()]);
 }

@@ -24,7 +24,7 @@ use crate::core::Result;
 
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
-use super::prepared_select::JoinBlocks;
+use super::prepared_select::{FirstReads, JoinBlocks};
 use super::query::JoinOutput;
 
 /// The programs one compile builds, shared only once they are held
@@ -281,22 +281,22 @@ impl PreparedJoin {
         Ok(built)
     }
 
-    /// The statement's blocks, or the ones `build` prepares, then held;
-    /// none when `build` prepares none
+    /// The statement's blocks, or the ones `build` prepares, then held, with
+    /// the views' rows preparing read; none when `build` prepares none
     pub(crate) fn join_blocks(
         &self,
-        build: impl FnOnce() -> Result<Option<JoinBlocks>>,
-    ) -> Result<Option<Arc<JoinBlocks>>> {
+        build: impl FnOnce() -> Result<Option<(JoinBlocks, FirstReads)>>,
+    ) -> Result<Option<(Arc<JoinBlocks>, FirstReads)>> {
         if let Some(held) = self.join_blocks.read().ok().and_then(|held| held.clone()) {
-            return Ok(Some(held));
+            return Ok(Some((held, FirstReads::new())));
         }
-        let Some(built) = build()? else {
+        let Some((built, first)) = build()? else {
             return Ok(None);
         };
         let built = Arc::new(built);
         if let Ok(mut held) = self.join_blocks.write() {
             held.get_or_insert_with(|| Arc::clone(&built));
         }
-        Ok(Some(built))
+        Ok(Some((built, first)))
     }
 }
