@@ -2322,3 +2322,30 @@ fn test_a_cte_the_statement_does_not_read_does_not_run() {
         "ABS of its row would overflow"
     );
 }
+
+#[test]
+fn test_a_cte_reads_the_ctes_and_views_around_it() {
+    let _guard = serial();
+    let db = setup("prepared_cte_scope");
+    db.execute(
+        "CREATE VIEW tv AS WITH w AS (SELECT id FROM t WHERE b = 2) SELECT id FROM w",
+        (),
+    )
+    .unwrap();
+    for (sql, want) in [
+        (
+            // Chained CTEs do not inline: c is materialized for s to read
+            "WITH c(id) AS (SELECT id FROM t WHERE b = 1), s AS (SELECT id FROM c) \
+             SELECT s.id FROM s WHERE s.id > (SELECT MIN(id) FROM u) ORDER BY s.id",
+            vec![2, 5],
+        ),
+        (
+            "WITH c(id) AS (SELECT 1) SELECT tv.id FROM tv \
+             WHERE tv.id > (SELECT MIN(id) FROM u) ORDER BY tv.id",
+            vec![3, 4, 6],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+    }
+}
