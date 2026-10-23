@@ -38,7 +38,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
-use super::expression::ExprVM;
+use super::expression::{ExprVM, SubqueryExecutor};
 use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
@@ -128,18 +128,25 @@ pub(crate) struct AggregateSlots<'a> {
     /// The columns of the rows aggregated, which the statement may read
     /// only through its groups
     pub source_columns: &'a [String],
+    /// The statement's blocks, which answer its SELECT list's subqueries
+    pub blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
 /// A program over aggregate slot rows: `aliases` read a group item or
-/// aggregate from its slot by identity, `outer_columns` the outer row by name
+/// aggregate from its slot by identity, `outer_columns` the outer row by name;
+/// its subqueries run as the statement's blocks when `blocks`
 pub(crate) fn compile_over_slots(
     expr: &Expression,
     columns: &[String],
     registry: &crate::functions::FunctionRegistry,
     aliases: Option<&FxHashMap<ExprKey, usize>>,
     outer_columns: Option<&[String]>,
+    blocks: bool,
 ) -> Result<super::expression::SharedProgram> {
     let mut compile = super::expression::CompileContext::new(columns, registry);
+    if blocks {
+        compile = compile.with_prepared_subqueries();
+    }
     if let Some(aliases) = aliases {
         compile = compile.with_expression_aliases(
             aliases
@@ -169,6 +176,22 @@ pub(crate) fn slot_context<'a>(
     );
     match ctx.outer_row() {
         Some(outer) => exec.with_outer_row(outer),
+        None => exec,
+    }
+}
+
+/// `exec` with its subqueries answered by the statement's `blocks`, which
+/// hold the parameters past the statement's own
+fn with_blocks<'a>(
+    exec: super::expression::ExecuteContext<'a>,
+    blocks: Option<&'a dyn SubqueryExecutor>,
+) -> super::expression::ExecuteContext<'a> {
+    let Some(blocks) = blocks else {
+        return exec;
+    };
+    let exec = exec.with_subquery_executor(blocks);
+    match blocks.params() {
+        Some(params) => exec.with_params(params),
         None => exec,
     }
 }
@@ -1018,20 +1041,23 @@ impl Executor {
             .collect()
     }
 
-    /// Execute SELECT with aggregation (GROUP BY support)
+    /// Execute SELECT with aggregation (GROUP BY support); the statement's
+    /// `blocks`, when it has them, answer its SELECT list and HAVING subqueries
     pub(crate) fn execute_select_with_aggregation(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: RowVec,
         base_columns: &[String],
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
         let written_stmt = stmt;
         // A subquery inside an aggregate is resolved per input row and read
         // back as a column, since an aggregate cannot resolve one itself
         let lifted_stmt;
         let lifted_columns;
-        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
+        let lifts = blocks.is_none() && Self::aggregates_hold_subquery(stmt);
+        let (stmt, base_rows, base_columns) = match lifts
             .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
             .flatten()
         {
@@ -1121,7 +1147,7 @@ impl Executor {
             // One that reads the group is left as written; apply_having
             // runs it once per group with that group as the outer row
             let has_correlated_having = Self::has_correlated_subqueries(having);
-            let processed_having = if has_correlated_having {
+            let processed_having = if has_correlated_having || blocks.is_some() {
                 (**having).clone()
             } else {
                 self.process_where_subqueries(having, ctx)?
@@ -1149,6 +1175,7 @@ impl Executor {
                 &slots,
                 outer_table.as_deref(),
                 ctx,
+                blocks,
             )?;
 
             // Collect rows after HAVING filter
@@ -1171,6 +1198,7 @@ impl Executor {
                 aggregations: &aggregations,
                 group_by_count: group_by_columns.len(),
                 source_columns: base_columns,
+                blocks,
             },
             ctx,
             having_columns,
@@ -1196,6 +1224,7 @@ impl Executor {
             aggregations,
             group_by_count,
             source_columns,
+            blocks,
         } = slots;
 
         // ORDER BY may name a grouped column the SELECT list drops. Capture
@@ -1223,6 +1252,7 @@ impl Executor {
                 aggregations,
                 having_columns,
                 having_rows,
+                blocks,
             )?
         } else {
             // Hidden aggregates exist: extract only the needed columns
@@ -1260,6 +1290,7 @@ impl Executor {
                 aggregations,
                 having_columns,
                 having_rows,
+                blocks,
             )?;
 
             // Append hidden aggregates to the result for ORDER BY to use
@@ -1339,6 +1370,7 @@ impl Executor {
 
     /// Apply post-aggregation expressions to the result
     /// This handles expressions like `CASE WHEN SUM(x) > 100 THEN 'big' ELSE 'small' END`
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_post_aggregation_expressions(
         &self,
         stmt: &SelectStatement,
@@ -1347,6 +1379,7 @@ impl Executor {
         aggregations: &[SqlAggregateFunction],
         agg_columns: Vec<String>,
         agg_rows: RowVec,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
         // Parse GROUP BY items for GROUPING() function support
         let group_by_columns = self.parse_group_by(stmt, &agg_columns)?;
@@ -1366,7 +1399,7 @@ impl Executor {
         // Pre-process scalar subqueries in SELECT columns (only non-correlated ones)
         // This executes subqueries like (SELECT SUM(amount) FROM sales) and replaces them
         // with their literal values before we process the column sources
-        let processed_columns = if has_any_correlated {
+        let processed_columns = if has_any_correlated || blocks.is_some() {
             // Don't pre-process if we have correlated subqueries - handle them per-row
             None
         } else {
@@ -1459,9 +1492,9 @@ impl Executor {
             // If correlated, we need to use the original expression
             let original_expr = &stmt.columns[i];
 
+            final_columns.push(self.grouped_item_name(col_expr));
             match col_expr {
                 Expression::Identifier(id) => {
-                    final_columns.push(id.value.to_string());
                     // A name no result column carries may be another alias of a shared slot
                     match slot_of(col_expr)
                         .filter(|_| !agg_col_index_map.contains_key(id.value_lower.as_str()))
@@ -1477,7 +1510,6 @@ impl Executor {
                 Expression::QualifiedIdentifier(qid) => {
                     // Use only the base column name (strip table alias prefix)
                     // e.g., u.username -> username
-                    final_columns.push(qid.name.value.to_string());
                     // Try qualified name first, then fall back to unqualified column name
                     let qualified_lower =
                         format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
@@ -1492,14 +1524,12 @@ impl Executor {
                 }
                 Expression::FunctionCall(func) => {
                     if is_aggregate_function(&func.function) {
-                        final_columns.push(self.get_aggregate_column_name(func));
                         column_sources.push(match slot_of(col_expr) {
                             Some(slot) => ColumnSource::AggSlot(slot),
                             None => make_source(col_expr, is_correlated),
                         });
                     } else if func.function.eq_ignore_ascii_case("GROUPING") {
                         // GROUPING() function - map to the appropriate grouping flag column
-                        final_columns.push(self.get_aggregate_column_name(func));
                         if let Some(idx) = self.find_grouping_column_index(func, &group_by_columns)
                         {
                             column_sources.push(ColumnSource::GroupingFlag(idx));
@@ -1519,7 +1549,6 @@ impl Executor {
                     } else {
                         // Non-aggregate function: a GROUP BY expression column is
                         // read as it is, anything else is evaluated
-                        final_columns.push(format!("{}(...)", func.function));
                         match slot_of(col_expr).filter(|_| !is_correlated) {
                             Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
                             None => column_sources.push(make_source(col_expr, is_correlated)),
@@ -1527,8 +1556,6 @@ impl Executor {
                     }
                 }
                 Expression::Aliased(aliased) => {
-                    final_columns.push(aliased.alias.value.to_string());
-
                     // The item by its own identity, never by its alias: an
                     // alias may repeat the name another slot carries
                     let slot = slot_of(&aliased.expression).filter(|_| !is_correlated);
@@ -1597,7 +1624,6 @@ impl Executor {
                     }
                 }
                 Expression::Case(_) => {
-                    final_columns.push(self.expression_to_string(col_expr));
                     if let Some(slot) = slot_of(col_expr).filter(|_| !is_correlated) {
                         // CASE is a GROUP BY column - use existing value
                         column_sources.push(ColumnSource::AggSlot(slot));
@@ -1608,7 +1634,6 @@ impl Executor {
                 }
                 _ => {
                     // A grouped expression is read from its slot, anything else evaluated
-                    final_columns.push(self.expression_to_string(col_expr));
                     match slot_of(col_expr).filter(|_| !is_correlated) {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
                         None => column_sources.push(make_source(col_expr, is_correlated)),
@@ -1698,6 +1723,7 @@ impl Executor {
                     crate::functions::registry::global_registry(),
                     Some(&slot_keys),
                     outer_columns.as_deref(),
+                    blocks.is_some(),
                 )
                 .map(Some),
                 _ => Ok(None),
@@ -1721,7 +1747,9 @@ impl Executor {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
                     ColumnSource::Expression(_) => match &source_programs[src_idx] {
-                        Some(p) => vm.execute_cow(p, &slot_context(&row, ctx))?,
+                        Some(p) => {
+                            vm.execute_cow(p, &with_blocks(slot_context(&row, ctx), blocks))?
+                        }
                         None => Value::null_unknown(),
                     },
                     ColumnSource::CorrelatedExpression(expr) => {
@@ -1756,6 +1784,7 @@ impl Executor {
                                     &self.function_registry,
                                     None,
                                     outer.as_deref(),
+                                    false,
                                 )?;
                                 vm.execute_cow(&program, &slot_context(&row, &correlated_ctx))
                             });
@@ -1783,6 +1812,23 @@ impl Executor {
         }
 
         Ok((final_columns, final_rows))
+    }
+
+    /// The name a grouped statement's SELECT item `expr` shows its column under
+    pub(crate) fn grouped_item_name(&self, expr: &Expression) -> String {
+        match expr {
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
+            Expression::FunctionCall(func)
+                if is_aggregate_function(&func.function)
+                    || func.function.eq_ignore_ascii_case("GROUPING") =>
+            {
+                self.get_aggregate_column_name(func)
+            }
+            Expression::FunctionCall(func) => format!("{}(...)", func.function),
+            Expression::Aliased(aliased) => aliased.alias.value.to_string(),
+            other => self.expression_to_string(other),
+        }
     }
 
     /// Get the column name for an aggregate function
@@ -1962,6 +2008,7 @@ impl Executor {
                 crate::functions::registry::global_registry(),
                 Some(&slots),
                 None,
+                false,
             )?;
             let mut vm = ExprVM::new();
             for (id, row) in result_rows {
@@ -2168,6 +2215,22 @@ impl Executor {
             }
             Expression::QuantifiedSet(set) => {
                 self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns, ctx)?;
+            }
+            Expression::In(in_expr) if expression_contains_aggregate(&in_expr.left) => {
+                self.extract_aggregates_from_expr(
+                    &in_expr.left,
+                    aggregations,
+                    non_agg_columns,
+                    ctx,
+                )?;
+            }
+            Expression::AllAny(all_any) if expression_contains_aggregate(&all_any.left) => {
+                self.extract_aggregates_from_expr(
+                    &all_any.left,
+                    aggregations,
+                    non_agg_columns,
+                    ctx,
+                )?;
             }
             // An aggregate a window function takes as its argument, or
             // partitions or orders by, is computed like any other
@@ -2770,6 +2833,7 @@ impl Executor {
         slots: &FxHashMap<ExprKey, usize>,
         outer_table: Option<&str>,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
         // Materialize the result
         let mut rows = RowVec::new();
@@ -2785,7 +2849,7 @@ impl Executor {
         // correlated subquery in the WHERE clause is run once per row. The
         // group's columns are offered under their bare names and under the
         // table's, since the subquery may name either
-        if Self::has_correlated_subqueries(having) {
+        if blocks.is_none() && Self::has_correlated_subqueries(having) {
             let columns_arc = CompactArc::new(columns.to_vec());
             let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = columns
                 .iter()
@@ -2818,6 +2882,7 @@ impl Executor {
                     crate::functions::registry::global_registry(),
                     Some(slots),
                     None,
+                    false,
                 )?;
                 if vm.execute_bool_checked(&filter, &slot_context(&row, &correlated_ctx))? {
                     filtered_rows.push((new_id, row));
@@ -2836,12 +2901,16 @@ impl Executor {
             crate::functions::registry::global_registry(),
             Some(slots),
             None,
+            blocks.is_some(),
         )?;
         let mut filtered_rows = RowVec::new();
         let mut new_id = 0i64;
         let mut vm = ExprVM::new();
         for (_, row) in rows {
-            if vm.execute_bool_checked(&having_filter, &slot_context(&row, ctx))? {
+            if vm.execute_bool_checked(
+                &having_filter,
+                &with_blocks(slot_context(&row, ctx), blocks),
+            )? {
                 filtered_rows.push((new_id, row));
                 new_id += 1;
             }
@@ -2988,6 +3057,7 @@ impl Executor {
             aggregations: &aggregations,
             group_by_count: 0,
             source_columns: &table.schema().column_names_arc(),
+            blocks: None,
         };
         self.finish_aggregation(AggregatePath::Pushdown, slots, ctx, result_columns, rows)
             .map(Some)
@@ -3217,6 +3287,7 @@ impl Executor {
             aggregations: &aggregations,
             group_by_count: 0,
             source_columns: columns,
+            blocks: None,
         };
         self.finish_aggregation(
             AggregatePath::FilteredPushdown,
@@ -3323,6 +3394,7 @@ impl Executor {
                     aggregations: &aggregations,
                     group_by_count: 0,
                     source_columns: &table.schema().column_names_arc(),
+                    blocks: None,
                 };
                 return self
                     .finish_aggregation(
@@ -3360,6 +3432,7 @@ impl Executor {
             aggregations: &aggregations,
             group_by_count: 0,
             source_columns: &table.schema().column_names_arc(),
+            blocks: None,
         };
         self.finish_aggregation(
             AggregatePath::StreamingGlobalScan,
@@ -3499,6 +3572,7 @@ impl Executor {
             aggregations: &aggregations,
             group_by_count: 1,
             source_columns: &source_columns,
+            blocks: None,
         };
         self.finish_aggregation(
             AggregatePath::StreamingDerivedTable,
@@ -3641,6 +3715,7 @@ impl Executor {
             aggregations: &aggregations,
             group_by_count: group_by_indices.len(),
             source_columns: all_columns,
+            blocks: None,
         };
         Some(self.finish_aggregation(
             AggregatePath::StorageGrouped,

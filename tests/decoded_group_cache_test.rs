@@ -575,12 +575,18 @@ fn a_statement_with_expressions_decodes_only_the_columns_it_names() {
     let rows = expect("SELECT id * 2 AS d FROM t WHERE k = 2 ORDER BY d DESC", 2);
     assert_eq!(rows.len(), 21);
     assert_eq!(rows[0][0], "124");
-    // A scalar subquery in the SELECT list reads every column
+    // An uncorrelated subquery in the SELECT list is read as a value
     let rows = expect(
         "SELECT COUNT(*), (SELECT MAX(k) FROM t) FROM t WHERE k >= 1",
-        5,
+        1,
     );
     assert_eq!(rows[0], vec!["43".to_string(), "2".to_string()]);
+    // A correlated subquery in the filter reads every column
+    let rows = expect(
+        "SELECT COUNT(*) FROM t WHERE k >= 1 AND EXISTS (SELECT 1 FROM t AS s WHERE s.id = t.id + 100)",
+        5,
+    );
+    assert_eq!(rows[0][0], "0");
     // A GROUPING SETS key absent from the SELECT list is read all the same
     let rows = expect(
         "SELECT SUM(id) FROM t WHERE id > 0 GROUP BY GROUPING SETS ((k)) HAVING SUM(id) > 0 ORDER BY 1",

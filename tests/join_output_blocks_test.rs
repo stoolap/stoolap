@@ -248,6 +248,25 @@ fn an_uncorrelated_output_subquery_is_read_before_the_join_reads_a_row() {
 }
 
 #[test]
+fn a_value_around_an_uncorrelated_output_subquery_is_computed_only_for_a_row() {
+    let _guard = serial();
+    let db = Database::open("memory://join_output_blocks_around").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT 9223372036854775807 + (SELECT 1) FROM l JOIN r ON l.id = r.id WHERE l.id < 0",
+        "SELECT l.id FROM l JOIN r ON l.id = r.id WHERE l.id < 0 \
+         ORDER BY 9223372036854775807 + (SELECT 1)",
+    ] {
+        let got = rows(&db, sql);
+        assert!(
+            got.as_ref().is_ok_and(|rows| rows.len() == 1) && got == rows(&db, &general(sql)),
+            "{sql}: {got:?}"
+        );
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+}
+
+#[test]
 fn a_correlated_output_subquery_raises_its_error_for_the_row_that_reaches_it() {
     let _guard = serial();
     let db = Database::open("memory://join_output_blocks_errors").unwrap();

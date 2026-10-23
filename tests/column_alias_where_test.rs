@@ -211,3 +211,36 @@ fn test_alias_with_count() {
 
     assert_eq!(count, 3, "Expected product count = 3");
 }
+
+#[test]
+fn test_alias_on_the_left_of_a_subquery_comparison() {
+    let db = setup_products_db("alias_subquery_left");
+    db.execute(
+        "CREATE TABLE limits (id INTEGER PRIMARY KEY, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO limits VALUES (1, 60), (2, 100)", ())
+        .unwrap();
+    let ids = |sql: &str, floor: i64| -> Vec<i64> {
+        db.query(sql, (floor,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    for (test, want) in [
+        ("cost > ANY (SELECT v FROM limits WHERE v > $1)", vec![2, 3]),
+        ("cost > ALL (SELECT v FROM limits WHERE v > $1)", vec![2]),
+        ("cost IN (SELECT v + 50 FROM limits WHERE v > $1)", vec![2]),
+    ] {
+        for from in ["products", "(SELECT * FROM products) p"] {
+            let sql = format!("SELECT id, price AS cost FROM {from} WHERE {test} ORDER BY id");
+            assert_eq!(ids(&sql, 0), want, "{sql}");
+            assert_eq!(
+                ids(&sql, 0),
+                ids(&sql.replace("WHERE cost", "WHERE price"), 0),
+                "{sql}: the alias reads its column"
+            );
+        }
+    }
+}

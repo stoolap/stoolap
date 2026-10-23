@@ -244,7 +244,7 @@ fn test_having_beside_a_window() {
 fn test_grouped_items_mixing_correlated_and_uncorrelated() {
     site(
         "site_grouped_mixed",
-        Fails("step 4"),
+        Right,
         "SELECT a, (SELECT MAX(x) FROM u), (SELECT COUNT(*) FROM u WHERE u.id = t.a) FROM t GROUP BY a ORDER BY a",
         "SELECT a, 3, CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END FROM t GROUP BY a ORDER BY a",
     );

@@ -686,8 +686,13 @@ impl Executor {
                     .order_by
                     .iter()
                     .any(|ob| Self::has_subqueries(&ob.expression)));
+        let grouped_output = join.is_none()
+            && get_classification(select).has_aggregation
+            && (select.columns.iter().any(Self::has_subqueries)
+                || select.having.as_deref().is_some_and(Self::has_subqueries));
         if on_subqueries
             || output_subqueries
+            || grouped_output
             || select
                 .where_clause
                 .as_deref()
@@ -695,6 +700,7 @@ impl Executor {
         {
             let prepared = match join {
                 Some(join) => self.join_prepared(select, join, own),
+                None if grouped_output => self.grouped_family(select, None),
                 None => self.prepared_family(select, None),
             };
             match prepared {

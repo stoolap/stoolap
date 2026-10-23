@@ -495,7 +495,8 @@ impl Executor {
                 | CompiledExecution::CountStar(_)
                 | CompiledExecution::PreparedJoin(_)
                 | CompiledExecution::PreparedSelect(_)
-                | CompiledExecution::PreparedDml(_) => return None,
+                | CompiledExecution::PreparedDml(_)
+                | CompiledExecution::PreparedGrouped(_) => return None,
             }
         }
 
@@ -643,7 +644,8 @@ impl Executor {
             | CompiledExecution::CountStar(_)
             | CompiledExecution::PreparedJoin(_)
             | CompiledExecution::PreparedSelect(_)
-            | CompiledExecution::PreparedDml(_) => return None,
+            | CompiledExecution::PreparedDml(_)
+            | CompiledExecution::PreparedGrouped(_) => return None,
         }
 
         // Do full pattern detection (same as try_fast_pk_lookup)
