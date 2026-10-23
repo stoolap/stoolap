@@ -105,14 +105,21 @@ impl<'a> Family<'a> {
         Ok(())
     }
 
-    /// The statement's FROM: one table or view, or a derived table; a view's
-    /// or a derived table's own statement runs as any statement does
+    /// The statement's FROM: one table or view, a derived table, or a VALUES
+    /// list; a view's or a derived table's own statement runs as any
+    /// statement does
     fn statement_from(
         &self,
         table_expr: Option<&'a Expression>,
     ) -> std::result::Result<(), OutOfFamily> {
         match table_expr {
             Some(Expression::SubquerySource(_)) => Ok(()),
+            Some(Expression::ValuesSource(values)) => {
+                match values.rows.iter().flatten().any(Executor::has_subqueries) {
+                    true => Err("a VALUES row holding a subquery"),
+                    false => Ok(()),
+                }
+            }
             Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
                 self.statement_table.set(Some(ts));
                 Ok(())
@@ -4852,8 +4859,8 @@ impl Executor {
     ) -> Result<PreparedOutput> {
         let inner_ctx = ctx.with_incremented_query_depth();
         let unnamed = SmartString::new("");
-        // A view's or a derived table's rows are read once, under the
-        // statement's snapshot, before the plan is taken
+        // A view's, a derived table's or a VALUES list's rows are read once,
+        // under the statement's snapshot, before the plan is taken
         let (source, scope_name) = match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = &ts.name.value_lower;
@@ -4878,6 +4885,16 @@ impl Executor {
                 (
                     StatementSource::Rows(columns, rows),
                     ss.alias
+                        .as_ref()
+                        .map_or(&unnamed, |alias| &alias.value_lower),
+                )
+            }
+            Some(Expression::ValuesSource(values)) => {
+                let (columns, rows) = Self::values_rows(values, ctx)?;
+                (
+                    StatementSource::Rows(columns, rows),
+                    values
+                        .alias
                         .as_ref()
                         .map_or(&unnamed, |alias| &alias.value_lower),
                 )

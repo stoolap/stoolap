@@ -7707,29 +7707,17 @@ impl Executor {
         ))
     }
 
-    /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
-    fn execute_values_source(
-        &self,
+    /// The columns of a VALUES source and its rows, each value evaluated once
+    pub(super) fn values_rows(
         values_source: &ValuesTableSource,
-        stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> SelectResult {
-        // classification is passed from caller to avoid redundant cache lookups
-
+    ) -> Result<(Vec<String>, RowVec)> {
         // Determine column names
         let num_columns = if values_source.rows.is_empty() {
             0
         } else {
             values_source.rows[0].len()
         };
-
-        // Get the table alias for qualified name resolution
-        let table_alias = values_source
-            .alias
-            .as_ref()
-            .map(|a| a.value.to_string())
-            .unwrap_or_default();
 
         let column_names: Vec<String> = if !values_source.column_aliases.is_empty() {
             // Use provided column aliases
@@ -7742,6 +7730,39 @@ impl Executor {
             // Generate default column names: column1, column2, ...
             (1..=num_columns).map(|i| format!("column{}", i)).collect()
         };
+
+        let mut rows = RowVec::with_capacity(values_source.rows.len());
+        for (row_id, row_exprs) in values_source.rows.iter().enumerate() {
+            let mut row_values = Vec::with_capacity(row_exprs.len());
+            for expr in row_exprs {
+                let value = ExpressionEval::compile(expr, &[])?
+                    .with_context(ctx)
+                    .eval_slice(&Row::new())?;
+                row_values.push(value);
+            }
+            rows.push((row_id as i64, Row::from_values(row_values)));
+        }
+        Ok((column_names, rows))
+    }
+
+    /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
+    fn execute_values_source(
+        &self,
+        values_source: &ValuesTableSource,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
+    ) -> SelectResult {
+        // classification is passed from caller to avoid redundant cache lookups
+
+        // Get the table alias for qualified name resolution
+        let table_alias = values_source
+            .alias
+            .as_ref()
+            .map(|a| a.value.to_string())
+            .unwrap_or_default();
+
+        let (column_names, rows) = Self::values_rows(values_source, ctx)?;
 
         // Build a map of both simple and qualified column names to indices
         let mut col_index_map = build_column_index_map(&column_names);
@@ -7777,31 +7798,22 @@ impl Executor {
             (None, None)
         };
 
-        // Evaluate all rows
-        let mut result_rows = RowVec::with_capacity(values_source.rows.len());
-        let mut row_id = 0i64;
-        for row_exprs in &values_source.rows {
-            let mut row_values = Vec::with_capacity(row_exprs.len());
-            for expr in row_exprs {
-                let value = ExpressionEval::compile(expr, &[])?
-                    .with_context(ctx)
-                    .eval_slice(&Row::new())?;
-                row_values.push(value);
-            }
-            let row = Row::from_values(row_values);
-
-            // Apply WHERE clause filtering
-            if let (Some(wf), Some(qf)) = (&where_filter, &qualified_filter) {
-                // Try with simple column names first, then qualified
-                if wf.matches_checked(&row)? || qf.matches_checked(&row)? {
-                    result_rows.push((row_id, row));
-                    row_id += 1;
+        // Apply WHERE clause filtering
+        let result_rows = match (&where_filter, &qualified_filter) {
+            (Some(wf), Some(qf)) => {
+                let mut kept = RowVec::with_capacity(rows.len());
+                let mut row_id = 0i64;
+                for (_, row) in rows {
+                    // Try with simple column names first, then qualified
+                    if wf.matches_checked(&row)? || qf.matches_checked(&row)? {
+                        kept.push((row_id, row));
+                        row_id += 1;
+                    }
                 }
-            } else {
-                result_rows.push((row_id, row));
-                row_id += 1;
+                kept
             }
-        }
+            _ => rows,
+        };
 
         let values_alias = values_source.alias.as_ref().map(|a| a.value_lower.as_str());
 

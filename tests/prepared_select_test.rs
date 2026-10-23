@@ -2205,3 +2205,38 @@ fn test_a_view_comes_before_a_table_of_its_name() {
     );
     assert_eq!(ids(&db, VIEW, ()).0, vec![101], "the prepared path");
 }
+
+#[test]
+fn test_a_values_list_runs_prepared_over_its_rows() {
+    let _guard = serial();
+    let db = setup("prepared_values");
+    const VALUES: &str = "SELECT s.id FROM (VALUES (1, $1), (2, 20), (5, 50)) AS s(id, a) \
+                          WHERE s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    assert_eq!(prepared_line(&db, VALUES), "Prepared: yes");
+    let built = prepared_selects_built();
+    let general = general_hits();
+    for (param, want) in [(10, vec![1]), (1, vec![]), (10, vec![1])] {
+        let (found, runs) = ids(&db, VALUES, (param,));
+        assert_eq!(found, want, "a = {param} in the first row");
+        assert_eq!(runs, 3, "a = {param} runs once per row");
+    }
+    assert_eq!(
+        prepared_selects_built() - built,
+        1,
+        "prepared once across three runs"
+    );
+    assert_eq!(general_hits(), general, "no general path ran");
+}
+
+#[test]
+fn test_a_values_row_holding_a_subquery_is_not_prepared() {
+    let _guard = serial();
+    let db = setup("prepared_values_row_subquery");
+    assert_eq!(
+        prepared_line(
+            &db,
+            "SELECT n FROM (VALUES ((SELECT MAX(v) FROM u)), (1)) AS s(n) WHERE n > (SELECT 0)"
+        ),
+        "Prepared: no (a VALUES row holding a subquery)"
+    );
+}
