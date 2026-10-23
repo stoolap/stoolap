@@ -1080,10 +1080,6 @@ fn test_classifier_rules() {
             "a side that is not a table read without AS OF",
         ),
         (
-            "SELECT id FROM uv WHERE v > (SELECT a FROM t WHERE t.id = uv.id)".to_string(),
-            "FROM names a view",
-        ),
-        (
             "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)".to_string(),
             "FROM names a view",
         ),
@@ -2118,4 +2114,94 @@ fn test_a_name_a_derived_table_repeats_is_ambiguous() {
     ] {
         assert_eq!(ids(&db, &sql, ()).0, vec![6, 5, 3, 2, 1], "{site}");
     }
+}
+
+#[test]
+fn test_a_view_runs_prepared_over_its_rows() {
+    let _guard = serial();
+    let db = setup("prepared_view");
+    db.execute("CREATE VIEW tv AS SELECT id, a, b FROM t", ())
+        .unwrap();
+    const VIEW: &str = "SELECT s.id FROM tv AS s \
+                        WHERE s.b = $1 AND s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    assert_eq!(prepared_line(&db, VIEW), "Prepared: yes");
+    let built = prepared_selects_built();
+    let general = general_hits();
+    for (param, want) in [(1, vec![1]), (2, vec![6]), (1, vec![1])] {
+        let (found, runs) = ids(&db, VIEW, (param,));
+        assert_eq!(found, want, "b = {param}");
+        assert_eq!(runs, 3, "b = {param} runs once per view row");
+    }
+    assert_eq!(
+        prepared_selects_built() - built,
+        1,
+        "prepared once across three runs"
+    );
+    assert_eq!(general_hits(), general, "no general path ran");
+}
+
+#[test]
+fn test_a_redefined_view_answers_from_its_new_body() {
+    let _guard = serial();
+    let db = setup("prepared_view_redefined");
+    const VIEW: &str =
+        "SELECT s.id FROM tv AS s WHERE s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    let built = prepared_selects_built();
+    for (body, want, prepared) in [
+        ("SELECT id, a FROM t WHERE b = 1", vec![1], 1),
+        ("SELECT id, a FROM t WHERE b = 2", vec![6], 1),
+        ("SELECT a, id FROM t", vec![1, 6], 2),
+    ] {
+        db.execute("DROP VIEW IF EXISTS tv", ()).unwrap();
+        db.execute(&format!("CREATE VIEW tv AS {body}"), ())
+            .unwrap();
+        assert_eq!(ids(&db, VIEW, ()).0, want, "{body}");
+        assert_eq!(
+            prepared_selects_built() - built,
+            prepared,
+            "{body}: the plan is kept while the view's columns are"
+        );
+    }
+}
+
+#[test]
+fn test_a_view_reading_itself_stops_at_the_nesting_limit() {
+    let _guard = serial();
+    let db = setup("prepared_view_loop");
+    db.execute(
+        "CREATE VIEW tv AS SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)",
+        (),
+    )
+    .unwrap();
+    let (err, _) = error(
+        &db,
+        "SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)",
+        (),
+    );
+    assert!(err.contains("Maximum view nesting depth"), "{err}");
+}
+
+#[test]
+fn test_a_view_comes_before_a_table_of_its_name() {
+    let _guard = serial();
+    let db = setup("prepared_view_and_table");
+    db.execute(
+        "CREATE VIEW tv AS SELECT id + 100 AS id FROM u WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE pair (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO pair VALUES (2)", ()).unwrap();
+    // Only the engine renames a table into a view's name, as a database
+    // an older release wrote can hold one
+    db.engine().rename_table("pair", "tv").unwrap();
+    const VIEW: &str = "SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)";
+    assert_eq!(prepared_line(&db, VIEW), "Prepared: yes");
+    assert_eq!(
+        ids(&db, "SELECT id FROM tv", ()).0,
+        vec![101],
+        "the general path"
+    );
+    assert_eq!(ids(&db, VIEW, ()).0, vec![101], "the prepared path");
 }

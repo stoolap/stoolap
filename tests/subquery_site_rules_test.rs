@@ -365,23 +365,20 @@ fn test_view_where_and_select_list() {
     let db = setup("site_view");
     db.execute("CREATE VIEW v AS SELECT id, a FROM t", ())
         .unwrap();
-    for (with_subquery, with_literal) in [
+    for (state, with_subquery, with_literal) in [
         (
+            Right,
             "SELECT id FROM v WHERE id > (SELECT MAX(x) FROM u) ORDER BY id",
             "SELECT id FROM v WHERE id > 3 ORDER BY id",
         ),
         (
+            Fails("step 6"),
             "SELECT id, (SELECT MAX(x) FROM u) FROM v ORDER BY id",
             "SELECT id, 3 FROM v ORDER BY id",
         ),
     ] {
         let want = rows(&db, with_literal).unwrap();
-        holds(
-            Fails("step 6"),
-            rows(&db, with_subquery),
-            &want,
-            with_subquery,
-        );
+        holds(state, rows(&db, with_subquery), &want, with_subquery);
     }
 }
 

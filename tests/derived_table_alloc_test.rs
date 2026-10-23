@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A statement over a derived table whose WHERE holds a subquery costs what
-//! the same statement over the table costs, plus a bounded number of
-//! allocations per run, whatever the number of rows
+//! A statement over a derived table or a view whose WHERE holds a
+//! subquery costs what the same statement over the table costs, plus a
+//! bounded number of allocations per run, whatever the number of rows
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -72,7 +72,7 @@ fn per_run(db: &Database, sql: &str) -> usize {
 }
 
 #[test]
-fn a_derived_table_costs_what_its_table_does_plus_a_bounded_count() {
+fn a_derived_table_or_view_costs_what_its_table_does_plus_a_bounded_count() {
     let mut costs = Vec::new();
     for rows in [100, 400] {
         let db = Database::open(&format!("memory://derived_table_alloc_{rows}")).unwrap();
@@ -95,12 +95,18 @@ fn a_derived_table_costs_what_its_table_does_plus_a_bounded_count() {
             &db,
             "SELECT s.id FROM (SELECT id, a FROM t) AS s WHERE s.a IN (SELECT x FROM u)",
         );
-        costs.push((rows, table, derived));
+        db.execute("CREATE VIEW tv AS SELECT id, a FROM t", ())
+            .unwrap();
+        let view = per_run(
+            &db,
+            "SELECT s.id FROM tv AS s WHERE s.a IN (SELECT x FROM u)",
+        );
+        costs.push((rows, table, derived, view));
     }
     assert!(
         costs
             .iter()
-            .all(|&(_, table, derived)| derived <= table + 12),
-        "(rows, allocations over the table, over the derived table): {costs:?}"
+            .all(|&(_, table, derived, view)| derived <= table + 12 && view <= table + 12),
+        "(rows, allocations over the table, the derived table, the view): {costs:?}"
     );
 }

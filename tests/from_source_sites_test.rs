@@ -425,7 +425,7 @@ fn state(source: &str, cell: &str) -> State {
         ("values", "body_row") => STEP_6,
         ("view" | "derived" | "series" | "values", "insert_values" | "on_conflict_set") => STEP_6,
         (
-            "view" | "values",
+            "values",
             "insert_select" | "where_scalar" | "where_in" | "where_not_in" | "where_all",
         ) => STEP_6,
         ("view", "select_scalar") => STEP_6,
