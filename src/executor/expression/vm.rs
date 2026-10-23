@@ -76,7 +76,7 @@ fn between_cell(value: &Value, low: &Value, high: &Value) -> Option<bool> {
 
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots, so 8 covers the common case.
-const STACK_INLINE_CAPACITY: usize = 16;
+pub(super) const STACK_INLINE_CAPACITY: usize = 16;
 
 /// Execution context for the VM
 ///
@@ -283,6 +283,17 @@ impl ExprVM {
             cached_regexp: None,
             bool_error: None,
         }
+    }
+
+    /// Drop every value a run left behind, its stack, arguments and cached
+    /// patterns, keeping the buffers' capacity
+    pub(crate) fn release_values(&mut self) {
+        self.stack.clear();
+        self.args_buffer.clear();
+        self.cached_like = None;
+        self.cached_glob = None;
+        self.cached_regexp = None;
+        self.bool_error = None;
     }
 
     /// Execute a program and return the result
@@ -808,17 +819,7 @@ impl ExprVM {
                 Op::Add => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // Handle timestamp + interval or timestamp + integer (days)
-                    let result = match (&a, &b) {
-                        (Value::Timestamp(t), Value::Integer(days))
-                        | (Value::Integer(days), Value::Timestamp(t)) => {
-                            Self::timestamp_add_days(*t, *days, false)?
-                        }
-                        (Value::Timestamp(_), Value::Text(_)) => {
-                            Self::timestamp_add_interval(&a, &b, false)?
-                        }
-                        _ => Self::arithmetic_op(&a, &b, IntegerOp::Add, |x, y| x + y)?,
-                    };
+                    let result = Self::add_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -826,23 +827,7 @@ impl ExprVM {
                 Op::Sub => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // Handle timestamp - interval, timestamp - integer (days), or timestamp - timestamp
-                    let result = match (&a, &b) {
-                        (Value::Timestamp(t1), Value::Timestamp(t2)) => {
-                            // Return interval text
-                            let duration = t1.signed_duration_since(*t2);
-                            Value::Text(SmartString::from_string(
-                                self.format_duration_as_interval(duration),
-                            ))
-                        }
-                        (Value::Timestamp(t), Value::Integer(days)) => {
-                            Self::timestamp_add_days(*t, *days, true)?
-                        }
-                        (Value::Timestamp(_), Value::Text(_)) => {
-                            Self::timestamp_add_interval(&a, &b, true)?
-                        }
-                        _ => Self::arithmetic_op(&a, &b, IntegerOp::Sub, |x, y| x - y)?,
-                    };
+                    let result = self.sub_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -850,7 +835,7 @@ impl ExprVM {
                 Op::Mul => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::arithmetic_op(&a, &b, IntegerOp::Mul, |x, y| x * y)?;
+                    let result = Self::mul_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -2356,6 +2341,41 @@ impl ExprVM {
                 }
 
                 // STRING CONCATENATION
+                Op::Add => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::add_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Sub => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(self.sub_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Mul => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::mul_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Div => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::div_op(&a, &b)?));
+                    pc += 1;
+                }
+
+                Op::Mod => {
+                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
+                    stack.push(Cow::Owned(Self::mod_op(&a, &b)?));
+                    pc += 1;
+                }
+
                 Op::Concat => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
@@ -3277,6 +3297,43 @@ impl ExprVM {
             _ if a.is_null() || b.is_null() => Ok(Value::Null(DataType::Float)),
             _ => Ok(Value::Null(DataType::Null)),
         }
+    }
+
+    /// `a + b`, with a timestamp plus days or an interval
+    #[inline]
+    fn add_op(a: &Value, b: &Value) -> Result<Value> {
+        match (a, b) {
+            (Value::Timestamp(t), Value::Integer(days))
+            | (Value::Integer(days), Value::Timestamp(t)) => {
+                Self::timestamp_add_days(*t, *days, false)
+            }
+            (Value::Timestamp(_), Value::Text(_)) => Self::timestamp_add_interval(a, b, false),
+            _ => Self::arithmetic_op(a, b, IntegerOp::Add, |x, y| x + y),
+        }
+    }
+
+    /// `a - b`, with a timestamp minus days or an interval, and the interval
+    /// text between two timestamps
+    #[inline]
+    fn sub_op(&self, a: &Value, b: &Value) -> Result<Value> {
+        match (a, b) {
+            (Value::Timestamp(t1), Value::Timestamp(t2)) => {
+                let duration = t1.signed_duration_since(*t2);
+                Ok(Value::Text(SmartString::from_string(
+                    self.format_duration_as_interval(duration),
+                )))
+            }
+            (Value::Timestamp(t), Value::Integer(days)) => {
+                Self::timestamp_add_days(*t, *days, true)
+            }
+            (Value::Timestamp(_), Value::Text(_)) => Self::timestamp_add_interval(a, b, true),
+            _ => Self::arithmetic_op(a, b, IntegerOp::Sub, |x, y| x - y),
+        }
+    }
+
+    #[inline]
+    fn mul_op(a: &Value, b: &Value) -> Result<Value> {
+        Self::arithmetic_op(a, b, IntegerOp::Mul, |x, y| x * y)
     }
 
     #[inline]
@@ -5441,5 +5498,25 @@ mod tests {
                 "{op:?}: a subquery without its prepared plan is an error"
             );
         }
+    }
+
+    #[test]
+    fn released_values_leave_nothing_of_the_run_behind() {
+        let statements =
+            crate::parser::parse_sql("SELECT * FROM t WHERE POSITION('x', c) > 0").unwrap();
+        let crate::parser::ast::Statement::Select(select) = &statements[0] else {
+            panic!("not a SELECT");
+        };
+        let columns = ["c".to_string()];
+        let ctx = super::super::compiler::CompileContext::with_global_registry(&columns);
+        let program = super::super::compiler::ExprCompiler::new(&ctx)
+            .compile(select.where_clause.as_deref().unwrap())
+            .unwrap();
+        let row = Row::from_values(vec![Value::text("y".repeat(4096))]);
+        let mut vm = ExprVM::new();
+        vm.execute(&program, &ExecuteContext::new(&row)).unwrap();
+        assert!(!vm.args_buffer.is_empty(), "a call keeps its arguments");
+        vm.release_values();
+        assert!(vm.args_buffer.is_empty() && vm.stack.is_empty());
     }
 }

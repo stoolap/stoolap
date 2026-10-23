@@ -13672,6 +13672,7 @@ impl Executor {
                     Some(&slots),
                     None,
                     false,
+                    Some(ctx.params()),
                 )?;
                 use crate::executor::expression::Op;
                 if filter

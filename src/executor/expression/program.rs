@@ -77,7 +77,7 @@ impl Program {
             )
         });
 
-        let cow_supported = Self::compute_cow_supported(&ops);
+        let cow_supported = Self::compute_cow_supported(&ops, max_stack_depth);
 
         Self {
             ops,
@@ -89,6 +89,11 @@ impl Program {
             #[cfg(debug_assertions)]
             source: None,
         }
+    }
+
+    /// The program's ops, for a builder to reuse
+    pub fn into_ops(self) -> Vec<Op> {
+        self.ops
     }
 
     /// Create a new program without peephole optimization.
@@ -107,7 +112,7 @@ impl Program {
             )
         });
 
-        let cow_supported = Self::compute_cow_supported(&ops);
+        let cow_supported = Self::compute_cow_supported(&ops, max_stack_depth);
 
         Self {
             ops,
@@ -365,7 +370,7 @@ impl Program {
         self.ops = Self::peephole_optimize(self.ops);
         // Recalculate metadata after optimization
         self.max_stack_depth = Self::compute_stack_depth(&self.ops);
-        self.cow_supported = Self::compute_cow_supported(&self.ops);
+        self.cow_supported = Self::compute_cow_supported(&self.ops, self.max_stack_depth);
         self
     }
 
@@ -376,8 +381,12 @@ impl Program {
     }
 
     /// Mirrors the op set ExprVM::execute_cow handles; keep the two in
-    /// sync (drift only costs performance, the cow catch-all stays)
-    fn compute_cow_supported(ops: &[Op]) -> bool {
+    /// sync (drift only costs performance, the cow catch-all stays). A
+    /// program deeper than its inline stack runs owned, which keeps its stack
+    fn compute_cow_supported(ops: &[Op], max_stack_depth: usize) -> bool {
+        if max_stack_depth > super::vm::STACK_INLINE_CAPACITY {
+            return false;
+        }
         ops.iter().all(|op| {
             matches!(
                 op,
@@ -393,6 +402,11 @@ impl Program {
                     | Op::Le
                     | Op::Gt
                     | Op::Ge
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Mod
                     | Op::EqColumnConst(..)
                     | Op::LtColumnConst(..)
                     | Op::GtColumnConst(..)
@@ -509,8 +523,10 @@ impl Program {
                     && !jump_targets.contains(&(i + 2));
 
                 if is_safe {
-                    if let (Op::LoadColumn(col_idx), Op::LoadConst(const_val)) =
-                        (&ops[i], &ops[i + 1])
+                    if let (
+                        Op::LoadColumn(col_idx) | Op::LoadAggregateResult(col_idx),
+                        Op::LoadConst(const_val),
+                    ) = (&ops[i], &ops[i + 1])
                     {
                         let fused = match &ops[i + 2] {
                             Op::Eq => Some(Op::EqColumnConst(*col_idx, const_val.clone())),
@@ -623,6 +639,12 @@ impl ProgramBuilder {
         Self {
             ops: Vec::with_capacity(32),
         }
+    }
+
+    /// A builder emitting into `ops`, emptied, to reuse its capacity
+    pub fn reusing(mut ops: Vec<Op>) -> Self {
+        ops.clear();
+        Self { ops }
     }
 
     /// Emit an operation
