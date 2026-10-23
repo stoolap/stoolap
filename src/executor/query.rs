@@ -1223,10 +1223,10 @@ impl Executor {
         let in_family = classification.where_has_subqueries
             && (self.holds_prepared_select(compiled, ctx)
                 || self.prepared_family(stmt, Some(ctx)).is_ok());
-        // A grouped statement whose SELECT list or HAVING holds subqueries
-        // runs them as its blocks
+        // A grouped statement whose SELECT list, HAVING or GROUP BY holds
+        // subqueries runs them as its blocks
         let grouped_family = classification.has_aggregation
-            && classification.output_has_subqueries
+            && classification.grouped_has_subqueries
             && !in_family
             && (self.holds_prepared_grouped(compiled, ctx)
                 || self.grouped_family(stmt, Some(ctx)).is_ok());
@@ -8690,6 +8690,22 @@ impl Executor {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::grouped_table_opening();
+        if held.reads_through_where() {
+            let name = &table_source.name.value_lower;
+            let (columns, rows) = held.passing_rows(self, &run, name, ctx)?;
+            let alias = table_source.alias.as_ref().map_or(name, |a| &a.value_lower);
+            let (result, layout) = self.group_and_window_rows(
+                &held.stmt,
+                ctx,
+                &held.classification,
+                rows,
+                &columns,
+                Some(&run),
+                |out| Self::shared_result_layout(&held.stmt, &columns, Some(alias), out),
+            )?;
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
+        }
         let mut read = None;
         let result = self.execute_simple_table_scan(
             table_source,

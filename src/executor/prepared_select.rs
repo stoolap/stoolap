@@ -265,7 +265,7 @@ impl<'a> Family<'a> {
                     if !matches!(site, Site::Grouped | Site::GroupedOutput) {
                         return Err("an aggregate outside a subquery block");
                     }
-                    return self.aggregate_call(call, scopes);
+                    return self.aggregate_call(call, scopes, site, found);
                 }
                 if call.is_distinct || !call.order_by.is_empty() || call.filter.is_some() {
                     return Err("DISTINCT, ORDER BY or FILTER in a call");
@@ -356,15 +356,21 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// An aggregate call of a grouped block: what it reads per row holds
-    /// values, and an argument after the first is a literal
+    /// An aggregate call at `site`, and an argument after the first is a
+    /// literal: what a block's call reads per row holds values, and what
+    /// the statement's own call reads may hold subqueries too
     fn aggregate_call(
         &self,
         call: &'a FunctionCall,
         scopes: usize,
+        site: Site,
+        found: &mut bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        let mut found = false;
-        let mut values = |e: &'a Expression| self.expression(e, scopes, Site::Values, &mut found);
+        let inputs = match site {
+            Site::GroupedOutput => Site::Subqueries,
+            _ => Site::Values,
+        };
+        let mut values = |e: &'a Expression| self.expression(e, scopes, inputs, found);
         let mut arguments = call.arguments.iter();
         match arguments.next() {
             None | Some(Expression::Star(_)) => {}
@@ -537,21 +543,16 @@ impl Executor {
         if !grouped_block(stmt) {
             return Err("a statement that does not group");
         }
-        let held = |expr: Option<&Expression>| expr.is_some_and(mentions_subquery);
-        // A GROUP BY item naming a SELECT alias or position groups that item
-        let items = self
-            .parse_group_by(stmt, &[])
-            .map_err(|_| "a GROUP BY position outside the SELECT list")?;
-        if held(stmt.where_clause.as_deref())
-            || stmt.group_by.columns.iter().any(|item| held(Some(item)))
-            || items.iter().any(|item| match item {
-                GroupByItem::Expression { expr, .. } => mentions_subquery(expr),
-                GroupByItem::Column(_) => false,
-            })
-            || stmt.order_by.iter().any(|ob| held(Some(&ob.expression)))
+        if stmt
+            .order_by
+            .iter()
+            .any(|ob| mentions_subquery(&ob.expression))
         {
-            return Err("a WHERE, GROUP BY or ORDER BY holding a subquery");
+            return Err("an ORDER BY holding a subquery");
         }
+        // A GROUP BY item naming a SELECT alias or position groups that item
+        self.parse_group_by(stmt, &[])
+            .map_err(|_| "a GROUP BY position outside the SELECT list")?;
         let family = Family {
             executor: self,
             ctx,
@@ -567,8 +568,14 @@ impl Executor {
         if let Some(having) = stmt.having.as_deref() {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
         }
+        for item in &stmt.group_by.columns {
+            family.expression(item, 1, Site::Subqueries, &mut found)?;
+        }
         if !found {
-            return Err("neither the SELECT list nor HAVING holds a subquery");
+            return Err("neither the SELECT list, HAVING nor GROUP BY holds a subquery");
+        }
+        if let Some(where_clause) = stmt.where_clause.as_deref() {
+            family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
         }
         counts_fit(stmt, ctx)?;
         family.from(stmt.table_expr.as_deref())?;
@@ -1293,6 +1300,28 @@ fn grouped_having(
         }
     }
     open(having, &aliased, &bound)
+}
+
+/// `expr` of a grouped statement with each GROUP BY item `items` holds, by
+/// its identity as written, read as its rewritten form, and each aggregate
+/// call holding a subquery rewritten by `call`, outside its subqueries
+fn read_inputs(
+    expr: &Expression,
+    items: &FxHashMap<ExprKey, Expression>,
+    call: &mut impl FnMut(&Expression) -> Result<Expression>,
+) -> Result<Expression> {
+    if let Some(item) = items.get(&ExprKey::of(expr)) {
+        return Ok(item.clone());
+    }
+    match expr {
+        Expression::FunctionCall(f) if is_aggregate_function(&f.function) => {
+            match mentions_subquery(expr) {
+                true => call(expr),
+                false => Ok(expr.clone()),
+            }
+        }
+        other => rebuild(other, &mut |child| read_inputs(child, items, call)),
+    }
 }
 
 /// Whether a bare name outside any subquery of `expr` passes `matches`
@@ -2078,6 +2107,20 @@ impl Builder<'_> {
     fn rewrite_blocks(&mut self, chain: &Chain<'_>, expr: &Expression) -> Result<Expression> {
         let mut work = Rewritten::default();
         match expr {
+            // A part prepared already, as an input of a grouped statement
+            Expression::ScalarSubquery(ScalarSubquery { subquery, .. })
+            | Expression::Exists(ExistsExpression { subquery, .. })
+            | Expression::AllAny(AllAnyExpression { subquery, .. })
+                if subquery.prepared.is_some() =>
+            {
+                Ok(expr.clone())
+            }
+            Expression::In(in_expr)
+                if matches!(&*in_expr.right, Expression::ScalarSubquery(nested)
+                    if nested.subquery.prepared.is_some()) =>
+            {
+                Ok(expr.clone())
+            }
             Expression::ScalarSubquery(_) | Expression::Exists(_) => {
                 self.rewrite(chain, None, expr, &mut work)
             }
@@ -3220,8 +3263,8 @@ impl PreparedSelect {
     }
 }
 
-/// A grouped statement over one table whose SELECT list or HAVING holds
-/// subqueries, prepared once as blocks of its rows: the statement the
+/// A grouped statement over one table whose SELECT list, HAVING or GROUP BY
+/// holds subqueries, prepared once as blocks of its rows: the statement the
 /// grouped path runs, with those clauses rewritten and each value read once
 /// a run slot
 #[derive(Debug)]
@@ -3230,10 +3273,13 @@ pub struct PreparedGrouped {
     /// The table's schema the clauses were prepared over
     schema: CompactArc<Schema>,
     blocks: PreparedBlocks,
-    /// Each block's holes, read from the GROUP BY items of its group's row
+    /// Each block's holes: an input block's read from the row it is asked
+    /// of, any other's from the GROUP BY items of its group's row
     holes: HoleSet,
     /// The uncorrelated member blocks it reads, read before any row
     ahead: Vec<u16>,
+    /// A WHERE holding subqueries, which the table's rows pass before they group
+    where_: Option<PreparedWhere>,
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
     /// Every subquery is a run slot: the statement runs as any grouped
@@ -3263,9 +3309,82 @@ impl PreparedGrouped {
             keeps_holes: true,
         };
         let mut run_slots = Vec::new();
-        let mut rewrite = |expr: &Expression| -> Result<Expression> {
-            let rewritten = builder.rewrite_blocks(&chain, expr)?;
-            builder.slotted(&rewritten, &mut run_slots)
+        fn rewrite(
+            builder: &mut Builder<'_>,
+            chain: &Chain<'_>,
+            run_slots: &mut Vec<(usize, Expression)>,
+            expr: &Expression,
+        ) -> Result<Expression> {
+            let rewritten = builder.rewrite_blocks(chain, expr)?;
+            builder.slotted(&rewritten, run_slots)
+        }
+        // What each input row reads comes first: its blocks' holes read the row
+        let mut work = Rewritten::default();
+        let where_parts = match stmt.where_clause.as_deref() {
+            Some(where_clause) if mentions_subquery(where_clause) => {
+                Some(builder.statement_where(
+                    &chain,
+                    &schema,
+                    where_clause,
+                    &mut work,
+                    &mut run_slots,
+                )?)
+            }
+            _ => None,
+        };
+        let opened_having = match stmt.having.as_deref() {
+            Some(having) if mentions_subquery(having) => {
+                Some(grouped_having(executor, stmt, having)?)
+            }
+            _ => None,
+        };
+        // Whether each block is asked of an input row, the WHERE's so far
+        let mut input = vec![true; builder.subqueries.len()];
+        fn input_rewrite(
+            builder: &mut Builder<'_>,
+            chain: &Chain<'_>,
+            run_slots: &mut Vec<(usize, Expression)>,
+            input: &mut Vec<bool>,
+            expr: &Expression,
+        ) -> Result<Expression> {
+            input.resize(builder.subqueries.len(), false);
+            let rewritten = rewrite(builder, chain, run_slots, expr)?;
+            input.resize(builder.subqueries.len(), true);
+            Ok(rewritten)
+        }
+        // A GROUP BY item holding a subquery is rewritten once, and the SELECT
+        // list and HAVING read it as that wherever they write it
+        let mut items = FxHashMap::default();
+        for item in executor.parse_group_by(stmt, &[])? {
+            let GroupByItem::Expression { expr, .. } = item else {
+                continue;
+            };
+            if !mentions_subquery(&expr) {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                items.entry(ExprKey::of(&expr))
+            {
+                let rewritten =
+                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, &expr)?;
+                entry.insert(rewritten);
+            }
+        }
+        let group_by = stmt
+            .group_by
+            .columns
+            .iter()
+            .map(|item| {
+                read_inputs(item, &items, &mut |call| {
+                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut output = |expr: &Expression| -> Result<Expression> {
+            let read = read_inputs(expr, &items, &mut |call| {
+                input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
+            })?;
+            rewrite(&mut builder, &chain, &mut run_slots, &read)
         };
         // An item holding a subquery keeps the name it is written under
         let mut columns = Vec::with_capacity(stmt.columns.len());
@@ -3274,14 +3393,14 @@ impl PreparedGrouped {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
-                    expression: Box::new(rewrite(&aliased.expression)?),
+                    expression: Box::new(output(&aliased.expression)?),
                     alias: aliased.alias.clone(),
                 }),
                 column => {
                     let name = executor.grouped_item_name(column);
                     Expression::Aliased(AliasedExpression {
                         token: Token::new(TokenType::Identifier, &name, Position::default()),
-                        expression: Box::new(rewrite(column)?),
+                        expression: Box::new(output(column)?),
                         alias: Identifier::new(
                             Token::new(TokenType::Identifier, &name, Position::default()),
                             &name,
@@ -3290,12 +3409,9 @@ impl PreparedGrouped {
                 }
             });
         }
-        let having = match stmt.having.as_deref() {
-            Some(having) if mentions_subquery(having) => {
-                let opened = grouped_having(executor, stmt, having)?;
-                Some(Box::new(rewrite(&opened)?))
-            }
-            other => other.map(|having| Box::new(having.clone())),
+        let having = match (&opened_having, stmt.having.as_deref()) {
+            (Some(opened), _) => Some(Box::new(output(opened)?)),
+            (None, other) => other.map(|having| Box::new(having.clone())),
         };
         let blocks_read = builder.subqueries.len();
         let values = CompileContext::new(&scope.columns, &executor.function_registry)
@@ -3304,7 +3420,22 @@ impl PreparedGrouped {
             .iter()
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let (blocks, _) = builder.finish(param_count, run_slots)?;
+        let mut read_as = FxHashMap::default();
+        if let Some(parts) = &where_parts {
+            compare_as_scan(&parts.clause, &schema, &mut read_as);
+        }
+        let own = CompileContext::new(&scope.columns, &executor.function_registry)
+            .with_prepared_subqueries()
+            .with_read_as(&read_as);
+        let where_program = where_parts
+            .as_ref()
+            .map(|parts| compile_with(&own, &parts.clause))
+            .transpose()?;
+        let (blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
+        let where_clause = where_parts.as_ref().map(|parts| parts.clause.clone());
+        let where_ = where_parts
+            .zip(where_program)
+            .map(|(parts, program)| parts.prepare(program, &blocks));
         // A group's row holds its GROUP BY items first: a column a hole reads
         // is the item naming it, and a column no item names cannot be read
         let group_slots: Vec<String> = stmt
@@ -3331,7 +3462,11 @@ impl PreparedGrouped {
             .collect();
         let slots_ctx = CompileContext::new(&group_slots, &executor.function_registry);
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
-        for sq in &blocks.subqueries {
+        for (id, sq) in blocks.subqueries.iter().enumerate() {
+            if input.get(id) == Some(&true) {
+                holes.push(std::mem::take(&mut row_holes.holes[id]));
+                continue;
+            }
             let mut grouped = Vec::with_capacity(sq.hole_exprs.len());
             for (slot, hole) in &sq.hole_exprs {
                 let read = match hole {
@@ -3362,10 +3497,19 @@ impl PreparedGrouped {
         let stmt = SelectStatement {
             columns,
             having,
+            group_by: GroupByClause {
+                columns: group_by,
+                modifier: stmt.group_by.modifier.clone(),
+            },
+            where_clause: where_clause
+                .map(Box::new)
+                .or_else(|| stmt.where_clause.clone()),
             ..stmt.clone()
         };
         let runs_alone = (!stmt.columns.iter().any(|c| mentions_subquery(unaliased(c)))
-            && !stmt.having.as_deref().is_some_and(mentions_subquery))
+            && !stmt.having.as_deref().is_some_and(mentions_subquery)
+            && !stmt.group_by.columns.iter().any(mentions_subquery)
+            && !stmt.where_clause.as_deref().is_some_and(mentions_subquery))
         .then(|| RwLock::new(CompiledExecution::Unknown));
         Ok(Some(Self {
             cached_epoch: epoch,
@@ -3373,10 +3517,43 @@ impl PreparedGrouped {
             blocks,
             holes: HoleSet { holes },
             ahead,
+            where_,
             classification: super::query_classification::get_classification(&stmt),
             stmt,
             runs_alone,
         }))
+    }
+
+    /// Whether the table's rows pass a WHERE holding subqueries before they group
+    pub(crate) fn reads_through_where(&self) -> bool {
+        self.where_.is_some()
+    }
+
+    /// The columns of table `name` and each of its rows the WHERE passes,
+    /// read through the `run`'s blocks as a prepared statement reads them
+    pub(crate) fn passing_rows(
+        &self,
+        executor: &Executor,
+        run: &PreparedRunner<'_>,
+        name: &str,
+        ctx: &ExecutionContext,
+    ) -> Result<(CompactArc<Vec<String>>, RowVec)> {
+        let Some(where_) = &self.where_ else {
+            return Err(Error::internal("a grouped statement without its WHERE"));
+        };
+        let table = executor.prepared_table(name, ctx, None)?;
+        self.table_fits(&table.schema_arc())?;
+        let mut rows = RowVec::new();
+        let keep = |id: i64, _: u64, row: Row| {
+            rows.push((id, row));
+            true
+        };
+        match run.passing_rows(where_, None, table.as_ref(), ctx, None, false, keep)? {
+            Passing::Pruned | Passing::Read => Ok((table.schema().column_names_arc(), rows)),
+            Passing::Answers(_) | Passing::Scan(_) | Passing::Filtered(..) => Err(Error::internal(
+                "a grouped statement read the scan's answers",
+            )),
+        }
     }
 
     /// SchemaChanged when `schema`, which the table's rows were read with,
@@ -6136,6 +6313,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
 
     fn params(&self) -> Option<&[Value]> {
         Some(&self.base)
+    }
+
+    fn bind_members(&self, program: &SharedProgram) -> Option<SharedProgram> {
+        self.bound_program(program)
     }
 }
 

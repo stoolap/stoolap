@@ -123,8 +123,8 @@ pub struct QueryClassification {
     // === SELECT clause correlated subqueries ===
     /// Whether any SELECT column has correlated subqueries
     pub select_has_correlated_subqueries: bool,
-    /// Whether the SELECT list or HAVING holds a subquery of any form
-    pub output_has_subqueries: bool,
+    /// Whether the SELECT list, HAVING or GROUP BY holds a subquery of any form
+    pub grouped_has_subqueries: bool,
 
     // === ORDER BY analysis ===
     /// Whether ORDER BY has correlated subqueries
@@ -223,11 +223,12 @@ impl QueryClassification {
             .iter()
             .any(Self::expression_has_correlated_subqueries);
 
-        let output_has_subqueries = stmt.columns.iter().any(super::Executor::has_subqueries)
-            || stmt
-                .having
-                .as_deref()
-                .is_some_and(super::Executor::has_subqueries);
+        let grouped_has_subqueries = stmt
+            .columns
+            .iter()
+            .chain(stmt.having.as_deref())
+            .chain(&stmt.group_by.columns)
+            .any(super::Executor::has_subqueries);
 
         // ORDER BY correlated subquery analysis
         let order_by_has_correlated_subqueries = stmt
@@ -275,7 +276,7 @@ impl QueryClassification {
             where_has_correlated_subqueries,
             has_nondeterministic_functions,
             select_has_correlated_subqueries,
-            output_has_subqueries,
+            grouped_has_subqueries,
             order_by_has_correlated_subqueries,
             has_derived_tables,
             is_simple_scan,

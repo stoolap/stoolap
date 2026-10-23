@@ -232,6 +232,12 @@ pub trait SubqueryExecutor {
     fn params(&self) -> Option<&[Value]> {
         None
     }
+
+    /// `program` with every block it tests members of read once and tested
+    /// as that set in place; None when it calls a block another way
+    fn bind_members(&self, _program: &CompactArc<Program>) -> Option<CompactArc<Program>> {
+        None
+    }
 }
 
 /// A subquery op compiles only into a prepared plan, which runs with its executor

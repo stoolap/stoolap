@@ -21,7 +21,7 @@ use ahash::AHasher;
 use rustc_hash::FxHasher;
 
 use crate::core::Value;
-use crate::parser::ast::{Expression, FunctionCall, OrderByExpression};
+use crate::parser::ast::{AllAnyType, Expression, FunctionCall, OrderByExpression};
 
 /// Two expressions share a key when they are the same computation. The key
 /// is two independent 64-bit hashes of the tree, so two different trees
@@ -344,6 +344,22 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b'q');
             hasher.name(&star.qualifier);
         }
+        // A prepared block is its id, as every mark prints alike
+        Expression::ScalarSubquery(sq) if sq.subquery.prepared.is_some() => {
+            hasher.tag(b'k');
+            sq.subquery.prepared.hash(hasher);
+        }
+        Expression::Exists(exists) if exists.subquery.prepared.is_some() => {
+            hasher.tag(b'e');
+            exists.subquery.prepared.hash(hasher);
+        }
+        Expression::AllAny(all_any) if all_any.subquery.prepared.is_some() => {
+            hasher.tag(b'y');
+            hasher.name(&all_any.operator);
+            hasher.flag(matches!(all_any.all_any_type, AllAnyType::All));
+            write_expr(&all_any.left, hasher);
+            all_any.subquery.prepared.hash(hasher);
+        }
         // Subqueries and table sources read the same when they print the same
         other => {
             hasher.tag(b'?');
@@ -407,5 +423,36 @@ mod tests {
     fn test_a_column_key_is_the_identifier_key() {
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
         assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
+    }
+
+    #[test]
+    fn test_a_prepared_block_reads_as_its_id() {
+        let marked = |sql: &str, id: u16| {
+            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            let Statement::Select(select) = &statements[0] else {
+                panic!("not a SELECT");
+            };
+            let mut expr = select.columns[0].clone();
+            match &mut expr {
+                Expression::ScalarSubquery(sq) => sq.subquery.prepared = Some(id),
+                Expression::Exists(exists) => exists.subquery.prepared = Some(id),
+                Expression::AllAny(all_any) => all_any.subquery.prepared = Some(id),
+                other => panic!("not a subquery: {other:?}"),
+            }
+            ExprKey::of(&expr)
+        };
+        for sql in [
+            "(SELECT 1 FROM u)",
+            "EXISTS (SELECT 1 FROM u)",
+            "a > ANY (SELECT x FROM u)",
+        ] {
+            assert_ne!(marked(sql, 0), marked(sql, 1), "{sql}: two blocks");
+            assert_eq!(marked(sql, 1), marked(sql, 1), "{sql}: one block");
+        }
+        assert_ne!(
+            marked("a > ANY (SELECT x FROM u)", 1),
+            marked("b > ANY (SELECT x FROM u)", 1),
+            "the left side reads too"
+        );
     }
 }
