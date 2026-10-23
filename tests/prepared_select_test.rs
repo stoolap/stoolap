@@ -2071,11 +2071,27 @@ fn test_a_name_a_derived_table_repeats_is_ambiguous() {
             format!("SELECT s.id {FROM} WHERE {EXISTS} ORDER BY s.x"),
         ),
         (
+            "ORDER BY expression over an alias of the name",
+            format!("SELECT s.id AS x {FROM} WHERE {EXISTS} ORDER BY x + 0"),
+        ),
+        (
             "correlated block",
             format!("SELECT s.id {FROM} WHERE EXISTS (SELECT 1 FROM u WHERE u.id = s.x)"),
         ),
     ] {
         let (err, _) = error(&db, &sql, ());
         assert!(err.contains("is ambiguous"), "{site}: {err}");
+    }
+    for (site, sql) in [
+        (
+            "bare ORDER BY alias",
+            format!("SELECT s.id AS x {FROM} WHERE {EXISTS} ORDER BY x DESC"),
+        ),
+        (
+            "ORDER BY expression over an alias no column has",
+            format!("SELECT s.id AS y {FROM} WHERE {EXISTS} ORDER BY 0 - y"),
+        ),
+    ] {
+        assert_eq!(ids(&db, &sql, ()).0, vec![6, 5, 3, 2, 1], "{site}");
     }
 }

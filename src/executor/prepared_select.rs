@@ -2811,8 +2811,15 @@ impl PreparedProjection {
                 }
             }
         }
+        // A bare key names an alias first; inside an expression a column of
+        // the same name comes first, so only the aliases this map keeps
+        let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+        let inner_aliases: Vec<&str> = alias_map.keys().map(String::as_str).collect();
         for ob in &stmt.order_by {
-            check_names(chain, &ob.expression, &aliases)?;
+            match &ob.expression {
+                Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str()) => {}
+                key => check_names(chain, key, &inner_aliases)?,
+            }
         }
         let plan = executor.order_by_projection(&select_exprs, &stmt.order_by, &[], columns, false);
         let registry = &executor.function_registry;
@@ -2842,7 +2849,6 @@ impl PreparedProjection {
         // it, under the key's own text, which is how the sort finds it
         let mut extra_names = plan.extra_names;
         let mut extra_sources = plan.extra_sources;
-        let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
         // Each alias reference is bound to its position by node, not by name,
         // so no column name can meet it; a repeated alias is its last use,
         // as the general path's evaluator over the output columns reads it
