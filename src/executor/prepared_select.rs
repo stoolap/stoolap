@@ -39,8 +39,8 @@ use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Scanner, Table, Transaction};
 
 use super::aggregation::{
-    aggregate_slot_keys, compile_over_slots, grouping_items, ungrouped_column, AggregatePath,
-    CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
+    aggregate_slot_keys, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
+    SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -1707,10 +1707,12 @@ struct PreparedSubquery {
     /// deeper subquery reads from it; empty for the statement's own blocks,
     /// whose holes its `HoleSet` keeps
     holes: Vec<(usize, Hole)>,
-    /// A join statement's own block's holes over its row, compiled again for
-    /// each layout of the row its sites run over; a grouped statement's as
-    /// the block wrote them, bound to its group items
+    /// A join or grouped statement's own block's holes over its row, compiled
+    /// again for each layout of the row its sites run over
     hole_exprs: Vec<(usize, Expression)>,
+    /// A grouped statement's own block's holes as the block wrote them,
+    /// which choose between group items holding one column
+    hole_written: Vec<(usize, Expression)>,
     /// Reads no enclosing scope: its value is computed once per run
     uncorrelated: bool,
 }
@@ -2918,9 +2920,13 @@ impl Builder<'_> {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        let hole_exprs = match parent {
+        let hole_exprs = if parent.is_none() && (outer[0].tables.len() > 1 || self.keeps_holes) {
+            work.holes.clone()
+        } else {
+            Vec::new()
+        };
+        let hole_written = match parent {
             None if self.keeps_holes => work.written.clone(),
-            None if outer[0].tables.len() > 1 => work.holes.clone(),
             _ => Vec::new(),
         };
         let correlated = work.reads_parent || !work.delegated.is_empty();
@@ -2959,6 +2965,7 @@ impl Builder<'_> {
             parent,
             holes,
             hole_exprs,
+            hole_written,
             uncorrelated: !correlated,
         });
         Ok((id, work.delegated, work.reads_parent))
@@ -3927,18 +3934,42 @@ impl PreparedGrouped {
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks));
-        // A group's row holds its GROUP BY items first. A hole reads them as
-        // the output reads what the block wrote: an item by its identity,
-        // else by the name the group's row gives it
+        // A group's row holds its GROUP BY items first, each holding the
+        // column the grouping reads it from when it reads one. A hole reads
+        // an item holding the column it resolved to; between several, the
+        // one the output reads for what the block wrote
+        let registry = &executor.function_registry;
         let group_items = executor.parse_group_by(stmt, &[])?;
         let names = schema.column_names_arc();
-        let item_names = executor.resolve_group_by_column_names_new(
-            &group_items,
-            &names,
-            &build_column_index_map(&names),
-        );
+        let name_index = build_column_index_map(&names);
+        let names_ctx = CompileContext::new(&names, registry);
+        let held: Vec<Option<usize>> = group_items
+            .iter()
+            .map(|group| match group {
+                GroupByItem::Column(name) => {
+                    Executor::lookup_column_index(&name.to_lowercase(), &name_index)
+                }
+                GroupByItem::Expression { expr, .. } => names_ctx
+                    .reference(expr)
+                    .and_then(|reference| reference.row_column())
+                    .map(usize::from),
+            })
+            .collect();
+        let item_names =
+            executor.resolve_group_by_column_names_new(&group_items, &names, &name_index);
         let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
-        let item_ctx = CompileContext::new(&item_names, &executor.function_registry);
+        let item_ctx = CompileContext::new(&item_names, registry);
+        // An expression a hole computes reads each column from its first item
+        let mut slot_names: Vec<String> = (0..group_items.len())
+            .map(|item| format!("\0group item {item}"))
+            .collect();
+        let mut taken = vec![false; names.len()];
+        for (item, column) in held.iter().enumerate() {
+            if let Some(column) = column.filter(|&c| !std::mem::replace(&mut taken[c], true)) {
+                slot_names[item] = scope.columns[column].clone();
+            }
+        }
+        let slots_ctx = CompileContext::new(&slot_names, registry);
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
         for (id, sq) in blocks.subqueries.iter().enumerate() {
             if input.get(id) == Some(&true) {
@@ -3946,24 +3977,25 @@ impl PreparedGrouped {
                 continue;
             }
             let mut grouped = Vec::with_capacity(sq.hole_exprs.len());
-            for (slot, hole) in &sq.hole_exprs {
-                let item = item_keys.get(&ExprKey::of(hole)).copied().or_else(|| {
-                    item_ctx
-                        .reference(hole)
-                        .and_then(|reference| reference.row_column())
-                        .map(usize::from)
-                });
-                let read = match item {
-                    Some(item) => Hole::Column(item),
-                    None => match compile_over_slots(
-                        hole,
-                        &item_names,
-                        &executor.function_registry,
-                        Some(&item_keys),
-                        None,
-                        false,
-                        None,
-                    ) {
+            for ((slot, hole), (_, written)) in sq.hole_exprs.iter().zip(&sq.hole_written) {
+                let read = match scope.position(hole) {
+                    Some(column) => {
+                        let holding: SmallVec<[usize; 2]> = (0..held.len())
+                            .filter(|&item| held[item] == Some(column))
+                            .collect();
+                        let output = item_keys.get(&ExprKey::of(written)).copied().or_else(|| {
+                            item_ctx
+                                .reference(written)
+                                .and_then(|reference| reference.row_column())
+                                .map(usize::from)
+                        });
+                        let item = output.filter(|item| holding.contains(item));
+                        match item.or(holding.first().copied()) {
+                            Some(item) => Hole::Column(item),
+                            None => return Ok(None),
+                        }
+                    }
+                    None => match compile_with(&slots_ctx, hole) {
                         Ok(program) => Hole::Program(program),
                         Err(_) => return Ok(None),
                     },

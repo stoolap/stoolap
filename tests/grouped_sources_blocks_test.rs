@@ -592,14 +592,18 @@ fn a_group_column_named_like_a_qualified_one_reads_its_own_cell() {
         db.execute(sql, ()).unwrap();
     }
     let mut wrong = Vec::new();
-    check(
-        &db,
-        "SELECT t.a, (SELECT MAX(u.x) FROM u WHERE u.k = t.\"t.a\") FROM t JOIN r ON r.id = t.id \
-         GROUP BY t.a, t.\"t.a\"",
-        &["Integer(1)|Integer(20)".to_string()],
-        GENERAL,
-        &mut wrong,
-    );
+    for read in ["t.\"t.a\"", "\"t.a\""] {
+        check(
+            &db,
+            &format!(
+                "SELECT t.a, (SELECT MAX(u.x) FROM u WHERE u.k = {read}) FROM t \
+                 JOIN r ON r.id = t.id GROUP BY t.a, t.\"t.a\""
+            ),
+            &["Integer(1)|Integer(20)".to_string()],
+            GENERAL,
+            &mut wrong,
+        );
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
