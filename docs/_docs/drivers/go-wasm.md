@@ -10,18 +10,23 @@ icon: go
 
 Pure Go driver for Stoolap using WebAssembly. No CGO, no shared libraries, no platform-specific binaries. The full Stoolap engine runs as a WASM module inside your Go process via [wazero](https://wazero.io/).
 
-For the native CGO driver, see [Go Driver]({{ '/docs/drivers/go/' | relative_url }}).
+For the native driver, which loads `libstoolap` as a shared library without CGO, see [Go Driver]({{ '/docs/drivers/go/' | relative_url }}).
 
 ## When to Use
 
-| | CGO Driver | WASM Driver |
+| | Native Driver | WASM Driver |
 |---|---|---|
 | **Package** | `github.com/stoolap/stoolap-go` | `github.com/stoolap/stoolap-go/wasm` |
-| **CGO required** | Yes | No |
+| **CGO required** | No | No |
+| **Native dependency** | `libstoolap` shared library (bundled for macOS arm64, Linux x64, Windows x64) | None |
 | **Threading** | Full (parallel queries) | Single-threaded |
 | **File persistence** | Full (automatic maintenance) | Works (manual maintenance) |
-| **Cross-compile** | Needs C toolchain per target | Anywhere Go compiles |
+| **Cross-compile** | Needs `libstoolap` for the target | Anywhere Go compiles |
 | **Best for** | Production, max throughput | Portability, zero dependencies |
+
+## Requirements
+
+- Go 1.25+
 
 ## Installation
 
@@ -201,7 +206,7 @@ db.Exec(ctx, "ANALYZE my_table")
 
 `hot_max_bytes` does not hold commits back on WASM. Natively a commit over the limit waits for the background seal, which WASM does not have, so the hot buffer only shrinks when `PRAGMA checkpoint` runs.
 
-For production file-based workloads with automatic background maintenance, use the [CGO driver]({{ '/docs/drivers/go/' | relative_url }}).
+For production file-based workloads with automatic background maintenance, use the [native driver]({{ '/docs/drivers/go/' | relative_url }}).
 
 ## FetchAll (Bulk Read)
 
@@ -228,6 +233,8 @@ for _, row := range allRows {
 | TIMESTAMP | `time.Time` | `sql.NullTime` |
 | JSON | `string` | `sql.NullString` |
 | VECTOR/BLOB | `[]byte` | `[]byte` (nil for NULL) |
+
+A nil `[]byte` parameter binds as NULL; an empty `[]byte{}` or an empty string binds as an empty value.
 
 ## Thread Safety
 
@@ -261,7 +268,7 @@ The WASM driver uses several optimizations to minimize overhead:
 - **CallWithStack**: Pre-allocated call stack eliminates per-call allocations.
 - **Arena allocator**: SQL strings and parameters are written to a pre-allocated WASM memory region with zero malloc/free overhead.
 
-Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native CGO driver. Write-heavy workloads have ~1.5-2x overhead due to WASM boundary crossing per operation.
+Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native driver. Write-heavy workloads have ~1.5-2x overhead due to WASM boundary crossing per operation.
 
 ## Direct API Reference
 
