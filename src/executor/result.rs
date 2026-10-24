@@ -1114,6 +1114,88 @@ impl QueryResult for OrderedResult {
     }
 }
 
+/// A row in the top-N heap, ordered by the sort's compare
+struct HeapRow<F: Fn(&Row, &Row) -> std::cmp::Ordering> {
+    row: Row,
+    compare: std::sync::Arc<F>,
+}
+
+impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> PartialEq for HeapRow<F> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.compare)(&self.row, &other.row) == std::cmp::Ordering::Equal
+    }
+}
+
+impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> Eq for HeapRow<F> {}
+
+impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> PartialOrd for HeapRow<F> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> Ord for HeapRow<F> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // The worst row kept is the heap's top, the one a better row replaces
+        (self.compare)(&self.row, &other.row)
+    }
+}
+
+/// The first `limit + offset` rows by `compare` of the rows pushed, in a
+/// bounded max-heap: a row only replaces a worse one, so of rows that
+/// compare equal the first pushed are kept
+pub(crate) struct TopN<F: Fn(&Row, &Row) -> std::cmp::Ordering> {
+    heap: std::collections::BinaryHeap<HeapRow<F>>,
+    compare: std::sync::Arc<F>,
+    capacity: usize,
+    offset: usize,
+}
+
+impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> TopN<F> {
+    pub(crate) fn new(compare: F, limit: usize, offset: usize) -> Self {
+        let capacity = limit.saturating_add(offset);
+        Self {
+            // The capacity saturates for an unbounded LIMIT; the heap grows on demand
+            heap: std::collections::BinaryHeap::with_capacity(capacity.saturating_add(1).min(4096)),
+            compare: std::sync::Arc::new(compare),
+            capacity,
+            offset,
+        }
+    }
+
+    /// Offers `row`; gives back the row the heap does not keep, `row` or
+    /// the one it replaced, so its storage can serve the next row
+    pub(crate) fn push(&mut self, row: Row) -> Option<Row> {
+        if self.heap.len() < self.capacity {
+            self.heap.push(HeapRow {
+                row,
+                compare: std::sync::Arc::clone(&self.compare),
+            });
+            return None;
+        }
+        match self.heap.peek_mut() {
+            // Replaced in place: one sift-down on drop
+            Some(mut worst) if (self.compare)(&row, &worst.row) == std::cmp::Ordering::Less => {
+                Some(std::mem::replace(&mut worst.row, row))
+            }
+            _ => Some(row),
+        }
+    }
+
+    /// The rows kept past the offset, in order
+    pub(crate) fn into_rows(self) -> Vec<Row> {
+        let compare = self.compare;
+        let mut rows: Vec<Row> = self.heap.into_iter().map(|hr| hr.row).collect();
+        rows.sort_unstable_by(|a, b| compare(a, b));
+        if self.offset >= rows.len() {
+            rows.clear();
+        } else {
+            rows.drain(..self.offset);
+        }
+        rows
+    }
+}
+
 /// Top-N result using a bounded heap for ORDER BY + LIMIT optimization
 ///
 /// This is O(n log k) instead of O(n log n) for full sort, where k = limit.
@@ -1143,87 +1225,26 @@ impl TopNResult {
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering + Clone,
     {
-        use std::collections::BinaryHeap;
-
         let columns = inner.columns().to_vec();
-        let heap_capacity = limit.saturating_add(offset);
 
         // If no limit, fall back to empty result
-        if heap_capacity == 0 {
+        if limit.saturating_add(offset) == 0 {
             return Ok(Self {
                 inner: ExecutorResult::new(columns, RowVec::new()),
             });
         }
 
-        // Use Arc to wrap compare function - cloning Arc is O(1)
-        let compare = std::sync::Arc::new(compare);
-
-        // Wrapper for Row with Arc-wrapped comparison (O(1) clone)
-        struct HeapRow<F: Fn(&Row, &Row) -> std::cmp::Ordering> {
-            row: Row,
-            compare: std::sync::Arc<F>,
-        }
-
-        impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> PartialEq for HeapRow<F> {
-            fn eq(&self, other: &Self) -> bool {
-                (self.compare)(&self.row, &other.row) == std::cmp::Ordering::Equal
-            }
-        }
-
-        impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> Eq for HeapRow<F> {}
-
-        impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> PartialOrd for HeapRow<F> {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> Ord for HeapRow<F> {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                // For TOP-N, we want the WORST element at the top of the max-heap
-                // so we can efficiently replace it when a better element comes.
-                (self.compare)(&self.row, &other.row)
-            }
-        }
-
-        // heap_capacity saturates at usize::MAX for an unbounded LIMIT, so
-        // cap the pre-allocation; the heap grows on demand anyway
-        let mut heap: BinaryHeap<HeapRow<F>> =
-            BinaryHeap::with_capacity(heap_capacity.saturating_add(1).min(4096));
-
+        let mut top = TopN::new(compare, limit, offset);
         while inner.next() {
-            let row = inner.take_row();
-
-            if heap.len() < heap_capacity {
-                heap.push(HeapRow {
-                    row,
-                    compare: std::sync::Arc::clone(&compare),
-                });
-            } else if let Some(mut worst) = heap.peek_mut() {
-                // Replace in place: one sift-down on drop instead of a
-                // pop + push double sift
-                if compare(&row, &worst.row) == std::cmp::Ordering::Less {
-                    worst.row = row;
-                }
-            }
+            top.push(inner.take_row());
         }
         if let Some(err) = inner.last_error() {
             return Err(err);
         }
 
-        // Extract rows from heap and sort them
-        let mut rows: Vec<Row> = heap.into_iter().map(|hr| hr.row).collect();
-        rows.sort_unstable_by(|a, b| compare(a, b));
-
-        // Apply offset
-        if offset > 0 && offset < rows.len() {
-            rows.drain(..offset);
-        } else if offset >= rows.len() {
-            rows.clear();
-        }
-
         // Convert to RowVec format
-        let result_rows: RowVec = rows
+        let result_rows: RowVec = top
+            .into_rows()
             .into_iter()
             .enumerate()
             .map(|(i, row)| (i as i64, row))

@@ -4078,14 +4078,6 @@ impl PreparedProjection {
             .any(|o| matches!(o, Output::Program(_) | Output::Block(_)))
     }
 
-    /// Whether no ORDER BY key is computed apart from the SELECT items
-    fn keys_are_items(&self) -> bool {
-        !self
-            .outputs
-            .iter()
-            .any(|o| matches!(o, Output::Key(_) | Output::AliasKey(..)))
-    }
-
     /// The source row's column the output at `position` holds as it is
     fn source_column(&self, position: usize) -> Option<usize> {
         match self.outputs.get(position)? {
@@ -4123,26 +4115,31 @@ impl PreparedProjection {
         let width = self.outputs.len();
         let mut vm = ExprVM::new();
         let mut sources = Vec::with_capacity(rows.len());
-        let mut first = RowVec::with_capacity(rows.len());
-        for (i, row) in rows.drain_rows().enumerate() {
-            let mut out = self.project_row::<true>(&mut vm, &row, run, &read)?;
-            // The row's place among the sources, past the outputs
-            out.set(width, Value::Integer(i as i64))?;
-            first.push((i as i64, out));
-            sources.push(row);
-        }
-        // The sort reads columns by position: their names are never read
-        let columns = vec![String::new(); width + 1];
-        let sorted = super::result::TopNResult::new(
-            Box::new(ExecutorResult::new(columns, first)),
-            move |a, b| Executor::compare_rows_with_indices(a, b, &order),
+        let mut top = super::result::TopN::new(
+            move |a: &Row, b: &Row| Executor::compare_rows_with_indices(a, b, &order),
             limit.unwrap_or(usize::MAX),
             offset,
-        )?;
-        let mut sorted: Box<dyn crate::storage::traits::QueryResult> = Box::new(sorted);
+        );
+        // The storage of a row the sort does not keep holds the next row's keys
+        let mut spare: Vec<Value> = Vec::new();
+        for (i, row) in rows.drain_rows().enumerate() {
+            let values = match spare.capacity() {
+                0 => Vec::with_capacity(width + 1),
+                _ => {
+                    spare.clear();
+                    std::mem::take(&mut spare)
+                }
+            };
+            let mut out = self.project_into::<true>(&mut vm, &row, run, &read, values)?;
+            // The row's place among the sources, past the outputs
+            out.set(width, Value::Integer(i as i64))?;
+            sources.push(row);
+            if let Some(dropped) = top.push(out) {
+                spare = dropped.into_values();
+            }
+        }
         let mut kept = RowVec::new();
-        while sorted.next() {
-            let mut out = sorted.take_row();
+        for mut out in top.into_rows() {
             let Some(Value::Integer(i)) = out.get(width).cloned() else {
                 return Err(Error::internal("a sorted row lost its source"));
             };
@@ -4158,9 +4155,6 @@ impl PreparedProjection {
             }
             out.truncate(width);
             kept.push((kept.len() as i64, out));
-        }
-        if let Some(e) = sorted.last_error() {
-            return Err(e);
         }
         Ok(kept)
     }
@@ -6997,18 +6991,17 @@ impl Executor {
         let projection = &prepared.projection;
         let order = (!read_in_order
             && !stmt.order_by.is_empty()
-            && (limit.is_some() || offset > 0)
-            && ((limit.is_some() && projection.keys_are_items()) || projection.defers()))
-        .then(|| {
-            let layout = prepared.layout.as_deref();
-            let (mapped, _) = self.order_by_columns(stmt, &output_columns, layout, false);
-            mapped
-                .into_iter()
-                .zip(&stmt.order_by)
-                .map(|(column, ob)| column.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
-                .collect::<Option<Vec<_>>>()
-        })
-        .flatten();
+            && (limit.is_some() || projection.defers() && offset > 0))
+            .then(|| {
+                let layout = prepared.layout.as_deref();
+                let (mapped, _) = self.order_by_columns(stmt, &output_columns, layout, false);
+                mapped
+                    .into_iter()
+                    .zip(&stmt.order_by)
+                    .map(|(column, ob)| column.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten();
         // Keys that are source columns choose the rows before any is projected
         let source = |column: Option<usize>| column.and_then(|c| projection.source_column(c));
         let source_order = limit
@@ -7023,14 +7016,14 @@ impl Executor {
                     .collect::<Vec<_>>()
             });
         if let (Some(source_order), Some(limit)) = (source_order, limit) {
-            rows = top_rows(rows, source_order, limit, offset)?;
+            rows = top_rows(rows, source_order, limit, offset);
             limit_applied = true;
         }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_projection_ran();
         // The output's blocks are asked of these rows, not of the table's
         runner.ask_rows(Some(rows.len()));
-        let rows = match order.filter(|_| !limit_applied && projection.defers()) {
+        let rows = match order.filter(|_| !limit_applied) {
             Some(order) => {
                 limit_applied = true;
                 projection.project_first(rows, &runner, order, limit, offset)?
@@ -7056,19 +7049,16 @@ fn top_rows(
     order: Vec<(Option<usize>, bool, Option<bool>)>,
     limit: usize,
     offset: usize,
-) -> Result<RowVec> {
-    use crate::storage::traits::QueryResult;
-    let mut sorted = super::result::TopNResult::new(
-        Box::new(ExecutorResult::new(Vec::new(), rows)),
-        move |a, b| Executor::compare_rows_with_indices(a, b, &order),
+) -> RowVec {
+    let mut top = super::result::TopN::new(
+        move |a: &Row, b: &Row| Executor::compare_rows_with_indices(a, b, &order),
         limit,
         offset,
-    )?;
-    let mut kept = RowVec::with_capacity(limit.min(64));
-    while sorted.next() {
-        kept.push((kept.len() as i64, sorted.take_row()));
+    );
+    for (_, row) in rows {
+        top.push(row);
     }
-    Ok(kept)
+    (0i64..).zip(top.into_rows()).collect()
 }
 
 /// A row a source hands the runner: its own, or one it lends, copied only

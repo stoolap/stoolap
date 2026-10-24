@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A prepared ORDER BY over source columns with a LIMIT projects the rows it
+//! A prepared ORDER BY with a LIMIT projects the rows it
 //! keeps, not the rows its WHERE passes, counted in the allocations the
 //! query makes on its thread
 
@@ -60,7 +60,7 @@ fn allocations(db: &Database, sql: &str) -> (usize, usize) {
 
 #[cfg(not(feature = "test-filedb"))]
 #[test]
-fn an_order_by_over_columns_with_a_limit_projects_the_rows_it_keeps() {
+fn an_order_by_with_a_limit_projects_the_rows_it_keeps() {
     let db = Database::open("memory://prepared_order_limit_alloc").unwrap();
     db.execute(
         "CREATE TABLE d (id INTEGER PRIMARY KEY, g INTEGER, s TEXT, f FLOAT)",
@@ -77,6 +77,8 @@ fn an_order_by_over_columns_with_a_limit_projects_the_rows_it_keeps() {
         "SELECT id, g FROM d WHERE f > (SELECT AVG(f) FROM d) ORDER BY g, id LIMIT 10",
         "SELECT id, s, g FROM d WHERE f > (SELECT AVG(f) FROM d) ORDER BY g DESC, id LIMIT 10 OFFSET 5",
         "SELECT id, g + 1 AS h FROM d WHERE f > (SELECT AVG(f) FROM d) ORDER BY g, id LIMIT 10",
+        "SELECT id, g FROM d WHERE f > (SELECT AVG(f) FROM d) ORDER BY g + 0, id LIMIT 10",
+        "SELECT id, g + 1 AS h FROM d WHERE f > (SELECT AVG(f) FROM d) ORDER BY h DESC, id LIMIT 10",
     ] {
         let (count, allocations) = allocations(&db, sql);
         assert_eq!(count, 10, "{sql}");
