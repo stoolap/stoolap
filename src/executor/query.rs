@@ -1459,6 +1459,9 @@ impl Executor {
         // Note: LIMIT/OFFSET was already evaluated earlier for set operations optimization
         // Skip ORDER BY if storage-level optimization already applied sorting + LIMIT/OFFSET
         // classification was already obtained at entry point and passed through
+        // A DISTINCT ON key reads only where the first branch put its items,
+        // which a set operation's rows keep
+        let item_layout = layout.as_deref();
         if !stmt.order_by.is_empty() && !limit_offset_applied {
             // A set operation's rows come from other branches too: there a
             // column stands for a sort key only when aliased or an aggregate,
@@ -1777,12 +1780,7 @@ impl Executor {
 
                 // Apply DISTINCT ON if active
                 if has_distinct_on {
-                    result = Self::distinct_on_result(
-                        stmt,
-                        result,
-                        layout.map(|l| &**l),
-                        expected_columns,
-                    )?;
+                    result = Self::distinct_on_result(stmt, result, item_layout, expected_columns)?;
 
                     // Remove extra columns after DISTINCT ON dedup
                     if needs_extra_col_removal {
@@ -1876,8 +1874,7 @@ impl Executor {
         // columns not in SELECT (they may be among the extra ORDER BY columns or
         // the full source columns).
         if !stmt.distinct_on.is_empty() {
-            let layout = layout.as_deref().filter(|_| stmt.set_operations.is_empty());
-            result = Self::distinct_on_result(stmt, result, layout, expected_columns)?;
+            result = Self::distinct_on_result(stmt, result, item_layout, expected_columns)?;
         }
 
         // Remove extra ORDER BY columns that were added for sorting

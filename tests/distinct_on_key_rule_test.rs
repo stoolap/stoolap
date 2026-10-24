@@ -170,6 +170,16 @@ fn a_group_by_position_reads_the_select_list_as_written() {
 }
 
 #[test]
+fn a_set_operation_reads_a_key_from_the_item_of_its_first_branch() {
+    let db = Database::open("memory://distinct_on_key_rule_union_item").unwrap();
+    fill(&db);
+    let sql = "SELECT DISTINCT ON (a % 2) t.*, a % 2 AS k, t.*, ROW_NUMBER() OVER (ORDER BY id) \
+               FROM t UNION ALL \
+               SELECT t.*, a % 2 AS k, t.*, ROW_NUMBER() OVER (ORDER BY id) FROM t";
+    assert_eq!(rows(&db, sql).len(), 2, "{sql}");
+}
+
+#[test]
 fn a_set_operation_branch_carries_no_key_column() {
     let db = Database::open("memory://distinct_on_key_rule_union").unwrap();
     fill(&db);
