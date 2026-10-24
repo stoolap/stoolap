@@ -24,6 +24,34 @@ fn the_same_block_written_twice_is_kept_once_for_both() {
         .unwrap();
     db.execute("INSERT INTO u VALUES (1, 10.0), (2, 20.0), (3, 30.0)", ())
         .unwrap();
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, b INTEGER, \"a.b\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO q VALUES (1, 10, 20)", ()).unwrap();
+    // Blocks a key that ignores quoting or qualification would take as one
+    for (sql, want) in [
+        (
+            "SELECT (SELECT \"a.b\" FROM q AS a), (SELECT a.b FROM q AS a) FROM q",
+            ["20", "10"],
+        ),
+        (
+            "SELECT (SELECT a.b FROM q AS a), (SELECT \"a.b\" FROM q AS a) FROM q",
+            ["10", "20"],
+        ),
+        (
+            "SELECT (SELECT \"UPPER\" FROM q), (SELECT \"upper\" FROM q) FROM q",
+            ["UPPER", "upper"],
+        ),
+    ] {
+        let statement = db.prepare(sql).unwrap();
+        for _ in 0..2 {
+            let row = statement.query(()).unwrap().next().unwrap().unwrap();
+            let found = [0, 1].map(|i| row.get::<String>(i).unwrap());
+            assert_eq!(found, want, "{sql}");
+        }
+    }
     for sql in [
         "SELECT id, (SELECT AVG(v) FROM u) FROM u WHERE v > (SELECT AVG(v) FROM u)",
         "SELECT id FROM u WHERE v > (SELECT AVG(v) FROM u) AND v < (SELECT AVG(v) FROM u) + 20",

@@ -3097,7 +3097,7 @@ impl Builder<'_> {
             scopes.push('\u{1}');
         }
         let kept = Kept {
-            identity_key: ExprKey::of(&identity),
+            identity_key: ExprKey::exact(&identity),
             identity: Arc::new(identity),
             scopes: Arc::from(scopes),
             tables: table.iter().cloned().collect(),
