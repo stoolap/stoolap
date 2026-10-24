@@ -103,6 +103,8 @@ FROM employees;
 
 ### Value Functions
 
+The `expression` of LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE may be any expression over the row, such as `salary * 12` or a subquery; it is computed for each row of the partition, and the function returns the value it has at the row it picks.
+
 #### LAG(expression [, offset [, default]])
 Accesses a value from a previous row within the partition.
 
