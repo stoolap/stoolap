@@ -87,8 +87,9 @@ fn setup(name: &str) -> Database {
     db
 }
 
-/// The rows, sorted: a shape without ORDER BY has no order to compare
-fn rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
+/// The rows in the order they came when `ordered`, else sorted: a shape
+/// without ORDER BY has no order to compare
+fn rows(db: &Database, sql: &str, ordered: bool) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = db
         .query(sql, ())
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
@@ -103,7 +104,9 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect();
-    out.sort();
+    if !ordered {
+        out.sort();
+    }
     out
 }
 
@@ -263,6 +266,9 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
     ),
 ];
 
+/// The query shapes whose statement orders its rows, compared in that order
+const ORDERED: &[&str] = &["order_by_scalar", "order_by_correlated"];
+
 /// Each write shape, the same write with literals, and its path
 const WRITES: &[(&str, &str, &str, Path)] = &[
     (
@@ -291,9 +297,10 @@ fn every_query_shape_takes_the_path_its_entry_names() {
     let mut wrong = Vec::new();
     for (name, sql, literal, path) in QUERIES {
         let db = setup(&format!("old_path_ledger_{name}"));
-        let want = rows(&db, literal);
+        let ordered = ORDERED.contains(name);
+        let want = rows(&db, literal, ordered);
         let before = hits();
-        let got = rows(&db, sql);
+        let got = rows(&db, sql, ordered);
         let ran = ran(&before);
         if got != want {
             wrong.push(format!("{name}: {got:?}, want {want:?}"));
@@ -316,8 +323,8 @@ fn every_write_shape_takes_the_path_its_entry_names() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
         let ran = ran(&before);
         let (got, want) = (
-            rows(&left, "SELECT * FROM t"),
-            rows(&right, "SELECT * FROM t"),
+            rows(&left, "SELECT * FROM t ORDER BY id", true),
+            rows(&right, "SELECT * FROM t ORDER BY id", true),
         );
         if got != want {
             wrong.push(format!("{name}: {got:?}, want {want:?}"));
