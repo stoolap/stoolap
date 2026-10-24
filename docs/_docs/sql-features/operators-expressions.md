@@ -118,7 +118,7 @@ SELECT * FROM metrics WHERE label LIKE '%!%%' ESCAPE '!';
 SELECT * FROM codes WHERE code LIKE 'A!_B' ESCAPE '!';
 ```
 
-The escape character can be any single character. The character immediately after the escape is treated as a literal instead of a wildcard.
+The escape character can be any single character. The character immediately after the escape stands for itself instead of a wildcard, whatever it is: `'a!b'` matches `ab`, and `'a!!b'` matches `a!b`. An escape at the end of the pattern stands for itself. The same holds for a pattern from a parameter, a column or an expression.
 
 #### GLOB (Shell-Style Patterns)
 
@@ -148,7 +148,7 @@ SELECT * FROM data WHERE value REGEXP '[0-9]{3}-[0-9]{4}';
 SELECT * FROM logs WHERE message NOT REGEXP 'debug|trace';
 ```
 
-Invalid regex patterns return an error instead of silently matching nothing.
+Invalid regex patterns return an error instead of silently matching nothing. A pattern written as a literal, or as an expression of literals such as `'[' || ''`, is checked before the statement reads a row, so it fails even over a table without rows; one read from a column is checked for each row that reaches it.
 
 #### Parameterized Patterns
 

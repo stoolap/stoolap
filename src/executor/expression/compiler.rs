@@ -39,6 +39,7 @@ use crate::core::pattern::Pattern;
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
+use crate::executor::pushdown::{read_as_column, reads_as_column_alike};
 use crate::executor::utils::{
     derived_aggregate_column_name, extract_literal_value, string_literal_value, string_to_datatype,
 };
@@ -536,13 +537,25 @@ impl<'a> ExprCompiler<'a> {
         expr: &Expression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        let start = builder.position();
         self.compile_node(expr, builder)?;
         if let Some(&column_type) = self
             .ctx
             .read_as
             .and_then(|r| r.get(&(expr as *const Expression as usize)))
         {
-            builder.emit(Op::ReadAsColumn(column_type));
+            // A value known when compiled is read as the column's type once,
+            // unless that reading depends on when it runs
+            match builder.take_constant_since(start) {
+                Some(value) if reads_as_column_alike(column_type, &value) => {
+                    builder.emit(Op::LoadConst(read_as_column(column_type, value)))
+                }
+                Some(value) => {
+                    builder.emit(Op::LoadConst(value));
+                    builder.emit(Op::ReadAsColumn(column_type));
+                }
+                None => builder.emit(Op::ReadAsColumn(column_type)),
+            }
         }
         Ok(())
     }
@@ -1079,81 +1092,29 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // Pattern matching via infix
-            InfixOperator::Like => {
+            InfixOperator::Like
+            | InfixOperator::ILike
+            | InfixOperator::NotLike
+            | InfixOperator::NotILike
+            | InfixOperator::Glob
+            | InfixOperator::NotGlob
+            | InfixOperator::Regexp
+            | InfixOperator::NotRegexp => {
+                use InfixOperator as I;
+                let kind = match infix.op_type {
+                    I::Glob | I::NotGlob => PatternKind::Glob,
+                    I::Regexp | I::NotRegexp => PatternKind::Regexp,
+                    op => PatternKind::Like {
+                        case_insensitive: matches!(op, I::ILike | I::NotILike),
+                        escape: None,
+                    },
+                };
                 self.compile_expr(&infix.left, builder)?;
-                let pattern_str = Self::extract_pattern_string(&infix.right);
-                if let Some(s) = pattern_str {
-                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, false))));
-                } else {
-                    self.compile_expr(&infix.right, builder)?;
-                    builder.emit(Op::LikeDynamic(false));
-                }
-            }
-
-            InfixOperator::ILike => {
-                self.compile_expr(&infix.left, builder)?;
-                let pattern_str = Self::extract_pattern_string(&infix.right);
-                if let Some(s) = pattern_str {
-                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, true))));
-                } else {
-                    self.compile_expr(&infix.right, builder)?;
-                    builder.emit(Op::LikeDynamic(true));
-                }
-            }
-
-            InfixOperator::NotLike => {
-                self.compile_expr(&infix.left, builder)?;
-                let pattern_str = Self::extract_pattern_string(&infix.right);
-                if let Some(s) = pattern_str {
-                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, false))));
-                    builder.emit(Op::Not);
-                } else {
-                    self.compile_expr(&infix.right, builder)?;
-                    builder.emit(Op::LikeDynamic(false));
-                    builder.emit(Op::Not);
-                }
-            }
-
-            InfixOperator::NotILike => {
-                self.compile_expr(&infix.left, builder)?;
-                let pattern_str = Self::extract_pattern_string(&infix.right);
-                if let Some(s) = pattern_str {
-                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, true))));
-                    builder.emit(Op::Not);
-                } else {
-                    self.compile_expr(&infix.right, builder)?;
-                    builder.emit(Op::LikeDynamic(true));
-                    builder.emit(Op::Not);
-                }
-            }
-
-            InfixOperator::Glob | InfixOperator::NotGlob => {
-                self.compile_expr(&infix.left, builder)?;
-                let pattern_str = Self::extract_pattern_string(&infix.right);
-                if let Some(s) = pattern_str {
-                    builder.emit(Op::Glob(Arc::new(Pattern::glob(&s))));
-                } else {
-                    self.compile_expr(&infix.right, builder)?;
-                    builder.emit(Op::GlobDynamic);
-                }
-                if matches!(infix.op_type, InfixOperator::NotGlob) {
-                    builder.emit(Op::Not);
-                }
-            }
-
-            InfixOperator::Regexp | InfixOperator::NotRegexp => {
-                self.compile_expr(&infix.left, builder)?;
-                let pattern_str = Self::extract_pattern_string(&infix.right);
-                if let Some(s) = pattern_str {
-                    let regex = regex::Regex::new(&s).map_err(|e| {
-                        CompileError::InvalidExpression(format!("Invalid regex: {}", e))
-                    })?;
-                    builder.emit(Op::Regexp(Arc::new(regex)));
-                } else {
-                    self.compile_expr(&infix.right, builder)?;
-                    builder.emit(Op::RegexpDynamic);
-                }
-                if matches!(infix.op_type, InfixOperator::NotRegexp) {
+                self.compile_pattern(&infix.right, kind, builder)?;
+                if matches!(
+                    infix.op_type,
+                    I::NotLike | I::NotILike | I::NotGlob | I::NotRegexp
+                ) {
                     builder.emit(Op::Not);
                 }
             }
@@ -1406,9 +1367,10 @@ impl<'a> ExprCompiler<'a> {
                     .read_as
                     .and_then(|r| r.get(&(item as *const Expression as usize)))
                 {
-                    Some(&column_type) => {
+                    Some(&column_type) if reads_as_column_alike(column_type, &value) => {
                         crate::executor::pushdown::read_as_column(column_type, value)
                     }
+                    Some(_) => return None,
                     None => value,
                 },
             )
@@ -1630,47 +1592,54 @@ impl<'a> ExprCompiler<'a> {
             return Ok(());
         }
 
-        // Try to compile pattern at compile time
-        let pattern_str = Self::extract_pattern_string(&like.pattern);
-        if let Some(s) = pattern_str {
-            if is_regexp {
-                let regex = regex::Regex::new(&s).map_err(|e| {
-                    CompileError::InvalidExpression(format!("Invalid regex: {}", e))
-                })?;
-                builder.emit(Op::Regexp(Arc::new(regex)));
-            } else if is_glob {
-                builder.emit(Op::Glob(Arc::new(Pattern::glob(&s))));
-            } else if let Some(esc) = escape_char {
-                // LIKE with ESCAPE - pre-process pattern to handle escape character
-                let processed_pattern = self.process_like_escape(&s, esc);
-                let pattern = Pattern::like(&processed_pattern, case_insensitive);
-                builder.emit(Op::LikeEscape(Arc::new(pattern), esc));
-            } else {
-                builder.emit(Op::Like(Arc::new(Pattern::like(&s, case_insensitive))));
-            }
-
-            if negated {
-                builder.emit(Op::Not);
-            }
+        let kind = if is_regexp {
+            PatternKind::Regexp
+        } else if is_glob {
+            PatternKind::Glob
         } else {
-            // Dynamic pattern (e.g. parameter $1) — compile the pattern expression
-            // onto the stack and use the dynamic op
-            self.compile_expr(&like.pattern, builder)?;
-            if is_regexp {
-                builder.emit(Op::RegexpDynamic);
-            } else if is_glob {
-                builder.emit(Op::GlobDynamic);
-            } else if let Some(esc) = escape_char {
-                builder.emit(Op::LikeDynamicEscape(case_insensitive, esc));
-            } else {
-                builder.emit(Op::LikeDynamic(case_insensitive));
+            PatternKind::Like {
+                case_insensitive,
+                escape: escape_char,
             }
-            if negated {
-                builder.emit(Op::Not);
+        };
+        self.compile_pattern(&like.pattern, kind, builder)?;
+        if negated {
+            builder.emit(Op::Not);
+        }
+        Ok(())
+    }
+
+    /// `pattern` and the op matching by it as `kind`: compiled once when the
+    /// pattern is known when compiled, else read each time the program runs
+    fn compile_pattern(
+        &self,
+        pattern: &Expression,
+        kind: PatternKind,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
+        match self.constant_pattern(pattern) {
+            Some(text) => builder.emit(kind.constant_op(&text)?),
+            None => {
+                self.compile_expr(pattern, builder)?;
+                builder.emit(kind.dynamic_op());
             }
         }
-
         Ok(())
+    }
+
+    /// The text of a pattern known when compiled: a literal, a double-quoted
+    /// identifier, or an expression that folds, a parameter the program's
+    /// execution holds among them. None for NULL, read as the runtime op reads it
+    fn constant_pattern(&self, expr: &Expression) -> Option<SmartString> {
+        if let Some(text) = Self::extract_pattern_string(expr) {
+            return Some(text);
+        }
+        if self.folding.get() || !may_fold(expr, self.ctx) {
+            return None;
+        }
+        self.try_fold_constant(expr)?
+            .as_string()
+            .map(SmartString::from_string)
     }
 
     /// A pattern known when compiled: a literal read as its text form, a
@@ -1683,35 +1652,6 @@ impl<'a> ExprCompiler<'a> {
                 .as_string()
                 .map(SmartString::from_string),
         }
-    }
-
-    /// Process LIKE pattern with escape character
-    /// Converts escaped wildcards to special markers and then to literal characters
-    fn process_like_escape(&self, pattern: &str, escape: char) -> String {
-        let mut result = String::with_capacity(pattern.len());
-        let mut chars = pattern.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == escape {
-                // Whatever follows stands for itself. A wildcard and the
-                // backslash the pattern reads as its own marker keep that
-                // marker in front of them; anything else is already itself
-                match chars.next() {
-                    Some(next) => {
-                        if next == '%' || next == '_' || next == '\\' {
-                            result.push('\\');
-                        }
-                        result.push(next);
-                    }
-                    // Nothing follows, so the escape stands for itself
-                    None => result.push(c),
-                }
-            } else {
-                result.push(c);
-            }
-        }
-
-        result
     }
 
     /// Compile a CASE expression
@@ -1899,6 +1839,84 @@ impl<'a> ExprCompiler<'a> {
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/// What a pattern operator matches by
+#[derive(Clone, Copy)]
+enum PatternKind {
+    Like {
+        case_insensitive: bool,
+        escape: Option<char>,
+    },
+    Glob,
+    Regexp,
+}
+
+impl PatternKind {
+    /// The op matching by the pattern `text`, compiled once; an invalid
+    /// regular expression is an error
+    fn constant_op(self, text: &str) -> Result<Op, CompileError> {
+        Ok(match self {
+            PatternKind::Regexp => {
+                let regex = regex::Regex::new(text).map_err(|e| {
+                    CompileError::InvalidExpression(format!("Invalid regex: {}", e))
+                })?;
+                Op::Regexp(Arc::new(regex))
+            }
+            PatternKind::Glob => Op::Glob(Arc::new(Pattern::glob(text))),
+            PatternKind::Like {
+                case_insensitive,
+                escape: Some(escape),
+            } => {
+                let text = like_escape_pattern(text, escape);
+                Op::LikeEscape(Arc::new(Pattern::like(&text, case_insensitive)), escape)
+            }
+            PatternKind::Like {
+                case_insensitive,
+                escape: None,
+            } => Op::Like(Arc::new(Pattern::like(text, case_insensitive))),
+        })
+    }
+
+    /// The op matching by a pattern the program reads when it runs
+    fn dynamic_op(self) -> Op {
+        match self {
+            PatternKind::Regexp => Op::RegexpDynamic,
+            PatternKind::Glob => Op::GlobDynamic,
+            PatternKind::Like {
+                case_insensitive,
+                escape: Some(escape),
+            } => Op::LikeDynamicEscape(case_insensitive, escape),
+            PatternKind::Like {
+                case_insensitive,
+                escape: None,
+            } => Op::LikeDynamic(case_insensitive),
+        }
+    }
+}
+
+/// `pattern` with `escape` read away: whatever follows the escape stands for
+/// itself, and a wildcard or backslash so freed keeps the backslash marker
+/// `Pattern::like` reads; a trailing escape stands for itself
+pub(crate) fn like_escape_pattern(pattern: &str, escape: char) -> String {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != escape {
+            result.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(next) => {
+                if next == '%' || next == '_' || next == '\\' {
+                    result.push('\\');
+                }
+                result.push(next);
+            }
+            None => result.push(c),
+        }
+    }
+    result
+}
 
 /// Whether `expr` is worth folding into a constant and may be: an operator,
 /// call or cast (a literal is a constant already)
@@ -2147,6 +2165,103 @@ mod tests {
                     .any(|op| matches!(op, Op::ScaleInterval(_, _) | Op::Mul)),
                 "{sql}: no interval text per row"
             );
+        }
+    }
+
+    fn parse(sql: &str) -> Expression {
+        crate::parser::Parser::new(sql)
+            .parse_expression(crate::parser::precedence::Precedence::Lowest)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_pattern_known_when_compiled_compiles_as_its_literal() {
+        let columns = vec!["s".to_string()];
+        let params = [Value::text("a!%"), Value::text("^a")];
+        let known = CompileContext::with_global_registry(&columns).with_params(&params);
+        let plain = CompileContext::with_global_registry(&columns);
+        for (sql, literal) in [
+            ("s LIKE $1", "s LIKE 'a!%'"),
+            ("s NOT ILIKE $1", "s NOT ILIKE 'a!%'"),
+            ("s LIKE $1 ESCAPE '!'", "s LIKE 'a!%' ESCAPE '!'"),
+            ("s GLOB $1", "s GLOB 'a!%'"),
+            ("s REGEXP $2", "s REGEXP '^a'"),
+            ("s LIKE 'a' || '%'", "s LIKE 'a%'"),
+            ("s NOT GLOB UPPER('a*')", "s NOT GLOB 'A*'"),
+        ] {
+            let program = ExprCompiler::new(&known).compile(&parse(sql)).unwrap();
+            let twin = ExprCompiler::new(&plain).compile(&parse(literal)).unwrap();
+            assert_eq!(program.disassemble(), twin.disassemble(), "{sql}");
+        }
+        let program = ExprCompiler::new(&plain)
+            .compile(&parse("s LIKE $1"))
+            .unwrap();
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::LikeDynamic(false))),
+            "a parameter no execution holds is read when the program runs"
+        );
+    }
+
+    #[test]
+    fn a_value_read_as_the_column_type_is_read_once_when_known() {
+        let columns = vec!["a".to_string()];
+        let params = [Value::text("6")];
+        for (sql, ctx_params) in [("a = '6'", None), ("a = $1", Some(&params[..]))] {
+            let expr = parse(sql);
+            let Expression::Infix(infix) = &expr else {
+                panic!("{sql} is a comparison");
+            };
+            let mut read_as = FxHashMap::default();
+            read_as.insert(
+                &*infix.right as *const Expression as usize,
+                DataType::Integer,
+            );
+            let mut ctx = CompileContext::with_global_registry(&columns).with_read_as(&read_as);
+            if let Some(params) = ctx_params {
+                ctx = ctx.with_params(params);
+            }
+            let program = ExprCompiler::new(&ctx).compile(&expr).unwrap();
+            let twin_ctx = CompileContext::with_global_registry(&columns);
+            let twin = ExprCompiler::new(&twin_ctx)
+                .compile(&parse("a = 6"))
+                .unwrap();
+            assert_eq!(program.disassemble(), twin.disassemble(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_time_of_day_is_read_as_a_timestamp_when_the_program_runs() {
+        let columns = vec!["ts".to_string()];
+        for (sql, when_run) in [
+            ("ts = '12:00:00'", true),
+            ("ts IN ('12:00:00', '2024-01-15')", true),
+            ("ts = '2024-01-15 12:00:00'", false),
+            ("ts IN ('2024-01-15 12:00:00', '2024-01-15')", false),
+        ] {
+            let expr = parse(sql);
+            let mut read_as = FxHashMap::default();
+            let mut mark = |e: &Expression| {
+                read_as.insert(e as *const Expression as usize, DataType::Timestamp);
+            };
+            match &expr {
+                Expression::Infix(infix) => mark(&infix.right),
+                Expression::In(in_expr) => match &*in_expr.right {
+                    Expression::List(list) => list.elements.iter().for_each(&mut mark),
+                    Expression::ExpressionList(list) => list.expressions.iter().for_each(&mut mark),
+                    other => panic!("{sql}: a list, not {other:?}"),
+                },
+                other => panic!("{sql}: a comparison, not {other:?}"),
+            }
+            let ctx = CompileContext::with_global_registry(&columns).with_read_as(&read_as);
+            let program = ExprCompiler::new(&ctx).compile(&expr).unwrap();
+            let reads = program
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::ReadAsColumn(DataType::Timestamp)));
+            assert_eq!(reads, when_run, "{sql}: {}", program.disassemble());
         }
     }
 }
