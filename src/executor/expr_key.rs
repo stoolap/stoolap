@@ -125,8 +125,15 @@ impl KeyHasher {
 
     /// A name, whatever its case
     fn name(&mut self, name: &str) {
-        for c in name.chars().flat_map(char::to_lowercase) {
-            self.write_u32(c as u32);
+        // Lowered as a name's `value_lower` is: a whole-text rule, final sigma included
+        if name.is_ascii() {
+            for b in name.bytes() {
+                self.write_u32(u32::from(b.to_ascii_lowercase()));
+            }
+        } else {
+            for c in name.to_lowercase().chars() {
+                self.write_u32(c as u32);
+            }
         }
         self.write_u32(u32::MAX);
     }
@@ -608,6 +615,9 @@ mod tests {
     fn test_a_column_key_is_the_identifier_key() {
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
         assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
+        // Lowered as the name's value_lower is, a final sigma to its own letter
+        assert_eq!(ExprKey::column("ΟΣ"), select_key("\"ΟΣ\""));
+        assert_ne!(select_key("\"ΟΣ\""), select_key("\"οσ\""));
     }
 
     #[test]

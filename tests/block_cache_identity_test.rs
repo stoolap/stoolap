@@ -55,6 +55,12 @@ fn the_same_block_written_twice_is_kept_once_for_both() {
             "SELECT (SELECT b FROM \"q AS a\"), (SELECT b FROM q AS a) FROM q",
             ["30", "10"],
         ),
+        // A final sigma lowers to its own letter, as the resolver lowers the alias
+        (
+            "SELECT (SELECT 'x' AS \"ΟΣ\" FROM q WHERE \"οσ\" = 'οσ'), \
+             (SELECT 'x' AS \"οσ\" FROM q WHERE \"οσ\" = 'οσ') FROM q",
+            ["x", "NULL"],
+        ),
         (
             "SELECT (SELECT b FROM q AS a), (SELECT b FROM \"q AS a\") FROM q",
             ["10", "30"],
@@ -63,7 +69,11 @@ fn the_same_block_written_twice_is_kept_once_for_both() {
         let statement = db.prepare(sql).unwrap();
         for _ in 0..2 {
             let row = statement.query(()).unwrap().next().unwrap().unwrap();
-            let found = [0, 1].map(|i| row.get::<String>(i).unwrap());
+            let found = [0, 1].map(|i| {
+                row.get::<Option<String>>(i)
+                    .unwrap()
+                    .unwrap_or_else(|| "NULL".to_string())
+            });
             assert_eq!(found, want, "{sql}");
         }
     }
