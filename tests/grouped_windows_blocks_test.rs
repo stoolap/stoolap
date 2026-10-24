@@ -280,9 +280,19 @@ fn a_value_function_reads_an_expression_argument_for_each_row() {
 fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
     let db = Database::open("memory://grouped_windows_blocks_alias").unwrap();
     fill(&db);
-    let sql = "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT t.grp) DESC";
-    let twin = "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a DESC";
-    assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
+    for (sql, twin) in [
+        (
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT t.grp) DESC",
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a DESC",
+        ),
+        (
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a \
+             ORDER BY (SELECT \"t.grp\" + 0 * t.a), t.a DESC",
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a",
+        ),
+    ] {
+        assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
+    }
 }
 
 #[test]

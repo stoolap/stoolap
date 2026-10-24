@@ -5702,8 +5702,9 @@ fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<E
     combine_predicates_with_and(range).map(Box::new)
 }
 
-/// Whether a name anywhere in `expr`, its subqueries' clauses included, bare
-/// or as the column of a qualified name, passes `matches`
+/// Whether a name anywhere in `expr`, its subqueries' clauses included, bare,
+/// as the part after a dotted name's last dot or as the column of a qualified
+/// name, passes `matches`
 fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
     let statement = |sq: &SelectStatement| {
         sq.columns
@@ -5715,7 +5716,13 @@ fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
             .any(|e| names_anywhere(e, matches))
     };
     match expr {
-        Expression::Identifier(id) => matches(&id.value_lower),
+        Expression::Identifier(id) => {
+            matches(&id.value_lower)
+                || id
+                    .value_lower
+                    .rsplit_once('.')
+                    .is_some_and(|(_, column)| matches(column))
+        }
         Expression::QualifiedIdentifier(qid) => matches(&qid.name.value_lower),
         Expression::Aliased(aliased) => names_anywhere(&aliased.expression, matches),
         Expression::ScalarSubquery(sq) => statement(&sq.subquery),
