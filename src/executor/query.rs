@@ -6399,6 +6399,7 @@ impl Executor {
                             classification,
                             final_rows,
                             &all_columns,
+                            left_cols.len(),
                         );
                     } else if let Some(output) = held.as_deref().and_then(Option::as_ref) {
                         return output_result(output, final_rows, order_limit_applied);
@@ -7063,6 +7064,7 @@ impl Executor {
                 classification,
                 final_rows,
                 &final_columns,
+                left_columns.len(),
             );
         }
 
@@ -8737,9 +8739,11 @@ impl Executor {
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
-    /// A join's grouped output over its joined `rows` of `columns`: through
-    /// the grouped blocks when the statement belongs to their family, held
-    /// with the `plan`; else as any grouped statement groups its rows
+    /// A join's grouped output over its joined `rows` of `columns`, the first
+    /// `left_width` its left side's as read: through the grouped blocks when
+    /// the statement belongs to their family, held with the `plan`; else as
+    /// any grouped statement groups its rows
+    #[allow(clippy::too_many_arguments)]
     fn grouped_join_select(
         &self,
         plan: Option<&PreparedJoin>,
@@ -8748,6 +8752,7 @@ impl Executor {
         classification: &QueryClassification,
         rows: RowVec,
         columns: &[String],
+        left_width: usize,
     ) -> SelectResult {
         let in_family =
             classification.has_aggregation && classification.grouped_has_subqueries && {
@@ -8759,10 +8764,14 @@ impl Executor {
             let mut first = super::prepared_select::FirstReads::new();
             let mut build = || {
                 let mut leaves = Vec::new();
-                if let Some(join) = stmt.table_expr.as_deref() {
-                    self.join_leaves(join, ctx, &mut leaves);
+                let mut left_leaves = 0;
+                if let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() {
+                    self.join_leaves(&join.left, ctx, &mut leaves);
+                    left_leaves = leaves.len();
+                    self.join_leaves(&join.right, ctx, &mut leaves);
                 }
-                self.prepare_grouped_join(stmt, columns, &leaves, ctx, &mut first)
+                let sides = (left_leaves, left_width);
+                self.prepare_grouped_join(stmt, columns, (&leaves, sides), ctx, &mut first)
             };
             let held = match plan {
                 Some(plan) => plan.grouped_blocks(columns, ctx.params().len(), build)?,
@@ -8781,7 +8790,9 @@ impl Executor {
     }
 
     /// Each source the join `expr` reads, left to right, with its column
-    /// names when known before the join reads it: a table's, or a CTE's
+    /// names when known before the join reads it, a table's or a CTE's, and
+    /// their count, also known for a derived table selecting no star and a
+    /// VALUES list
     fn join_leaves(
         &self,
         expr: &Expression,
@@ -8802,11 +8813,24 @@ impl Executor {
             },
             _ => None,
         };
+        let width = match expr {
+            _ if columns.is_some() => columns.as_ref().map(Vec::len),
+            Expression::SubquerySource(ss) => {
+                let items = &ss.subquery.columns;
+                let star = |c: &Expression| {
+                    matches!(c, Expression::Star(_) | Expression::QualifiedStar(_))
+                };
+                (!items.iter().any(star)).then_some(items.len())
+            }
+            Expression::ValuesSource(values) => values.rows.first().map(Vec::len),
+            _ => None,
+        };
         leaves.push(super::prepared_select::JoinLeaf {
             name: get_table_alias_from_expr(expr)
                 .map(|name| name.to_lowercase())
                 .unwrap_or_default(),
             columns,
+            width,
         });
     }
 

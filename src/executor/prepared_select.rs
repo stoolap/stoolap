@@ -736,14 +736,18 @@ impl ScopeTable {
         })
     }
 
-    /// The joined row a join path lays out as `columns` from its `leaves`:
-    /// the one split of the columns, in leaf order, where each column spells
-    /// its leaf's name, a dot and its own name, and a leaf whose names are
-    /// known before the join reads it has those. Read by position as
-    /// `joined`'s are; None when no split or more than one fits
-    fn of_join_columns(columns: &[String], leaves: &[JoinLeaf]) -> Option<Self> {
+    /// The joined row a join path lays out as `columns` from its `leaves`,
+    /// the first `sides.0` of them read as its left side's `sides.1` columns:
+    /// the one split, in leaf order, where each column spells its leaf's
+    /// name, a dot and its own name, and a leaf has its known names and width.
+    /// Read by position as `joined`'s are; None when no split or several fit
+    fn of_join_columns(
+        columns: &[String],
+        leaves: &[JoinLeaf],
+        sides: (usize, usize),
+    ) -> Option<Self> {
         let (n, m) = (columns.len(), leaves.len());
-        if m < 2 {
+        if m < 2 || sides.0 == 0 || sides.0 >= m || sides.1 > n {
             return None;
         }
         let spelled: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
@@ -764,12 +768,20 @@ impl ScopeTable {
         let mut starts = vec![vec![0usize; n + 1]; m + 1];
         ways[0][0] = 1;
         for (i, leaf) in leaves.iter().enumerate() {
+            // The right side starts where the left side's columns, as read, end
+            if i == sides.0 {
+                for (end, reached) in ways[i].iter_mut().enumerate() {
+                    if end != sides.1 {
+                        *reached = 0;
+                    }
+                }
+            }
             for start in 0..n {
                 let reached = ways[i][start];
                 if reached == 0 {
                     continue;
                 }
-                let width = leaf.columns.as_ref().map(Vec::len);
+                let width = leaf.width;
                 let mut end = start;
                 while end < n && width.is_none_or(|w| end - start < w) {
                     if own(leaf, end - start, end).is_none() {
@@ -3909,31 +3921,35 @@ impl PreparedGrouped {
         // is the item naming it, and a column no item names cannot be read
         // Each item binds a column as the grouping binds it over the rows'
         // columns: a name by its lookup, an expression by the compiler's rule.
-        // A column two items bind is the first's, as the output reads it
+        // The output reads a column from the item naming it, ahead of one
+        // reaching it through an alias or position, the first of each
         let names = schema.column_names_arc();
         let name_index = build_column_index_map(&names);
         let names_ctx = CompileContext::new(&names, &executor.function_registry);
+        let group_items = executor.parse_group_by(stmt, &[])?;
+        let mut group_slots: Vec<String> = (0..group_items.len())
+            .map(|item| format!("\0group item {item}"))
+            .collect();
         let mut bound = vec![false; names.len()];
-        let group_slots: Vec<String> = executor
-            .parse_group_by(stmt, &[])?
-            .iter()
-            .enumerate()
-            .map(|(item, group)| {
+        for named in [true, false] {
+            for (item, group) in group_items.iter().enumerate() {
                 let column = match group {
-                    GroupByItem::Column(name) => {
+                    GroupByItem::Column(name) if named => {
                         Executor::lookup_column_index(&name.to_lowercase(), &name_index)
                     }
-                    GroupByItem::Expression { expr, .. } => names_ctx
+                    GroupByItem::Expression { expr, .. } if !named => names_ctx
                         .reference(expr)
                         .and_then(|reference| reference.row_column())
                         .map(usize::from),
+                    _ => None,
                 };
-                match column.filter(|&column| !std::mem::replace(&mut bound[column], true)) {
-                    Some(column) => scope.columns[column].clone(),
-                    None => format!("\0group item {item}"),
+                if let Some(column) =
+                    column.filter(|&column| !std::mem::replace(&mut bound[column], true))
+                {
+                    group_slots[item] = scope.columns[column].clone();
                 }
-            })
-            .collect();
+            }
+        }
         let slots_ctx = CompileContext::new(&group_slots, &executor.function_registry);
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
         for (id, sq) in blocks.subqueries.iter().enumerate() {
@@ -4160,18 +4176,18 @@ impl Executor {
     }
 
     /// A grouped join statement prepared over the joined `columns` its join
-    /// path laid out from its `leaves`, the views' rows preparing read going
-    /// to `first`; None when they do not line up or a block reads a column
-    /// outside its groups
+    /// path laid out from its `leaves` and `sides`, as `of_join_columns`
+    /// takes them, the views' rows preparing read going to `first`; None when
+    /// they do not line up or a block reads a column outside its groups
     pub(crate) fn prepare_grouped_join(
         &self,
         stmt: &SelectStatement,
         columns: &[String],
-        leaves: &[JoinLeaf],
+        (leaves, sides): (&[JoinLeaf], (usize, usize)),
         ctx: &ExecutionContext,
         first: &mut FirstReads,
     ) -> Result<Option<PreparedGrouped>> {
-        let Some(scope) = ScopeTable::of_join_columns(columns, leaves) else {
+        let Some(scope) = ScopeTable::of_join_columns(columns, leaves, sides) else {
             return Ok(None);
         };
         PreparedGrouped::prepare(
@@ -5989,10 +6005,12 @@ impl StatementSource<'_> {
 }
 
 /// One source a join reads: the name qualifying its columns, lowercase,
-/// and their names when known before the join reads it
+/// their names when known before the join reads it, and how many there are
+/// when that is known
 pub(crate) struct JoinLeaf {
     pub(crate) name: String,
     pub(crate) columns: Option<Vec<String>>,
+    pub(crate) width: Option<usize>,
 }
 
 /// A derived table's columns as its scope's schema: their names and no

@@ -632,7 +632,7 @@ fn a_join_scope_keeps_an_alias_another_alias_begins_with() {
 }
 
 #[test]
-fn a_rolled_up_item_naming_the_column_another_item_names_reads_the_first() {
+fn a_rolled_up_column_reads_the_cell_of_the_item_naming_it() {
     let _guard = serial();
     let db = Database::open("memory://grouped_sources_rollup_alias").unwrap();
     for sql in [
@@ -643,18 +643,30 @@ fn a_rolled_up_item_naming_the_column_another_item_names_reads_the_first() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    let mut want = rows(
-        &db,
-        "SELECT a AS g, COUNT(*), CASE WHEN a = 1 THEN 10 END FROM t GROUP BY ROLLUP(a, g)",
-    )
-    .unwrap();
-    want.sort();
-    let sql = "SELECT a AS g, COUNT(*), (SELECT MAX(u.x) FROM u WHERE u.k = t.a) FROM t \
-               GROUP BY ROLLUP(a, g)";
-    let mut got = rows(&db, sql).unwrap();
-    got.sort();
-    assert_eq!(got, want, "{sql}");
-    assert_eq!(prepared_line(&db, sql), "Prepared: yes");
+    // A subtotal reads a's cell, NULL where a rolled up and g did not
+    for (sets, tens) in [("ROLLUP(a, g)", 2), ("ROLLUP(g, a)", 1)] {
+        let mut want = rows(
+            &db,
+            &format!(
+                "SELECT a AS g, COUNT(*), CASE WHEN t.a = 1 THEN 10 END FROM t GROUP BY {sets}"
+            ),
+        )
+        .unwrap();
+        want.sort();
+        let sql = format!(
+            "SELECT a AS g, COUNT(*), (SELECT MAX(u.x) FROM u WHERE u.k = t.a) FROM t \
+             GROUP BY {sets}"
+        );
+        let mut got = rows(&db, &sql).unwrap();
+        got.sort();
+        assert_eq!(got, want, "{sql}");
+        let read = got
+            .iter()
+            .filter(|row| row.ends_with("Integer(10)"))
+            .count();
+        assert_eq!(read, tens, "{sql}: the rows whose a is 1");
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes");
+    }
 }
 
 #[test]
@@ -671,12 +683,23 @@ fn a_join_of_two_derived_tables_groups_by_a_subquery() {
     ] {
         db.execute(sql, ()).unwrap();
     }
+    db.execute("INSERT INTO s VALUES (1, 41)", ()).unwrap();
     let mut wrong = Vec::new();
     check(
         &db,
         "SELECT COUNT(*) FROM (SELECT id, k FROM l) a CROSS JOIN (SELECT id FROM r) b \
          GROUP BY (SELECT s.a FROM s WHERE s.id = a.k)",
         &["Integer(1)".to_string()],
+        GENERAL,
+        &mut wrong,
+    );
+    // Dotted names the text splits two ways; the join read its sides apart
+    check(
+        &db,
+        "SELECT MAX(\"a.b\".id), (SELECT s.a FROM s WHERE s.id = a.id) \
+         FROM (SELECT id, k AS \"b.k\" FROM l) a CROSS JOIN (SELECT id FROM r) \"a.b\" \
+         GROUP BY (SELECT s.a FROM s WHERE s.id = a.id)",
+        &["Integer(1)|Integer(41)".to_string()],
         GENERAL,
         &mut wrong,
     );
