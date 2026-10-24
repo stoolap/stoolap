@@ -375,6 +375,31 @@ fn a_statement_differing_only_inside_a_call_or_a_grouping_set_classifies_alone()
 }
 
 #[test]
+fn a_where_set_raises_its_error_only_for_a_row_that_reaches_it() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_where_error").unwrap();
+    fill(&db);
+    let set = "(SELECT 9223372036854775807 + u.x FROM u)";
+    for (sql, fails) in [
+        (
+            format!("SELECT COUNT(*) FROM t WHERE FALSE AND t.a IN {set}"),
+            false,
+        ),
+        (
+            format!("SELECT COUNT(*) FROM t WHERE t.b = 99 AND t.a IN {set}"),
+            false,
+        ),
+        (
+            format!("SELECT t.a, COUNT(*) FROM t WHERE TRUE OR t.a IN {set} GROUP BY t.a"),
+            false,
+        ),
+        (format!("SELECT COUNT(*) FROM t WHERE t.a IN {set}"), true),
+    ] {
+        assert_eq!(rows(&db, &sql).is_err(), fails, "{sql}");
+    }
+}
+
+#[test]
 fn an_argument_read_once_that_reads_the_row_is_an_error() {
     let _guard = serial();
     let db = Database::open("memory://grouped_windows_blocks_row_argument").unwrap();

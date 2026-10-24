@@ -4116,7 +4116,8 @@ pub struct PreparedGrouped {
     /// Each block's holes: an input block's read from the row it is asked
     /// of, any other's from the GROUP BY items of its group's row
     holes: HoleSet,
-    /// The uncorrelated member blocks it reads, read before any row
+    /// The uncorrelated member blocks past its WHERE, read before any row;
+    /// the WHERE's are read by the first row that reaches them
     ahead: Vec<u16>,
     /// A WHERE holding subqueries, which the table's rows pass before they group
     where_: Option<PreparedWhere>,
@@ -4291,6 +4292,8 @@ impl PreparedGrouped {
             }
             _ => None,
         };
+        // The WHERE's blocks come first; a row that reaches one reads it
+        let where_blocks = builder.subqueries.len();
         let opened_having = match stmt.having.as_deref() {
             Some(having) if mentions_subquery(having) => {
                 Some(grouped_having(executor, stmt, having)?)
@@ -4555,7 +4558,7 @@ impl PreparedGrouped {
             }
             holes.push(grouped);
         }
-        let ahead = (0..blocks_read)
+        let ahead = (where_blocks..blocks_read)
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
                 sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
