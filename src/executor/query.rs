@@ -1946,7 +1946,7 @@ impl Executor {
     /// appended as a hidden item named by its identity, when the aggregation
     /// or window path computes its rows: a key is then computed where its row
     /// is, reading groups, aggregates and windows as a SELECT item does
-    fn with_distinct_on_items(
+    pub(crate) fn with_distinct_on_items(
         stmt: &SelectStatement,
         classification: &QueryClassification,
     ) -> Option<SelectStatement> {

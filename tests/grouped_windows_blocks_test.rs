@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A statement with window functions, or a grouped one with an ORDER BY
-//! holding subqueries, runs them through prepared blocks over any source:
-//! it answers as its twin written without them
+//! A statement with window functions, or a grouped one with an ORDER BY or
+//! a DISTINCT ON holding subqueries, runs them through prepared blocks over
+//! any source: it answers as its twin written without them
 
 #![cfg(feature = "test-failpoints")]
 
@@ -159,6 +159,23 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, COUNT(*) FROM {t} GROUP BY t.a \
              ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), t.a",
             "SELECT t.a, COUNT(*) FROM t GROUP BY t.a ORDER BY {count}, t.a",
+        ),
+        // A DISTINCT ON
+        shape(
+            "SELECT DISTINCT ON (t.a % 2 + (SELECT MIN(u.x) FROM u)) t.a, COUNT(*) FROM {t} \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT DISTINCT ON (t.a % 2) t.a, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT DISTINCT ON ((SELECT COUNT(*) FROM u WHERE u.k = t.a)) t.a FROM {t} \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT DISTINCT ON ({count}) t.a FROM t GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT DISTINCT ON ((SELECT COUNT(*) FROM u WHERE u.k = t.a)) t.id, \
+             ROW_NUMBER() OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT DISTINCT ON ({count}) t.id, ROW_NUMBER() OVER (ORDER BY t.id) FROM t \
+             ORDER BY t.id",
         ),
     ]
 }
