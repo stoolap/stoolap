@@ -4078,6 +4078,26 @@ impl PreparedProjection {
             .any(|o| matches!(o, Output::Program(_) | Output::Block(_)))
     }
 
+    /// Whether no ORDER BY key is computed apart from the SELECT items
+    fn keys_are_items(&self) -> bool {
+        !self
+            .outputs
+            .iter()
+            .any(|o| matches!(o, Output::Key(_) | Output::AliasKey(..)))
+    }
+
+    /// The source row's column the output at `position` holds as it is
+    fn source_column(&self, position: usize) -> Option<usize> {
+        match self.outputs.get(position)? {
+            Output::Column(column) => Some(*column),
+            Output::Copy(item) => match self.outputs.get(*item)? {
+                Output::Column(column) => Some(*column),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The output of the rows `order` keeps past `offset`, at most `limit`:
     /// the keys and the SELECT items they read are computed for every row,
     /// any other computed item only for a row kept, so it and its blocks
@@ -6974,10 +6994,11 @@ impl Executor {
         // With an ORDER BY a SELECT item is computed for the rows LIMIT and
         // OFFSET keep, once the sort chose them by the columns the general
         // sort reads
+        let projection = &prepared.projection;
         let order = (!read_in_order
             && !stmt.order_by.is_empty()
             && (limit.is_some() || offset > 0)
-            && prepared.projection.defers())
+            && ((limit.is_some() && projection.keys_are_items()) || projection.defers()))
         .then(|| {
             let layout = prepared.layout.as_deref();
             let (mapped, _) = self.order_by_columns(stmt, &output_columns, layout, false);
@@ -6988,17 +7009,33 @@ impl Executor {
                 .collect::<Option<Vec<_>>>()
         })
         .flatten();
+        // Keys that are source columns choose the rows before any is projected
+        let source = |column: Option<usize>| column.and_then(|c| projection.source_column(c));
+        let source_order = limit
+            .and(order.as_ref())
+            .filter(|order| order.iter().all(|&(column, ..)| source(column).is_some()))
+            .map(|order| {
+                order
+                    .iter()
+                    .map(|&(column, ascending, nulls_first)| {
+                        (source(column), ascending, nulls_first)
+                    })
+                    .collect::<Vec<_>>()
+            });
+        if let (Some(source_order), Some(limit)) = (source_order, limit) {
+            rows = top_rows(rows, source_order, limit, offset)?;
+            limit_applied = true;
+        }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_projection_ran();
         // The output's blocks are asked of these rows, not of the table's
         runner.ask_rows(Some(rows.len()));
-        let rows = match order {
+        let rows = match order.filter(|_| !limit_applied && projection.defers()) {
             Some(order) => {
                 limit_applied = true;
-                let projection = &prepared.projection;
                 projection.project_first(rows, &runner, order, limit, offset)?
             }
-            None => prepared.projection.project(rows, &runner)?,
+            None => projection.project(rows, &runner)?,
         };
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), rows);
         Ok((
@@ -7010,6 +7047,28 @@ impl Executor {
             false,
         ))
     }
+}
+
+/// The rows past `offset`, at most `limit`, in `order` over their own
+/// columns: the general sort's top-N, so ties keep the rows it keeps
+fn top_rows(
+    rows: RowVec,
+    order: Vec<(Option<usize>, bool, Option<bool>)>,
+    limit: usize,
+    offset: usize,
+) -> Result<RowVec> {
+    use crate::storage::traits::QueryResult;
+    let mut sorted = super::result::TopNResult::new(
+        Box::new(ExecutorResult::new(Vec::new(), rows)),
+        move |a, b| Executor::compare_rows_with_indices(a, b, &order),
+        limit,
+        offset,
+    )?;
+    let mut kept = RowVec::with_capacity(limit.min(64));
+    while sorted.next() {
+        kept.push((kept.len() as i64, sorted.take_row()));
+    }
+    Ok(kept)
 }
 
 /// A row a source hands the runner: its own, or one it lends, copied only
