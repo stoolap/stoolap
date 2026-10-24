@@ -1163,49 +1163,46 @@ impl Chain<'_> {
 /// passes `matches`: an aggregate's after its first, a window function's
 /// after its first (each of NTILE's), and a frame offset
 fn constant_args_any(expr: &Expression, matches: &impl Fn(&Expression) -> bool) -> bool {
-    let (inputs, constants): (Vec<&Expression>, Vec<&Expression>) = match expr {
-        Expression::ScalarSubquery(_) | Expression::Exists(_) => return false,
+    let within = |input: &Expression| constant_args_any(input, matches);
+    match expr {
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => false,
         Expression::Window(window) => {
             let call = &window.function;
             let first = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
-            let inputs = call.arguments[..first.min(call.arguments.len())]
-                .iter()
-                .chain(call.filter.as_deref())
-                .chain(call.order_by.iter().map(|o| &o.expression))
-                .chain(&window.partition_by)
-                .chain(window.order_by.iter().map(|o| &o.expression))
-                .collect();
-            let constants = call
-                .arguments
+            call.arguments
                 .iter()
                 .skip(first)
                 .chain(window.frame_offsets())
-                .collect();
-            (inputs, constants)
+                .any(matches)
+                || call
+                    .arguments
+                    .iter()
+                    .take(first)
+                    .chain(call.filter.as_deref())
+                    .chain(call.order_by.iter().map(|o| &o.expression))
+                    .chain(&window.partition_by)
+                    .chain(window.order_by.iter().map(|o| &o.expression))
+                    .any(within)
         }
         Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
-            let inputs = call
-                .arguments
-                .iter()
-                .take(1)
-                .chain(call.filter.as_deref())
-                .chain(call.order_by.iter().map(|o| &o.expression))
-                .collect();
-            (inputs, call.arguments.iter().skip(1).collect())
+            call.arguments.iter().skip(1).any(matches)
+                || call
+                    .arguments
+                    .iter()
+                    .take(1)
+                    .chain(call.filter.as_deref())
+                    .chain(call.order_by.iter().map(|o| &o.expression))
+                    .any(within)
         }
         other => {
             let mut found = false;
             let _ = for_each_child(other, &mut |child| {
-                found |= constant_args_any(child, matches);
+                found |= within(child);
                 Ok(())
             });
-            return found;
+            found
         }
-    };
-    constants.into_iter().any(matches)
-        || inputs
-            .into_iter()
-            .any(|input| constant_args_any(input, matches))
+    }
 }
 
 /// Each direct operand of an expression of the family's forms
@@ -4577,10 +4574,12 @@ impl PreparedGrouped {
         .then(|| RwLock::new(CompiledExecution::Unknown));
         // An argument read once for its call holds only run slots: one reading
         // the row is the general path's to refuse
+        // The ORDER BY keys a hidden item computes count with the list
         let constants = |stmt: &SelectStatement, matches: &dyn Fn(&Expression) -> bool| {
             stmt.columns
                 .iter()
                 .chain(stmt.having.as_deref())
+                .chain(stmt.order_by.iter().map(|ob| &ob.expression))
                 .any(|e| constant_args_any(e, &matches))
         };
         if constants(&stmt, &mentions_subquery) {

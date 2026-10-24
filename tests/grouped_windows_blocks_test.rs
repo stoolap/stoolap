@@ -200,6 +200,13 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.b, t.id), {count} FROM t \
              GROUP BY t.a ORDER BY t.a",
         ),
+        shape(
+            "SELECT t.a, (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM {t} GROUP BY t.a \
+             ORDER BY STRING_AGG(CAST(t.b AS TEXT), CAST((SELECT MIN(u.x) FROM u) AS TEXT) \
+             ORDER BY t.b, t.id), t.a",
+            "SELECT t.a, {count} FROM t GROUP BY t.a \
+             ORDER BY STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.b, t.id), t.a",
+        ),
         // A DISTINCT ON
         shape(
             "SELECT DISTINCT ON (t.a % 2 + (SELECT MIN(u.x) FROM u)) t.a, COUNT(*) FROM {t} \
