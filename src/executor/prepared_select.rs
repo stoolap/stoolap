@@ -403,13 +403,10 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if !block_clauses(sq)
-            || !sq.order_by.is_empty()
-            || sq.limit.is_some()
-            || sq.offset.is_some()
-        {
+        if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
+        self.order(sq, scopes)?;
         self.block_from(sq.table_expr.as_deref())?;
         let [column] = sq.columns.as_slice() else {
             return Err("a subquery block without exactly one SELECT expression");
@@ -427,6 +424,39 @@ impl<'a> Family<'a> {
             }
             None => Ok(()),
         }
+    }
+
+    /// A block's ORDER BY, LIMIT and OFFSET: its counts literals or
+    /// parameters, its keys values over its row and the enclosing ones; a
+    /// block that groups holds none of them
+    fn order(
+        &self,
+        sq: &'a SelectStatement,
+        scopes: usize,
+    ) -> std::result::Result<(), OutOfFamily> {
+        if sq.order_by.is_empty() && sq.limit.is_none() && sq.offset.is_none() {
+            return Ok(());
+        }
+        if grouped_block(sq) {
+            return Err("a grouped subquery block with ORDER BY, LIMIT or OFFSET");
+        }
+        let counts = [sq.limit.as_deref(), sq.offset.as_deref()];
+        if counts.into_iter().flatten().any(|count| {
+            !matches!(
+                count,
+                Expression::IntegerLiteral(_) | Expression::Parameter(_)
+            )
+        }) {
+            return Err("a subquery block's LIMIT or OFFSET that is not a literal or a parameter");
+        }
+        let mut found = false;
+        for ob in &sq.order_by {
+            if matches!(ob.expression, Expression::IntegerLiteral(_)) {
+                return Err("an ORDER BY position in a subquery block");
+            }
+            self.expression(&ob.expression, scopes, Site::Values, &mut found)?;
+        }
+        Ok(())
     }
 
     /// A grouped block's GROUP BY items read values; its HAVING aggregates
@@ -493,13 +523,10 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if !block_clauses(sq)
-            || !sq.order_by.is_empty()
-            || sq.limit.is_some()
-            || sq.offset.is_some()
-        {
+        if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
+        self.order(sq, scopes)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
         for column in &sq.columns {
@@ -1999,6 +2026,8 @@ struct PreparedSubquery {
     answer: Answer,
     /// A block that aggregates: its answer reads the slot rows of its groups
     grouping: Option<Box<Grouping>>,
+    /// A LIMIT or OFFSET, which choose the rows the block answers from
+    order: Option<Box<BlockOrder>>,
     /// The subquery whose row this one runs for; None for the statement's row
     parent: Option<u16>,
     /// What fills each slot from the parent's row, including values a
@@ -2014,6 +2043,60 @@ struct PreparedSubquery {
     /// Reads no enclosing scope: its value is computed once per run
     uncorrelated: bool,
 }
+
+/// A block's LIMIT and OFFSET over the rows its WHERE passes, in the order
+/// of its ORDER BY; an EXISTS keeps no keys, its answer the count alone
+#[derive(Debug)]
+struct BlockOrder {
+    /// Each key over the block's row, its direction and its NULLS clause
+    keys: Vec<(SharedProgram, bool, Option<bool>)>,
+    limit: Option<SharedProgram>,
+    offset: Option<SharedProgram>,
+}
+
+impl BlockOrder {
+    /// The order of two rows' key values
+    fn compare(&self, a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+        self.keys
+            .iter()
+            .zip(a.iter().zip(b))
+            .map(|((_, ascending, nulls), (a, b))| {
+                crate::core::value::compare_order_key(Some(a), Some(b), *ascending, *nulls)
+            })
+            .find(|ordering| ordering.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// A row a block's LIMIT may keep: by its keys, then by when it was read
+struct HeldRow<'o> {
+    keys: SmallVec<[Value; 2]>,
+    read: usize,
+    row: Row,
+    order: &'o BlockOrder,
+}
+
+impl Ord for HeldRow<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order
+            .compare(&self.keys, &other.keys)
+            .then(self.read.cmp(&other.read))
+    }
+}
+
+impl PartialOrd for HeldRow<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for HeldRow<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for HeldRow<'_> {}
 
 impl PreparedSubquery {
     /// Whether the block may read `table`: its own table, or one its view's
@@ -3102,6 +3185,21 @@ impl Builder<'_> {
         }
         let candidates = conjunction(key_parts);
         let filter = conjunction(rest);
+        // A LIMIT or OFFSET chooses the rows the block answers from, by its
+        // ORDER BY, whose keys read the block's row and enclosing values as
+        // its WHERE does; an EXISTS needs the count alone
+        let cut = sq.limit.is_some() || sq.offset.is_some();
+        let mut order_keys = Vec::new();
+        if cut && !matches!(form, Form::Exists(_)) {
+            for ob in &sq.order_by {
+                let key = with_aliases(&ob.expression, &sq.columns, &scope.columns);
+                let key = self.rewrite(&chain, Some(id), &key, &mut work)?;
+                order_keys.push((key, ob.ascending, ob.nulls_first));
+            }
+        }
+        for count in sq.limit.iter().chain(&sq.offset) {
+            self.note_params(count);
+        }
         let grouped = if grouped_block(sq) {
             let exists = matches!(form, Form::Exists(_));
             Some(self.grouping(&chain, id, sq, projection.as_ref(), exists, &mut work)?)
@@ -3151,9 +3249,12 @@ impl Builder<'_> {
         if let Some(grouped) = &grouped {
             others.extend(grouped.reads.iter().copied());
         }
-        let keyed =
-            (keyed_test && grouped.is_none() && self.keyed(&chain, &keys, &work, sq, &others))
-                .then(|| keyed_plan(&chain, &keys, filter.as_ref(), &schema));
+        // A keyed set holds every row of a key, which a LIMIT or OFFSET cuts
+        let keyed = (keyed_test
+            && grouped.is_none()
+            && !cut
+            && self.keyed(&chain, &keys, &work, sq, &others))
+        .then(|| keyed_plan(&chain, &keys, filter.as_ref(), &schema));
         // What the block answers and how its members are read is part of what is kept
         let mut scopes = signature;
         for scope in outer {
@@ -3188,7 +3289,14 @@ impl Builder<'_> {
             Form::Exists(_) => Answer::Exists(kept),
         };
         let mut reads = SmallVec::new();
-        for expr in projection.iter().chain(&candidates).chain(&filter) {
+        let counts = sq.limit.iter().chain(&sq.offset).map(|count| &**count);
+        for expr in projection
+            .iter()
+            .chain(&candidates)
+            .chain(&filter)
+            .chain(order_keys.iter().map(|(key, ..)| key))
+            .chain(counts)
+        {
             slots_read(expr, &mut reads);
         }
         let grouping = match grouped {
@@ -3210,6 +3318,24 @@ impl Builder<'_> {
             None => None,
         };
         let candidates = compile(&candidates)?;
+        let order = match cut {
+            true => {
+                let count = |count: &Option<Box<Expression>>| {
+                    count.as_deref().map(|c| compile_with(&own, c)).transpose()
+                };
+                Some(Box::new(BlockOrder {
+                    keys: order_keys
+                        .iter()
+                        .map(|(key, ascending, nulls)| {
+                            compile_with(&own, key).map(|p| (p, *ascending, *nulls))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    limit: count(&sq.limit)?,
+                    offset: count(&sq.offset)?,
+                }))
+            }
+            false => None,
+        };
         let mut rest = Vec::new();
         if let (true, Some(filter)) = (picks, &filter) {
             let mut parts = Vec::new();
@@ -3275,6 +3401,7 @@ impl Builder<'_> {
             reads,
             answer,
             grouping,
+            order,
             parent,
             holes,
             hole_exprs,
@@ -7567,8 +7694,8 @@ impl<'a> PreparedRunner<'a> {
             }
         }
         // A failed slot its nested blocks read is theirs to raise; a block
-        // that aggregates reads every candidate, so it raises its own
-        if sq.grouping.is_none() && !matches!(sq.answer, Answer::Value(..)) {
+        // that aggregates or cuts its rows by a LIMIT or OFFSET raises its own
+        if sq.grouping.is_none() && sq.order.is_none() && !matches!(sq.answer, Answer::Value(..)) {
             return Ok(());
         }
         match failed.iter().find(|(slot, _)| sq.reads.contains(slot)) {
@@ -7620,6 +7747,9 @@ impl<'a> PreparedRunner<'a> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_exists_probed();
         let sq = &self.prepared.subqueries[index];
+        if let Some(order) = &sq.order {
+            return Ok(!self.cut_rows(index, order)?.is_empty());
+        }
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
@@ -8058,6 +8188,9 @@ impl PreparedRunner<'_> {
             }
             return Ok(values.pop().unwrap_or_else(Value::null_unknown));
         }
+        if let Some(order) = &sq.order {
+            return self.cut_value(index, order, projection, caller, site);
+        }
         let mut vm = self.blocks[index].vm.borrow_mut();
         self.fill(index, &mut vm, caller, site)?;
         // Read-only from here on: a nested subquery copies these values
@@ -8140,6 +8273,125 @@ impl PreparedRunner<'_> {
             .with_subquery_executor(self);
         *value = Some(vm.execute(projection, &exec)?);
         Ok(())
+    }
+
+    /// [`Self::scalar_value`] of a block with a LIMIT or OFFSET
+    #[inline(never)]
+    fn cut_value(
+        &self,
+        index: usize,
+        order: &BlockOrder,
+        projection: &SharedProgram,
+        caller: &ExecuteContext,
+        site: &HoleSet,
+    ) -> Result<Value> {
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
+        let rows = self.cut_rows(index, order)?;
+        let mut vm = self.blocks[index].vm.borrow_mut();
+        let params = self.blocks[index].buffer.borrow();
+        let mut value = None;
+        for row in &rows {
+            self.take_one(&mut vm, projection, row, &params, &mut value)?;
+        }
+        Ok(value.unwrap_or_else(Value::null_unknown))
+    }
+
+    /// The rows block `index` answers from for the buffer filled: those its
+    /// WHERE passes in its ORDER BY, a tie in the order read, past its
+    /// OFFSET and up to its LIMIT. A candidate's error is the block's
+    fn cut_rows(&self, index: usize, order: &BlockOrder) -> Result<Vec<Row>> {
+        self.ctx.check_cancelled()?;
+        let sq = &self.prepared.subqueries[index];
+        let mut vm = self.blocks[index].vm.borrow_mut();
+        let params = self.blocks[index].buffer.borrow();
+        let slots_failed = self.blocks[index].failed.borrow();
+        let empty = Row::new();
+        let none = ExecuteContext::with_common_params(&empty, &params, self.transaction_id);
+        let mut count = |program: &Option<SharedProgram>, clause| {
+            program
+                .as_ref()
+                .map(|program| super::row_count::count_of(vm.execute(program, &none)?, clause))
+                .transpose()
+        };
+        let limit = count(&order.limit, "LIMIT")?;
+        let offset = count(&order.offset, "OFFSET")?.unwrap_or(0);
+        let keep = limit.map_or(usize::MAX, |limit| limit.saturating_add(offset));
+        if keep == 0 {
+            return Ok(Vec::new());
+        }
+        let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
+        let mut scanner = if pushed {
+            let bound = self.blocks[index].bound.borrow();
+            self.point_or_scan(index, bound.as_ref().map(BoundPushdown::expr))?
+        } else {
+            self.scan(index, None)?
+        };
+        let decided = pushed && sq.pushed_whole;
+        let mut kept = Vec::new();
+        // The worst row held on top, which a better one replaces
+        let mut held = std::collections::BinaryHeap::new();
+        let (mut passed, mut scanned) = (0usize, 0u64);
+        while scanner.next() {
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            let row = scanner.row();
+            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                .with_subquery_executor(self);
+            if !decided {
+                if let Some(candidates) = &sq.candidates {
+                    if !vm.execute_bool_checked(candidates, &exec)? {
+                        continue;
+                    }
+                }
+                if !self.passes_rest(sq, &mut vm, &exec, &slots_failed)? {
+                    continue;
+                }
+            }
+            passed += 1;
+            // Without keys the rows come in the order read: OFFSET's are passed
+            if order.keys.is_empty() {
+                if passed > offset {
+                    kept.push(row.clone());
+                }
+                if passed == keep {
+                    break;
+                }
+                continue;
+            }
+            let mut keys = SmallVec::new();
+            for (key, ..) in &order.keys {
+                keys.push(vm.execute(key, &exec)?);
+            }
+            if held.len() < keep {
+                let row = row.clone();
+                held.push(HeldRow {
+                    keys,
+                    read: passed,
+                    row,
+                    order,
+                });
+            } else if let Some(mut worst) = held.peek_mut() {
+                if order.compare(&keys, &worst.keys).is_lt() {
+                    let row = row.clone();
+                    *worst = HeldRow {
+                        keys,
+                        read: passed,
+                        row,
+                        order,
+                    };
+                }
+            }
+        }
+        if let Some(err) = scanner.err() {
+            return Err(err.clone());
+        }
+        if order.keys.is_empty() {
+            return Ok(kept);
+        }
+        let held = held.into_sorted_vec().into_iter().skip(offset);
+        Ok(held.map(|held| held.row).collect())
     }
 
     fn exists_answer(&self, index: usize, caller: &ExecuteContext, site: &HoleSet) -> Result<bool> {
@@ -8438,6 +8690,20 @@ impl PreparedRunner<'_> {
             crate::test_failpoints::in_subquery_ran();
         }
         let sq = &self.prepared.subqueries[index];
+        if let Some(order) = &sq.order {
+            let rows = self.cut_rows(index, order)?;
+            let mut vm = self.blocks[index].vm.borrow_mut();
+            let params = self.blocks[index].buffer.borrow();
+            let mut fold = MemberFold::new(members.test);
+            for row in &rows {
+                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                    .with_subquery_executor(self);
+                if let Some(answer) = fold.member(value, self.member(members, &mut vm, &exec))? {
+                    return Ok(Some(answer));
+                }
+            }
+            return fold.finish();
+        }
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
@@ -8553,6 +8819,24 @@ impl PreparedRunner<'_> {
             crate::test_failpoints::in_subquery_ran();
         }
         let sq = &self.prepared.subqueries[index];
+        if let Some(order) = &sq.order {
+            let rows = self.cut_rows(index, order)?;
+            let mut vm = self.blocks[index].vm.borrow_mut();
+            let params = self.blocks[index].buffer.borrow();
+            let (mut values, mut failed) = (Vec::with_capacity(rows.len()), None);
+            for row in &rows {
+                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                    .with_subquery_executor(self);
+                match self.member(members, &mut vm, &exec) {
+                    Ok(member) => values.push(member),
+                    Err(e) => {
+                        failed.get_or_insert(deferred(e)?);
+                    }
+                }
+            }
+            let set = member_set(members.test, values, true);
+            return Ok(std::iter::once((SmallVec::new(), KeptMembers { set, failed })).collect());
+        }
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
