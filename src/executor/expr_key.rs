@@ -125,31 +125,8 @@ impl KeyHasher {
 
     /// A name, whatever its case
     fn name(&mut self, name: &str) {
-        // Lowered as a name's `value_lower` is: a whole-text rule, final sigma included
-        if name.is_ascii() {
-            for b in name.bytes() {
-                self.write_u32(u32::from(b.to_ascii_lowercase()));
-            }
-        } else {
-            for c in name.to_lowercase().chars() {
-                self.write_u32(c as u32);
-            }
-        }
-        self.write_u32(u32::MAX);
-    }
-
-    /// The name `qualifier.name`, lowered as one text as [`Self::name`] lowers
-    /// the dotted name a GROUP BY keeps, which a lowering by parts can miss
-    fn dotted_name(&mut self, qualifier: &str, name: &str) {
-        if !(qualifier.is_ascii() && name.is_ascii()) {
-            return self.name(&format!("{qualifier}.{name}"));
-        }
-        for b in qualifier
-            .bytes()
-            .chain(std::iter::once(b'.'))
-            .chain(name.bytes())
-        {
-            self.write_u32(u32::from(b.to_ascii_lowercase()));
+        for c in name.chars().flat_map(char::to_lowercase) {
+            self.write_u32(c as u32);
         }
         self.write_u32(u32::MAX);
     }
@@ -252,7 +229,17 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
         // A GROUP BY keeps a qualified column as its dotted name
         Expression::QualifiedIdentifier(qid) => {
             hasher.tag(b'I');
-            hasher.dotted_name(&qid.qualifier.value, &qid.name.value);
+            for c in qid
+                .qualifier
+                .value_lower
+                .chars()
+                .chain(std::iter::once('.'))
+                .chain(qid.name.value_lower.chars())
+                .flat_map(char::to_lowercase)
+            {
+                hasher.write_u32(c as u32);
+            }
+            hasher.write_u32(u32::MAX);
         }
         Expression::IntegerLiteral(lit) => {
             hasher.tag(b'N');
@@ -430,7 +417,8 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
         match column {
             Expression::Aliased(aliased) => {
                 hasher.tag(b'a');
-                hasher.name(&aliased.alias.value);
+                // A name as the resolver reads it, which per letter lowering keeps
+                hasher.name(&aliased.alias.value_lower);
                 write_expr(&aliased.expression, hasher);
             }
             column => write_expr(column, hasher),
@@ -441,10 +429,10 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
         hasher.flag(with.is_recursive);
         hasher.write_usize(with.ctes.len());
         for cte in &with.ctes {
-            hasher.name(&cte.name.value);
+            hasher.name(&cte.name.value_lower);
             hasher.write_usize(cte.column_names.len());
             for column in &cte.column_names {
-                hasher.name(&column.value);
+                hasher.name(&column.value_lower);
             }
             write_statement(&cte.query, hasher);
         }
@@ -492,11 +480,11 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
 fn write_names(alias: Option<&Identifier>, columns: &[Identifier], hasher: &mut KeyHasher) {
     hasher.flag(alias.is_some());
     if let Some(alias) = alias {
-        hasher.name(&alias.value);
+        hasher.name(&alias.value_lower);
     }
     hasher.write_usize(columns.len());
     for column in columns {
-        hasher.name(&column.value);
+        hasher.name(&column.value_lower);
     }
 }
 
@@ -507,7 +495,7 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b's');
             hasher.flag(sub.alias.is_some());
             if let Some(alias) = &sub.alias {
-                hasher.name(&alias.value);
+                hasher.name(&alias.value_lower);
             }
             write_statement(&sub.subquery, hasher);
         }
@@ -519,7 +507,7 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             write_optional(join.condition.as_deref(), hasher);
             hasher.write_usize(join.using_columns.len());
             for column in &join.using_columns {
-                hasher.name(&column.value);
+                hasher.name(&column.value_lower);
             }
         }
         Expression::ValuesSource(values) => {
@@ -621,12 +609,18 @@ mod tests {
     fn test_a_column_key_is_the_identifier_key() {
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
         assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
-        // Lowered as the name's value_lower is, a final sigma to its own letter
-        assert_eq!(ExprKey::column("ΟΣ"), select_key("\"ΟΣ\""));
-        // A qualified column as the dotted name a GROUP BY keeps for it
         assert_eq!(ExprKey::column("a.Σ"), select_key("a.\"Σ\""));
-        assert_eq!(ExprKey::column("ΑΣ.b"), select_key("\"ΑΣ\".b"));
+        // A name as the resolver lowers it, a final sigma to its own letter
         assert_ne!(select_key("\"ΟΣ\""), select_key("\"οσ\""));
+        assert_ne!(
+            select_key("(SELECT v AS \"ΟΣ\" FROM u)"),
+            select_key("(SELECT v AS \"οσ\" FROM u)")
+        );
+        // A qualified column's parts lowered each as the resolver lowers them
+        assert_ne!(
+            select_key("SUM(a.\"Σ\" * 2)"),
+            select_key("SUM(a.\"ς\" * 2)")
+        );
     }
 
     #[test]
