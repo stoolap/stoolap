@@ -230,7 +230,7 @@ impl QueryClassification {
             .iter()
             .chain(stmt.having.as_deref())
             .chain(&stmt.group_by.columns)
-            .chain(super::aggregation::grouping_items(stmt))
+            .chain(grouping_set_items(stmt))
             .any(super::Executor::has_subqueries);
         let output_has_subqueries = stmt
             .columns
@@ -1369,7 +1369,15 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
     }
 }
 
-/// Hash the structural elements of an expression (discriminants, not values)
+/// Each item of `stmt`'s grouping sets, as written, none without them
+fn grouping_set_items(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
+    let sets: &[Vec<Expression>] = match &stmt.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets,
+        _ => &[],
+    };
+    sets.iter().flatten()
+}
+
 /// Hash a call's name case-insensitively, without allocating, and every
 /// part of it the classifier reads: its arguments, FILTER and ORDER BY
 fn hash_call_structure<H: std::hash::Hasher>(func: &FunctionCall, hasher: &mut H) {
@@ -1389,6 +1397,7 @@ fn hash_call_structure<H: std::hash::Hasher>(func: &FunctionCall, hasher: &mut H
     }
 }
 
+/// Hash the structural elements of an expression (discriminants, not values)
 fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     std::mem::discriminant(expr).hash(hasher);
 
