@@ -7010,15 +7010,18 @@ impl Executor {
         })
         .flatten();
         // Keys that are source columns choose the rows before any is projected
-        let source_order = order.as_ref().and_then(|order| {
-            order
-                .iter()
-                .map(|&(column, ascending, nulls_first)| {
-                    let column = projection.source_column(column?)?;
-                    Some((Some(column), ascending, nulls_first))
-                })
-                .collect::<Option<Vec<_>>>()
-        });
+        let source = |column: Option<usize>| column.and_then(|c| projection.source_column(c));
+        let source_order = limit
+            .and(order.as_ref())
+            .filter(|order| order.iter().all(|&(column, ..)| source(column).is_some()))
+            .map(|order| {
+                order
+                    .iter()
+                    .map(|&(column, ascending, nulls_first)| {
+                        (source(column), ascending, nulls_first)
+                    })
+                    .collect::<Vec<_>>()
+            });
         if let (Some(source_order), Some(limit)) = (source_order, limit) {
             rows = top_rows(rows, source_order, limit, offset)?;
             limit_applied = true;
