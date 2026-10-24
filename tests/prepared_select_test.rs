@@ -1017,6 +1017,8 @@ fn test_classifier_rules() {
         format!("SELECT id, {sq} FROM t"),
         format!("SELECT id FROM t WHERE b = 1 ORDER BY {sq}"),
         format!("SELECT id, {sq} FROM t ORDER BY {sq} DESC, id LIMIT 3 OFFSET $1"),
+        format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),
+        format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u"),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1058,7 +1060,7 @@ fn test_classifier_rules() {
             "a tuple on the left of IN (subquery)",
         ),
         (
-            format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),
+            format!("SELECT DISTINCT ON (b) id FROM t WHERE a > {sq}"),
             "a clause outside the family",
         ),
         (
@@ -1099,8 +1101,8 @@ fn test_classifier_rules() {
             "FROM is not one table",
         ),
         (
-            format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u"),
-            "a clause outside the family",
+            format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u ORDER BY {sq}"),
+            "an ORDER BY subquery over a set operation",
         ),
         (
             format!("SELECT id FROM t WHERE 'x' || CAST({sq} AS TEXT) = 'x5'"),

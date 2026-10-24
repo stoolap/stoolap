@@ -1390,6 +1390,13 @@ impl Executor {
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let (mut result, columns, limit_offset_applied, shape) = if in_family {
+            // DISTINCT reads every row before a LIMIT counts them; a set
+            // operation's branch takes the bound its whole one allows
+            let (limit, offset) = match (stmt.set_operations.is_empty(), stmt.distinct) {
+                (false, _) => (set_limit, 0),
+                (true, true) => (None, 0),
+                (true, false) => (limit, offset),
+            };
             let (result, columns, applied, visible, layout) =
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
             prepared_visible = Some(visible);

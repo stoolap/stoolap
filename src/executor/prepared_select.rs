@@ -623,11 +623,15 @@ fn is_tuple(expr: &Expression) -> bool {
     }
 }
 
-/// No WITH, set operation, DISTINCT, GROUP BY, HAVING or WINDOW
 /// A statement of the family's clauses: its WITH runs before it, as its own
-/// statements
+/// statements, and its DISTINCT and set operation over the rows it gives, as
+/// the general path runs them; no DISTINCT ON, grouping, HAVING or WINDOW
 fn plain_statement(stmt: &SelectStatement) -> bool {
-    statement_clauses(stmt) && stmt.group_by.columns.is_empty() && stmt.having.is_none()
+    stmt.distinct_on.is_empty()
+        && matches!(stmt.group_by.modifier, GroupByModifier::None)
+        && stmt.window_defs.is_empty()
+        && stmt.group_by.columns.is_empty()
+        && stmt.having.is_none()
 }
 
 /// No WITH, set operation, DISTINCT, grouping set or WINDOW
@@ -681,8 +685,19 @@ impl Executor {
                 family.expression(unaliased(column), 1, Site::Subqueries, &mut found)?;
             }
         }
-        for ob in &stmt.order_by {
-            family.expression(&ob.expression, 1, Site::Subqueries, &mut found)?;
+        // A set operation's ORDER BY is the whole one's, over its rows
+        if !stmt.set_operations.is_empty() {
+            if stmt
+                .order_by
+                .iter()
+                .any(|ob| mentions_subquery(&ob.expression))
+            {
+                return Err("an ORDER BY subquery over a set operation");
+            }
+        } else {
+            for ob in &stmt.order_by {
+                family.expression(&ob.expression, 1, Site::Subqueries, &mut found)?;
+            }
         }
         if !found {
             return Err("no WHERE, SELECT list or ORDER BY subquery");
@@ -6359,6 +6374,21 @@ impl Executor {
                 }
             }
         }
+        // A set operation's first branch: the whole one reads the rest
+        let branch;
+        let stmt = match stmt.set_operations.is_empty() {
+            true => stmt,
+            false => {
+                branch = SelectStatement {
+                    set_operations: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    ..stmt.clone()
+                };
+                &branch
+            }
+        };
         let mut first = FirstReads::new();
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
