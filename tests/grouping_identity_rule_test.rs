@@ -231,3 +231,25 @@ fn rows_group_by_one_key_equality_everywhere() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn a_qualified_column_of_greek_letters_keeps_its_identity() {
+    let db = Database::open("memory://grouping_identity_unicode_qualified").unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"Σ\" INTEGER, \"ς\" INTEGER)",
+        "INSERT INTO u VALUES (1, 10, 20), (2, 20, 40)",
+        "CREATE TABLE v (id INTEGER PRIMARY KEY)",
+        "INSERT INTO v VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for column in ["a.\"Σ\"", "a.id"] {
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM u AS a CROSS JOIN v GROUP BY GROUPING SETS (({column}))"
+        );
+        assert_eq!(rows(&db, &sql), ["n:1", "n:1"], "{sql}");
+    }
+    // Two columns whose names lower to two letters are two aggregates
+    let sql = "SELECT SUM(a.\"Σ\" * 2) AS x, SUM(a.\"ς\" * 2) AS y FROM u AS a WHERE a.id = 1";
+    assert_eq!(rows(&db, sql), ["n:20|n:40"]);
+}

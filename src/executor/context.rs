@@ -628,11 +628,10 @@ pub enum BlockAnswer {
     KeyedMembers(CompactArc<MemberKeys>),
 }
 
-/// What a prepared EXISTS answer is of: the block as written, its key, the
-/// scopes around it its names bind in, and the statement's parameter values
-/// it reads: those at `read`, or every one
+/// What a prepared EXISTS answer is of: the block's identity, the scopes
+/// around it its names bind in, and the statement's parameter values it
+/// reads: those at `read`, or every one
 pub(crate) struct BlockOrigin<'a> {
-    pub block: &'a Arc<crate::parser::ast::Expression>,
     pub block_key: super::expr_key::ExprKey,
     pub scopes: &'a Arc<str>,
     pub params: &'a [Value],
@@ -641,7 +640,7 @@ pub(crate) struct BlockOrigin<'a> {
 
 /// An `BlockOrigin` as its cache entry keeps it
 struct KeptBlockOrigin {
-    block: Arc<crate::parser::ast::Expression>,
+    block_key: super::expr_key::ExprKey,
     scopes: Arc<str>,
     params: Vec<Value>,
 }
@@ -671,7 +670,7 @@ impl BlockOrigin<'_> {
     }
 
     fn is(&self, kept: &KeptBlockOrigin) -> bool {
-        (Arc::ptr_eq(self.block, &kept.block) || **self.block == *kept.block)
+        self.block_key == kept.block_key
             && (Arc::ptr_eq(self.scopes, &kept.scopes) || **self.scopes == *kept.scopes)
             && kept.params.len() == self.read_params().count()
             && kept
@@ -725,7 +724,7 @@ pub(crate) fn cache_block_answer(
     answer: BlockAnswer,
 ) {
     let kept = KeptBlockOrigin {
-        block: Arc::clone(origin.block),
+        block_key: origin.block_key,
         scopes: Arc::clone(origin.scopes),
         params: origin.read_params().cloned().collect(),
     };

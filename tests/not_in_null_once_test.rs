@@ -56,6 +56,8 @@ fn test_not_in_over_a_set_holding_null_runs_the_subquery_once() {
             "SELECT id FROM t WHERE id NOT IN (SELECT k FROM u) AND a > 0",
         ),
     ] {
+        // The statements hold one block, whose kept members would serve them all
+        stoolap::executor::context::clear_block_answer_cache();
         assert_eq!(
             run(&db, sql),
             (vec![], 1),

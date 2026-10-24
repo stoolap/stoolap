@@ -39,6 +39,16 @@ impl ExprKey {
         hasher.finish()
     }
 
+    /// The key of `expr` as one answer is of: as [`Self::of`], but a quoted
+    /// name as written and a qualified column apart from a dotted name,
+    /// which a column lookup or a name read as text tells apart
+    pub(crate) fn exact(expr: &Expression) -> Self {
+        let mut hasher = KeyHasher::new();
+        hasher.exact = true;
+        write_expr(expr, &mut hasher);
+        hasher.finish()
+    }
+
     pub(crate) fn of_call(call: &FunctionCall) -> Self {
         let mut hasher = KeyHasher::new();
         write_call(call, &mut hasher);
@@ -74,6 +84,8 @@ impl ExprKey {
 struct KeyHasher {
     fx: FxHasher,
     a: AHasher,
+    /// Names keep their quoting and qualification, see [`ExprKey::exact`]
+    exact: bool,
 }
 
 impl Hasher for KeyHasher {
@@ -92,6 +104,7 @@ impl KeyHasher {
         KeyHasher {
             fx: FxHasher::default(),
             a: AHasher::default(),
+            exact: false,
         }
     }
 
@@ -189,11 +202,29 @@ fn write_value(value: &Value, hasher: &mut KeyHasher) {
     }
 }
 
+/// One part of a qualified name under [`ExprKey::exact`]
+fn write_identifier(id: &Identifier, hasher: &mut KeyHasher) {
+    match id.quoted {
+        true => hasher.text(&id.value),
+        false => hasher.name(&id.value_lower),
+    }
+    hasher.flag(id.quoted);
+}
+
 fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
     match expr {
+        Expression::Identifier(id) if hasher.exact && id.quoted => {
+            hasher.tag(b'q');
+            hasher.text(&id.value);
+        }
         Expression::Identifier(id) => {
             hasher.tag(b'I');
             hasher.name(&id.value_lower);
+        }
+        Expression::QualifiedIdentifier(qid) if hasher.exact => {
+            hasher.tag(b'Q');
+            write_identifier(&qid.qualifier, hasher);
+            write_identifier(&qid.name, hasher);
         }
         // A GROUP BY keeps a qualified column as its dotted name
         Expression::QualifiedIdentifier(qid) => {
@@ -386,7 +417,8 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
         match column {
             Expression::Aliased(aliased) => {
                 hasher.tag(b'a');
-                hasher.name(&aliased.alias.value);
+                // A name as the resolver reads it, which per letter lowering keeps
+                hasher.name(&aliased.alias.value_lower);
                 write_expr(&aliased.expression, hasher);
             }
             column => write_expr(column, hasher),
@@ -397,10 +429,10 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
         hasher.flag(with.is_recursive);
         hasher.write_usize(with.ctes.len());
         for cte in &with.ctes {
-            hasher.name(&cte.name.value);
+            hasher.name(&cte.name.value_lower);
             hasher.write_usize(cte.column_names.len());
             for column in &cte.column_names {
-                hasher.name(&column.value);
+                hasher.name(&column.value_lower);
             }
             write_statement(&cte.query, hasher);
         }
@@ -448,11 +480,11 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
 fn write_names(alias: Option<&Identifier>, columns: &[Identifier], hasher: &mut KeyHasher) {
     hasher.flag(alias.is_some());
     if let Some(alias) = alias {
-        hasher.name(&alias.value);
+        hasher.name(&alias.value_lower);
     }
     hasher.write_usize(columns.len());
     for column in columns {
-        hasher.name(&column.value);
+        hasher.name(&column.value_lower);
     }
 }
 
@@ -463,7 +495,7 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b's');
             hasher.flag(sub.alias.is_some());
             if let Some(alias) = &sub.alias {
-                hasher.name(&alias.value);
+                hasher.name(&alias.value_lower);
             }
             write_statement(&sub.subquery, hasher);
         }
@@ -475,7 +507,7 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             write_optional(join.condition.as_deref(), hasher);
             hasher.write_usize(join.using_columns.len());
             for column in &join.using_columns {
-                hasher.name(&column.value);
+                hasher.name(&column.value_lower);
             }
         }
         Expression::ValuesSource(values) => {
@@ -492,7 +524,33 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             write_list(&function.arguments, hasher);
             write_names(function.alias.as_ref(), &function.column_aliases, hasher);
         }
+        Expression::TableSource(table) => {
+            hasher.tag(b't');
+            write_source_name(&table.name, table.alias.as_ref(), hasher);
+            hasher.flag(table.as_of.is_some());
+            if let Some(as_of) = &table.as_of {
+                hasher.name(&as_of.as_of_type);
+                write_expr(&as_of.value, hasher);
+            }
+        }
+        Expression::CteReference(cte) => {
+            hasher.tag(b'r');
+            write_source_name(&cte.name, cte.alias.as_ref(), hasher);
+        }
         other => write_expr(other, hasher),
+    }
+}
+
+/// A source's name and its alias, each a name of its own
+fn write_source_name(name: &Identifier, alias: Option<&Identifier>, hasher: &mut KeyHasher) {
+    let write = |id: &Identifier, hasher: &mut KeyHasher| match hasher.exact {
+        true => write_identifier(id, hasher),
+        false => hasher.name(&id.value_lower),
+    };
+    write(name, hasher);
+    hasher.flag(alias.is_some());
+    if let Some(alias) = alias {
+        write(alias, hasher);
     }
 }
 
@@ -551,6 +609,47 @@ mod tests {
     fn test_a_column_key_is_the_identifier_key() {
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
         assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
+        assert_eq!(ExprKey::column("a.Σ"), select_key("a.\"Σ\""));
+        // A name as the resolver lowers it, a final sigma to its own letter
+        assert_ne!(select_key("\"ΟΣ\""), select_key("\"οσ\""));
+        assert_ne!(
+            select_key("(SELECT v AS \"ΟΣ\" FROM u)"),
+            select_key("(SELECT v AS \"οσ\" FROM u)")
+        );
+        // A qualified column's parts lowered each as the resolver lowers them
+        assert_ne!(
+            select_key("SUM(a.\"Σ\" * 2)"),
+            select_key("SUM(a.\"ς\" * 2)")
+        );
+    }
+
+    #[test]
+    fn test_an_exact_key_keeps_quoting_and_qualification() {
+        let exact = |sql: &str| {
+            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            match &statements[0] {
+                Statement::Select(select) => ExprKey::exact(&select.columns[0]),
+                other => panic!("not a SELECT: {other:?}"),
+            }
+        };
+        for (a, b) in [
+            ("\"a.b\"", "a.b"),
+            ("\"UPPER\"", "\"upper\""),
+            ("\"v\"", "v"),
+        ] {
+            assert_eq!(select_key(a), select_key(b), "{a} and {b} name one column");
+            assert_ne!(exact(a), exact(b), "{a} and {b} may read two values");
+        }
+        for (a, b) in [("t.V + 1", "T.v + 1"), ("UPPER(v)", "upper(V)")] {
+            assert_eq!(exact(a), exact(b), "{a} and {b} are one expression");
+        }
+        // A source's name and alias are parts of their own, not its text
+        let (quoted, aliased) = ("(SELECT v FROM \"u AS a\")", "(SELECT v FROM u AS a)");
+        assert_ne!(select_key(quoted), select_key(aliased));
+        assert_ne!(exact(quoted), exact(aliased));
+        let (upper, lower) = ("(SELECT v FROM U AS A)", "(SELECT v FROM u AS a)");
+        assert_eq!(select_key(upper), select_key(lower), "one table");
+        assert_eq!(exact(upper), exact(lower), "one table");
     }
 
     #[test]
