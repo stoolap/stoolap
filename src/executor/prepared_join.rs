@@ -24,7 +24,7 @@ use crate::core::Result;
 
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
-use super::prepared_select::{FirstReads, JoinBlocks};
+use super::prepared_select::{FirstReads, JoinBlocks, PreparedGrouped};
 use super::query::JoinOutput;
 
 /// The programs one compile builds, shared only once they are held
@@ -92,6 +92,13 @@ struct AnalysisKey {
 struct OutputKey {
     columns: Vec<String>,
     sorted: bool,
+}
+
+/// The joined rows and parameter count a grouped statement was prepared for
+#[derive(Debug)]
+struct GroupedKey {
+    columns: Vec<String>,
+    params: usize,
 }
 
 /// A value held with the plan, or built for this execution alone
@@ -163,6 +170,11 @@ pub struct PreparedJoin {
     /// blocks; decided on first need
     blocks_where: std::sync::OnceLock<bool>,
     join_blocks: RwLock<Option<Arc<JoinBlocks>>>,
+    /// Whether a grouped statement's subqueries run as its grouped blocks;
+    /// decided on first need
+    grouped: std::sync::OnceLock<bool>,
+    /// None stands for blocks that read a column outside the groups
+    grouped_blocks: Shelf<GroupedKey, Option<PreparedGrouped>>,
 }
 
 impl PreparedJoin {
@@ -175,6 +187,8 @@ impl PreparedJoin {
             wheres: Shelf::new(),
             blocks_where: std::sync::OnceLock::new(),
             join_blocks: RwLock::new(None),
+            grouped: std::sync::OnceLock::new(),
+            grouped_blocks: Shelf::new(),
         }
     }
 
@@ -182,6 +196,42 @@ impl PreparedJoin {
     /// `decide` finds once
     pub fn blocks_where(&self, decide: impl FnOnce() -> bool) -> bool {
         *self.blocks_where.get_or_init(decide)
+    }
+
+    /// Whether the grouped statement's subqueries run as its grouped blocks,
+    /// as `decide` finds once
+    pub fn grouped(&self, decide: impl FnOnce() -> bool) -> bool {
+        *self.grouped.get_or_init(decide)
+    }
+
+    /// Whether a run found the grouped statement's subqueries run as its
+    /// grouped blocks; false until one did
+    pub fn holds_grouped(&self) -> bool {
+        self.grouped.get().copied().unwrap_or(false)
+    }
+
+    /// The grouped blocks held for joined rows of `columns` and `params`
+    /// parameters, or the ones `build` prepares
+    pub(crate) fn grouped_blocks(
+        &self,
+        columns: &[String],
+        params: usize,
+        build: impl FnOnce() -> Result<Option<PreparedGrouped>>,
+    ) -> Result<Arc<Option<PreparedGrouped>>> {
+        let wanted = |held: &GroupedKey| held.params == params && held.columns == columns;
+        if let Some(held) = self.grouped_blocks.find(wanted) {
+            return Ok(held);
+        }
+        let built = Arc::new(build()?);
+        self.grouped_blocks.hold(
+            wanted,
+            || GroupedKey {
+                columns: columns.to_vec(),
+                params,
+            },
+            || Arc::clone(&built),
+        );
+        Ok(built)
     }
 
     /// The output held for joined rows of `columns`, or the one `build`

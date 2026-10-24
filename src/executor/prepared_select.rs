@@ -39,7 +39,7 @@ use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Scanner, Table, Transaction};
 
 use super::aggregation::{
-    aggregate_slot_keys, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
+    aggregate_slot_keys, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
     SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
@@ -56,8 +56,9 @@ use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
 use super::result::{ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
-    combine_predicates_with_and, expression_contains_aggregate, extract_literal_value,
-    flip_operator, infix_to_operator, is_aggregate_function, strip_table_qualifier,
+    build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
+    extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
+    strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -481,6 +482,7 @@ enum Site {
 /// SELECT list calls an aggregate
 fn grouped_block(sq: &SelectStatement) -> bool {
     !sq.group_by.columns.is_empty()
+        || matches!(sq.group_by.modifier, GroupByModifier::GroupingSets(_))
         || sq.having.is_some()
         || sq.columns.iter().any(expression_contains_aggregate)
 }
@@ -583,16 +585,23 @@ impl Executor {
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
-        if !block_clauses(stmt) {
-            return Err("a clause outside the family");
+        if !stmt.window_defs.is_empty() {
+            return Err("a window function");
+        }
+        if !stmt.distinct_on.is_empty() {
+            return Err("DISTINCT ON");
         }
         if !grouped_block(stmt) {
             return Err("a statement that does not group");
         }
-        if stmt
-            .order_by
-            .iter()
-            .any(|ob| mentions_subquery(&ob.expression))
+        // A set operation's ORDER BY, LIMIT and OFFSET are the whole one's,
+        // read over its rows once the blocks gave the first branch's
+        let whole = stmt.set_operations.is_empty();
+        if whole
+            && stmt
+                .order_by
+                .iter()
+                .any(|ob| mentions_subquery(&ob.expression))
         {
             return Err("an ORDER BY holding a subquery");
         }
@@ -604,7 +613,7 @@ impl Executor {
             ctx,
             tables: RefCell::new(SmallVec::new()),
             blocks: RefCell::new(SmallVec::new()),
-            with: None,
+            with: stmt.with.as_ref(),
         };
         let mut found = false;
         for column in &stmt.columns {
@@ -615,17 +624,31 @@ impl Executor {
         if let Some(having) = stmt.having.as_deref() {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
         }
-        for item in &stmt.group_by.columns {
+        for item in grouping_items(stmt) {
             family.expression(item, 1, Site::Subqueries, &mut found)?;
         }
         if !found {
             return Err("neither the SELECT list, HAVING nor GROUP BY holds a subquery");
         }
-        if let Some(where_clause) = stmt.where_clause.as_deref() {
-            family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
+        if whole {
+            counts_fit(stmt, ctx)?;
         }
-        counts_fit(stmt, ctx)?;
-        family.from(stmt.table_expr.as_deref())?;
+        // A join's rows pass its ON and WHERE as the join path asks them
+        match stmt.table_expr.as_deref() {
+            Some(Expression::JoinSource(join)) => {
+                if join.join_type.to_uppercase().contains("NATURAL")
+                    || !join.using_columns.is_empty()
+                {
+                    return Err("a NATURAL or USING join whose output holds a subquery");
+                }
+            }
+            table_expr => {
+                if let Some(where_clause) = stmt.where_clause.as_deref() {
+                    family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
+                }
+                family.statement_from(table_expr)?;
+            }
+        }
         family.catalog()
     }
 }
@@ -710,6 +733,80 @@ impl ScopeTable {
             columns: CompactArc::new((0..width).map(|i| format!("{RESOLVED}#{i}")).collect()),
             lower: CompactArc::new(lower),
             types,
+        })
+    }
+
+    /// The joined row a join path lays out as `columns` from its `leaves`:
+    /// the one split of the columns, in leaf order, where each column spells
+    /// its leaf's name, a dot and its own name, and a leaf whose names are
+    /// known before the join reads it has those. Read by position as
+    /// `joined`'s are; None when no split or more than one fits
+    fn of_join_columns(columns: &[String], leaves: &[JoinLeaf]) -> Option<Self> {
+        let (n, m) = (columns.len(), leaves.len());
+        if m < 2 {
+            return None;
+        }
+        let spelled: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
+        // The own name column `at` spells as the `offset`-th of `leaf`
+        let own = |leaf: &JoinLeaf, offset: usize, at: usize| -> Option<&str> {
+            let name = spelled[at]
+                .strip_prefix(leaf.name.as_str())?
+                .strip_prefix('.')?;
+            match &leaf.columns {
+                Some(names) => names.get(offset).filter(|n| n.to_lowercase() == name)?,
+                None => &spelled[at],
+            };
+            Some(name)
+        };
+        // How many splits give the first `e` columns to the first `i` leaves,
+        // 2 for several, and where the last of them starts
+        let mut ways = vec![vec![0u8; n + 1]; m + 1];
+        let mut starts = vec![vec![0usize; n + 1]; m + 1];
+        ways[0][0] = 1;
+        for (i, leaf) in leaves.iter().enumerate() {
+            for start in 0..n {
+                let reached = ways[i][start];
+                if reached == 0 {
+                    continue;
+                }
+                let width = leaf.columns.as_ref().map(Vec::len);
+                let mut end = start;
+                while end < n && width.is_none_or(|w| end - start < w) {
+                    if own(leaf, end - start, end).is_none() {
+                        break;
+                    }
+                    end += 1;
+                    if width.is_none_or(|w| end - start == w) {
+                        ways[i + 1][end] = (ways[i + 1][end] + reached).min(2);
+                        starts[i + 1][end] = start;
+                    }
+                }
+            }
+        }
+        if ways[m][n] != 1 {
+            return None;
+        }
+        let mut bounds = vec![n; m + 1];
+        for i in (0..m).rev() {
+            bounds[i] = starts[i + 1][bounds[i + 1]];
+        }
+        let mut tables: SmallVec<[(SmartString, usize); 2]> = SmallVec::new();
+        let mut lower = Vec::with_capacity(n);
+        for (i, leaf) in leaves.iter().enumerate() {
+            tables.push((SmartString::from(leaf.name.as_str()), bounds[i]));
+            for at in bounds[i]..bounds[i + 1] {
+                lower.push(own(leaf, at - bounds[i], at)?.to_string());
+            }
+        }
+        Some(Self {
+            tables,
+            columns: CompactArc::new(
+                (0..columns.len())
+                    .map(|i| format!("{RESOLVED}#{i}"))
+                    .collect(),
+            ),
+            lower: CompactArc::new(lower),
+            types: vec![DataType::Null; columns.len()],
         })
     }
 
@@ -1915,6 +2012,9 @@ struct KeyedPlan {
     pushed_whole: bool,
     /// The WHERE is the keys alone, which is when a probe may be cheaper
     pure: bool,
+    /// A parent column has no type: a call whose key value is not of its
+    /// own column's type is asked without the keys
+    checked: bool,
 }
 
 /// `column operator value` with the column resolved at preparation; only
@@ -2716,7 +2816,7 @@ impl Builder<'_> {
         }
         let keyed =
             (keyed_test && grouped.is_none() && self.keyed(&chain, &keys, &work, sq, &others))
-                .then(|| keyed_plan(&keys, filter.as_ref(), &schema));
+                .then(|| keyed_plan(&chain, &keys, filter.as_ref(), &schema));
         // What the block answers and how its members are read is part of what is kept
         let mut scopes = signature;
         for scope in outer {
@@ -2766,7 +2866,7 @@ impl Builder<'_> {
                     }
                 }
                 if self.keyed(&chain, &keys, &work, sq, &others) {
-                    grouping.keyed = Some(keyed_plan(&keys, filter.as_ref(), &schema));
+                    grouping.keyed = Some(keyed_plan(&chain, &keys, filter.as_ref(), &schema));
                 }
                 Some(Box::new(grouping))
             }
@@ -3013,8 +3113,9 @@ impl Builder<'_> {
             && work.delegated.is_empty()
             && keys.iter().all(|((own, depth, index), _)| {
                 let own = chain.scopes[0].types[*own];
+                let parent = chain.scopes[1].types[*index];
                 *depth == 1
-                    && own == chain.scopes[1].types[*index]
+                    && (own == parent || parent == DataType::Null)
                     && matches!(
                         own,
                         DataType::Integer
@@ -3064,8 +3165,9 @@ fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<String> {
 }
 
 /// The keyed plan of a block whose correlation equalities are `keys`, the
-/// rest of its WHERE being `filter`
+/// rest of its WHERE being `filter`, its parent scope the chain's second
 fn keyed_plan(
+    chain: &Chain<'_>,
     keys: &[((usize, usize, usize), usize)],
     filter: Option<&Expression>,
     schema: &Schema,
@@ -3090,6 +3192,9 @@ fn keyed_plan(
         pushdown,
         pushed_whole,
         pure: filter.is_none(),
+        checked: keys
+            .iter()
+            .any(|((_, _, parent), _)| chain.scopes[1].types[*parent] == DataType::Null),
     }
 }
 
@@ -3458,8 +3563,10 @@ impl PreparedSelect {
 #[derive(Debug)]
 pub struct PreparedGrouped {
     cached_epoch: u64,
-    /// The table's schema the clauses were prepared over
+    /// The table's schema the clauses were prepared over, or the columns of
+    /// the rows of another source
     schema: CompactArc<Schema>,
+    source: GroupedSource,
     blocks: PreparedBlocks,
     /// Each block's holes: an input block's read from the row it is asked
     /// of, any other's from the GROUP BY items of its group's row
@@ -3471,25 +3578,125 @@ pub struct PreparedGrouped {
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
     /// Every subquery is a run slot: the statement runs as any grouped
-    /// statement does, reading them as parameters, under this plan of its own
+    /// statement does, reading them as parameters, under this plan of its
+    /// own over a table, and groups another source's rows so
     pub(crate) runs_alone: Option<RwLock<CompiledExecution>>,
 }
 
+/// What a grouped statement's rows come from, which says what its blocks run
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupedSource {
+    /// A table, whose scan answers a WHERE without subqueries
+    Table,
+    /// Another source's rows, whose WHERE the blocks run whole
+    Rows,
+    /// A join's rows, which its WHERE has already passed
+    Joined,
+}
+
+/// One execution of a grouped statement of the family: its plan, and the
+/// rows of a source that is not a base table with the name its scope bears
+pub(crate) struct GroupedRun<'s> {
+    /// None when the blocks cannot run the statement, whose source's rows,
+    /// read already, the general path takes
+    pub(crate) held: Option<Arc<PreparedGrouped>>,
+    source: Option<(StatementSource<'s>, SmartString)>,
+    /// The views' rows preparing read, which this run opens
+    pub(crate) first: FirstReads,
+}
+
+impl GroupedRun<'_> {
+    /// The name the rows' scope bears, None over a base table
+    pub(crate) fn scope_name(&self) -> Option<&str> {
+        self.source.as_ref().map(|(_, name)| name.as_str())
+    }
+
+    /// The columns of the source's rows and each row the WHERE passes, read
+    /// through the `run`'s blocks; every row without them. None over a base
+    /// table
+    pub(crate) fn source_rows(
+        self,
+        run: Option<&PreparedRunner<'_>>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(CompactArc<Vec<String>>, RowVec)>> {
+        let Some((source, _)) = self.source else {
+            return Ok(None);
+        };
+        let Some(columns) = source.columns() else {
+            return Err(Error::internal(
+                "a grouped statement read its table as rows",
+            ));
+        };
+        let columns = CompactArc::new(columns.to_vec());
+        let where_ = self.held.as_deref().and_then(|held| held.where_.as_ref());
+        let Some((run, where_)) = run.zip(where_) else {
+            let rows = match source {
+                StatementSource::Rows(_, rows) => rows,
+                StatementSource::Values(_, values) => (0i64..)
+                    .zip(&values.rows)
+                    .map(|(id, exprs)| Executor::values_row(exprs, ctx).map(|row| (id, row)))
+                    .collect::<Result<_>>()?,
+                StatementSource::Cte((_, rows)) => rows.iter().cloned().collect(),
+                StatementSource::Table(_) => {
+                    return Err(Error::internal(
+                        "a grouped statement read its table as rows",
+                    ))
+                }
+            };
+            return Ok(Some((columns, rows)));
+        };
+        let mut rows = RowVec::new();
+        let keep = |id: i64, _: u64, row: Row| {
+            rows.push((id, row));
+            true
+        };
+        let read = match source {
+            StatementSource::Rows(_, source) => {
+                run.rows_passing(where_, source.into_iter().map(Ok), ctx, None, keep)
+            }
+            StatementSource::Values(_, values) => run.rows_passing(
+                where_,
+                (0i64..)
+                    .zip(&values.rows)
+                    .map(|(id, exprs)| Executor::values_row(exprs, ctx).map(|row| (id, row))),
+                ctx,
+                None,
+                keep,
+            ),
+            StatementSource::Cte((_, source)) => run.rows_passing(
+                where_,
+                source.iter().map(|(id, row)| Ok((*id, row))),
+                ctx,
+                None,
+                keep,
+            ),
+            StatementSource::Table(_) => {
+                return Err(Error::internal(
+                    "a grouped statement read its table as rows",
+                ))
+            }
+        };
+        read?;
+        Ok(Some((columns, rows)))
+    }
+}
+
 impl PreparedGrouped {
-    /// Prepare `stmt` over its table, named `scope_name`; None when a block
-    /// reads a column of the row that is not a GROUP BY item
+    /// Prepare `stmt` over the `scope` of its `source`'s rows, whose columns
+    /// `schema` holds, with the views' rows preparing read going to `first`;
+    /// None when a block reads a column of the row that is not a GROUP BY item
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
         stmt: &SelectStatement,
+        scope: ScopeTable,
         schema: CompactArc<Schema>,
-        scope_name: &SmartString,
+        source: GroupedSource,
         param_count: usize,
         epoch: u64,
         first: &mut FirstReads,
     ) -> Result<Option<Self>> {
-        let scope = ScopeTable::of(scope_name.clone(), &schema);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -3514,7 +3721,13 @@ impl PreparedGrouped {
         // What each input row reads comes first: its blocks' holes read the row
         let mut work = Rewritten::default();
         let where_parts = match stmt.where_clause.as_deref() {
-            Some(where_clause) if mentions_subquery(where_clause) => {
+            Some(where_clause)
+                if match source {
+                    GroupedSource::Table => mentions_subquery(where_clause),
+                    GroupedSource::Rows => true,
+                    GroupedSource::Joined => false,
+                } =>
+            {
                 let where_clause = with_aliases(where_clause, &stmt.columns, &scope.columns);
                 Some(builder.statement_where(
                     &chain,
@@ -3606,18 +3819,30 @@ impl PreparedGrouped {
                 *slot = Some(rewritten);
             }
         }
-        let mut group_by = Vec::with_capacity(stmt.group_by.columns.len());
-        for item in &stmt.group_by.columns {
+        let mut group_item = |item: &Expression| -> Result<Expression> {
             if !mentions_subquery(item) {
-                group_by.push(item.clone());
-                continue;
+                return Ok(item.clone());
             }
             let rewritten = input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, item)?;
-            items
+            Ok(items
                 .entry(ExprKey::of(item))
-                .or_insert_with(|| rewritten.clone());
-            group_by.push(rewritten);
-        }
+                .or_insert_with(|| rewritten.clone())
+                .clone())
+        };
+        let group_by = stmt
+            .group_by
+            .columns
+            .iter()
+            .map(&mut group_item)
+            .collect::<Result<Vec<_>>>()?;
+        let modifier = match &stmt.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => GroupByModifier::GroupingSets(
+                sets.iter()
+                    .map(|set| set.iter().map(&mut group_item).collect())
+                    .collect::<Result<_>>()?,
+            ),
+            other => other.clone(),
+        };
         // An item the GROUP BY names is read for each input row, as rewritten
         // above; any other for each group
         let mut output = |expr: &Expression, key: Option<&Expression>| -> Result<Expression> {
@@ -3682,23 +3907,28 @@ impl PreparedGrouped {
             .map(|(parts, program)| parts.prepare(program, &blocks));
         // A group's row holds its GROUP BY items first: a column a hole reads
         // is the item naming it, and a column no item names cannot be read
-        let group_slots: Vec<String> = stmt
-            .group_by
-            .columns
+        // Each item binds a column as the grouping binds it over the rows'
+        // columns: a name by its lookup, an expression by the compiler's rule.
+        // A column two items bind is the first's, as the output reads it
+        let names = schema.column_names_arc();
+        let name_index = build_column_index_map(&names);
+        let names_ctx = CompileContext::new(&names, &executor.function_registry);
+        let mut bound = vec![false; names.len()];
+        let group_slots: Vec<String> = executor
+            .parse_group_by(stmt, &[])?
             .iter()
             .enumerate()
-            .map(|(item, expr)| {
-                let named = |name: &str| schema.columns.iter().position(|c| c.name_lower == name);
-                let column = match expr {
-                    Expression::Identifier(id) => named(&id.value_lower),
-                    Expression::QualifiedIdentifier(q)
-                        if q.qualifier.value_lower == *scope_name =>
-                    {
-                        named(&q.name.value_lower)
+            .map(|(item, group)| {
+                let column = match group {
+                    GroupByItem::Column(name) => {
+                        Executor::lookup_column_index(&name.to_lowercase(), &name_index)
                     }
-                    _ => None,
+                    GroupByItem::Expression { expr, .. } => names_ctx
+                        .reference(expr)
+                        .and_then(|reference| reference.row_column())
+                        .map(usize::from),
                 };
-                match column {
+                match column.filter(|&column| !std::mem::replace(&mut bound[column], true)) {
                     Some(column) => scope.columns[column].clone(),
                     None => format!("\0group item {item}"),
                 }
@@ -3743,21 +3973,33 @@ impl PreparedGrouped {
             having,
             group_by: GroupByClause {
                 columns: group_by,
-                modifier: stmt.group_by.modifier.clone(),
+                modifier,
             },
             where_clause: where_clause
                 .map(Box::new)
                 .or_else(|| stmt.where_clause.clone()),
             ..stmt.clone()
         };
+        // A set operation's first branch: the whole one reads the rest
+        let stmt = match stmt.set_operations.is_empty() {
+            true => stmt,
+            false => SelectStatement {
+                set_operations: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                ..stmt
+            },
+        };
         let runs_alone = (!stmt.columns.iter().any(|c| mentions_subquery(unaliased(c)))
             && !stmt.having.as_deref().is_some_and(mentions_subquery)
-            && !stmt.group_by.columns.iter().any(mentions_subquery)
+            && !grouping_items(&stmt).into_iter().any(mentions_subquery)
             && !stmt.where_clause.as_deref().is_some_and(mentions_subquery))
         .then(|| RwLock::new(CompiledExecution::Unknown));
         Ok(Some(Self {
             cached_epoch: epoch,
             schema,
+            source,
             blocks,
             holes: HoleSet { holes },
             ahead,
@@ -3813,19 +4055,17 @@ impl PreparedGrouped {
 }
 
 impl Executor {
-    /// The plan's prepared grouped statement over `table`, prepared now when
-    /// it holds none for this schema and parameter count, with the views'
-    /// rows preparing read; None when the statement's blocks read a column
-    /// outside its groups
-    pub(crate) fn prepared_grouped(
+    /// The plan's prepared grouped statement, with the rows of its source
+    /// read now when that is not a base table; prepared now when the plan
+    /// holds none for this schema, parameter count and source columns, with
+    /// the views' rows preparing read. None when the statement's blocks read
+    /// a column outside its groups
+    pub(crate) fn prepared_grouped<'s>(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<(Arc<PreparedGrouped>, FirstReads)>> {
-        let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
-            return Err(Error::internal("a grouped statement without one table"));
-        };
+        stmt: &'s SelectStatement,
+        ctx: &'s ExecutionContext,
+    ) -> Result<Option<GroupedRun<'s>>> {
         let epoch = self.engine.schema_epoch();
         let held = compiled
             .and_then(|slot| slot.read().ok())
@@ -3837,27 +4077,69 @@ impl Executor {
                 }
                 _ => None,
             });
-        if let Some(held) = held {
-            return Ok(Some((held, FirstReads::new())));
-        }
-        let table = self.prepared_table(&ts.name.value_lower, ctx, None)?;
-        let scope_name = ts
-            .alias
+        // A table held a plan for this epoch, so no view bears its name
+        let base_table = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) if !ctx.has_cte_by_lower(&ts.name.value_lower) => {
+                Some(ts)
+            }
+            _ => None,
+        };
+        if let Some(held) = held
             .as_ref()
-            .map_or(&ts.name.value_lower, |alias| &alias.value_lower);
+            .filter(|p| p.source == GroupedSource::Table && base_table.is_some())
+        {
+            return Ok(Some(GroupedRun {
+                held: Some(Arc::clone(held)),
+                source: None,
+                first: FirstReads::new(),
+            }));
+        }
+        let inner_ctx = ctx.with_incremented_query_depth();
+        let (source, scope_name) = self.read_source(stmt, ctx, &inner_ctx)?;
+        let scope_name = scope_name.cloned().unwrap_or_default();
+        let columns = source.as_ref().and_then(StatementSource::columns);
+        if let Some(held) = held.filter(|p| {
+            p.source == GroupedSource::Rows
+                && columns.is_some_and(|columns| *p.schema.column_names_arc() == columns)
+        }) {
+            return Ok(Some(GroupedRun {
+                held: Some(held),
+                source: source.map(|source| (source, scope_name)),
+                first: FirstReads::new(),
+            }));
+        }
+        let (schema, kind) = match (columns, base_table) {
+            (Some(columns), _) => (
+                CompactArc::new(untyped_schema(&scope_name, columns)),
+                GroupedSource::Rows,
+            ),
+            (None, Some(ts)) => (
+                self.prepared_table(&ts.name.value_lower, ctx, None)?
+                    .schema_arc(),
+                GroupedSource::Table,
+            ),
+            (None, None) => return Err(Error::internal("a grouped statement without one table")),
+        };
+        let scope = ScopeTable::of(scope_name.clone(), &schema);
         let mut first = FirstReads::new();
         let Some(prepared) = PreparedGrouped::prepare(
             self,
             ctx,
             stmt,
-            table.schema_arc(),
-            scope_name,
+            scope,
+            schema,
+            kind,
             ctx.params().len(),
             epoch,
             &mut first,
         )?
         else {
-            return Ok(None);
+            // Rows read already go to the general path, which reads no source again
+            return Ok(source.map(|source| GroupedRun {
+                held: None,
+                source: Some((source, scope_name)),
+                first: FirstReads::new(),
+            }));
         };
         let prepared = Arc::new(prepared);
         if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
@@ -3870,7 +4152,39 @@ impl Executor {
                 *guard = CompiledExecution::PreparedGrouped(Arc::clone(&prepared));
             }
         }
-        Ok(Some((prepared, first)))
+        Ok(Some(GroupedRun {
+            held: Some(prepared),
+            source: source.map(|source| (source, scope_name)),
+            first,
+        }))
+    }
+
+    /// A grouped join statement prepared over the joined `columns` its join
+    /// path laid out from its `leaves`, the views' rows preparing read going
+    /// to `first`; None when they do not line up or a block reads a column
+    /// outside its groups
+    pub(crate) fn prepare_grouped_join(
+        &self,
+        stmt: &SelectStatement,
+        columns: &[String],
+        leaves: &[JoinLeaf],
+        ctx: &ExecutionContext,
+        first: &mut FirstReads,
+    ) -> Result<Option<PreparedGrouped>> {
+        let Some(scope) = ScopeTable::of_join_columns(columns, leaves) else {
+            return Ok(None);
+        };
+        PreparedGrouped::prepare(
+            self,
+            ctx,
+            stmt,
+            scope,
+            CompactArc::new(untyped_schema("", columns)),
+            GroupedSource::Joined,
+            ctx.params().len(),
+            self.engine.schema_epoch(),
+            first,
+        )
     }
 
     /// Whether the plan holds a grouped statement prepared for the current
@@ -3886,6 +4200,11 @@ impl Executor {
                 CompiledExecution::PreparedGrouped(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
                         && p.blocks.param_count == ctx.params().len()
+                        && ctx.outer_row().is_none()
+                }
+                CompiledExecution::PreparedJoin(p) => {
+                    p.cached_epoch == self.engine.schema_epoch()
+                        && p.holds_grouped()
                         && ctx.outer_row().is_none()
                 }
                 _ => false,
@@ -5391,6 +5710,65 @@ impl Executor {
         }
     }
 
+    /// What `stmt` reads its rows from, and the name its scope bears: None
+    /// for a base table, left closed; else a CTE's rows, a VALUES list, or a
+    /// view's, a derived table's or a table function's rows, read once under
+    /// the statement's snapshot, before a plan is taken
+    fn read_source<'s>(
+        &self,
+        stmt: &'s SelectStatement,
+        ctx: &'s ExecutionContext,
+        inner_ctx: &ExecutionContext,
+    ) -> Result<(Option<StatementSource<'s>>, Option<&'s SmartString>)> {
+        let named = |alias: &'s Option<Identifier>| alias.as_ref().map(|alias| &alias.value_lower);
+        Ok(match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => {
+                let name = &ts.name.value_lower;
+                // A CTE comes before a view, and a view before a table, of
+                // one name, as the general path reads them
+                let source = match ctx.get_cte_by_lower(name) {
+                    Some(cte) => Some(StatementSource::Cte(cte)),
+                    None => match self.engine.get_view_lowercase(name)? {
+                        Some(view) => {
+                            let result = self.execute_view_body(&view, inner_ctx)?;
+                            let columns = result.columns().to_vec();
+                            Some(StatementSource::Rows(
+                                columns,
+                                Self::materialize_result(result)?,
+                            ))
+                        }
+                        None => None,
+                    },
+                };
+                let scope = ts.alias.as_ref().map_or(name, |alias| &alias.value_lower);
+                (source, Some(scope))
+            }
+            Some(Expression::SubquerySource(ss)) => {
+                let result = self.execute_select(&ss.subquery, inner_ctx)?;
+                let columns = result.columns().to_vec();
+                let rows = Self::materialize_result(result)?;
+                (Some(StatementSource::Rows(columns, rows)), named(&ss.alias))
+            }
+            Some(Expression::ValuesSource(values)) => (
+                Some(StatementSource::Values(
+                    Self::values_columns(values),
+                    values,
+                )),
+                named(&values.alias),
+            ),
+            Some(Expression::FunctionTableSource(function)) => {
+                let (rows, columns) =
+                    Self::tvf_rows(function, stmt.where_clause.as_deref(), None, ctx)?;
+                let scope = function
+                    .alias
+                    .as_ref()
+                    .map_or(&function.function.value_lower, |alias| &alias.value_lower);
+                (Some(StatementSource::Rows(columns, rows)), Some(scope))
+            }
+            _ => return Err(Error::internal("a prepared statement without one table")),
+        })
+    }
+
     /// Run an in-family statement: scan its table narrowed by the
     /// conjuncts without a subquery, keep the rows the WHERE program
     /// passes, and project them. With no ORDER BY the scan stops once
@@ -5404,61 +5782,16 @@ impl Executor {
         offset: usize,
     ) -> Result<PreparedOutput> {
         let inner_ctx = ctx.with_incremented_query_depth();
-        let unnamed = SmartString::new("");
-        // A view's, a derived table's or a VALUES list's rows are read once,
-        // under the statement's snapshot, before the plan is taken
-        let (source, scope_name) = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => {
-                let name = &ts.name.value_lower;
-                // A CTE comes before a view, and a view before a table, of
-                // one name, as the general path reads them
-                let source = match ctx.get_cte_by_lower(name) {
-                    Some(cte) => StatementSource::Cte(cte),
-                    None => match self.engine.get_view_lowercase(name)? {
-                        Some(view) => {
-                            let result = self.execute_view_body(&view, &inner_ctx)?;
-                            let columns = result.columns().to_vec();
-                            StatementSource::Rows(columns, Self::materialize_result(result)?)
-                        }
-                        None => StatementSource::Table(self.prepared_table(name, ctx, None)?),
-                    },
-                };
-                (
-                    source,
-                    ts.alias.as_ref().map_or(name, |alias| &alias.value_lower),
-                )
+        let (source, scope_name) = self.read_source(stmt, ctx, &inner_ctx)?;
+        let source = match (source, stmt.table_expr.as_deref()) {
+            (Some(source), _) => source,
+            (None, Some(Expression::TableSource(ts))) => {
+                StatementSource::Table(self.prepared_table(&ts.name.value_lower, ctx, None)?)
             }
-            Some(Expression::SubquerySource(ss)) => {
-                let result = self.execute_select(&ss.subquery, &inner_ctx)?;
-                let columns = result.columns().to_vec();
-                let rows = Self::materialize_result(result)?;
-                (
-                    StatementSource::Rows(columns, rows),
-                    ss.alias
-                        .as_ref()
-                        .map_or(&unnamed, |alias| &alias.value_lower),
-                )
-            }
-            Some(Expression::ValuesSource(values)) => (
-                StatementSource::Values(Self::values_columns(values), values),
-                values
-                    .alias
-                    .as_ref()
-                    .map_or(&unnamed, |alias| &alias.value_lower),
-            ),
-            Some(Expression::FunctionTableSource(function)) => {
-                let (rows, columns) =
-                    Self::tvf_rows(function, stmt.where_clause.as_deref(), None, ctx)?;
-                (
-                    StatementSource::Rows(columns, rows),
-                    function
-                        .alias
-                        .as_ref()
-                        .map_or(&function.function.value_lower, |alias| &alias.value_lower),
-                )
-            }
-            _ => return Err(Error::internal("a prepared statement without one table")),
+            (None, _) => return Err(Error::internal("a prepared statement without one table")),
         };
+        let unnamed = SmartString::new("");
+        let scope_name = scope_name.unwrap_or(&unnamed);
         let table_columns;
         let columns: &[String] = match &source {
             StatementSource::Table(table) => {
@@ -5640,6 +5973,26 @@ enum StatementSource<'s> {
     Values(Vec<String>, &'s ValuesTableSource),
     /// A CTE's columns and rows, materialized by the statement's WITH
     Cte(&'s super::cte::CteData),
+}
+
+impl StatementSource<'_> {
+    /// The columns of the rows it reads; None for a table, whose schema has them
+    fn columns(&self) -> Option<&[String]> {
+        match self {
+            StatementSource::Table(_) => None,
+            StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => {
+                Some(columns)
+            }
+            StatementSource::Cte((columns, _)) => Some(columns),
+        }
+    }
+}
+
+/// One source a join reads: the name qualifying its columns, lowercase,
+/// and their names when known before the join reads it
+pub(crate) struct JoinLeaf {
+    pub(crate) name: String,
+    pub(crate) columns: Option<Vec<String>>,
 }
 
 /// A derived table's columns as its scope's schema: their names and no
@@ -6270,7 +6623,9 @@ impl<'a> PreparedRunner<'a> {
     /// Hand `keep` each of `rows` that passes `where_`, with the count of
     /// rows read so far, until `keep` says stop; a borrowed row is copied
     /// only when it passes. The set conjuncts test the members read before
-    /// the first row, as a table's scan does
+    /// the first row, as a table's scan does. Inlined into a caller as large
+    /// as `execute_prepared_select`, its loop costs more per row
+    #[inline(never)]
     fn rows_passing<R: SourceRow>(
         &self,
         where_: &PreparedWhere,
@@ -6339,7 +6694,7 @@ impl<'a> PreparedRunner<'a> {
         let Answer::Exists(existence) = &sq.answer else {
             return Ok(None);
         };
-        let Some(plan) = &existence.keyed else {
+        let Some(plan) = existence.keyed.as_ref().filter(|plan| !plan.checked) else {
             return Ok(None);
         };
         if !self.takes_keyed_set(index, plan) {
@@ -6539,6 +6894,20 @@ impl<'a> PreparedRunner<'a> {
         let keyed = forced.unwrap_or_else(|| !(plan.pure && self.probe_cheaper(index, plan)));
         self.blocks[index].keyed_choice.set(Some(keyed));
         keyed
+    }
+
+    /// Whether the keyed set answers the call the buffer holds: each key
+    /// value of a checked plan NULL or of its own column's type
+    fn keys_fit(&self, index: usize, plan: &KeyedPlan) -> bool {
+        if !plan.checked {
+            return true;
+        }
+        let columns = &self.prepared.subqueries[index].schema.columns;
+        let params = self.blocks[index].buffer.borrow();
+        plan.keys.iter().all(|(own, slot, _)| {
+            let value = &params[*slot];
+            value.is_null() || value.data_type() == columns[*own].data_type
+        })
     }
 
     /// The general path's rule for its index nested loop, with the parent
@@ -7040,7 +7409,9 @@ impl PreparedRunner<'_> {
             (None, false) => {
                 self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
                 match &existence.keyed {
-                    Some(plan) if self.takes_keyed_set(index, plan) => {
+                    Some(plan)
+                        if self.takes_keyed_set(index, plan) && self.keys_fit(index, plan) =>
+                    {
                         self.keyed_lookup(index, existence, plan)?
                     }
                     _ => self.probe(index)?,
@@ -7135,7 +7506,7 @@ impl PreparedRunner<'_> {
         }
         self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
         match &kept.keyed {
-            Some(plan) if self.takes_keyed_set(index, plan) => {
+            Some(plan) if self.takes_keyed_set(index, plan) && self.keys_fit(index, plan) => {
                 self.keyed_members_answer(index, kept, members, plan, value)
             }
             _ => self.probe_members(index, members, value),
@@ -7747,7 +8118,7 @@ impl PreparedRunner<'_> {
     ) -> Result<T> {
         self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
         if let Some(plan) = grouping.keyed.as_ref() {
-            if self.takes_keyed_set(index, plan) {
+            if self.takes_keyed_set(index, plan) && self.keys_fit(index, plan) {
                 if self.blocks[index].grouped.borrow().is_none() {
                     let keys = self.grouped_keys(index, grouping, plan)?;
                     *self.blocks[index].grouped.borrow_mut() = Some(keys);

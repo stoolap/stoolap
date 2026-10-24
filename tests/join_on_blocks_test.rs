@@ -640,10 +640,6 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
             "Prepared: yes".to_string(),
         ),
         (
-            format!("SELECT COUNT(*), (SELECT MAX(s.b) FROM s) FROM l JOIN r ON l.g = r.w WHERE {exists}"),
-            "Prepared: no (a grouped SELECT list whose subqueries are read first)".to_string(),
-        ),
-        (
             format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND (l.g, l.k) = (r.w, r.k) AND {exists}"),
             "Prepared: no (an expression form outside the family)".to_string(),
         ),

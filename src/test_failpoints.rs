@@ -1704,11 +1704,13 @@ pub enum GeneralPath {
     SelectFold,
     /// `process_correlated_expression`
     CorrelatedExpression,
+    /// `materialize_lifted_subqueries`, which reads an aggregate's subquery per row
+    LiftedSubqueries,
 }
 
 /// Process-wide: how often each general path mechanism ran
-static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 14] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 14];
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 15] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 15];
 
 /// How often `path` ran, so far
 pub fn general_path_hits(path: GeneralPath) -> usize {

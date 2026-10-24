@@ -1198,13 +1198,21 @@ impl Executor {
 
         // Check for CTEs (WITH clause). A statement with one keeps every
         // subquery for the aggregation entry, which runs with the CTEs bound
-        // A statement of the prepared family keeps its plan: its CTEs inline
-        // as the CTE path inlines them, or are read from the context,
-        // materialized under the snapshot its subqueries read
+        // A statement of the prepared or grouped family keeps its plan: its
+        // CTEs inline as the CTE path inlines them, or are read from the
+        // context, materialized under the snapshot its subqueries read
         let ctes_ctx;
         let ctx = if self.has_cte(stmt) {
+            let grouped = || {
+                let classification = get_classification(stmt);
+                classification.has_aggregation
+                    && classification.grouped_has_subqueries
+                    && self.grouped_family(stmt, Some(ctx)).is_ok()
+            };
             if !self.holds_prepared_select(compiled, ctx)
+                && !self.holds_prepared_grouped(compiled, ctx)
                 && self.prepared_family(stmt, Some(ctx)).is_err()
+                && !grouped()
             {
                 return self.execute_select_with_ctes(stmt, ctx);
             }
@@ -1281,11 +1289,17 @@ impl Executor {
         let bound_stmt;
         // A statement holding this execution's values keeps nothing in its plan
         let mut folded_select = false;
-        let grouped = match grouped_family {
+        // A join prepares its grouped blocks once it has laid out its rows
+        let grouped_join =
+            grouped_family && matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
+        let grouped = match grouped_family && !grouped_join {
             true => self.prepared_grouped(compiled, stmt, ctx)?,
             false => None,
         };
-        let stmt = if grouped.is_none() && Self::folds_select_subqueries(stmt, &classification) {
+        let stmt = if grouped.as_ref().is_none_or(|run| run.held.is_none())
+            && !grouped_join
+            && Self::folds_select_subqueries(stmt, &classification)
+        {
             match self.try_process_select_subqueries(&stmt.columns, ctx)? {
                 Some(columns) => {
                     bound_stmt = SelectStatement {
@@ -1360,8 +1374,8 @@ impl Executor {
                 visible: None,
             };
             (result, columns, applied, Some(shape))
-        } else if let Some((grouped, first)) = grouped.as_ref() {
-            self.execute_prepared_grouped(grouped, first, ctx)?
+        } else if let Some(grouped) = grouped {
+            self.execute_prepared_grouped(grouped, branch, ctx)?
         } else {
             let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, &classification, compiled)?
@@ -5001,6 +5015,13 @@ impl Executor {
         }
     }
 
+    /// Whether a join's output groups its rows, so the grouped blocks or the
+    /// general path run its subqueries after the join, never its join blocks
+    fn grouped_join_output(stmt: &SelectStatement) -> bool {
+        let classification = get_classification(stmt);
+        classification.has_aggregation && !classification.has_window_functions
+    }
+
     /// Whether the SELECT list or the ORDER BY of a join holds subqueries,
     /// all of the forms the prepared blocks run over the joined rows, or
     /// why the blocks cannot run them
@@ -5010,6 +5031,10 @@ impl Executor {
         join_source: &JoinTableSource,
         join_type: &str,
     ) -> std::result::Result<bool, OutOfFamily> {
+        if Self::grouped_join_output(stmt) {
+            return Ok(false);
+        }
+        let classification = get_classification(stmt);
         let items = stmt
             .columns
             .iter()
@@ -5029,7 +5054,6 @@ impl Executor {
         if join_type.contains("NATURAL") || !join_source.using_columns.is_empty() {
             return Err("a NATURAL or USING join whose output holds a subquery");
         }
-        let classification = get_classification(stmt);
         if classification.has_aggregation
             || classification.has_window_functions
             || !stmt.group_by.columns.is_empty()
@@ -5169,15 +5193,16 @@ impl Executor {
                 ),
             ];
             // The SELECT items and ORDER BY keys whose subqueries the blocks run
+            let output = !Self::grouped_join_output(stmt);
             let select: Vec<Option<&Expression>> = stmt
                 .columns
                 .iter()
-                .map(|c| Some(unaliased_item(c)).filter(|e| Self::has_subqueries(e)))
+                .map(|c| Some(unaliased_item(c)).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
             let keys: Vec<Option<&Expression>> = stmt
                 .order_by
                 .iter()
-                .map(|ob| Some(&ob.expression).filter(|e| Self::has_subqueries(e)))
+                .map(|ob| Some(&ob.expression).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
             self.prepare_join_blocks(
                 on,
@@ -5257,6 +5282,10 @@ impl Executor {
         };
         let on_condition: Option<&Expression> =
             processed_on.as_ref().or(join_source.condition.as_deref());
+        let grouped_plan = plan
+            .as_ref()
+            .filter(|_| classification.has_aggregation && classification.grouped_has_subqueries)
+            .cloned();
         let prepared = plan.filter(|_| {
             processed_on.is_none()
                 && ((!classification.where_has_subqueries && !on_subqueries) || blocks_where)
@@ -6363,13 +6392,13 @@ impl Executor {
                         )?
                     };
                     if has_agg || has_window {
-                        return self.grouped_select(
+                        return self.grouped_join_select(
+                            grouped_plan.as_deref(),
                             stmt,
                             ctx,
                             classification,
                             final_rows,
                             &all_columns,
-                            None,
                         );
                     } else if let Some(output) = held.as_deref().and_then(Option::as_ref) {
                         return output_result(output, final_rows, order_limit_applied);
@@ -7027,13 +7056,13 @@ impl Executor {
         };
 
         if classification.has_aggregation || classification.has_window_functions {
-            return self.grouped_select(
+            return self.grouped_join_select(
+                grouped_plan.as_deref(),
                 stmt,
                 ctx,
                 classification,
                 final_rows,
                 &final_columns,
-                None,
             );
         }
 
@@ -8708,19 +8737,142 @@ impl Executor {
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
-    /// A grouped statement whose SELECT list or HAVING subqueries run as
-    /// `held` prepared them: with every one a run slot, as any grouped
-    /// statement reading them as parameters; else over its table's rows,
-    /// the general aggregation asking the blocks of each group
-    fn execute_prepared_grouped(
+    /// A join's grouped output over its joined `rows` of `columns`: through
+    /// the grouped blocks when the statement belongs to their family, held
+    /// with the `plan`; else as any grouped statement groups its rows
+    fn grouped_join_select(
+        &self,
+        plan: Option<&PreparedJoin>,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+        rows: RowVec,
+        columns: &[String],
+    ) -> SelectResult {
+        let in_family =
+            classification.has_aggregation && classification.grouped_has_subqueries && {
+                let decide = || self.grouped_family(stmt, Some(ctx)).is_ok();
+                plan.map_or_else(decide, |plan| plan.grouped(decide))
+            };
+        if in_family {
+            // The views' rows preparing read, which this run opens
+            let mut first = super::prepared_select::FirstReads::new();
+            let mut build = || {
+                let mut leaves = Vec::new();
+                if let Some(join) = stmt.table_expr.as_deref() {
+                    self.join_leaves(join, ctx, &mut leaves);
+                }
+                self.prepare_grouped_join(stmt, columns, &leaves, ctx, &mut first)
+            };
+            let held = match plan {
+                Some(plan) => plan.grouped_blocks(columns, ctx.params().len(), build)?,
+                None => std::sync::Arc::new(build()?),
+            };
+            if let Some(held) = held.as_ref() {
+                let run = self.grouped_runner(held, &first, ctx)?.ok_or_else(|| {
+                    Error::internal("a table's columns changed while the statement prepared")
+                })?;
+                return self.group_held_rows(held, &run, ctx, rows, columns, |out| {
+                    Self::result_layout(&held.stmt, columns, None, out)
+                });
+            }
+        }
+        self.grouped_select(stmt, ctx, classification, rows, columns, None)
+    }
+
+    /// Each source the join `expr` reads, left to right, with its column
+    /// names when known before the join reads it: a table's, or a CTE's
+    fn join_leaves(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        leaves: &mut Vec<super::prepared_select::JoinLeaf>,
+    ) {
+        if let Expression::JoinSource(join) = expr {
+            self.join_leaves(&join.left, ctx, leaves);
+            self.join_leaves(&join.right, ctx, leaves);
+            return;
+        }
+        let columns = match expr {
+            Expression::TableSource(ts) => match ctx.get_cte_by_lower(&ts.name.value_lower) {
+                Some((columns, _)) => Some(columns.to_vec()),
+                None => self
+                    .base_table_side_schema(expr, CteNames::Context(ctx))
+                    .map(|schema| schema.column_names_arc().to_vec()),
+            },
+            _ => None,
+        };
+        leaves.push(super::prepared_select::JoinLeaf {
+            name: get_table_alias_from_expr(expr)
+                .map(|name| name.to_lowercase())
+                .unwrap_or_default(),
+            columns,
+        });
+    }
+
+    /// `rows` of `columns` grouped as `held` prepared them: reading its run
+    /// slots as parameters when they are all its subqueries, else asking
+    /// the `run`'s blocks
+    fn group_held_rows(
         &self,
         held: &super::prepared_select::PreparedGrouped,
-        first: &super::prepared_select::FirstReads,
+        run: &super::prepared_select::PreparedRunner<'_>,
+        ctx: &ExecutionContext,
+        rows: RowVec,
+        columns: &[String],
+        layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
+    ) -> SelectResult {
+        let slots_ctx;
+        let (ctx, blocks): (_, Option<&dyn SubqueryExecutor>) = match held.runs_alone {
+            Some(_) => {
+                slots_ctx = ctx
+                    .with_slot_params(run.params().unwrap_or_default().iter().cloned().collect());
+                (&slots_ctx, None)
+            }
+            None => (ctx, Some(run)),
+        };
+        let (result, layout) = self.group_and_window_rows(
+            &held.stmt,
+            ctx,
+            &held.classification,
+            rows,
+            columns,
+            blocks,
+            layout,
+        )?;
+        let columns = CompactArc::new(result.columns().to_vec());
+        Ok((result, columns, false, SelectShape::laid_out(layout)))
+    }
+
+    /// A grouped statement whose subqueries run as `grouped` prepared them:
+    /// over a source's rows, or a table's, the general aggregation asking
+    /// the blocks of each group; over a table with every one a run slot, as
+    /// any grouped statement reading them as parameters
+    fn execute_prepared_grouped(
+        &self,
+        grouped: super::prepared_select::GroupedRun<'_>,
+        branch: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> SelectResult {
-        let run = self.grouped_runner(held, first, ctx)?.ok_or_else(|| {
-            Error::internal("a table's columns changed while the statement prepared")
-        })?;
+        let Some(held) = grouped.held.clone() else {
+            // The general path groups the rows the source gave, as `branch`
+            let Some((columns, rows)) = grouped.source_rows(None, ctx)? else {
+                return Err(Error::internal("a grouped statement without its rows"));
+            };
+            return self.execute_query_on_memory_result(branch, ctx, columns.to_vec(), rows);
+        };
+        let held = &*held;
+        let run = self
+            .grouped_runner(held, &grouped.first, ctx)?
+            .ok_or_else(|| {
+                Error::internal("a table's columns changed while the statement prepared")
+            })?;
+        let alias = grouped.scope_name().map(SmartString::from);
+        if let Some((columns, rows)) = grouped.source_rows(Some(&run), ctx)? {
+            return self.group_held_rows(held, &run, ctx, rows, &columns, |out| {
+                Self::shared_result_layout(&held.stmt, &columns, alias.as_deref(), out)
+            });
+        }
         if let Some(plan) = &held.runs_alone {
             let params = run.params().unwrap_or_default().iter().cloned().collect();
             let ctx = ctx.with_slot_params(params);
