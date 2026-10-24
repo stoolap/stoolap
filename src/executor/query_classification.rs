@@ -33,7 +33,7 @@ use rustc_hash::FxHasher;
 
 use crate::executor::volatility::expression_volatility;
 use crate::functions::Volatility;
-use crate::parser::ast::{Expression, SelectStatement};
+use crate::parser::ast::{Expression, FunctionCall, GroupByModifier, SelectStatement};
 
 /// Maximum number of cached query classifications (LRU eviction)
 const CLASSIFICATION_CACHE_SIZE: usize = 512;
@@ -230,6 +230,7 @@ impl QueryClassification {
             .iter()
             .chain(stmt.having.as_deref())
             .chain(&stmt.group_by.columns)
+            .chain(super::aggregation::grouping_items(stmt))
             .any(super::Executor::has_subqueries);
         let output_has_subqueries = stmt
             .columns
@@ -1281,9 +1282,18 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
         ob.nulls_first.hash(hasher);
     }
 
-    // Hash GROUP BY expressions
+    // Hash GROUP BY expressions, and the modifier with each grouping set's
     for gb in &stmt.group_by.columns {
         hash_expression_structure(gb, hasher);
+    }
+    std::mem::discriminant(&stmt.group_by.modifier).hash(hasher);
+    if let GroupByModifier::GroupingSets(sets) = &stmt.group_by.modifier {
+        for set in sets {
+            set.len().hash(hasher);
+            for item in set {
+                hash_expression_structure(item, hasher);
+            }
+        }
     }
 
     // Hash HAVING clause if present
@@ -1360,33 +1370,37 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
 }
 
 /// Hash the structural elements of an expression (discriminants, not values)
+/// Hash a call's name case-insensitively, without allocating, and every
+/// part of it the classifier reads: its arguments, FILTER and ORDER BY
+fn hash_call_structure<H: std::hash::Hasher>(func: &FunctionCall, hasher: &mut H) {
+    for c in func.function.bytes() {
+        c.to_ascii_uppercase().hash(hasher);
+    }
+    func.arguments.len().hash(hasher);
+    func.filter.is_some().hash(hasher);
+    func.order_by.len().hash(hasher);
+    let read = func
+        .arguments
+        .iter()
+        .chain(func.filter.as_deref())
+        .chain(func.order_by.iter().map(|o| &o.expression));
+    for expr in read {
+        hash_expression_structure(expr, hasher);
+    }
+}
+
 fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     std::mem::discriminant(expr).hash(hasher);
 
     match expr {
-        Expression::FunctionCall(func) => {
-            // Hash function name case-insensitively without allocating
-            for c in func.function.bytes() {
-                c.to_ascii_uppercase().hash(hasher);
-            }
-            func.arguments.len().hash(hasher);
-            for arg in &func.arguments {
-                hash_expression_structure(arg, hasher);
-            }
-        }
+        Expression::FunctionCall(func) => hash_call_structure(func, hasher),
         Expression::Window(wf) => {
-            // Hash window function name case-insensitively without allocating
-            for c in wf.function.function.bytes() {
-                c.to_ascii_uppercase().hash(hasher);
-            }
-            let read = wf
-                .function
-                .arguments
-                .iter()
-                .chain(&wf.partition_by)
-                .chain(wf.order_by.iter().map(|o| &o.expression));
-            wf.function.arguments.len().hash(hasher);
+            hash_call_structure(&wf.function, hasher);
             wf.partition_by.len().hash(hasher);
+            let read = wf
+                .partition_by
+                .iter()
+                .chain(wf.order_by.iter().map(|o| &o.expression));
             for expr in read {
                 hash_expression_structure(expr, hasher);
             }
