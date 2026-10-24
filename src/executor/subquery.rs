@@ -1880,6 +1880,10 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<crate::core::Value> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::ScalarSubquery,
+        );
         // Check if this is a non-correlated subquery (no outer row context)
         // Non-correlated subqueries can be cached since they return the same result
         let is_non_correlated =
@@ -2048,6 +2052,10 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<Vec<crate::core::Value>>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::InSubquery,
+        );
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
@@ -2150,6 +2158,12 @@ impl Executor {
             // If result is None and no subquery found, do nothing (use original)
         }
 
+        #[cfg(feature = "test-failpoints")]
+        if result.is_some() {
+            crate::test_failpoints::general_path_reached(
+                crate::test_failpoints::GeneralPath::SelectFold,
+            );
+        }
         Ok(result)
     }
 
@@ -2625,6 +2639,10 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
     ) -> Result<Expression> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::CorrelatedExpression,
+        );
         match expr {
             Expression::ScalarSubquery(subquery) => {
                 // Execute scalar subquery with outer row context

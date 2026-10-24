@@ -1695,13 +1695,20 @@ pub enum GeneralPath {
     ExistsSemiJoin,
     /// `execute_exists_subquery`
     ExistsSubquery,
-    /// `execute_in_subquery`, which reads an IN, ANY or ALL block's values
+    /// `execute_in_subquery` or `execute_in_subquery_rows`, which read an IN,
+    /// ANY or ALL block's values
     InSubquery,
+    /// `execute_scalar_subquery`
+    ScalarSubquery,
+    /// `try_process_select_subqueries`, which folds a SELECT list's subqueries
+    SelectFold,
+    /// `process_correlated_expression`
+    CorrelatedExpression,
 }
 
 /// Process-wide: how often each general path mechanism ran
-static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 11] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 11];
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 14] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 14];
 
 /// How often `path` ran, so far
 pub fn general_path_hits(path: GeneralPath) -> usize {
