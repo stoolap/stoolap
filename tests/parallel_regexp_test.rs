@@ -149,7 +149,8 @@ fn a_worker_reads_no_row_after_the_first_error() {
     let read = worker_rows_filtered() - before;
     assert!(failed, "{OVERFLOWING} overflows on its second row");
     assert!(
-        read <= 2,
-        "one worker read {read} rows, past the error on row 2"
+        (1..=2).contains(&read),
+        "one worker read {read} rows: none means the filter took no worker, more \
+         means it read past the error on row 2"
     );
 }
