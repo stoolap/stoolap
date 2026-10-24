@@ -39,8 +39,8 @@ use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Scanner, Table, Transaction};
 
 use super::aggregation::{
-    aggregate_slot_keys, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
-    SqlAggregateFunction, COUNT_STAR,
+    aggregate_slot_keys, compile_over_slots, grouping_items, ungrouped_column, AggregatePath,
+    CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -1707,8 +1707,9 @@ struct PreparedSubquery {
     /// deeper subquery reads from it; empty for the statement's own blocks,
     /// whose holes its `HoleSet` keeps
     holes: Vec<(usize, Hole)>,
-    /// A join statement's own block's holes as written, compiled again for
-    /// each layout of the row its sites run over
+    /// A join statement's own block's holes over its row, compiled again for
+    /// each layout of the row its sites run over; a grouped statement's as
+    /// the block wrote them, bound to its group items
     hole_exprs: Vec<(usize, Expression)>,
     /// Reads no enclosing scope: its value is computed once per run
     uncorrelated: bool,
@@ -2182,21 +2183,25 @@ struct Builder<'e> {
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
-/// expression a scope further out computes into it, and that scope's depth
-type Delegated = (usize, Expression, usize);
+/// expression a scope further out computes into it, that scope's depth,
+/// and the expression as the block wrote it
+type Delegated = (usize, Expression, usize, Expression);
 
 /// What rewriting one block's expressions collects
 #[derive(Default)]
 struct Rewritten {
     holes: Vec<(usize, Expression)>,
+    /// Each hole as the block wrote it, which a grouped statement binds to
+    /// its group items as its output binds a name
+    written: Vec<(usize, Expression)>,
     delegated: Vec<Delegated>,
     /// Whether a hole reads the parent's row
     reads_parent: bool,
     /// Whether anything read is a column of the block's own row
     reads_row: bool,
-    /// The slot of each enclosing column read, by scope depth and column:
-    /// one per column, so two reads of it are one expression
-    outer: FxHashMap<(usize, usize), usize>,
+    /// The slot of each enclosing column read, by scope depth and column,
+    /// and by its spelling when the holes are kept as written
+    outer: FxHashMap<(usize, usize, Option<ExprKey>), usize>,
 }
 
 impl Builder<'_> {
@@ -2425,17 +2430,19 @@ impl Builder<'_> {
                         Ok(chain.column(0, index))
                     }
                     Some((depth, index)) => {
-                        if let Some(&slot) = work.outer.get(&(depth, index)) {
+                        let spelled = self.keeps_holes.then(|| ExprKey::of(expr));
+                        if let Some(&slot) = work.outer.get(&(depth, index, spelled)) {
                             return Ok(slot_parameter(slot));
                         }
                         let slot = self.slot();
-                        work.outer.insert((depth, index), slot);
+                        work.outer.insert((depth, index, spelled), slot);
                         let value = chain.column(depth, index);
                         if depth == 1 {
                             work.reads_parent = true;
                             work.holes.push((slot, value));
+                            work.written.push((slot, expr.clone()));
                         } else {
-                            work.delegated.push((slot, value, depth));
+                            work.delegated.push((slot, value, depth, expr.clone()));
                         }
                         Ok(slot_parameter(slot))
                     }
@@ -2513,12 +2520,13 @@ impl Builder<'_> {
     ) -> Result<Box<SelectStatement>> {
         let (nested_id, delegated, reads_this_row) = self.subquery(sq, chain.scopes, id, form)?;
         work.reads_row |= reads_this_row;
-        for (slot, value, depth) in delegated {
+        for (slot, value, depth, written) in delegated {
             if depth == 2 {
                 work.reads_parent = true;
                 work.holes.push((slot, value));
+                work.written.push((slot, written));
             } else {
-                work.delegated.push((slot, value, depth - 1));
+                work.delegated.push((slot, value, depth - 1, written));
             }
         }
         let mark = Box::new(SelectStatement {
@@ -2574,8 +2582,10 @@ impl Builder<'_> {
                         if reads == 0 || depth == 1 {
                             work.reads_parent |= reads != 0;
                             work.holes.push((slot, value_in_scope));
+                            work.written.push((slot, (**value).clone()));
                         } else {
-                            work.delegated.push((slot, value_in_scope, depth));
+                            work.delegated
+                                .push((slot, value_in_scope, depth, (**value).clone()));
                         }
                         let mut out = infix.clone();
                         let other = self.rewrite(chain, Some(id), other, work)?;
@@ -2908,10 +2918,10 @@ impl Builder<'_> {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        let hole_exprs = if parent.is_none() && (outer[0].tables.len() > 1 || self.keeps_holes) {
-            work.holes.clone()
-        } else {
-            Vec::new()
+        let hole_exprs = match parent {
+            None if self.keeps_holes => work.written.clone(),
+            None if outer[0].tables.len() > 1 => work.holes.clone(),
+            _ => Vec::new(),
         };
         let correlated = work.reads_parent || !work.delegated.is_empty();
         let mut grouping = grouping;
@@ -3917,40 +3927,18 @@ impl PreparedGrouped {
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks));
-        // A group's row holds its GROUP BY items first: a column a hole reads
-        // is the item naming it, and a column no item names cannot be read
-        // Each item binds a column as the grouping binds it over the rows'
-        // columns: a name by its lookup, an expression by the compiler's rule.
-        // The output reads a column from the item naming it, ahead of one
-        // reaching it through an alias or position, the first of each
-        let names = schema.column_names_arc();
-        let name_index = build_column_index_map(&names);
-        let names_ctx = CompileContext::new(&names, &executor.function_registry);
+        // A group's row holds its GROUP BY items first. A hole reads them as
+        // the output reads what the block wrote: an item by its identity,
+        // else by the name the group's row gives it
         let group_items = executor.parse_group_by(stmt, &[])?;
-        let mut group_slots: Vec<String> = (0..group_items.len())
-            .map(|item| format!("\0group item {item}"))
-            .collect();
-        let mut bound = vec![false; names.len()];
-        for named in [true, false] {
-            for (item, group) in group_items.iter().enumerate() {
-                let column = match group {
-                    GroupByItem::Column(name) if named => {
-                        Executor::lookup_column_index(&name.to_lowercase(), &name_index)
-                    }
-                    GroupByItem::Expression { expr, .. } if !named => names_ctx
-                        .reference(expr)
-                        .and_then(|reference| reference.row_column())
-                        .map(usize::from),
-                    _ => None,
-                };
-                if let Some(column) =
-                    column.filter(|&column| !std::mem::replace(&mut bound[column], true))
-                {
-                    group_slots[item] = scope.columns[column].clone();
-                }
-            }
-        }
-        let slots_ctx = CompileContext::new(&group_slots, &executor.function_registry);
+        let names = schema.column_names_arc();
+        let item_names = executor.resolve_group_by_column_names_new(
+            &group_items,
+            &names,
+            &build_column_index_map(&names),
+        );
+        let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
+        let item_ctx = CompileContext::new(&item_names, &executor.function_registry);
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
         for (id, sq) in blocks.subqueries.iter().enumerate() {
             if input.get(id) == Some(&true) {
@@ -3959,16 +3947,23 @@ impl PreparedGrouped {
             }
             let mut grouped = Vec::with_capacity(sq.hole_exprs.len());
             for (slot, hole) in &sq.hole_exprs {
-                let read = match hole {
-                    Expression::Identifier(id) => group_slots
-                        .iter()
-                        .position(|name| *name == id.value_lower)
-                        .map(Hole::Column),
-                    _ => None,
-                };
-                let read = match read {
-                    Some(read) => read,
-                    None => match compile_with(&slots_ctx, hole) {
+                let item = item_keys.get(&ExprKey::of(hole)).copied().or_else(|| {
+                    item_ctx
+                        .reference(hole)
+                        .and_then(|reference| reference.row_column())
+                        .map(usize::from)
+                });
+                let read = match item {
+                    Some(item) => Hole::Column(item),
+                    None => match compile_over_slots(
+                        hole,
+                        &item_names,
+                        &executor.function_registry,
+                        Some(&item_keys),
+                        None,
+                        false,
+                        None,
+                    ) {
                         Ok(program) => Hole::Program(program),
                         Err(_) => return Ok(None),
                     },

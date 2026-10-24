@@ -2857,7 +2857,7 @@ impl Executor {
     }
 
     /// Resolve GROUP BY column names for result (new version supporting GroupByItem)
-    fn resolve_group_by_column_names_new(
+    pub(crate) fn resolve_group_by_column_names_new(
         &self,
         group_by_items: &[GroupByItem],
         columns: &[String],

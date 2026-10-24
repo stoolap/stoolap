@@ -643,8 +643,13 @@ fn a_rolled_up_column_reads_the_cell_of_the_item_naming_it() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // A subtotal reads a's cell, NULL where a rolled up and g did not
-    for (sets, tens) in [("ROLLUP(a, g)", 2), ("ROLLUP(g, a)", 1)] {
+    // A subtotal reads the cell the output reads for t.a, NULL where it rolled up
+    for (sets, tens) in [
+        ("ROLLUP(a, g)", 2),
+        ("ROLLUP(g, a)", 1),
+        ("ROLLUP(a, t.a)", 1),
+        ("ROLLUP(t.a, a)", 2),
+    ] {
         let mut want = rows(
             &db,
             &format!(
