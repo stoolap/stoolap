@@ -6893,9 +6893,15 @@ impl Executor {
             crate::test_failpoints::prepared_ordered_read();
         }
         // A DISTINCT whose output asks no block keeps the first row of each
-        // value as the scan passes it; one that does is told its rows first
-        let distinct = (stmt.distinct
-            && stmt.set_operations.is_empty()
+        // value as the scan passes it; one that does is told its rows first.
+        // A first branch whose set operation removes duplicates is one too
+        let dedups_branch = stmt.set_operations.first().is_some_and(|op| {
+            matches!(
+                op.operation,
+                SetOperationType::Union | SetOperationType::Intersect | SetOperationType::Except
+            )
+        });
+        let distinct = (((stmt.distinct && stmt.set_operations.is_empty()) || dedups_branch)
             && !stmt
                 .columns
                 .iter()
