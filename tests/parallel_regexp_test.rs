@@ -15,17 +15,26 @@
 //! A REGEXP run by several threads at once, each through its own copy of
 //! the program, answers as the pattern matched row by row does.
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::Database;
 
 const ROWS: i64 = 30_000;
+
+// The worker row count is process-wide
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn text(id: i64) -> String {
     format!("v{id}")
 }
 
-fn open(sealed: bool, dir: &tempfile::TempDir) -> Database {
+fn open(name: &str, sealed: bool, dir: &tempfile::TempDir) -> Database {
     let db = match sealed {
-        false => Database::open("memory://parallel_regexp").unwrap(),
+        false => Database::open(&format!("memory://{name}")).unwrap(),
         true => Database::open(&format!("file://{}", dir.path().display())).unwrap(),
     };
     db.execute(
@@ -49,13 +58,14 @@ fn open(sealed: bool, dir: &tempfile::TempDir) -> Database {
 
 #[test]
 fn a_regexp_filter_over_many_rows_answers_row_by_row() {
+    let _guard = serial();
     let pattern = regex::Regex::new("^v1[0-9]*5$").unwrap();
     let want: Vec<i64> = (1..=ROWS)
         .filter(|id| pattern.is_match(&text(*id)))
         .collect();
     let dir = tempfile::tempdir().unwrap();
     for sealed in [false, true] {
-        let db = open(sealed, &dir);
+        let db = open("parallel_regexp_filter", sealed, &dir);
         for sql in [
             "SELECT id FROM t WHERE s REGEXP '^v1[0-9]*5$' ORDER BY id",
             "SELECT id FROM t WHERE NOT (s NOT REGEXP '^v1[0-9]*5$') ORDER BY id",
@@ -73,6 +83,7 @@ fn a_regexp_filter_over_many_rows_answers_row_by_row() {
 
 #[test]
 fn a_regexp_in_a_lag_default_over_many_partitions_answers_row_by_row() {
+    let _guard = serial();
     let ends_in_five = regex::Regex::new("5$").unwrap();
     let want: Vec<(i64, i64)> = (1..=ROWS)
         .map(|id| match id > 20 {
@@ -88,7 +99,7 @@ fn a_regexp_in_a_lag_default_over_many_partitions_answers_row_by_row() {
         })
         .collect();
     let dir = tempfile::tempdir().unwrap();
-    let db = open(false, &dir);
+    let db = open("parallel_regexp_lag", false, &dir);
     let sql = "SELECT id, LAG(id, 1, CASE WHEN s REGEXP '5$' THEN -1 ELSE -2 END) \
                OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id";
     let got: Vec<(i64, i64)> = db
@@ -104,11 +115,41 @@ fn a_regexp_in_a_lag_default_over_many_partitions_answers_row_by_row() {
 
 #[test]
 fn an_error_beside_a_regexp_over_many_rows_is_the_statements() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
-    let db = open(false, &dir);
-    let sql = "SELECT id FROM t WHERE s REGEXP '^v' AND id * 9223372036854775807 > 0 ORDER BY id";
+    let db = open("parallel_regexp_error", false, &dir);
     let rows = db
-        .query(sql, ())
+        .query(OVERFLOWING, ())
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
-    assert!(rows.is_err(), "{sql} overflows on its second row");
+    assert!(rows.is_err(), "{OVERFLOWING} overflows on its second row");
+}
+
+/// Overflows on the row with id 2, through the parallel filter's workers
+const OVERFLOWING: &str =
+    "SELECT id FROM t WHERE s REGEXP '^v' AND id * 9223372036854775807 > 0 ORDER BY id";
+
+#[cfg(all(feature = "parallel", feature = "test-failpoints"))]
+#[test]
+fn a_worker_reads_no_row_after_the_first_error() {
+    use stoolap::test_failpoints::worker_rows_filtered;
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open("parallel_regexp_stops", false, &dir);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let before = worker_rows_filtered();
+    let failed = pool
+        .install(|| {
+            db.query(OVERFLOWING, ())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .is_err();
+    let read = worker_rows_filtered() - before;
+    assert!(failed, "{OVERFLOWING} overflows on its second row");
+    assert!(
+        read <= 2,
+        "one worker read {read} rows, past the error on row 2"
+    );
 }

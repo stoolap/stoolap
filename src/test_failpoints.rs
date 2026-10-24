@@ -1468,6 +1468,19 @@ pub(crate) fn prepared_scalar_next() {
     run_hook(&PREPARED_SCALAR_HOOK);
 }
 
+/// Process-wide: rows a parallel filter's worker copies evaluated
+static WORKER_ROWS_FILTERED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Rows a parallel filter's worker copies evaluated, so far
+pub fn worker_rows_filtered() -> usize {
+    WORKER_ROWS_FILTERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn worker_row_filtered() {
+    WORKER_ROWS_FILTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process-wide: prepared EXISTS blocks probed, keyed sets built, keyed
 /// set lookups, and statements whose rows a keyed set's keys named
 static PREPARED_EXISTS: [std::sync::atomic::AtomicUsize; 4] =

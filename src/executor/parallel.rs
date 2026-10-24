@@ -222,23 +222,34 @@ pub fn parallel_filter(
 
 /// Whether each of `rows` passes `filter`, run by one job per thread over
 /// its own worker, so each worker's regex warms its cache once. The mask is
-/// collected as plain booleans, the first error kept aside: a second
-/// `Result<Vec<bool>>` collect would stop the shared path inlining its own
+/// collected as plain booleans, the first error kept aside and no row read
+/// after it: a second `Result<Vec<bool>>` collect would stop the shared
+/// path inlining its own
 #[cfg(feature = "parallel")]
 #[inline(never)]
 fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stopped = AtomicBool::new(false);
     let failed = std::sync::Mutex::new(None);
     let keep: Vec<bool> = rows
         .par_iter()
         .with_min_len(rows.len().div_ceil(rayon::current_num_threads()))
         .map_init(
             || filter.worker(),
-            |worker, (_, row)| match worker.matches_checked(row) {
-                Ok(keep) => keep,
-                Err(error) => {
-                    let mut failed = failed.lock().unwrap_or_else(|e| e.into_inner());
-                    failed.get_or_insert(error);
-                    false
+            |worker, (_, row)| {
+                if stopped.load(Ordering::Relaxed) {
+                    return false;
+                }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::worker_row_filtered();
+                match worker.matches_checked(row) {
+                    Ok(keep) => keep,
+                    Err(error) => {
+                        stopped.store(true, Ordering::Relaxed);
+                        let mut failed = failed.lock().unwrap_or_else(|e| e.into_inner());
+                        failed.get_or_insert(error);
+                        false
+                    }
                 }
             },
         )
