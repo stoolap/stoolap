@@ -20,10 +20,11 @@
 //! - EXCEPT / EXCEPT ALL
 
 use crate::core::row_vec::RowVec;
-use crate::core::Result;
+use crate::core::{Result, Row};
 use crate::parser::ast::{SetOperation, SetOperationType};
 use crate::storage::traits::QueryResult;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::context::ExecutionContext;
 use super::result::ExecutorResult;
@@ -49,7 +50,7 @@ impl Executor {
             .iter()
             .all(|op| matches!(op.operation, SetOperationType::UnionAll));
 
-        let mut result_rows = if let (true, Some(lim)) = (all_union_all, limit) {
+        let mut running = if let (true, Some(lim)) = (all_union_all, limit) {
             // Only materialize up to limit rows from left side
             let mut rows = RowVec::with_capacity(lim.min(1024));
             let mut left_result = left_result;
@@ -64,9 +65,17 @@ impl Executor {
             if let Some(err) = left_result.last_error() {
                 return Err(err);
             }
-            rows
+            Running::Rows(rows)
+        } else if set_ops
+            .first()
+            .is_some_and(|op| removes_duplicates(&op.operation))
+        {
+            // The first operation keeps one row of each value, so the left side does
+            let mut left = RowSet::default();
+            left.read(left_result)?;
+            Running::Set(left)
         } else {
-            Self::materialize_result(left_result)?
+            Running::Rows(Self::materialize_result(left_result)?)
         };
 
         // Process each set operation in sequence
@@ -74,7 +83,7 @@ impl Executor {
             // For UNION ALL with limit, check if we already have enough rows
             if matches!(set_op.operation, SetOperationType::UnionAll) {
                 if let Some(lim) = limit {
-                    if result_rows.len() >= lim {
+                    if running.len() >= lim {
                         // Already have enough rows, skip remaining set operations
                         break;
                     }
@@ -102,52 +111,20 @@ impl Executor {
             }
 
             // Apply the set operation
-            match &set_op.operation {
+            running = match &set_op.operation {
                 SetOperationType::Union => {
-                    // UNION: combine rows and remove duplicates with proper collision handling
-                    let right_rows = Self::materialize_result(right_result)?;
-                    // Use hash map: hash -> list of indices to detect duplicates with collision handling
-                    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    let mut unique_rows = RowVec::new();
-                    let mut row_id = 0i64;
-
-                    // Add left rows (dedup)
-                    for (_, row) in result_rows {
-                        let hash = hash_row(&row);
-                        let indices = hash_to_indices.entry(hash).or_default();
-
-                        // Check if this exact row already exists (handle hash collisions)
-                        let is_duplicate = indices
-                            .iter()
-                            .any(|&idx| rows_equal(&unique_rows[idx].1, &row));
-
-                        if !is_duplicate {
-                            indices.push(unique_rows.len());
-                            unique_rows.push((row_id, row));
-                            row_id += 1;
-                        }
-                    }
-
-                    // Add right rows (dedup)
-                    for (_, row) in right_rows {
-                        let hash = hash_row(&row);
-                        let indices = hash_to_indices.entry(hash).or_default();
-
-                        // Check if this exact row already exists (handle hash collisions)
-                        let is_duplicate = indices
-                            .iter()
-                            .any(|&idx| rows_equal(&unique_rows[idx].1, &row));
-
-                        if !is_duplicate {
-                            indices.push(unique_rows.len());
-                            unique_rows.push((row_id, row));
-                            row_id += 1;
-                        }
-                    }
-
-                    result_rows = unique_rows;
+                    let mut union = running.into_set();
+                    union.read(right_result)?;
+                    Running::Set(union)
+                }
+                SetOperationType::Intersect | SetOperationType::Except => {
+                    let mut right = RowSet::default();
+                    right.read(right_result)?;
+                    let keep_matches = set_op.operation == SetOperationType::Intersect;
+                    running.retain(|row| right.contains(row) == keep_matches)
                 }
                 SetOperationType::UnionAll => {
+                    let mut result_rows = running.into_rows();
                     // UNION ALL: just concatenate (keep all duplicates)
                     // With limit optimization, only take as many rows as needed
                     if let Some(lim) = limit {
@@ -173,52 +150,10 @@ impl Executor {
                             result_rows.push((row_id, row));
                         }
                     }
-                }
-                SetOperationType::Intersect => {
-                    // INTERSECT: keep only rows that exist in both (dedup) with proper collision handling
-                    let right_rows = Self::materialize_result(right_result)?;
-
-                    // Build hash map: hash -> list of right rows with that hash
-                    let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    for (idx, (_, row)) in right_rows.iter().enumerate() {
-                        let hash = hash_row(row);
-                        right_hash_map.entry(hash).or_default().push(idx);
-                    }
-
-                    // Track which left rows we've already added (for deduplication)
-                    let mut left_seen: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    let mut intersected_rows = RowVec::new();
-                    let mut row_id = 0i64;
-
-                    for (_, left_row) in result_rows {
-                        let hash = hash_row(&left_row);
-
-                        // Check if this hash exists in right side
-                        if let Some(right_indices) = right_hash_map.get(&hash) {
-                            // Check if any right row with this hash actually equals this left row
-                            let has_match = right_indices
-                                .iter()
-                                .any(|&idx| rows_equal(&left_row, &right_rows[idx].1));
-
-                            if has_match {
-                                // Check if we've already added this left row (dedup)
-                                let left_indices = left_seen.entry(hash).or_default();
-                                let is_duplicate = left_indices
-                                    .iter()
-                                    .any(|&idx| rows_equal(&intersected_rows[idx].1, &left_row));
-
-                                if !is_duplicate {
-                                    left_indices.push(intersected_rows.len());
-                                    intersected_rows.push((row_id, left_row));
-                                    row_id += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    result_rows = intersected_rows;
+                    Running::Rows(result_rows)
                 }
                 SetOperationType::IntersectAll => {
+                    let result_rows = running.into_rows();
                     // INTERSECT ALL: keep matching rows with multiplicity with proper collision handling
                     let right_rows = Self::materialize_result(right_result)?;
 
@@ -268,55 +203,10 @@ impl Executor {
                         }
                     }
 
-                    result_rows = intersected_rows;
-                }
-                SetOperationType::Except => {
-                    // EXCEPT: keep left rows not in right (dedup) with proper collision handling
-                    let right_rows = Self::materialize_result(right_result)?;
-
-                    // Build hash map: hash -> list of right row indices
-                    let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    for (idx, (_, row)) in right_rows.iter().enumerate() {
-                        let hash = hash_row(row);
-                        right_hash_map.entry(hash).or_default().push(idx);
-                    }
-
-                    // Track which left rows we've already added (for deduplication)
-                    let mut left_seen: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    let mut excepted_rows = RowVec::new();
-                    let mut row_id = 0i64;
-
-                    for (_, left_row) in result_rows {
-                        let hash = hash_row(&left_row);
-
-                        // Check if this row exists in right side
-                        let exists_in_right = if let Some(right_indices) = right_hash_map.get(&hash)
-                        {
-                            right_indices
-                                .iter()
-                                .any(|&idx| rows_equal(&left_row, &right_rows[idx].1))
-                        } else {
-                            false
-                        };
-
-                        if !exists_in_right {
-                            // Check if we've already added this left row (dedup)
-                            let left_indices = left_seen.entry(hash).or_default();
-                            let is_duplicate = left_indices
-                                .iter()
-                                .any(|&idx| rows_equal(&excepted_rows[idx].1, &left_row));
-
-                            if !is_duplicate {
-                                left_indices.push(excepted_rows.len());
-                                excepted_rows.push((row_id, left_row));
-                                row_id += 1;
-                            }
-                        }
-                    }
-
-                    result_rows = excepted_rows;
+                    Running::Rows(intersected_rows)
                 }
                 SetOperationType::ExceptAll => {
+                    let result_rows = running.into_rows();
                     // EXCEPT ALL: remove matching rows with multiplicity with proper collision handling
                     let right_rows = Self::materialize_result(right_result)?;
 
@@ -370,11 +260,128 @@ impl Executor {
                         }
                     }
 
-                    result_rows = excepted_rows;
+                    Running::Rows(excepted_rows)
                 }
-            }
+            };
         }
 
-        Ok(Box::new(ExecutorResult::new(columns, result_rows)))
+        Ok(Box::new(ExecutorResult::new(columns, running.into_rows())))
+    }
+}
+
+/// Whether the operation answers one row of each value
+fn removes_duplicates(operation: &SetOperationType) -> bool {
+    matches!(
+        operation,
+        SetOperationType::Union | SetOperationType::Intersect | SetOperationType::Except
+    )
+}
+
+/// The rows the operations so far answer, and whether each value is in them once
+enum Running {
+    Rows(RowVec),
+    Distinct(RowVec),
+    Set(RowSet),
+}
+
+impl Running {
+    fn len(&self) -> usize {
+        match self {
+            Running::Rows(rows) | Running::Distinct(rows) => rows.len(),
+            Running::Set(set) => set.rows.len(),
+        }
+    }
+
+    fn into_rows(self) -> RowVec {
+        match self {
+            Running::Rows(rows) | Running::Distinct(rows) => rows,
+            Running::Set(set) => set.rows,
+        }
+    }
+
+    fn into_set(self) -> RowSet {
+        match self {
+            Running::Set(set) => set,
+            Running::Rows(rows) | Running::Distinct(rows) => {
+                let mut set = RowSet::default();
+                for (_, row) in rows {
+                    set.insert(row);
+                }
+                set
+            }
+        }
+    }
+
+    /// One row of each value that `keep` keeps
+    fn retain(self, keep: impl Fn(&Row) -> bool) -> Running {
+        match self {
+            Running::Rows(rows) => {
+                let mut kept = RowSet::default();
+                for (_, row) in rows {
+                    if keep(&row) {
+                        kept.insert(row);
+                    }
+                }
+                Running::Set(kept)
+            }
+            distinct => {
+                let rows = distinct.into_rows().into_iter().map(|(_, row)| row);
+                Running::Distinct((0i64..).zip(rows.filter(|row| keep(row))).collect())
+            }
+        }
+    }
+}
+
+/// One row of each value, in the order first met, by the equality the set
+/// operations compare rows by
+#[derive(Default)]
+struct RowSet {
+    rows: RowVec,
+    by_hash: FxHashMap<u64, SmallVec<[usize; 1]>>,
+}
+
+impl RowSet {
+    fn holds(&self, hash: u64, row: &Row) -> bool {
+        self.by_hash
+            .get(&hash)
+            .is_some_and(|at| at.iter().any(|&i| rows_equal(&self.rows[i].1, row)))
+    }
+
+    fn contains(&self, row: &Row) -> bool {
+        self.holds(hash_row(row), row)
+    }
+
+    /// The place a row of `row`'s value takes, taken for it; None when a
+    /// row of that value is kept
+    fn place(&mut self, row: &Row) -> Option<usize> {
+        let hash = hash_row(row);
+        if self.holds(hash, row) {
+            return None;
+        }
+        let at = self.rows.len();
+        self.by_hash.entry(hash).or_default().push(at);
+        Some(at)
+    }
+
+    /// Keeps `row` unless a row of its value is kept
+    fn insert(&mut self, row: Row) {
+        if let Some(at) = self.place(&row) {
+            self.rows.push((at as i64, row));
+        }
+    }
+
+    /// Keeps a copy of each row of `result` whose value it does not hold;
+    /// a row it holds is read in place and never copied
+    fn read(&mut self, mut result: Box<dyn QueryResult>) -> Result<()> {
+        while result.next() {
+            let row = result.row();
+            if let Some(at) = self.place(row) {
+                self.rows.push((at as i64, row.clone()));
+            }
+        }
+        match result.last_error() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
