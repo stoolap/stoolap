@@ -187,3 +187,35 @@ fn a_qualifier_reads_the_entry_it_names() {
     db.execute("DELETE FROM u AS a WHERE a.id = 3", ()).unwrap();
     assert_eq!(state(&db), "2/15");
 }
+
+#[test]
+fn a_view_keeps_the_quotes_of_a_name_that_needs_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    let read = |db: &Database| -> String {
+        db.query_one(
+            "SELECT x || ' ' || \"r.s\" || ' ' || \"say \"\"hi\"\"\" FROM v",
+            (),
+        )
+        .unwrap()
+    };
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, \"a.b\" INTEGER, \"p q\" INTEGER, \
+             \"say \"\"hi\"\"\" INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 7, 8, 9)", ()).unwrap();
+        db.execute(
+            "CREATE VIEW v AS SELECT \"a.b\" + 0 AS x, \"p q\" AS \"r.s\", t.\"say \"\"hi\"\"\" FROM t",
+            (),
+        )
+        .unwrap();
+        assert_eq!(read(&db), "7 8 9");
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(read(&db), "7 8 9", "after reopening");
+}
