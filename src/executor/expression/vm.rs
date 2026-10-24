@@ -323,7 +323,7 @@ impl ExprVM {
         }
         // !% becomes \% so the pattern reads the wildcard as literal
         let processed = match esc {
-            Some(esc) => process_like_escape_runtime(&pat, esc),
+            Some(esc) => super::compiler::like_escape_pattern(&pat, esc),
             None => pat.to_string(),
         };
         let compiled = Pattern::like(&processed, ci);
@@ -3602,35 +3602,6 @@ impl Default for ExprVM {
 }
 
 /// Extract raw LE f32 bytes from a vector Value, zero-copy for Extension.
-/// Process a LIKE pattern with a custom escape character at runtime.
-///
-/// Converts escaped wildcards (e.g. `!%` with escape `!`) into the
-/// default `\%` escape form that `Pattern::like` understands.
-fn process_like_escape_runtime(pattern: &str, escape: char) -> String {
-    let mut result = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == escape {
-            if let Some(&next) = chars.peek() {
-                if next == '%' || next == '_' || next == escape {
-                    // Convert to default escape form: \% or \_ or \\
-                    result.push('\\');
-                    result.push(chars.next().unwrap());
-                } else {
-                    result.push(c);
-                }
-            } else {
-                result.push(c);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
 /// For Text values, parses and writes into `buf` as fallback.
 #[inline]
 fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u8]> {

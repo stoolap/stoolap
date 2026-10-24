@@ -679,6 +679,21 @@ impl ProgramBuilder {
         self.ops.len() as u16
     }
 
+    /// The value of the one `LoadConst` emitted since `start`, taken back out
+    pub fn take_constant_since(&mut self, start: u16) -> Option<Value> {
+        if self.ops.len() != usize::from(start) + 1 {
+            return None;
+        }
+        match self.ops.pop() {
+            Some(Op::LoadConst(value)) => Some(value),
+            Some(op) => {
+                self.ops.push(op);
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Patch a jump target at a specific position
     pub fn patch_jump(&mut self, pos: usize, target: u16) {
         if pos < self.ops.len() {

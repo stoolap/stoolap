@@ -14,7 +14,8 @@
 
 //! LIKE, ILIKE, GLOB and REGEXP read both sides as the text CAST AS TEXT
 //! gives them, a NULL on either side gives NULL, and every path that
-//! answers them, hot or sealed, indexed or not, answers alike.
+//! answers them, hot or sealed, indexed or not, answers alike. A pattern
+//! answers as its literal, whether a parameter, a column or an expression.
 
 use stoolap::{Database, Value};
 
@@ -375,4 +376,135 @@ fn test_a_wildcard_and_a_trailing_escape_read_alike_on_every_path() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+const ESCAPED_VALUES: &[&str] = &["ab", "a!b", "a%", "ax", "a_x", "a!", "!a", "a!!b", "a!x"];
+
+const ESCAPED_PATTERNS: &[&str] = &["a!b", "a!!b", "a!%", "%!_%", "a!", "!a%", "a!x%"];
+
+/// v holds `ESCAPED_VALUES` as `val`, each row with `pattern` as `pat`
+fn escaped(name: &str, pattern: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute(
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, val TEXT, pat TEXT)",
+        (),
+    )
+    .unwrap();
+    for (id, val) in (1i64..).zip(ESCAPED_VALUES) {
+        db.execute("INSERT INTO v VALUES ($1, $2, $3)", (id, *val, pattern))
+            .unwrap();
+    }
+    db
+}
+
+#[test]
+fn test_the_character_after_the_escape_stands_for_itself() {
+    let db = escaped("pattern_rule_escape_itself", "");
+    let sql = "SELECT id FROM v WHERE val LIKE 'a!b' ESCAPE '!'";
+    assert_eq!(
+        ids(&db, sql, vec![]),
+        Ok(vec![1]),
+        "{sql} matches 'ab' only"
+    );
+    let sql = "SELECT id FROM v WHERE val LIKE 'a!!b' ESCAPE '!'";
+    assert_eq!(
+        ids(&db, sql, vec![]),
+        Ok(vec![2]),
+        "{sql} matches 'a!b' only"
+    );
+}
+
+#[test]
+fn test_every_escaped_pattern_form_answers_as_the_literal() {
+    let mut wrong = Vec::new();
+    for (n, pattern) in ESCAPED_PATTERNS.iter().enumerate() {
+        let db = escaped(&format!("pattern_rule_escape_forms_{n}"), pattern);
+        let literal = format!("SELECT id FROM v WHERE val LIKE '{pattern}' ESCAPE '!'");
+        let want = ids(&db, &literal, vec![]);
+        let text = || vec![Value::text(*pattern)];
+        let forms: [(&str, Vec<Value>); 7] = [
+            ("SELECT id FROM v WHERE val LIKE $1 ESCAPE '!'", text()),
+            (
+                "SELECT id FROM v WHERE val LIKE $1 ESCAPE $2",
+                vec![Value::text(*pattern), Value::text("!")],
+            ),
+            ("SELECT id FROM v WHERE val LIKE pat ESCAPE '!'", vec![]),
+            (
+                "SELECT id FROM v WHERE val LIKE pat || '' ESCAPE '!'",
+                vec![],
+            ),
+            (
+                "SELECT id FROM v WHERE CASE WHEN val LIKE $1 ESCAPE '!' THEN 1 ELSE 0 END = 1",
+                text(),
+            ),
+            (
+                "SELECT id FROM v WHERE NOT (val NOT LIKE $1 ESCAPE '!')",
+                text(),
+            ),
+            (
+                "SELECT id FROM v GROUP BY id, val HAVING val LIKE $1 ESCAPE '!'",
+                text(),
+            ),
+        ];
+        for (sql, params) in forms {
+            let got = ids(&db, sql, params);
+            if got != want {
+                wrong.push(format!(
+                    "{pattern}: {sql} gave {got:?}, the literal {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn test_a_pattern_of_literals_answers_as_the_literal() {
+    let db = escaped("pattern_rule_of_literals", "");
+    for (sql, params, literal) in [
+        (
+            "SELECT id FROM v WHERE val LIKE 'a' || '%'",
+            vec![],
+            "SELECT id FROM v WHERE val LIKE 'a%'",
+        ),
+        (
+            "SELECT id FROM v WHERE val NOT ILIKE UPPER('a!%')",
+            vec![],
+            "SELECT id FROM v WHERE val NOT ILIKE 'A!%'",
+        ),
+        (
+            "SELECT id FROM v WHERE val GLOB LOWER('A*')",
+            vec![],
+            "SELECT id FROM v WHERE val GLOB 'a*'",
+        ),
+        (
+            "SELECT id FROM v WHERE val REGEXP '^a' || '!'",
+            vec![],
+            "SELECT id FROM v WHERE val REGEXP '^a!'",
+        ),
+        (
+            "SELECT id FROM v GROUP BY id, val HAVING val GLOB $1",
+            vec![Value::text("a*")],
+            "SELECT id FROM v GROUP BY id, val HAVING val GLOB 'a*'",
+        ),
+    ] {
+        assert_eq!(ids(&db, sql, params), ids(&db, literal, vec![]), "{sql}");
+    }
+}
+
+#[test]
+fn test_an_invalid_regular_expression_of_literals_fails_as_the_literal() {
+    let db = Database::open("memory://pattern_rule_invalid_regexp").unwrap();
+    db.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, val TEXT)", ())
+        .unwrap();
+    for sql in [
+        "SELECT id FROM v WHERE val REGEXP '['",
+        "SELECT id FROM v WHERE val REGEXP '[' || ''",
+        "SELECT id FROM v WHERE val NOT REGEXP LOWER('[')",
+    ] {
+        assert!(
+            ids(&db, sql, vec![]).is_err(),
+            "{sql} fails over a table without rows"
+        );
+    }
 }
