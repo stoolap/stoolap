@@ -25,9 +25,9 @@ use smallvec::SmallVec;
 
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString};
-use crate::core::predicate::PredicateSet;
+use crate::core::predicate::{kind, KeySide, PredicateSet};
 use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value};
-use crate::functions::aggregate::{CallTemplate, ColumnsKey, GroupedAggregates};
+use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
 use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -36,11 +36,11 @@ use crate::storage::expression::{
 };
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::TableUse;
-use crate::storage::traits::{Engine, Scanner, Table, Transaction};
+use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Scanner, Table, Transaction};
 
 use super::aggregation::{
     aggregate_slot_keys, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
-    SqlAggregateFunction, COUNT_STAR,
+    Modifiers, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -51,6 +51,7 @@ use super::expression::{
     CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, Op,
     QuantifiedMembers, RowFilter, SharedProgram, SubqueryExecutor,
 };
+use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
@@ -2068,6 +2069,8 @@ struct Grouping {
     /// An uncorrelated block without subqueries, as written: run once as a
     /// statement, so every aggregate path the general path admits answers it
     statement: Option<Box<StatementRun>>,
+    /// One group whose every call counts rows, which an index can answer
+    counts_rows: bool,
 }
 
 /// A block run as a statement of its own, with the plan its runs keep, as
@@ -2318,6 +2321,14 @@ impl PreparedComparison {
             PreparedValue::Slot(slot) => params.get(*slot)?.clone(),
         };
         coerce_constant(Some(self.data_type), value)
+    }
+
+    /// Whether the value compared with is NULL, which equals no row
+    fn compares_null(&self, params: &[Value]) -> bool {
+        match &self.value {
+            PreparedValue::Const(value) => value.is_null(),
+            PreparedValue::Slot(slot) => params.get(*slot).is_some_and(Value::is_null),
+        }
     }
 }
 
@@ -3339,6 +3350,15 @@ impl Builder<'_> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // Every call a bare COUNT(*): a FILTER or DISTINCT reads its rows
+        let counts_rows = items.is_empty()
+            && !calls.is_empty()
+            && aggregations
+                .iter()
+                .all(|agg| agg.answered_with(Modifiers::NONE))
+            && calls
+                .iter()
+                .all(|call| matches!(call.instance(), CompiledAggregate::CountStar { .. }));
         Ok(Grouped {
             grouping: Grouping {
                 aggregations,
@@ -3349,6 +3369,7 @@ impl Builder<'_> {
                 having: having_program,
                 keyed: None,
                 statement: None,
+                counts_rows,
             },
             projection,
             reads,
@@ -6763,7 +6784,15 @@ struct BlockState {
     feed_vm: RefCell<Option<ExprVM>>,
     /// The row a primary key equality read by key, kept for the next call
     point_rows: RefCell<RowVec>,
+    /// The row ids an index count reads, kept for the next call
+    count_ids: RefCell<Option<Box<CountIds>>>,
 }
+
+/// The row ids of one index probe and the scratch it reads them with
+type CountIds = (Vec<i64>, ProbeScratch);
+
+/// The most row ids an index count keeps room for between calls
+const COUNT_IDS_KEPT: usize = 4096;
 
 impl<'a> PreparedRunner<'a> {
     /// Every subquery's table as `inner_ctx` reads it, through `through`
@@ -6884,6 +6913,7 @@ impl<'a> PreparedRunner<'a> {
                     grouped: RefCell::new(None),
                     feed_vm: RefCell::new(None),
                     point_rows: RefCell::new(RowVec::new()),
+                    count_ids: RefCell::new(None),
                 })
                 .collect(),
             base,
@@ -8822,6 +8852,9 @@ impl PreparedRunner<'_> {
     /// WHERE passes, fed to its group
     fn group_rows(&self, index: usize, grouping: &Grouping) -> Result<Vec<Row>> {
         self.ctx.check_cancelled()?;
+        if let Some(rows) = self.index_count(index, grouping)? {
+            return Ok(rows);
+        }
         AggregatePath::PreparedBlock.taken();
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_strategy_ran(
@@ -8869,6 +8902,88 @@ impl PreparedRunner<'_> {
             .into_iter()
             .map(|(_, row)| row)
             .collect())
+    }
+
+    /// The slot row of a block whose calls count rows and whose WHERE is one
+    /// equality an index holds, counted from the index's ids as the
+    /// statement sees them; None when the index cannot answer for this call
+    fn index_count(&self, index: usize, grouping: &Grouping) -> Result<Option<Vec<Row>>> {
+        if !grouping.counts_rows {
+            return Ok(None);
+        }
+        let sq = &self.prepared.subqueries[index];
+        let ([equality], true) = (sq.pushdown.as_slice(), sq.pushed_whole) else {
+            return Ok(None);
+        };
+        let table = self.tables[index].as_ref().and_then(BlockInput::table);
+        let Some(table) = table.filter(|_| equality.operator == Operator::Eq) else {
+            return Ok(None);
+        };
+        let params = self.blocks[index].buffer.borrow();
+        // An equality with NULL holds for no row
+        let count = match equality.value(&params) {
+            _ if equality.compares_null(&params) => 0,
+            Some(key) => match self.key_count(index, table, equality, &key)? {
+                Some(count) => count,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        drop(params);
+        AggregatePath::IndexCount.taken();
+        let count = CompiledAggregate::CountStar {
+            count: i64::try_from(count).map_err(|_| Error::internal("a count past i64"))?,
+        };
+        let mut groups = grouping.groups(0);
+        for run in groups.aggregates(0) {
+            run.merge(&count);
+        }
+        Ok(Some(
+            groups
+                .into_rows()?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
+        ))
+    }
+
+    /// How many rows the statement sees holding `key` in the column of
+    /// `equality`, read from the ids its index holds for the key; None when
+    /// the index cannot answer, the key crosses the column's type or the
+    /// index moved while the ids were taken
+    fn key_count(
+        &self,
+        index: usize,
+        table: &dyn Table,
+        equality: &PreparedComparison,
+        key: &Value,
+    ) -> Result<Option<usize>> {
+        let Some(epoch) = table.index_view_epoch() else {
+            return Ok(None);
+        };
+        let column = &table.schema().columns[equality.index];
+        if crosses_inner_key(KeySide::of_kinds(kind::of_type(column.data_type)), key) {
+            return Ok(None);
+        }
+        let mut held = self.blocks[index].count_ids.borrow_mut();
+        let (ids, scratch) = &mut **held.get_or_insert_with(Box::default);
+        ids.clear();
+        // The cap bounds sealed reads; hot ids cost only their visibility
+        let cap = match table.has_sealed_rows() {
+            true => EQUALITY_CANDIDATE_CAP,
+            false => usize::MAX,
+        };
+        let found = table.equality_candidates(&equality.column, key, cap, ids, scratch)?;
+        if !matches!(found, Some(CappedEqual::Copied)) {
+            return Ok(None);
+        }
+        let count =
+            table.count_equal_candidates(ids, equality.index, key, usize::MAX, Some(epoch))?;
+        // A key that held many rows does not keep their room for every call
+        if ids.capacity() > COUNT_IDS_KEPT {
+            *ids = Vec::new();
+        }
+        Ok((table.index_view_epoch() == Some(epoch)).then_some(count))
     }
 
     /// Every candidate of a keyed grouped block fed to its group under its

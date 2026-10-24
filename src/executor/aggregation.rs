@@ -70,6 +70,8 @@ pub(crate) enum AggregatePath {
     CompiledCountDistinct,
     /// A prepared subquery block that aggregates, per call or by key
     PreparedBlock,
+    /// A prepared block's COUNT(*) of one indexed key, counted from the index
+    IndexCount,
 }
 
 impl AggregatePath {
@@ -84,7 +86,7 @@ impl AggregatePath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl AggregatePath {
-    pub(crate) const ALL: [AggregatePath; 12] = [
+    pub(crate) const ALL: [AggregatePath; 13] = [
         AggregatePath::General,
         AggregatePath::Pushdown,
         AggregatePath::FilteredPushdown,
@@ -97,6 +99,7 @@ impl AggregatePath {
         AggregatePath::CompiledCountStar,
         AggregatePath::CompiledCountDistinct,
         AggregatePath::PreparedBlock,
+        AggregatePath::IndexCount,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -113,6 +116,7 @@ impl AggregatePath {
             AggregatePath::CompiledCountStar => "compiled_count_star",
             AggregatePath::CompiledCountDistinct => "compiled_count_distinct",
             AggregatePath::PreparedBlock => "prepared_block",
+            AggregatePath::IndexCount => "index_count",
         }
     }
 }
