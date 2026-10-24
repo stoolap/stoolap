@@ -56,7 +56,7 @@ use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
-use super::result::{ExecutorResult, FilteredResult, ScannerResult};
+use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
@@ -4158,7 +4158,21 @@ impl PreparedProjection {
         run: &PreparedRunner<'_>,
         read: &[usize],
     ) -> Result<Row> {
-        let mut values = Vec::with_capacity(self.outputs.len() + usize::from(FIRST));
+        let values = Vec::with_capacity(self.outputs.len() + usize::from(FIRST));
+        self.project_into::<FIRST>(vm, row, run, read, values)
+    }
+
+    /// [`Self::project_row`] built in `values`, an empty buffer whose room
+    /// a caller may keep across rows
+    #[inline]
+    fn project_into<const FIRST: bool>(
+        &self,
+        vm: &mut ExprVM,
+        row: &Row,
+        run: &PreparedRunner<'_>,
+        read: &[usize],
+        mut values: Vec<Value>,
+    ) -> Result<Row> {
         let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
             .with_subquery_executor(run);
         for (position, output) in self.outputs.iter().enumerate() {
@@ -6690,6 +6704,55 @@ impl Executor {
         })
     }
 
+    /// The output rows a DISTINCT keeps of `scan`, each projected as it
+    /// passes `bound` and held only when its values are new, `wanted` of
+    /// them at most: the scan's rows are read in place, as the general
+    /// path's stream reads them
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn distinct_scan(
+        &self,
+        mut scan: Box<dyn Scanner>,
+        bound: Option<SharedProgram>,
+        runner: &PreparedRunner<'_>,
+        projection: &PreparedProjection,
+        mut distinct: DistinctRows,
+        wanted: Option<usize>,
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
+        let (mut vm, mut filter_vm) = (ExprVM::new(), ExprVM::new());
+        let (mut values, mut kept) = (Vec::new(), RowVec::new());
+        let mut scanned = 0u64;
+        while scan.next() {
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                ctx.check_cancelled()?;
+            }
+            let row = scan.row();
+            if let Some(bound) = &bound {
+                if !runner.matches(&mut filter_vm, bound, row)? {
+                    continue;
+                }
+            }
+            let out = projection.project_into::<false>(&mut vm, row, runner, &[], values)?;
+            if distinct.is_new(&out) {
+                kept.push((kept.len() as i64, out));
+                if wanted.is_some_and(|wanted| kept.len() >= wanted) {
+                    break;
+                }
+                values = Vec::new();
+            } else {
+                values = out.into_values();
+                values.clear();
+            }
+        }
+        if let Some(err) = scan.err() {
+            return Err(err.clone());
+        }
+        ctx.check_cancelled()?;
+        Ok(kept)
+    }
+
     /// Run an in-family statement: scan its table narrowed by the
     /// conjuncts without a subquery, keep the rows the WHERE program
     /// passes, and project them. With no ORDER BY the scan stops once
@@ -6808,6 +6871,17 @@ impl Executor {
         if read_in_order {
             crate::test_failpoints::prepared_ordered_read();
         }
+        // A DISTINCT whose output asks no block keeps the first row of each
+        // value as the scan passes it; one that does is told its rows first
+        let distinct = (stmt.distinct
+            && stmt.set_operations.is_empty()
+            && !prepared.projection.whole_row
+            && !stmt
+                .columns
+                .iter()
+                .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+                .any(mentions_subquery))
+        .then(|| DistinctRows::new(prepared.visible));
         let read = match (ordered, source) {
             (Some(rows), _) => Ok(Passing::Answers(rows)),
             (None, StatementSource::Table(table)) => runner.passing_rows(
@@ -6816,7 +6890,7 @@ impl Executor {
                 &*table,
                 ctx,
                 target,
-                false,
+                distinct.is_some(),
                 &mut keep,
             ),
             (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
@@ -6843,6 +6917,25 @@ impl Executor {
                 &mut keep,
             ),
         };
+        // Only a DISTINCT asks the read for its scan
+        let streamed = |scan: Box<dyn Scanner>, bound| -> Result<PreparedOutput> {
+            let distinct = distinct
+                .ok_or_else(|| Error::internal("a prepared statement streamed its scan"))?;
+            // Without an ORDER BY the first rows a LIMIT keeps end the read
+            let wanted =
+                super::row_count::rows_needed(stmt, ctx).filter(|_| stmt.order_by.is_empty());
+            let projection = &prepared.projection;
+            let rows =
+                self.distinct_scan(scan, bound, &runner, projection, distinct, wanted, ctx)?;
+            let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), rows);
+            Ok((
+                Box::new(result),
+                CompactArc::clone(&output_columns),
+                false,
+                prepared.visible,
+                prepared.layout.clone(),
+            ))
+        };
         let mut rows = match read? {
             Passing::Pruned => {
                 let result = ExecutorResult::with_arc_columns(
@@ -6859,9 +6952,8 @@ impl Executor {
             }
             Passing::Answers(answers) => answers,
             Passing::Read => kept.unwrap_or_else(|| RowVec::with_capacity(64)),
-            Passing::Scan(_) | Passing::Filtered(..) => {
-                return Err(Error::internal("a prepared statement streamed its scan"))
-            }
+            Passing::Scan(scan) => return streamed(scan, None),
+            Passing::Filtered(scan, bound) => return streamed(scan, Some(bound)),
         };
         // Without an ORDER BY the rows LIMIT and OFFSET keep are the ones the
         // output is computed for, whether or not the read stopped early
