@@ -134,3 +134,57 @@ fn a_count_the_index_cannot_answer_counts_its_rows() {
         assert!(!taken.contains(&"index_count"), "{sql} took {taken:?}");
     }
 }
+
+#[test]
+fn a_key_its_column_type_reads_as_null_counts_no_row() {
+    let db = Database::open("memory://index_count_null_after_read").unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, t TEXT)",
+        "INSERT INTO u VALUES (1, 'invalid'), (2, 'true')",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k BOOLEAN)",
+        "CREATE INDEX o_k ON o(k)",
+        "INSERT INTO o VALUES (1, NULL), (2, NULL), (3, TRUE)",
+        "INSERT INTO o SELECT 10 + g.value, FALSE FROM generate_series(1, 2000) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql =
+        "SELECT u.id, (SELECT COUNT(*) FROM o WHERE o.k = u.t) FROM u ORDER BY u.id LIMIT 100";
+    let general =
+        "SELECT DISTINCT u.id, (SELECT COUNT(*) FROM o WHERE o.k = u.t AND o.id + 0 = o.id) \
+                   FROM u ORDER BY u.id LIMIT 100";
+    let (found, _) = pairs(&db, sql);
+    assert_eq!(found, pairs(&db, general).0);
+    assert_eq!(
+        found[0],
+        (1, Some(0)),
+        "'invalid' read as BOOLEAN is NULL, which equals no row"
+    );
+}
+
+#[test]
+fn a_count_through_a_handle_a_column_change_left_behind_fails_as_a_scan_does() {
+    use stoolap::test_failpoints::before_prepared_scalar;
+    let outcome = |block: &str| {
+        let db = setup(&format!("index_count_retyped_{}", block.len()));
+        let writer = db.clone();
+        before_prepared_scalar(move || {
+            writer
+                .execute("ALTER TABLE o MODIFY COLUMN k TEXT", ())
+                .unwrap();
+        });
+        let sql = format!("SELECT u.id, ({block}) FROM u ORDER BY u.id LIMIT 100");
+        match db.query(&sql, ()) {
+            Ok(rows) => match rows.collect::<Result<Vec<_>, _>>() {
+                Ok(rows) => format!("{} rows", rows.len()),
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e.to_string(),
+        }
+    };
+    // The count reads the key's ids; COUNT(v) reads its rows through the scan
+    let counted = outcome("SELECT COUNT(*) FROM o WHERE o.k = u.r");
+    let scanned = outcome("SELECT COUNT(v) FROM o WHERE o.k = u.r");
+    assert_eq!(counted, scanned);
+    assert!(counted.contains("schema"), "{counted}");
+}

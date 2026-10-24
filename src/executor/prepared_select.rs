@@ -8920,9 +8920,11 @@ impl PreparedRunner<'_> {
             return Ok(None);
         };
         let params = self.blocks[index].buffer.borrow();
-        // An equality with NULL holds for no row
+        // An equality with NULL holds for no row, a value read as NULL by
+        // the column's type included
         let count = match equality.value(&params) {
             _ if equality.compares_null(&params) => 0,
+            Some(key) if key.is_null() => 0,
             Some(key) => match self.key_count(index, table, equality, &key)? {
                 Some(count) => count,
                 None => return Ok(None),
