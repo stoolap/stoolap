@@ -161,26 +161,13 @@ fn visit_order_by_inputs<'e>(
 ) -> bool {
     let mut read_all = true;
     for ob in &stmt.order_by {
-        read_all &= visit_key_inputs(&ob.expression, stmt, visit);
+        match bind_order_key(&ob.expression, stmt) {
+            key @ OrderKey::Input(..) => visit(&ob.expression, key),
+            OrderKey::Expression => read_all &= visit_expression_inputs(&ob.expression, visit),
+            OrderKey::Ordinal(_) | OrderKey::Item(_) => {}
+        }
     }
     read_all
-}
-
-/// Each input column one sort key of `stmt` reads, as `visit_order_by_inputs`
-/// visits them
-fn visit_key_inputs<'e>(
-    key: &'e Expression,
-    stmt: &'e SelectStatement,
-    visit: &mut dyn FnMut(&'e Expression, OrderKey<'e>),
-) -> bool {
-    match bind_order_key(key, stmt) {
-        bound @ OrderKey::Input(..) => {
-            visit(key, bound);
-            true
-        }
-        OrderKey::Expression => visit_expression_inputs(key, visit),
-        OrderKey::Ordinal(_) | OrderKey::Item(_) => true,
-    }
 }
 
 /// Each name inside a sort expression, bound as an input column; false as
@@ -1375,6 +1362,16 @@ impl Executor {
             };
             &branch_stmt
         };
+        // A DISTINCT ON key the aggregation or window path computes rides along
+        // as a hidden item, which the visible column count trims after
+        let keyed_stmt;
+        let branch = match Self::with_distinct_on_items(branch, &classification) {
+            Some(keyed) => {
+                keyed_stmt = keyed;
+                &keyed_stmt
+            }
+            None => branch,
+        };
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let (mut result, columns, limit_offset_applied, shape) = if in_family {
@@ -1765,7 +1762,7 @@ impl Executor {
 
                 // Apply DISTINCT ON if active
                 if has_distinct_on {
-                    result = self.distinct_on_result(stmt, ctx, result, layout.map(|l| &**l))?;
+                    result = Self::distinct_on_result(stmt, result)?;
 
                     // Remove extra columns after DISTINCT ON dedup
                     if needs_extra_col_removal {
@@ -1859,7 +1856,7 @@ impl Executor {
         // columns not in SELECT (they may be among the extra ORDER BY columns or
         // the full source columns).
         if !stmt.distinct_on.is_empty() {
-            result = self.distinct_on_result(stmt, ctx, result, layout.as_deref())?;
+            result = Self::distinct_on_result(stmt, result)?;
         }
 
         // Remove extra ORDER BY columns that were added for sorting
@@ -1877,85 +1874,75 @@ impl Executor {
     }
 
     /// `result` deduplicated on `stmt`'s DISTINCT ON keys, each read from the
-    /// column `resolve_distinct_on_indices` binds it to; a key no column holds
-    /// is computed for each row as a sort key is, over the output columns and
-    /// the input columns `layout` names, into a column dropped after
+    /// column `resolve_distinct_on_indices` binds it to
     fn distinct_on_result(
-        &self,
         stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        mut result: Box<dyn QueryResult>,
-        layout: Option<&OutputLayout>,
+        result: Box<dyn QueryResult>,
     ) -> Result<Box<dyn QueryResult>> {
         let columns = result.columns().to_vec();
-        let mapped =
+        let indices =
             Self::resolve_distinct_on_indices(&stmt.distinct_on, &columns, Some(&stmt.columns));
-        if mapped.iter().all(Option::is_some) {
-            let indices = mapped.into_iter().flatten().collect();
-            return Ok(Box::new(DistinctOnResult::new(result, indices)));
-        }
-        let set_operation = !stmt.set_operations.is_empty();
-        let layout = layout.filter(|_| !set_operation);
-        let (_, mut slots) = self.output_slots(stmt, &columns, layout, set_operation);
-        let computed: Vec<&Expression> = stmt
+        let indices = stmt
             .distinct_on
             .iter()
-            .zip(&mapped)
-            .filter(|(_, mapped)| mapped.is_none())
-            .map(|(key, _)| key)
-            .collect();
-        if let Some(layout) = layout {
-            for key in &computed {
-                visit_key_inputs(key, stmt, &mut |column, bound| {
-                    if let Some(position) = layout.position(&bound) {
-                        slots.entry(ExprKey::of(column)).or_insert(position);
-                    }
-                });
-            }
-        }
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        evaluator.init_columns(&columns);
-        evaluator.add_aggregate_aliases(&slots);
-        let programs = computed
-            .iter()
-            .map(|key| evaluator.compile_cached(key))
+            .zip(indices)
+            .map(|(key, index)| {
+                index.ok_or_else(|| {
+                    Error::invalid_argument(format!("DISTINCT ON key {key} names no column"))
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
-        let mut computed_at = columns.len()..;
-        let indices = mapped
-            .iter()
-            .map(|mapped| mapped.unwrap_or_else(|| computed_at.next().unwrap_or_default()))
-            .collect();
-        let mut names = columns.clone();
-        names.extend(
-            computed
+        Ok(Box::new(DistinctOnResult::new(result, indices)))
+    }
+
+    /// `stmt` with each DISTINCT ON key that is no SELECT position or alias
+    /// appended as a hidden item named by its identity, when the aggregation
+    /// or window path computes its rows: a key is then computed where its row
+    /// is, reading groups, aggregates and windows as a SELECT item does
+    fn with_distinct_on_items(
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+    ) -> Option<SelectStatement> {
+        if stmt.distinct_on.is_empty()
+            || !(classification.has_aggregation || classification.has_window_functions)
+        {
+            return None;
+        }
+        let mut columns = stmt.columns.clone();
+        for key in &stmt.distinct_on {
+            let alias = |id: &Identifier| {
+                stmt.columns.iter().any(|c| {
+                    matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower)
+                })
+            };
+            match key {
+                Expression::IntegerLiteral(_) => continue,
+                Expression::Identifier(id) if alias(id) => continue,
+                _ => {}
+            }
+            let name = ExprKey::of(key).hidden_column_name();
+            if columns
                 .iter()
-                .map(|key| ExprKey::of(key).hidden_column_name()),
-        );
-        let mut rows = RowVec::new();
-        let mut values = Vec::with_capacity(programs.len());
-        while result.next() {
-            let mut row = result.take_row();
-            values.clear();
-            for program in &programs {
-                values.push(evaluator.evaluate_program(program, &row)?);
+                .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == name))
+            {
+                continue;
             }
-            for value in values.drain(..) {
-                row.push(value);
-            }
-            rows.push((rows.len() as i64, row));
+            let token = dummy_token(&name, TokenType::Identifier);
+            columns.push(Expression::Aliased(AliasedExpression {
+                token: token.clone(),
+                expression: Box::new(key.clone()),
+                alias: Identifier::new(token, name),
+            }));
         }
-        if let Some(err) = result.last_error() {
-            return Err(err);
-        }
-        let deduped = DistinctOnResult::new(Box::new(ExecutorResult::new(names, rows)), indices);
-        Ok(Box::new(ProjectedResult::new(
-            Box::new(deduped),
-            columns.len(),
-        )))
+        (columns.len() > stmt.columns.len()).then(|| SelectStatement {
+            columns,
+            ..stmt.clone()
+        })
     }
 
     /// Resolve DISTINCT ON expressions to column indices in the result set,
-    /// None for a key no column holds.
+    /// None for a key no column holds; a key carried as a hidden column is
+    /// found by its identity.
     /// Also checks original SELECT expressions to handle aliased columns
     /// (e.g., `SELECT DISTINCT ON (customer) customer AS c` — matches `customer`
     /// against the original identifier behind the `c` alias).
@@ -1967,7 +1954,13 @@ impl Executor {
         distinct_on
             .iter()
             .map(|expr| {
-                match expr {
+                let hidden = || {
+                    let key = ExprKey::of(expr);
+                    result_columns
+                        .iter()
+                        .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
+                };
+                let bound = match expr {
                     Expression::Identifier(id) => {
                         // First: direct match against result column names
                         let direct = result_columns
@@ -2080,7 +2073,8 @@ impl Executor {
                                 result_columns.iter().position(|c| *c == expr_str)
                             })
                     }
-                }
+                };
+                bound.or_else(hidden)
             })
             .collect()
     }
@@ -11625,58 +11619,6 @@ impl Executor {
         layout: Option<&OutputLayout>,
         set_operation: bool,
     ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
-        let (column_slots, aggregate_slots) =
-            self.output_slots(stmt, columns, layout, set_operation);
-
-        // An expression the projection put in a column of its own, named
-        // after it, or one the slots above hold
-        let find_column_for = |expr: &Expression| -> Option<usize> {
-            column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
-                let name = expr.to_string();
-                columns.iter().position(|c| *c == name)
-            })
-        };
-
-        // Each ORDER BY item by its binding: an ordinal by position, a
-        // plain name by the column the layout says holds what it reads,
-        // a name the input lacks or anything else by a column computing it
-        let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
-            let key = bind_order_key(&ob.expression, stmt);
-            match (&key, layout) {
-                (OrderKey::Ordinal(position), _) => Some(*position),
-                (OrderKey::Expression, _) => find_column_for(&ob.expression),
-                (_, Some(layout)) => layout
-                    .position(&key)
-                    .or_else(|| find_column_for(&ob.expression)),
-                // A set operation's rows carry only output names
-                (OrderKey::Item(_) | OrderKey::Input(..), None) => {
-                    debug_assert!(
-                        set_operation,
-                        "rows reached ORDER BY {} without a layout",
-                        ob.expression
-                    );
-                    let name = match &ob.expression {
-                        Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
-                        Expression::Identifier(id) => &id.value_lower,
-                        _ => return None,
-                    };
-                    columns.iter().position(|c| c.eq_ignore_ascii_case(name))
-                }
-            }
-        };
-        let mapped = stmt.order_by.iter().map(try_map_to_column).collect();
-        (mapped, aggregate_slots)
-    }
-
-    /// Each output column by the identity of what computed it, and the
-    /// aggregates among them, which stand in for themselves inside a key
-    fn output_slots(
-        &self,
-        stmt: &SelectStatement,
-        columns: &[String],
-        layout: Option<&OutputLayout>,
-        set_operation: bool,
-    ) -> (FxHashMap<ExprKey, usize>, FxHashMap<ExprKey, usize>) {
         // Each column by the identity of what computed it: the SELECT
         // list in order (unless a star moves the positions), then the
         // aggregates carried only for this sort
@@ -11725,7 +11667,45 @@ impl Executor {
                 aggregate_slots.entry(key).or_insert(i);
             }
         }
-        (column_slots, aggregate_slots)
+
+        // An expression the projection put in a column of its own, named
+        // after it, or one the slots above hold
+        let find_column_for = |expr: &Expression| -> Option<usize> {
+            column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
+                let name = expr.to_string();
+                columns.iter().position(|c| *c == name)
+            })
+        };
+
+        // Each ORDER BY item by its binding: an ordinal by position, a
+        // plain name by the column the layout says holds what it reads,
+        // a name the input lacks or anything else by a column computing it
+        let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
+            let key = bind_order_key(&ob.expression, stmt);
+            match (&key, layout) {
+                (OrderKey::Ordinal(position), _) => Some(*position),
+                (OrderKey::Expression, _) => find_column_for(&ob.expression),
+                (_, Some(layout)) => layout
+                    .position(&key)
+                    .or_else(|| find_column_for(&ob.expression)),
+                // A set operation's rows carry only output names
+                (OrderKey::Item(_) | OrderKey::Input(..), None) => {
+                    debug_assert!(
+                        set_operation,
+                        "rows reached ORDER BY {} without a layout",
+                        ob.expression
+                    );
+                    let name = match &ob.expression {
+                        Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
+                        Expression::Identifier(id) => &id.value_lower,
+                        _ => return None,
+                    };
+                    columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+                }
+            }
+        };
+        let mapped = stmt.order_by.iter().map(try_map_to_column).collect();
+        (mapped, aggregate_slots)
     }
 
     /// Compare two rows for ORDER BY using pre-computed column indices

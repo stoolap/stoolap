@@ -99,7 +99,51 @@ const SHAPES: &[(&str, &str)] = &[
         "SELECT DISTINCT ON (a % 2) a, id FROM t ORDER BY a % 2, id",
         "SELECT DISTINCT ON (k) a, id FROM (SELECT a, id, a % 2 AS k FROM t) s ORDER BY k, id",
     ),
+    (
+        "SELECT DISTINCT ON (SUM(id) % 2) a FROM t GROUP BY a ORDER BY a",
+        "SELECT DISTINCT ON (k) a FROM (SELECT a, SUM(id) % 2 AS k FROM t GROUP BY a) s ORDER BY a",
+    ),
 ];
+
+#[test]
+fn a_key_reads_the_source_and_the_groups_without_an_order_by() {
+    let db = Database::open("memory://distinct_on_key_rule_sources").unwrap();
+    fill(&db);
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO r VALUES (1, 0, 10), (2, 1, 12), (3, 2, 14)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT DISTINCT ON (r.a % 2) r.a AS x, r.b AS a, COUNT(*) FROM r GROUP BY r.a, r.b",
+        "SELECT DISTINCT ON (a % 2) COUNT(*) FROM t GROUP BY a",
+    ] {
+        assert_eq!(rows(&db, sql).len(), 2, "{sql}");
+    }
+}
+
+#[test]
+fn a_rolled_up_key_reads_the_group_item_it_names() {
+    let db = Database::open("memory://distinct_on_key_rule_rollup").unwrap();
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO r VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT DISTINCT ON ((a + 1) % 2) a, a + 1 AS k, COUNT(*) FROM r \
+             GROUP BY ROLLUP(a, a + 1) ORDER BY a, k"
+        ),
+        vec![
+            "Integer(1)|Integer(2)|Integer(1)",
+            "Integer(1)|Null(Null)|Integer(1)"
+        ]
+    );
+}
 
 #[test]
 fn a_key_no_column_holds_is_computed_for_each_output_row() {
