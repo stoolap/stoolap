@@ -231,3 +231,22 @@ fn rows_group_by_one_key_equality_everywhere() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn a_qualified_grouping_set_column_is_its_group_item_whatever_its_letters() {
+    let db = Database::open("memory://grouping_identity_unicode_qualified").unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"Σ\" INTEGER, \"ΑΣ\" INTEGER)",
+        "INSERT INTO u VALUES (1, 10, 10), (2, 20, 20)",
+        "CREATE TABLE v (id INTEGER PRIMARY KEY)",
+        "INSERT INTO v VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for column in ["a.\"Σ\"", "a.\"ΑΣ\"", "a.id"] {
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM u AS a CROSS JOIN v GROUP BY GROUPING SETS (({column}))"
+        );
+        assert_eq!(rows(&db, &sql), ["n:1", "n:1"], "{sql}");
+    }
+}

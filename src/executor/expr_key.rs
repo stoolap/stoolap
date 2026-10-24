@@ -138,6 +138,22 @@ impl KeyHasher {
         self.write_u32(u32::MAX);
     }
 
+    /// The name `qualifier.name`, lowered as one text as [`Self::name`] lowers
+    /// the dotted name a GROUP BY keeps, which a lowering by parts can miss
+    fn dotted_name(&mut self, qualifier: &str, name: &str) {
+        if !(qualifier.is_ascii() && name.is_ascii()) {
+            return self.name(&format!("{qualifier}.{name}"));
+        }
+        for b in qualifier
+            .bytes()
+            .chain(std::iter::once(b'.'))
+            .chain(name.bytes())
+        {
+            self.write_u32(u32::from(b.to_ascii_lowercase()));
+        }
+        self.write_u32(u32::MAX);
+    }
+
     fn flag(&mut self, flag: bool) {
         self.write_u8(flag as u8);
     }
@@ -236,17 +252,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
         // A GROUP BY keeps a qualified column as its dotted name
         Expression::QualifiedIdentifier(qid) => {
             hasher.tag(b'I');
-            for c in qid
-                .qualifier
-                .value_lower
-                .chars()
-                .chain(std::iter::once('.'))
-                .chain(qid.name.value_lower.chars())
-                .flat_map(char::to_lowercase)
-            {
-                hasher.write_u32(c as u32);
-            }
-            hasher.write_u32(u32::MAX);
+            hasher.dotted_name(&qid.qualifier.value, &qid.name.value);
         }
         Expression::IntegerLiteral(lit) => {
             hasher.tag(b'N');
@@ -617,6 +623,9 @@ mod tests {
         assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
         // Lowered as the name's value_lower is, a final sigma to its own letter
         assert_eq!(ExprKey::column("ΟΣ"), select_key("\"ΟΣ\""));
+        // A qualified column as the dotted name a GROUP BY keeps for it
+        assert_eq!(ExprKey::column("a.Σ"), select_key("a.\"Σ\""));
+        assert_eq!(ExprKey::column("ΑΣ.b"), select_key("\"ΑΣ\".b"));
         assert_ne!(select_key("\"ΟΣ\""), select_key("\"οσ\""));
     }
 
