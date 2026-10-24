@@ -2691,3 +2691,133 @@ fn test_select_list_exists_in_and_all_answer_as_their_literals() {
         assert_eq!(answers(sql), answers(literal), "{sql}");
     }
 }
+
+#[test]
+fn test_an_ordered_limit_asks_its_select_list_blocks_of_the_rows_returned() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_ordered_limit_rows").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO u VALUES (1, 1, 100), (2, 2, 200), (3, 2, 300), (4, 3, 400), (5, 4, 500)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Row 2's block answers more than one row: no row it reaches is returned
+    for (sql, want) in [
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t ORDER BY t.id LIMIT 1",
+            vec![1],
+        ),
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t ORDER BY t.a LIMIT 1",
+            vec![1],
+        ),
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t \
+             ORDER BY t.a DESC LIMIT 2",
+            vec![4, 3],
+        ),
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t \
+             ORDER BY t.a DESC LIMIT 1 OFFSET 1",
+            vec![3],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let (found, runs) = ids(&db, sql, ());
+        assert_eq!(found, want, "{sql}");
+        assert_eq!(runs, want.len(), "{sql}: one run per row returned");
+    }
+}
+
+#[test]
+fn test_a_table_function_without_where_or_order_by_generates_the_rows_returned() {
+    let _guard = serial();
+    let db = setup("prepared_tvf_first_rows");
+    const SQL: &str = "SELECT value, (SELECT 1) FROM generate_series(1, 10000001) LIMIT 2 OFFSET 1";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
+    let before = tvf_rows();
+    assert_eq!(ids(&db, SQL, ()).0, vec![2, 3]);
+    assert_eq!(tvf_rows() - before, 3, "LIMIT and OFFSET, of ten million");
+}
+
+#[test]
+fn test_an_order_by_subquery_naming_a_select_alias_inside_it_is_not_prepared() {
+    let _guard = serial();
+    let db = setup("prepared_order_by_alias_inside");
+    for sql in [
+        "SELECT id AS z FROM t ORDER BY (SELECT z + t.id) DESC",
+        "SELECT t.id AS z FROM t JOIN u ON u.id = t.id ORDER BY (SELECT z + t.id) DESC",
+    ] {
+        assert_eq!(
+            prepared_line(&db, sql),
+            "Prepared: no (an ORDER BY subquery that names a SELECT alias)",
+            "{sql}"
+        );
+        assert!(db.query(sql, ()).is_ok(), "{sql}");
+    }
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id AS z FROM t ORDER BY (SELECT z + t.id) DESC",
+            ()
+        )
+        .0,
+        vec![6, 5, 4, 3, 2, 1]
+    );
+}
+
+#[test]
+fn test_an_order_by_key_repeating_a_select_item_reads_its_value() {
+    let _guard = serial();
+    let db = setup("prepared_order_by_repeated_item");
+    const SQL: &str = "SELECT id, (SELECT RANDOM() FROM u WHERE u.id = t.id) FROM t \
+                       ORDER BY (SELECT RANDOM() FROM u WHERE u.id = t.id), id";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
+    let before = random_draws();
+    let rows: Vec<(i64, Option<f64>)> = db
+        .query(SQL, ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        random_draws() - before,
+        5,
+        "one draw per row u holds a key of"
+    );
+    let drawn: Vec<f64> = rows.iter().filter_map(|(_, value)| *value).collect();
+    assert!(
+        drawn.windows(2).all(|pair| pair[0] <= pair[1]),
+        "ordered by the values returned: {rows:?}"
+    );
+}
+
+#[test]
+fn test_a_select_list_block_over_values_is_asked_of_the_rows_limit_and_offset_keep() {
+    let _guard = serial();
+    let db = setup("prepared_values_limit_rows");
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1, 1), (2, 2), (3, 2)", ())
+        .unwrap();
+    for (sql, want) in [
+        (
+            "SELECT n, (SELECT d.id FROM d WHERE d.k = q.n) FROM (VALUES (2), (1)) AS q(n) LIMIT 0",
+            vec![],
+        ),
+        (
+            "SELECT n, (SELECT d.id FROM d WHERE d.k = q.n) FROM (VALUES (2), (1)) AS q(n) OFFSET 1",
+            vec![1],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let (found, runs) = ids(&db, sql, ());
+        assert_eq!(found, want, "{sql}");
+        assert_eq!(runs, want.len(), "{sql}: one run per row returned");
+    }
+}

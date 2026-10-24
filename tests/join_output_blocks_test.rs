@@ -318,7 +318,7 @@ fn a_join_output_s_subqueries_answer_in_every_context() {
         (
             "SELECT l.id AS x, r.id FROM l JOIN r ON l.k = r.k \
              ORDER BY (SELECT s.a FROM s WHERE s.id = x), 1, 2",
-            true,
+            false,
         ),
         (
             "SELECT l.id, r.id, (SELECT s.a FROM s WHERE s.id = l.id) FROM l JOIN r USING (k) \

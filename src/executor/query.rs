@@ -340,7 +340,7 @@ use super::operators::index_nested_loop::{
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin, WhereSite};
-use super::prepared_select::{names_any, JoinBlocks, OutOfFamily};
+use super::prepared_select::{names_any_within, JoinBlocks, OutOfFamily};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
@@ -1438,13 +1438,6 @@ impl Executor {
         // Skip ORDER BY if storage-level optimization already applied sorting + LIMIT/OFFSET
         // classification was already obtained at entry point and passed through
         if !stmt.order_by.is_empty() && !limit_offset_applied {
-            // Each column by the identity of what computed it: the SELECT
-            // list in order (unless a star moves the positions), then the
-            // aggregates carried only for this sort
-            let mut column_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
-            // Only aggregates stand in for themselves inside a sort key: a
-            // literal or a name there is read as written
-            let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
             // A set operation's rows come from other branches too: there a
             // column stands for a sort key only when aliased or an aggregate,
             // as on main, and aggregates are not read inside keys
@@ -1452,87 +1445,9 @@ impl Executor {
             // The rows' layout names each column's source; a set operation's
             // rows are the branches' too, so there only output names stand
             let layout = layout.as_ref().filter(|_| !set_operation);
-            let star = stmt
-                .columns
-                .iter()
-                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
-            for (i, col) in stmt.columns.iter().enumerate() {
-                // No sort key names a star
-                if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
-                    continue;
-                }
-                if set_operation
-                    && !matches!(col, Expression::Aliased(_))
-                    && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
-                {
-                    continue;
-                }
-                // An item's column by the layout; without one, by its index
-                // while no star moves the positions
-                let Some(position) = (match layout {
-                    Some(layout) => layout.item_position(i),
-                    None => (!star).then_some(i),
-                }) else {
-                    continue;
-                };
-                let key = ExprKey::of(col);
-                column_slots.entry(key).or_insert(position);
-                let inner = match col {
-                    Expression::Aliased(aliased) => aliased.expression.as_ref(),
-                    other => other,
-                };
-                if !set_operation
-                    && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
-                {
-                    aggregate_slots.entry(key).or_insert(position);
-                }
-            }
-            for (i, name) in columns.iter().enumerate() {
-                if let Some(key) = ExprKey::from_hidden_column_name(name) {
-                    column_slots.entry(key).or_insert(i);
-                    aggregate_slots.entry(key).or_insert(i);
-                }
-            }
-
-            // An expression the projection put in a column of its own, named
-            // after it, or one the slots above hold
-            let find_column_for = |expr: &Expression| -> Option<usize> {
-                column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
-                    let name = expr.to_string();
-                    columns.iter().position(|c| *c == name)
-                })
-            };
-
-            // Each ORDER BY item by its binding: an ordinal by position, a
-            // plain name by the column the layout says holds what it reads,
-            // a name the input lacks or anything else by a column computing it
-            let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
-                let key = bind_order_key(&ob.expression, stmt);
-                match (&key, layout) {
-                    (OrderKey::Ordinal(position), _) => Some(*position),
-                    (OrderKey::Expression, _) => find_column_for(&ob.expression),
-                    (_, Some(layout)) => layout
-                        .position(&key)
-                        .or_else(|| find_column_for(&ob.expression)),
-                    // A set operation's rows carry only output names
-                    (OrderKey::Item(_) | OrderKey::Input(..), None) => {
-                        debug_assert!(
-                            set_operation,
-                            "rows reached ORDER BY {} without a layout",
-                            ob.expression
-                        );
-                        let name = match &ob.expression {
-                            Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
-                            Expression::Identifier(id) => &id.value_lower,
-                            _ => return None,
-                        };
-                        columns.iter().position(|c| c.eq_ignore_ascii_case(name))
-                    }
-                }
-            };
             // Mapped once: the correlated path below asks for every row
-            let mapped_columns: Vec<Option<usize>> =
-                stmt.order_by.iter().map(try_map_to_column).collect();
+            let (mapped_columns, aggregate_slots) =
+                self.order_by_columns(stmt, &columns, layout.map(|l| &**l), set_operation);
 
             // Check if any ORDER BY expression needs evaluation (not just column refs or position)
             let has_complex_order_by = mapped_columns.iter().any(Option::is_none);
@@ -5074,7 +4989,7 @@ impl Executor {
             .collect();
         if stmt.order_by.iter().any(|ob| {
             Self::has_subqueries(&ob.expression)
-                && names_any(&ob.expression, &|name| aliases.contains(&name))
+                && names_any_within(&ob.expression, &|name| aliases.contains(&name))
         }) {
             return Err("an ORDER BY subquery that names a SELECT alias");
         }
@@ -11614,10 +11529,109 @@ impl Executor {
         Some((indices, names))
     }
 
+    /// Each ORDER BY item's column among `columns`, the rows `layout` laid
+    /// out, None when no column holds it; and the aggregate columns a sort
+    /// key may read by identity
+    pub(crate) fn order_by_columns(
+        &self,
+        stmt: &SelectStatement,
+        columns: &[String],
+        layout: Option<&OutputLayout>,
+        set_operation: bool,
+    ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
+        // Each column by the identity of what computed it: the SELECT
+        // list in order (unless a star moves the positions), then the
+        // aggregates carried only for this sort
+        let mut column_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+        // Only aggregates stand in for themselves inside a sort key: a
+        // literal or a name there is read as written
+        let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+        let star = stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+        for (i, col) in stmt.columns.iter().enumerate() {
+            // No sort key names a star
+            if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
+                continue;
+            }
+            if set_operation
+                && !matches!(col, Expression::Aliased(_))
+                && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+            {
+                continue;
+            }
+            // An item's column by the layout; without one, by its index
+            // while no star moves the positions
+            let Some(position) = (match layout {
+                Some(layout) => layout.item_position(i),
+                None => (!star).then_some(i),
+            }) else {
+                continue;
+            };
+            let key = ExprKey::of(col);
+            column_slots.entry(key).or_insert(position);
+            let inner = match col {
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                other => other,
+            };
+            if !set_operation
+                && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+            {
+                aggregate_slots.entry(key).or_insert(position);
+            }
+        }
+        for (i, name) in columns.iter().enumerate() {
+            if let Some(key) = ExprKey::from_hidden_column_name(name) {
+                column_slots.entry(key).or_insert(i);
+                aggregate_slots.entry(key).or_insert(i);
+            }
+        }
+
+        // An expression the projection put in a column of its own, named
+        // after it, or one the slots above hold
+        let find_column_for = |expr: &Expression| -> Option<usize> {
+            column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
+                let name = expr.to_string();
+                columns.iter().position(|c| *c == name)
+            })
+        };
+
+        // Each ORDER BY item by its binding: an ordinal by position, a
+        // plain name by the column the layout says holds what it reads,
+        // a name the input lacks or anything else by a column computing it
+        let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
+            let key = bind_order_key(&ob.expression, stmt);
+            match (&key, layout) {
+                (OrderKey::Ordinal(position), _) => Some(*position),
+                (OrderKey::Expression, _) => find_column_for(&ob.expression),
+                (_, Some(layout)) => layout
+                    .position(&key)
+                    .or_else(|| find_column_for(&ob.expression)),
+                // A set operation's rows carry only output names
+                (OrderKey::Item(_) | OrderKey::Input(..), None) => {
+                    debug_assert!(
+                        set_operation,
+                        "rows reached ORDER BY {} without a layout",
+                        ob.expression
+                    );
+                    let name = match &ob.expression {
+                        Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
+                        Expression::Identifier(id) => &id.value_lower,
+                        _ => return None,
+                    };
+                    columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+                }
+            }
+        };
+        let mapped = stmt.order_by.iter().map(try_map_to_column).collect();
+        (mapped, aggregate_slots)
+    }
+
     /// Compare two rows for ORDER BY using pre-computed column indices
     /// This avoids string allocations during sort comparisons
     #[inline]
-    fn compare_rows_with_indices(
+    pub(crate) fn compare_rows_with_indices(
         a: &Row,
         b: &Row,
         order_specs: &[(Option<usize>, bool, Option<bool>)],
