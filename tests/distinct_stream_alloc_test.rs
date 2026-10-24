@@ -146,3 +146,30 @@ fn a_streamed_distinct_dedups_its_rows_once() {
         "{allocations} allocations for 20000 distinct rows"
     );
 }
+
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_first_branch_whose_set_operation_dedups_holds_the_rows_it_keeps() {
+    let db = table("distinct_stream_alloc_set_branch");
+    for (sql, rows) in [
+        (
+            "SELECT g FROM d WHERE id > (SELECT MIN(id) FROM d) - 1 UNION SELECT g FROM d WHERE id < 3",
+            4,
+        ),
+        (
+            "SELECT g FROM d WHERE id > (SELECT MIN(id) FROM d) - 1 INTERSECT SELECT g FROM d WHERE id < 3",
+            2,
+        ),
+        (
+            "SELECT g FROM d WHERE id > (SELECT MIN(id) FROM d) - 1 EXCEPT SELECT g FROM d WHERE id < 3",
+            2,
+        ),
+    ] {
+        let (count, allocations) = allocations(&db, sql);
+        assert_eq!(count, rows, "{sql}");
+        assert!(
+            allocations < 2000,
+            "{allocations} allocations for {rows} rows kept of 20000: {sql}"
+        );
+    }
+}
