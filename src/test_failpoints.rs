@@ -1424,6 +1424,20 @@ pub(crate) fn prepared_select_built() {
     PREPARED_SELECTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+thread_local! {
+    static PREPARED_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The value slots, parameters included, of the blocks this thread
+/// prepared last, which every run's buffers hold
+pub fn prepared_slot_count() -> usize {
+    PREPARED_SLOTS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn prepared_slots(count: usize) {
+    PREPARED_SLOTS.with(|slots| slots.set(count));
+}
+
 /// Process-wide: prepared statements that read their rows in ORDER BY
 /// order through an index or a top-k scan
 static PREPARED_ORDERED_READS: std::sync::atomic::AtomicUsize =

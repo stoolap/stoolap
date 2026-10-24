@@ -253,7 +253,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "block_order_by_limit",
         "SELECT id FROM t WHERE a = (SELECT x FROM u WHERE u.x >= t.a ORDER BY x LIMIT 1)",
         "SELECT id FROM t WHERE a IN (1, 2)",
-        Old("block ORDER BY and LIMIT"),
+        Prepared,
     ),
     (
         "tuple_in",

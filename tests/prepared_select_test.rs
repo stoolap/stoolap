@@ -36,9 +36,9 @@ const S1: &str =
     "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id) ORDER BY id";
 const S2: &str =
     "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id + 1) ORDER BY id";
-// The same questions with an inner ORDER BY, which keeps them out of the family
-const S1_OLD: &str = "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id ORDER BY v) ORDER BY id";
-const S2_OLD: &str = "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id + 1 ORDER BY v) ORDER BY id";
+// The same questions with an inner ORDER BY position, which keeps them out of the family
+const S1_OLD: &str = "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1) ORDER BY id";
+const S2_OLD: &str = "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id + 1 ORDER BY 1) ORDER BY id";
 
 fn setup(name: &str) -> Database {
     let db = Database::open(&format!("memory://{name}")).unwrap();
@@ -265,7 +265,7 @@ fn test_scalar_subquery_results() {
     assert!(err.contains("more than one row"), "{err}");
     assert!(runs >= 1, "the error came from the prepared path");
     let multi_old =
-        "SELECT id FROM t WHERE a > (SELECT v FROM m WHERE m.k = t.id ORDER BY v) ORDER BY id";
+        "SELECT id FROM t WHERE a > (SELECT v FROM m WHERE m.k = t.id ORDER BY 1) ORDER BY id";
     assert!(error(&db, multi_old, ()).0.contains("more than one row"));
 }
 
@@ -389,7 +389,7 @@ fn test_projection_and_order_by_run_prepared() {
     let _guard = serial();
     let db = setup("prepared_projection");
     let present = "(SELECT v FROM u WHERE u.id = t.id) IS NOT NULL";
-    let present_old = "(SELECT v FROM u WHERE u.id = t.id ORDER BY v) IS NOT NULL";
+    let present_old = "(SELECT v FROM u WHERE u.id = t.id ORDER BY 1) IS NOT NULL";
     let names = vec!["id".to_string(), "d".to_string()];
     for (order, expected) in [
         ("a DESC", vec![(6, 120), (5, 100), (2, 40), (1, 20)]),
@@ -468,7 +468,7 @@ fn test_expressions_see_the_transaction_id() {
                AND a > (SELECT v FROM u WHERE u.id = t.id) \
                AND CURRENT_TRANSACTION_ID() IS NOT NULL ORDER BY a";
     let old = "SELECT id, CURRENT_TRANSACTION_ID() FROM t WHERE b = 1 \
-               AND a > (SELECT v FROM u WHERE u.id = t.id ORDER BY v) \
+               AND a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1) \
                AND CURRENT_TRANSACTION_ID() IS NOT NULL ORDER BY a";
     db.execute("BEGIN", ()).unwrap();
     let scalar_before = prepared_scalar_runs();
@@ -615,7 +615,7 @@ fn test_a_reused_comparison_takes_each_value() {
     db.execute("INSERT INTO q VALUES (1, 1, 0), (2, 2, 20)", ())
         .unwrap();
     let sql = "SELECT id FROM o WHERE a > (SELECT v FROM q WHERE q.k = o.s) ORDER BY id";
-    let old = "SELECT id FROM o WHERE a > (SELECT v FROM q WHERE q.k = o.s ORDER BY v) ORDER BY id";
+    let old = "SELECT id FROM o WHERE a > (SELECT v FROM q WHERE q.k = o.s ORDER BY 1) ORDER BY id";
     let expected = ids(&db, old, ()).0;
     assert_eq!(expected, vec![1, 4], "the old path's answer");
     assert_eq!(
@@ -628,10 +628,10 @@ fn test_a_reused_comparison_takes_each_value() {
 const NESTED: &str = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
                       AND u.v < (SELECT w.x FROM w WHERE w.k = u.id AND w.z = t.b AND w.x > $1)) \
                       ORDER BY id";
-// The same question with an inner ORDER BY in the middle scope, out of the family
+// The same question with an inner ORDER BY position in the middle scope, out of the family
 const NESTED_OLD: &str = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
                           AND u.v < (SELECT w.x FROM w WHERE w.k = u.id AND w.z = t.b AND w.x > $1) \
-                          ORDER BY v) ORDER BY id";
+                          ORDER BY 1) ORDER BY id";
 
 fn nested_setup(name: &str) -> Database {
     let db = setup(name);
@@ -735,7 +735,7 @@ fn test_one_value_reading_two_enclosing_scopes() {
     let sql = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
                AND u.v < (SELECT s.x FROM s WHERE s.k = u.id + t.b)) ORDER BY id";
     let old = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
-               AND u.v < (SELECT s.x FROM s WHERE s.k = u.id + t.b) ORDER BY v) ORDER BY id";
+               AND u.v < (SELECT s.x FROM s WHERE s.k = u.id + t.b) ORDER BY 1) ORDER BY id";
     assert_eq!(
         ids(&db, sql, ()),
         (vec![1, 6], 11),
@@ -1039,11 +1039,11 @@ fn test_classifier_rules() {
     };
     for sql in &yes {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-        // An inner ORDER BY keeps the same question out of the family
+        // An inner ORDER BY position keeps the same question out of the family
         let old = sql
-            .replace(" = t.id)", " = t.id ORDER BY v)")
-            .replace("u.id = 2)", "u.id = 2 ORDER BY v)");
-        let old = old.replace(" = o.id)", " = o.id ORDER BY v)");
+            .replace(" = t.id)", " = t.id ORDER BY 1)")
+            .replace("u.id = 2)", "u.id = 2 ORDER BY 1)");
+        let old = old.replace(" = o.id)", " = o.id ORDER BY 1)");
         assert!(
             prepared_line(&db, &old).starts_with("Prepared: no"),
             "{old}"
@@ -1078,11 +1078,16 @@ fn test_classifier_rules() {
         (
             "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"
                 .to_string(),
-            "a subquery block with a clause outside the family",
+            "a grouped subquery block with ORDER BY, LIMIT or OFFSET",
         ),
         (
-            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT 1)".to_string(),
-            "a subquery block with a clause outside the family",
+            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1 LIMIT 1)"
+                .to_string(),
+            "an ORDER BY position in a subquery block",
+        ),
+        (
+            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT t.a)".to_string(),
+            "a subquery block's LIMIT or OFFSET that is not a literal or a parameter",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT v, id FROM u WHERE u.id = t.id)".to_string(),
@@ -1372,7 +1377,7 @@ fn test_a_whole_pushed_inner_where_is_not_checked_again() {
     for (inner, param) in [("u.b = $1", "true"), ("u.ts = $1", "2024-01-02 03:04:05")] {
         let sql = format!("SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner})");
         let old = format!(
-            "SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner} ORDER BY u.id)"
+            "SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner} ORDER BY 1)"
         );
         let expected = ids(&db, &old, (param,)).0;
         assert_eq!(
@@ -1437,7 +1442,7 @@ fn test_an_order_by_key_reading_an_alias_is_prepared() {
     let db = setup("prepared_order_alias");
     let sql = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) IS NOT NULL \
                ORDER BY x % 3, id";
-    let old = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id ORDER BY v) \
+    let old = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id ORDER BY 1) \
                IS NOT NULL ORDER BY x % 3, id";
     let expected = pairs(&db, old);
     let before = general_path_hits(GeneralPath::OrderByEvaluator);
@@ -1664,7 +1669,7 @@ fn test_a_subquery_value_against_a_boolean_column_reads_as_the_column() {
     let sql = "SELECT t.id FROM t WHERE t.id = \
                (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1))";
     let old = "SELECT t.id FROM t WHERE t.id = \
-               (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1) ORDER BY u.id)";
+               (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1) ORDER BY 1)";
     assert_eq!(ids(&db, old, ()).0, vec![1], "the general path");
     let (found, runs) = ids(&db, sql, ());
     assert!(runs >= 1, "ran prepared");
