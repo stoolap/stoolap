@@ -2065,7 +2065,7 @@ impl Executor {
                     }
                     Expression::QualifiedIdentifier(qi) => {
                         // Match table.column — try full qualified name first
-                        let full = format!("{}.{}", qi.qualifier, qi.name);
+                        let full = format!("{}.{}", qi.qualifier.value, qi.name.value);
                         let qualified_match = result_columns
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(&full));

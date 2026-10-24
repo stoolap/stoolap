@@ -276,7 +276,9 @@ impl Executor {
         // Get column name
         let col_name = match col_expr {
             Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(q) => format!("{}.{}", q.qualifier, q.name),
+            Expression::QualifiedIdentifier(q) => {
+                format!("{}.{}", q.qualifier.value, q.name.value)
+            }
             _ => return None,
         };
 

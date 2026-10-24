@@ -219,3 +219,30 @@ fn a_view_keeps_the_quotes_of_a_name_that_needs_them() {
     let db = Database::open(&dsn).unwrap();
     assert_eq!(read(&db), "7 8 9", "after reopening");
 }
+
+#[test]
+fn a_qualified_name_that_needs_quotes_matches_its_column() {
+    let db = Database::open("memory://qualifier_scope_quoted_match").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1, 7), (2, 7)",
+        "INSERT INTO u VALUES (1), (2)",
+        "CREATE TABLE w (\"id x\" INTEGER PRIMARY KEY, \"a.b\" INTEGER)",
+        "INSERT INTO w VALUES (1, 10), (2, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let rows: i64 = db
+        .query(
+            "SELECT DISTINCT ON (\"q q\".x) * FROM t AS \"q q\" JOIN u ON \"q q\".id = u.id",
+            (),
+        )
+        .unwrap()
+        .count() as i64;
+    assert_eq!(rows, 1);
+    let found: i64 = db
+        .query_one("SELECT \"a.b\" FROM w WHERE w.\"id x\" = 2", ())
+        .unwrap();
+    assert_eq!(found, 20);
+}
