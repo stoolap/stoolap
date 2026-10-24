@@ -240,12 +240,12 @@ fn heavy_key_tables(name: &str, using: &str) -> Database {
     db
 }
 
-/// The EXISTS cap leaves a correlated COUNT to count a key of any size
-/// through the index
+/// The EXISTS cap leaves a correlated COUNT, a prepared block, to count a
+/// key of any size
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_correlated_count_still_counts_a_key_held_by_many_rows_from_the_index() {
-    use stoolap::test_failpoints::equality_candidate_ids_copied_count;
+    use stoolap::test_failpoints::prepared_scalar_runs;
     let db = heavy_key_tables("count_heavy_key", "BTREE");
     let sql = "SELECT o.id, (SELECT COUNT(*) FROM {i} WHERE {i}.c = o.k) FROM o \
                ORDER BY o.id LIMIT 1";
@@ -257,13 +257,9 @@ fn a_correlated_count_still_counts_a_key_held_by_many_rows_from_the_index() {
             .unwrap()
     };
     let want = count("hw");
-    let copied = equality_candidate_ids_copied_count();
+    let runs = prepared_scalar_runs();
     assert_eq!(count("h"), want);
-    let copied = equality_candidate_ids_copied_count() - copied;
-    assert!(
-        copied >= 5000,
-        "the count read the key's ids from the index: {copied}"
-    );
+    assert!(prepared_scalar_runs() > runs, "the count ran prepared");
 }
 
 /// Inside a transaction that changed the inner table its index answers no

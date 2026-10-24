@@ -1252,8 +1252,11 @@ impl Executor {
             None => get_classification(stmt),
         };
 
-        // A statement of the prepared family runs on that path and no other
-        let in_family = classification.where_has_subqueries
+        // A statement of the prepared family runs on that path and no other;
+        // one without FROM never is
+        let in_family = (classification.where_has_subqueries
+            || classification.output_has_subqueries)
+            && stmt.table_expr.is_some()
             && (self.holds_prepared_select(compiled, ctx)
                 || self.prepared_family(stmt, Some(ctx)).is_ok());
         // A grouped statement whose SELECT list, HAVING or GROUP BY holds

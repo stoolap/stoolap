@@ -1012,6 +1012,11 @@ fn test_classifier_rules() {
         "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = 2)".to_string(),
         format!("SELECT id FROM t WHERE a > (SELECT {sq} FROM u WHERE u.id = 1)"),
         "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)".to_string(),
+        format!("SELECT id, {sq} FROM t WHERE a > {sq}"),
+        format!("SELECT id FROM t WHERE a > {sq} ORDER BY {sq}"),
+        format!("SELECT id, {sq} FROM t"),
+        format!("SELECT id FROM t WHERE b = 1 ORDER BY {sq}"),
+        format!("SELECT id, {sq} FROM t ORDER BY {sq} DESC, id LIMIT 3 OFFSET $1"),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1019,10 +1024,14 @@ fn test_classifier_rules() {
             .unwrap()
             .map(|row| {
                 let row = row.unwrap();
-                format!(
-                    "{:?}",
-                    (0..row.len()).map(|i| row.get_value(i)).collect::<Vec<_>>()
-                )
+                // A NULL is NULL whatever type it carries
+                let values: Vec<_> = (0..row.len())
+                    .map(|i| match row.get_value(i) {
+                        Some(stoolap::core::Value::Null(_)) => None,
+                        other => other,
+                    })
+                    .collect();
+                format!("{values:?}")
             })
             .collect();
         found.sort();
@@ -1059,14 +1068,6 @@ fn test_classifier_rules() {
         (
             format!("SELECT COUNT(*) FROM t WHERE a > {sq}"),
             "an aggregate outside a subquery block",
-        ),
-        (
-            format!("SELECT id, {sq} FROM t WHERE a > {sq}"),
-            "a subquery outside WHERE and the subquery blocks",
-        ),
-        (
-            format!("SELECT id FROM t WHERE a > {sq} ORDER BY {sq}"),
-            "a subquery outside WHERE and the subquery blocks",
         ),
         (
             format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
@@ -1115,9 +1116,9 @@ fn test_classifier_rules() {
         );
     }
     assert_eq!(
-        prepared_line(&db, &format!("SELECT id FROM t WHERE b = 1 ORDER BY {sq}")),
+        prepared_line(&db, "SELECT id FROM t WHERE b = 1 ORDER BY id"),
         "",
-        "a WHERE without a subquery is no candidate, so EXPLAIN says nothing"
+        "a statement without a subquery is no candidate, so EXPLAIN says nothing"
     );
 }
 
@@ -2618,4 +2619,75 @@ fn test_a_table_function_generating_nothing_keeps_its_column_names() {
         .columns()
         .to_vec();
     assert_eq!(columns, vec!["n".to_string()]);
+}
+
+#[test]
+fn test_a_select_list_block_is_asked_of_each_row_returned() {
+    let _guard = serial();
+    let db = setup("prepared_select_list_rows");
+    const SQL: &str = "SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t LIMIT 2";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
+    let (found, runs) = ids(&db, SQL, ());
+    assert_eq!(found.len(), 2);
+    assert_eq!(runs, 2, "one run per row returned, not per row read");
+}
+
+#[test]
+fn test_an_uncorrelated_output_subquery_is_read_before_any_row() {
+    let _guard = serial();
+    let db = setup("prepared_output_read_first");
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO m VALUES (1, -9223372036854775808)", ())
+        .unwrap();
+    for sql in [
+        "SELECT id, (SELECT ABS(x) FROM m) FROM t WHERE id > 100",
+        "SELECT id, a IN (SELECT ABS(x) FROM m) FROM t WHERE id > 100",
+        "SELECT id, a > ALL (SELECT ABS(x) FROM m) FROM t WHERE id > 100",
+        "SELECT id, EXISTS (SELECT 1 FROM m WHERE ABS(x) > 0) FROM t WHERE id > 100",
+        "SELECT id FROM t WHERE id > 100 ORDER BY a IN (SELECT ABS(x) FROM m)",
+        "SELECT id, (SELECT ABS(x) FROM m) FROM t ORDER BY id LIMIT 0",
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert!(
+            error(&db, sql, ()).0.contains("overflow"),
+            "{sql}: the subquery's error, though no row is returned"
+        );
+    }
+    const CORRELATED: &str = "SELECT id, (SELECT ABS(x) FROM m WHERE m.id = t.id) FROM t \
+                              WHERE id > 100";
+    assert_eq!(ids(&db, CORRELATED, ()).0, Vec::<i64>::new());
+}
+
+#[test]
+fn test_select_list_exists_in_and_all_answer_as_their_literals() {
+    let _guard = serial();
+    let db = setup("prepared_select_list_forms");
+    let answers = |sql: &str| -> Vec<(i64, Option<bool>)> {
+        db.query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get(0).unwrap(), row.get(1).unwrap())
+            })
+            .collect()
+    };
+    for (sql, literal) in [
+        (
+            "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.id = t.id) FROM t ORDER BY id",
+            "SELECT id, id IN (1, 2, 3, 5, 6) FROM t ORDER BY id",
+        ),
+        (
+            "SELECT id, a IN (SELECT v FROM u WHERE u.id = t.id) FROM t ORDER BY id",
+            "SELECT id, CASE WHEN id = 3 THEN NULL ELSE FALSE END FROM t ORDER BY id",
+        ),
+        (
+            "SELECT id, a > ALL (SELECT v FROM u WHERE u.id = t.id) FROM t ORDER BY id",
+            "SELECT id, CASE id WHEN 2 THEN FALSE WHEN 3 THEN NULL WHEN 5 THEN FALSE \
+             ELSE TRUE END FROM t ORDER BY id",
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert_eq!(answers(sql), answers(literal), "{sql}");
+    }
 }
