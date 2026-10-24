@@ -277,6 +277,41 @@ fn every_source_answers_a_windowed_or_grouped_statement_as_its_twin() {
 }
 
 #[test]
+fn a_statement_differing_only_inside_a_call_or_a_grouping_set_classifies_alone() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_classified").unwrap();
+    fill(&db);
+    let mut wrong = Vec::new();
+    for (twin, sql) in [
+        (
+            "SELECT t.a, SUM(t.b) FILTER (WHERE t.b > 0) FROM t GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, SUM(t.b) FILTER (WHERE t.b > (SELECT MIN(u.x) FROM u)) FROM t \
+             GROUP BY t.a ORDER BY t.a",
+        ),
+        (
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), ',' ORDER BY t.b * -1) FROM t GROUP BY t.a \
+             ORDER BY t.a",
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), ',' ORDER BY t.b * (SELECT MIN(u.x) - 1 \
+             FROM u)) FROM t GROUP BY t.a ORDER BY t.a",
+        ),
+        (
+            "SELECT t.a, COUNT(*) FROM t GROUP BY GROUPING SETS ((t.a), (t.a + 0)) ORDER BY t.a",
+            "SELECT t.a, COUNT(*) FROM t GROUP BY GROUPING SETS ((t.a), (t.a + (SELECT MIN(u.x) \
+             FROM u))) ORDER BY t.a",
+        ),
+    ] {
+        let want = rows(&db, twin).unwrap_or_else(|e| panic!("{twin}: {e}"));
+        let line = prepared_line(&db, sql);
+        let before = general_hits();
+        let got = rows(&db, sql);
+        if got.as_deref() != Ok(&want[..]) || line != "Prepared: yes" || general_hits() != before {
+            wrong.push(format!("{sql}\n  [{line}] {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_value_function_reads_an_expression_argument_for_each_row() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
