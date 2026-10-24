@@ -24,9 +24,12 @@ For the native driver, which loads `libstoolap` as a shared library without CGO,
 | **Cross-compile** | Needs `libstoolap` for the target | Anywhere Go compiles |
 | **Best for** | Production, max throughput | Portability, zero dependencies |
 
+The two drivers expose the same API: positional and named parameters, prepared statements with batches, transactions, chunked row iteration, one-call result sets and `database/sql`.
+
 ## Requirements
 
 - Go 1.25+
+- A `stoolap.wasm` built from Stoolap 0.5.0 or newer. `NewEngine` reports which export an older binary lacks.
 
 ## Installation
 
@@ -128,17 +131,25 @@ See [Connection String Reference]({{ '/docs/getting-started/connection-strings/'
 
 ## Parameters
 
-Use positional parameters `$1`, `$2`, etc.:
+Positional parameters are `$1`, `$2`, etc. or `?`. Named parameters are `:name`; a name may be used more than once in a statement. A statement uses one style or the other, and every parameter it names must be supplied.
 
 ```go
-// Direct API
+// Direct API, positional
 db.ExecParams(ctx, "INSERT INTO users VALUES ($1, $2)", []any{int64(1), "Alice"})
 rows, _ := db.QueryParams(ctx, "SELECT * FROM users WHERE id = $1", []any{int64(1)})
 
+// Direct API, named
+db.ExecNamed(ctx, "INSERT INTO users VALUES (:id, :name)",
+    []sql.NamedArg{sql.Named("id", int64(2)), sql.Named("name", "Bob")})
+rows, _ := db.QueryNamed(ctx, "SELECT * FROM users WHERE id = :id",
+    []sql.NamedArg{sql.Named("id", int64(2))})
+
 // database/sql
 db.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2)", 1, "Alice")
-rows, _ := db.QueryContext(ctx, "SELECT * FROM users WHERE id = $1", 1)
+rows, _ := db.QueryContext(ctx, "SELECT * FROM users WHERE id = :id", sql.Named("id", 1))
 ```
+
+Parameter values may be `nil`, `int64`, `int`, `int32`, `float64`, `float32`, `bool`, `string`, `[]byte` (VECTOR or BLOB) and `time.Time`. A nil `[]byte` binds as NULL; an empty `[]byte{}` or an empty string binds as an empty value. There is no size limit on a parameter: the WASM arena grows to fit it.
 
 ## Transactions
 
@@ -146,7 +157,8 @@ rows, _ := db.QueryContext(ctx, "SELECT * FROM users WHERE id = $1", 1)
 // Direct API
 tx, _ := db.Begin(ctx)
 tx.Exec(ctx, "INSERT INTO users VALUES (1, 'Alice')")
-tx.Exec(ctx, "INSERT INTO users VALUES (2, 'Bob')")
+tx.ExecNamed(ctx, "INSERT INTO users VALUES (:id, :name)",
+    []sql.NamedArg{sql.Named("id", int64(2)), sql.Named("name", "Bob")})
 tx.Commit()
 
 // Snapshot isolation
@@ -161,16 +173,73 @@ tx.Exec(ctx, "DELETE FROM users")
 tx.Rollback() // changes discarded
 ```
 
+`Commit` and `Rollback` consume the transaction; using it afterwards returns an error.
+
 ## Prepared Statements
 
 ```go
 stmt, _ := db.Prepare(ctx, "INSERT INTO users VALUES ($1, $2)")
 defer stmt.Close()
 
-for i := int64(1); i <= 1000; i++ {
-    stmt.ExecContext(ctx, []any{i, "User"})
+// One row per call
+stmt.ExecContext(ctx, []any{int64(1), "Alice"})
+
+// Many rows in one WASM call, inside one transaction. A failing row rolls
+// back the whole batch.
+batch := make([][]any, 1000)
+for i := range batch {
+    batch[i] = []any{int64(i + 2), fmt.Sprintf("user_%d", i+2)}
+}
+res, _ := stmt.ExecBatch(ctx, batch)
+n, _ := res.RowsAffected() // 1000
+
+// Named parameters
+upd, _ := db.Prepare(ctx, "UPDATE users SET name = :name WHERE id = :id")
+upd.ExecNamed(ctx, []sql.NamedArg{sql.Named("name", "Carol"), sql.Named("id", int64(1))})
+```
+
+In `database/sql`, a statement prepared on a `*sql.Tx` runs inside that transaction.
+
+## Reading Results
+
+`Query` returns a `*Rows` cursor. Rows arrive from the engine in packed chunks (32 rows first, doubling to 256), so a scan crosses the WASM boundary once per chunk rather than once per row and column. Values are decoded in Go when you read them.
+
+```go
+rows, _ := db.Query(ctx, "SELECT id, name, score FROM users")
+defer rows.Close()
+for rows.Next() {
+    var id int64
+    var name string
+    var score float64
+    rows.Scan(&id, &name, &score)
+}
+if err := rows.Err(); err != nil {
+    // the error that ended iteration
 }
 ```
+
+`Scan` accepts `*int64`, `*float64`, `*string`, `*bool`, `*time.Time`, `*[]byte`, the `sql.Null*` types and `*any`. The destination count must match the column count. Scanning a non-text column into a string gives the engine's own text form, the same as `CAST(x AS TEXT)`. A TEXT column in a recognised timestamp form scans into `time.Time`; anything else into `time.Time` is an error.
+
+Typed accessors read the current row without a `Scan`: `rows.IsNull(i)`, `rows.Int64(i)`, `rows.Float64(i)`, `rows.Bool(i)` and `rows.Timestamp(i)`. They convert between numeric types the way the engine does.
+
+### One-Call Result Sets
+
+When the whole result is wanted at once, `QueryAll` fetches it in a single WASM call. There is no cursor to iterate or close. The `database/sql` driver takes this path for every query.
+
+```go
+rs, _ := db.QueryAll(ctx, "SELECT id, name FROM users WHERE id > $1", []any{int64(10)})
+fmt.Println(rs.Columns) // [id name]
+for _, row := range rs.Rows {
+    fmt.Printf("id=%v name=%v\n", row[0], row[1])
+}
+
+// Named, prepared and transactional forms
+rs, _ = db.QueryNamedAll(ctx, "SELECT * FROM users WHERE id = :id", []sql.NamedArg{sql.Named("id", int64(1))})
+rs, _ = stmt.QueryAll(ctx, []any{int64(1)})
+rs, _ = tx.QueryAll(ctx, "SELECT COUNT(*) FROM users", nil)
+```
+
+`rows.FetchAll()` does the same for the rows a cursor has not yet returned.
 
 ## File Persistence
 
@@ -208,20 +277,6 @@ db.Exec(ctx, "ANALYZE my_table")
 
 For production file-based workloads with automatic background maintenance, use the [native driver]({{ '/docs/drivers/go/' | relative_url }}).
 
-## FetchAll (Bulk Read)
-
-The `FetchAll()` method retrieves all remaining rows in a single WASM call and returns them as parsed Go values. The `database/sql` driver uses this automatically.
-
-```go
-rows, _ := db.Query(ctx, "SELECT id, name, age FROM users")
-defer rows.Close()
-
-allRows, _ := rows.FetchAll()
-for _, row := range allRows {
-    fmt.Printf("id=%v name=%v age=%v\n", row[0], row[1], row[2])
-}
-```
-
 ## Type Mapping
 
 | SQL Type | Go Type | Nullable Go Type |
@@ -234,14 +289,13 @@ for _, row := range allRows {
 | JSON | `string` | `sql.NullString` |
 | VECTOR/BLOB | `[]byte` | `[]byte` (nil for NULL) |
 
-A nil `[]byte` parameter binds as NULL; an empty `[]byte{}` or an empty string binds as an empty value.
-
 ## Thread Safety
 
 All WASM operations are serialized through a mutex. The engine is safe for concurrent use from multiple goroutines, but operations execute sequentially.
 
 - **Engine**: Thread-safe (mutex-protected)
-- **DB, Tx, Stmt, Rows**: Use from any goroutine (engine serializes access)
+- **DB, Tx, Stmt**: Use from any goroutine (engine serializes access)
+- **Rows**: One goroutine at a time; the cursor and its decoded chunk live in Go memory
 - **database/sql**: Thread-safe by default (connection pool creates cloned handles)
 
 ## Building the WASM Binary from Source
@@ -262,13 +316,15 @@ wasm-opt -Oz target/wasm32-wasip1/max/stoolap.wasm -o stoolap.wasm
 
 ## Performance
 
-The WASM driver uses several optimizations to minimize overhead:
+Every WASM call costs a boundary crossing, so the driver makes as few as it can:
 
-- **FetchAll**: All result rows are fetched in a single WASM call as packed binary, then parsed in Go. The `database/sql` driver uses this automatically.
-- **CallWithStack**: Pre-allocated call stack eliminates per-call allocations.
-- **Arena allocator**: SQL strings and parameters are written to a pre-allocated WASM memory region with zero malloc/free overhead.
+- **Chunked cursors**: `Rows` reads packed chunks of up to 256 rows per call and decodes them in Go. Scanning 1000 rows of four columns takes about 80us, against 370us when each column was a call.
+- **One-call results**: `QueryAll` and the `database/sql` driver receive the whole result packed from a single call, with no rows handle to open or close.
+- **Batches**: `ExecBatch` sends every row of a batch in one call inside one transaction.
+- **CallWithStack**: A pre-allocated call stack eliminates per-call allocations.
+- **Arena allocator**: SQL text and parameters are written into a pre-allocated WASM memory region with no malloc or free per operation. The arena grows when an operation needs more than 256 KB.
 
-Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native driver. Write-heavy workloads have ~1.5-2x overhead due to WASM boundary crossing per operation.
+Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native driver. Write-heavy workloads have roughly 1.5 to 2x overhead from the boundary crossing per operation; batches remove most of it.
 
 ## Direct API Reference
 
@@ -290,9 +346,13 @@ Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native dr
 | `db.Close()` | Close the connection |
 | `db.Clone(ctx)` | Clone handle (shares engine) |
 | `db.Exec(ctx, query)` | Execute without parameters |
-| `db.ExecParams(ctx, query, args)` | Execute with parameters |
+| `db.ExecParams(ctx, query, args)` | Execute with positional parameters |
+| `db.ExecNamed(ctx, query, args)` | Execute with named parameters |
 | `db.Query(ctx, query)` | Query without parameters |
-| `db.QueryParams(ctx, query, args)` | Query with parameters |
+| `db.QueryParams(ctx, query, args)` | Query with positional parameters |
+| `db.QueryNamed(ctx, query, args)` | Query with named parameters |
+| `db.QueryAll(ctx, query, args)` | Whole result in one call, as a `ResultSet` |
+| `db.QueryNamedAll(ctx, query, args)` | Same with named parameters |
 | `db.Prepare(ctx, query)` | Create prepared statement |
 | `db.Begin(ctx)` | Begin transaction (Read Committed) |
 | `db.BeginTx(ctx, opts)` | Begin transaction with options |
@@ -303,16 +363,30 @@ Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native dr
 |--------|-------------|
 | `rows.Next()` | Advance to next row |
 | `rows.Scan(dest...)` | Read current row |
-| `rows.Close()` | Close result set |
+| `rows.Err()` | Error that ended iteration |
 | `rows.Columns()` | Get column names |
-| `rows.FetchAll()` | Fetch all rows as `[][]any` |
+| `rows.IsNull(i)`, `rows.Int64(i)`, `rows.Float64(i)`, `rows.Bool(i)`, `rows.Timestamp(i)` | Read one column of the current row |
+| `rows.FetchAll()` | Remaining rows as `[][]any` in one call |
+| `rows.Close()` | Close result set |
+
+### ResultSet
+
+| Field | Description |
+|-------|-------------|
+| `rs.Columns` | Column names |
+| `rs.Rows` | Every row as `[]any` |
 
 ### Stmt
 
 | Method | Description |
 |--------|-------------|
-| `stmt.ExecContext(ctx, args)` | Execute with parameters |
-| `stmt.QueryContext(ctx, args)` | Query with parameters |
+| `stmt.ExecContext(ctx, args)` | Execute with positional parameters |
+| `stmt.ExecNamed(ctx, args)` | Execute with named parameters |
+| `stmt.ExecBatch(ctx, rows)` | Execute once per row in one transaction |
+| `stmt.QueryContext(ctx, args)` | Query with positional parameters |
+| `stmt.QueryNamed(ctx, args)` | Query with named parameters |
+| `stmt.QueryAll(ctx, args)` | Whole result in one call |
+| `stmt.QueryNamedAll(ctx, args)` | Same with named parameters |
 | `stmt.Close()` | Destroy the statement |
 
 ### Tx
@@ -320,8 +394,12 @@ Read-heavy workloads (SELECT, aggregation, JOINs) perform close to the native dr
 | Method | Description |
 |--------|-------------|
 | `tx.Exec(ctx, query)` | Execute within transaction |
-| `tx.ExecParams(ctx, query, args)` | Execute with parameters |
+| `tx.ExecParams(ctx, query, args)` | Execute with positional parameters |
+| `tx.ExecNamed(ctx, query, args)` | Execute with named parameters |
 | `tx.Query(ctx, query)` | Query within transaction |
-| `tx.QueryParams(ctx, query, args)` | Query with parameters |
+| `tx.QueryParams(ctx, query, args)` | Query with positional parameters |
+| `tx.QueryNamed(ctx, query, args)` | Query with named parameters |
+| `tx.QueryAll(ctx, query, args)` | Whole result in one call |
+| `tx.QueryNamedAll(ctx, query, args)` | Same with named parameters |
 | `tx.Commit()` | Commit |
 | `tx.Rollback()` | Rollback |
