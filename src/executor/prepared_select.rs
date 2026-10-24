@@ -2730,6 +2730,8 @@ impl Builder<'_> {
                 })
                 .collect(),
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::prepared_slots(self.next_slot);
         let blocks = PreparedBlocks {
             param_count,
             slot_count: self.next_slot,
@@ -2847,6 +2849,27 @@ impl Builder<'_> {
             (Some(_), false) => Ok(expr.clone()),
             (None, _) => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
         }
+    }
+
+    /// [`Self::rewrite`] of `expr` for a look at its bound form only: its
+    /// enclosing reads take the slots `outer` holds, and a new one is given
+    /// back, so the statement's buffer does not grow for it. `expr` holds
+    /// no subquery, which would prepare a block
+    fn trial_rewrite(
+        &mut self,
+        chain: &Chain<'_>,
+        id: u16,
+        expr: &Expression,
+        outer: &FxHashMap<(usize, usize, Option<ExprKey>), usize>,
+    ) -> Result<Expression> {
+        let next_slot = self.next_slot;
+        let mut trial = Rewritten {
+            outer: outer.clone(),
+            ..Rewritten::default()
+        };
+        let rewritten = self.rewrite(chain, Some(id), expr, &mut trial);
+        self.next_slot = next_slot;
+        rewritten
     }
 
     /// `expr` of the block whose chain is `chain` (id `id`, None for the
@@ -3256,11 +3279,7 @@ impl Builder<'_> {
                     // matched before an alias in it is read as its item
                     let same = !mentions_subquery(&ob.expression)
                         && projection.as_ref().is_some_and(|item| {
-                            let mut written = Rewritten {
-                                outer: work.outer.clone(),
-                                ..Rewritten::default()
-                            };
-                            self.rewrite(&chain, Some(id), &ob.expression, &mut written)
+                            self.trial_rewrite(&chain, id, &ob.expression, &work.outer)
                                 .is_ok_and(|key| ExprKey::exact(item) == ExprKey::exact(&key))
                         });
                     let key = match same {
@@ -3271,8 +3290,7 @@ impl Builder<'_> {
                 }
                 // A key that chooses no row is still bound, as any ORDER BY is
                 (Some(key), false) => {
-                    let mut unused = Rewritten::default();
-                    bound_only.push(self.rewrite(&chain, Some(id), &key, &mut unused)?);
+                    bound_only.push(self.trial_rewrite(&chain, id, &key, &work.outer)?);
                 }
                 (None, false) => {}
             }

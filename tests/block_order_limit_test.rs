@@ -487,3 +487,31 @@ fn an_order_by_that_chooses_no_row_is_still_bound() {
         "Prepared: no (a subquery block's ORDER BY key holding a subquery without LIMIT)"
     );
 }
+
+#[test]
+fn a_key_looked_at_only_takes_no_slot_of_its_own() {
+    use stoolap::test_failpoints::prepared_slot_count;
+    let _guard = serial();
+    let db = setup("block_order_slots");
+    let slots = |sql: &str| {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        column(&db, sql, 0, (1, 1, 1, 1, 1, 1, 1));
+        prepared_slot_count()
+    };
+    // The key matched against the item first, and a key that chooses no row
+    for tail in ["LIMIT $7", "LIMIT 1 OFFSET $7"] {
+        let sql = |key: &str| format!("SELECT (SELECT x FROM u ORDER BY {key} {tail}) FROM t");
+        assert_eq!(
+            slots(&sql("ABS(x - t.a)")),
+            slots(&sql("x")),
+            "{tail}: matching the key with the item takes no slot of its own"
+        );
+    }
+    let unused =
+        |key: &str| format!("SELECT (SELECT x FROM u WHERE u.id = $7 ORDER BY {key}) FROM t");
+    assert_eq!(
+        slots(&unused("ABS(x - t.a)")),
+        slots(&unused("x")),
+        "a key that chooses no row reads no enclosing value"
+    );
+}
