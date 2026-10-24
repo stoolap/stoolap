@@ -694,9 +694,11 @@ impl Executor {
             return Err("a DISTINCT ON subquery in a set operation's branch");
         }
         let grouped = grouped_block(stmt);
+        // A grouped statement's DISTINCT ON key runs as an item, its windows too
         let windowed = stmt
             .columns
             .iter()
+            .chain(stmt.distinct_on.iter().filter(|_| grouped))
             .any(QueryClassification::expression_has_window_function);
         if !grouped && !windowed {
             return Err("a statement that neither groups nor has window functions");
@@ -761,13 +763,8 @@ impl Executor {
             family.expression(key, 1, Site::GroupedOutput, &mut found)?;
         }
         // A DISTINCT ON key is computed as a SELECT item of the statement is
-        let distinct_on = if grouped {
-            Site::GroupedOutput
-        } else {
-            Site::Subqueries
-        };
         for key in &stmt.distinct_on {
-            family.expression(key, 1, distinct_on, &mut found)?;
+            family.expression(key, 1, list, &mut found)?;
         }
         for item in grouping_items(stmt) {
             family.expression(item, 1, Site::Subqueries, &mut found)?;

@@ -177,6 +177,19 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT DISTINCT ON ({count}) t.id, ROW_NUMBER() OVER (ORDER BY t.id) FROM t \
              ORDER BY t.id",
         ),
+        shape(
+            "SELECT DISTINCT ON (ROW_NUMBER() OVER (ORDER BY t.id) % 3 + (SELECT MAX(u.x) FROM u)) \
+             t.id, ROW_NUMBER() OVER (ORDER BY t.id) % 3 + (SELECT MAX(u.x) FROM u) AS k \
+             FROM {t} ORDER BY t.id",
+            "SELECT DISTINCT ON (ROW_NUMBER() OVER (ORDER BY t.id) % 3 + 6) t.id, \
+             ROW_NUMBER() OVER (ORDER BY t.id) % 3 + 6 AS k FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT DISTINCT ON (RANK() OVER (ORDER BY t.a) % 2 + (SELECT MIN(u.x) FROM u)) t.a \
+             FROM {t} GROUP BY t.a ORDER BY t.a",
+            "SELECT DISTINCT ON (RANK() OVER (ORDER BY t.a) % 2) t.a FROM t GROUP BY t.a \
+             ORDER BY t.a",
+        ),
     ]
 }
 
