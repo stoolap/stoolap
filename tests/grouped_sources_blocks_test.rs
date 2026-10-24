@@ -676,6 +676,32 @@ fn a_rolled_up_column_reads_the_cell_of_the_item_naming_it() {
         assert_eq!(read, tens, "{sql}: the rows whose a is 1");
         assert_eq!(prepared_line(&db, &sql), "Prepared: yes");
     }
+    // A computed correlation reads the item its column reads alone
+    db.execute("INSERT INTO u VALUES (2, 2, 20)", ()).unwrap();
+    for sets in [
+        "ROLLUP(a, t.a)",
+        "ROLLUP(t.a, a)",
+        "ROLLUP(a, g)",
+        "ROLLUP(g, a)",
+    ] {
+        let mut want = rows(
+            &db,
+            &format!(
+                "SELECT a AS g, COUNT(*), CASE WHEN t.a + 1 = 2 THEN 20 END FROM t GROUP BY {sets}"
+            ),
+        )
+        .unwrap();
+        want.sort();
+        for test in ["u.k = t.a + 1", "u.k - 1 = t.a"] {
+            let sql = format!(
+                "SELECT a AS g, COUNT(*), (SELECT MAX(u.x) FROM u WHERE {test}) FROM t \
+                 GROUP BY {sets}"
+            );
+            let mut got = rows(&db, &sql).unwrap();
+            got.sort();
+            assert_eq!(got, want, "{sql}");
+        }
+    }
 }
 
 #[test]
