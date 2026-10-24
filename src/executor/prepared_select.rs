@@ -3243,21 +3243,22 @@ impl Builder<'_> {
             .filter(|_| !matches!(form, Form::Exists(_)));
         let (mut order_keys, mut bound_only) = (Vec::new(), Vec::new());
         for ob in &sq.order_by {
-            // A bare alias, or the item as written, sorts by the item's value
-            // Two spellings of one column stay two keys, read each its own way
-            let is_item = item.is_some_and(|item| {
-                order_by_names_an_alias(&ob.expression, sq)
-                    || ExprKey::exact(&ob.expression) == ExprKey::exact(item)
-            });
-            let key = match is_item {
+            // A bare alias sorts by the item's value
+            let alias = item.is_some() && order_by_names_an_alias(&ob.expression, sq);
+            let key = match alias {
                 true => None,
                 false => Some(with_aliases(&ob.expression, &sq.columns, &scope.columns)),
             };
             match (key, chooses) {
-                (key, true) => {
-                    let key = key
-                        .map(|key| self.rewrite(&chain, Some(id), &key, &mut work))
-                        .transpose()?;
+                (None, true) => order_keys.push((None, ob.ascending, ob.nulls_first)),
+                (Some(key), true) => {
+                    let key = self.rewrite(&chain, Some(id), &key, &mut work)?;
+                    // So does the item's computation over the columns it binds to
+                    let same = !mentions_subquery(&ob.expression)
+                        && projection
+                            .as_ref()
+                            .is_some_and(|item| ExprKey::exact(item) == ExprKey::exact(&key));
+                    let key = (!same).then_some(key);
                     order_keys.push((key, ob.ascending, ob.nulls_first));
                 }
                 // A key that chooses no row is still bound, as any ORDER BY is

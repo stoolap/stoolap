@@ -369,6 +369,19 @@ fn a_key_that_is_the_select_item_answers_with_the_value_it_sorted() {
         8,
         "one run, one draw per inner row and none for the answer"
     );
+    // The item's computation over the same columns, however they are spelled
+    for key in ["RANDOM() + x", "RANDOM() + \"x\"", "random() + U.X"] {
+        let sql = format!("SELECT (SELECT RANDOM() + x AS r FROM u ORDER BY {key} LIMIT 1) FROM t");
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        let draws = random_draws();
+        let found = db.query(&sql, ()).unwrap().collect::<Result<Vec<_>, _>>();
+        assert_eq!(found.unwrap().len(), 4);
+        assert_eq!(
+            random_draws() - draws,
+            8,
+            "{sql} sorts by the value it answers"
+        );
+    }
     let refused = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r + 0 LIMIT 1) FROM t";
     assert_eq!(
         prepared_line(&db, refused),
