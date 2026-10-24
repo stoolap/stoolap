@@ -357,11 +357,11 @@ impl<'a> Family<'a> {
                     return Err("a named window");
                 }
                 // NTILE's argument, the ones after a call's first and the frame
-                // offsets are read once for the call
+                // offsets are read once for the call: a subquery there runs once
                 let call = &window.function;
                 let inputs = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
                 for (i, arg) in call.arguments.iter().enumerate() {
-                    let at = if i < inputs { inner } else { Site::Values };
+                    let at = if i < inputs { inner } else { Site::Subqueries };
                     if !matches!(arg, Expression::Star(_)) {
                         self.expression(arg, scopes, at, found)?;
                     }
@@ -384,7 +384,7 @@ impl<'a> Family<'a> {
                     if let WindowFrameBound::Preceding(offset)
                     | WindowFrameBound::Following(offset) = bound
                     {
-                        self.expression(offset, scopes, Site::Values, found)?;
+                        self.expression(offset, scopes, Site::Subqueries, found)?;
                     }
                 }
                 Ok(())
@@ -464,11 +464,15 @@ impl<'a> Family<'a> {
             None | Some(Expression::Star(_)) => {}
             Some(first) => values(first)?,
         }
+        // The statement's own call reads one value for an argument after the
+        // first, which a subquery there gives once; a block's call a literal
         let literal = |arg: &Expression| {
             extract_literal_value(arg).is_some()
                 || matches!(arg, Expression::Identifier(id) if id.quoted)
         };
-        if !arguments.all(literal) {
+        if inputs == Site::Subqueries {
+            arguments.try_for_each(&mut values)?;
+        } else if !arguments.all(literal) {
             return Err("an aggregate argument after the first that is not a literal");
         }
         if let Some(filter) = call.filter.as_deref() {
@@ -1155,6 +1159,55 @@ impl Chain<'_> {
     }
 }
 
+/// Whether an argument a call in `expr` reads once rather than for each row
+/// passes `matches`: an aggregate's after its first, a window function's
+/// after its first (each of NTILE's), and a frame offset
+fn constant_args_any(expr: &Expression, matches: &impl Fn(&Expression) -> bool) -> bool {
+    let (inputs, constants): (Vec<&Expression>, Vec<&Expression>) = match expr {
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => return false,
+        Expression::Window(window) => {
+            let call = &window.function;
+            let first = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
+            let inputs = call.arguments[..first.min(call.arguments.len())]
+                .iter()
+                .chain(call.filter.as_deref())
+                .chain(call.order_by.iter().map(|o| &o.expression))
+                .chain(&window.partition_by)
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .collect();
+            let constants = call
+                .arguments
+                .iter()
+                .skip(first)
+                .chain(window.frame_offsets())
+                .collect();
+            (inputs, constants)
+        }
+        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
+            let inputs = call
+                .arguments
+                .iter()
+                .take(1)
+                .chain(call.filter.as_deref())
+                .chain(call.order_by.iter().map(|o| &o.expression))
+                .collect();
+            (inputs, call.arguments.iter().skip(1).collect())
+        }
+        other => {
+            let mut found = false;
+            let _ = for_each_child(other, &mut |child| {
+                found |= constant_args_any(child, matches);
+                Ok(())
+            });
+            return found;
+        }
+    };
+    constants.into_iter().any(matches)
+        || inputs
+            .into_iter()
+            .any(|input| constant_args_any(input, matches))
+}
+
 /// Each direct operand of an expression of the family's forms
 fn for_each_child(expr: &Expression, f: &mut impl FnMut(&Expression) -> Result<()>) -> Result<()> {
     match expr {
@@ -1210,7 +1263,8 @@ fn for_each_child(expr: &Expression, f: &mut impl FnMut(&Expression) -> Result<(
             }
             call.order_by.iter().try_for_each(|o| f(&o.expression))?;
             window.partition_by.iter().try_for_each(&mut *f)?;
-            window.order_by.iter().try_for_each(|o| f(&o.expression))
+            window.order_by.iter().try_for_each(|o| f(&o.expression))?;
+            window.frame_offsets().try_for_each(f)
         }
         _ => Ok(()),
     }
@@ -1376,7 +1430,28 @@ fn rebuild(
                     .map(&mut *f)
                     .collect::<Result<_>>()?,
                 order_by: window_order_by,
-                frame: window.frame.clone(),
+                frame: window
+                    .frame
+                    .as_ref()
+                    .map(|frame| {
+                        let mut bound = |bound: &WindowFrameBound| -> Result<WindowFrameBound> {
+                            Ok(match bound {
+                                WindowFrameBound::Preceding(offset) => {
+                                    WindowFrameBound::Preceding(boxed(f, offset)?)
+                                }
+                                WindowFrameBound::Following(offset) => {
+                                    WindowFrameBound::Following(boxed(f, offset)?)
+                                }
+                                other => other.clone(),
+                            })
+                        };
+                        Ok::<_, Error>(WindowFrame {
+                            unit: frame.unit,
+                            start: bound(&frame.start)?,
+                            end: frame.end.as_ref().map(&mut bound).transpose()?,
+                        })
+                    })
+                    .transpose()?,
             }))
         }
         other => other.clone(),
@@ -4031,6 +4106,9 @@ pub struct PreparedGrouped {
     where_: Option<PreparedWhere>,
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
+    /// An argument read once for its call holds a run slot, which the
+    /// statement's parameters then carry beside the blocks'
+    pub(crate) reads_slots: bool,
     /// Every subquery is a run slot: the statement runs as any grouped
     /// statement does, reading them as parameters, under this plan of its
     /// own over a table, and groups another source's rows so
@@ -4154,6 +4232,7 @@ impl PreparedGrouped {
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
+        let written = stmt;
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -4496,6 +4575,17 @@ impl PreparedGrouped {
             && !grouping_items(&stmt).into_iter().any(mentions_subquery)
             && !stmt.where_clause.as_deref().is_some_and(mentions_subquery))
         .then(|| RwLock::new(CompiledExecution::Unknown));
+        // An argument read once for its call holds only run slots: one reading
+        // the row is the general path's to refuse
+        let constants = |stmt: &SelectStatement, matches: &dyn Fn(&Expression) -> bool| {
+            stmt.columns
+                .iter()
+                .chain(stmt.having.as_deref())
+                .any(|e| constant_args_any(e, &matches))
+        };
+        if constants(&stmt, &mentions_subquery) {
+            return Ok(None);
+        }
         Ok(Some(Self {
             cached_epoch: epoch,
             schema,
@@ -4504,6 +4594,7 @@ impl PreparedGrouped {
             holes: HoleSet { holes },
             ahead,
             where_,
+            reads_slots: constants(written, &mentions_subquery),
             classification: super::query_classification::get_classification(&stmt),
             stmt,
             runs_alone,

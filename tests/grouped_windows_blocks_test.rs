@@ -160,6 +160,46 @@ fn shapes() -> Vec<(String, String)> {
              ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), t.a",
             "SELECT t.a, COUNT(*) FROM t GROUP BY t.a ORDER BY {count}, t.a",
         ),
+        // An argument read once for its call
+        shape(
+            "SELECT t.id, NTILE((SELECT MIN(u.x) FROM u) + 3) OVER (ORDER BY t.id) FROM {t} \
+             ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, LAG(t.b, (SELECT MIN(u.x) + 2 FROM u), (SELECT MAX(u.x) FROM u)) \
+             OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, LAG(t.b, 2, 6) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN (SELECT MIN(u.x) + 2 FROM u) \
+             PRECEDING AND CURRENT ROW) FROM {t} ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CAST((SELECT MIN(u.x) FROM u) AS TEXT) \
+             ORDER BY t.b, t.id) FROM {t} GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.b, t.id) FROM t \
+             GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.a, NTILE((SELECT MIN(u.x) FROM u) + 2) OVER (ORDER BY t.a) FROM {t} \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, NTILE(2) OVER (ORDER BY t.a) FROM t GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.id, NTILE((SELECT MIN(u.x) FROM u) + 3) OVER (ORDER BY t.id), \
+             (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id), {count} FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CAST((SELECT MIN(u.x) FROM u) AS TEXT) \
+             ORDER BY t.b, t.id), (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM {t} \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.b, t.id), {count} FROM t \
+             GROUP BY t.a ORDER BY t.a",
+        ),
         // A DISTINCT ON
         shape(
             "SELECT DISTINCT ON (t.a % 2 + (SELECT MIN(u.x) FROM u)) t.a, COUNT(*) FROM {t} \
@@ -309,6 +349,20 @@ fn a_statement_differing_only_inside_a_call_or_a_grouping_set_classifies_alone()
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_argument_read_once_that_reads_the_row_is_an_error() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_row_argument").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT t.id, NTILE((SELECT COUNT(*) FROM u WHERE u.k = t.a)) OVER (ORDER BY t.id) FROM t",
+        "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CAST((SELECT COUNT(*) FROM u \
+         WHERE u.k = t.a) AS TEXT)) FROM t GROUP BY t.a",
+    ] {
+        assert!(rows(&db, sql).is_err(), "{sql}");
+    }
 }
 
 #[test]

@@ -1406,10 +1406,12 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
         Expression::Window(wf) => {
             hash_call_structure(&wf.function, hasher);
             wf.partition_by.len().hash(hasher);
+            wf.frame_offsets().count().hash(hasher);
             let read = wf
                 .partition_by
                 .iter()
-                .chain(wf.order_by.iter().map(|o| &o.expression));
+                .chain(wf.order_by.iter().map(|o| &o.expression))
+                .chain(wf.frame_offsets());
             for expr in read {
                 hash_expression_structure(expr, hasher);
             }

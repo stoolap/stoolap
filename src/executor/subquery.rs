@@ -2127,6 +2127,7 @@ impl Executor {
                 .chain(window.function.order_by.iter().map(|o| &o.expression))
                 .chain(window.partition_by.iter())
                 .chain(window.order_by.iter().map(|o| &o.expression))
+                .chain(window.frame_offsets())
                 .any(Self::has_subqueries),
             _ => false,
         }
