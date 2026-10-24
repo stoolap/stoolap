@@ -1447,21 +1447,33 @@ fn parse_iso_fast(b: &[u8]) -> Option<NaiveDateTime> {
 fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
     #[cfg(test)]
     TS_FORMAT_PARSES.with(|count| count.set(count.get() + 1));
+    parse_timestamp_dated(s).map(|(timestamp, _)| timestamp)
+}
+
+/// Whether `s` reads as a TIMESTAMP only as a time of day, which takes the
+/// date of the day it is read on, so the same text reads differently later
+pub fn timestamp_reads_the_clock(s: &str) -> bool {
+    let s = s.trim();
+    parse_iso_fast(s.as_bytes()).is_none() && matches!(parse_timestamp_dated(s), Ok((_, true)))
+}
+
+/// [`parse_timestamp_formats`]'s timestamp, and whether it took today's date
+fn parse_timestamp_dated(s: &str) -> Result<(DateTime<Utc>, bool)> {
     // Try each timestamp format
     for format in TIMESTAMP_FORMATS {
         if let Ok(dt) = DateTime::parse_from_str(s, format) {
-            return Ok(dt.with_timezone(&Utc));
+            return Ok((dt.with_timezone(&Utc), false));
         }
         // Try parsing as naive datetime and assume UTC
         if let Ok(ndt) = NaiveDateTime::parse_from_str(s, format) {
-            return Ok(Utc.from_utc_datetime(&ndt));
+            return Ok((Utc.from_utc_datetime(&ndt), false));
         }
     }
 
     // Try date-only formats
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let datetime = date.and_hms_opt(0, 0, 0).unwrap();
-        return Ok(Utc.from_utc_datetime(&datetime));
+        return Ok((Utc.from_utc_datetime(&datetime), false));
     }
 
     // Try time-only formats (use today's date)
@@ -1469,7 +1481,7 @@ fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
         if let Ok(time) = NaiveTime::parse_from_str(s, format) {
             let today = Utc::now().date_naive();
             let datetime = today.and_time(time);
-            return Ok(Utc.from_utc_datetime(&datetime));
+            return Ok((Utc.from_utc_datetime(&datetime), true));
         }
     }
 
@@ -2035,6 +2047,21 @@ mod tests {
 
         // Invalid format
         assert!(parse_timestamp("not a date").is_err());
+    }
+
+    #[test]
+    fn a_time_of_day_alone_reads_the_clock() {
+        for text in ["12:00:00", " 12:00:00 ", "12:00"] {
+            assert!(timestamp_reads_the_clock(text), "{text:?}");
+        }
+        for text in [
+            "2024-01-15",
+            "2024-01-15 12:00:00",
+            "2024-01-15T12:00:00Z",
+            "not a date",
+        ] {
+            assert!(!timestamp_reads_the_clock(text), "{text:?}");
+        }
     }
 
     // =========================================================================

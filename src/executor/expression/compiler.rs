@@ -39,7 +39,7 @@ use crate::core::pattern::Pattern;
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
-use crate::executor::pushdown::read_as_column;
+use crate::executor::pushdown::{read_as_column, reads_as_column_alike};
 use crate::executor::utils::{
     derived_aggregate_column_name, extract_literal_value, string_literal_value, string_to_datatype,
 };
@@ -544,9 +544,16 @@ impl<'a> ExprCompiler<'a> {
             .read_as
             .and_then(|r| r.get(&(expr as *const Expression as usize)))
         {
-            // A value known when compiled is read as the column's type once
+            // A value known when compiled is read as the column's type once,
+            // unless that reading depends on when it runs
             match builder.take_constant_since(start) {
-                Some(value) => builder.emit(Op::LoadConst(read_as_column(column_type, value))),
+                Some(value) if reads_as_column_alike(column_type, &value) => {
+                    builder.emit(Op::LoadConst(read_as_column(column_type, value)))
+                }
+                Some(value) => {
+                    builder.emit(Op::LoadConst(value));
+                    builder.emit(Op::ReadAsColumn(column_type));
+                }
                 None => builder.emit(Op::ReadAsColumn(column_type)),
             }
         }
@@ -1360,9 +1367,10 @@ impl<'a> ExprCompiler<'a> {
                     .read_as
                     .and_then(|r| r.get(&(item as *const Expression as usize)))
                 {
-                    Some(&column_type) => {
+                    Some(&column_type) if reads_as_column_alike(column_type, &value) => {
                         crate::executor::pushdown::read_as_column(column_type, value)
                     }
+                    Some(_) => return None,
                     None => value,
                 },
             )
@@ -2221,6 +2229,39 @@ mod tests {
                 .compile(&parse("a = 6"))
                 .unwrap();
             assert_eq!(program.disassemble(), twin.disassemble(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_time_of_day_is_read_as_a_timestamp_when_the_program_runs() {
+        let columns = vec!["ts".to_string()];
+        for (sql, when_run) in [
+            ("ts = '12:00:00'", true),
+            ("ts IN ('12:00:00', '2024-01-15')", true),
+            ("ts = '2024-01-15 12:00:00'", false),
+            ("ts IN ('2024-01-15 12:00:00', '2024-01-15')", false),
+        ] {
+            let expr = parse(sql);
+            let mut read_as = FxHashMap::default();
+            let mut mark = |e: &Expression| {
+                read_as.insert(e as *const Expression as usize, DataType::Timestamp);
+            };
+            match &expr {
+                Expression::Infix(infix) => mark(&infix.right),
+                Expression::In(in_expr) => match &*in_expr.right {
+                    Expression::List(list) => list.elements.iter().for_each(&mut mark),
+                    Expression::ExpressionList(list) => list.expressions.iter().for_each(&mut mark),
+                    other => panic!("{sql}: a list, not {other:?}"),
+                },
+                other => panic!("{sql}: a comparison, not {other:?}"),
+            }
+            let ctx = CompileContext::with_global_registry(&columns).with_read_as(&read_as);
+            let program = ExprCompiler::new(&ctx).compile(&expr).unwrap();
+            let reads = program
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::ReadAsColumn(DataType::Timestamp)));
+            assert_eq!(reads, when_run, "{sql}: {}", program.disassemble());
         }
     }
 }
