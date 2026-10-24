@@ -7788,7 +7788,6 @@ impl<'a> PreparedRunner<'a> {
             None
         };
         let origin = BlockOrigin {
-            block: &existence.identity,
             block_key: existence.identity_key,
             scopes: &existence.scopes,
             params: statement.params(),
