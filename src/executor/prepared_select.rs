@@ -701,7 +701,7 @@ impl Executor {
             .collect();
         if keys
             .iter()
-            .any(|key| names_any(key, &|name| aliases.contains(&name)))
+            .any(|key| names_anywhere(key, &|name| aliases.contains(&name)))
         {
             return Err("an ORDER BY subquery key naming a SELECT alias");
         }
@@ -5453,6 +5453,38 @@ fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<E
         .cloned()
         .collect();
     combine_predicates_with_and(range).map(Box::new)
+}
+
+/// Whether a name anywhere in `expr`, its subqueries' clauses included, bare
+/// or as the column of a qualified name, passes `matches`
+fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
+    let statement = |sq: &SelectStatement| {
+        sq.columns
+            .iter()
+            .chain(sq.where_clause.as_deref())
+            .chain(sq.having.as_deref())
+            .chain(&sq.group_by.columns)
+            .chain(sq.order_by.iter().map(|o| &o.expression))
+            .any(|e| names_anywhere(e, matches))
+    };
+    match expr {
+        Expression::Identifier(id) => matches(&id.value_lower),
+        Expression::QualifiedIdentifier(qid) => matches(&qid.name.value_lower),
+        Expression::Aliased(aliased) => names_anywhere(&aliased.expression, matches),
+        Expression::ScalarSubquery(sq) => statement(&sq.subquery),
+        Expression::Exists(exists) => statement(&exists.subquery),
+        Expression::AllAny(all_any) => {
+            names_anywhere(&all_any.left, matches) || statement(&all_any.subquery)
+        }
+        other => {
+            let mut found = false;
+            let _ = for_each_child(other, &mut |child| {
+                found |= names_anywhere(child, matches);
+                Ok(())
+            });
+            found
+        }
+    }
 }
 
 fn mentions_subquery(expr: &Expression) -> bool {
