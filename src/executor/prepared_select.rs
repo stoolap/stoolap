@@ -669,14 +669,15 @@ impl Executor {
                 .order_by
                 .iter()
                 .any(|ob| Self::has_subqueries(&ob.expression));
+        let distinct_on = stmt.distinct_on.iter().any(Self::has_subqueries);
         (classification.has_aggregation || classification.has_window_functions)
-            && (classification.grouped_has_subqueries || rows_where || grouped_keys)
+            && (classification.grouped_has_subqueries || rows_where || grouped_keys || distinct_on)
     }
 
     /// Whether `stmt` groups its rows or has window functions, and holds
-    /// subqueries in its SELECT list, HAVING or GROUP BY, in the ORDER BY of
-    /// one that groups without windows, or in the WHERE of one that does not
-    /// group or join, all of the family's forms, or why not
+    /// subqueries in its SELECT list, HAVING, GROUP BY or DISTINCT ON, in the
+    /// ORDER BY of one that groups without windows, or in the WHERE of one
+    /// that does not group or join, all of the family's forms, or why not
     pub(crate) fn grouped_family(
         &self,
         stmt: &SelectStatement,
@@ -688,13 +689,16 @@ impl Executor {
         if !stmt.window_defs.is_empty() {
             return Err("a named window");
         }
-        if !stmt.distinct_on.is_empty() {
-            return Err("DISTINCT ON");
+        // A set operation's branch carries no DISTINCT ON key as a column
+        if !stmt.set_operations.is_empty() && stmt.distinct_on.iter().any(mentions_subquery) {
+            return Err("a DISTINCT ON subquery in a set operation's branch");
         }
         let grouped = grouped_block(stmt);
+        // A grouped statement's DISTINCT ON key runs as an item, its windows too
         let windowed = stmt
             .columns
             .iter()
+            .chain(stmt.distinct_on.iter().filter(|_| grouped))
             .any(QueryClassification::expression_has_window_function);
         if !grouped && !windowed {
             return Err("a statement that neither groups nor has window functions");
@@ -757,6 +761,10 @@ impl Executor {
         }
         for key in keys {
             family.expression(key, 1, Site::GroupedOutput, &mut found)?;
+        }
+        // A DISTINCT ON key is computed as a SELECT item of the statement is
+        for key in &stmt.distinct_on {
+            family.expression(key, 1, list, &mut found)?;
         }
         for item in grouping_items(stmt) {
             family.expression(item, 1, Site::Subqueries, &mut found)?;
@@ -4143,6 +4151,9 @@ impl PreparedGrouped {
         epoch: u64,
         first: &mut FirstReads,
     ) -> Result<Option<Self>> {
+        // A DISTINCT ON key rides along as the hidden item it runs with
+        let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
+        let stmt = keyed.as_ref().unwrap_or(stmt);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {

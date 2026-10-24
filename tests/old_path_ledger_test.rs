@@ -294,6 +294,14 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "grouped_distinct_on",
+        "SELECT DISTINCT ON ((SELECT COUNT(*) FROM u WHERE u.id = t.a)) a FROM t GROUP BY a \
+         ORDER BY a",
+        "SELECT DISTINCT ON (CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END) a FROM t GROUP BY a \
+         ORDER BY a",
+        Prepared,
+    ),
+    (
         "operator_outside_the_family",
         "SELECT id FROM t WHERE id > (SELECT MAX(x) FROM u) AND a || '' = '1'",
         "SELECT id FROM t WHERE id > 3 AND a || '' = '1'",
@@ -315,7 +323,12 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
-const ORDERED: &[&str] = &["order_by_scalar", "order_by_correlated", "grouped_order_by"];
+const ORDERED: &[&str] = &[
+    "order_by_scalar",
+    "order_by_correlated",
+    "grouped_order_by",
+    "grouped_distinct_on",
+];
 
 /// Each write shape, the same write with literals, and its path
 const WRITES: &[(&str, &str, &str, Path)] = &[
