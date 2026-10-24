@@ -234,7 +234,7 @@ fn test_group_by_expression() {
 fn test_having_beside_a_window() {
     site(
         "site_having_window",
-        Fails("step 4"),
+        Right,
         "SELECT a, SUM(b), RANK() OVER (ORDER BY a) FROM t GROUP BY a HAVING SUM(b) > (SELECT 70) ORDER BY a",
         "SELECT a, SUM(b), RANK() OVER (ORDER BY a) FROM t GROUP BY a HAVING SUM(b) > 70 ORDER BY a",
     );

@@ -271,7 +271,21 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "window_where",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > (SELECT MAX(x) FROM u)",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > 3",
-        Old("DISTINCT, set operations and windows"),
+        Prepared,
+    ),
+    (
+        "window_select",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id), (SELECT COUNT(*) FROM u WHERE u.id = t.a) \
+         FROM t",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id), CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END \
+         FROM t",
+        Prepared,
+    ),
+    (
+        "grouped_order_by",
+        "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY (SELECT COUNT(*) FROM u WHERE u.id = t.a), a",
+        "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END, a",
+        Prepared,
     ),
     (
         "operator_outside_the_family",
@@ -295,7 +309,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
-const ORDERED: &[&str] = &["order_by_scalar", "order_by_correlated"];
+const ORDERED: &[&str] = &["order_by_scalar", "order_by_correlated", "grouped_order_by"];
 
 /// Each write shape, the same write with literals, and its path
 const WRITES: &[(&str, &str, &str, Path)] = &[

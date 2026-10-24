@@ -719,17 +719,23 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
     fill(&db);
     for (sql, reason) in [
         (
-            "SELECT a, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a ORDER BY (SELECT MIN(u.x) FROM u) + a",
+            "SELECT a, RANK() OVER (ORDER BY a), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+             ORDER BY (SELECT MIN(u.x) FROM u) + a",
             "an ORDER BY holding a subquery",
+        ),
+        (
+            "SELECT a AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+             ORDER BY (SELECT MIN(u.x) FROM u) + g",
+            "an ORDER BY subquery key naming a SELECT alias",
         ),
         (
             "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
             "a subquery outside WHERE and the subquery blocks",
         ),
         (
-            "SELECT a, SUM(b), RANK() OVER (ORDER BY a) FROM t GROUP BY a \
-             HAVING SUM(b) > (SELECT MAX(u.x) FROM u)",
-            "a window function",
+            "SELECT a, SUM(b), RANK() OVER w FROM t GROUP BY a \
+             HAVING SUM(b) > (SELECT MAX(u.x) FROM u) WINDOW w AS (ORDER BY a)",
+            "a named window",
         ),
     ] {
         assert_eq!(
