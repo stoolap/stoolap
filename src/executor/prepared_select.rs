@@ -274,7 +274,7 @@ impl<'a> Family<'a> {
                         if is_tuple(&in_expr.left) {
                             return Err("a tuple on the left of IN (subquery)");
                         }
-                        walk(&in_expr.left)?;
+                        self.expression(&in_expr.left, scopes, site.operand(), found)?;
                         *found = true;
                         return self.block(&sq.subquery, scopes + 1);
                     }
@@ -343,7 +343,7 @@ impl<'a> Family<'a> {
                 if is_tuple(&all_any.left) {
                     return Err("a tuple on the left of ANY or ALL");
                 }
-                walk(&all_any.left)?;
+                self.expression(&all_any.left, scopes, site.operand(), found)?;
                 *found = true;
                 self.block(&all_any.subquery, scopes + 1)
             }
@@ -534,6 +534,18 @@ enum Site {
 
 /// Whether a block aggregates its rows: it groups, has HAVING, or its
 /// SELECT list calls an aggregate
+impl Site {
+    /// What the left of a set test over a block may hold: no window function,
+    /// which the window path computes only outside one
+    fn operand(self) -> Site {
+        match self {
+            Site::Rows => Site::Subqueries,
+            Site::GroupedList => Site::GroupedOutput,
+            other => other,
+        }
+    }
+}
+
 fn grouped_block(sq: &SelectStatement) -> bool {
     !sq.group_by.columns.is_empty()
         || matches!(sq.group_by.modifier, GroupByModifier::GroupingSets(_))
