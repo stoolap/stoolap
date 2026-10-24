@@ -61,6 +61,8 @@ Based on the implementation, Stoolap recognizes various date and time formats:
 14:30                         -- Hours and minutes only
 ```
 
+A time of day alone, read as a TIMESTAMP, takes the date of the day it is read on (UTC), as `NOW()` does. Each statement reads it again, so a prepared or repeated statement, and an answer it keeps for the next execution, never carries an earlier day's date.
+
 ## Date and Time Functions
 
 ### NOW() / CURRENT_TIMESTAMP / CURRENT_DATE

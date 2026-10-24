@@ -134,6 +134,12 @@ impl Walk<'_> {
             | Expression::Star(_)
             | Expression::QualifiedStar(_)
             | Expression::Default(_) => varies,
+            // A time of day read as a TIMESTAMP takes the date it is read on
+            Expression::StringLiteral(lit)
+                if crate::core::value::timestamp_reads_the_clock(&lit.value) =>
+            {
+                Volatility::PerStatement
+            }
             Expression::IntegerLiteral(_)
             | Expression::FloatLiteral(_)
             | Expression::StringLiteral(_)

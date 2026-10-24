@@ -2264,4 +2264,22 @@ mod tests {
             assert_eq!(reads, when_run, "{sql}: {}", program.disassemble());
         }
     }
+
+    #[test]
+    fn a_cast_of_a_time_of_day_is_not_folded_into_the_program() {
+        let columns = vec!["ts".to_string()];
+        let ctx = CompileContext::with_global_registry(&columns);
+        for (sql, folded) in [
+            ("ts = CAST('12:00:00' AS TIMESTAMP)", false),
+            ("ts = EXTRACT(HOUR FROM CAST('12:00' AS TIMESTAMP))", false),
+            ("ts = CAST('2024-01-15 12:00:00' AS TIMESTAMP)", true),
+        ] {
+            let program = ExprCompiler::new(&ctx).compile(&parse(sql)).unwrap();
+            let cast = program
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Cast(DataType::Timestamp)));
+            assert_eq!(!cast, folded, "{sql}: {}", program.disassemble());
+        }
+    }
 }
