@@ -328,7 +328,7 @@ fn a_join_output_s_subqueries_answer_in_every_context() {
         (
             "SELECT l.k, COUNT(*), (SELECT MAX(s.a) FROM s WHERE s.b = l.k) FROM l JOIN r ON l.k = r.k \
              GROUP BY l.k ORDER BY 1",
-            false,
+            true,
         ),
     ] {
         let got = rows(&db, sql);

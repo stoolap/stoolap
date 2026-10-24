@@ -3379,6 +3379,10 @@ impl Executor {
         base_columns: &[String],
         qualifier: Option<&str>,
     ) -> Result<(crate::core::RowVec, Vec<String>)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::LiftedSubqueries,
+        );
         // Each column under its own name, its bare name when qualified, and
         // its qualified name when the source's name or alias is known
         let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = base_columns

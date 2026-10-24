@@ -222,6 +222,21 @@ struct GroupingSet {
     active_columns: Vec<bool>,
 }
 
+/// The expressions `stmt` groups by, in the order its groups hold them:
+/// GROUPING SETS's each once, as it first appears
+pub(crate) fn grouping_items(stmt: &SelectStatement) -> Vec<&Expression> {
+    match &stmt.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => {
+            let mut seen = FxHashSet::default();
+            sets.iter()
+                .flatten()
+                .filter(|expr| seen.insert(ExprKey::of(expr)))
+                .collect()
+        }
+        _ => stmt.group_by.columns.iter().collect(),
+    }
+}
+
 /// The identity of a GROUP BY item
 fn group_by_item_key(item: &GroupByItem) -> ExprKey {
     match item {
@@ -2481,26 +2496,7 @@ impl Executor {
             })
             .collect();
 
-        // For GROUPING SETS, extract all unique columns from all sets
-        let columns_to_parse: Vec<&Expression> =
-            if let GroupByModifier::GroupingSets(ref sets) = stmt.group_by.modifier {
-                // Collect all unique columns from all grouping sets
-                let mut seen = FxHashSet::default();
-                let mut unique_cols = Vec::new();
-                for set in sets {
-                    for expr in set {
-                        if seen.insert(ExprKey::of(expr)) {
-                            unique_cols.push(expr);
-                        }
-                    }
-                }
-                unique_cols
-            } else {
-                // Regular GROUP BY, ROLLUP, or CUBE - use columns directly
-                stmt.group_by.columns.iter().collect()
-            };
-
-        for expr in columns_to_parse {
+        for expr in grouping_items(stmt) {
             match expr {
                 Expression::Identifier(id) => {
                     // Check if this identifier is an alias defined in SELECT
@@ -2861,7 +2857,7 @@ impl Executor {
     }
 
     /// Resolve GROUP BY column names for result (new version supporting GroupByItem)
-    fn resolve_group_by_column_names_new(
+    pub(crate) fn resolve_group_by_column_names_new(
         &self,
         group_by_items: &[GroupByItem],
         columns: &[String],
@@ -2895,7 +2891,10 @@ impl Executor {
 
     /// Look up column index, handling both qualified (e.g., "o.amount") and unqualified names.
     /// If a qualified name lookup fails, tries the unqualified part (after the dot).
-    fn lookup_column_index(column_lower: &str, col_index_map: &StringMap<usize>) -> Option<usize> {
+    pub(crate) fn lookup_column_index(
+        column_lower: &str,
+        col_index_map: &StringMap<usize>,
+    ) -> Option<usize> {
         // First try exact match
         if let Some(&idx) = col_index_map.get(column_lower) {
             return Some(idx);

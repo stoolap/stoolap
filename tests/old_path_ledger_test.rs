@@ -42,7 +42,7 @@ enum Path {
 
 use Path::{Old, Prepared};
 
-const ALL: [GeneralPath; 14] = [
+const ALL: [GeneralPath; 15] = [
     GeneralPath::CorrelatedScan,
     GeneralPath::CorrelatedWhere,
     GeneralPath::OuterBinding,
@@ -57,6 +57,7 @@ const ALL: [GeneralPath; 14] = [
     GeneralPath::ScalarSubquery,
     GeneralPath::SelectFold,
     GeneralPath::CorrelatedExpression,
+    GeneralPath::LiftedSubqueries,
 ];
 
 fn hits() -> Vec<usize> {
@@ -213,7 +214,34 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
          HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE u.x = s.a)",
         "SELECT a, COUNT(*) FROM t GROUP BY a \
          HAVING COUNT(*) > CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END",
-        Old("a grouped statement over a source"),
+        Prepared,
+    ),
+    (
+        "grouped_over_a_derived_table",
+        "SELECT d.a, SUM((SELECT MAX(x) FROM u WHERE u.x = d.a)) FROM (SELECT a FROM t) d \
+         GROUP BY d.a",
+        "SELECT a, SUM(CASE WHEN a BETWEEN 1 AND 3 THEN a END) FROM t GROUP BY a",
+        Prepared,
+    ),
+    (
+        "grouped_over_a_join",
+        "SELECT t.a, (SELECT COUNT(*) FROM u WHERE u.x = t.a) FROM t JOIN u v ON v.id = t.id \
+         GROUP BY t.a",
+        "SELECT t.a, CASE WHEN t.a BETWEEN 1 AND 3 THEN 1 ELSE 0 END FROM t \
+         JOIN u v ON v.id = t.id GROUP BY t.a",
+        Prepared,
+    ),
+    (
+        "grouped_rollup_and_distinct",
+        "SELECT DISTINCT a, (SELECT MAX(x) FROM u) FROM t GROUP BY ROLLUP(a)",
+        "SELECT DISTINCT a, 3 FROM t GROUP BY ROLLUP(a)",
+        Prepared,
+    ),
+    (
+        "grouped_set_operation_branch",
+        "SELECT a, (SELECT MAX(x) FROM u) FROM t GROUP BY a UNION ALL SELECT -1, 0",
+        "SELECT a, 3 FROM t GROUP BY a UNION ALL SELECT -1, 0",
+        Prepared,
     ),
     (
         "block_order_by_limit",

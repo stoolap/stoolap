@@ -685,7 +685,7 @@ impl Executor {
                     .order_by
                     .iter()
                     .any(|ob| Self::has_subqueries(&ob.expression)));
-        let grouped_output = join.is_none() && {
+        let grouped_output = {
             let classification = get_classification(select);
             classification.has_aggregation && classification.grouped_has_subqueries
         };
@@ -698,8 +698,8 @@ impl Executor {
                 .is_some_and(Self::has_subqueries)
         {
             let prepared = match join {
+                _ if grouped_output => self.grouped_family(select, None),
                 Some(join) => self.join_prepared(select, join, own),
-                None if grouped_output => self.grouped_family(select, None),
                 None => self.prepared_family(select, None),
             };
             match prepared {
