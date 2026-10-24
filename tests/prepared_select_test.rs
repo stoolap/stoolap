@@ -1074,8 +1074,10 @@ fn test_classifier_rules() {
             "LIMIT or OFFSET that is not a literal or a parameter",
         ),
         (
-            format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE a > {sq}"),
-            "a window function",
+            format!(
+                "SELECT id, ROW_NUMBER() OVER w FROM t WHERE a > {sq} WINDOW w AS (ORDER BY id)"
+            ),
+            "a named window",
         ),
         (
             format!("SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > {sq}"),

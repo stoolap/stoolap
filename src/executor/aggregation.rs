@@ -187,7 +187,7 @@ pub(crate) fn slot_context<'a>(
 
 /// The parameters a slot row's programs read: the `blocks`' when the
 /// statement has them, as `with_blocks` gives them, else the statement's
-fn slot_params<'a>(
+pub(crate) fn slot_params<'a>(
     ctx: &'a ExecutionContext,
     blocks: Option<&'a dyn SubqueryExecutor>,
 ) -> &'a [Value] {
@@ -198,7 +198,7 @@ fn slot_params<'a>(
 
 /// `exec` with its subqueries answered by the statement's `blocks`, which
 /// hold the parameters past the statement's own
-fn with_blocks<'a>(
+pub(crate) fn with_blocks<'a>(
     exec: super::expression::ExecuteContext<'a>,
     blocks: Option<&'a dyn SubqueryExecutor>,
 ) -> super::expression::ExecuteContext<'a> {
@@ -1992,21 +1992,24 @@ impl Executor {
     }
 
     /// Aggregate, then run the window functions over the aggregate's output.
-    /// A subquery inside an aggregate is resolved per input row first, and
-    /// both stages read the same rewritten statement
+    /// A subquery inside an aggregate is resolved per input row first, unless
+    /// the statement's `blocks` answer its subqueries, and both stages read
+    /// the same rewritten statement
     pub(crate) fn execute_aggregation_then_windows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         let lifted_stmt;
         let lifted_rows;
         let lifted_columns;
-        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
-            .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
-            .flatten()
+        let (stmt, base_rows, base_columns) = match (blocks.is_none()
+            && Self::aggregates_hold_subquery(stmt))
+        .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
+        .flatten()
         {
             Some((rewritten, lifted, names)) => {
                 let qualifier = stmt
@@ -2033,13 +2036,14 @@ impl Executor {
             None => (stmt, base_rows, base_columns),
         };
         let (agg_columns, agg_rows, slots) =
-            self.execute_aggregation_for_window(stmt, ctx, base_rows, base_columns)?;
+            self.execute_aggregation_for_window(stmt, ctx, base_rows, base_columns, blocks)?;
         self.execute_select_with_window_functions_over_groups(
             stmt,
             ctx,
             &agg_rows,
             &agg_columns,
             &slots,
+            blocks,
         )
     }
 
@@ -2052,6 +2056,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec, FxHashMap<ExprKey, usize>)> {
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
@@ -2070,7 +2075,7 @@ impl Executor {
                 base_columns,
                 &col_index_map,
                 ctx,
-                None,
+                blocks,
             )?
         } else {
             // Grouped aggregation - no limit since window functions need all groups
@@ -2082,7 +2087,7 @@ impl Executor {
                 &col_index_map,
                 ctx,
                 None, // Window functions need all groups
-                None,
+                blocks,
             )?
         };
 
@@ -2096,12 +2101,15 @@ impl Executor {
                 crate::functions::registry::global_registry(),
                 Some(&slots),
                 None,
-                false,
-                Some(ctx.params()),
+                blocks.is_some(),
+                Some(slot_params(ctx, blocks)),
             )?;
             let mut vm = ExprVM::new();
             for (id, row) in result_rows {
-                if vm.execute_bool_checked(&having_filter, &slot_context(&row, ctx))? {
+                if vm.execute_bool_checked(
+                    &having_filter,
+                    &with_blocks(slot_context(&row, ctx), blocks),
+                )? {
                     result_rows_with_ids.push((id, row));
                 }
             }

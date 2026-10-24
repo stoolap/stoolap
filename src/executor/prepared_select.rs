@@ -54,6 +54,7 @@ use super::expression::{
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
+use super::query_classification::{get_classification, QueryClassification};
 use super::result::{ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
@@ -213,7 +214,10 @@ impl<'a> Family<'a> {
         site: Site,
         found: &mut bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        let subqueries = matches!(site, Site::Subqueries | Site::GroupedOutput);
+        let subqueries = matches!(
+            site,
+            Site::Subqueries | Site::GroupedOutput | Site::Rows | Site::GroupedList
+        );
         let mut walk = |e: &'a Expression| self.expression(e, scopes, site, found);
         match expr {
             Expression::Identifier(_)
@@ -302,7 +306,10 @@ impl<'a> Family<'a> {
             Expression::Cast(cast) => walk(&cast.expr),
             Expression::FunctionCall(call) => {
                 if is_aggregate_function(&call.function) {
-                    if !matches!(site, Site::Grouped | Site::GroupedOutput) {
+                    if !matches!(
+                        site,
+                        Site::Grouped | Site::GroupedOutput | Site::GroupedList
+                    ) {
                         return Err("an aggregate outside a subquery block");
                     }
                     return self.aggregate_call(call, scopes, site, found);
@@ -340,7 +347,48 @@ impl<'a> Family<'a> {
                 *found = true;
                 self.block(&all_any.subquery, scopes + 1)
             }
-            Expression::Window(_) => Err("a window function"),
+            Expression::Window(window) => {
+                let inner = match site {
+                    Site::Rows => Site::Subqueries,
+                    Site::GroupedList => Site::GroupedOutput,
+                    _ => return Err("a window function outside the SELECT list"),
+                };
+                if window.window_ref.is_some() {
+                    return Err("a named window");
+                }
+                // NTILE's argument, the ones after a call's first and the frame
+                // offsets are read once for the call
+                let call = &window.function;
+                let inputs = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
+                for (i, arg) in call.arguments.iter().enumerate() {
+                    let at = if i < inputs { inner } else { Site::Values };
+                    if !matches!(arg, Expression::Star(_)) {
+                        self.expression(arg, scopes, at, found)?;
+                    }
+                }
+                let read = call
+                    .filter
+                    .as_deref()
+                    .into_iter()
+                    .chain(call.order_by.iter().map(|o| &o.expression))
+                    .chain(&window.partition_by)
+                    .chain(window.order_by.iter().map(|o| &o.expression));
+                for expr in read {
+                    self.expression(expr, scopes, inner, found)?;
+                }
+                let bounds = window
+                    .frame
+                    .iter()
+                    .flat_map(|frame| std::iter::once(&frame.start).chain(&frame.end));
+                for bound in bounds {
+                    if let WindowFrameBound::Preceding(offset)
+                    | WindowFrameBound::Following(offset) = bound
+                    {
+                        self.expression(offset, scopes, Site::Values, found)?;
+                    }
+                }
+                Ok(())
+            }
             _ => Err("an expression form outside the family"),
         }
     }
@@ -407,7 +455,7 @@ impl<'a> Family<'a> {
         found: &mut bool,
     ) -> std::result::Result<(), OutOfFamily> {
         let inputs = match site {
-            Site::GroupedOutput => Site::Subqueries,
+            Site::GroupedOutput | Site::GroupedList => Site::Subqueries,
             _ => Site::Values,
         };
         let mut values = |e: &'a Expression| self.expression(e, scopes, inputs, found);
@@ -476,6 +524,12 @@ enum Site {
     /// A grouped statement's own SELECT list and HAVING: aggregate calls,
     /// and subqueries outside them
     GroupedOutput,
+    /// The SELECT list of a statement that does not group: subqueries and
+    /// window functions
+    Rows,
+    /// A grouped statement's own SELECT list: what `GroupedOutput` holds,
+    /// and window functions
+    GroupedList,
 }
 
 /// Whether a block aggregates its rows: it groups, has HAVING, or its
@@ -588,9 +642,29 @@ impl Executor {
         family.catalog()
     }
 
-    /// Whether `stmt` groups one table and holds subqueries in its SELECT
-    /// list or HAVING, all of the family's forms and none inside an
-    /// aggregate, while its WHERE, GROUP BY and ORDER BY hold none, or why not
+    /// Whether `stmt`, as `classification` says, is a statement the grouped
+    /// family may take, which `grouped_family` then decides
+    pub(crate) fn grouped_family_reach(
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+    ) -> bool {
+        let rows_where = classification.has_window_functions
+            && !classification.has_aggregation
+            && classification.where_has_subqueries
+            && !matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
+        let grouped_keys = classification.has_aggregation
+            && stmt
+                .order_by
+                .iter()
+                .any(|ob| Self::has_subqueries(&ob.expression));
+        (classification.has_aggregation || classification.has_window_functions)
+            && (classification.grouped_has_subqueries || rows_where || grouped_keys)
+    }
+
+    /// Whether `stmt` groups its rows or has window functions, and holds
+    /// subqueries in its SELECT list, HAVING or GROUP BY, in the ORDER BY of
+    /// one that groups without windows, or in the WHERE of one that does not
+    /// group or join, all of the family's forms, or why not
     pub(crate) fn grouped_family(
         &self,
         stmt: &SelectStatement,
@@ -600,24 +674,50 @@ impl Executor {
             return Err("it runs for a row of an enclosing statement");
         }
         if !stmt.window_defs.is_empty() {
-            return Err("a window function");
+            return Err("a named window");
         }
         if !stmt.distinct_on.is_empty() {
             return Err("DISTINCT ON");
         }
-        if !grouped_block(stmt) {
-            return Err("a statement that does not group");
+        let grouped = grouped_block(stmt);
+        let windowed = stmt
+            .columns
+            .iter()
+            .any(QueryClassification::expression_has_window_function);
+        if !grouped && !windowed {
+            return Err("a statement that neither groups nor has window functions");
+        }
+        // The windows run over the groups when the statement aggregates first
+        if windowed && grouped != get_classification(stmt).has_aggregation {
+            return Err("windows over a grouping the aggregation does not run");
         }
         // A set operation's ORDER BY, LIMIT and OFFSET are the whole one's,
         // read over its rows once the blocks gave the first branch's
         let whole = stmt.set_operations.is_empty();
-        if whole
-            && stmt
-                .order_by
-                .iter()
-                .any(|ob| mentions_subquery(&ob.expression))
-        {
+        // A grouped key holding a subquery is computed for each group, where
+        // a SELECT alias names no column
+        let keys: SmallVec<[&Expression; 2]> = stmt
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .filter(|key| whole && mentions_subquery(key))
+            .collect();
+        if !keys.is_empty() && windowed {
             return Err("an ORDER BY holding a subquery");
+        }
+        let aliases: SmallVec<[&str; 4]> = stmt
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+                _ => None,
+            })
+            .collect();
+        if keys
+            .iter()
+            .any(|key| names_any(key, &|name| aliases.contains(&name)))
+        {
+            return Err("an ORDER BY subquery key naming a SELECT alias");
         }
         // A GROUP BY item naming a SELECT alias or position groups that item
         self.parse_group_by(stmt, &[])
@@ -630,19 +730,33 @@ impl Executor {
             with: stmt.with.as_ref(),
         };
         let mut found = false;
+        let list = if grouped {
+            Site::GroupedList
+        } else {
+            Site::Rows
+        };
         for column in &stmt.columns {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
-                family.expression(unaliased(column), 1, Site::GroupedOutput, &mut found)?;
+                family.expression(unaliased(column), 1, list, &mut found)?;
             }
         }
         if let Some(having) = stmt.having.as_deref() {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
         }
+        for key in keys {
+            family.expression(key, 1, Site::GroupedOutput, &mut found)?;
+        }
         for item in grouping_items(stmt) {
             family.expression(item, 1, Site::Subqueries, &mut found)?;
         }
+        // The WHERE of rows that do not group runs as their blocks too, unless
+        // a join's path asks it
+        let joined = matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
+        if !grouped && !joined {
+            found |= stmt.where_clause.as_deref().is_some_and(mentions_subquery);
+        }
         if !found {
-            return Err("neither the SELECT list, HAVING nor GROUP BY holds a subquery");
+            return Err("no clause the blocks run holds a subquery");
         }
         if whole {
             counts_fit(stmt, ctx)?;
@@ -1068,6 +1182,16 @@ fn for_each_child(expr: &Expression, f: &mut impl FnMut(&Expression) -> Result<(
         Expression::AllAny(all_any) => f(&all_any.left),
         Expression::List(list) => list.elements.iter().try_for_each(f),
         Expression::ExpressionList(list) => list.expressions.iter().try_for_each(f),
+        Expression::Window(window) => {
+            let call = &window.function;
+            call.arguments.iter().try_for_each(&mut *f)?;
+            if let Some(filter) = call.filter.as_deref() {
+                f(filter)?;
+            }
+            call.order_by.iter().try_for_each(|o| f(&o.expression))?;
+            window.partition_by.iter().try_for_each(&mut *f)?;
+            window.order_by.iter().try_for_each(|o| f(&o.expression))
+        }
         _ => Ok(()),
     }
 }
@@ -1199,6 +1323,42 @@ fn rebuild(
                 .map(&mut *f)
                 .collect::<Result<_>>()?,
         })),
+        Expression::Window(window) => {
+            let mut order_by = |order: &[OrderByExpression]| {
+                order
+                    .iter()
+                    .map(|o| {
+                        Ok(OrderByExpression {
+                            expression: f(&o.expression)?,
+                            ascending: o.ascending,
+                            nulls_first: o.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            };
+            let call = &window.function;
+            let call_order_by = order_by(&call.order_by)?;
+            let window_order_by = order_by(&window.order_by)?;
+            Expression::Window(Box::new(WindowExpression {
+                token: window.token.clone(),
+                function: Box::new(FunctionCall {
+                    token: call.token.clone(),
+                    function: call.function.clone(),
+                    arguments: call.arguments.iter().map(&mut *f).collect::<Result<_>>()?,
+                    is_distinct: call.is_distinct,
+                    order_by: call_order_by,
+                    filter: call.filter.as_deref().map(|e| boxed(f, e)).transpose()?,
+                }),
+                window_ref: window.window_ref.clone(),
+                partition_by: window
+                    .partition_by
+                    .iter()
+                    .map(&mut *f)
+                    .collect::<Result<_>>()?,
+                order_by: window_order_by,
+                frame: window.frame.clone(),
+            }))
+        }
         other => other.clone(),
     })
 }
@@ -3831,10 +3991,9 @@ impl PreparedSelect {
     }
 }
 
-/// A grouped statement over one table whose SELECT list, HAVING or GROUP BY
-/// holds subqueries, prepared once as blocks of its rows: the statement the
-/// grouped path runs, with those clauses rewritten and each value read once
-/// a run slot
+/// A grouped or windowed statement whose clauses hold subqueries, prepared
+/// once as blocks of its rows: the statement the grouped and window paths
+/// run, with those clauses rewritten and each value read once a run slot
 #[derive(Debug)]
 pub struct PreparedGrouped {
     cached_epoch: u64,
@@ -4119,10 +4278,15 @@ impl PreparedGrouped {
             other => other.clone(),
         };
         // An item the GROUP BY names is read for each input row, as rewritten
-        // above; any other for each group
+        // above, and so is every item of rows that do not group; any other
+        // for each group
+        let groups = grouped_block(stmt);
         let mut output = |expr: &Expression, key: Option<&Expression>| -> Result<Expression> {
             if let Some(rewritten) = key {
                 return Ok(rewritten.clone());
+            }
+            if !groups {
+                return input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr);
             }
             let read = read_inputs(expr, &items, &mut |call| {
                 input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
@@ -4157,6 +4321,31 @@ impl PreparedGrouped {
             (Some(opened), _) => Some(Box::new(output(opened, None)?)),
             (None, other) => other.map(|having| Box::new(having.clone())),
         };
+        // An ORDER BY key holding a subquery is computed for each group into a
+        // column named by its identity, which the sort reads as the key
+        let mut order_by = stmt.order_by.clone();
+        for ob in order_by
+            .iter_mut()
+            .filter(|_| stmt.set_operations.is_empty())
+        {
+            if !mentions_subquery(&ob.expression) {
+                continue;
+            }
+            let name = ExprKey::of(&ob.expression).hidden_column_name();
+            let token = Token::new(TokenType::Identifier, &name, Position::default());
+            let column = Identifier::new(token.clone(), &name);
+            if !columns
+                .iter()
+                .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == column.value))
+            {
+                columns.push(Expression::Aliased(AliasedExpression {
+                    token,
+                    expression: Box::new(output(&ob.expression, None)?),
+                    alias: column.clone(),
+                }));
+            }
+            ob.expression = Expression::Identifier(column);
+        }
         let blocks_read = builder.subqueries.len();
         let values = CompileContext::new(&scope.columns, &executor.function_registry)
             .with_prepared_subqueries();
@@ -4265,6 +4454,7 @@ impl PreparedGrouped {
             where_clause: where_clause
                 .map(Box::new)
                 .or_else(|| stmt.where_clause.clone()),
+            order_by,
             ..stmt.clone()
         };
         // A set operation's first branch: the whole one reads the rest

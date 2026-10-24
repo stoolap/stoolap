@@ -901,98 +901,6 @@ impl ExpressionEval {
     }
 }
 
-// ============================================================================
-// MULTI-EXPRESSION EVALUATOR - For SELECT projections
-// ============================================================================
-
-/// Evaluates multiple expressions efficiently (for SELECT projections).
-///
-/// Pre-compiles all expressions once, then evaluates them together for each row.
-pub struct MultiExpressionEval {
-    /// Pre-compiled programs for each expression
-    programs: Vec<SharedProgram>,
-    /// Single VM instance (reused for all expressions)
-    vm: ExprVM,
-    /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
-    params: CompactArc<ParamVec>,
-    /// Transaction ID
-    transaction_id: Option<u64>,
-}
-
-impl MultiExpressionEval {
-    /// Compile expressions whose group items and aggregates are read from the
-    /// row's slot for each expression's identity (for windows over groups)
-    pub(crate) fn compile_with_aliases(
-        exprs: &[Expression],
-        columns: &[String],
-        aliases: &FxHashMap<ExprKey, usize>,
-    ) -> Result<Self> {
-        let ctx = CompileContext::with_global_registry(columns)
-            .with_expression_aliases(alias_slots(aliases));
-        let compiler = ExprCompiler::new(&ctx);
-
-        let programs = exprs
-            .iter()
-            .map(|expr| {
-                compiler
-                    .compile(expr)
-                    .map(CompactArc::new)
-                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            programs,
-            vm: ExprVM::new(),
-            params: EMPTY_PARAMS.clone(),
-            transaction_id: None,
-        })
-    }
-
-    /// Set from execution context.
-    ///
-    /// PERF: `params` shares the Arc - zero cloning.
-    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        // Share params Arc - no cloning needed
-        self.params = CompactArc::clone(ctx.params_arc());
-        self.transaction_id = ctx.transaction_id();
-        self
-    }
-
-    /// Evaluate all expressions for a row, returning values in order.
-    #[inline]
-    pub fn eval_all(&mut self, row: &Row) -> Result<Vec<Value>> {
-        let mut ctx = ExecuteContext::new(row);
-
-        if !self.params.is_empty() {
-            ctx = ctx.with_params(&self.params);
-        }
-        ctx = ctx.with_transaction_id(self.transaction_id);
-
-        self.programs
-            .iter()
-            .map(|prog| self.vm.execute_cow(prog, &ctx))
-            .collect()
-    }
-
-    /// Evaluate all expressions, writing results into provided buffer.
-    #[inline]
-    pub fn eval_into(&mut self, row: &Row, output: &mut Vec<Value>) -> Result<()> {
-        let mut ctx = ExecuteContext::new(row);
-
-        if !self.params.is_empty() {
-            ctx = ctx.with_params(&self.params);
-        }
-        ctx = ctx.with_transaction_id(self.transaction_id);
-
-        output.clear();
-        for prog in &self.programs {
-            output.push(self.vm.execute_cow(prog, &ctx)?);
-        }
-        Ok(())
-    }
-}
-
 /// Shared program reference for zero-copy caching
 pub type SharedProgram = CompactArc<Program>;
 
@@ -1014,7 +922,6 @@ const LOCAL_PROGRAM_CACHE_MAX: usize = 128;
 /// - [`ExpressionEval`] - For single expression evaluation (most common case)
 /// - [`RowFilter`] - For closure-based filtering (Send+Sync safe)
 /// - [`JoinFilter`] - For join condition evaluation
-/// - [`MultiExpressionEval`] - For SELECT projections (multiple expressions)
 ///
 /// The new APIs pre-compile expressions eagerly rather than lazily, avoiding
 /// cache invalidation issues and providing better performance.
@@ -1044,7 +951,6 @@ const LOCAL_PROGRAM_CACHE_MAX: usize = 128;
 /// **Use the new APIs (recommended for most cases):**
 /// - [`ExpressionEval`] - Single expression with static schema
 /// - [`RowFilter`] - WHERE clause filtering (thread-safe)
-/// - [`MultiExpressionEval`] - SELECT projections (multiple expressions)
 ///
 /// **Use CompiledEvaluator when:**
 /// - Expressions change per-row (e.g., after `process_correlated_expression`)
@@ -1949,37 +1855,6 @@ mod tests {
 
         let row = Row::from(vec![Value::Integer(3)]);
         assert!(!eval.eval_bool_checked(&row).unwrap());
-    }
-
-    // =========================================================================
-    // MultiExpressionEval tests
-    // =========================================================================
-
-    #[test]
-    fn test_multi_expression_eval_all() {
-        let expr1 = make_infix(
-            make_identifier("col"),
-            InfixOperator::Add,
-            make_int_literal(10),
-        );
-        let expr2 = make_infix(
-            make_identifier("col"),
-            InfixOperator::Multiply,
-            make_int_literal(2),
-        );
-        let columns = vec!["col".to_string()];
-        let mut eval = MultiExpressionEval::compile_with_aliases(
-            &[expr1, expr2],
-            &columns,
-            &FxHashMap::default(),
-        )
-        .unwrap();
-
-        let row = Row::from(vec![Value::Integer(5)]);
-        let results = eval.eval_all(&row).unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0], Value::Integer(15)); // 5 + 10
-        assert_eq!(results[1], Value::Integer(10)); // 5 * 2
     }
 
     // =========================================================================
