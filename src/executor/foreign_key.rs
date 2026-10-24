@@ -28,6 +28,7 @@
 //! - Cached reverse FK mapping (rebuilt only on schema_epoch change)
 //! - Index-based parent lookups (no table scans when index exists)
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
@@ -798,11 +799,32 @@ fn cascade_update_recursive(
 
     // Now update the matching child rows (safe — RESTRICT checks passed above)
     let mut child = engine.get_table_for_txn(txn_id, child_table)?;
-    let new_val = new_value.clone();
 
     let child_schema = child.schema();
     let col_idx = key_position(child_schema, fk)?;
     let col_name = &child_schema.columns[col_idx].name;
+    // The child stores the parent's value in its own column type, checked as stored
+    let col_type = child_schema.columns[col_idx].data_type;
+    let new_val = new_value.try_coerce_to_type(col_type)?;
+    super::dml::validate_coercion(
+        new_value,
+        &new_val,
+        col_name,
+        col_type,
+        child_schema.columns[col_idx].vector_dimensions,
+    )?;
+    if !new_val.is_null() && !matches!(new_val.compare(new_value), Ok(Ordering::Equal)) {
+        return Err(Error::foreign_key_violation(
+            child_table,
+            &fk.column_name,
+            &fk.referenced_table,
+            &fk.referenced_column,
+            format!(
+                "cannot cascade {} = {} into column '{}' of type {:?}",
+                fk.referenced_column, new_value, fk.column_name, col_type
+            ),
+        ));
+    }
     let mut expr = crate::storage::expression::ComparisonExpr::new(
         col_name.as_str(),
         crate::core::Operator::Eq,

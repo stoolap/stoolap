@@ -174,3 +174,106 @@ fn a_check_runs_on_a_null_value_and_only_a_null_result_passes() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE v IS NULL"), 0);
 }
+
+#[test]
+fn not_null_refuses_an_update_on_hot_and_sealed_rows() {
+    let statements = [
+        "UPDATE t SET v = NULL WHERE id = 1",
+        "UPDATE t SET v = NULL WHERE k = 1",
+        "UPDATE t SET v = NULLIF(v, 9) WHERE id = 1",
+        "UPDATE t SET v = NULL",
+        "UPDATE t SET v = CASE WHEN id = 2 THEN NULL ELSE 5 END",
+        "UPDATE t SET v = NULL WHERE id IN (SELECT id FROM t WHERE k = 2)",
+        "INSERT INTO t VALUES (1, 1, 1) ON CONFLICT (id) DO UPDATE SET v = NULL",
+    ];
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1, 9), (2, 2, 9)", ())
+            .unwrap();
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for sql in statements {
+            if db.execute(sql, ()).is_ok() {
+                wrong.push(format!("sealed={sealed} {sql}: accepted"));
+            }
+            if count(&db, "SELECT COUNT(*) FROM t WHERE v = 9") != 2 {
+                wrong.push(format!("sealed={sealed} {sql}: changed a row"));
+            }
+        }
+        let mut tx = db.begin().unwrap();
+        tx.execute("UPDATE t SET v = 7 WHERE id = 1", ()).unwrap();
+        for sql in [
+            "UPDATE t SET v = NULL WHERE k = 1",
+            "UPDATE t SET v = NULL WHERE k = 2",
+        ] {
+            if tx.execute(sql, ()).is_ok() {
+                wrong.push(format!("sealed={sealed} in a transaction {sql}: accepted"));
+            }
+            let kept: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM t WHERE v = 7 OR (id = 2 AND v = 9)",
+                    (),
+                )
+                .unwrap();
+            if kept != 2 {
+                wrong.push(format!(
+                    "sealed={sealed} in a transaction {sql}: changed a row"
+                ));
+            }
+        }
+        tx.commit().unwrap();
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_cascade_stores_the_parent_value_in_the_child_type_or_fails() {
+    let db = Database::open("memory://write_path_cascade_type").unwrap();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k FLOAT UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+         k INTEGER CHECK (k > 0) REFERENCES p(k) ON UPDATE CASCADE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES (1, 1.0), (2, 2.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE p SET k = 1.5 WHERE id = 1",
+        "UPDATE p SET k = 0.5 WHERE id = 2",
+        "UPDATE p SET k = -1.0 WHERE id = 2",
+    ] {
+        if db.execute(sql, ()).is_ok() {
+            wrong.push(format!("{sql}: accepted"));
+        }
+        let kept = count(
+            &db,
+            "SELECT COUNT(*) FROM p JOIN c ON c.id = p.id WHERE p.k = p.id AND c.k = c.id",
+        );
+        if kept != 2 {
+            wrong.push(format!("{sql}: changed a row"));
+        }
+    }
+    db.execute("UPDATE p SET k = 3.0 WHERE id = 1", ()).unwrap();
+    let child: String = db
+        .query_one("SELECT k || ' ' || TYPEOF(k) FROM c WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(child, "3 INTEGER");
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
