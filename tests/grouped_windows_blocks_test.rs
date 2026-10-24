@@ -248,6 +248,7 @@ fn every_source_answers_a_windowed_or_grouped_statement_as_its_twin() {
 
 #[test]
 fn a_value_function_reads_an_expression_argument_for_each_row() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let hot = Database::open("memory://grouped_windows_blocks_values").unwrap();
     fill(&hot);
@@ -278,6 +279,7 @@ fn a_value_function_reads_an_expression_argument_for_each_row() {
 
 #[test]
 fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
+    let _guard = serial();
     let db = Database::open("memory://grouped_windows_blocks_alias").unwrap();
     fill(&db);
     for (sql, twin) in [
@@ -297,6 +299,7 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
 
 #[test]
 fn an_item_holding_a_subquery_keeps_the_name_it_is_written_under() {
+    let _guard = serial();
     let db = Database::open("memory://grouped_windows_blocks_names").unwrap();
     fill(&db);
     for (sql, names) in [
