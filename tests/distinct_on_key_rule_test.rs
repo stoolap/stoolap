@@ -132,6 +132,33 @@ fn a_carried_key_never_reaches_the_columns_beside_a_star() {
 }
 
 #[test]
+fn a_carried_window_key_serves_the_order_by_once() {
+    let db = Database::open("memory://distinct_on_key_rule_shared").unwrap();
+    fill(&db);
+    let sql = "SELECT DISTINCT ON (ROW_NUMBER() OVER (ORDER BY id)) *, \
+               ROW_NUMBER() OVER (ORDER BY a) AS r FROM t ORDER BY ROW_NUMBER() OVER (ORDER BY id)";
+    let result = db.query(sql, ()).unwrap();
+    assert_eq!(result.columns(), ["id", "a", "b", "r"], "{sql}");
+}
+
+#[test]
+fn an_order_by_position_counts_the_columns_a_star_gives() {
+    let db = Database::open("memory://distinct_on_key_rule_star_position").unwrap();
+    fill(&db);
+    let sql = "SELECT DISTINCT ON (a % 2) *, ROW_NUMBER() OVER (ORDER BY id) FROM t ORDER BY 4";
+    assert_eq!(rows(&db, sql).len(), 2, "{sql}");
+}
+
+#[test]
+fn a_window_key_of_a_grouped_statement_runs_the_windows() {
+    let db = Database::open("memory://distinct_on_key_rule_window_key").unwrap();
+    fill(&db);
+    let sql =
+        "SELECT DISTINCT ON (ROW_NUMBER() OVER (ORDER BY a) % 2) a, COUNT(*) FROM t GROUP BY a";
+    assert_eq!(rows(&db, sql).len(), 2, "{sql}");
+}
+
+#[test]
 fn a_group_by_position_reads_the_select_list_as_written() {
     let db = Database::open("memory://distinct_on_key_rule_position").unwrap();
     fill(&db);

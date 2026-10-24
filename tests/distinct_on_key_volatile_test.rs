@@ -73,4 +73,19 @@ fn a_key_the_select_list_computes_runs_once_per_row() {
         })
         .collect();
     assert_eq!(got, vec![1, 2, 3], "one call per group");
+    let before = CALLS.load(Ordering::Relaxed);
+    let rows = db
+        .query(
+            "SELECT DISTINCT ON (NEXT_COUNT()) *, NEXT_COUNT() AS \"NEXT_COUNT()\", \
+             ROW_NUMBER() OVER (ORDER BY id) FROM t",
+            (),
+        )
+        .unwrap()
+        .count();
+    assert_eq!(rows, 3);
+    assert_eq!(
+        CALLS.load(Ordering::Relaxed) - before,
+        3,
+        "beside a star, one call per row"
+    );
 }

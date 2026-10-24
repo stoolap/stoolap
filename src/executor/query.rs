@@ -795,6 +795,10 @@ fn unaliased_item(mut expr: &Expression) -> &Expression {
     expr
 }
 
+fn is_star_item(expr: &Expression) -> bool {
+    matches!(expr, Expression::Star(_) | Expression::QualifiedStar(_))
+}
+
 /// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
 /// constant, so no column reads as the text of its name, that evaluates to
 /// false or NULL
@@ -1365,15 +1369,24 @@ impl Executor {
         // A DISTINCT ON key the aggregation or window path computes rides along
         // as a hidden item, which the visible column count trims after
         let keyed_stmt;
+        let keyed_classification;
         let written_items = branch.columns.len();
-        let branch = match Self::with_distinct_on_items(branch, &classification) {
-            Some(keyed) => {
-                keyed_stmt = keyed;
-                &keyed_stmt
-            }
-            None => branch,
-        };
+        let (branch, branch_classification) =
+            match Self::with_distinct_on_items(branch, &classification) {
+                Some(keyed) => {
+                    keyed_stmt = keyed;
+                    keyed_classification = get_classification(&keyed_stmt);
+                    (&keyed_stmt, &keyed_classification)
+                }
+                None => (branch, &classification),
+            };
+        // The columns past the visible ones: the carried keys, and the ORDER BY
+        // windows no item, a carried key included, computes
         let hidden_keys = branch.columns.len() - written_items;
+        let hidden_windows = match branch_classification.has_window_functions {
+            true => Self::hidden_order_by_windows(branch).len(),
+            false => 0,
+        };
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let (mut result, columns, limit_offset_applied, shape) = if in_family {
@@ -1390,7 +1403,7 @@ impl Executor {
             self.execute_prepared_grouped(grouped, branch, ctx)?
         } else {
             let compiled = compiled.filter(|_| !folded_select);
-            self.execute_select_internal(branch, ctx, &classification, compiled)?
+            self.execute_select_internal(branch, ctx, branch_classification, compiled)?
         };
         let SelectShape {
             deferred: deferred_projection,
@@ -1416,12 +1429,8 @@ impl Executor {
         // computed for it, so those are counted off the end
         let expected_columns =
             match prepared_visible.unwrap_or_else(|| self.count_select_columns(stmt)) {
-                0 if classification.has_window_functions || hidden_keys > 0 => {
-                    let windows = match classification.has_window_functions {
-                        true => Self::hidden_order_by_windows(stmt).len(),
-                        false => 0,
-                    };
-                    let hidden = windows + hidden_keys;
+                0 if hidden_windows + hidden_keys > 0 => {
+                    let hidden = hidden_windows + hidden_keys;
                     if hidden > 0 {
                         columns.len().saturating_sub(hidden)
                     } else {
@@ -1768,7 +1777,12 @@ impl Executor {
 
                 // Apply DISTINCT ON if active
                 if has_distinct_on {
-                    result = Self::distinct_on_result(stmt, result)?;
+                    result = Self::distinct_on_result(
+                        stmt,
+                        result,
+                        layout.map(|l| &**l),
+                        expected_columns,
+                    )?;
 
                     // Remove extra columns after DISTINCT ON dedup
                     if needs_extra_col_removal {
@@ -1862,7 +1876,8 @@ impl Executor {
         // columns not in SELECT (they may be among the extra ORDER BY columns or
         // the full source columns).
         if !stmt.distinct_on.is_empty() {
-            result = Self::distinct_on_result(stmt, result)?;
+            let layout = layout.as_deref().filter(|_| stmt.set_operations.is_empty());
+            result = Self::distinct_on_result(stmt, result, layout, expected_columns)?;
         }
 
         // Remove extra ORDER BY columns that were added for sorting
@@ -1884,10 +1899,29 @@ impl Executor {
     fn distinct_on_result(
         stmt: &SelectStatement,
         result: Box<dyn QueryResult>,
+        layout: Option<&OutputLayout>,
+        visible: usize,
     ) -> Result<Box<dyn QueryResult>> {
         let columns = result.columns().to_vec();
-        let indices =
-            Self::resolve_distinct_on_indices(&stmt.distinct_on, &columns, Some(&stmt.columns));
+        let visible = if visible == 0 { columns.len() } else { visible };
+        // An item's column by the layout; else counted from the front, or
+        // from the end of the visible columns for one after a star
+        let item_column = |key: &Expression| {
+            let item = Self::item_computing(stmt, key)?;
+            if let Some(layout) = layout {
+                return layout.item_position(item);
+            }
+            match stmt.columns.iter().rposition(is_star_item) {
+                Some(star) if star < item => visible.checked_sub(stmt.columns.len() - item),
+                _ => Some(item),
+            }
+        };
+        let indices = Self::resolve_distinct_on_indices(
+            &stmt.distinct_on,
+            &columns,
+            Some(&stmt.columns),
+            &item_column,
+        );
         let indices = stmt
             .distinct_on
             .iter()
@@ -1905,6 +1939,21 @@ impl Executor {
     /// appended as a hidden item named by its identity, when the aggregation
     /// or window path computes its rows: a key is then computed where its row
     /// is, reading groups, aggregates and windows as a SELECT item does
+    /// The SELECT item computing `key`, when its output position is known
+    /// without a star's width: no star stands before it, or none after it
+    fn item_computing(stmt: &SelectStatement, key: &Expression) -> Option<usize> {
+        let item = stmt
+            .columns
+            .iter()
+            .position(|c| ExprKey::of(unaliased_item(c)) == ExprKey::of(key))?;
+        let first_star = stmt.columns.iter().position(is_star_item);
+        let last_star = stmt.columns.iter().rposition(is_star_item);
+        match (first_star, last_star) {
+            (Some(first), Some(last)) if first < item && item < last => None,
+            _ => Some(item),
+        }
+    }
+
     fn with_distinct_on_items(
         stmt: &SelectStatement,
         classification: &QueryClassification,
@@ -1915,31 +1964,29 @@ impl Executor {
         {
             return None;
         }
-        // A position past the SELECT list stays an error, not a hidden item
+        // A position past the SELECT list stays an error, not a hidden item;
+        // beside a star the list's width is the star's, which ORDER BY reads
+        let star = stmt.columns.iter().any(is_star_item);
         let past_list = |expr: &Expression| {
             matches!(expr, Expression::IntegerLiteral(lit)
                 if usize::try_from(lit.value).map_or(true, |p| p > stmt.columns.len()))
         };
+        let order_by = stmt
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .filter(|_| !star);
         if super::aggregation::grouping_items(stmt)
             .into_iter()
-            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(order_by)
             .any(past_list)
         {
             return None;
         }
-        let star = stmt
-            .columns
-            .iter()
-            .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
         let mut columns = stmt.columns.clone();
         for key in &stmt.distinct_on {
             // A key the SELECT list computes is read from that item
-            let computed = !star
-                && stmt
-                    .columns
-                    .iter()
-                    .any(|c| ExprKey::of(unaliased_item(c)) == ExprKey::of(key));
-            if computed {
+            if Self::item_computing(stmt, key).is_some() {
                 continue;
             }
             let alias = |id: &Identifier| {
@@ -1982,6 +2029,7 @@ impl Executor {
         distinct_on: &[Expression],
         result_columns: &[String],
         select_exprs: Option<&[Expression]>,
+        item_column: &dyn Fn(&Expression) -> Option<usize>,
     ) -> Vec<Option<usize>> {
         distinct_on
             .iter()
@@ -2088,16 +2136,7 @@ impl Executor {
                         // hidden column carried for it, as ORDER BY reads them, else
                         // the column named after it
                         let key = ExprKey::of(expr);
-                        select_exprs
-                            .filter(|sel| {
-                                !sel.iter().any(|s| {
-                                    matches!(s, Expression::Star(_) | Expression::QualifiedStar(_))
-                                })
-                            })
-                            .and_then(|sel| {
-                                sel.iter()
-                                    .position(|s| ExprKey::of(unaliased_item(s)) == key)
-                            })
+                        item_column(expr)
                             .or_else(|| {
                                 result_columns
                                     .iter()
