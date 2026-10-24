@@ -192,12 +192,7 @@ fn test_vector_search_select_list() {
         "SELECT id, 4 FROM d ORDER BY VEC_DISTANCE_L2(e, '[1,2]') LIMIT 3",
     )
     .unwrap();
-    holds(
-        Fails("step 1"),
-        rows(&db, with_subquery),
-        &want,
-        with_subquery,
-    );
+    holds(Right, rows(&db, with_subquery), &want, with_subquery);
 }
 
 #[test]
@@ -372,7 +367,7 @@ fn test_view_where_and_select_list() {
             "SELECT id FROM v WHERE id > 3 ORDER BY id",
         ),
         (
-            Fails("step 6"),
+            Right,
             "SELECT id, (SELECT MAX(x) FROM u) FROM v ORDER BY id",
             "SELECT id, 3 FROM v ORDER BY id",
         ),

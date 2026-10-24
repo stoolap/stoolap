@@ -15,8 +15,8 @@
 //! Subqueries over and inside FROM sources other than a table: views, CTEs,
 //! derived tables, VALUES and table functions. Each cell answers as the same
 //! statement over the tables the source copies, hot and sealed, unless
-//! `state` says it fails until a plan step prepares it or answers wrong
-//! until an issue is fixed
+//! `state` says it fails until a plan step prepares it or names its
+//! columns wrong until an issue is fixed
 
 use stoolap::Database;
 
@@ -27,13 +27,11 @@ enum State {
     Right,
     /// An error that changes nothing, until the plan step named prepares it
     Fails(&'static str),
-    /// A wrong answer, until the issue named is fixed
-    Wrong(&'static str),
     /// The right rows under other column names, until the issue named is fixed
     WrongNames(&'static str),
 }
 
-use State::{Fails, Right, Wrong, WrongNames};
+use State::{Fails, Right, WrongNames};
 
 /// A source over t or u: the WITH it needs, what FROM names, and whether
 /// it holds every column of the table it copies
@@ -391,12 +389,7 @@ fn state(source: &str, cell: &str) -> State {
     const STEP_6: State = Fails("step 6");
     const GRAMMAR: State = Fails("step 6, grammar first");
     match (source, cell) {
-        ("values", "block_outer_arithmetic") => Wrong("#578"),
-        (
-            "cte_columns" | "recursive" | "series",
-            "select_scalar" | "select_correlated" | "order_by_correlated" | "limit",
-        ) => WrongNames("#581"),
-        ("values", "block_select_list") => Fails("#578"),
+        ("cte_columns" | "recursive" | "series", "limit") => WrongNames("#581"),
         ("series", "body_argument") => GRAMMAR,
         ("cte" | "cte_columns", "insert_values" | "on_conflict_set") => GRAMMAR,
         (_, "join_on_correlated") => STEP_6,
@@ -410,7 +403,6 @@ fn state(source: &str, cell: &str) -> State {
         ) => STEP_6,
         ("view" | "derived" | "cte" | "cte_columns", "body_join_on") => STEP_6,
         ("values", "body_row") => STEP_6,
-        ("view", "select_scalar") => STEP_6,
         _ => Right,
     }
 }
@@ -514,13 +506,6 @@ fn judge(
         (Fails(owner), Ok(got)) => wrong.push(format!(
             "{what}: gave {got:?}, want {want:?} or an error until {owner}"
         )),
-        (Wrong(issue), Ok(got)) if got == want => wrong.push(format!(
-            "{what}: now answers right, mark it Right ({issue})"
-        )),
-        (Wrong(_), Ok(_)) => {}
-        (Wrong(issue), Err(e)) => {
-            wrong.push(format!("{what}: known wrong ({issue}), now fails: {e}"))
-        }
         (WrongNames(issue), Ok(got)) if got == want => wrong.push(format!(
             "{what}: now names its columns right, mark it Right ({issue})"
         )),

@@ -156,6 +156,7 @@ fn test_exists_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id FROM t WHERE 1 = (SELECT 1 FROM w WHERE w.id = t.id AND EXISTS (SELECT 1 FROM u WHERE u.k = w.k))",
         "SELECT id FROM t WHERE EXISTS (SELECT u.v + 1 AS x, u.s FROM u WHERE u.k = t.k) LIMIT 2",
         "SELECT id FROM t WHERE EXISTS (SELECT COUNT(*) FROM u WHERE u.k = t.k)",
+        "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.k = t.k) FROM t WHERE EXISTS (SELECT 1 FROM u)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
@@ -167,10 +168,6 @@ fn test_exists_belongs_to_the_family_wherever_where_holds_it() {
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k LIMIT 1)",
             "a subquery block with a clause outside the family",
-        ),
-        (
-            "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.k = t.k) FROM t WHERE EXISTS (SELECT 1 FROM u)",
-            "a subquery outside WHERE and the subquery blocks",
         ),
         // The WHERE reads the alias, so the SELECT list's forms count
         (
