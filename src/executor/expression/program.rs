@@ -126,6 +126,26 @@ impl Program {
         }
     }
 
+    /// Whether a thread running this program beside others should run its
+    /// [`Self::worker_copy`]: a REGEXP matched from several threads at once
+    /// makes all but one wait on its shared cache
+    pub fn holds_thread_state(&self) -> bool {
+        self.ops.iter().any(|op| matches!(op, Op::Regexp(_)))
+    }
+
+    /// This program for one more thread, each REGEXP with a cache of its own
+    pub fn worker_copy(&self) -> Self {
+        let ops = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                Op::Regexp(regex) => Op::Regexp(std::sync::Arc::new(regex::Regex::clone(regex))),
+                op => op.clone(),
+            })
+            .collect();
+        Self::new_unoptimized(ops)
+    }
+
     /// Create an empty program that returns NULL
     pub fn null() -> Self {
         Self::new(vec![Op::LoadNull(crate::core::DataType::Null), Op::Return])
@@ -1006,5 +1026,27 @@ mod tests {
         assert!(debug_str.contains("Program"));
         assert!(debug_str.contains("ops_count"));
         assert!(debug_str.contains("max_stack_depth"));
+    }
+
+    #[test]
+    fn a_worker_copy_matches_by_a_regex_of_its_own() {
+        let regex = std::sync::Arc::new(regex::Regex::new("^a").unwrap());
+        let prog = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::Regexp(std::sync::Arc::clone(&regex)),
+            Op::Return,
+        ]);
+        assert!(prog.holds_thread_state());
+        let copy = prog.worker_copy();
+        assert_eq!(copy.disassemble(), prog.disassemble());
+        let Op::Regexp(copied) = &copy.ops()[1] else {
+            panic!("the copy keeps the REGEXP at its place");
+        };
+        assert!(
+            !std::sync::Arc::ptr_eq(copied, &regex),
+            "the copy owns its regex"
+        );
+        assert_eq!(copied.as_str(), "^a");
+        assert!(!Program::constant(Value::Integer(1)).holds_thread_state());
     }
 }

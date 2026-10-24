@@ -544,6 +544,23 @@ impl RowFilter {
         self
     }
 
+    /// Whether every thread may run this filter as it is, without a
+    /// [`Self::worker`] of its own
+    #[cfg(feature = "parallel")]
+    pub(crate) fn shares_across_threads(&self) -> bool {
+        !self.program.holds_thread_state()
+    }
+
+    /// This filter for one more thread, over the program's worker copy
+    #[cfg(feature = "parallel")]
+    pub(crate) fn worker(&self) -> Self {
+        Self {
+            program: CompactArc::new(self.program.worker_copy()),
+            params: CompactArc::clone(&self.params),
+            transaction_id: self.transaction_id,
+        }
+    }
+
     /// Check a row against the filter, returning an evaluation error instead of swallowing it.
     ///
     /// Returns `Err` when the VM encounters a runtime error (e.g. invalid

@@ -192,10 +192,13 @@ pub fn parallel_filter(
             // then single-pass extract kept rows in original order.
             // This avoids materializing an N-sized Option<(i64,Row)> intermediate.
             let mut row_vec: Vec<(i64, Row)> = rows.into_vec();
-            let keep: Result<Vec<bool>> = row_vec
-                .par_iter()
-                .map(|(_, row)| filter.matches_checked(row))
-                .collect();
+            let keep: Result<Vec<bool>> = match filter.shares_across_threads() {
+                true => row_vec
+                    .par_iter()
+                    .map(|(_, row)| filter.matches_checked(row))
+                    .collect(),
+                false => filter_by_workers(&row_vec, &filter),
+            };
             let keep = keep?;
 
             // Single-pass extract: move kept rows into result, preserving order
@@ -217,7 +220,49 @@ pub fn parallel_filter(
     sequential_filter(rows, filter_expr, columns, ctx)
 }
 
-/// Sequential filter for small datasets or when parallel is disabled
+/// Whether each of `rows` passes `filter`, run by one job per thread over
+/// its own worker, so each worker's regex warms its cache once. The mask is
+/// collected as plain booleans, the first error kept aside and no row read
+/// after it: a second `Result<Vec<bool>>` collect would stop the shared
+/// path inlining its own
+#[cfg(feature = "parallel")]
+#[inline(never)]
+fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stopped = AtomicBool::new(false);
+    let failed = std::sync::Mutex::new(None);
+    let keep: Vec<bool> = rows
+        .par_iter()
+        .with_min_len(rows.len().div_ceil(rayon::current_num_threads()))
+        .map_init(
+            || filter.worker(),
+            |worker, (_, row)| {
+                if stopped.load(Ordering::Relaxed) {
+                    return false;
+                }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::worker_row_filtered();
+                match worker.matches_checked(row) {
+                    Ok(keep) => keep,
+                    Err(error) => {
+                        stopped.store(true, Ordering::Relaxed);
+                        let mut failed = failed.lock().unwrap_or_else(|e| e.into_inner());
+                        failed.get_or_insert(error);
+                        false
+                    }
+                }
+            },
+        )
+        .collect();
+    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(error) => Err(error),
+        None => Ok(keep),
+    }
+}
+
+/// Sequential filter for small datasets or when parallel is disabled; out
+/// of line so the parallel branch does not shape its row loop
+#[inline(never)]
 fn sequential_filter(
     rows: RowVec,
     filter_expr: &Expression,
