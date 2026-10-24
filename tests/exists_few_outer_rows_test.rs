@@ -16,7 +16,18 @@
 //! outer rows against the inner table's, probes the index per outer row and
 //! answers as the semi-join over the same table without the index
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::Database;
+
+// The EXISTS run counter is process-wide, and every test here runs EXISTS
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
     let mut out: Vec<i64> = db
@@ -86,6 +97,7 @@ fn check(db: &Database, phase: &str) {
 
 #[test]
 fn exists_over_few_outer_rows_answers_as_the_semi_join() {
+    let _serial = serial();
     let db = Database::open("memory://exists_few_outer_rows").unwrap();
     create(&db);
     check(&db, "memory");
@@ -103,6 +115,7 @@ fn exists_over_few_outer_rows_answers_as_the_semi_join() {
 
 #[test]
 fn exists_over_few_outer_rows_answers_as_the_semi_join_hot_and_sealed() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
     create(&db);
@@ -117,6 +130,7 @@ fn exists_over_few_outer_rows_answers_as_the_semi_join_hot_and_sealed() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn exists_over_few_outer_rows_does_not_read_the_inner_table_whole() {
+    let _serial = serial();
     use stoolap::test_failpoints::inner_table_reads;
     let db = Database::open("memory://exists_few_outer_rows_reads").unwrap();
     create(&db);
@@ -140,6 +154,7 @@ fn exists_over_few_outer_rows_does_not_read_the_inner_table_whole() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn an_output_block_counts_the_rows_its_where_passes_not_the_table() {
+    let _serial = serial();
     use stoolap::test_failpoints::inner_table_reads;
     let db = Database::open("memory://exists_few_outer_rows_output").unwrap();
     create(&db);
@@ -171,6 +186,7 @@ fn an_output_block_counts_the_rows_its_where_passes_not_the_table() {
 
 #[test]
 fn not_exists_sees_its_own_transaction() {
+    let _serial = serial();
     for index in [false, true] {
         let db = Database::open(&format!("memory://not_exists_own_transaction_{index}")).unwrap();
         db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, c INTEGER)", ())
@@ -216,6 +232,7 @@ fn not_exists_sees_its_own_transaction() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn exists_over_a_key_held_by_many_rows_builds_the_semi_join_once() {
+    let _serial = serial();
     use stoolap::test_failpoints::{
         equality_candidate_ids_copied_count, exists_subquery_runs, inner_table_reads,
     };
@@ -279,6 +296,7 @@ fn heavy_key_tables(name: &str, using: &str) -> Database {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_correlated_count_still_counts_a_key_held_by_many_rows_from_the_index() {
+    let _serial = serial();
     use stoolap::test_failpoints::prepared_scalar_runs;
     let db = heavy_key_tables("count_heavy_key", "BTREE");
     let sql = "SELECT o.id, (SELECT COUNT(*) FROM {i} WHERE {i}.c = o.k) FROM o \
@@ -301,6 +319,7 @@ fn a_correlated_count_still_counts_a_key_held_by_many_rows_from_the_index() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn exists_after_local_changes_asks_no_probe() {
+    let _serial = serial();
     use stoolap::test_failpoints::{correlated_probes_asked, exists_subquery_runs};
     let db = Database::open("memory://exists_local_changes").unwrap();
     create(&db);
@@ -320,6 +339,7 @@ fn exists_after_local_changes_asks_no_probe() {
 /// An EXISTS over a recursive CTE sees the rows of the round that asks
 #[test]
 fn exists_over_a_recursive_cte_sees_each_round() {
+    let _serial = serial();
     let db = Database::open("memory://exists_recursive_cte").unwrap();
     let rows: Vec<(i64, bool)> = db
         .query(
