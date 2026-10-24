@@ -1101,7 +1101,10 @@ fn test_classifier_rules() {
             "FROM is not one table",
         ),
         (
-            format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u ORDER BY {sq}"),
+            format!(
+                "SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u \
+                 ORDER BY (SELECT v FROM u WHERE u.id = 2)"
+            ),
             "an ORDER BY subquery over a set operation",
         ),
         (

@@ -259,6 +259,7 @@ fn a_plan_run_with_an_outer_row_keeps_no_program() {
     use stoolap::common::CompactArc;
     use stoolap::core::Value;
     use stoolap::executor::{context::ExecutionContext, Executor};
+    use stoolap::parser::ast::{Expression, ParamSlots, Statement};
 
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://join_residual_outer_row").unwrap();
@@ -266,12 +267,30 @@ fn a_plan_run_with_an_outer_row_keeps_no_program() {
         .unwrap();
     db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", ())
         .unwrap();
+    db.execute("CREATE TABLE parent (v INTEGER)", ()).unwrap();
     db.execute("INSERT INTO a VALUES (1, 1)", ()).unwrap();
     db.execute("INSERT INTO b VALUES (1, 10)", ()).unwrap();
+    // The correlated block of a statement that parses, kept as a plan of its own
+    let outer = stoolap::parser::parse_sql(
+        "SELECT parent.v FROM parent WHERE EXISTS \
+         (SELECT a.id FROM a JOIN b ON a.k = b.id WHERE a.id + b.v = parent.v)",
+    )
+    .unwrap();
+    let Statement::Select(outer) = &outer[0] else {
+        panic!("not a SELECT");
+    };
+    let Some(Expression::Exists(exists)) = outer.where_clause.as_deref() else {
+        panic!("not an EXISTS");
+    };
+    let block = Statement::Select((*exists.subquery).clone());
     let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let plan = executor.query_cache().put(
+        "join residual outer row block",
+        std::sync::Arc::new(block),
+        ParamSlots::default(),
+    );
     // The outer row's value is written into the WHERE before the join
     // splits it, so a program kept from one execution would carry it
-    let sql = "SELECT a.id FROM a JOIN b ON a.k = b.id WHERE b.v = parent.v";
     let read = |value: i64| {
         let ctx = ExecutionContext::new().with_outer_row(
             [("parent.v".into(), Value::Integer(value))]
@@ -279,7 +298,7 @@ fn a_plan_run_with_an_outer_row_keeps_no_program() {
                 .collect(),
             CompactArc::new(vec!["parent.v".to_string()]),
         );
-        let mut rows = executor.execute_with_context(sql, &ctx).unwrap();
+        let mut rows = executor.execute_with_cached_plan(&plan, &ctx).unwrap();
         let mut ids = Vec::new();
         while rows.next() {
             ids.push(rows.row()[0].clone());
@@ -287,9 +306,9 @@ fn a_plan_run_with_an_outer_row_keeps_no_program() {
         assert!(rows.last_error().is_none());
         ids
     };
-    assert_eq!(read(10), vec![Value::Integer(1)]);
-    assert_eq!(read(20), Vec::<Value>::new());
-    assert_eq!(read(10), vec![Value::Integer(1)]);
+    assert_eq!(read(11), vec![Value::Integer(1)]);
+    assert_eq!(read(12), Vec::<Value>::new());
+    assert_eq!(read(11), vec![Value::Integer(1)]);
 }
 
 /// The allocations of one more run of `sql` on `db`, prepared and warmed up
