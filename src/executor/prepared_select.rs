@@ -60,7 +60,7 @@ use super::result::{ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
-    strip_table_qualifier,
+    order_by_names_an_alias, strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -406,7 +406,7 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
-        self.order(sq, scopes)?;
+        self.order(sq, scopes, false)?;
         self.block_from(sq.table_expr.as_deref())?;
         let [column] = sq.columns.as_slice() else {
             return Err("a subquery block without exactly one SELECT expression");
@@ -433,6 +433,7 @@ impl<'a> Family<'a> {
         &self,
         sq: &'a SelectStatement,
         scopes: usize,
+        exists: bool,
     ) -> std::result::Result<(), OutOfFamily> {
         if sq.order_by.is_empty() && sq.limit.is_none() && sq.offset.is_none() {
             return Ok(());
@@ -449,12 +450,31 @@ impl<'a> Family<'a> {
         }) {
             return Err("a subquery block's LIMIT or OFFSET that is not a literal or a parameter");
         }
+        // Keys that choose no row are bound but never computed
+        let chooses = !exists && (sq.limit.is_some() || sq.offset.is_some());
+        let volatile_alias = match sq.columns.as_slice() {
+            [Expression::Aliased(item)]
+                if volatile(&item.expression, &self.executor.function_registry) =>
+            {
+                Some(&item.alias.value_lower)
+            }
+            _ => None,
+        };
         let mut found = false;
         for ob in &sq.order_by {
-            if matches!(ob.expression, Expression::IntegerLiteral(_)) {
+            let key = &ob.expression;
+            if matches!(key, Expression::IntegerLiteral(_)) {
                 return Err("an ORDER BY position in a subquery block");
             }
-            self.expression(&ob.expression, scopes, Site::Values, &mut found)?;
+            if !chooses && mentions_subquery(key) {
+                return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
+            }
+            if let Some(alias) = volatile_alias.filter(|_| !order_by_names_an_alias(key, sq)) {
+                if names_any(key, &|name| name == alias.as_str()) {
+                    return Err("an ORDER BY expression reading a volatile SELECT alias");
+                }
+            }
+            self.expression(key, scopes, Site::Values, &mut found)?;
         }
         Ok(())
     }
@@ -526,7 +546,7 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
-        self.order(sq, scopes)?;
+        self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
         for column in &sq.columns {
@@ -2048,8 +2068,11 @@ struct PreparedSubquery {
 /// of its ORDER BY; an EXISTS keeps no keys, its answer the count alone
 #[derive(Debug)]
 struct BlockOrder {
-    /// Each key over the block's row, its direction and its NULLS clause
-    keys: Vec<(SharedProgram, bool, Option<bool>)>,
+    /// Each key over the block's row, its direction and its NULLS clause;
+    /// no program for a key that is the SELECT item, whose value it keeps
+    keys: Vec<(Option<SharedProgram>, bool, Option<bool>)>,
+    /// The first key that is the SELECT item, which the answer reads
+    item: Option<usize>,
     limit: Option<SharedProgram>,
     offset: Option<SharedProgram>,
 }
@@ -2121,9 +2144,17 @@ enum BlockSource {
     View(SmartString, Option<Vec<SmartString>>),
     Cte(SmartString),
     Values(Box<ValuesTableSource>),
-    /// A table function, with the WHERE's conjuncts that narrow its range
-    Function(Box<FunctionTableSource>, Option<Box<Expression>>),
+    /// A table function, with the WHERE's conjuncts that narrow its range,
+    /// and the LIMIT and OFFSET of a block whose first rows are its answer
+    Function(
+        Box<FunctionTableSource>,
+        Option<Box<Expression>>,
+        Option<BlockCounts>,
+    ),
 }
+
+/// A block's LIMIT and OFFSET
+type BlockCounts = (Box<Expression>, Option<Box<Expression>>);
 
 /// The rows of the views blocks read while the statement prepared, by block
 /// id, which the run that prepared it opens in place of reading them again
@@ -2364,6 +2395,16 @@ struct Members {
     projection: SharedProgram,
     read_as: Option<DataType>,
     test: MemberTest,
+}
+
+impl Members {
+    /// A value of the SELECT expression as the tested value's column reads it
+    fn read(&self, value: Value) -> Value {
+        match self.read_as {
+            Some(column_type) => read_as_column(column_type, value),
+            None => value,
+        }
+    }
 }
 
 /// What a block is prepared to answer
@@ -3112,9 +3153,15 @@ impl Builder<'_> {
                     .unwrap_or(&function.function)
                     .value_lower;
                 let range = function_range(sq.where_clause.as_deref(), name);
+                // Without a WHERE or an ORDER BY the first rows are the answer
+                let counts = sq
+                    .limit
+                    .clone()
+                    .filter(|_| sq.where_clause.is_none() && sq.order_by.is_empty())
+                    .map(|limit| (limit, sq.offset.clone()));
                 over_source(
                     name.clone(),
-                    BlockSource::Function(function.clone(), range),
+                    BlockSource::Function(function.clone(), range, counts),
                     Executor::tvf_columns(function)?,
                 )
             }
@@ -3189,12 +3236,35 @@ impl Builder<'_> {
         // ORDER BY, whose keys read the block's row and enclosing values as
         // its WHERE does; an EXISTS needs the count alone
         let cut = sq.limit.is_some() || sq.offset.is_some();
-        let mut order_keys = Vec::new();
-        if cut && !matches!(form, Form::Exists(_)) {
-            for ob in &sq.order_by {
-                let key = with_aliases(&ob.expression, &sq.columns, &scope.columns);
-                let key = self.rewrite(&chain, Some(id), &key, &mut work)?;
-                order_keys.push((key, ob.ascending, ob.nulls_first));
+        let chooses = cut && !matches!(form, Form::Exists(_));
+        let item = sq
+            .columns
+            .first()
+            .filter(|_| !matches!(form, Form::Exists(_)));
+        let (mut order_keys, mut bound_only) = (Vec::new(), Vec::new());
+        for ob in &sq.order_by {
+            // A bare alias, or the item as written, sorts by the item's value
+            let is_item = item.is_some_and(|item| {
+                order_by_names_an_alias(&ob.expression, sq)
+                    || ExprKey::of(&ob.expression) == ExprKey::of(item)
+            });
+            let key = match is_item {
+                true => None,
+                false => Some(with_aliases(&ob.expression, &sq.columns, &scope.columns)),
+            };
+            match (key, chooses) {
+                (key, true) => {
+                    let key = key
+                        .map(|key| self.rewrite(&chain, Some(id), &key, &mut work))
+                        .transpose()?;
+                    order_keys.push((key, ob.ascending, ob.nulls_first));
+                }
+                // A key that chooses no row is still bound, as any ORDER BY is
+                (Some(key), false) => {
+                    let mut unused = Rewritten::default();
+                    bound_only.push(self.rewrite(&chain, Some(id), &key, &mut unused)?);
+                }
+                (None, false) => {}
             }
         }
         for count in sq.limit.iter().chain(&sq.offset) {
@@ -3294,7 +3364,7 @@ impl Builder<'_> {
             .iter()
             .chain(&candidates)
             .chain(&filter)
-            .chain(order_keys.iter().map(|(key, ..)| key))
+            .chain(order_keys.iter().filter_map(|(key, ..)| key.as_ref()))
             .chain(counts)
         {
             slots_read(expr, &mut reads);
@@ -3318,16 +3388,21 @@ impl Builder<'_> {
             None => None,
         };
         let candidates = compile(&candidates)?;
+        for key in &bound_only {
+            compile_with(&own, key)?;
+        }
         let order = match cut {
             true => {
                 let count = |count: &Option<Box<Expression>>| {
                     count.as_deref().map(|c| compile_with(&own, c)).transpose()
                 };
                 Some(Box::new(BlockOrder {
+                    item: order_keys.iter().position(|(key, ..)| key.is_none()),
                     keys: order_keys
                         .iter()
                         .map(|(key, ascending, nulls)| {
-                            compile_with(&own, key).map(|p| (p, *ascending, *nulls))
+                            let key = key.as_ref().map(|key| compile_with(&own, key));
+                            key.transpose().map(|p| (p, *ascending, *nulls))
                         })
                         .collect::<Result<Vec<_>>>()?,
                     limit: count(&sq.limit)?,
@@ -6170,8 +6245,15 @@ impl Executor {
                 }
                 (Self::values_columns(values), rows)
             }
-            BlockSource::Function(function, range) => {
-                let (rows, columns) = Self::tvf_rows(function, range.as_deref(), None, ctx)?;
+            BlockSource::Function(function, range, counts) => {
+                // A count the block cannot read is its error, raised when it runs
+                let first = counts.as_ref().and_then(|(limit, offset)| {
+                    use super::row_count::row_count;
+                    let limit = row_count(limit, ctx, "LIMIT").ok()?;
+                    let offset = offset.as_deref().map(|o| row_count(o, ctx, "OFFSET"));
+                    Some(limit.saturating_add(offset.transpose().ok()?.unwrap_or(0)))
+                });
+                let (rows, columns) = Self::tvf_rows(function, range.as_deref(), first, ctx)?;
                 (columns, rows)
             }
         };
@@ -7748,7 +7830,7 @@ impl<'a> PreparedRunner<'a> {
         crate::test_failpoints::prepared_exists_probed();
         let sq = &self.prepared.subqueries[index];
         if let Some(order) = &sq.order {
-            return Ok(!self.cut_rows(index, order)?.is_empty());
+            return Ok(!self.cut_rows(index, order, None, true)?.is_empty());
         }
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
@@ -8286,20 +8368,31 @@ impl PreparedRunner<'_> {
         site: &HoleSet,
     ) -> Result<Value> {
         self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
-        let rows = self.cut_rows(index, order)?;
+        let rows = self.cut_rows(index, order, Some(projection), false)?;
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let mut value = None;
-        for row in &rows {
-            self.take_one(&mut vm, projection, row, &params, &mut value)?;
+        for (mut keys, row) in rows {
+            match order.item {
+                Some(_) if value.is_some() => return Err(more_than_one_row()),
+                Some(item) => value = Some(keys.swap_remove(item)),
+                None => self.take_one(&mut vm, projection, &row, &params, &mut value)?,
+            }
         }
         Ok(value.unwrap_or_else(Value::null_unknown))
     }
 
-    /// The rows block `index` answers from for the buffer filled: those its
-    /// WHERE passes in its ORDER BY, a tie in the order read, past its
-    /// OFFSET and up to its LIMIT. A candidate's error is the block's
-    fn cut_rows(&self, index: usize, order: &BlockOrder) -> Result<Vec<Row>> {
+    /// The rows block `index` answers from for the buffer filled, with
+    /// their key values: those its WHERE passes in its ORDER BY, a tie in
+    /// the order read, past its OFFSET and up to its LIMIT, or the first of
+    /// them for an `exists`. A candidate's error is the block's
+    fn cut_rows(
+        &self,
+        index: usize,
+        order: &BlockOrder,
+        item: Option<&SharedProgram>,
+        exists: bool,
+    ) -> Result<Vec<(SmallVec<[Value; 2]>, Row)>> {
         self.ctx.check_cancelled()?;
         let sq = &self.prepared.subqueries[index];
         let mut vm = self.blocks[index].vm.borrow_mut();
@@ -8315,9 +8408,12 @@ impl PreparedRunner<'_> {
         };
         let limit = count(&order.limit, "LIMIT")?;
         let offset = count(&order.offset, "OFFSET")?.unwrap_or(0);
-        let keep = limit.map_or(usize::MAX, |limit| limit.saturating_add(offset));
+        let mut keep = limit.map_or(usize::MAX, |limit| limit.saturating_add(offset));
         if keep == 0 {
             return Ok(Vec::new());
+        }
+        if exists {
+            keep = keep.min(offset.saturating_add(1));
         }
         let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
@@ -8353,16 +8449,25 @@ impl PreparedRunner<'_> {
             // Without keys the rows come in the order read: OFFSET's are passed
             if order.keys.is_empty() {
                 if passed > offset {
-                    kept.push(row.clone());
+                    kept.push((SmallVec::new(), row.clone()));
                 }
                 if passed == keep {
                     break;
                 }
                 continue;
             }
-            let mut keys = SmallVec::new();
-            for (key, ..) in &order.keys {
-                keys.push(vm.execute(key, &exec)?);
+            let mut keys: SmallVec<[Value; 2]> = SmallVec::new();
+            for (i, (key, ..)) in order.keys.iter().enumerate() {
+                let value = match (key, order.item) {
+                    (Some(key), _) => vm.execute(key, &exec)?,
+                    (None, Some(first)) if first < i => keys[first].clone(),
+                    (None, _) => {
+                        let item =
+                            item.ok_or_else(|| Error::internal("a sort key without item"))?;
+                        vm.execute(item, &exec)?
+                    }
+                };
+                keys.push(value);
             }
             if held.len() < keep {
                 let row = row.clone();
@@ -8391,7 +8496,7 @@ impl PreparedRunner<'_> {
             return Ok(kept);
         }
         let held = held.into_sorted_vec().into_iter().skip(offset);
-        Ok(held.map(|held| held.row).collect())
+        Ok(held.map(|held| (held.keys, held.row)).collect())
     }
 
     fn exists_answer(&self, index: usize, caller: &ExecuteContext, site: &HoleSet) -> Result<bool> {
@@ -8667,11 +8772,25 @@ impl PreparedRunner<'_> {
     /// The member a candidate's SELECT expression gives, read as the tested
     /// value's column reads it
     fn member(&self, members: &Members, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<Value> {
-        let value = vm.execute(&members.projection, exec)?;
-        Ok(match members.read_as {
-            Some(column_type) => read_as_column(column_type, value),
-            None => value,
-        })
+        Ok(members.read(vm.execute(&members.projection, exec)?))
+    }
+
+    /// The member of a row a block's LIMIT kept: the SELECT expression's
+    /// value its sort computed, or the expression over the row
+    fn cut_member(
+        &self,
+        members: &Members,
+        order: &BlockOrder,
+        (mut keys, row): (SmallVec<[Value; 2]>, Row),
+        vm: &mut ExprVM,
+        params: &[Value],
+    ) -> Result<Value> {
+        if let Some(item) = order.item {
+            return Ok(members.read(keys.swap_remove(item)));
+        }
+        let exec = ExecuteContext::with_common_params(&row, params, self.transaction_id)
+            .with_subquery_executor(self);
+        self.member(members, vm, &exec)
     }
 
     /// `value` tested by the probe against the buffer filled: a member that
@@ -8691,14 +8810,13 @@ impl PreparedRunner<'_> {
         }
         let sq = &self.prepared.subqueries[index];
         if let Some(order) = &sq.order {
-            let rows = self.cut_rows(index, order)?;
+            let rows = self.cut_rows(index, order, Some(&members.projection), false)?;
             let mut vm = self.blocks[index].vm.borrow_mut();
             let params = self.blocks[index].buffer.borrow();
             let mut fold = MemberFold::new(members.test);
-            for row in &rows {
-                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                    .with_subquery_executor(self);
-                if let Some(answer) = fold.member(value, self.member(members, &mut vm, &exec))? {
+            for row in rows {
+                let member = self.cut_member(members, order, row, &mut vm, &params);
+                if let Some(answer) = fold.member(value, member)? {
                     return Ok(Some(answer));
                 }
             }
@@ -8820,14 +8938,12 @@ impl PreparedRunner<'_> {
         }
         let sq = &self.prepared.subqueries[index];
         if let Some(order) = &sq.order {
-            let rows = self.cut_rows(index, order)?;
+            let rows = self.cut_rows(index, order, Some(&members.projection), false)?;
             let mut vm = self.blocks[index].vm.borrow_mut();
             let params = self.blocks[index].buffer.borrow();
             let (mut values, mut failed) = (Vec::with_capacity(rows.len()), None);
-            for row in &rows {
-                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                    .with_subquery_executor(self);
-                match self.member(members, &mut vm, &exec) {
+            for row in rows {
+                match self.cut_member(members, order, row, &mut vm, &params) {
                     Ok(member) => values.push(member),
                     Err(e) => {
                         failed.get_or_insert(deferred(e)?);

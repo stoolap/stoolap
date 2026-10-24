@@ -16,7 +16,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{prepared_exists_counts, prepared_scalar_runs};
+use stoolap::test_failpoints::{prepared_exists_counts, prepared_scalar_runs, random_draws};
 use stoolap::{Database, Params};
 
 // The counters are process-wide
@@ -301,4 +301,156 @@ fn a_cut_block_outside_the_family_says_why() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn an_order_by_name_binds_as_the_general_path_binds_it() {
+    let _guard = serial();
+    let db = setup("block_order_binding");
+    let n = None;
+    for (block, want) in [
+        // A bare alias sorts by the SELECT item, over the column it shadows
+        (
+            "SELECT -u.id AS id FROM u WHERE u.k = t.id ORDER BY id LIMIT 1",
+            [Some(-3), Some(-5), Some(-8), n],
+        ),
+        // Inside an expression the column comes first
+        (
+            "SELECT -u.id AS id FROM u WHERE u.k = t.id ORDER BY id + 0 LIMIT 1",
+            [Some(-1), Some(-4), Some(-6), n],
+        ),
+        (
+            "SELECT -u.x AS k FROM u WHERE u.k = t.id ORDER BY k LIMIT 1",
+            [Some(-9), Some(-7), Some(-4), n],
+        ),
+        (
+            "SELECT -u.x AS y FROM u WHERE u.k = t.id ORDER BY -y LIMIT 1",
+            [Some(-5), Some(-3), Some(-4), n],
+        ),
+        (
+            "SELECT x * 2 FROM u WHERE u.k = t.id ORDER BY x * 2 DESC LIMIT 1",
+            [n, Some(14), n, n],
+        ),
+    ] {
+        let sql = scalar(block);
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        assert_eq!(column(&db, &sql, 1, ()), want, "{sql}");
+    }
+    let member = "SELECT id FROM t \
+                  WHERE -5 IN (SELECT -u.id AS id FROM u WHERE u.k = t.id ORDER BY id LIMIT 1)";
+    assert_eq!(column(&db, member, 0, ()), [Some(2)]);
+}
+
+#[test]
+fn a_key_that_is_the_select_item_answers_with_the_value_it_sorted() {
+    let _guard = serial();
+    let db = setup("block_order_item_value");
+    let sql = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r LIMIT 1) FROM t";
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes");
+    let draws = random_draws();
+    let found = db.query(sql, ()).unwrap().collect::<Result<Vec<_>, _>>();
+    assert_eq!(found.unwrap().len(), 4);
+    assert_eq!(
+        random_draws() - draws,
+        8,
+        "one run, one draw per inner row and none for the answer"
+    );
+    let refused = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r + 0 LIMIT 1) FROM t";
+    assert_eq!(
+        prepared_line(&db, refused),
+        "Prepared: no (an ORDER BY expression reading a volatile SELECT alias)"
+    );
+}
+
+#[test]
+fn an_exists_reads_no_row_past_the_first_its_offset_leaves() {
+    let _guard = serial();
+    let db = setup("block_order_exists_stops");
+    // Rows past the second raise an error, which no answer reaches
+    let fails = "CASE WHEN u.id > 2 THEN ABS('a') ELSE 1 END = 1";
+    for tail in ["OFFSET 1", "LIMIT 5 OFFSET 1"] {
+        let sql = format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE {fails} {tail})");
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        assert_eq!(column(&db, &sql, 0, ()).len(), 4, "{sql}");
+    }
+    let sql = format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE {fails} OFFSET 2)");
+    assert!(error(&db, &sql).contains("ABS"), "{sql}");
+}
+
+#[test]
+fn a_table_function_block_generates_the_rows_its_limit_keeps() {
+    let _guard = serial();
+    let db = setup("block_order_function");
+    let series = "generate_series(1, 10000001)";
+    for (sql, want) in [
+        (
+            scalar(&format!("SELECT value FROM {series} LIMIT 1 OFFSET 2")),
+            [Some(3), Some(3), Some(3), Some(3)],
+        ),
+        (
+            scalar(&format!("SELECT value + t.id FROM {series} LIMIT 1")),
+            [Some(2), Some(3), Some(4), Some(5)],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        assert_eq!(column(&db, &sql, 1, ()), want, "{sql}");
+    }
+    let exists = format!("SELECT id FROM t WHERE EXISTS (SELECT value FROM {series} LIMIT 1)");
+    assert_eq!(column(&db, &exists, 0, ()).len(), 4);
+    let member = format!("SELECT id FROM t WHERE id + 2 IN (SELECT value FROM {series} LIMIT 3)");
+    assert_eq!(column(&db, &member, 0, ()), [Some(1)]);
+}
+
+#[test]
+fn an_order_by_that_chooses_no_row_is_still_bound() {
+    let _guard = serial();
+    let db = setup("block_order_unused");
+    for (sql, want) in [
+        (
+            scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY missing"),
+            "missing",
+        ),
+        (
+            scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY u.missing"),
+            "u.missing",
+        ),
+        (
+            scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY t.missing"),
+            "t.missing",
+        ),
+        (
+            scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY nosuchfn(x)"),
+            "NOSUCHFN",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u ORDER BY missing)".to_string(),
+            "missing",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u ORDER BY missing LIMIT 1)".to_string(),
+            "missing",
+        ),
+        (
+            "SELECT id FROM t WHERE a / 10 IN (SELECT k FROM u ORDER BY missing)".to_string(),
+            "missing",
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        let err = error(&db, &sql);
+        assert!(err.contains(want), "{sql}: {err}");
+    }
+    let sql = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY ABS(x - t.a)");
+    assert_eq!(prepared_line(&db, &sql), "Prepared: yes");
+    let runs = prepared_scalar_runs();
+    assert_eq!(column(&db, &sql, 1, ()), [Some(5); 4]);
+    assert_eq!(
+        prepared_scalar_runs() - runs,
+        1,
+        "a key that chooses no row reads no outer value"
+    );
+    let refused = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
+    assert_eq!(
+        prepared_line(&db, &refused),
+        "Prepared: no (a subquery block's ORDER BY key holding a subquery without LIMIT)"
+    );
 }
