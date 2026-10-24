@@ -2842,28 +2842,43 @@ impl Executor {
             // Each partition writes to its own row indices (guaranteed disjoint).
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
+            let lead_lag_default = args.default_program(columns)?;
 
+            // A default holding a REGEXP is copied once per thread, not per job
+            #[cfg(feature = "parallel")]
+            let min_len = match lead_lag_default.is_some_and(Program::holds_thread_state) {
+                true => partitions.len().div_ceil(rayon::current_num_threads()),
+                false => 1,
+            };
             #[cfg(feature = "parallel")]
             let iter_result = partitions
                 .par_iter()
-                .try_for_each(|row_indices| -> Result<()> {
-                    // Direct writing: each partition writes to its own indices
-                    self.compute_window_for_partition_parallel(
-                        &*window_func,
-                        wf_info,
-                        rows,
-                        row_indices.clone(),
-                        true,
-                        precomputed_order_by,
-                        columns,
-                        col_index_map,
-                        group_slots,
-                        ctx,
-                        &frame,
-                        &args,
-                        &parallel_results,
-                    )
-                });
+                .with_min_len(min_len)
+                .try_for_each_init(
+                    || {
+                        lead_lag_default
+                            .filter(|program| program.holds_thread_state())
+                            .map(Program::worker_copy)
+                    },
+                    |worker, row_indices| -> Result<()> {
+                        // Direct writing: each partition writes to its own indices
+                        self.compute_window_for_partition_parallel(
+                            &*window_func,
+                            wf_info,
+                            rows,
+                            row_indices.clone(),
+                            true,
+                            precomputed_order_by,
+                            col_index_map,
+                            group_slots,
+                            ctx,
+                            &frame,
+                            &args,
+                            worker.as_ref().or(lead_lag_default),
+                            &parallel_results,
+                        )
+                    },
+                );
             #[cfg(not(feature = "parallel"))]
             let iter_result = partitions.iter().try_for_each(|row_indices| -> Result<()> {
                 // Direct writing: each partition writes to its own indices
@@ -2874,12 +2889,12 @@ impl Executor {
                     row_indices.clone(),
                     true,
                     precomputed_order_by,
-                    columns,
                     col_index_map,
                     group_slots,
                     ctx,
                     &frame,
                     &args,
+                    lead_lag_default,
                     &parallel_results,
                 )
             });
@@ -2965,10 +2980,10 @@ impl Executor {
             wf_info,
             &frame,
             args,
+            args.default_program(columns)?,
             all_rows,
             &row_indices,
             order_by_values,
-            columns,
             col_index_map,
             group_slots,
             ctx,
@@ -2986,10 +3001,10 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         frame: &Frame,
         args: &CallArgs,
+        lead_lag_default: Option<&Program>,
         all_rows: &[(i64, Row)],
         row_indices: &[usize],
         order_by_values: &ColumnarOrderByValues,
-        columns: &[String],
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
@@ -3023,7 +3038,6 @@ impl Executor {
 
         // NTH_VALUE's n evaluates only for a frame that is not empty
         let mut count_arg = args.count.as_ref().map(PartitionArg::new);
-        let lead_lag_default = args.default_program(columns)?;
         let mut default_vm = ExprVM::new();
         let lead_lag_offset = if wf_info.name == "LEAD" {
             "the offset of LEAD"
@@ -3168,10 +3182,10 @@ impl Executor {
             wf_info,
             frame,
             args,
+            args.default_program(columns)?,
             all_rows,
             &row_indices,
             order_by_values,
-            columns,
             col_index_map,
             group_slots,
             ctx,
@@ -3193,12 +3207,12 @@ impl Executor {
         mut row_indices: Vec<usize>,
         already_sorted: bool,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
-        columns: &[String],
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         frame: &Frame,
         args: &CallArgs,
+        lead_lag_default: Option<&Program>,
         results: &ParallelVec,
     ) -> Result<()> {
         // Empty fallback for when no precomputed values are provided
@@ -3225,10 +3239,10 @@ impl Executor {
             wf_info,
             frame,
             args,
+            lead_lag_default,
             all_rows,
             &row_indices,
             order_by_values,
-            columns,
             col_index_map,
             group_slots,
             ctx,
