@@ -2944,13 +2944,14 @@ impl Executor {
 
     /// Whether a subquery under `ctx` reads committed rows no older than a
     /// stamp taken before its read: no explicit transaction and no statement
-    /// snapshot that keeps the rows of its start. A statement view answers
-    /// only through a stamp it sees whole
+    /// snapshot that keeps the rows of its start or is written through. A
+    /// statement view answers only through a stamp it sees whole
     pub(crate) fn reads_cacheable_rows(ctx: &ExecutionContext) -> bool {
         ctx.transaction_id().is_none()
             && ctx.statement_snapshot().is_none_or(|snapshot| {
-                snapshot.reads_latest()
-                    || snapshot.view().is_some() && ctx.statement_view().is_some()
+                snapshot.writes_nothing()
+                    && (snapshot.reads_latest()
+                        || snapshot.view().is_some() && ctx.statement_view().is_some())
             })
     }
 

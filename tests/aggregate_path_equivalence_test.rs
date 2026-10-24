@@ -194,26 +194,26 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "memory",
         "prepared_block",
         "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
-        "SELECT DISTINCT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+        "SELECT DISTINCT ON (id) id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
     ),
     (
         "sealed",
         "prepared_block",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
-        "SELECT DISTINCT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+        "SELECT DISTINCT ON (id) id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
     ),
     (
         "memory",
         "index_count",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u WHERE u.g = t.g) LIMIT 10",
-        "SELECT DISTINCT id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u \
+        "SELECT DISTINCT ON (id) id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u \
          WHERE u.g = t.g AND u.id + 0 = u.id) LIMIT 10",
     ),
     (
         "memory",
         "index_count",
         "SELECT id, (SELECT COUNT(*) FROM t AS u WHERE u.g = t.a) FROM t LIMIT 10",
-        "SELECT DISTINCT id, (SELECT COUNT(*) FROM t AS u \
+        "SELECT DISTINCT ON (id) id, (SELECT COUNT(*) FROM t AS u \
          WHERE u.g = t.a AND u.id + 0 = u.id) FROM t LIMIT 10",
     ),
     (
@@ -221,7 +221,7 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "index_count",
         "SELECT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u WHERE u.g = t.g \
          HAVING COUNT(*) > 1) LIMIT 10",
-        "SELECT DISTINCT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u \
+        "SELECT DISTINCT ON (id) id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u \
          WHERE u.g = t.g AND u.id + 0 = u.id HAVING COUNT(*) > 1) LIMIT 10",
     ),
     (

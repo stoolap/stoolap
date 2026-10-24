@@ -1273,6 +1273,56 @@ impl QueryResult for TopNResult {
     }
 }
 
+/// The rows a DISTINCT has passed, by the values of their first columns: the
+/// one rule of which rows DISTINCT keeps, the first of each in the order read
+pub(crate) struct DistinctRows {
+    /// Number of columns to consider for distinctness
+    /// (may be less than total columns when ORDER BY adds extra columns)
+    distinct_column_count: usize,
+    /// Seen rows for deduplication: hash -> list of row values (for collision handling)
+    /// We only store the distinct columns, not the full row
+    seen: FxHashMap<u64, Vec<Vec<Value>>>,
+}
+
+impl DistinctRows {
+    pub(crate) fn new(distinct_column_count: usize) -> Self {
+        Self {
+            distinct_column_count,
+            seen: FxHashMap::default(),
+        }
+    }
+
+    /// Whether `row` is the first row with its values, kept as seen if so
+    pub(crate) fn is_new(&mut self, row: &Row) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = FxHasher::default();
+        for value in row.iter().take(self.distinct_column_count) {
+            value.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        // Compare by reference so duplicate rows allocate nothing
+        let prefix_len = row.len().min(self.distinct_column_count);
+        let is_dup = self.seen.get(&hash).is_some_and(|seen_rows| {
+            seen_rows.iter().any(|seen| {
+                seen.len() == prefix_len
+                    && seen
+                        .iter()
+                        .zip(row.iter().take(self.distinct_column_count))
+                        .all(|(a, b)| a == b)
+            })
+        });
+        if !is_dup {
+            let values = row
+                .iter()
+                .take(self.distinct_column_count)
+                .cloned()
+                .collect();
+            self.seen.entry(hash).or_default().push(values);
+        }
+        !is_dup
+    }
+}
+
 /// Streaming distinct result that removes duplicate rows on-the-fly
 ///
 /// This streams rows and only stores seen row values for deduplication. This enables:
@@ -1284,12 +1334,8 @@ pub struct DistinctResult {
     inner: Box<dyn QueryResult>,
     /// Columns from inner result
     columns: Vec<String>,
-    /// Number of columns to consider for distinctness
-    /// (may be less than total columns when ORDER BY adds extra columns)
-    distinct_column_count: usize,
-    /// Seen rows for deduplication: hash -> list of row values (for collision handling)
-    /// We only store the distinct columns, not the full row
-    seen: FxHashMap<u64, Vec<Vec<Value>>>,
+    /// The rows passed so far
+    seen: DistinctRows,
     /// Current row (stored for row() method)
     current_row: Row,
     /// Whether we have a valid current row
@@ -1315,21 +1361,10 @@ impl DistinctResult {
         Self {
             inner,
             columns,
-            distinct_column_count,
-            seen: FxHashMap::default(),
+            seen: DistinctRows::new(distinct_column_count),
             current_row: Row::new(),
             has_current: false,
         }
-    }
-
-    /// Compute hash for the distinct columns of a row
-    fn hash_row(&self, row: &Row) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = FxHasher::default();
-        for value in row.iter().take(self.distinct_column_count) {
-            value.hash(&mut hasher);
-        }
-        hasher.finish()
     }
 }
 
@@ -1341,33 +1376,9 @@ impl QueryResult for DistinctResult {
     fn next(&mut self) -> bool {
         // Keep getting rows until we find a non-duplicate
         while self.inner.next() {
-            let row = self.inner.row();
-            let hash = self.hash_row(row);
-
-            // Compare by reference so duplicate rows allocate nothing
-            let prefix_len = row.len().min(self.distinct_column_count);
-            let is_dup = if let Some(seen_rows) = self.seen.get(&hash) {
-                seen_rows.iter().any(|seen| {
-                    seen.len() == prefix_len
-                        && seen
-                            .iter()
-                            .zip(row.iter().take(self.distinct_column_count))
-                            .all(|(a, b)| a == b)
-                })
-            } else {
-                false
-            };
-
-            if !is_dup {
-                // New unique row found - take ownership and mark as seen
+            if self.seen.is_new(self.inner.row()) {
+                // New unique row found - take ownership
                 self.current_row = self.inner.take_row();
-                let values = self
-                    .current_row
-                    .iter()
-                    .take(self.distinct_column_count)
-                    .cloned()
-                    .collect();
-                self.seen.entry(hash).or_default().push(values);
                 self.has_current = true;
                 return true;
             }

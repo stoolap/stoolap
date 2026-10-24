@@ -265,13 +265,13 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "distinct_where",
         "SELECT DISTINCT a FROM t WHERE id > (SELECT MAX(x) FROM u)",
         "SELECT DISTINCT a FROM t WHERE id > 3",
-        Old("DISTINCT, set operations and windows"),
+        Prepared,
     ),
     (
         "union_where",
         "SELECT id FROM t WHERE id > (SELECT MAX(x) FROM u) UNION SELECT 9",
         "SELECT id FROM t WHERE id > 3 UNION SELECT 9",
-        Old("DISTINCT, set operations and windows"),
+        Prepared,
     ),
     (
         "window_where",

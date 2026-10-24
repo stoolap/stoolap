@@ -1389,10 +1389,19 @@ impl Executor {
         };
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
+        let mut distinct_applied = false;
         let (mut result, columns, limit_offset_applied, shape) = if in_family {
-            let (result, columns, applied, visible, layout) =
+            // DISTINCT reads every row before a LIMIT counts them; a set
+            // operation's branch takes the bound its whole one allows
+            let (limit, offset) = match (stmt.set_operations.is_empty(), stmt.distinct) {
+                (false, _) => (set_limit, 0),
+                (true, true) => (None, 0),
+                (true, false) => (limit, offset),
+            };
+            let (result, columns, applied, visible, layout, distinct) =
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
             prepared_visible = Some(visible);
+            distinct_applied = distinct;
             let shape = SelectShape {
                 deferred: None,
                 layout: layout.map(LaidOut::Shared),
@@ -1443,7 +1452,7 @@ impl Executor {
         // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
         // DISTINCT should only consider the original SELECT columns, not the extra ORDER BY columns.
-        if stmt.distinct && stmt.distinct_on.is_empty() {
+        if stmt.distinct && stmt.distinct_on.is_empty() && !distinct_applied {
             if columns.len() > expected_columns && expected_columns > 0 {
                 // Extra ORDER BY columns present - only hash SELECT columns for distinctness
                 result = Box::new(DistinctResult::with_column_count(

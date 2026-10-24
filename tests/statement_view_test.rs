@@ -308,13 +308,13 @@ fn a_dml_under_a_snapshot_view_selects_its_target_from_the_newest_state() {
 
 #[test]
 fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statements() {
-    // DISTINCT keeps the general path's probe; without it the prepared
+    // DISTINCT ON keeps the general path's probe; without it the prepared
     // family probes
     let cases: [(&str, &str, &str, &'static str); 5] = [
         (
             "probe",
             "INSERT INTO w VALUES (1, 1)",
-            "SELECT DISTINCT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 10",
+            "SELECT DISTINCT ON (id) id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 10",
             "DELETE FROM w WHERE id = 1",
         ),
         (
