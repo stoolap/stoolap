@@ -795,6 +795,10 @@ fn unaliased_item(mut expr: &Expression) -> &Expression {
     expr
 }
 
+fn is_star_item(expr: &Expression) -> bool {
+    matches!(expr, Expression::Star(_) | Expression::QualifiedStar(_))
+}
+
 /// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
 /// constant, so no column reads as the text of its name, that evaluates to
 /// false or NULL
@@ -1362,6 +1366,27 @@ impl Executor {
             };
             &branch_stmt
         };
+        // A DISTINCT ON key the aggregation or window path computes rides along
+        // as a hidden item, which the visible column count trims after
+        let keyed_stmt;
+        let keyed_classification;
+        let written_items = branch.columns.len();
+        let (branch, branch_classification) =
+            match Self::with_distinct_on_items(branch, &classification) {
+                Some(keyed) => {
+                    keyed_stmt = keyed;
+                    keyed_classification = get_classification(&keyed_stmt);
+                    (&keyed_stmt, &keyed_classification)
+                }
+                None => (branch, &classification),
+            };
+        // The columns past the visible ones: the carried keys, and the ORDER BY
+        // windows no item, a carried key included, computes
+        let hidden_keys = branch.columns.len() - written_items;
+        let hidden_windows = match branch_classification.has_window_functions {
+            true => Self::hidden_order_by_windows(branch).len(),
+            false => 0,
+        };
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let (mut result, columns, limit_offset_applied, shape) = if in_family {
@@ -1378,7 +1403,7 @@ impl Executor {
             self.execute_prepared_grouped(grouped, branch, ctx)?
         } else {
             let compiled = compiled.filter(|_| !folded_select);
-            self.execute_select_internal(branch, ctx, &classification, compiled)?
+            self.execute_select_internal(branch, ctx, branch_classification, compiled)?
         };
         let SelectShape {
             deferred: deferred_projection,
@@ -1404,8 +1429,8 @@ impl Executor {
         // computed for it, so those are counted off the end
         let expected_columns =
             match prepared_visible.unwrap_or_else(|| self.count_select_columns(stmt)) {
-                0 if classification.has_window_functions => {
-                    let hidden = Self::hidden_order_by_windows(stmt).len();
+                0 if hidden_windows + hidden_keys > 0 => {
+                    let hidden = hidden_windows + hidden_keys;
                     if hidden > 0 {
                         columns.len().saturating_sub(hidden)
                     } else {
@@ -1434,6 +1459,9 @@ impl Executor {
         // Note: LIMIT/OFFSET was already evaluated earlier for set operations optimization
         // Skip ORDER BY if storage-level optimization already applied sorting + LIMIT/OFFSET
         // classification was already obtained at entry point and passed through
+        // A DISTINCT ON key reads only where the first branch put its items,
+        // which a set operation's rows keep
+        let item_layout = layout.as_deref();
         if !stmt.order_by.is_empty() && !limit_offset_applied {
             // A set operation's rows come from other branches too: there a
             // column stands for a sort key only when aliased or an aggregate,
@@ -1752,13 +1780,7 @@ impl Executor {
 
                 // Apply DISTINCT ON if active
                 if has_distinct_on {
-                    let result_cols = result.columns().to_vec();
-                    let key_indices = Self::resolve_distinct_on_indices(
-                        &stmt.distinct_on,
-                        &result_cols,
-                        Some(&stmt.columns),
-                    );
-                    result = Box::new(DistinctOnResult::new(result, key_indices));
+                    result = Self::distinct_on_result(stmt, result, item_layout, expected_columns)?;
 
                     // Remove extra columns after DISTINCT ON dedup
                     if needs_extra_col_removal {
@@ -1852,13 +1874,7 @@ impl Executor {
         // columns not in SELECT (they may be among the extra ORDER BY columns or
         // the full source columns).
         if !stmt.distinct_on.is_empty() {
-            let result_columns = result.columns().to_vec();
-            let key_indices = Self::resolve_distinct_on_indices(
-                &stmt.distinct_on,
-                &result_columns,
-                Some(&stmt.columns),
-            );
-            result = Box::new(DistinctOnResult::new(result, key_indices));
+            result = Self::distinct_on_result(stmt, result, item_layout, expected_columns)?;
         }
 
         // Remove extra ORDER BY columns that were added for sorting
@@ -1875,7 +1891,129 @@ impl Executor {
         Ok(result)
     }
 
-    /// Resolve DISTINCT ON expressions to column indices in the result set.
+    /// `result` deduplicated on `stmt`'s DISTINCT ON keys, each read from the
+    /// column `resolve_distinct_on_indices` binds it to
+    fn distinct_on_result(
+        stmt: &SelectStatement,
+        result: Box<dyn QueryResult>,
+        layout: Option<&OutputLayout>,
+        visible: usize,
+    ) -> Result<Box<dyn QueryResult>> {
+        let columns = result.columns().to_vec();
+        let visible = if visible == 0 { columns.len() } else { visible };
+        // An item's column by the layout; without one, counted from the front,
+        // or from the end of the visible columns for one after every star
+        let item_column = |key: &Expression| {
+            let item = Self::item_computing(stmt, key)?;
+            if let Some(layout) = layout {
+                return layout.item_position(item);
+            }
+            let first_star = stmt.columns.iter().position(is_star_item);
+            let last_star = stmt.columns.iter().rposition(is_star_item);
+            match (first_star, last_star) {
+                (Some(first), Some(last)) if first < item && item < last => None,
+                (_, Some(last)) if last < item => visible.checked_sub(stmt.columns.len() - item),
+                _ => Some(item),
+            }
+        };
+        let indices = Self::resolve_distinct_on_indices(
+            &stmt.distinct_on,
+            &columns,
+            Some(&stmt.columns),
+            &item_column,
+        );
+        let indices = stmt
+            .distinct_on
+            .iter()
+            .zip(indices)
+            .map(|(key, index)| {
+                index.ok_or_else(|| {
+                    Error::invalid_argument(format!("DISTINCT ON key {key} names no column"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Box::new(DistinctOnResult::new(result, indices)))
+    }
+
+    /// The SELECT item computing `key`, aliased or not
+    fn item_computing(stmt: &SelectStatement, key: &Expression) -> Option<usize> {
+        stmt.columns
+            .iter()
+            .position(|c| ExprKey::of(unaliased_item(c)) == ExprKey::of(key))
+    }
+
+    /// `stmt` with each DISTINCT ON key that is no SELECT position or alias
+    /// appended as a hidden item named by its identity, when the aggregation
+    /// or window path computes its rows: a key is then computed where its row
+    /// is, reading groups, aggregates and windows as a SELECT item does
+    fn with_distinct_on_items(
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+    ) -> Option<SelectStatement> {
+        if stmt.distinct_on.is_empty()
+            || !stmt.set_operations.is_empty()
+            || !(classification.has_aggregation || classification.has_window_functions)
+        {
+            return None;
+        }
+        // A position past the SELECT list stays an error, not a hidden item;
+        // beside a star the list's width is the star's, which ORDER BY reads
+        let star = stmt.columns.iter().any(is_star_item);
+        let past_list = |expr: &Expression| {
+            matches!(expr, Expression::IntegerLiteral(lit)
+                if usize::try_from(lit.value).map_or(true, |p| p > stmt.columns.len()))
+        };
+        let order_by = stmt
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .filter(|_| !star);
+        if super::aggregation::grouping_items(stmt)
+            .into_iter()
+            .chain(order_by)
+            .any(past_list)
+        {
+            return None;
+        }
+        let mut columns = stmt.columns.clone();
+        for key in &stmt.distinct_on {
+            // A key the SELECT list computes is read from that item
+            if Self::item_computing(stmt, key).is_some() {
+                continue;
+            }
+            let alias = |id: &Identifier| {
+                stmt.columns.iter().any(|c| {
+                    matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower)
+                })
+            };
+            match key {
+                Expression::IntegerLiteral(_) => continue,
+                Expression::Identifier(id) if alias(id) => continue,
+                _ => {}
+            }
+            let name = ExprKey::of(key).hidden_column_name();
+            if columns
+                .iter()
+                .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == name))
+            {
+                continue;
+            }
+            let token = dummy_token(&name, TokenType::Identifier);
+            columns.push(Expression::Aliased(AliasedExpression {
+                token: token.clone(),
+                expression: Box::new(key.clone()),
+                alias: Identifier::new(token, name),
+            }));
+        }
+        (columns.len() > stmt.columns.len()).then(|| SelectStatement {
+            columns,
+            ..stmt.clone()
+        })
+    }
+
+    /// Resolve DISTINCT ON expressions to column indices in the result set,
+    /// None for a key no column holds; a key carried as a hidden column is
+    /// found by its identity.
     /// Also checks original SELECT expressions to handle aliased columns
     /// (e.g., `SELECT DISTINCT ON (customer) customer AS c` — matches `customer`
     /// against the original identifier behind the `c` alias).
@@ -1883,11 +2021,18 @@ impl Executor {
         distinct_on: &[Expression],
         result_columns: &[String],
         select_exprs: Option<&[Expression]>,
-    ) -> Vec<usize> {
+        item_column: &dyn Fn(&Expression) -> Option<usize>,
+    ) -> Vec<Option<usize>> {
         distinct_on
             .iter()
-            .filter_map(|expr| {
-                match expr {
+            .map(|expr| {
+                let hidden = || {
+                    let key = ExprKey::of(expr);
+                    result_columns
+                        .iter()
+                        .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
+                };
+                let bound = match expr {
                     Expression::Identifier(id) => {
                         // First: direct match against result column names
                         let direct = result_columns
@@ -1983,13 +2128,7 @@ impl Executor {
                         // hidden column carried for it, as ORDER BY reads them, else
                         // the column named after it
                         let key = ExprKey::of(expr);
-                        select_exprs
-                            .filter(|sel| {
-                                !sel.iter().any(|s| {
-                                    matches!(s, Expression::Star(_) | Expression::QualifiedStar(_))
-                                })
-                            })
-                            .and_then(|sel| sel.iter().position(|s| ExprKey::of(s) == key))
+                        item_column(expr)
                             .or_else(|| {
                                 result_columns
                                     .iter()
@@ -2000,7 +2139,8 @@ impl Executor {
                                 result_columns.iter().position(|c| *c == expr_str)
                             })
                     }
-                }
+                };
+                bound.or_else(hidden)
             })
             .collect()
     }
@@ -11303,13 +11443,13 @@ impl Executor {
     }
 
     /// The layout of `stmt`'s output columns over the input `all_columns`,
-    /// for its ORDER BY to read; None without one, which reads nothing
+    /// for its ORDER BY and DISTINCT ON to read; None without either
     pub(crate) fn output_layout(
         stmt: &SelectStatement,
         all_columns: &[String],
         table_alias: Option<&str>,
     ) -> Option<OutputLayout> {
-        (!stmt.order_by.is_empty())
+        (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty())
             .then(|| Self::select_layout(&stmt.columns, all_columns, table_alias))
     }
 
@@ -11319,7 +11459,7 @@ impl Executor {
         all_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
     ) -> Option<OutputLayout> {
-        (!stmt.order_by.is_empty()).then(|| {
+        (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty()).then(|| {
             Self::shared_select_layout(&stmt.columns, CompactArc::clone(all_columns), table_alias)
         })
     }
@@ -11328,7 +11468,7 @@ impl Executor {
     /// columns those of the SELECT list over `all_columns`, the rest appended
     /// for ORDER BY, a hidden key computing an expression and any other
     /// column carrying the input column it is named after. None without an
-    /// ORDER BY
+    /// ORDER BY or a DISTINCT ON
     pub(crate) fn result_layout(
         stmt: &SelectStatement,
         all_columns: &[String],

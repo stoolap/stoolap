@@ -151,6 +151,18 @@ FROM sales
 ORDER BY region, category, sale_date;
 ```
 
+### DISTINCT ON Keys
+
+A key may be a column, a SELECT alias or position, or any expression, including one the SELECT list does not compute. A key that is not a SELECT alias or position is computed for each row as a SELECT item would be: in a query with GROUP BY, aggregates or window functions it may read the GROUP BY items and aggregates, and under ROLLUP, CUBE or GROUPING SETS a rolled-up item reads NULL, whether or not the SELECT list shows them. In the first SELECT of a UNION, INTERSECT or EXCEPT, a key is a column, a SELECT alias or position, or an expression the SELECT list computes. A name that no column or SELECT item answers is an error.
+
+```sql
+-- First region per parity of its total, grouped
+SELECT DISTINCT ON (SUM(amount) % 2) region, SUM(amount)
+FROM sales
+GROUP BY region
+ORDER BY SUM(amount) % 2, region;
+```
+
 ### DISTINCT ON with LIMIT
 
 DISTINCT ON composes naturally with LIMIT and OFFSET. Deduplication happens first, then LIMIT is applied to the deduplicated result.

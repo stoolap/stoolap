@@ -976,7 +976,8 @@ impl Executor {
             for (id, row) in base_rows.iter() {
                 rows.push((*id, row.clone()));
             }
-            let layout = (!stmt.order_by.is_empty()).then(|| OutputLayout::of_input(base_columns));
+            let layout = (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty())
+                .then(|| OutputLayout::of_input(base_columns));
             return Ok((
                 Box::new(ExecutorResult::new(base_columns.to_vec(), rows)),
                 layout,
@@ -1083,7 +1084,7 @@ impl Executor {
         let mut result_columns = Vec::new();
 
         // Parse the SELECT list to determine output column order
-        let laid_out = !stmt.order_by.is_empty();
+        let laid_out = !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty();
         let mut item_of = Vec::new();
         let select_items = self.parse_select_list_for_window(
             stmt,
