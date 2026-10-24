@@ -814,10 +814,10 @@ fn test_name_errors_are_the_statements() {
         0,
         "nothing that fails to bind is prepared"
     );
-    assert_eq!(
-        prepared_line(&db, unknown),
-        "Prepared: yes",
-        "the statement is in the family; the error is its own"
+    let explain = db.query(&format!("EXPLAIN {unknown}"), ());
+    assert!(
+        explain.is_err_and(|e| e.to_string().contains("unknown table or alias 'nosuch'")),
+        "the statement fails before any path reads it"
     );
 }
 

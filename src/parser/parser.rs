@@ -150,6 +150,12 @@ pub struct Parser<'a> {
     max_positional: usize,
     /// The `:name` slots of the current statement, in slot order
     named_slots: Vec<SmartString>,
+    /// Whether each statement's qualifiers are checked against its FROM
+    /// entries; off for text the engine wrote itself
+    scoped: bool,
+    /// Whether the current statement wrote a qualifier, the one thing the
+    /// scope check can refuse
+    pub(crate) qualified: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -169,7 +175,16 @@ impl<'a> Parser<'a> {
             parameter_counter: 1,
             max_positional: 0,
             named_slots: Vec::new(),
+            scoped: true,
+            qualified: false,
         }
+    }
+
+    /// A parser for a stored expression's text, whose qualifiers were
+    /// checked when the user wrote it
+    pub(crate) fn unscoped(mut self) -> Self {
+        self.scoped = false;
+        self
     }
 
     /// Parse the input and return a Program
@@ -483,6 +498,18 @@ impl<'a> Parser<'a> {
     pub(crate) fn add_error(&mut self, msg: String) {
         self.errors
             .push(ParseError::new(msg, self.cur_token.position));
+    }
+
+    /// Refuses a qualifier `stmt`, parsed whole without error, writes where
+    /// no FROM entry in scope has that name
+    pub(crate) fn check_scopes(&mut self, stmt: &Statement) {
+        if !std::mem::take(&mut self.qualified) || !self.scoped || !self.errors.is_empty() {
+            return;
+        }
+        if let Err(error) = super::scope::check(stmt) {
+            self.errors
+                .push(ParseError::new(error.message, error.position));
+        }
     }
 
     /// Get collected errors

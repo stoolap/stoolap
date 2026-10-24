@@ -79,6 +79,7 @@ impl Parser<'_> {
     /// [`Self::parse_statement`] and the slots the statement takes
     pub(crate) fn parse_statement_with_slots(&mut self) -> Option<(Statement, ParamSlots)> {
         let mut stmt = self.parse_statement_body()?;
+        self.check_scopes(&stmt);
         let slots = self.take_param_slots(&stmt);
         stmt.set_param_count(slots.count);
         Some((stmt, slots))
