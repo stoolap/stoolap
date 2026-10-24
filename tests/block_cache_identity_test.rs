@@ -30,6 +30,13 @@ fn the_same_block_written_twice_is_kept_once_for_both() {
     )
     .unwrap();
     db.execute("INSERT INTO q VALUES (1, 10, 20)", ()).unwrap();
+    db.execute(
+        "CREATE TABLE \"q AS a\" (id INTEGER PRIMARY KEY, b INTEGER, \"a.b\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO \"q AS a\" VALUES (1, 30, 40)", ())
+        .unwrap();
     // Blocks a key that ignores quoting or qualification would take as one
     for (sql, want) in [
         (
@@ -43,6 +50,14 @@ fn the_same_block_written_twice_is_kept_once_for_both() {
         (
             "SELECT (SELECT \"UPPER\" FROM q), (SELECT \"upper\" FROM q) FROM q",
             ["UPPER", "upper"],
+        ),
+        (
+            "SELECT (SELECT b FROM \"q AS a\"), (SELECT b FROM q AS a) FROM q",
+            ["30", "10"],
+        ),
+        (
+            "SELECT (SELECT b FROM q AS a), (SELECT b FROM \"q AS a\") FROM q",
+            ["10", "30"],
         ),
     ] {
         let statement = db.prepare(sql).unwrap();

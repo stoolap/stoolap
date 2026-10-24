@@ -128,6 +128,8 @@ fn exists_over_few_outer_rows_does_not_read_the_inner_table_whole() {
                 "SELECT {outer}.id FROM {outer} WHERE {test} \
                  (SELECT 1 FROM {inner} WHERE {inner}.c = {outer}.k)"
             );
+            // EXISTS and NOT EXISTS hold one block, whose kept answer would serve both
+            stoolap::executor::context::clear_block_answer_cache();
             let before = inner_table_reads();
             ids(&db, &sql);
             assert_eq!(inner_table_reads() > before, reads_whole, "{sql}");

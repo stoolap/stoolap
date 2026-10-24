@@ -523,7 +523,33 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             write_list(&function.arguments, hasher);
             write_names(function.alias.as_ref(), &function.column_aliases, hasher);
         }
+        Expression::TableSource(table) => {
+            hasher.tag(b't');
+            write_source_name(&table.name, table.alias.as_ref(), hasher);
+            hasher.flag(table.as_of.is_some());
+            if let Some(as_of) = &table.as_of {
+                hasher.name(&as_of.as_of_type);
+                write_expr(&as_of.value, hasher);
+            }
+        }
+        Expression::CteReference(cte) => {
+            hasher.tag(b'r');
+            write_source_name(&cte.name, cte.alias.as_ref(), hasher);
+        }
         other => write_expr(other, hasher),
+    }
+}
+
+/// A source's name and its alias, each a name of its own
+fn write_source_name(name: &Identifier, alias: Option<&Identifier>, hasher: &mut KeyHasher) {
+    let write = |id: &Identifier, hasher: &mut KeyHasher| match hasher.exact {
+        true => write_identifier(id, hasher),
+        false => hasher.name(&id.value_lower),
+    };
+    write(name, hasher);
+    hasher.flag(alias.is_some());
+    if let Some(alias) = alias {
+        write(alias, hasher);
     }
 }
 
@@ -604,6 +630,13 @@ mod tests {
         for (a, b) in [("t.V + 1", "T.v + 1"), ("UPPER(v)", "upper(V)")] {
             assert_eq!(exact(a), exact(b), "{a} and {b} are one expression");
         }
+        // A source's name and alias are parts of their own, not its text
+        let (quoted, aliased) = ("(SELECT v FROM \"u AS a\")", "(SELECT v FROM u AS a)");
+        assert_ne!(select_key(quoted), select_key(aliased));
+        assert_ne!(exact(quoted), exact(aliased));
+        let (upper, lower) = ("(SELECT v FROM U AS A)", "(SELECT v FROM u AS a)");
+        assert_eq!(select_key(upper), select_key(lower), "one table");
+        assert_eq!(exact(upper), exact(lower), "one table");
     }
 
     #[test]
