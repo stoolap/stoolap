@@ -3252,13 +3252,21 @@ impl Builder<'_> {
             match (key, chooses) {
                 (None, true) => order_keys.push((None, ob.ascending, ob.nulls_first)),
                 (Some(key), true) => {
-                    let key = self.rewrite(&chain, Some(id), &key, &mut work)?;
-                    // So does the item's computation over the columns it binds to
+                    // So does the item as written over the columns it binds,
+                    // matched before an alias in it is read as its item
                     let same = !mentions_subquery(&ob.expression)
-                        && projection
-                            .as_ref()
-                            .is_some_and(|item| ExprKey::exact(item) == ExprKey::exact(&key));
-                    let key = (!same).then_some(key);
+                        && projection.as_ref().is_some_and(|item| {
+                            let mut written = Rewritten {
+                                outer: work.outer.clone(),
+                                ..Rewritten::default()
+                            };
+                            self.rewrite(&chain, Some(id), &ob.expression, &mut written)
+                                .is_ok_and(|key| ExprKey::exact(item) == ExprKey::exact(&key))
+                        });
+                    let key = match same {
+                        true => None,
+                        false => Some(self.rewrite(&chain, Some(id), &key, &mut work)?),
+                    };
                     order_keys.push((key, ob.ascending, ob.nulls_first));
                 }
                 // A key that chooses no row is still bound, as any ORDER BY is

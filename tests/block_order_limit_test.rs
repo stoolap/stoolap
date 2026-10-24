@@ -346,6 +346,12 @@ fn an_order_by_name_binds_as_the_general_path_binds_it() {
     .unwrap();
     db.execute("INSERT INTO w VALUES (1, 10, 20), (2, 20, 10)", ())
         .unwrap();
+    // The item as written is matched before its alias, which here names
+    // the enclosing column too, is read inside the key
+    let sql = "SELECT (SELECT ABS(u.x - a) AS a FROM u WHERE u.k = 1 \
+               ORDER BY ABS(u.x - a) LIMIT 1) FROM t WHERE t.id = 1";
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes");
+    assert_eq!(column(&db, sql, 0, ()), [Some(1)]);
     // A column named w.x is not the item w.x, though the two read alike
     for (key, want) in [("\"w.x\", x", 20), ("w.x", 10)] {
         let sql =
