@@ -37,6 +37,13 @@ CREATE TABLE users (
 );
 ```
 
+A NOT NULL column refuses NULL on every write: INSERT, UPDATE, the update of an upsert (`ON CONFLICT DO UPDATE`, `ON DUPLICATE KEY UPDATE`) and COPY, inside or outside a transaction, whether the row is still in memory or already in a frozen volume. The statement fails with `NULL value in non-nullable column` and writes none of its rows.
+
+```sql
+UPDATE users SET name = NULL WHERE id = 1;
+-- Error: NULL value in non-nullable column 'name'
+```
+
 ## Testing for NULL Values
 
 To test for NULL values, use the IS NULL and IS NOT NULL operators:

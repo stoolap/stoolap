@@ -1725,9 +1725,30 @@ impl MVCCTable {
         Ok(Some(result))
     }
 
+    /// Validates and coerces a row against the schema; a row that needs no
+    /// coercion and holds no refused NULL is valid as is
+    #[inline]
+    fn validate_and_coerce_row(&self, row: &mut Row) -> Result<()> {
+        let columns = &self.cached_schema.columns;
+        if row.len() == columns.len()
+            && columns.iter().zip(row.as_slice()).all(|(col, value)| {
+                if value.is_null() {
+                    col.nullable
+                } else {
+                    value.data_type() == col.data_type
+                }
+            })
+        {
+            return Ok(());
+        }
+        self.coerce_row(row)
+    }
+
     /// Validates and coerces a row against the schema
     /// Returns the coerced row if successful
-    fn validate_and_coerce_row(&self, row: &mut Row) -> Result<()> {
+    #[cold]
+    #[inline(never)]
+    fn coerce_row(&self, row: &mut Row) -> Result<()> {
         // OPTIMIZATION: Use cached_schema instead of version_store.schema() to avoid clone
         let schema = &self.cached_schema;
 
@@ -2512,16 +2533,18 @@ impl MVCCTable {
     }
 
     /// Runs the setter on the planned hot rows from `start` on, in order,
-    /// keeping the rows it changed
+    /// keeping the rows it changed, each validated as an insert is
     fn set_planned(
+        &self,
         plan: &mut PlannedUpdate,
         start: usize,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<()> {
         let mut kept = start;
         for i in start..plan.hot.len() {
-            let (row, changed) = setter(std::mem::take(&mut plan.hot[i].1))?;
+            let (mut row, changed) = setter(std::mem::take(&mut plan.hot[i].1))?;
             if changed {
+                self.validate_and_coerce_row(&mut row)?;
                 plan.hot[i].1 = row;
                 plan.hot.swap(kept, i);
                 kept += 1;
@@ -2569,7 +2592,7 @@ impl MVCCTable {
                 if let Some((row, read)) = read {
                     let row = self.normalize_row_to_schema(row, schema);
                     plan.hot.push((pk_id, row, read));
-                    Self::set_planned(plan, start, setter)?;
+                    self.set_planned(plan, start, setter)?;
                 }
                 return Ok(());
             }
@@ -2595,7 +2618,7 @@ impl MVCCTable {
                         }
                     }
                 }
-                Self::set_planned(plan, start, setter)?;
+                self.set_planned(plan, start, setter)?;
                 if !remaining_row_ids.is_empty() {
                     let batch_rows = self
                         .version_store
@@ -2606,7 +2629,7 @@ impl MVCCTable {
                         let row = self.normalize_row_to_schema(row, schema);
                         plan.hot.push((row_id, row, version));
                     }
-                    Self::set_planned(plan, stored, setter)?;
+                    self.set_planned(plan, stored, setter)?;
                 }
                 return Ok(());
             }
@@ -2647,7 +2670,7 @@ impl MVCCTable {
                     }
                 }
                 self.check_read()?;
-                return Self::set_planned(plan, start, setter);
+                return self.set_planned(plan, start, setter);
             }
         }
 
@@ -2726,7 +2749,7 @@ impl MVCCTable {
                 plan.hot.push((row_id, row, self.local_read(version)));
             }
         }
-        Self::set_planned(plan, start, setter)
+        self.set_planned(plan, start, setter)
     }
 
     /// The rows `update_by_row_ids` sets, planned, with the setter run as in
@@ -2755,7 +2778,7 @@ impl MVCCTable {
                 }
             }
         }
-        Self::set_planned(plan, start, setter)?;
+        self.set_planned(plan, start, setter)?;
         if !remaining_row_ids.is_empty() {
             let batch_rows = self
                 .version_store
@@ -2766,7 +2789,7 @@ impl MVCCTable {
                 let row = self.normalize_row_to_schema(row, schema);
                 plan.hot.push((row_id, row, version));
             }
-            Self::set_planned(plan, stored, setter)?;
+            self.set_planned(plan, stored, setter)?;
         }
         Ok(())
     }
