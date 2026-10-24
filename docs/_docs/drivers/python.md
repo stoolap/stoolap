@@ -183,7 +183,7 @@ print(changes)  # 3
 
 ## Prepared Statements
 
-Prepared statements parse SQL once and reuse the cached execution plan on every call. No parsing or cache lookup overhead per execution.
+Prepared statements parse SQL once and reuse the compiled execution plan on every call, on the database and inside transactions. No parsing or cache lookup overhead per execution.
 
 ```python
 insert = db.prepare('INSERT INTO users VALUES ($1, $2, $3)')
@@ -260,8 +260,27 @@ except:
 | `query_one(sql, params?)` | `dict \| None` | Query single row |
 | `query_raw(sql, params?)` | `dict` | Query in columnar format |
 | `execute_batch(sql, params_list)` | `int` | Execute with multiple param sets |
+| `execute_prepared(stmt, params?)` | `int` | Execute a prepared statement |
+| `query_prepared(stmt, params?)` | `list[dict]` | Query with a prepared statement |
+| `query_one_prepared(stmt, params?)` | `dict \| None` | Query single row with a prepared statement |
+| `query_raw_prepared(stmt, params?)` | `dict` | Query in columnar format with a prepared statement |
 | `commit()` | `None` | Commit the transaction |
 | `rollback()` | `None` | Rollback the transaction |
+
+### Prepared Statements in a Transaction
+
+A statement prepared on the database runs inside a transaction with its compiled plan, so the per-call cost matches `Database`. Both positional and named parameters work.
+
+```python
+insert = db.prepare('INSERT INTO users VALUES (:id, :name, :email)')
+lookup = db.prepare('SELECT * FROM users WHERE id = $1')
+
+with db.begin() as tx:
+    tx.execute_prepared(insert, {'id': 1, 'name': 'Alice', 'email': 'alice@example.com'})
+    tx.execute_prepared(insert, {'id': 2, 'name': 'Bob', 'email': 'bob@example.com'})
+
+    user = tx.query_one_prepared(lookup, [1])  # sees the uncommitted row
+```
 
 ### Batch in Transaction
 
@@ -355,6 +374,18 @@ db.query('SELECT * FROM users WHERE id = :id', {':id': 1})
 db.query('SELECT * FROM users WHERE id = :id', {'@id': 1})
 db.query('SELECT * FROM users WHERE id = :id', {'$id': 1})
 ```
+
+Every parameter the statement reads must have a value. A named parameter missing from the dict, or a positional list shorter than the statement needs, raises `StoolapError`:
+
+```python
+db.query('SELECT * FROM users WHERE id = :id', {})
+# StoolapError: invalid argument: named parameter :id has no value
+
+db.query('SELECT * FROM users WHERE id = $1', [])
+# StoolapError: invalid argument: Query requires 1 parameters but only 0 provided
+```
+
+Keys the statement does not read are ignored.
 
 ## Error Handling
 
