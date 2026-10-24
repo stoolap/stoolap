@@ -76,6 +76,73 @@ fn accumulate_ordered_frame(
     }
 }
 
+/// Programs over the rows a window statement reads, each run with the
+/// statement's parameters, outer row and transaction, and its subqueries
+/// answered by the statement's `blocks`
+struct RowPrograms<'a> {
+    programs: SmallVec<[SharedProgram; 1]>,
+    vm: ExprVM,
+    ctx: &'a ExecutionContext,
+    blocks: Option<&'a dyn SubqueryExecutor>,
+}
+
+impl<'a> RowPrograms<'a> {
+    /// `exprs` over `columns`, a group item or aggregate read from its slot
+    /// by identity when `slots` are given
+    fn compile<'e>(
+        exprs: impl IntoIterator<Item = &'e Expression>,
+        columns: &[String],
+        slots: Option<&FxHashMap<ExprKey, usize>>,
+        ctx: &'a ExecutionContext,
+        blocks: Option<&'a dyn SubqueryExecutor>,
+    ) -> Result<Self> {
+        let programs = exprs
+            .into_iter()
+            .map(|expr| match (blocks, slots) {
+                (None, None) => compile_expression(expr, columns),
+                _ => {
+                    let program = compile_over_slots(
+                        expr,
+                        columns,
+                        global_registry(),
+                        slots,
+                        None,
+                        blocks.is_some(),
+                        blocks.map(|blocks| slot_params(ctx, Some(blocks))),
+                    )?;
+                    Ok(blocks
+                        .and_then(|blocks| blocks.bind_members(&program))
+                        .unwrap_or(program))
+                }
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            programs,
+            vm: ExprVM::new(),
+            ctx,
+            blocks,
+        })
+    }
+
+    /// The first program's value for `row`
+    #[inline]
+    fn eval(&mut self, row: &Row) -> Result<Value> {
+        let exec = with_blocks(slot_context(row, self.ctx), self.blocks);
+        self.vm.execute_cow(&self.programs[0], &exec)
+    }
+
+    /// Each program's value for `row`, in order, into `out`
+    #[inline]
+    fn eval_into(&mut self, row: &Row, out: &mut Vec<Value>) -> Result<()> {
+        let exec = with_blocks(slot_context(row, self.ctx), self.blocks);
+        out.clear();
+        for program in &self.programs {
+            out.push(self.vm.execute_cow(program, &exec)?);
+        }
+        Ok(())
+    }
+}
+
 /// How a window argument is read: a literal by its value, resolved once
 /// for the call; a parameter from the statement; anything else by a
 /// program compiled the first time a partition reads it
@@ -158,6 +225,32 @@ struct CallArgs<'w> {
     count: Option<ConstArg<'w>>,
     /// LAG and LEAD's default, which may read the row
     default: Option<(&'w Expression, ArgSource)>,
+    /// A value function's first argument for each row, when it is not a column
+    input: Vec<Value>,
+}
+
+/// How a value function reads its first argument at a row: from its column,
+/// else from the values read for each row; None when it has neither
+#[derive(Clone, Copy)]
+struct ValueInput<'a> {
+    column: Option<usize>,
+    values: &'a [Value],
+}
+
+impl ValueInput<'_> {
+    #[inline]
+    fn at(self, rows: &[(i64, Row)], row_idx: usize) -> Option<Value> {
+        match self.column {
+            Some(column) => Some(
+                rows[row_idx]
+                    .1
+                    .get(column)
+                    .cloned()
+                    .unwrap_or_else(Value::null_unknown),
+            ),
+            None => self.values.get(row_idx).cloned(),
+        }
+    }
 }
 
 impl<'w> CallArgs<'w> {
@@ -186,6 +279,7 @@ impl<'w> CallArgs<'w> {
                 .get(2)
                 .filter(|_| lead_lag)
                 .map(|expr| (expr, ArgSource::of(expr))),
+            input: Vec::new(),
         }
     }
 
@@ -449,17 +543,18 @@ type OrderByKey = SmallVec<[OrderByItemKey; 2]>;
 /// Identity of a whole OVER clause: partition items then ORDER BY items
 type OverClauseKey = (SmallVec<[(u64, String); 2]>, OrderByKey);
 
-use crate::functions::registry::FunctionRegistry;
+use crate::functions::registry::{global_registry, FunctionRegistry};
 use crate::functions::{Volatility, WindowFunction};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
+use super::aggregation::{compile_over_slots, slot_context, slot_params, with_blocks};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
-    compile_once, compute_expression_hash, evaluate_once, execute_context, execute_once,
-    literal_value, CompileContext, ExprCompiler, ExprVM, ExpressionEval, MultiExpressionEval,
-    Program,
+    compile_expression, compile_once, compute_expression_hash, evaluate_once, execute_context,
+    execute_once, literal_value, CompileContext, ExprCompiler, ExprVM, Program, SharedProgram,
+    SubqueryExecutor,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
@@ -710,12 +805,15 @@ impl Executor {
             .collect()
     }
 
+    /// Window functions over the rows, the statement's subqueries answered
+    /// by its `blocks`
     pub(crate) fn execute_select_with_window_functions(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -725,6 +823,7 @@ impl Executor {
             &FxHashMap::default(),
             None,
             None,
+            blocks,
         )
     }
 
@@ -737,6 +836,7 @@ impl Executor {
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         group_slots: &FxHashMap<ExprKey, usize>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -746,6 +846,7 @@ impl Executor {
             group_slots,
             None,
             None,
+            blocks,
         )
     }
 
@@ -759,6 +860,7 @@ impl Executor {
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_sorted: Option<WindowPreSortedState>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -768,6 +870,7 @@ impl Executor {
             &FxHashMap::default(),
             pre_sorted,
             None,
+            blocks,
         )
     }
 
@@ -781,6 +884,7 @@ impl Executor {
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_grouped: WindowPreGroupedState,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -790,6 +894,7 @@ impl Executor {
             &FxHashMap::default(),
             None,
             Some(pre_grouped),
+            blocks,
         )
     }
 
@@ -804,6 +909,7 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         // A window function in ORDER BY that the select list does not carry
         // is computed into a column of its own, named after it, which the
@@ -824,14 +930,16 @@ impl Executor {
         };
 
         // A subquery inside a window function or its OVER clause is resolved
-        // per input row first; the columns it adds stay out of SELECT *
+        // per input row first, unless the blocks answer it; the columns it
+        // adds stay out of SELECT *
         let visible_columns = base_columns.len();
         let lifted_stmt;
         let lifted_rows;
         let lifted_columns;
-        let (stmt, base_rows, base_columns) = match Self::windows_hold_subquery(stmt)
-            .then(|| Self::lift_subqueries_in_windows(stmt, base_columns))
-            .flatten()
+        let (stmt, base_rows, base_columns) = match (blocks.is_none()
+            && Self::windows_hold_subquery(stmt))
+        .then(|| Self::lift_subqueries_in_windows(stmt, base_columns))
+        .flatten()
         {
             Some((rewritten, lifted, names)) => {
                 let qualifier = stmt
@@ -907,6 +1015,7 @@ impl Executor {
                             visible_columns,
                             &window_functions,
                             limit_val,
+                            blocks,
                         )?;
                         return Ok((result, None));
                     }
@@ -941,6 +1050,7 @@ impl Executor {
                         &col_index_map,
                         group_slots,
                         ctx,
+                        blocks,
                     )?;
                     order_by_cache.push((cache_key, precomputed));
                 }
@@ -963,6 +1073,7 @@ impl Executor {
                 pre_grouped.as_ref(),
                 &order_by_cache,
                 &mut partition_cache,
+                blocks,
             )?;
             window_value_map.insert(wf.column_name.to_lowercase(), window_values);
         }
@@ -1047,10 +1158,13 @@ impl Executor {
         let base_exprs: Vec<Expression> =
             base_expr_items.iter().map(|(_, e)| (*e).clone()).collect();
         let mut base_eval = if !base_exprs.is_empty() {
-            Some(
-                MultiExpressionEval::compile_with_aliases(&base_exprs, base_columns, group_slots)?
-                    .with_context(ctx),
-            )
+            Some(RowPrograms::compile(
+                &base_exprs,
+                base_columns,
+                Some(group_slots),
+                ctx,
+                blocks,
+            )?)
         } else {
             None
         };
@@ -1059,14 +1173,13 @@ impl Executor {
         // CRITICAL: Propagate compilation errors instead of silently producing NULLs
         let ext_exprs: Vec<Expression> = ext_expr_items.iter().map(|(_, e)| (*e).clone()).collect();
         let mut ext_eval = if !ext_exprs.is_empty() {
-            Some(
-                MultiExpressionEval::compile_with_aliases(
-                    &ext_exprs,
-                    &extended_columns,
-                    group_slots,
-                )?
-                .with_context(ctx),
-            )
+            Some(RowPrograms::compile(
+                &ext_exprs,
+                &extended_columns,
+                Some(group_slots),
+                ctx,
+                blocks,
+            )?)
         } else {
             None
         };
@@ -1082,6 +1195,7 @@ impl Executor {
         // vector behind, so each row paid two allocations to rebuild it.
         let mut ext_row = Row::from_compact_vec(CompactVec::with_capacity(ext_values_capacity));
         let mut ext_results: Vec<Value> = Vec::with_capacity(ext_expr_items.len());
+        let mut base_results: Vec<Value> = Vec::with_capacity(base_expr_items.len());
 
         // Number of output columns
         let num_items = select_items.len();
@@ -1141,7 +1255,7 @@ impl Executor {
             for (row_idx, (_, base_row)) in base_rows.iter().enumerate() {
                 // Evaluate base expressions and update their column values
                 if let Some(ref mut eval) = base_eval {
-                    let base_results = eval.eval_all(base_row)?;
+                    eval.eval_into(base_row, &mut base_results)?;
                     for (eval_idx, (item_idx, _)) in base_expr_items.iter().enumerate() {
                         if eval_idx < base_results.len() {
                             column_data[*item_idx][row_idx] = base_results[eval_idx].clone();
@@ -1229,6 +1343,7 @@ impl Executor {
         visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
         limit: usize,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
         // Use the first window function with PARTITION BY for partitioning
         let primary_wf = window_functions
@@ -1247,6 +1362,7 @@ impl Executor {
             &col_index_map,
             group_slots,
             ctx,
+            blocks,
         )?;
 
         // Build result columns from SELECT list
@@ -1275,6 +1391,7 @@ impl Executor {
                         &col_index_map,
                         group_slots,
                         ctx,
+                        blocks,
                     )?;
                     order_by_cache.push((cache_key, precomputed));
                 }
@@ -1291,9 +1408,19 @@ impl Executor {
                 } else {
                     self.function_registry.get_window(&wf.name)
                 };
-                (wf, func, is_agg, CallArgs::of(wf, &self.function_registry))
+                let mut args = CallArgs::of(wf, &self.function_registry);
+                args.input = self.window_input(
+                    wf,
+                    base_rows,
+                    base_columns,
+                    &col_index_map,
+                    group_slots,
+                    ctx,
+                    blocks,
+                )?;
+                Ok((wf, func, is_agg, args))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Precompute aggregate window functions once over all rows (not per partition)
         let mut precomputed_agg: StringMap<Vec<Value>> = StringMap::new();
@@ -1317,6 +1444,7 @@ impl Executor {
                     precomputed_order_by,
                     &mut streaming_partition_cache,
                     args,
+                    blocks,
                 )?;
                 precomputed_agg.insert(wf.column_name.to_lowercase(), agg_results);
             }
@@ -1386,14 +1514,14 @@ impl Executor {
             }
 
             // Precompile expression evaluators once per partition (not per row)
-            enum CompiledItem<'a> {
+            enum CompiledItem<'a, 'p> {
                 BaseColumn(usize),
                 WindowFunction(&'a str),
-                Expression(ExpressionEval),
-                ExpressionWithWindow(ExpressionEval, Vec<&'a str>),
+                Expression(RowPrograms<'p>),
+                ExpressionWithWindow(RowPrograms<'p>, Vec<&'a str>),
             }
             let num_items = select_items.len();
-            let mut compiled_items: Vec<CompiledItem<'_>> = Vec::with_capacity(num_items);
+            let mut compiled_items: Vec<CompiledItem<'_, '_>> = Vec::with_capacity(num_items);
             for item in &select_items {
                 compiled_items.push(match &item.source {
                     SelectItemSource::BaseColumn(idx) => CompiledItem::BaseColumn(*idx),
@@ -1401,7 +1529,7 @@ impl Executor {
                         CompiledItem::WindowFunction(name.as_str())
                     }
                     SelectItemSource::Expression(expr) => CompiledItem::Expression(
-                        ExpressionEval::compile(expr, base_columns)?.with_context(ctx),
+                        RowPrograms::compile([expr], base_columns, None, ctx, blocks)?,
                     ),
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
@@ -1412,7 +1540,7 @@ impl Executor {
                             ext_columns.push(wf_name.clone());
                         }
                         let eval =
-                            ExpressionEval::compile(&transformed, &ext_columns)?.with_context(ctx);
+                            RowPrograms::compile([&transformed], &ext_columns, None, ctx, blocks)?;
                         let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
                         CompiledItem::ExpressionWithWindow(eval, name_refs)
                     }
@@ -1490,7 +1618,7 @@ impl Executor {
         let group_slots = FxHashMap::default();
 
         // Resolve window functions from registry
-        let resolved_wfs: Vec<_> = window_functions
+        let mut resolved_wfs: Vec<_> = window_functions
             .iter()
             .map(|wf| {
                 let is_agg = self.function_registry.is_aggregate(&wf.name);
@@ -1559,6 +1687,7 @@ impl Executor {
                             &col_index_map,
                             &group_slots,
                             ctx,
+                            None,
                         )?;
                         order_by_cache.push((cache_key, precomputed));
                     }
@@ -1573,12 +1702,21 @@ impl Executor {
             // clause while indices differ per partition, so keep it local
             let mut lazy_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
 
-            for (wf, win_func_opt, is_agg, args) in &resolved_wfs {
+            for (wf, win_func_opt, is_agg, args) in &mut resolved_wfs {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
                 let precomputed_order_by = order_by_cache
                     .iter()
                     .find(|(key, _)| key == &cache_key)
                     .map(|(_, v)| v);
+                args.input = self.window_input(
+                    wf,
+                    &partition_rows,
+                    base_columns,
+                    &col_index_map,
+                    &group_slots,
+                    ctx,
+                    None,
+                )?;
 
                 if *is_agg {
                     let agg_results = self.compute_aggregate_window_function(
@@ -1592,6 +1730,7 @@ impl Executor {
                         precomputed_order_by,
                         &mut lazy_partition_cache,
                         args,
+                        None,
                     )?;
                     // agg_results is already indexed by local row index
                     window_value_map.insert(wf.column_name.to_lowercase(), agg_results);
@@ -1619,14 +1758,14 @@ impl Executor {
             }
 
             // Precompile expression evaluators once per partition (not per row)
-            enum CompiledItemLazy<'a> {
+            enum CompiledItemLazy<'a, 'p> {
                 BaseColumn(usize),
                 WindowFunction(&'a str),
-                Expression(ExpressionEval),
-                ExpressionWithWindow(ExpressionEval, Vec<&'a str>),
+                Expression(RowPrograms<'p>),
+                ExpressionWithWindow(RowPrograms<'p>, Vec<&'a str>),
             }
             let num_items = select_items.len();
-            let mut compiled_items: Vec<CompiledItemLazy<'_>> = Vec::with_capacity(num_items);
+            let mut compiled_items: Vec<CompiledItemLazy<'_, '_>> = Vec::with_capacity(num_items);
             for item in &select_items {
                 compiled_items.push(match &item.source {
                     SelectItemSource::BaseColumn(idx) => CompiledItemLazy::BaseColumn(*idx),
@@ -1634,7 +1773,7 @@ impl Executor {
                         CompiledItemLazy::WindowFunction(name.as_str())
                     }
                     SelectItemSource::Expression(expr) => CompiledItemLazy::Expression(
-                        ExpressionEval::compile(expr, base_columns)?.with_context(ctx),
+                        RowPrograms::compile([expr], base_columns, None, ctx, None)?,
                     ),
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
@@ -1645,7 +1784,7 @@ impl Executor {
                             ext_columns.push(wf_name.clone());
                         }
                         let eval =
-                            ExpressionEval::compile(&transformed, &ext_columns)?.with_context(ctx);
+                            RowPrograms::compile([&transformed], &ext_columns, None, ctx, None)?;
                         let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
                         CompiledItemLazy::ExpressionWithWindow(eval, name_refs)
                     }
@@ -2377,6 +2516,7 @@ impl Executor {
         pre_grouped: Option<&WindowPreGroupedState>,
         order_by_values: Option<&ColumnarOrderByValues>,
         partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<SharedSortedPartitions> {
         let shareable = self.over_clause_is_shareable(wf_info);
         let key = Self::over_clause_cache_key(wf_info);
@@ -2395,9 +2535,17 @@ impl Executor {
         }) {
             pg.partition_map.values().cloned().collect()
         } else {
-            Self::build_partition_map(wf_info, rows, columns, col_index_map, group_slots, ctx)?
-                .into_values()
-                .collect()
+            Self::build_partition_map(
+                wf_info,
+                rows,
+                columns,
+                col_index_map,
+                group_slots,
+                ctx,
+                blocks,
+            )?
+            .into_values()
+            .collect()
         };
 
         if let Some(order_by) = order_by_values.filter(|v| !v.is_empty()) {
@@ -2486,7 +2634,7 @@ impl Executor {
 
     /// Build partition map from PARTITION BY expressions.
     /// Handles both simple column references (fast path) and complex expressions like
-    /// function calls (e.g., TIME_TRUNC('30m', timestamp)) via MultiExpressionEval.
+    /// function calls (e.g., TIME_TRUNC('30m', timestamp)) evaluated per row.
     fn build_partition_map(
         wf_info: &WindowFunctionInfo,
         rows: &[(i64, Row)],
@@ -2494,6 +2642,7 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<FxHashMap<PartitionKey, Vec<usize>>> {
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
@@ -2506,21 +2655,23 @@ impl Executor {
         });
 
         if has_complex_expr && !wf_info.partition_by_exprs.is_empty() {
-            // Complex path: use MultiExpressionEval to evaluate expressions per row
-            let eval = MultiExpressionEval::compile_with_aliases(
+            // Complex path: evaluate the expressions per row
+            let mut eval = RowPrograms::compile(
                 &wf_info.partition_by_exprs,
                 columns,
-                group_slots,
+                Some(group_slots),
+                ctx,
+                blocks,
             )
             .map_err(|e| {
                 Error::internal(format!("Failed to compile PARTITION BY expression: {}", e))
             })?;
-            let mut eval = eval.with_context(ctx);
+            let mut values = Vec::with_capacity(wf_info.partition_by_exprs.len());
             for (i, (_, row)) in rows.iter().enumerate() {
-                let values = eval.eval_all(row).map_err(|e| {
+                eval.eval_into(row, &mut values).map_err(|e| {
                     Error::internal(format!("Failed to evaluate PARTITION BY expression: {}", e))
                 })?;
-                let key: PartitionKey = SmallVec::from_vec(values);
+                let key: PartitionKey = values.drain(..).collect();
                 partitions.entry(key).or_default().push(i);
             }
         } else {
@@ -2574,6 +2725,7 @@ impl Executor {
         pre_grouped: Option<&WindowPreGroupedState>,
         order_by_cache: &[(OrderByKey, ColumnarOrderByValues)],
         partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
         // Check if this is an aggregate function used as window function
         let is_aggregate = self.function_registry.is_aggregate(&wf_info.name);
@@ -2597,6 +2749,7 @@ impl Executor {
                 cached_order_by,
                 partition_cache,
                 &CallArgs::of(wf_info, &self.function_registry),
+                blocks,
             );
         }
 
@@ -2631,13 +2784,23 @@ impl Executor {
             pre_grouped,
             precomputed_order_by,
             partition_cache,
+            blocks,
         )?;
 
         // No row, no frame offset evaluates
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let args = CallArgs::of(wf_info, &self.function_registry);
+        let mut args = CallArgs::of(wf_info, &self.function_registry);
+        args.input = self.window_input(
+            wf_info,
+            rows,
+            columns,
+            col_index_map,
+            group_slots,
+            ctx,
+            blocks,
+        )?;
         let frame = Frame::read(wf_info, &args, ctx)?;
 
         // If there's no partitioning, all rows form one partition
@@ -2832,10 +2995,12 @@ impl Executor {
         mut emit: impl FnMut(usize, Value),
     ) -> Result<()> {
         // OPTIMIZATION: Pre-compute column index for function argument
-        let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.resolve_column_index(&wf_info.arguments[0], col_index_map, group_slots)
-        } else {
-            None
+        let input = ValueInput {
+            column: wf_info
+                .arguments
+                .first()
+                .and_then(|arg| self.resolve_column_index(arg, col_index_map, group_slots)),
+            values: &args.input,
         };
 
         // MEMORY OPTIMIZATION: Compute rank info directly from ColumnarOrderByValues
@@ -2884,7 +3049,7 @@ impl Executor {
                     )?,
                     all_rows,
                     row_indices,
-                    arg_col_idx,
+                    input,
                     i,
                 )?,
                 "NTILE" => Self::compute_ntile(
@@ -2906,14 +3071,14 @@ impl Executor {
                         "FIRST_VALUE" => self.compute_first_value_indexed(
                             all_rows,
                             row_indices,
-                            arg_col_idx,
+                            input,
                             frame_start,
                             frame_end,
                         )?,
                         "LAST_VALUE" => self.compute_last_value_indexed(
                             all_rows,
                             row_indices,
-                            arg_col_idx,
+                            input,
                             frame_start,
                             frame_end,
                         )?,
@@ -2924,7 +3089,7 @@ impl Executor {
                                     n,
                                     all_rows,
                                     row_indices,
-                                    arg_col_idx,
+                                    input,
                                     frame_start,
                                     frame_end,
                                 )
@@ -3132,7 +3297,7 @@ impl Executor {
         default_value: Value,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
-        arg_col_idx: Option<usize>,
+        input: ValueInput<'_>,
         current_pos: usize,
     ) -> Result<Value> {
         // Calculate target position in sorted order
@@ -3144,19 +3309,9 @@ impl Executor {
         };
 
         match target_pos {
-            Some(pos) if pos < sorted_indices.len() => {
-                // Access value directly from all_rows via index
-                let target_row_idx = sorted_indices[pos];
-                if let Some(col_idx) = arg_col_idx {
-                    Ok(all_rows[target_row_idx]
-                        .1
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown))
-                } else {
-                    Ok(default_value)
-                }
-            }
+            Some(pos) if pos < sorted_indices.len() => Ok(input
+                .at(all_rows, sorted_indices[pos])
+                .unwrap_or(default_value)),
             _ => Ok(default_value),
         }
     }
@@ -3166,23 +3321,16 @@ impl Executor {
         &self,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
-        arg_col_idx: Option<usize>,
+        input: ValueInput<'_>,
         frame_start: usize,
         frame_end: usize,
     ) -> Result<Value> {
         if frame_start >= frame_end || frame_start >= sorted_indices.len() {
             return Ok(Value::null_unknown());
         }
-        let row_idx = sorted_indices[frame_start];
-        if let Some(col_idx) = arg_col_idx {
-            Ok(all_rows[row_idx]
-                .1
-                .get(col_idx)
-                .cloned()
-                .unwrap_or_else(Value::null_unknown))
-        } else {
-            Ok(Value::null_unknown())
-        }
+        Ok(input
+            .at(all_rows, sorted_indices[frame_start])
+            .unwrap_or_else(Value::null_unknown))
     }
 
     /// Compute LAST_VALUE using index-based access (no cloning)
@@ -3190,23 +3338,16 @@ impl Executor {
         &self,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
-        arg_col_idx: Option<usize>,
+        input: ValueInput<'_>,
         frame_start: usize,
         frame_end: usize,
     ) -> Result<Value> {
         if frame_start >= frame_end || frame_end > sorted_indices.len() {
             return Ok(Value::null_unknown());
         }
-        let row_idx = sorted_indices[frame_end - 1];
-        if let Some(col_idx) = arg_col_idx {
-            Ok(all_rows[row_idx]
-                .1
-                .get(col_idx)
-                .cloned()
-                .unwrap_or_else(Value::null_unknown))
-        } else {
-            Ok(Value::null_unknown())
-        }
+        Ok(input
+            .at(all_rows, sorted_indices[frame_end - 1])
+            .unwrap_or_else(Value::null_unknown))
     }
 
     /// Compute NTH_VALUE using index-based access (no cloning); `n` counts
@@ -3215,24 +3356,16 @@ impl Executor {
         n: usize,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
-        arg_col_idx: Option<usize>,
+        input: ValueInput<'_>,
         frame_start: usize,
         frame_end: usize,
     ) -> Value {
         if n > frame_end - frame_start {
             return Value::null_unknown();
         }
-
-        let row_idx = sorted_indices[frame_start + n - 1];
-        if let Some(col_idx) = arg_col_idx {
-            all_rows[row_idx]
-                .1
-                .get(col_idx)
-                .cloned()
-                .unwrap_or_else(Value::null_unknown)
-        } else {
-            Value::null_unknown()
-        }
+        input
+            .at(all_rows, sorted_indices[frame_start + n - 1])
+            .unwrap_or_else(Value::null_unknown)
     }
 
     /// Compute NTILE function; the bucket count is pre-resolved by the caller
@@ -3292,6 +3425,36 @@ impl Executor {
         }
     }
 
+    /// A value function's first argument for each of `rows` when it is not a
+    /// column, read once ahead of the partitions; empty otherwise
+    #[allow(clippy::too_many_arguments)]
+    fn window_input(
+        &self,
+        wf_info: &WindowFunctionInfo,
+        rows: &[(i64, Row)],
+        columns: &[String],
+        col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<Vec<Value>> {
+        let reads_values = matches!(
+            wf_info.name.as_str(),
+            "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+        );
+        let Some(arg) = wf_info.arguments.first().filter(|arg| {
+            reads_values
+                && !matches!(arg, Expression::Star(_))
+                && self
+                    .resolve_column_index(arg, col_index_map, group_slots)
+                    .is_none()
+        }) else {
+            return Ok(Vec::new());
+        };
+        let mut eval = RowPrograms::compile([arg], columns, None, ctx, blocks)?;
+        rows.iter().map(|(_, row)| eval.eval(row)).collect()
+    }
+
     /// Resolve column index from expression, trying both qualified and unqualified names
     fn resolve_column_index(
         &self,
@@ -3325,6 +3488,7 @@ impl Executor {
 
     /// Precompute ORDER BY values for all rows using columnar layout
     /// Returns a ColumnarOrderByValues structure for cache-efficient sorting
+    #[allow(clippy::too_many_arguments)]
     fn precompute_order_by_values(
         &self,
         order_by: &[OrderByExpression],
@@ -3333,6 +3497,7 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<ColumnarOrderByValues> {
         let num_rows = rows.len();
         let num_cols = order_by.len();
@@ -3373,10 +3538,11 @@ impl Executor {
 
             // A group item or aggregate in ORDER BY reads its slot
             let mut eval =
-                MultiExpressionEval::compile_with_aliases(&order_exprs, columns, group_slots)?
-                    .with_context(ctx);
+                RowPrograms::compile(&order_exprs, columns, Some(group_slots), ctx, blocks)?;
+            let mut values = Vec::with_capacity(num_cols);
             for (_, row) in rows {
-                for (col_idx, value) in eval.eval_all(row)?.into_iter().enumerate() {
+                eval.eval_into(row, &mut values)?;
+                for (col_idx, value) in values.drain(..).enumerate() {
                     if col_idx < result_columns.len() {
                         result_columns[col_idx].push(value);
                     }
@@ -3828,8 +3994,9 @@ impl Executor {
         ctx: &ExecutionContext,
         arg_col_idx: Option<usize>,
         expression_values: &[Value],
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
-        let mut eval = ExpressionEval::compile(filter, columns)?.with_context(ctx);
+        let mut eval = RowPrograms::compile([filter], columns, None, ctx, blocks)?;
         let mut values = Vec::with_capacity(rows.len());
         for (idx, (_, row)) in rows.iter().enumerate() {
             values.push(if matches!(eval.eval(row)?, Value::Boolean(true)) {
@@ -3867,6 +4034,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Vec<Value>>> {
         if wf_info.call_order_by.is_empty()
             || !self
@@ -3876,16 +4044,17 @@ impl Executor {
         {
             return Ok(Vec::new());
         }
-        let mut evals = Vec::with_capacity(wf_info.call_order_by.len());
-        for order in wf_info.call_order_by.iter() {
-            evals.push(ExpressionEval::compile(&order.expression, columns)?.with_context(ctx));
-        }
+        let mut evals = RowPrograms::compile(
+            wf_info.call_order_by.iter().map(|order| &order.expression),
+            columns,
+            None,
+            ctx,
+            blocks,
+        )?;
         let mut sort_keys = Vec::with_capacity(rows.len());
         for (_, row) in rows {
-            let mut key = Vec::with_capacity(evals.len());
-            for eval in evals.iter_mut() {
-                key.push(eval.eval(row)?);
-            }
+            let mut key = Vec::with_capacity(wf_info.call_order_by.len());
+            evals.eval_into(row, &mut key)?;
             sort_keys.push(key);
         }
         Ok(sort_keys)
@@ -3906,6 +4075,7 @@ impl Executor {
         cached_order_by: Option<&ColumnarOrderByValues>,
         partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
         args: &CallArgs,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -3928,7 +4098,7 @@ impl Executor {
         // Pre-compute expression values for all rows if needed
         let mut expression_values: Vec<Value> = if has_expression_arg {
             let mut eval =
-                ExpressionEval::compile(&wf_info.arguments[0], columns)?.with_context(ctx);
+                RowPrograms::compile(&wf_info.arguments[..1], columns, None, ctx, blocks)?;
             rows.iter()
                 .map(|(_, row)| eval.eval(row))
                 .collect::<Result<_>>()?
@@ -3946,12 +4116,13 @@ impl Executor {
                 ctx,
                 arg_col_idx,
                 &expression_values,
+                blocks,
             )?;
             arg_col_idx = None;
         }
 
         // The keys the call's own ORDER BY gives each row, empty without one
-        let sort_keys = self.window_call_sort_keys(wf_info, rows, columns, ctx)?;
+        let sort_keys = self.window_call_sort_keys(wf_info, rows, columns, ctx, blocks)?;
         let keys: Option<&[Vec<Value>]> = (!sort_keys.is_empty()).then_some(&sort_keys);
 
         // Use precomputed ORDER BY values from cache if available
@@ -3974,9 +4145,17 @@ impl Executor {
         // the shared cache
         let owned_partitions: Option<Vec<Vec<usize>>> = if skip_sorting {
             Some(
-                Self::build_partition_map(wf_info, rows, columns, col_index_map, group_slots, ctx)?
-                    .into_values()
-                    .collect(),
+                Self::build_partition_map(
+                    wf_info,
+                    rows,
+                    columns,
+                    col_index_map,
+                    group_slots,
+                    ctx,
+                    blocks,
+                )?
+                .into_values()
+                .collect(),
             )
         } else {
             None
@@ -3993,6 +4172,7 @@ impl Executor {
                 None,
                 cached_order_by,
                 partition_cache,
+                blocks,
             )?),
         };
         // Borrow the shared entry instead of cloning the index vectors

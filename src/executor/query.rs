@@ -1204,9 +1204,7 @@ impl Executor {
         let ctes_ctx;
         let ctx = if self.has_cte(stmt) {
             let grouped = || {
-                let classification = get_classification(stmt);
-                classification.has_aggregation
-                    && classification.grouped_has_subqueries
+                Self::grouped_family_reach(stmt, &get_classification(stmt))
                     && self.grouped_family(stmt, Some(ctx)).is_ok()
             };
             if !self.holds_prepared_select(compiled, ctx)
@@ -1259,10 +1257,9 @@ impl Executor {
             && stmt.table_expr.is_some()
             && (self.holds_prepared_select(compiled, ctx)
                 || self.prepared_family(stmt, Some(ctx)).is_ok());
-        // A grouped statement whose SELECT list, HAVING or GROUP BY holds
-        // subqueries runs them as its blocks
-        let grouped_family = classification.has_aggregation
-            && classification.grouped_has_subqueries
+        // A grouped or windowed statement whose clauses hold subqueries runs
+        // them as its blocks
+        let grouped_family = Self::grouped_family_reach(stmt, &classification)
             && !in_family
             && (self.holds_prepared_grouped(compiled, ctx)
                 || self.grouped_family(stmt, Some(ctx)).is_ok());
@@ -4523,7 +4520,11 @@ impl Executor {
                         let has_order_by = !stmt.order_by.is_empty();
                         // DISTINCT runs after the fetch, so it keeps the LIMIT out too
                         let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
-                        if !has_order_by && !distinct && !Self::windows_hold_subquery(stmt) {
+                        if !has_order_by
+                            && !distinct
+                            && blocks.is_none()
+                            && !Self::windows_hold_subquery(stmt)
+                        {
                             if let Some(limit_val) = Self::fetch_limit(stmt, ctx) {
                                 // Use lazy partition fetching - returns early!
                                 let result = self
@@ -4706,6 +4707,7 @@ impl Executor {
                     &rows,
                     &all_columns,
                     pregrouped,
+                    blocks,
                 )?
             } else if window_presorted_state.is_some() {
                 // ORDER BY optimization: rows are already sorted
@@ -4715,10 +4717,11 @@ impl Executor {
                     &rows,
                     &all_columns,
                     window_presorted_state,
+                    blocks,
                 )?
             } else {
                 // Default path: no optimization
-                self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?
+                self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns, blocks)?
             };
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
@@ -5202,7 +5205,7 @@ impl Executor {
             processed_on.as_ref().or(join_source.condition.as_deref());
         let grouped_plan = plan
             .as_ref()
-            .filter(|_| classification.has_aggregation && classification.grouped_has_subqueries)
+            .filter(|_| Self::grouped_family_reach(stmt, classification))
             .cloned();
         let prepared = plan.filter(|_| {
             processed_on.is_none()
@@ -8611,7 +8614,7 @@ impl Executor {
     /// the one dispatch every source hands its rows to: GROUP BY and then
     /// the windows over the groups, the windows alone, or the aggregation
     /// alone, whose layout `aggregate_layout` builds from its columns, its
-    /// SELECT list and HAVING subqueries answered by the statement's `blocks`
+    /// subqueries answered by the statement's `blocks`
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn group_and_window_rows(
         &self,
@@ -8627,8 +8630,12 @@ impl Executor {
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
-            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns),
-            (false, true) => self.execute_select_with_window_functions(stmt, ctx, &rows, columns),
+            (true, true) => {
+                self.execute_aggregation_then_windows(stmt, ctx, &rows, columns, blocks)
+            }
+            (false, true) => {
+                self.execute_select_with_window_functions(stmt, ctx, &rows, columns, blocks)
+            }
             _ => {
                 let result =
                     self.execute_select_with_aggregation(stmt, ctx, rows, columns, blocks)?;
@@ -8672,11 +8679,10 @@ impl Executor {
         columns: &[String],
         left_width: usize,
     ) -> SelectResult {
-        let in_family =
-            classification.has_aggregation && classification.grouped_has_subqueries && {
-                let decide = || self.grouped_family(stmt, Some(ctx)).is_ok();
-                plan.map_or_else(decide, |plan| plan.grouped(decide))
-            };
+        let in_family = Self::grouped_family_reach(stmt, classification) && {
+            let decide = || self.grouped_family(stmt, Some(ctx)).is_ok();
+            plan.map_or_else(decide, |plan| plan.grouped(decide))
+        };
         if in_family {
             // The views' rows preparing read, which this run opens
             let mut first = super::prepared_select::FirstReads::new();

@@ -49,8 +49,8 @@ pub(crate) use compiler::literal_value;
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
 pub use evaluator_bridge::{
     clear_program_cache, compile_expression, compile_expression_with_context,
-    compute_expression_hash, CompiledEvaluator, ExpressionEval, JoinFilter, MultiExpressionEval,
-    RowFilter, SharedProgram,
+    compute_expression_hash, CompiledEvaluator, ExpressionEval, JoinFilter, RowFilter,
+    SharedProgram,
 };
 pub(crate) use once::{
     compile_once, evaluate_once, execute_context, execute_once, try_eval_constant_expr_with_context,
