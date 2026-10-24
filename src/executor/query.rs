@@ -8911,13 +8911,17 @@ impl Executor {
         layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
     ) -> SelectResult {
         let slots_ctx;
-        let (ctx, blocks): (_, Option<&dyn SubqueryExecutor>) = match held.runs_alone {
-            Some(_) => {
+        let ctx = match held.runs_alone.is_some() || held.reads_slots {
+            true => {
                 slots_ctx = ctx
                     .with_slot_params(run.params().unwrap_or_default().iter().cloned().collect());
-                (&slots_ctx, None)
+                &slots_ctx
             }
-            None => (ctx, Some(run)),
+            false => ctx,
+        };
+        let blocks: Option<&dyn SubqueryExecutor> = match held.runs_alone {
+            Some(_) => None,
+            None => Some(run),
         };
         let (result, layout) = self.group_and_window_rows(
             &held.stmt,
@@ -8973,6 +8977,16 @@ impl Executor {
         }
         let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
             return Err(Error::internal("a grouped statement without its table"));
+        };
+        // An argument read once for its call reads its run slot as a parameter
+        let slots_ctx;
+        let ctx = match held.reads_slots {
+            true => {
+                slots_ctx = ctx
+                    .with_slot_params(run.params().unwrap_or_default().iter().cloned().collect());
+                &slots_ctx
+            }
+            false => ctx,
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::grouped_table_opening();

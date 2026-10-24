@@ -1182,6 +1182,21 @@ pub struct WindowExpression {
     pub frame: Option<WindowFrame>,
 }
 
+impl WindowExpression {
+    /// The offsets of the frame's bounds
+    pub fn frame_offsets(&self) -> impl Iterator<Item = &Expression> {
+        self.frame
+            .iter()
+            .flat_map(|frame| std::iter::once(&frame.start).chain(&frame.end))
+            .filter_map(|bound| match bound {
+                WindowFrameBound::Preceding(offset) | WindowFrameBound::Following(offset) => {
+                    Some(offset.as_ref())
+                }
+                _ => None,
+            })
+    }
+}
+
 impl fmt::Display for WindowExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut result = self.function.to_string();
