@@ -3244,9 +3244,10 @@ impl Builder<'_> {
         let (mut order_keys, mut bound_only) = (Vec::new(), Vec::new());
         for ob in &sq.order_by {
             // A bare alias, or the item as written, sorts by the item's value
+            // Two spellings of one column stay two keys, read each its own way
             let is_item = item.is_some_and(|item| {
                 order_by_names_an_alias(&ob.expression, sq)
-                    || ExprKey::of(&ob.expression) == ExprKey::of(item)
+                    || ExprKey::exact(&ob.expression) == ExprKey::exact(item)
             });
             let key = match is_item {
                 true => None,

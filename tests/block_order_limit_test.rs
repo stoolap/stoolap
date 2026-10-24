@@ -339,6 +339,20 @@ fn an_order_by_name_binds_as_the_general_path_binds_it() {
     let member = "SELECT id FROM t \
                   WHERE -5 IN (SELECT -u.id AS id FROM u WHERE u.k = t.id ORDER BY id LIMIT 1)";
     assert_eq!(column(&db, member, 0, ()), [Some(2)]);
+    db.execute(
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER, \"w.x\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO w VALUES (1, 10, 20), (2, 20, 10)", ())
+        .unwrap();
+    // A column named w.x is not the item w.x, though the two read alike
+    for (key, want) in [("\"w.x\", x", 20), ("w.x", 10)] {
+        let sql =
+            format!("SELECT (SELECT w.x FROM w ORDER BY {key} LIMIT 1) FROM t WHERE t.id = 1");
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        assert_eq!(column(&db, &sql, 0, ()), [Some(want)], "{sql}");
+    }
 }
 
 #[test]
