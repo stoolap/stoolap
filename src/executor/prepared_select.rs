@@ -83,6 +83,8 @@ type PreparedOutput = (
     bool,
     usize,
     Option<CompactArc<OutputLayout>>,
+    // Whether its rows are already distinct
+    bool,
 );
 
 /// The classifier's walk over one statement
@@ -6734,16 +6736,25 @@ impl Executor {
                     continue;
                 }
             }
-            let out = projection.project_into::<false>(&mut vm, row, runner, &[], values)?;
-            if distinct.is_new(&out) {
-                kept.push((kept.len() as i64, out));
-                if wanted.is_some_and(|wanted| kept.len() >= wanted) {
-                    break;
+            // A row that is its own output is copied only when new
+            let out = if projection.whole_row {
+                if !distinct.is_new(row) {
+                    continue;
+                }
+                row.clone()
+            } else {
+                let out = projection.project_into::<false>(&mut vm, row, runner, &[], values)?;
+                if !distinct.is_new(&out) {
+                    values = out.into_values();
+                    values.clear();
+                    continue;
                 }
                 values = Vec::new();
-            } else {
-                values = out.into_values();
-                values.clear();
+                out
+            };
+            kept.push((kept.len() as i64, out));
+            if wanted.is_some_and(|wanted| kept.len() >= wanted) {
+                break;
             }
         }
         if let Some(err) = scan.err() {
@@ -6875,7 +6886,6 @@ impl Executor {
         // value as the scan passes it; one that does is told its rows first
         let distinct = (stmt.distinct
             && stmt.set_operations.is_empty()
-            && !prepared.projection.whole_row
             && !stmt
                 .columns
                 .iter()
@@ -6934,6 +6944,7 @@ impl Executor {
                 false,
                 prepared.visible,
                 prepared.layout.clone(),
+                true,
             ))
         };
         let mut rows = match read? {
@@ -6948,6 +6959,7 @@ impl Executor {
                     true,
                     prepared.visible,
                     None,
+                    false,
                 ));
             }
             Passing::Answers(answers) => answers,
@@ -6999,6 +7011,7 @@ impl Executor {
             limit_applied,
             prepared.visible,
             prepared.layout.clone(),
+            false,
         ))
     }
 }
