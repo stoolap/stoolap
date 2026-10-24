@@ -1371,6 +1371,17 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             for c in wf.function.function.bytes() {
                 c.to_ascii_uppercase().hash(hasher);
             }
+            let read = wf
+                .function
+                .arguments
+                .iter()
+                .chain(&wf.partition_by)
+                .chain(wf.order_by.iter().map(|o| &o.expression));
+            wf.function.arguments.len().hash(hasher);
+            wf.partition_by.len().hash(hasher);
+            for expr in read {
+                hash_expression_structure(expr, hasher);
+            }
         }
         Expression::Aliased(aliased) => {
             hash_expression_structure(&aliased.expression, hasher);

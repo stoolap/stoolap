@@ -685,10 +685,7 @@ impl Executor {
                     .order_by
                     .iter()
                     .any(|ob| Self::has_subqueries(&ob.expression)));
-        let grouped_output = {
-            let classification = get_classification(select);
-            classification.has_aggregation && classification.grouped_has_subqueries
-        };
+        let grouped_output = Self::grouped_family_reach(select, &get_classification(select));
         if on_subqueries
             || output_subqueries
             || grouped_output
