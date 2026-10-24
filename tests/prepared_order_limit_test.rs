@@ -78,6 +78,14 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT id, a FROM t WHERE c > {sq} ORDER BY a, id LIMIT $1",
         "SELECT id, a FROM t WHERE c > {sq} ORDER BY a, id LIMIT $1 OFFSET 2",
         "SELECT id, a FROM t WHERE c > {sq} ORDER BY id DESC LIMIT 4",
+        "SELECT id, a FROM t WHERE c > {sq} ORDER BY a + 0, id LIMIT 8",
+        "SELECT id, a FROM t WHERE c > {sq} ORDER BY a * -1 NULLS FIRST, id LIMIT 8 OFFSET 3",
+        "SELECT id, a + 1 AS a1 FROM t WHERE c > {sq} ORDER BY a1 DESC, id LIMIT 8",
+        "SELECT id, a + 1 AS a1 FROM t WHERE c > {sq} ORDER BY id, a1 LIMIT 8",
+        "SELECT id, b FROM t WHERE c > {sq} ORDER BY LENGTH(b) DESC, b, id LIMIT 8",
+        "SELECT id, UPPER(b) AS bx FROM t WHERE c > {sq} ORDER BY bx, c DESC LIMIT 8",
+        "SELECT id, a + 1 AS a1 FROM t WHERE c > {sq} ORDER BY a1, id OFFSET 390",
+        "SELECT id FROM t WHERE c > {sq} ORDER BY c * 2, id LIMIT $1",
     ] {
         let prepared = shape.replace("{sq}", PREPARED);
         let general = shape.replace("{sq}", GENERAL);
