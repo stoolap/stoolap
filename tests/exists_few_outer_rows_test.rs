@@ -137,6 +137,38 @@ fn exists_over_few_outer_rows_does_not_read_the_inner_table_whole() {
     }
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_output_block_counts_the_rows_its_where_passes_not_the_table() {
+    use stoolap::test_failpoints::inner_table_reads;
+    let db = Database::open("memory://exists_few_outer_rows_output").unwrap();
+    create(&db);
+    let pairs = |sql: &str| -> Vec<(i64, i64)> {
+        db.query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|r| {
+                let r = r.unwrap();
+                (r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap())
+            })
+            .collect()
+    };
+    // `many` holds 1000 rows, of which the WHERE passes five
+    for block in [
+        "(SELECT COUNT(*) FROM {i} WHERE {i}.c = many.k)",
+        "CASE WHEN EXISTS (SELECT 1 FROM {i} WHERE {i}.c = many.k) THEN 1 ELSE 0 END",
+    ] {
+        let sql = format!("SELECT many.id, {block} FROM many WHERE many.id <= 5 ORDER BY many.id");
+        let before = inner_table_reads();
+        let got = pairs(&sql.replace("{i}", "t"));
+        assert_eq!(
+            inner_table_reads(),
+            before,
+            "{sql}: five probes, no read of t whole"
+        );
+        assert_eq!(got, pairs(&sql.replace("{i}", "w")), "{sql}");
+    }
+}
+
 #[test]
 fn not_exists_sees_its_own_transaction() {
     for index in [false, true] {

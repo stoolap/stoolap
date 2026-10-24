@@ -6860,6 +6860,8 @@ impl Executor {
         .flatten();
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_projection_ran();
+        // The output's blocks are asked of these rows, not of the table's
+        runner.ask_rows(Some(rows.len()));
         let rows = match order {
             Some(order) => {
                 limit_applied = true;
