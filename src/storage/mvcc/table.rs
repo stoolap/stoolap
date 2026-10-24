@@ -4483,6 +4483,8 @@ impl Table for MVCCTable {
                 break;
             }
         }
+        // The ids bind this handle's column positions only in its layout
+        self.check_read()?;
         Ok(count.min(limit))
     }
 
