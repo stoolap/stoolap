@@ -20,8 +20,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
     after_prepared_plan_taken, after_select_table_opened, before_prepared_scalar,
-    general_path_hits, prepared_projection_runs, prepared_scalar_runs, prepared_selects_built,
-    random_draws, tvf_rows, GeneralPath,
+    general_path_hits, prepared_ordered_reads, prepared_projection_runs, prepared_scalar_runs,
+    prepared_selects_built, random_draws, tvf_rows, GeneralPath,
 };
 use stoolap::{Database, Params};
 
@@ -2820,4 +2820,110 @@ fn test_a_select_list_block_over_values_is_asked_of_the_rows_limit_and_offset_ke
         assert_eq!(found, want, "{sql}");
         assert_eq!(runs, want.len(), "{sql}: one run per row returned");
     }
+}
+
+/// t: id 1..4, a = id * 10 indexed, x overflowing ABS on id 2; u holds two
+/// rows for key 2 and one for each other key
+fn ordered_setup(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER)",
+        "CREATE INDEX t_a ON t(a)",
+        "INSERT INTO t VALUES (1, 10, 1), (2, 20, -9223372036854775808), (3, 30, 3), (4, 40, 4)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO u VALUES (1, 1, 100), (2, 2, 200), (3, 2, 300), (4, 3, 400), (5, 4, 500)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+#[test]
+fn test_an_ordered_limit_on_a_column_reads_its_rows_in_order() {
+    let _guard = serial();
+    let db = ordered_setup("prepared_ordered_read");
+    // None where the table decides whether its top-k scan can read them
+    for (sql, want, in_order) in [
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t ORDER BY t.id LIMIT 1",
+            vec![1],
+            Some(true),
+        ),
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t ORDER BY a DESC LIMIT 2",
+            vec![4, 3],
+            Some(true),
+        ),
+        (
+            "SELECT t.id, (SELECT u.v FROM u WHERE u.k = t.id) FROM t \
+             WHERE a > (SELECT MIN(v) FROM u) - 80 ORDER BY t.id LIMIT 1 OFFSET 1",
+            vec![4],
+            None,
+        ),
+        (
+            "SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.id) \
+             ORDER BY t.id LIMIT 1",
+            vec![1],
+            Some(false),
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let reads = prepared_ordered_reads();
+        let (found, _) = ids(&db, sql, ());
+        assert_eq!(found, want, "{sql}");
+        if let Some(in_order) = in_order {
+            assert_eq!(
+                prepared_ordered_reads() - reads,
+                usize::from(in_order),
+                "{sql}: read in order through the index"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_an_ordered_limit_computes_select_items_for_the_rows_it_keeps() {
+    let _guard = serial();
+    let db = ordered_setup("prepared_ordered_items");
+    for (sql, want) in [
+        // ABS overflows on row 2, which the LIMIT drops
+        (
+            "SELECT t.id, ABS(t.x), (SELECT u.v FROM u WHERE u.k = t.id) FROM t \
+             ORDER BY t.id + 0 LIMIT 1",
+            vec![1],
+        ),
+        // The key reads z, not the subquery, so row 2's block runs for no row
+        (
+            "SELECT id AS z, (SELECT u.v FROM u WHERE u.k = t.id) FROM t ORDER BY z + 0 LIMIT 1",
+            vec![1],
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let (found, runs) = ids(&db, sql, ());
+        assert_eq!(found, want, "{sql}");
+        assert_eq!(runs, 1, "{sql}: the block runs for the row returned");
+    }
+}
+
+#[test]
+fn test_an_alias_inside_an_aliased_order_by_subquery_item_is_not_prepared() {
+    let _guard = serial();
+    let db = setup("prepared_order_by_inner_alias");
+    const SQL: &str = "SELECT id AS z FROM t ORDER BY (SELECT z + t.id AS k) DESC";
+    assert_eq!(
+        prepared_line(&db, SQL),
+        "Prepared: no (an ORDER BY subquery that names a SELECT alias)"
+    );
+    assert_eq!(ids(&db, SQL, ()).0, vec![6, 5, 4, 3, 2, 1]);
+}
+
+#[test]
+fn test_an_uncorrelated_order_by_key_repeating_a_select_item_runs_once() {
+    let _guard = serial();
+    let db = setup("prepared_order_by_repeated_slot");
+    const SQL: &str = "SELECT id, (SELECT RANDOM()) FROM t ORDER BY (SELECT RANDOM()), id";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
+    let before = random_draws();
+    assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(random_draws() - before, 1, "one draw, which the key reads");
 }

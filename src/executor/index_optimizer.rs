@@ -190,6 +190,26 @@ impl Executor {
         Ok(None)
     }
 
+    /// The one table column `stmt`'s ORDER BY sorts by, as written, with its
+    /// direction and NULLS clause: what an index-ordered or a top-k read
+    /// answers; None for any other ORDER BY
+    pub(crate) fn ordered_read_column(
+        stmt: &SelectStatement,
+    ) -> Option<(&str, bool, Option<bool>)> {
+        let [order_by] = stmt.order_by.as_slice() else {
+            return None;
+        };
+        let column_name = match &order_by.expression {
+            Expression::Identifier(id) => id.value.as_str(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.as_str(),
+            _ => return None,
+        };
+        if order_by_names_an_alias(&order_by.expression, stmt) {
+            return None;
+        }
+        Some((column_name, order_by.ascending, order_by.nulls_first))
+    }
+
     /// Try to optimize ORDER BY + LIMIT using index-ordered scan
     ///
     /// For queries like `SELECT * FROM table ORDER BY col LIMIT 10`,
@@ -203,19 +223,9 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        // Get the ORDER BY column name
-        let order_by = &stmt.order_by[0];
-        let column_name = match &order_by.expression {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
-            _ => return Ok(None), // Can't optimize complex ORDER BY expressions
-        };
-        if order_by_names_an_alias(&order_by.expression, stmt) {
+        let Some((column_name, ascending, nulls_first)) = Self::ordered_read_column(stmt) else {
             return Ok(None);
-        }
-
-        // Determine sort order
-        let ascending = order_by.ascending;
+        };
 
         let RowCounts {
             limit: Some(limit),
@@ -225,11 +235,11 @@ impl Executor {
             return Ok(None);
         };
 
-        let nulls_first = crate::core::value::nulls_first(ascending, order_by.nulls_first);
+        let nulls_first = crate::core::value::nulls_first(ascending, nulls_first);
 
         // Try to use index-ordered scan
         if let Some(rows) = table.collect_rows_ordered_by_index(
-            &column_name,
+            column_name,
             ascending,
             nulls_first,
             limit,
@@ -273,16 +283,9 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        let order_by = &stmt.order_by[0];
-        let column_name = match &order_by.expression {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
-            _ => return Ok(None),
-        };
-        if order_by_names_an_alias(&order_by.expression, stmt) {
+        let Some((column_name, ascending, _)) = Self::ordered_read_column(stmt) else {
             return Ok(None);
-        }
-        let ascending = order_by.ascending;
+        };
 
         let RowCounts {
             limit: Some(limit),
@@ -292,7 +295,7 @@ impl Executor {
             return Ok(None);
         };
 
-        let Some(rows) = table.scan_top_k(storage_expr, &column_name, ascending, limit, offset)?
+        let Some(rows) = table.scan_top_k(storage_expr, column_name, ascending, limit, offset)?
         else {
             return Ok(None);
         };

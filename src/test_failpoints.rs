@@ -1424,6 +1424,20 @@ pub(crate) fn prepared_select_built() {
     PREPARED_SELECTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: prepared statements that read their rows in ORDER BY
+/// order through an index or a top-k scan
+static PREPARED_ORDERED_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Prepared statements that read their rows in order, so far
+pub fn prepared_ordered_reads() -> usize {
+    PREPARED_ORDERED_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn prepared_ordered_read() {
+    PREPARED_ORDERED_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Scalar subqueries run by a prepared statement, so far
 pub fn prepared_scalar_runs() -> usize {
     PREPARED_SCALAR_RUNS.load(std::sync::atomic::Ordering::Relaxed)

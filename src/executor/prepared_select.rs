@@ -1508,6 +1508,7 @@ pub(super) fn names_any_within(expr: &Expression, matches: &impl Fn(&str) -> boo
     };
     match expr {
         Expression::Identifier(id) => matches(&id.value_lower),
+        Expression::Aliased(aliased) => names_any_within(&aliased.expression, matches),
         Expression::ScalarSubquery(sq) => block(&sq.subquery),
         Expression::Exists(exists) => block(&exists.subquery),
         Expression::AllAny(all_any) => {
@@ -2202,8 +2203,9 @@ enum Output {
     Block(SharedProgram),
     /// An ORDER BY or DISTINCT ON key, NULL where it fails, as on the general path
     Key(SharedProgram),
-    /// A key that reads SELECT aliases from the projected row, as its second row
-    AliasKey(SharedProgram),
+    /// A key that reads SELECT aliases from the projected row, as its second
+    /// row, and the positions of the items it reads
+    AliasKey(SharedProgram, SmallVec<[usize; 2]>),
     /// A key that is the SELECT item at this position, read from it
     Copy(usize),
 }
@@ -3472,12 +3474,14 @@ impl PreparedProjection {
             // A key holding subqueries that is a SELECT item reads its value,
             // so the subqueries run once per row
             let key = ExprKey::of(expr);
-            let item = rewritten.and_then(|_| {
-                select_exprs
-                    .iter()
-                    .zip(&item_rewritten)
-                    .position(|(e, r)| r.is_some() && ExprKey::of(unaliased(e)) == key)
-            });
+            let item = mentions_subquery(expr)
+                .then(|| {
+                    select_exprs
+                        .iter()
+                        .zip(&item_rewritten)
+                        .position(|(e, r)| r.is_some() && ExprKey::of(unaliased(e)) == key)
+                })
+                .flatten();
             outputs.push(match item {
                 Some(position) => Output::Copy(position),
                 None => Output::Key(compile(expr, rewritten)?),
@@ -3516,7 +3520,12 @@ impl PreparedProjection {
             if extra_names.contains(&name) {
                 continue;
             }
-            outputs.push(Output::AliasKey(compile_with(&alias_ctx, key)?));
+            let items = positions
+                .iter()
+                .filter(|(alias, _)| names_any(key, &|name| name == **alias))
+                .map(|(_, position)| usize::from(*position))
+                .collect();
+            outputs.push(Output::AliasKey(compile_with(&alias_ctx, key)?, items));
             extra_names.push(name);
             extra_sources.push(ColumnSource {
                 item: None,
@@ -3548,18 +3557,17 @@ impl PreparedProjection {
         Ok(projected)
     }
 
-    /// Whether a SELECT item holds subqueries the sort can leave for later
+    /// Whether a SELECT item is computed, which the sort can leave for later
     fn defers(&self) -> bool {
-        !self
-            .outputs
+        self.outputs
             .iter()
-            .any(|o| matches!(o, Output::AliasKey(_)))
-            && self.outputs.iter().any(|o| matches!(o, Output::Block(_)))
+            .any(|o| matches!(o, Output::Program(_) | Output::Block(_)))
     }
 
     /// The output of the rows `order` keeps past `offset`, at most `limit`:
-    /// the keys are computed for every row, a SELECT item holding subqueries
-    /// only for a row kept, so its blocks are asked of the rows returned
+    /// the keys and the SELECT items they read are computed for every row,
+    /// any other computed item only for a row kept, so it and its blocks
+    /// are asked of the rows returned
     fn project_first(
         &self,
         mut rows: RowVec,
@@ -3568,12 +3576,16 @@ impl PreparedProjection {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<RowVec> {
-        // The items the sort reads, directly or through a copying key
+        // The items the sort reads, directly, through a copying key or
+        // through a key reading their aliases
         let mut read: SmallVec<[usize; 4]> = order.iter().filter_map(|(c, ..)| *c).collect();
-        read.extend(self.outputs.iter().filter_map(|o| match o {
-            Output::Copy(position) => Some(*position),
-            _ => None,
-        }));
+        for output in &self.outputs {
+            match output {
+                Output::Copy(position) => read.push(*position),
+                Output::AliasKey(_, items) => read.extend_from_slice(items),
+                _ => {}
+            }
+        }
         let width = self.outputs.len();
         let mut vm = ExprVM::new();
         let mut sources = Vec::with_capacity(rows.len());
@@ -3604,7 +3616,7 @@ impl PreparedProjection {
             let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
                 .with_subquery_executor(run);
             for (position, output) in self.outputs.iter().enumerate() {
-                if let Output::Block(program) = output {
+                if let Output::Program(program) | Output::Block(program) = output {
                     if !read.contains(&position) {
                         out.set(position, vm.execute(program, &exec)?)?;
                     }
@@ -3619,9 +3631,9 @@ impl PreparedProjection {
         Ok(kept)
     }
 
-    /// One row's output. In the `FIRST` phase of a sort, a SELECT item
-    /// holding subqueries that `read` does not hold is left NULL, and one
-    /// more column follows for the row's place
+    /// One row's output. In the `FIRST` phase of a sort, a computed SELECT
+    /// item that `read` does not hold is left NULL, and one more column
+    /// follows for the row's place
     #[inline]
     fn project_row<const FIRST: bool>(
         &self,
@@ -3636,11 +3648,13 @@ impl PreparedProjection {
         for (position, output) in self.outputs.iter().enumerate() {
             let value = match output {
                 Output::Column(i) => row.get(*i).cloned().unwrap_or_else(Value::null_unknown),
-                Output::Block(_) if FIRST && !read.contains(&position) => Value::null_unknown(),
+                Output::Program(_) | Output::Block(_) if FIRST && !read.contains(&position) => {
+                    Value::null_unknown()
+                }
                 Output::Program(program) | Output::Key(program) | Output::Block(program) => {
                     vm.execute(program, &exec)?
                 }
-                Output::AliasKey(_) => Value::null_unknown(),
+                Output::AliasKey(..) => Value::null_unknown(),
                 Output::Copy(item) => values
                     .get(*item)
                     .cloned()
@@ -3653,7 +3667,7 @@ impl PreparedProjection {
         }
         let mut out = Row::from_values(values);
         for (position, output) in self.outputs.iter().enumerate() {
-            if let Output::AliasKey(program) = output {
+            if let Output::AliasKey(program, _) = output {
                 let mut exec =
                     ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
                 exec.row2 = Some(&out);
@@ -3726,10 +3740,22 @@ impl PreparedSelect {
             .iter()
             .map(|column| output(unaliased(column)))
             .collect::<Result<Vec<_>>>()?;
+        // A key that is a SELECT item holding subqueries reads that item,
+        // so its blocks and run slots are the item's
+        let repeats = |key: &Expression| {
+            mentions_subquery(key)
+                && stmt
+                    .columns
+                    .iter()
+                    .any(|c| ExprKey::of(unaliased(c)) == ExprKey::of(key))
+        };
         let order_by = stmt
             .order_by
             .iter()
-            .map(|ob| output(&ob.expression))
+            .map(|ob| match repeats(&ob.expression) {
+                true => Ok(None),
+                false => output(&ob.expression),
+            })
             .collect::<Result<Vec<_>>>()?;
         let output_blocks = first_output_block..builder.subqueries.len();
         let mut read_as = FxHashMap::default();
@@ -6135,8 +6161,25 @@ impl Executor {
             rows.push((scanned as i64, row));
             target.is_none_or(|target| rows.len() < target)
         };
-        let read = match source {
-            StatementSource::Table(table) => runner.passing_rows(
+        // An ORDER BY of one column under a LIMIT reads the rows it keeps in
+        // order, through the column's index or the table's top-k scan
+        let ordered = match (&source, limit) {
+            (StatementSource::Table(table), Some(limit)) => match Self::ordered_read_column(stmt) {
+                Some(key) => {
+                    runner.ordered_rows(&prepared.where_, &**table, ctx, key, limit, offset)?
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        let read_in_order = ordered.is_some();
+        #[cfg(feature = "test-failpoints")]
+        if read_in_order {
+            crate::test_failpoints::prepared_ordered_read();
+        }
+        let read = match (ordered, source) {
+            (Some(rows), _) => Ok(Passing::Answers(rows)),
+            (None, StatementSource::Table(table)) => runner.passing_rows(
                 &prepared.where_,
                 None,
                 &*table,
@@ -6145,14 +6188,14 @@ impl Executor {
                 false,
                 &mut keep,
             ),
-            StatementSource::Rows(_, rows) => runner.rows_passing(
+            (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
                 &prepared.where_,
                 rows.into_iter().map(Ok),
                 ctx,
                 target,
                 &mut keep,
             ),
-            StatementSource::Values(_, values) => runner.rows_passing(
+            (None, StatementSource::Values(_, values)) => runner.rows_passing(
                 &prepared.where_,
                 (0i64..)
                     .zip(&values.rows)
@@ -6161,7 +6204,7 @@ impl Executor {
                 target,
                 &mut keep,
             ),
-            StatementSource::Cte((_, rows)) => runner.rows_passing(
+            (None, StatementSource::Cte((_, rows))) => runner.rows_passing(
                 &prepared.where_,
                 rows.iter().map(|(id, row)| Ok((*id, row))),
                 ctx,
@@ -6196,10 +6239,12 @@ impl Executor {
             let keep = limit.unwrap_or(usize::MAX);
             rows = rows.into_iter().skip(offset).take(keep).collect();
         }
-        // With an ORDER BY a SELECT item holding subqueries is computed for
-        // the rows LIMIT and OFFSET keep, once the sort chose them by the
-        // columns the general sort reads
-        let order = (!stmt.order_by.is_empty()
+        limit_applied |= read_in_order;
+        // With an ORDER BY a SELECT item is computed for the rows LIMIT and
+        // OFFSET keep, once the sort chose them by the columns the general
+        // sort reads
+        let order = (!read_in_order
+            && !stmt.order_by.is_empty()
             && (limit.is_some() || offset > 0)
             && prepared.projection.defers())
         .then(|| {
@@ -6824,6 +6869,50 @@ impl<'a> PreparedRunner<'a> {
                 }
             }
         })
+    }
+
+    /// The rows of `table` an ORDER BY of `column` keeps past `offset`, at
+    /// most `limit`, read in order as the general path reads them: through
+    /// the column's index without a filter, else the table's top-k scan.
+    /// None when the scan does not take the whole WHERE, the WHERE narrows
+    /// the rows by a set, or the table cannot read them in order
+    fn ordered_rows(
+        &self,
+        where_: &PreparedWhere,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+        (column, ascending, nulls_first): (&str, bool, Option<bool>),
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        if where_.narrowing.is_some() || where_.narrowing_set.is_some() {
+            return Ok(None);
+        }
+        let Some((storage_expr, scanned_whole, _)) =
+            self.where_scan(where_, None, None, table, ctx)?
+        else {
+            return Ok(Some(RowVec::new()));
+        };
+        if !scanned_whole {
+            return Ok(None);
+        }
+        if storage_expr.is_none() {
+            let nulls_first = crate::core::value::nulls_first(ascending, nulls_first);
+            let rows = table.collect_rows_ordered_by_index(
+                column,
+                ascending,
+                nulls_first,
+                limit,
+                offset,
+            )?;
+            if rows.is_some() {
+                return Ok(rows);
+            }
+        }
+        let rows = table.scan_top_k(storage_expr.as_deref(), column, ascending, limit, offset)?;
+        // A read that checks for no cancel is the statement's all the same
+        ctx.check_cancelled()?;
+        Ok(rows)
     }
 
     /// Hand `keep` each row of `table` that passes `where_`, with its row
