@@ -160,6 +160,22 @@ fn shapes() -> Vec<(String, String)> {
              ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), t.a",
             "SELECT t.a, COUNT(*) FROM t GROUP BY t.a ORDER BY {count}, t.a",
         ),
+        // A WHERE holding the only subqueries
+        shape(
+            "SELECT COUNT(*) FROM {t} WHERE t.a IN (SELECT u.x FROM u)",
+            "SELECT COUNT(*) FROM t WHERE t.a IN (0, 1, 2, 3, 4, 5, 6)",
+        ),
+        shape(
+            "SELECT t.a, SUM(t.b) FROM {t} WHERE t.id > (SELECT MAX(u.x) FROM u) * 20 \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, SUM(t.b) FROM t WHERE t.id > 120 GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.a, COUNT(*) FROM {t} WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.a \
+             AND u.x > 4) GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, COUNT(*) FROM t WHERE t.a IN (0, 1, 2, 4, 5, 6, 7, 8) GROUP BY t.a \
+             ORDER BY t.a",
+        ),
         // An argument read once for its call
         shape(
             "SELECT t.id, NTILE((SELECT MIN(u.x) FROM u) + 3) OVER (ORDER BY t.id) FROM {t} \
@@ -356,6 +372,31 @@ fn a_statement_differing_only_inside_a_call_or_a_grouping_set_classifies_alone()
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_where_set_raises_its_error_only_for_a_row_that_reaches_it() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_where_error").unwrap();
+    fill(&db);
+    let set = "(SELECT 9223372036854775807 + u.x FROM u)";
+    for (sql, fails) in [
+        (
+            format!("SELECT COUNT(*) FROM t WHERE FALSE AND t.a IN {set}"),
+            false,
+        ),
+        (
+            format!("SELECT COUNT(*) FROM t WHERE t.b = 99 AND t.a IN {set}"),
+            false,
+        ),
+        (
+            format!("SELECT t.a, COUNT(*) FROM t WHERE TRUE OR t.a IN {set} GROUP BY t.a"),
+            false,
+        ),
+        (format!("SELECT COUNT(*) FROM t WHERE t.a IN {set}"), true),
+    ] {
+        assert_eq!(rows(&db, &sql).is_err(), fails, "{sql}");
+    }
 }
 
 #[test]

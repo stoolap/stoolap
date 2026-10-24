@@ -200,13 +200,13 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "aggregate_where",
         "SELECT COUNT(*) FROM t WHERE a IN (SELECT x FROM u)",
         "SELECT COUNT(*) FROM t WHERE a IN (1, 2, 3)",
-        Old("aggregate with a WHERE subquery"),
+        Prepared,
     ),
     (
         "group_by_where",
         "SELECT a, COUNT(*) FROM t WHERE id > (SELECT MAX(x) FROM u) GROUP BY a",
         "SELECT a, COUNT(*) FROM t WHERE id > 3 GROUP BY a",
-        Old("aggregate with a WHERE subquery"),
+        Prepared,
     ),
     (
         "aggregate_argument",

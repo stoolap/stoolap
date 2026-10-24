@@ -665,9 +665,7 @@ impl Executor {
         stmt: &SelectStatement,
         classification: &QueryClassification,
     ) -> bool {
-        let rows_where = classification.has_window_functions
-            && !classification.has_aggregation
-            && classification.where_has_subqueries
+        let rows_where = classification.where_has_subqueries
             && !matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
         let grouped_keys = classification.has_aggregation
             && stmt
@@ -682,7 +680,7 @@ impl Executor {
     /// Whether `stmt` groups its rows or has window functions, and holds
     /// subqueries in its SELECT list, HAVING, GROUP BY or DISTINCT ON, in the
     /// ORDER BY of one that groups without windows, or in the WHERE of one
-    /// that does not group or join, all of the family's forms, or why not
+    /// that does not join, all of the family's forms, or why not
     pub(crate) fn grouped_family(
         &self,
         stmt: &SelectStatement,
@@ -774,10 +772,10 @@ impl Executor {
         for item in grouping_items(stmt) {
             family.expression(item, 1, Site::Subqueries, &mut found)?;
         }
-        // The WHERE of rows that do not group runs as their blocks too, unless
-        // a join's path asks it
+        // The WHERE runs as the statement's blocks too, unless a join's path
+        // asks it
         let joined = matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
-        if !grouped && !joined {
+        if !joined {
             found |= stmt.where_clause.as_deref().is_some_and(mentions_subquery);
         }
         if !found {
@@ -4118,7 +4116,8 @@ pub struct PreparedGrouped {
     /// Each block's holes: an input block's read from the row it is asked
     /// of, any other's from the GROUP BY items of its group's row
     holes: HoleSet,
-    /// The uncorrelated member blocks it reads, read before any row
+    /// The uncorrelated member blocks past its WHERE, read before any row;
+    /// the WHERE's are read by the first row that reaches them
     ahead: Vec<u16>,
     /// A WHERE holding subqueries, which the table's rows pass before they group
     where_: Option<PreparedWhere>,
@@ -4293,6 +4292,8 @@ impl PreparedGrouped {
             }
             _ => None,
         };
+        // The WHERE's blocks come first; a row that reaches one reads it
+        let where_blocks = builder.subqueries.len();
         let opened_having = match stmt.having.as_deref() {
             Some(having) if mentions_subquery(having) => {
                 Some(grouped_having(executor, stmt, having)?)
@@ -4557,7 +4558,7 @@ impl PreparedGrouped {
             }
             holes.push(grouped);
         }
-        let ahead = (0..blocks_read)
+        let ahead = (where_blocks..blocks_read)
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
                 sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
