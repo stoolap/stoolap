@@ -160,6 +160,22 @@ fn shapes() -> Vec<(String, String)> {
              ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), t.a",
             "SELECT t.a, COUNT(*) FROM t GROUP BY t.a ORDER BY {count}, t.a",
         ),
+        // A WHERE holding the only subqueries
+        shape(
+            "SELECT COUNT(*) FROM {t} WHERE t.a IN (SELECT u.x FROM u)",
+            "SELECT COUNT(*) FROM t WHERE t.a IN (0, 1, 2, 3, 4, 5, 6)",
+        ),
+        shape(
+            "SELECT t.a, SUM(t.b) FROM {t} WHERE t.id > (SELECT MAX(u.x) FROM u) * 20 \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, SUM(t.b) FROM t WHERE t.id > 120 GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.a, COUNT(*) FROM {t} WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.a \
+             AND u.x > 4) GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, COUNT(*) FROM t WHERE t.a IN (0, 1, 2, 4, 5, 6, 7, 8) GROUP BY t.a \
+             ORDER BY t.a",
+        ),
         // An argument read once for its call
         shape(
             "SELECT t.id, NTILE((SELECT MIN(u.x) FROM u) + 3) OVER (ORDER BY t.id) FROM {t} \

@@ -1062,14 +1062,6 @@ fn test_classifier_rules() {
             "a clause outside the family",
         ),
         (
-            format!("SELECT b FROM t WHERE a > {sq} GROUP BY b"),
-            "a clause outside the family",
-        ),
-        (
-            format!("SELECT COUNT(*) FROM t WHERE a > {sq}"),
-            "an aggregate outside a subquery block",
-        ),
-        (
             format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
             "LIMIT or OFFSET that is not a literal or a parameter",
         ),

@@ -665,9 +665,7 @@ impl Executor {
         stmt: &SelectStatement,
         classification: &QueryClassification,
     ) -> bool {
-        let rows_where = classification.has_window_functions
-            && !classification.has_aggregation
-            && classification.where_has_subqueries
+        let rows_where = classification.where_has_subqueries
             && !matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
         let grouped_keys = classification.has_aggregation
             && stmt
@@ -682,7 +680,7 @@ impl Executor {
     /// Whether `stmt` groups its rows or has window functions, and holds
     /// subqueries in its SELECT list, HAVING, GROUP BY or DISTINCT ON, in the
     /// ORDER BY of one that groups without windows, or in the WHERE of one
-    /// that does not group or join, all of the family's forms, or why not
+    /// that does not join, all of the family's forms, or why not
     pub(crate) fn grouped_family(
         &self,
         stmt: &SelectStatement,
@@ -774,10 +772,10 @@ impl Executor {
         for item in grouping_items(stmt) {
             family.expression(item, 1, Site::Subqueries, &mut found)?;
         }
-        // The WHERE of rows that do not group runs as their blocks too, unless
-        // a join's path asks it
+        // The WHERE runs as the statement's blocks too, unless a join's path
+        // asks it
         let joined = matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
-        if !grouped && !joined {
+        if !joined {
             found |= stmt.where_clause.as_deref().is_some_and(mentions_subquery);
         }
         if !found {
