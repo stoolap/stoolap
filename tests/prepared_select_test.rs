@@ -1019,6 +1019,11 @@ fn test_classifier_rules() {
         format!("SELECT id, {sq} FROM t ORDER BY {sq} DESC, id LIMIT 3 OFFSET $1"),
         format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),
         format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u"),
+        "SELECT id FROM t WHERE a > (SELECT q.v FROM (SELECT id, v FROM u) AS q WHERE q.id = t.id)"
+            .to_string(),
+        "SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT v FROM u WHERE u.id <> t.b) AS q \
+         WHERE q.v = t.id)"
+            .to_string(),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1099,6 +1104,22 @@ fn test_classifier_rules() {
             "SELECT id FROM t WHERE a > (SELECT v FROM u JOIN t AS x ON x.id = u.id WHERE u.id = t.id)"
                 .to_string(),
             "FROM is not one table",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.v FROM u JOIN uv ON uv.id = u.id) \
+             AS q WHERE q.v = t.a)"
+                .to_string(),
+            "a derived table over a join",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u LIMIT t.a) AS q)".to_string(),
+            "a derived table's LIMIT or OFFSET naming a column",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u WHERE v IN \
+             (SELECT x.v FROM u AS x LIMIT t.a)) AS q)"
+                .to_string(),
+            "a derived table's LIMIT or OFFSET naming a column",
         ),
         (
             format!(

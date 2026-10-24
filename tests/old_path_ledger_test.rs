@@ -318,6 +318,19 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "block_over_a_derived_table",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT x FROM u) AS q WHERE q.x = t.a)",
         "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
+    (
+        "block_over_a_correlated_derived_table",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT x FROM u WHERE u.x = t.a) AS q)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
+    (
+        "block_over_a_derived_join",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.x FROM u JOIN u AS w ON w.id = u.id) \
+         AS q WHERE q.x = t.a)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
         Old("plan-less and source-side joins"),
     ),
 ];
@@ -342,7 +355,7 @@ const WRITES: &[(&str, &str, &str, Path)] = &[
         "update_where_over_a_derived_table",
         "UPDATE t SET b = 0 WHERE EXISTS (SELECT 1 FROM (SELECT x FROM u) AS q WHERE q.x = t.a)",
         "UPDATE t SET b = 0 WHERE a IN (1, 2, 3)",
-        Old("DML refusals"),
+        Prepared,
     ),
     (
         "delete_with_an_operator_outside_the_family",

@@ -393,14 +393,6 @@ fn state(source: &str, cell: &str) -> State {
         ("series", "body_argument") => GRAMMAR,
         ("cte" | "cte_columns", "insert_values" | "on_conflict_set") => GRAMMAR,
         (_, "join_on_correlated") => STEP_6,
-        (
-            "derived",
-            "block_grandparent"
-            | "block_unqualified_outer"
-            | "returning"
-            | "insert_values"
-            | "on_conflict_set",
-        ) => STEP_6,
         ("view" | "derived" | "cte" | "cte_columns", "body_join_on") => STEP_6,
         ("values", "body_row") => STEP_6,
         _ => Right,
