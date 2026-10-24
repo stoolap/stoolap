@@ -443,7 +443,7 @@ fn a_correlated_exists_probes_across_a_drop() {
     let _guard = fp::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let mut report = Vec::new();
-    // DISTINCT keeps the EXISTS out of the prepared family, on the general
+    // DISTINCT ON keeps the EXISTS out of the prepared family, on the general
     // path's probe; the prepared family's own blocks are the other shapes
     type Install = fn(Box<dyn FnOnce() + Send>);
     let general: Install = |hook| fp::before_correlated_fetch(hook);
@@ -451,7 +451,7 @@ fn a_correlated_exists_probes_across_a_drop() {
     let prepared_scalar: Install = |hook| fp::before_prepared_scalar(hook);
     for (sql, install) in [
         (
-            "SELECT DISTINCT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) ORDER BY p.id LIMIT 10",
+            "SELECT DISTINCT ON (p.id) p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) ORDER BY p.id LIMIT 10",
             general,
         ),
         (
