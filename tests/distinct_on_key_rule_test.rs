@@ -124,6 +124,50 @@ fn a_key_reads_the_source_and_the_groups_without_an_order_by() {
 }
 
 #[test]
+fn a_carried_key_never_reaches_the_columns_beside_a_star() {
+    let db = Database::open("memory://distinct_on_key_rule_star").unwrap();
+    fill(&db);
+    let sql = "SELECT DISTINCT ON (a % 2) *, ROW_NUMBER() OVER (ORDER BY id) FROM t";
+    assert_eq!(db.query(sql, ()).unwrap().columns().len(), 4, "{sql}");
+}
+
+#[test]
+fn a_group_by_position_reads_the_select_list_as_written() {
+    let db = Database::open("memory://distinct_on_key_rule_position").unwrap();
+    fill(&db);
+    let err = db
+        .query("SELECT DISTINCT ON (a) COUNT(*) FROM t GROUP BY 2", ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .err();
+    assert!(err.is_some(), "GROUP BY 2 names no item of a one-item list");
+}
+
+#[test]
+fn a_set_operation_branch_carries_no_key_column() {
+    let db = Database::open("memory://distinct_on_key_rule_union").unwrap();
+    fill(&db);
+    let columns = |sql: &str| db.query(sql, ()).unwrap().columns().len();
+    let sql = "SELECT DISTINCT ON (a % 2) a, COUNT(*) FROM t GROUP BY a \
+               UNION ALL SELECT a, COUNT(*) FROM t GROUP BY a";
+    let err = db
+        .query(sql, ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .err();
+    assert!(
+        err.as_ref()
+            .is_some_and(|e| e.to_string().contains("names no column")),
+        "a set operation's branch carries no key column: {err:?}"
+    );
+    assert_eq!(
+        columns(
+            "SELECT DISTINCT ON (a) a, COUNT(*) FROM t GROUP BY a \
+             UNION ALL SELECT a, COUNT(*) FROM t GROUP BY a"
+        ),
+        2
+    );
+}
+
+#[test]
 fn a_rolled_up_key_reads_the_group_item_it_names() {
     let db = Database::open("memory://distinct_on_key_rule_rollup").unwrap();
     for sql in [

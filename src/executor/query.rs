@@ -1365,6 +1365,7 @@ impl Executor {
         // A DISTINCT ON key the aggregation or window path computes rides along
         // as a hidden item, which the visible column count trims after
         let keyed_stmt;
+        let written_items = branch.columns.len();
         let branch = match Self::with_distinct_on_items(branch, &classification) {
             Some(keyed) => {
                 keyed_stmt = keyed;
@@ -1372,6 +1373,7 @@ impl Executor {
             }
             None => branch,
         };
+        let hidden_keys = branch.columns.len() - written_items;
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let (mut result, columns, limit_offset_applied, shape) = if in_family {
@@ -1414,8 +1416,12 @@ impl Executor {
         // computed for it, so those are counted off the end
         let expected_columns =
             match prepared_visible.unwrap_or_else(|| self.count_select_columns(stmt)) {
-                0 if classification.has_window_functions => {
-                    let hidden = Self::hidden_order_by_windows(stmt).len();
+                0 if classification.has_window_functions || hidden_keys > 0 => {
+                    let windows = match classification.has_window_functions {
+                        true => Self::hidden_order_by_windows(stmt).len(),
+                        false => 0,
+                    };
+                    let hidden = windows + hidden_keys;
                     if hidden > 0 {
                         columns.len().saturating_sub(hidden)
                     } else {
@@ -1904,12 +1910,38 @@ impl Executor {
         classification: &QueryClassification,
     ) -> Option<SelectStatement> {
         if stmt.distinct_on.is_empty()
+            || !stmt.set_operations.is_empty()
             || !(classification.has_aggregation || classification.has_window_functions)
         {
             return None;
         }
+        // A position past the SELECT list stays an error, not a hidden item
+        let past_list = |expr: &Expression| {
+            matches!(expr, Expression::IntegerLiteral(lit)
+                if usize::try_from(lit.value).map_or(true, |p| p > stmt.columns.len()))
+        };
+        if super::aggregation::grouping_items(stmt)
+            .into_iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .any(past_list)
+        {
+            return None;
+        }
+        let star = stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
         let mut columns = stmt.columns.clone();
         for key in &stmt.distinct_on {
+            // A key the SELECT list computes is read from that item
+            let computed = !star
+                && stmt
+                    .columns
+                    .iter()
+                    .any(|c| ExprKey::of(unaliased_item(c)) == ExprKey::of(key));
+            if computed {
+                continue;
+            }
             let alias = |id: &Identifier| {
                 stmt.columns.iter().any(|c| {
                     matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower)
@@ -2062,7 +2094,10 @@ impl Executor {
                                     matches!(s, Expression::Star(_) | Expression::QualifiedStar(_))
                                 })
                             })
-                            .and_then(|sel| sel.iter().position(|s| ExprKey::of(s) == key))
+                            .and_then(|sel| {
+                                sel.iter()
+                                    .position(|s| ExprKey::of(unaliased_item(s)) == key)
+                            })
                             .or_else(|| {
                                 result_columns
                                     .iter()
