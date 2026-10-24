@@ -88,4 +88,17 @@ fn a_key_the_select_list_computes_runs_once_per_row() {
         3,
         "beside a star, one call per row"
     );
+    for order_by in ["ORDER BY id", ""] {
+        let before = CALLS.load(Ordering::Relaxed);
+        let sql = format!(
+            "SELECT DISTINCT ON (NEXT_COUNT()) t.*, NEXT_COUNT() AS k, t.*, \
+             ROW_NUMBER() OVER (ORDER BY id) FROM t {order_by}"
+        );
+        assert_eq!(db.query(&sql, ()).unwrap().count(), 3, "{sql}");
+        assert_eq!(
+            CALLS.load(Ordering::Relaxed) - before,
+            3,
+            "between two stars, one call per row: {sql}"
+        );
+    }
 }

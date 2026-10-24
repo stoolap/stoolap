@@ -1904,15 +1904,18 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let columns = result.columns().to_vec();
         let visible = if visible == 0 { columns.len() } else { visible };
-        // An item's column by the layout; else counted from the front, or
-        // from the end of the visible columns for one after a star
+        // An item's column by the layout; without one, counted from the front,
+        // or from the end of the visible columns for one after every star
         let item_column = |key: &Expression| {
             let item = Self::item_computing(stmt, key)?;
             if let Some(layout) = layout {
                 return layout.item_position(item);
             }
-            match stmt.columns.iter().rposition(is_star_item) {
-                Some(star) if star < item => visible.checked_sub(stmt.columns.len() - item),
+            let first_star = stmt.columns.iter().position(is_star_item);
+            let last_star = stmt.columns.iter().rposition(is_star_item);
+            match (first_star, last_star) {
+                (Some(first), Some(last)) if first < item && item < last => None,
+                (_, Some(last)) if last < item => visible.checked_sub(stmt.columns.len() - item),
                 _ => Some(item),
             }
         };
@@ -1935,25 +1938,17 @@ impl Executor {
         Ok(Box::new(DistinctOnResult::new(result, indices)))
     }
 
+    /// The SELECT item computing `key`, aliased or not
+    fn item_computing(stmt: &SelectStatement, key: &Expression) -> Option<usize> {
+        stmt.columns
+            .iter()
+            .position(|c| ExprKey::of(unaliased_item(c)) == ExprKey::of(key))
+    }
+
     /// `stmt` with each DISTINCT ON key that is no SELECT position or alias
     /// appended as a hidden item named by its identity, when the aggregation
     /// or window path computes its rows: a key is then computed where its row
     /// is, reading groups, aggregates and windows as a SELECT item does
-    /// The SELECT item computing `key`, when its output position is known
-    /// without a star's width: no star stands before it, or none after it
-    fn item_computing(stmt: &SelectStatement, key: &Expression) -> Option<usize> {
-        let item = stmt
-            .columns
-            .iter()
-            .position(|c| ExprKey::of(unaliased_item(c)) == ExprKey::of(key))?;
-        let first_star = stmt.columns.iter().position(is_star_item);
-        let last_star = stmt.columns.iter().rposition(is_star_item);
-        match (first_star, last_star) {
-            (Some(first), Some(last)) if first < item && item < last => None,
-            _ => Some(item),
-        }
-    }
-
     fn with_distinct_on_items(
         stmt: &SelectStatement,
         classification: &QueryClassification,
@@ -11451,13 +11446,13 @@ impl Executor {
     }
 
     /// The layout of `stmt`'s output columns over the input `all_columns`,
-    /// for its ORDER BY to read; None without one, which reads nothing
+    /// for its ORDER BY and DISTINCT ON to read; None without either
     pub(crate) fn output_layout(
         stmt: &SelectStatement,
         all_columns: &[String],
         table_alias: Option<&str>,
     ) -> Option<OutputLayout> {
-        (!stmt.order_by.is_empty())
+        (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty())
             .then(|| Self::select_layout(&stmt.columns, all_columns, table_alias))
     }
 
@@ -11467,7 +11462,7 @@ impl Executor {
         all_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
     ) -> Option<OutputLayout> {
-        (!stmt.order_by.is_empty()).then(|| {
+        (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty()).then(|| {
             Self::shared_select_layout(&stmt.columns, CompactArc::clone(all_columns), table_alias)
         })
     }
@@ -11476,7 +11471,7 @@ impl Executor {
     /// columns those of the SELECT list over `all_columns`, the rest appended
     /// for ORDER BY, a hidden key computing an expression and any other
     /// column carrying the input column it is named after. None without an
-    /// ORDER BY
+    /// ORDER BY or a DISTINCT ON
     pub(crate) fn result_layout(
         stmt: &SelectStatement,
         all_columns: &[String],
