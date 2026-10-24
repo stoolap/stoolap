@@ -42,6 +42,7 @@ pub mod token;
 
 // Expression and statement parsing are implemented as impl blocks on Parser
 mod expressions;
+pub(crate) mod scope;
 mod statements;
 
 // Re-export main types
@@ -186,9 +187,12 @@ pub(crate) fn parse_stored_expression(
             "the {kind} of {column} is not an expression: {text}"
         ))
     };
-    let statements = parse_sql(&format!("SELECT {}", text))
+    let sql = format!("SELECT {}", text);
+    let program = Parser::new(&sql)
+        .unscoped()
+        .parse_program()
         .map_err(|e| Error::parse(format!("the {kind} of {column} does not parse: {e}")))?;
-    match statements.into_iter().next() {
+    match program.statements.into_iter().next() {
         Some(Statement::Select(select)) => select.columns.into_iter().next().ok_or_else(not_one),
         _ => Err(not_one()),
     }

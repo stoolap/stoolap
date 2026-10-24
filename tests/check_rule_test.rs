@@ -203,23 +203,23 @@ fn rename_refuses_a_name_that_would_rebind_a_check() {
 }
 
 #[test]
-fn rename_refuses_a_name_that_would_not_read_back_as_one_name() {
+fn rename_to_a_name_that_needs_quotes_keeps_the_check() {
     let db = Database::open("memory://check_rename_shape").unwrap();
     db.execute(
         "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))",
         (),
     )
     .unwrap();
-    for sql in [
-        "ALTER TABLE c RENAME COLUMN v TO \"2 + t.x\"",
-        "ALTER TABLE c RENAME COLUMN v TO \"-v\"",
+    for (from, to) in [
+        ("v", "\"2 + t.x\""),
+        ("\"2 + t.x\"", "\"-v\""),
+        ("\"-v\"", "w"),
     ] {
-        assert!(db.execute(sql, ()).is_err(), "{sql} changed CHECK (v > 0)");
+        db.execute(&format!("ALTER TABLE c RENAME COLUMN {from} TO {to}"), ())
+            .unwrap();
+        refused(&db, &["INSERT INTO c VALUES (1, -1)"]);
     }
-    refused(&db, &["INSERT INTO c VALUES (1, -1)"]);
-    db.execute("ALTER TABLE c RENAME COLUMN v TO w", ())
-        .unwrap();
-    refused(&db, &["INSERT INTO c VALUES (1, -1)"]);
+    db.execute("INSERT INTO c VALUES (1, 5)", ()).unwrap();
 }
 
 #[test]

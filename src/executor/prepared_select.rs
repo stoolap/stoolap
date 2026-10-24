@@ -30,6 +30,7 @@ use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, Schema
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
 use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
+use crate::parser::scope::unknown_qualifier;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr,
@@ -1135,9 +1136,7 @@ impl Chain<'_> {
                     .find(|(name, _)| name == qualifier)
                     .map(|(_, start)| (depth, *start))
             })
-            .ok_or_else(|| {
-                Error::invalid_argument(format!("unknown table or alias '{}'", qualifier))
-            })?;
+            .ok_or_else(|| Error::invalid_argument(unknown_qualifier(qualifier)))?;
         let scope = self.scopes[depth];
         let (_, mut range) = scope.table(start);
         let index = range
@@ -3924,10 +3923,7 @@ impl PreparedProjection {
                 }
                 Expression::QualifiedStar(star) => {
                     if star.qualifier.to_lowercase() != scope.tables[0].0.as_str() {
-                        return Err(Error::invalid_argument(format!(
-                            "unknown table or alias '{}'",
-                            star.qualifier
-                        )));
+                        return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)));
                     }
                     select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)));
                     star_columns.extend((0..columns.len()).map(Some));

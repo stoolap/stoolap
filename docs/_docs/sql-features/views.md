@@ -143,3 +143,4 @@ SHOW CREATE VIEW engineering;
 - Views are read-only (INSERT, UPDATE, DELETE on views are not supported)
 - View definitions are stored in the WAL and persist across restarts
 - A view cannot take parameters (`$1`, `?`, `:name`): it is stored SQL with no values of its own, so `CREATE VIEW` refuses one, and reading a view stored with one is an error
+- A view's query follows the qualifier rule of every statement: `CREATE VIEW` refuses a qualified name that names no FROM entry of the view's query, and reading a view stored with one is an error. A query that reads the view names it by the view's name or alias, never by a table inside the view

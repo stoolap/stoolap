@@ -339,8 +339,17 @@ impl Identifier {
 }
 
 impl fmt::Display for Identifier {
+    /// The name as the lexer reads it back as one name: quoted, its quotes
+    /// doubled, when it holds a character a bare name cannot
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.value)
+        let mut chars = self.value.chars();
+        let bare = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if bare {
+            write!(f, "{}", self.value)
+        } else {
+            write!(f, "\"{}\"", self.value.replace('"', "\"\""))
+        }
     }
 }
 

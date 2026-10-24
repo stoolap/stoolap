@@ -561,7 +561,7 @@ mod tests {
     use crate::parser::parse_sql;
 
     fn select_key(sql: &str) -> ExprKey {
-        let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+        let statements = parse_sql(&format!("SELECT {sql} FROM t, a")).unwrap();
         match &statements[0] {
             Statement::Select(select) => ExprKey::of(&select.columns[0]),
             other => panic!("not a SELECT: {other:?}"),
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn test_an_exact_key_keeps_quoting_and_qualification() {
         let exact = |sql: &str| {
-            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            let statements = parse_sql(&format!("SELECT {sql} FROM t, a")).unwrap();
             match &statements[0] {
                 Statement::Select(select) => ExprKey::exact(&select.columns[0]),
                 other => panic!("not a SELECT: {other:?}"),
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn test_a_prepared_block_reads_as_its_id() {
         let marked = |sql: &str, id: u16| {
-            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            let statements = parse_sql(&format!("SELECT {sql} FROM t, a")).unwrap();
             let Statement::Select(select) = &statements[0] else {
                 panic!("not a SELECT");
             };
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn test_parameters_and_subqueries_read_by_what_they_hold() {
         let pair = |sql: &str| {
-            let statements = parse_sql(&format!("SELECT {sql}")).unwrap();
+            let statements = parse_sql(&format!("SELECT {sql} FROM t, a")).unwrap();
             let Statement::Select(select) = &statements[0] else {
                 panic!("not a SELECT");
             };

@@ -452,7 +452,7 @@ mod tests {
     fn test_a_statement_constant_reads_no_row() {
         let registry = FunctionRegistry::new();
         let value = |sql: &str| {
-            let stmt = select(&format!("SELECT {sql}"));
+            let stmt = select(&format!("SELECT {sql} FROM t"));
             stmt.columns.into_iter().next().expect("one column")
         };
         for (sql, constant) in [
