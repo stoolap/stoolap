@@ -1132,6 +1132,12 @@ impl StatementSnapshot {
         self.0.reads_latest
     }
 
+    /// Whether nothing writes through its transaction, so a commit stamp
+    /// covers every row its reads can see
+    pub(crate) fn writes_nothing(&self) -> bool {
+        self.0.table_use == TableUse::Read
+    }
+
     /// The statement view its tables are read through
     pub(crate) fn view(&self) -> Option<&StatementView> {
         self.0.view.as_ref()
