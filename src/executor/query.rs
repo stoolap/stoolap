@@ -144,11 +144,17 @@ fn bind_order_key<'e>(expr: &'e Expression, stmt: &SelectStatement) -> OrderKey<
             })
             .map_or(OrderKey::Expression, OrderKey::Item),
         Expression::Identifier(id) => OrderKey::Input(None, &id.value_lower),
-        Expression::QualifiedIdentifier(qid) => {
+        Expression::QualifiedIdentifier(qid) if reads_input(stmt.table_expr.as_deref(), qid) => {
             OrderKey::Input(Some(&qid.qualifier.value_lower), &qid.name.value_lower)
         }
         _ => OrderKey::Expression,
     }
+}
+
+/// Whether a qualified name reads the input of a query whose FROM is `from`:
+/// one whose qualifier no entry shows is an enclosing query's column
+fn reads_input(from: Option<&Expression>, qid: &QualifiedIdentifier) -> bool {
+    from.is_some_and(|from| crate::parser::scope::from_shows(from, &qid.qualifier.value_lower))
 }
 
 /// Each input column `stmt`'s ORDER BY reads by its binding, with the
@@ -163,22 +169,26 @@ fn visit_order_by_inputs<'e>(
     for ob in &stmt.order_by {
         match bind_order_key(&ob.expression, stmt) {
             key @ OrderKey::Input(..) => visit(&ob.expression, key),
-            OrderKey::Expression => read_all &= visit_expression_inputs(&ob.expression, visit),
+            OrderKey::Expression => {
+                read_all &=
+                    visit_expression_inputs(&ob.expression, stmt.table_expr.as_deref(), visit)
+            }
             OrderKey::Ordinal(_) | OrderKey::Item(_) => {}
         }
     }
     read_all
 }
 
-/// Each name inside a sort expression, bound as an input column; false as
-/// `visit_column_refs` says
+/// Each name inside a sort expression of a query whose FROM is `from`,
+/// bound as an input column; false as `visit_column_refs` says
 fn visit_expression_inputs<'e>(
     expr: &'e Expression,
+    from: Option<&Expression>,
     visit: &mut dyn FnMut(&'e Expression, OrderKey<'e>),
 ) -> bool {
     visit_column_refs(expr, &mut |column| match column {
         Expression::Identifier(id) => visit(column, OrderKey::Input(None, &id.value_lower)),
-        Expression::QualifiedIdentifier(qid) => visit(
+        Expression::QualifiedIdentifier(qid) if reads_input(from, qid) => visit(
             column,
             OrderKey::Input(Some(&qid.qualifier.value_lower), &qid.name.value_lower),
         ),
@@ -2787,7 +2797,9 @@ impl Executor {
                 {
                     return true;
                 }
-                Expression::QualifiedIdentifier(qi) => {
+                Expression::QualifiedIdentifier(qi)
+                    if reads_input(stmt.table_expr.as_deref(), qi) =>
+                {
                     let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
                     if !select_columns.contains(full_name.as_str())
                         && all_columns.iter().any(|c| {
@@ -2821,7 +2833,7 @@ impl Executor {
                 // One the sort evaluates reads its input columns from the row
                 other if Self::has_subqueries(other) => {
                     let mut names_input = false;
-                    visit_expression_inputs(other, &mut |_, key| {
+                    visit_expression_inputs(other, stmt.table_expr.as_deref(), &mut |_, key| {
                         if let OrderKey::Input(qualifier, name) = key {
                             names_input |=
                                 input_column_index(all_columns, qualifier, name).is_some();
@@ -3195,6 +3207,7 @@ impl Executor {
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
+                stmt.table_expr.as_deref(),
                 rows,
                 all_columns,
                 table_alias,
@@ -6615,6 +6628,7 @@ impl Executor {
                                 &stmt.columns,
                                 &stmt.order_by,
                                 &stmt.distinct_on,
+                                stmt.table_expr.as_deref(),
                                 final_rows,
                                 &CompactArc::new(all_columns.clone()),
                                 None,
@@ -7284,6 +7298,7 @@ impl Executor {
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
+                stmt.table_expr.as_deref(),
                 final_rows,
                 &CompactArc::new(final_columns.clone()),
                 None,
@@ -7524,6 +7539,7 @@ impl Executor {
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
+                stmt.table_expr.as_deref(),
                 filtered_rows,
                 &CompactArc::new(columns.clone()),
                 subquery_alias,
@@ -7825,6 +7841,7 @@ impl Executor {
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
+                stmt.table_expr.as_deref(),
                 rows,
                 &CompactArc::new(view_columns.clone()),
                 view_alias.as_deref(),
@@ -10961,6 +10978,7 @@ impl Executor {
         select_exprs: &[Expression],
         order_by: &[crate::parser::ast::OrderByExpression],
         distinct_on: &[Expression],
+        from: Option<&Expression>,
         rows: RowVec,
         all_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
@@ -10970,6 +10988,7 @@ impl Executor {
             select_exprs,
             order_by,
             distinct_on,
+            from,
             rows,
             all_columns,
             table_alias,
@@ -10987,6 +11006,7 @@ impl Executor {
         select_exprs: &[Expression],
         order_by: &[crate::parser::ast::OrderByExpression],
         distinct_on: &[Expression],
+        from: Option<&Expression>,
         mut rows: RowVec,
         all_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
@@ -11022,6 +11042,7 @@ impl Executor {
             &select_exprs,
             order_by,
             distinct_on,
+            from,
             shared_columns,
             table_alias,
             ctx,
@@ -11032,11 +11053,13 @@ impl Executor {
     /// What a projection keeping the ORDER BY and DISTINCT ON values the
     /// SELECT list leaves out reads per row, the names it appends, and
     /// where each output column comes from
+    #[allow(clippy::too_many_arguments)]
     fn ordered_projection(
         &self,
         select_exprs: &[Expression],
         order_by: &[crate::parser::ast::OrderByExpression],
         distinct_on: &[Expression],
+        from: Option<&Expression>,
         shared_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
@@ -11050,7 +11073,14 @@ impl Executor {
             computed_distinct_on,
             extra_names,
             extra_sources,
-        } = self.order_by_projection(select_exprs, order_by, distinct_on, all_columns, false);
+        } = self.order_by_projection(
+            select_exprs,
+            order_by,
+            distinct_on,
+            from,
+            all_columns,
+            false,
+        );
         let mut layout = Self::shared_select_layout(
             select_exprs,
             CompactArc::clone(shared_columns),
@@ -11144,6 +11174,7 @@ impl Executor {
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
+                stmt.table_expr.as_deref(),
                 &CompactArc::new(all_columns.to_vec()),
                 None,
                 ctx,
@@ -11221,6 +11252,7 @@ impl Executor {
             &stmt.columns,
             &stmt.order_by,
             &stmt.distinct_on,
+            stmt.table_expr.as_deref(),
             all_columns,
             true,
         );
@@ -11375,6 +11407,7 @@ impl Executor {
         select_exprs: &'e [Expression],
         order_by: &'e [crate::parser::ast::OrderByExpression],
         distinct_on: &'e [Expression],
+        from: Option<&Expression>,
         all_columns: &[String],
         computes_subqueries: bool,
     ) -> OrderByProjection<'e> {
@@ -11439,7 +11472,7 @@ impl Executor {
                         }
                     }
                 }
-                Expression::QualifiedIdentifier(qi) => {
+                Expression::QualifiedIdentifier(qi) if reads_input(from, qi) => {
                     let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
                     // Only match against full qualified name in SELECT to avoid ambiguity
                     if !select_column_names.contains(&full_name) {
@@ -11485,7 +11518,7 @@ impl Executor {
                 // An expression the sort evaluates carries the input columns
                 // it names, which the sort reads by the layout
                 other if Self::has_subqueries(other) => {
-                    visit_expression_inputs(other, &mut |_, key| {
+                    visit_expression_inputs(other, from, &mut |_, key| {
                         if let OrderKey::Input(qualifier, name) = key {
                             if let Some(idx) = input_column_index(all_columns, qualifier, name) {
                                 if !extra_order_indices.contains(&idx) {

@@ -3948,7 +3948,14 @@ impl PreparedProjection {
             }
         }
         // A key holding a subquery is computed into a column named after it
-        let plan = executor.order_by_projection(&select_exprs, &stmt.order_by, &[], columns, true);
+        let plan = executor.order_by_projection(
+            &select_exprs,
+            &stmt.order_by,
+            &[],
+            stmt.table_expr.as_deref(),
+            columns,
+            true,
+        );
         let registry = &executor.function_registry;
         let ctx = std::cell::OnceCell::new();
         let blocks_ctx = std::cell::OnceCell::new();
