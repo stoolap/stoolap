@@ -547,9 +547,9 @@ impl ViewDefinition {
 
         // Column names, after the query, where a reader before them stops
         if let Some(columns) = self.columns() {
-            buf.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&(columns.len() as u32).to_le_bytes());
             for column in columns {
-                buf.extend_from_slice(&(column.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&(column.len() as u32).to_le_bytes());
                 buf.extend_from_slice(column.as_bytes());
             }
         }
@@ -598,15 +598,16 @@ impl ViewDefinition {
             return Ok(view);
         }
         let invalid = || crate::core::Error::internal("invalid view: bad column names");
-        let read_u16 = |pos: &mut usize| {
-            let bytes = data.get(*pos..*pos + 2).ok_or_else(invalid)?;
-            *pos += 2;
-            Ok::<_, crate::core::Error>(u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+        let read_u32 = |pos: &mut usize| {
+            let bytes = data.get(*pos..*pos + 4).ok_or_else(invalid)?;
+            *pos += 4;
+            let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+            Ok::<_, crate::core::Error>(u32::from_le_bytes(bytes) as usize)
         };
-        let count = read_u16(&mut pos)?;
-        let mut columns = Vec::with_capacity(count);
+        let count = read_u32(&mut pos)?;
+        let mut columns = Vec::with_capacity(count.min(data.len()));
         for _ in 0..count {
-            let len = read_u16(&mut pos)?;
+            let len = read_u32(&mut pos)?;
             let bytes = data.get(pos..pos + len).ok_or_else(invalid)?;
             columns.push(String::from_utf8(bytes.to_vec()).map_err(|_| invalid())?);
             pos += len;

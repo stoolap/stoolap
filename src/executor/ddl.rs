@@ -1327,8 +1327,10 @@ impl Executor {
         let mut result = self.execute_view_body(&view, ctx)?;
         let columns = result.columns().to_vec();
         result.close()?;
+        // Two names alike as a reference resolves them, lowercase
+        let lower: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
         for (i, column) in columns.iter().enumerate() {
-            if columns[..i].iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            if lower[..i].contains(&lower[i]) {
                 return Err(Error::invalid_argument(format!(
                     "column '{}' is named more than once in view '{}'",
                     column, view_name

@@ -62,6 +62,7 @@ fn a_view_is_refused_when_two_columns_share_a_name() {
         "CREATE VIEW v AS SELECT a, a FROM t",
         "CREATE VIEW v AS SELECT a, b AS A FROM t",
         "CREATE VIEW v AS SELECT id, a AS id FROM t",
+        "CREATE VIEW v AS SELECT 1 AS \"Ä\", 2 AS \"ä\"",
     ] {
         let message = error(&db, sql);
         assert!(message.contains("more than once"), "{sql}: {message}");
@@ -123,6 +124,38 @@ fn a_view_recorded_without_names_takes_the_ones_it_first_gives() {
 }
 
 #[test]
+fn a_column_name_longer_than_a_u16_survives_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/db", dir.path().display());
+    let long = "x".repeat(70_000);
+    for checkpoint in [false, true] {
+        {
+            let db = Database::open(&dsn).unwrap();
+            db.execute("DROP VIEW IF EXISTS w", ()).unwrap();
+            db.execute("DROP TABLE IF EXISTS t", ()).unwrap();
+            setup(&db);
+            db.execute(
+                &format!("CREATE VIEW w AS SELECT a AS {long}, b FROM t"),
+                (),
+            )
+            .unwrap();
+            if checkpoint {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            db.close().unwrap();
+        }
+        let db = Database::open(&dsn).unwrap();
+        let names = columns(&db, "SELECT * FROM w");
+        assert_eq!(names.len(), 2, "checkpoint {checkpoint}");
+        assert!(
+            names[0] == long && names[1] == "b",
+            "checkpoint {checkpoint}"
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
 fn a_view_keeps_its_names_when_the_database_opens_again() {
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!("file://{}/db", dir.path().display());
@@ -161,4 +194,5 @@ fn a_view_keeps_its_names_through_a_restore() {
     db.execute("ALTER TABLE t RENAME COLUMN a TO z", ())
         .unwrap();
     assert_eq!(columns(&db, "SELECT * FROM w"), ["id", "a", "b"]);
+    db.close().unwrap();
 }
