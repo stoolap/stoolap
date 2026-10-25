@@ -340,7 +340,7 @@ impl ScalarFunction for TimeTruncFunction {
         let duration_nanos = Self::cached_parse_duration(&duration_str)?;
 
         // Truncate the timestamp
-        let ts_nanos = ts.timestamp_nanos_opt().unwrap_or(0);
+        let ts_nanos = crate::core::value::timestamp_nanos(&ts)?;
         let truncated_nanos = ts_nanos - (ts_nanos % duration_nanos);
 
         let result = DateTime::from_timestamp_nanos(truncated_nanos);

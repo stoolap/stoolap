@@ -39,6 +39,8 @@ Query data as it existed at a specific timestamp:
 SELECT * FROM table_name AS OF TIMESTAMP 'timestamp_string'
 ```
 
+The text is read in any form a TIMESTAMP accepts. A time outside the range a table stores, `1677-09-21` to `2262-04-11`, is an error rather than an empty answer: for "as of now or later", write the current time or a time inside the range.
+
 ## Usage Examples
 
 ### Basic AS OF TRANSACTION Query

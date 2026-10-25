@@ -1554,7 +1554,12 @@ impl MVCCEngine {
             }
             true
         })?;
-        let mut volume = builder.finish()?;
+        let mut volume = builder.finish().map_err(|e| {
+            Error::internal(format!(
+                "converting the snapshot of table {}: {e}",
+                schema.table_name
+            ))
+        })?;
         let vol_row_count = volume.meta.row_count;
 
         // Write volume file to disk and retain CompressedBlockStore for

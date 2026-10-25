@@ -12857,32 +12857,12 @@ impl Executor {
                 }
             }
             "TIMESTAMP" => {
-                // Expect timestamp string or timestamp value
+                // Expect timestamp string or timestamp value; a time outside
+                // the TIMESTAMP range is an error, not an empty answer
                 match value {
-                    Value::Timestamp(ts) => {
-                        // Convert to nanoseconds since epoch
-                        Ok(ts.timestamp_nanos_opt().unwrap_or(0))
-                    }
+                    Value::Timestamp(ts) => crate::core::value::timestamp_nanos(&ts),
                     Value::Text(s) => {
-                        // Parse timestamp string
-                        use chrono::{DateTime, NaiveDateTime, Utc};
-                        let ts = if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-                            dt.with_timezone(&Utc)
-                        } else if let Ok(ndt) =
-                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        {
-                            DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc)
-                        } else if let Ok(ndt) =
-                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
-                        {
-                            DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc)
-                        } else {
-                            return Err(Error::invalid_argument(format!(
-                                "Invalid timestamp format: {}",
-                                s
-                            )));
-                        };
-                        Ok(ts.timestamp_nanos_opt().unwrap_or(0))
+                        crate::core::value::timestamp_nanos(&crate::core::parse_timestamp(&s)?)
                     }
                     Value::Integer(i) => {
                         // Interpret as nanoseconds since epoch

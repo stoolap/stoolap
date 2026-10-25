@@ -1726,18 +1726,23 @@ impl MVCCTable {
     }
 
     /// Validates and coerces a row against the schema; a row that needs no
-    /// coercion and holds no refused NULL is valid as is
-    #[inline]
+    /// coercion, holds no refused NULL and no TIMESTAMP outside the stored
+    /// range is valid as is
+    #[inline(always)]
     fn validate_and_coerce_row(&self, row: &mut Row) -> Result<()> {
         let columns = &self.cached_schema.columns;
         if row.len() == columns.len()
-            && columns.iter().zip(row.as_slice()).all(|(col, value)| {
-                if value.is_null() {
-                    col.nullable
-                } else {
-                    value.data_type() == col.data_type
-                }
-            })
+            && columns
+                .iter()
+                .zip(row.as_slice())
+                .all(|(col, value)| match value {
+                    Value::Null(_) => col.nullable,
+                    Value::Timestamp(t) => {
+                        col.data_type == DataType::Timestamp
+                            && crate::core::value::timestamp_fits(t)
+                    }
+                    _ => value.data_type() == col.data_type,
+                })
         {
             return Ok(());
         }
@@ -1773,6 +1778,11 @@ impl MVCCTable {
                     "NULL value in non-nullable column '{}'",
                     col.name
                 )));
+            }
+
+            // A TIMESTAMP the engine cannot store is refused, not wrapped
+            if let Value::Timestamp(t) = value {
+                crate::core::value::timestamp_in_range(*t)?;
             }
 
             // Check type compatibility for non-NULL values

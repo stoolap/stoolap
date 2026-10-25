@@ -223,11 +223,7 @@ impl Scratch {
             }
             Scratch::TimestampNanos(values, nulls) => {
                 values.push(match value {
-                    Value::Timestamp(ts) => ts.timestamp_nanos_opt().unwrap_or_else(|| {
-                        ts.timestamp()
-                            .wrapping_mul(1_000_000_000)
-                            .wrapping_add(ts.timestamp_subsec_nanos() as i64)
-                    }),
+                    Value::Timestamp(ts) => crate::core::value::timestamp_nanos(ts)?,
                     _ => 0,
                 });
                 nulls.push(false);
