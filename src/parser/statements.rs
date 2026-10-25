@@ -296,12 +296,14 @@ impl Parser<'_> {
     }
 
     /// Parse a set operation (UNION, INTERSECT, EXCEPT)
-    /// Handles SQL standard precedence: INTERSECT/EXCEPT bind tighter than UNION
+    /// Handles SQL standard precedence: INTERSECT binds tighter than UNION and
+    /// EXCEPT, which bind equally and apply left to right
     fn parse_set_operation(&mut self) -> Option<SetOperation> {
         self.next_token(); // consume UNION/INTERSECT/EXCEPT
 
         let keyword = self.cur_token.keyword;
         let is_union = keyword == Some(Keyword::Union);
+        let binds_looser = keyword != Some(Keyword::Intersect);
         let operation = if is_union {
             if self.peek_token_is_keyword(Keyword::All) {
                 self.next_token();
@@ -335,12 +337,10 @@ impl Parser<'_> {
         // Parse the right side SELECT
         let mut right = self.parse_simple_select()?;
 
-        // If this is UNION, the right side should consume any INTERSECT/EXCEPT operations
-        // because INTERSECT/EXCEPT have higher precedence than UNION
-        if is_union {
-            while self.peek_token_is_keyword(Keyword::Intersect)
-                || self.peek_token_is_keyword(Keyword::Except)
-            {
+        // After UNION or EXCEPT, the right side consumes the INTERSECT
+        // operations that follow, because INTERSECT has higher precedence
+        if binds_looser {
+            while self.peek_token_is_keyword(Keyword::Intersect) {
                 if let Some(set_op) = self.parse_set_operation() {
                     right.set_operations.push(set_op);
                 } else {
