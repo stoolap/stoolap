@@ -147,3 +147,36 @@ fn a_row_cannot_move_between_two_member_probes() {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+#[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
+fn count_member_probes(count: std::rc::Rc<std::cell::Cell<usize>>) {
+    stoolap::test_failpoints::after_in_member_probed(move || {
+        count.set(count.get() + 1);
+        count_member_probes(count);
+    });
+}
+
+#[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
+#[test]
+fn a_limit_stops_the_member_read_at_the_key_that_meets_it() {
+    let db = Database::open("memory://a_limit_stops_the_member_read_at_the_key").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        "CREATE INDEX t_k ON t(k) USING BTREE",
+        "INSERT INTO t SELECT value, value FROM generate_series(1, 10)",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO p SELECT value, value FROM generate_series(1, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    count_member_probes(std::rc::Rc::clone(&probes));
+    let rows = ids(&db, "SELECT id FROM t WHERE k IN (SELECT a FROM p) LIMIT 2");
+    stoolap::test_failpoints::after_in_member_probed(|| {});
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        probes.get(),
+        2,
+        "each key holds one row, so two keys meet LIMIT 2 whatever their order"
+    );
+}

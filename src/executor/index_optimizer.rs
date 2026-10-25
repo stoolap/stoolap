@@ -1001,8 +1001,8 @@ impl Executor {
     }
 
     /// Each row id `index` holds for one of `members`, until `out` holds
-    /// `target`, members a doubling batch at a time; false when the index
-    /// does not answer for the view the table reads: it holds neither the
+    /// `target`, checked after every member; false when the index does not
+    /// answer for the view the table reads: it holds neither the
     /// transaction's own writes nor, once a commit the statement misses
     /// landed, its keys
     fn index_members<'v>(
@@ -1014,14 +1014,15 @@ impl Executor {
     ) -> bool {
         let epoch = table.index_view_epoch();
         // A NULL member equals nothing, so it is not looked up
-        let mut members = members.filter(|value| !value.is_null()).peekable();
+        let mut members = members.filter(|value| !value.is_null());
         match target {
             None => index.get_row_ids_in_into(&mut members, out),
             Some(target) => {
-                let mut batch = 1;
-                while out.len() < target && members.peek().is_some() {
-                    index.get_row_ids_in_into(&mut members.by_ref().take(batch), out);
-                    batch = batch.saturating_mul(2);
+                while out.len() < target {
+                    let Some(value) = members.next() else {
+                        break;
+                    };
+                    index.get_row_ids_in_into(&mut std::iter::once(value), out);
                 }
             }
         }
