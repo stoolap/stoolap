@@ -428,3 +428,68 @@ fn a_block_source_no_call_needs_raises_nothing() {
         }
     }
 }
+
+#[test]
+fn a_view_that_reads_itself_raises_the_nesting_error() {
+    let _turn = turn();
+    let db = hot("view_cycle");
+    for sql in [
+        "CREATE VIEW v AS SELECT x FROM v",
+        "CREATE VIEW v1 AS SELECT x FROM u",
+        "CREATE VIEW v2 AS SELECT x FROM v1",
+        "DROP VIEW v1",
+        "CREATE VIEW v1 AS SELECT x FROM v2",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM v WHERE v.x = t.id)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT x FROM v) AS q WHERE q.x = t.id)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT x FROM v WHERE x = t.id) AS q)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM v1 WHERE v1.x = t.id)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT x FROM v2 WHERE x = t.id) AS q)",
+    ] {
+        let got = answer(&db, sql);
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.contains("Maximum view nesting depth")),
+            "{sql}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
+    let _turn = turn();
+    let db = hot("exists_order");
+    const Q: &str = "(SELECT x FROM u WHERE u.id = t.id) AS q";
+    for (sql, missing) in [
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY q.missing LIMIT 1)"),
+            "q.missing",
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY missing LIMIT 1)"),
+            "missing",
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY q.x, q.missing)"),
+            "q.missing",
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY ABS(missing))"),
+            "missing",
+        ),
+    ] {
+        let got = answer(&db, &sql);
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.contains(&format!("'{missing}' not found"))),
+            "{sql}: {got:?}"
+        );
+    }
+    let bound = format!(
+        "SELECT id FROM t WHERE EXISTS (SELECT q.x AS k FROM {Q} ORDER BY k, q.x, x, t.a, ABS(q.x - 9223372036854775807 - 10)) ORDER BY id"
+    );
+    assert_eq!(answer(&db, &bound), Ok(ids(&[1, 2, 3, 4])), "{bound}");
+}

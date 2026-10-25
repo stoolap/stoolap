@@ -45,6 +45,17 @@ use crate::storage::traits::{Engine, QueryResult};
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
 
+/// The error a view raises when `depth` views around it are already open
+pub(super) fn check_view_depth(depth: usize) -> Result<()> {
+    if depth >= MAX_VIEW_DEPTH {
+        return Err(Error::InvalidArgument(format!(
+            "Maximum view nesting depth ({}) exceeded",
+            MAX_VIEW_DEPTH
+        )));
+    }
+    Ok(())
+}
+
 /// Threshold below which streaming NOT EXISTS with early termination outperforms
 /// bulk anti-join materialization. Queries with LIMIT below this value use the
 /// streaming InHashSet path which can terminate early, while queries without LIMIT
@@ -7649,13 +7660,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Check view depth to prevent stack overflow from deeply nested views
-        let depth = ctx.view_depth();
-        if depth >= MAX_VIEW_DEPTH {
-            return Err(Error::InvalidArgument(format!(
-                "Maximum view nesting depth ({}) exceeded",
-                MAX_VIEW_DEPTH
-            )));
-        }
+        check_view_depth(ctx.view_depth())?;
 
         // Parse the view's query using cache (returns Arc<Statement>, no clone)
         let view_stmt = self.parse_view_statement(&view_def.query)?;

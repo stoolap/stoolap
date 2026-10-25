@@ -1156,11 +1156,23 @@ enum Reach<'x> {
 }
 
 /// One statement level of a [`StatementWalk`]: its scope, then those it
-/// sees, the first `inside` of them inside the block, and its SELECT aliases
+/// sees, the first `inside` of them inside the block, and its SELECT
+/// aliases; `check` raises a name no scope has, for a clause nothing runs
+#[derive(Clone)]
 struct Level<'s> {
     scopes: Vec<&'s ScopeTable>,
     inside: usize,
     aliases: Vec<SmartString>,
+    check: bool,
+}
+
+/// Which clauses of a walked statement raise a name no scope has, since
+/// the statement runs without them: none, its ORDER BY, or all of them
+#[derive(Clone, Copy, PartialEq)]
+enum Check {
+    Off,
+    Order,
+    All,
 }
 
 /// A statement a block runs whole, its names bound as a block's are: the
@@ -1171,6 +1183,8 @@ struct StatementWalk<'w> {
     executor: &'w Executor,
     ctx: &'w ExecutionContext,
     on: &'w mut dyn FnMut(Reach<'_>) -> Result<Option<Expression>>,
+    /// The views open around the one the walk reads, beyond the context's
+    views: usize,
 }
 
 impl StatementWalk<'_> {
@@ -1183,8 +1197,9 @@ impl StatementWalk<'_> {
         stmt: &SelectStatement,
         enclosing: &[&ScopeTable],
         inside: usize,
+        check: Check,
     ) -> Result<(SelectStatement, Vec<String>, Vec<String>)> {
-        let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside)?;
+        let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
         scopes.push(&own);
         scopes.extend_from_slice(enclosing);
@@ -1201,11 +1216,17 @@ impl StatementWalk<'_> {
             scopes: scopes.clone(),
             inside: inside + 1,
             aliases: Vec::new(),
+            check: check == Check::All,
         };
         let level = Level {
             scopes,
             inside: inside + 1,
             aliases,
+            check: check == Check::All,
+        };
+        let sorted = Level {
+            check: check != Check::Off,
+            ..level.clone()
         };
         let names = output_names(stmt, &own);
         let all = |walk: &mut Self, exprs: &[Expression]| {
@@ -1219,12 +1240,12 @@ impl StatementWalk<'_> {
                 .map(|e| walk.expr(e, &level).map(Box::new))
                 .transpose()
         };
-        let order = |walk: &mut Self, order: &[OrderByExpression]| {
+        let order = |walk: &mut Self, order: &[OrderByExpression], at: &Level<'_>| {
             order
                 .iter()
                 .map(|o| {
                     Ok(OrderByExpression {
-                        expression: walk.expr(&o.expression, &level)?,
+                        expression: walk.expr(&o.expression, at)?,
                         ..o.clone()
                     })
                 })
@@ -1258,19 +1279,19 @@ impl StatementWalk<'_> {
                 .map(|def| {
                     Ok(WindowDefinition {
                         partition_by: all(self, &def.partition_by)?,
-                        order_by: order(self, &def.order_by)?,
+                        order_by: order(self, &def.order_by, &level)?,
                         ..def.clone()
                     })
                 })
                 .collect::<Result<_>>()?,
-            order_by: order(self, &stmt.order_by)?,
+            order_by: order(self, &stmt.order_by, &sorted)?,
             limit: one(self, &stmt.limit)?,
             offset: one(self, &stmt.offset)?,
             set_operations: stmt
                 .set_operations
                 .iter()
                 .map(|op| {
-                    let (right, ..) = self.statement(&op.right, enclosing, inside)?;
+                    let (right, ..) = self.statement(&op.right, enclosing, inside, check)?;
                     Ok(SetOperation {
                         operation: op.operation.clone(),
                         right: Box::new(right),
@@ -1289,11 +1310,18 @@ impl StatementWalk<'_> {
         table_expr: Option<&Expression>,
         enclosing: &[&ScopeTable],
         inside: usize,
+        check: Check,
     ) -> Result<(Option<Expression>, ScopeTable)> {
+        // A FROM runs with its statement unless no clause of it does
+        let check = match check {
+            Check::All => Check::All,
+            _ => Check::Off,
+        };
         let beside = Level {
             scopes: enclosing.to_vec(),
             inside,
             aliases: Vec::new(),
+            check: check == Check::All,
         };
         let untyped = |name: &SmartString, columns: &[String]| {
             ScopeTable::of(name.clone(), &untyped_schema(name, columns))
@@ -1359,7 +1387,8 @@ impl StatementWalk<'_> {
                 ));
             }
             Expression::SubquerySource(derived) => {
-                let (subquery, names, _) = self.statement(&derived.subquery, enclosing, inside)?;
+                let (subquery, names, _) =
+                    self.statement(&derived.subquery, enclosing, inside, check)?;
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
                 let scope = untyped(&name.unwrap_or_default(), &names);
                 let walked = SubqueryTableSource {
@@ -1383,21 +1412,30 @@ impl StatementWalk<'_> {
             scopes: &level.scopes,
         };
         let beyond = |depth: usize| depth.checked_sub(level.inside).map(|d| d + 1);
+        // A source inside whose computed column has no known name may hold
+        // a name: it stays there, never read beyond by mistake
+        let unknown = || {
+            level.scopes[..level.inside]
+                .iter()
+                .any(|scope| scope.lower.iter().any(String::is_empty))
+        };
+        let nested = |exists: bool| match (level.check, exists) {
+            (false, _) => Check::Off,
+            (true, true) => Check::Order,
+            (true, false) => Check::All,
+        };
         match expr {
             Expression::Identifier(id) => {
                 if level.aliases.contains(&id.value_lower) {
                     return Ok(expr.clone());
                 }
-                // A source inside whose computed column has no known name may
-                // hold the name: it stays there, never read beyond by mistake
-                let unknown = level.scopes[..level.inside]
-                    .iter()
-                    .any(|scope| scope.lower.iter().any(String::is_empty));
+                let unknown = unknown();
                 match chain.bare(id) {
                     Ok(Some((depth, index))) if !unknown => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
                         None => Ok(expr.clone()),
                     },
+                    Err(e) if level.check && !unknown => Err(e),
                     _ => Ok(expr.clone()),
                 }
             }
@@ -1416,7 +1454,12 @@ impl StatementWalk<'_> {
                             None => Ok(expr.clone()),
                         }
                     }
-                    None => Ok(expr.clone()),
+                    None => {
+                        if level.check && !unknown() {
+                            chain.qualified(qualifier, &q.name.value_lower, &q.to_string())?;
+                        }
+                        Ok(expr.clone())
+                    }
                 }
             }
             Expression::Parameter(_) => {
@@ -1425,20 +1468,28 @@ impl StatementWalk<'_> {
             }
             Expression::ScalarSubquery(sq) => Ok(Expression::ScalarSubquery(ScalarSubquery {
                 token: sq.token.clone(),
-                subquery: Box::new(self.statement(&sq.subquery, &level.scopes, level.inside)?.0),
+                subquery: Box::new(
+                    self.statement(&sq.subquery, &level.scopes, level.inside, nested(false))?
+                        .0,
+                ),
             })),
             Expression::Exists(exists) => Ok(Expression::Exists(ExistsExpression {
                 token: exists.token.clone(),
                 subquery: Box::new(
-                    self.statement(&exists.subquery, &level.scopes, level.inside)?
+                    self.statement(&exists.subquery, &level.scopes, level.inside, nested(true))?
                         .0,
                 ),
             })),
             Expression::AllAny(all_any) => Ok(Expression::AllAny(AllAnyExpression {
                 left: Box::new(self.expr(&all_any.left, level)?),
                 subquery: Box::new(
-                    self.statement(&all_any.subquery, &level.scopes, level.inside)?
-                        .0,
+                    self.statement(
+                        &all_any.subquery,
+                        &level.scopes,
+                        level.inside,
+                        nested(false),
+                    )?
+                    .0,
                 ),
                 ..all_any.clone()
             })),
@@ -1457,6 +1508,7 @@ impl StatementWalk<'_> {
     /// The names a view's rows have, read from its query without running it;
     /// one name nothing spells when its source is none the walk reads
     fn view_names(&mut self, query: &str) -> Result<Vec<String>> {
+        super::query::check_view_depth(self.ctx.view_depth() + self.views)?;
         let parsed = self.executor.parse_view_statement(query)?;
         let Statement::Select(select) = parsed.as_ref() else {
             return Ok(vec![String::new()]);
@@ -1464,7 +1516,10 @@ impl StatementWalk<'_> {
         if select.with.is_some() {
             return Ok(vec![String::new()]);
         }
-        Ok(match self.from(select.table_expr.as_deref(), &[], 0) {
+        self.views += 1;
+        let from = self.from(select.table_expr.as_deref(), &[], 0, Check::Off);
+        self.views -= 1;
+        Ok(match from {
             Ok((_, own)) => output_names(select, &own),
             Err(_) => vec![String::new()],
         })
@@ -3467,8 +3522,9 @@ impl Builder<'_> {
                 }
                 Reach::Param(_) => Ok(None),
             },
+            views: 0,
         }
-        .statement(stmt, outer, 0)?;
+        .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
         Ok((reads, names))
     }
@@ -3493,6 +3549,11 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
+        // An EXISTS runs without its ORDER BY, which is still bound
+        let check = match form {
+            Form::Exists(_) => Check::Order,
+            _ => Check::Off,
+        };
         let mut max_param = 0;
         let (statement, _, from_names) = StatementWalk {
             executor,
@@ -3507,8 +3568,9 @@ impl Builder<'_> {
                 }
                 Reach::Param(_) => Ok(None),
             },
+            views: 0,
         }
-        .statement(sq, outer, 0)?;
+        .statement(sq, outer, 0, check)?;
         self.max_param = self.max_param.max(max_param);
         let statement = match form {
             Form::Exists(_) => existence(executor, statement, &from_names)?,
@@ -3893,6 +3955,7 @@ impl Builder<'_> {
             executor: self.executor,
             ctx: self.ctx,
             on: &mut |_| Ok(None),
+            views: 0,
         }
         .view_names(&view.query)?;
         if !named.iter().any(String::is_empty) {
