@@ -121,7 +121,7 @@ Under `SELECT DISTINCT`, one distinct row can stand for several rows, so an `ORD
 
 - a selected item, by its expression, its alias or its position (`ORDER BY 2`);
 - a selected column under its table's name or without it (`t.a` and `a` are the same column of `t`);
-- an expression of selected columns, such as `a + 1` or `CASE WHEN a > 0 THEN 1 ELSE 2 END` when `a` is selected;
+- an expression of selected columns, such as `a + 1`, `a IN (1, 2)` or `CASE WHEN a > 0 THEN 1 ELSE 2 END` when `a` is selected, with no function that answers anew on each call, such as `RANDOM()`;
 - a column a star selects, or a column of an enclosing query, which is constant inside a subquery.
 
 Any other key, a column that is not selected or an aggregate, window or subquery that is not itself a selected item, may hold a different value in each merged row. The statement is then refused instead of being sorted by whichever row was kept:

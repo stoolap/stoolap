@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Under SELECT DISTINCT every ORDER BY key is a SELECT item: by position, by
-//! alias, as the same expression or as the column an item reads. Any other
-//! key is refused, naming it, over every source and pipeline
+//! Under SELECT DISTINCT every ORDER BY key is one the SELECT items determine:
+//! by position, by alias, as the same expression or as a value of the columns
+//! they read. Any other key is refused, naming it, over every source and pipeline
 
 use stoolap::Database;
 
@@ -84,6 +84,9 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
             ("t.a", "t.b LIMIT 2", "t.b"),
             // A position past the list
             ("t.a", "2", "2"),
+            // A call that may answer anew for each merged row
+            ("t.a", "RANDOM()", "RANDOM()"),
+            ("t.a", "t.a + RANDOM()", "(t.a + RANDOM())"),
         ] {
             let sql = format!("{with}SELECT DISTINCT {items} FROM {from} ORDER BY {order_by}");
             let key = if key.is_empty() { order_by } else { key };
@@ -103,6 +106,10 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
             ("t.a", "t.a + 1"),
             ("a", "-a, t.a * 2"),
             ("t.a", "CASE WHEN a > 1 THEN 0 ELSE 1 END"),
+            ("t.b", "t.b LIKE 'x%'"),
+            ("t.a", "t.a IN (1, 2)"),
+            ("t.a", "CASE WHEN t.a NOT IN (1, 2) THEN 0 ELSE 1 END"),
+            ("t.a", "ABS(t.a - 2)"),
             ("t.a AS k", "k"),
             ("t.a, t.b", "2"),
             ("t.a", "1"),

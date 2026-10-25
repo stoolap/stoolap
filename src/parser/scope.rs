@@ -223,7 +223,8 @@ fn column_determined<'i>(
 }
 
 /// Whether `expr` is computed from its columns alone, each passing `column`:
-/// no aggregate, window or subquery, which read rows beyond the one
+/// no aggregate, window or subquery, which read rows beyond the one, and no
+/// function the global registry says may answer anew per call
 fn scalar_of(expr: &Expression, column: &mut dyn FnMut(&Expression) -> bool) -> bool {
     match expr {
         Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => column(expr),
@@ -240,6 +241,14 @@ fn scalar_of(expr: &Expression, column: &mut dyn FnMut(&Expression) -> bool) -> 
         Expression::Between(b) => {
             scalar_of(&b.expr, column) && scalar_of(&b.lower, column) && scalar_of(&b.upper, column)
         }
+        Expression::Like(l) => {
+            scalar_of(&l.left, column)
+                && scalar_of(&l.pattern, column)
+                && l.escape.as_deref().is_none_or(|e| scalar_of(e, column))
+        }
+        Expression::In(i) => scalar_of(&i.left, column) && scalar_of(&i.right, column),
+        Expression::List(l) => l.elements.iter().all(|e| scalar_of(e, column)),
+        Expression::ExpressionList(l) => l.expressions.iter().all(|e| scalar_of(e, column)),
         Expression::Case(c) => {
             c.value.as_deref().is_none_or(|v| scalar_of(v, column))
                 && c.when_clauses
@@ -248,7 +257,9 @@ fn scalar_of(expr: &Expression, column: &mut dyn FnMut(&Expression) -> bool) -> 
                 && c.else_value.as_deref().is_none_or(|e| scalar_of(e, column))
         }
         Expression::FunctionCall(f) => {
-            !crate::executor::utils::is_aggregate_function(&f.function)
+            let registry = crate::functions::registry::global_registry();
+            !registry.is_aggregate(&f.function)
+                && registry.volatility(&f.function) != crate::functions::Volatility::PerCall
                 && f.filter.is_none()
                 && f.order_by.is_empty()
                 && f.arguments.iter().all(|a| scalar_of(a, column))
