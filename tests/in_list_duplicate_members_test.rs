@@ -100,19 +100,28 @@ fn a_row_cannot_move_between_two_member_probes() {
         .unwrap();
     db.execute("INSERT INTO t VALUES (6, 3), (7, 1), (8, 2)", ())
         .unwrap();
-    let (done, moved) = std::sync::mpsc::channel();
+    let (at_index, reached) = std::sync::mpsc::channel();
+    let (key_removed, removed) = std::sync::mpsc::channel();
     let mover = std::rc::Rc::new(std::cell::RefCell::new(None));
     let mover_in_hook = std::rc::Rc::clone(&mover);
     let moved_during_probe = std::rc::Rc::new(std::cell::Cell::new(false));
     let moved_in_hook = std::rc::Rc::clone(&moved_during_probe);
     stoolap::test_failpoints::after_in_member_probed(move || {
         *mover_in_hook.borrow_mut() = Some(std::thread::spawn(move || {
+            stoolap::test_failpoints::before_commit_index_capture(move || {
+                let _ = at_index.send(());
+            });
+            stoolap::test_failpoints::after_commit_index_removed(move || {
+                let _ = key_removed.send(());
+            });
             other
                 .execute("UPDATE t SET k = 2 WHERE id = 7", ())
                 .unwrap();
-            let _ = done.send(());
         }));
-        let waited = moved.recv_timeout(std::time::Duration::from_millis(500));
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the UPDATE reached its index changes");
+        let waited = removed.recv_timeout(std::time::Duration::from_millis(500));
         moved_in_hook.set(waited.is_ok());
     });
     assert_eq!(ids(&db, "SELECT id FROM t WHERE k IN (1, 2)"), vec![7, 8]);

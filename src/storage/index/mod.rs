@@ -64,6 +64,39 @@ pub(crate) fn each_entry_once<K: Ord + Copy, T: Copy>(found: &[(K, T)], mut copy
 }
 
 #[cfg(test)]
+mod in_list_tests {
+    use super::seal_removal_tests::indexes;
+    use crate::core::Value;
+
+    #[test]
+    fn an_in_list_appends_each_row_once_after_the_buffer() {
+        let members: Vec<Value> = (0..24)
+            .map(|i| Value::Integer([2, 0, 5, 9][i % 4] + if i == 23 { 50 } else { 0 }))
+            .collect();
+        for (name, index) in indexes() {
+            let key = |id: i64| if name == "pk" { id } else { id % 10 };
+            for id in 1..=60 {
+                let values = match name {
+                    "multi_column" => vec![Value::Integer(key(id)), Value::Integer(id)],
+                    _ => vec![Value::Integer(key(id))],
+                };
+                index.add(&values, id, id).unwrap();
+            }
+            let mut buffer = vec![-1, -1];
+            index.get_row_ids_in_into(&members, &mut buffer);
+            let mut rows = buffer.split_off(2);
+            assert_eq!(buffer, vec![-1, -1], "{name}: the buffer's rows are kept");
+            rows.sort_unstable();
+            let mut want: Vec<i64> = (1..=60)
+                .filter(|&id| members.iter().any(|m| *m == Value::Integer(key(id))))
+                .collect();
+            want.sort_unstable();
+            assert_eq!(rows, want, "{name}: each matching row once");
+        }
+    }
+}
+
+#[cfg(test)]
 mod seal_removal_tests {
     use super::*;
     use crate::common::i64_map::slot_visits;
@@ -74,7 +107,7 @@ mod seal_removal_tests {
     const FIRST: i64 = 10_000_000;
     const ROWS: i64 = 200_000;
 
-    fn indexes() -> Vec<(&'static str, Box<dyn Index>)> {
+    pub(super) fn indexes() -> Vec<(&'static str, Box<dyn Index>)> {
         let cols = || (vec!["k".to_string()], vec![1], vec![DataType::Integer]);
         let (hn, hi, ht) = cols();
         let (bn, bi, bt) = cols();
