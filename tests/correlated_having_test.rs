@@ -15,7 +15,18 @@
 //! A subquery that reads the outer row only in its HAVING is correlated on
 //! every path that asks whether a WHERE is
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::Database;
+
+// The classification cache is process-wide, and dropping a database clears it
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    stoolap::executor::clear_classification_cache();
+    guard
+}
 
 fn ids(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
     let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
@@ -78,16 +89,19 @@ fn check_twins(db: &Database, correlated_first: bool) {
 
 #[test]
 fn a_correlated_subquery_after_its_uncorrelated_twin_reads_the_outer_row() {
+    let _serial = serial();
     check_twins(&create("memory://correlated_after_its_twin"), false);
 }
 
 #[test]
 fn an_uncorrelated_subquery_after_its_correlated_twin_answers_alike() {
+    let _serial = serial();
     check_twins(&create("memory://uncorrelated_after_its_twin"), true);
 }
 
 #[test]
 fn a_subquery_reading_the_outer_row_in_its_having_is_correlated() {
+    let _serial = serial();
     let db = create("memory://a_subquery_reading_the_outer_row_in_its_having");
     let having = "(SELECT COUNT(*) FROM u HAVING COUNT(*) > t.k) = 2";
     let mut failed = Vec::new();
