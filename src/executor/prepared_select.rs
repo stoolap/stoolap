@@ -6947,9 +6947,11 @@ impl Executor {
         let streamed = |scan: Box<dyn Scanner>, bound| -> Result<PreparedOutput> {
             let distinct = distinct
                 .ok_or_else(|| Error::internal("a prepared statement streamed its scan"))?;
-            // Without an ORDER BY the first rows a LIMIT keeps end the read
-            let wanted =
-                super::row_count::rows_needed(stmt, ctx).filter(|_| stmt.order_by.is_empty());
+            // Without an ORDER BY the first rows a LIMIT keeps end the read;
+            // a set operation's LIMIT counts its own rows, not the branch's
+            let branch = !stmt.set_operations.is_empty();
+            let wanted = super::row_count::rows_needed(stmt, ctx)
+                .filter(|_| stmt.order_by.is_empty() && !branch);
             let projection = &prepared.projection;
             let rows =
                 self.distinct_scan(scan, bound, &runner, projection, distinct, wanted, ctx)?;
@@ -6960,7 +6962,8 @@ impl Executor {
                 false,
                 prepared.visible,
                 prepared.layout.clone(),
-                true,
+                // A branch's DISTINCT leaves the whole statement's to run
+                !branch,
             ))
         };
         let mut rows = match read? {

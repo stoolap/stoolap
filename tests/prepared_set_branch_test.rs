@@ -94,6 +94,10 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT a, b FROM t WHERE c > {sq} UNION SELECT a, b FROM t WHERE id < 10 \
          ORDER BY 2 DESC, 1 NULLS FIRST LIMIT 4 OFFSET 2",
         "SELECT a FROM t WHERE c > {sq} UNION SELECT a FROM t WHERE id < 10 LIMIT 3",
+        "SELECT a FROM t WHERE c > {sq} INTERSECT SELECT a FROM t WHERE a > 3 LIMIT 1",
+        "SELECT a FROM t WHERE c > {sq} EXCEPT SELECT a FROM t WHERE a < 3 LIMIT 2",
+        "SELECT DISTINCT a FROM t WHERE c > {sq} UNION SELECT 1 UNION ALL SELECT 1",
+        "SELECT DISTINCT a FROM t WHERE c > {sq} EXCEPT SELECT 2 UNION ALL SELECT a FROM w",
         "SELECT a FROM t WHERE c > {sq} AND id > $1 INTERSECT SELECT a FROM t WHERE id < 20",
         "SELECT a + 1 AS a1 FROM t WHERE c > {sq} UNION SELECT a FROM t WHERE id < 10",
     ] {
@@ -101,9 +105,15 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         let general = shape.replace("{sq}", GENERAL);
         let (got, want) = (answer(db, &prepared), answer(db, &general));
         // A LIMIT without ORDER BY may keep any rows of the answer
-        if shape.contains("LIMIT 3") {
-            match (&got, &answer(db, &general.replace(" LIMIT 3", ""))) {
-                (Ok(got), Ok(all)) if got.len() == 3 && got.iter().all(|r| all.contains(r)) => {}
+        let unordered_limit = general
+            .rsplit_once(" LIMIT ")
+            .filter(|_| !shape.contains("ORDER BY"));
+        if let Some((all, limit)) = unordered_limit {
+            let limit: usize = limit.parse().unwrap();
+            match (&got, &answer(db, all)) {
+                (Ok(got), Ok(all))
+                    if got.len() == limit.min(all.len()) && got.iter().all(|r| all.contains(r)) => {
+                }
                 _ => wrong.push(format!("{phase}: {shape}\n  got  {got:?}")),
             }
         } else if got != want {
