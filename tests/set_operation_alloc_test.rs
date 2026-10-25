@@ -27,6 +27,7 @@ struct ThreadCounting;
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for ThreadCounting {
@@ -34,6 +35,7 @@ unsafe impl GlobalAlloc for ThreadCounting {
     // thread-local Cell, which never allocates
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.with(|a| a.set(a.get() + 1));
+        BYTES.with(|b| b.set(b.get() + layout.size()));
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -41,6 +43,7 @@ unsafe impl GlobalAlloc for ThreadCounting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.with(|a| a.set(a.get() + 1));
+        BYTES.with(|b| b.set(b.get() + new_size));
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -50,11 +53,21 @@ static COUNTING: ThreadCounting = ThreadCounting;
 
 /// The rows of `sql`'s second run and the allocations it took
 fn allocations(db: &Database, sql: &str) -> (usize, usize) {
+    let (count, allocations, _) = measured(db, sql);
+    (count, allocations)
+}
+
+/// The rows of `sql`'s second run, its allocations and the bytes they asked
+fn measured(db: &Database, sql: &str) -> (usize, usize, usize) {
     let rows = |db: &Database| db.query(sql, ()).unwrap().count();
     rows(db);
-    let before = ALLOCATIONS.with(Cell::get);
+    let (allocations, bytes) = (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get));
     let count = rows(db);
-    (count, ALLOCATIONS.with(Cell::get) - before)
+    (
+        count,
+        ALLOCATIONS.with(Cell::get) - allocations,
+        BYTES.with(Cell::get) - bytes,
+    )
 }
 
 #[cfg(not(feature = "test-filedb"))]
@@ -81,4 +94,34 @@ fn a_deduplicating_set_operation_copies_the_rows_it_keeps() {
             "{allocations} allocations for {rows} values of 20000 rows: {sql}"
         );
     }
+    let (_, grouped) = allocations(&db, "SELECT id FROM d GROUP BY id");
+    let sql = "SELECT g FROM d WHERE id < 3 UNION SELECT id FROM d GROUP BY id";
+    let (count, union) = allocations(&db, sql);
+    assert_eq!(count, 20000, "{sql}");
+    assert!(
+        union < grouped + 2000,
+        "{union} allocations against the branch's own {grouped}: {sql}"
+    );
+}
+
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_set_operation_keeping_no_row_asks_no_room_for_them() {
+    let db = Database::open("memory://set_operation_room").unwrap();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    // More rows than a pooled row buffer holds, so each buffer is asked anew
+    db.execute(
+        "INSERT INTO d SELECT value FROM generate_series(1, 70000)",
+        (),
+    )
+    .unwrap();
+    let (_, _, union) = measured(&db, "SELECT id FROM d UNION SELECT id FROM d WHERE id < 0");
+    let sql = "SELECT id FROM d INTERSECT SELECT id FROM d WHERE id < 0";
+    let (count, _, intersect) = measured(&db, sql);
+    assert_eq!(count, 0, "{sql}");
+    assert!(
+        intersect < union + 64 * 1024,
+        "{intersect} bytes against the UNION's {union}: {sql}"
+    );
 }

@@ -325,8 +325,12 @@ impl Running {
                 Running::Set(kept)
             }
             distinct => {
-                let rows = distinct.into_rows().into_iter().map(|(_, row)| row);
-                Running::Distinct((0i64..).zip(rows.filter(|row| keep(row))).collect())
+                let mut rows = distinct.into_rows();
+                rows.retain(|(_, row)| keep(row));
+                for (id, (row_id, _)) in (0i64..).zip(rows.iter_mut()) {
+                    *row_id = id;
+                }
+                Running::Distinct(rows)
             }
         }
     }
@@ -370,13 +374,12 @@ impl RowSet {
         }
     }
 
-    /// Keeps a copy of each row of `result` whose value it does not hold;
-    /// a row it holds is read in place and never copied
+    /// Takes each row of `result` whose value it does not hold; a row it
+    /// holds is read in place and never taken
     fn read(&mut self, mut result: Box<dyn QueryResult>) -> Result<()> {
         while result.next() {
-            let row = result.row();
-            if let Some(at) = self.place(row) {
-                self.rows.push((at as i64, row.clone()));
+            if let Some(at) = self.place(result.row()) {
+                self.rows.push((at as i64, result.take_row()));
             }
         }
         match result.last_error() {
