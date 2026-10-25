@@ -135,6 +135,22 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
 
 /// The names a FROM tree shows: each entry's alias, else its own name
 fn from_names<'a>(source: &'a Expression, scope: &mut Scope<'a, '_>) {
+    visit_from_names(source, &mut |shown, hidden| {
+        scope.visible.push(shown);
+        scope.hidden.extend(hidden);
+    });
+}
+
+/// Whether a FROM tree shows `name`, lowercased, as one of its entries: a
+/// qualifier it does not show names an enclosing query's entry
+pub(crate) fn from_shows(source: &Expression, name: &str) -> bool {
+    let mut shows = false;
+    visit_from_names(source, &mut |shown, _| shows |= shown == name);
+    shows
+}
+
+/// Each name a FROM tree shows, lowercased, with the table name its alias hides
+fn visit_from_names<'a>(source: &'a Expression, visit: &mut dyn FnMut(&'a str, Option<&'a str>)) {
     let (name, alias) = match source {
         Expression::TableSource(t) => (Some(&t.name), t.alias.as_ref()),
         Expression::CteReference(c) => (Some(&c.name), c.alias.as_ref()),
@@ -142,18 +158,15 @@ fn from_names<'a>(source: &'a Expression, scope: &mut Scope<'a, '_>) {
         Expression::SubquerySource(s) => (None, s.alias.as_ref()),
         Expression::ValuesSource(v) => (None, v.alias.as_ref()),
         Expression::JoinSource(j) => {
-            from_names(&j.left, scope);
-            from_names(&j.right, scope);
+            visit_from_names(&j.left, visit);
+            visit_from_names(&j.right, visit);
             return;
         }
         _ => return,
     };
     match (alias, name) {
-        (Some(alias), name) => {
-            scope.visible.push(&alias.value_lower);
-            scope.hidden.extend(name.map(|n| n.value_lower.as_str()));
-        }
-        (None, Some(name)) => scope.visible.push(&name.value_lower),
+        (Some(alias), name) => visit(&alias.value_lower, name.map(|n| n.value_lower.as_str())),
+        (None, Some(name)) => visit(&name.value_lower, None),
         (None, None) => {}
     }
 }
