@@ -107,13 +107,10 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
     (h1.finish(), h2.finish())
 }
 
-/// `program` with the parameters it loads bound to `params`, or as it is
-/// when it loads none
+/// `program` with the parameters it loads bound to `params`, see
+/// [`Program::bound`]
 pub(crate) fn bind_params(program: SharedProgram, params: &[Value]) -> SharedProgram {
-    match program.bind(params) {
-        Some(bound) => CompactArc::new(bound),
-        None => program,
-    }
+    Program::bound(program, params)
 }
 
 /// Each aliased slot at the width the program loads it with
@@ -2075,5 +2072,52 @@ mod tests {
     fn test_compiled_evaluator_default() {
         let eval = CompiledEvaluator::default();
         assert!(eval.columns.is_empty());
+    }
+
+    fn where_of(sql: &str) -> Expression {
+        match crate::parser::parse_sql(sql).unwrap().remove(0) {
+            crate::parser::ast::Statement::Select(select) => *select.where_clause.unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn context(value: i64) -> ExecutionContext {
+        ExecutionContext::with_params(ParamVec::from_iter([Value::Integer(value)]))
+    }
+
+    #[test]
+    fn a_filter_given_another_context_reads_its_parameters() {
+        let expr = where_of("SELECT 1 FROM t WHERE a = $1");
+        let columns = vec!["a".to_string()];
+        let row = Row::from(vec![Value::Integer(2)]);
+
+        let filter = RowFilter::new(&expr, &columns)
+            .unwrap()
+            .with_context(&context(1))
+            .with_context(&context(2));
+        assert!(
+            filter.matches_checked(&row).unwrap(),
+            "RowFilter kept $1 = 1"
+        );
+
+        let mut eval = ExpressionEval::compile(&expr, &columns)
+            .unwrap()
+            .with_context(&context(1))
+            .with_context(&context(2));
+        assert!(
+            eval.eval_bool_checked(&row).unwrap(),
+            "ExpressionEval kept $1 = 1"
+        );
+
+        let right = vec!["b".to_string()];
+        let join = JoinFilter::new(&expr, &columns, &right, global_registry())
+            .unwrap()
+            .with_context(&context(1))
+            .with_context(&context(2));
+        let mut failed = false;
+        assert!(
+            join.matches(&row, &Row::from(vec![Value::Integer(0)]), &mut failed),
+            "JoinFilter kept $1 = 1"
+        );
     }
 }

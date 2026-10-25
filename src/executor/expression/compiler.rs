@@ -1847,12 +1847,11 @@ fn run_fold(program: &Program, params: &[Value]) -> Option<Value> {
 }
 
 /// The value the ops of a range the compiler marked to fold give, their
-/// parameters bound in; None when it errors, and the ops run per row
-pub(crate) fn fold_ops(ops: &[Op]) -> Option<Value> {
-    let mut program = Vec::with_capacity(ops.len() + 1);
-    program.extend_from_slice(ops);
-    program.push(Op::Return);
-    run_fold(&Program::new_unoptimized(program), &[])
+/// parameters bound in and their jumps relative to the range; None when it
+/// errors, and the ops run per row
+pub(crate) fn fold_ops(mut ops: Vec<Op>) -> Option<Value> {
+    ops.push(Op::Return);
+    run_fold(&Program::new_unoptimized(ops), &[])
 }
 
 /// The test of a value against an IN list of the constants `values`, NULL
@@ -1920,6 +1919,15 @@ pub(crate) fn bound_consumer(
 /// builds again once they are known
 pub(crate) fn takes_values(op: &Op) -> bool {
     Consumer::of(op).is_some()
+}
+
+/// How many values loaded before `op` it takes, when it takes any
+pub(crate) fn values_taken(op: &Op) -> Option<usize> {
+    Some(match Consumer::of(op)? {
+        Consumer::List(count) => count,
+        Consumer::ReadAs(_) | Consumer::Pattern(_) => 1,
+        Consumer::EscapedLike(_) => 2,
+    })
 }
 
 /// An op reading values loaded before it, which the compiler builds

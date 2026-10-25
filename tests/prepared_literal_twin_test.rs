@@ -16,15 +16,16 @@
 //! blocks bound to the values one execution reads, are op for op the
 //! programs of the statement with those values written as literals. A
 //! parameter or run slot left to load its value per row, which costs what
-//! loading the constant does, counts as that constant.
-
-#![cfg(feature = "test-failpoints")]
+//! loading the constant does, counts as that constant. Each also answers
+//! what its twin answers.
 
 use stoolap::core::Value;
+#[cfg(feature = "test-failpoints")]
 use stoolap::test_failpoints::programs_ran;
 use stoolap::Database;
 
 /// A program the VM entered at least this often ran per row or per group
+#[cfg(feature = "test-failpoints")]
 const PER_ROW: usize = 3;
 
 fn open(name: &str) -> Database {
@@ -42,6 +43,7 @@ fn open(name: &str) -> Database {
 }
 
 /// The per-row programs one execution of `sql` with `params` ran
+#[cfg(feature = "test-failpoints")]
 fn row_programs(db: &Database, sql: &str, params: &[Value]) -> Result<Vec<String>, String> {
     let stmt = db.prepare(sql).map_err(|e| e.to_string())?;
     let run = |params: Vec<Value>| -> Result<(), String> {
@@ -55,15 +57,7 @@ fn row_programs(db: &Database, sql: &str, params: &[Value]) -> Result<Vec<String
     };
     // A first execution, with other values, compiles and caches what the
     // plan keeps: what it bound must not reach the next
-    let other = params
-        .iter()
-        .map(|value| match value {
-            Value::Integer(n) => Value::Integer(n + 100),
-            Value::Text(s) => Value::text(format!("{s}z")),
-            value => value.clone(),
-        })
-        .collect();
-    run(other)?;
+    run(other_values(params))?;
     let mut failed = None;
     let ran = programs_ran(|| failed = run(params.to_vec()).err());
     match failed {
@@ -83,6 +77,7 @@ fn row_programs(db: &Database, sql: &str, params: &[Value]) -> Result<Vec<String
 
 /// `listing` with each parameter load read as the load of its value, and a
 /// NULL constant as a NULL literal loads
+#[cfg(feature = "test-failpoints")]
 fn as_constants(mut listing: String, params: &[Value]) -> String {
     for (slot, value) in params.iter().enumerate() {
         listing = listing.replace(
@@ -95,6 +90,7 @@ fn as_constants(mut listing: String, params: &[Value]) -> String {
 
 /// Whether `ran` are `literal` op for op, a run slot's load, which costs
 /// what loading its value does, counting as the constant's
+#[cfg(feature = "test-failpoints")]
 fn same_programs(ran: &[String], literal: &[String]) -> bool {
     let load = |op: &str| op.starts_with("LoadConst(") || op.starts_with("LoadNull(");
     ran.len() == literal.len()
@@ -108,13 +104,71 @@ fn same_programs(ran: &[String], literal: &[String]) -> bool {
         })
 }
 
+/// What one execution of `sql` with `params` answers, after one with other
+/// values: its rows in order, or the rows a write changed
+fn answer(db: &Database, sql: &str, params: &[Value]) -> Result<Vec<String>, String> {
+    let stmt = db.prepare(sql).map_err(|e| e.to_string())?;
+    let run = |params: Vec<Value>| -> Result<Vec<String>, String> {
+        if sql.starts_with("SELECT") {
+            let mut rows = Vec::new();
+            for row in stmt.query(params).map_err(|e| e.to_string())? {
+                let row = row.map_err(|e| e.to_string())?;
+                rows.push(format!("{:?}", row.as_row()));
+            }
+            return Ok(rows);
+        }
+        stmt.execute(params)
+            .map(|n| vec![n.to_string()])
+            .map_err(|e| e.to_string())
+    };
+    let _ = run(other_values(params));
+    run(params.to_vec())
+}
+
+/// `params` changed, for an execution before the one a test reads
+fn other_values(params: &[Value]) -> Vec<Value> {
+    params
+        .iter()
+        .map(|value| match value {
+            Value::Integer(n) => Value::Integer(n + 100),
+            Value::Text(s) => Value::text(format!("{s}z")),
+            value => value.clone(),
+        })
+        .collect()
+}
+
 #[test]
-fn a_bound_statement_runs_its_literal_twins_programs() {
-    let db = open("prepared_literal_twin");
+fn a_bound_statement_answers_as_its_literal_twin() {
+    let db = open("prepared_literal_twin_answers");
+    let mut wrong = Vec::new();
+    for (sql, params, twin) in &shapes() {
+        let bound = answer(&db, sql, params);
+        let literal = answer(&db, twin, &[]);
+        if bound != literal {
+            wrong.push(format!(
+                "{sql} {params:?}\n  ran     {bound:?}\n  literal {literal:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Each statement shape: the statement, its values, and the statement with
+/// the values as literals
+fn shapes() -> Vec<(&'static str, Vec<Value>, &'static str)> {
     let int = Value::Integer;
     let text = |s: &str| Value::text(s);
-    // (statement, its values, the statement with the values as literals)
-    let shapes: Vec<(&str, Vec<Value>, &str)> = vec![
+    vec![
+        (
+            "SELECT id + (COALESCE($1, 2) + 3) FROM t",
+            vec![int(1)],
+            "SELECT id + (COALESCE(1, 2) + 3) FROM t",
+        ),
+        (
+            "SELECT id FROM t WHERE (a IN ($1, $2)) IS TRUE",
+            vec![int(6), int(1)],
+            "SELECT id FROM t WHERE (a IN (6, 1)) IS TRUE",
+        ),
         (
             "SELECT COUNT(*) FROM t WHERE (a = $1) IS TRUE",
             vec![int(6)],
@@ -367,9 +421,15 @@ fn a_bound_statement_runs_its_literal_twins_programs() {
             vec![int(1)],
             "UPDATE t SET b = b WHERE a = 6 OR b + 1 = 4",
         ),
-    ];
+    ]
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_bound_statement_runs_its_literal_twins_programs() {
+    let db = open("prepared_literal_twin");
     let mut wrong = Vec::new();
-    for (sql, params, twin) in &shapes {
+    for (sql, params, twin) in &shapes() {
         let bound = row_programs(&db, sql, params);
         let literal = row_programs(&db, twin, &[]);
         let same = match (&bound, &literal) {

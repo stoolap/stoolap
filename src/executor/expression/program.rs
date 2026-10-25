@@ -22,6 +22,7 @@
 use smallvec::SmallVec;
 
 use super::ops::Op;
+use crate::common::CompactArc;
 use crate::core::Value;
 
 /// Compiled expression program
@@ -55,6 +56,9 @@ pub struct Program {
     /// What binding the program to its execution's parameters reads, for a
     /// program that loads one
     binding: Option<Box<Binding>>,
+
+    /// The program this one was bound from, which a later bind binds again
+    bound_from: Option<CompactArc<Program>>,
 
     /// Source expression string (for debugging)
     #[cfg(debug_assertions)]
@@ -98,6 +102,7 @@ impl Program {
             has_subqueries,
             cow_supported,
             binding,
+            bound_from: None,
             #[cfg(debug_assertions)]
             source: None,
         }
@@ -135,6 +140,7 @@ impl Program {
             has_subqueries,
             cow_supported,
             binding,
+            bound_from: None,
             #[cfg(debug_assertions)]
             source: None,
         }
@@ -186,6 +192,20 @@ impl Program {
         shrinks.then_some(bound)
     }
 
+    /// `program` bound to `params`, from the program it was bound from when
+    /// it was bound before; that program as it is when binding does not
+    /// shrink it
+    pub fn bound(program: CompactArc<Program>, params: &[Value]) -> CompactArc<Program> {
+        let source = program.bound_from.clone().unwrap_or(program);
+        match source.bind(params) {
+            Some(mut bound) => {
+                bound.bound_from = Some(source);
+                CompactArc::new(bound)
+            }
+            None => source,
+        }
+    }
+
     /// Whether this program loads a parameter and a bind found that binding
     /// the parameters never shrinks it
     pub fn bind_never_shrinks(&self) -> bool {
@@ -214,7 +234,7 @@ impl Program {
         for (at, op) in replaced {
             source[at] = op;
         }
-        let folded = self.folded(&source, &replaced_at, &targets);
+        let folded = self.folded(&mut source, &replaced_at);
         let mut ops: Vec<Op> = Vec::with_capacity(source.len());
         // Of each op emitted: whether it loads a value known only now, and
         // the first position it stands for
@@ -247,7 +267,8 @@ impl Program {
                     *position = first;
                 }
                 ops.push(taken);
-                emitted.push((false, at));
+                // Built from a value known only now, as a value it is one too
+                emitted.push((true, at));
                 if takes_next {
                     position_map.push(first);
                     at = next + 1;
@@ -277,6 +298,7 @@ impl Program {
         emitted: &[(bool, usize)],
         targets: &JumpTargets,
     ) -> Option<(usize, bool, Op)> {
+        let needed = super::compiler::values_taken(op)?;
         if !matches!(ops.last(), Some(Op::LoadConst(_) | Op::LoadNull(_))) || targets.contains(&at)
         {
             return None;
@@ -284,6 +306,7 @@ impl Program {
         let mut values: SmallVec<[Value; 4]> = ops
             .iter()
             .rev()
+            .take(needed)
             .map_while(|op| match op {
                 Op::LoadConst(value) => Some(value.clone()),
                 Op::LoadNull(data_type) => Some(Value::Null(*data_type)),
@@ -306,12 +329,12 @@ impl Program {
 
     /// The marked ranges of `source` that fold now, with their values: each
     /// that holds an op replaced at `replaced`, the outermost first; one
-    /// whose fold errors leaves the ranges inside it to fold
+    /// whose fold errors, or that a jump crosses, leaves the ranges inside
+    /// it to fold
     fn folded(
         &self,
-        source: &[Op],
+        source: &mut [Op],
         replaced: &[usize],
-        targets: &JumpTargets,
     ) -> SmallVec<[(usize, usize, Value); 2]> {
         let marked = self.binding.as_deref().map_or(&[][..], |b| &b.folds[..]);
         let mut folds: SmallVec<[(usize, usize); 4]> = marked
@@ -325,15 +348,41 @@ impl Program {
             if folded.iter().any(|(s, e, _)| start >= *s && end <= *e) {
                 continue;
             }
-            debug_assert!(
-                !(start + 1..end).any(|position| targets.contains(&position)),
-                "a jump lands inside a range marked to fold"
-            );
-            if let Some(value) = super::compiler::fold_ops(&source[start..end]) {
+            let Some(range) = Self::fold_range(source, start, end) else {
+                continue;
+            };
+            if let Some(value) = super::compiler::fold_ops(range) {
                 folded.push((start, end, value));
             }
         }
         folded
+    }
+
+    /// The ops of `source[start..end]` as a program of their own, their
+    /// jumps moved with them; None when a jump crosses the range's edge
+    /// other than into its start or out to its end
+    fn fold_range(source: &mut [Op], start: usize, end: usize) -> Option<Vec<Op>> {
+        let (before, rest) = source.split_at_mut(start);
+        let (inside, after) = rest.split_at_mut(end - start);
+        let entered = before
+            .iter_mut()
+            .chain(after.iter_mut())
+            .filter_map(jump_target)
+            .any(|target| (start + 1..end).contains(&usize::from(*target)));
+        if entered {
+            return None;
+        }
+        // Room for the Return the fold ends it with
+        let mut range = Vec::with_capacity(inside.len() + 1);
+        range.extend_from_slice(inside);
+        for target in range.iter_mut().filter_map(jump_target) {
+            let at = usize::from(*target);
+            if !(start..=end).contains(&at) {
+                return None;
+            }
+            *target = u16::try_from(at - start).ok()?;
+        }
+        Some(range)
     }
 
     /// Create an empty program that returns NULL
@@ -1330,5 +1379,26 @@ mod tests {
         );
         assert_eq!(copied.as_str(), "^a");
         assert!(!Program::constant(Value::Integer(1)).holds_thread_state());
+    }
+
+    #[test]
+    fn values_read_as_the_column_bind_into_the_in_list_after_them() {
+        let program = Program::new_unoptimized(vec![
+            Op::LoadColumn(0),
+            Op::LoadParam(0),
+            Op::ReadAsColumn(crate::core::DataType::Integer),
+            Op::LoadParam(1),
+            Op::ReadAsColumn(crate::core::DataType::Integer),
+            Op::InList(2),
+            Op::Return,
+        ]);
+        let bound = program
+            .bind(&[Value::Integer(6), Value::Float(1.0)])
+            .expect("the parameters bind");
+        let listing = format!("{:?}", bound.ops());
+        assert!(
+            !listing.contains("InList"),
+            "the list binds to a set test: {listing}"
+        );
     }
 }
