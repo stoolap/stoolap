@@ -39,14 +39,20 @@ fn open(name: &str, sealed: bool, dir: &tempfile::TempDir) -> (Database, String)
     (db, dsn)
 }
 
+/// Each row's values with their types, one string per row
 fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     db.query(sql, ())
         .and_then(|rows| {
             rows.map(|row| {
-                row.map(|row| match row.get_value(0).cloned() {
-                    Some(Value::Timestamp(ts)) => ts.to_rfc3339(),
-                    Some(value) => value.to_string(),
-                    None => "NULL".into(),
+                row.map(|row| {
+                    (0..row.len())
+                        .map(|i| match row.get_value(i) {
+                            Some(Value::Timestamp(ts)) => ts.to_rfc3339(),
+                            Some(value) => format!("{value:?}"),
+                            None => "missing".into(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 })
             })
             .collect()
@@ -63,15 +69,21 @@ fn a_timestamp_past_the_stored_range_is_computed_with() {
     for sealed in [false, true] {
         let (db, _) = open(&format!("timestamp_range_computed_{sealed}"), sealed, &dir);
         for (sql, want) in [
-            ("SELECT id FROM t WHERE ts < '9999-12-31'", vec!["1"]),
-            ("SELECT id FROM t WHERE ts > '1600-01-01'", vec!["1"]),
+            (
+                "SELECT id FROM t WHERE ts < '9999-12-31'",
+                vec!["Integer(1)"],
+            ),
+            (
+                "SELECT id FROM t WHERE ts > '1600-01-01'",
+                vec!["Integer(1)"],
+            ),
             (
                 "SELECT id FROM t WHERE ts BETWEEN '1000-01-01' AND '9999-12-31'",
-                vec!["1"],
+                vec!["Integer(1)"],
             ),
             (
                 "SELECT id FROM t WHERE ts < TIMESTAMP '3000-01-01'",
-                vec!["1"],
+                vec!["Integer(1)"],
             ),
             ("SELECT id FROM t WHERE ts >= '3000-01-01'", vec![]),
             (
@@ -174,7 +186,69 @@ fn a_time_past_the_range_is_an_error_where_it_becomes_nanoseconds() {
             &db,
             "SELECT id FROM t AS OF TIMESTAMP '2262-01-01 00:00:00' ORDER BY id"
         ),
-        Ok(vec!["1".to_string(), "2".to_string()]),
+        Ok(vec!["Integer(1)".to_string(), "Integer(2)".to_string()]),
         "a time inside the range reads the rows"
     );
+}
+
+#[test]
+fn a_schema_change_that_would_store_a_timestamp_past_the_range_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let (db, dsn) = open(&format!("timestamp_range_schema_{sealed}"), sealed, &dir);
+        for sql in [
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT)",
+            "INSERT INTO u VALUES (1, '9999-12-31'), (2, '2024-01-01')",
+            // d's default is what a volume sealed before d was added reads
+            "ALTER TABLE u ADD COLUMN d TEXT DEFAULT '9999-12-31'",
+            "UPDATE u SET d = '2024-01-01'",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        let before = [
+            rows(&db, STORED).unwrap(),
+            rows(&db, "SELECT * FROM u ORDER BY id").unwrap(),
+        ];
+        for sql in [
+            "ALTER TABLE t ADD COLUMN far TIMESTAMP DEFAULT '9999-12-31'",
+            "ALTER TABLE t ADD COLUMN far TIMESTAMP DEFAULT TIMESTAMP '1600-01-01'",
+            "ALTER TABLE u MODIFY COLUMN s TIMESTAMP",
+            "ALTER TABLE u MODIFY COLUMN d TIMESTAMP",
+        ] {
+            match db.execute(sql, ()) {
+                Err(e) if e.to_string().contains("outside the range") => {}
+                other => wrong.push(format!("sealed {sealed}: {sql} gave {other:?}")),
+            }
+            let now = [
+                rows(&db, STORED).unwrap(),
+                rows(&db, "SELECT * FROM u ORDER BY id").unwrap(),
+            ];
+            if now != before {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql} left {now:?}, was {before:?}"
+                ));
+            }
+        }
+        if let Err(e) = db.execute("PRAGMA CHECKPOINT", ()) {
+            wrong.push(format!(
+                "sealed {sealed}: the checkpoint after the refusals gave {e}"
+            ));
+        }
+        db.close().unwrap();
+        if sealed {
+            let db = Database::open(&dsn).unwrap();
+            let reopened = [
+                rows(&db, STORED).unwrap(),
+                rows(&db, "SELECT * FROM u ORDER BY id").unwrap(),
+            ];
+            if reopened != before {
+                wrong.push(format!("reopened {reopened:?}, was {before:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

@@ -24,7 +24,7 @@ CREATE TABLE events (
 
 A TIMESTAMP is computed with between `0000-01-01 00:00:00` and `9999-12-31 23:59:59.999999999`: a comparison, a `CAST` or a literal such as `'9999-12-31'` reads it in full. Moving a timestamp by an INTERVAL or a number of days (`+`, `-`, `DATE_ADD`, `DATE_SUB`) to a point outside that range is an error.
 
-A table stores a TIMESTAMP as nanoseconds since 1970-01-01, which holds `1677-09-21 00:12:43.145224192` to `2262-04-11 23:47:16.854775807` UTC. Writing one outside that range with `INSERT`, `UPDATE` or an upsert is an error and writes nothing, as is reading a table `AS OF TIMESTAMP` a time outside it, `TIME_TRUNC` of one, and handing one to a driver through the C API. For "no end", store NULL rather than a far date such as `9999-12-31`.
+A table stores a TIMESTAMP as nanoseconds since 1970-01-01, which holds `1677-09-21 00:12:43.145224192` to `2262-04-11 23:47:16.854775807` UTC. Writing one outside that range with `INSERT`, `UPDATE` or an upsert, or giving one to the existing rows with `ALTER TABLE ... ADD COLUMN ... DEFAULT` or `MODIFY COLUMN`, is an error and changes nothing, as is reading a table `AS OF TIMESTAMP` a time outside it, `TIME_TRUNC` of one, and handing one to a driver through the C API. For "no end", store NULL rather than a far date such as `9999-12-31`.
 
 Before version 0.5.0 such a value was accepted and, once its table was written to disk, read back as another time; `'9999-12-31 23:59:59'`, for example, came back as `1816-03-30 05:56:07.066277376`. A value written that way is still in its table. A row of a table that is not yet on disk and holds one makes the table refuse to be written to disk, with the row named in the error, until that row is updated.
 

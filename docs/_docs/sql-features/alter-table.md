@@ -18,7 +18,7 @@ ALTER TABLE users ADD COLUMN last_login TIMESTAMP;
 ALTER TABLE users ADD COLUMN score INTEGER;
 ```
 
-Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL and DEFAULT; a CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and so is a DEFAULT holding a subquery, an aggregate or a window function; the table is left unchanged. Subsequent inserts can provide values for the new column:
+Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL and DEFAULT; a CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and so is a DEFAULT holding a subquery, an aggregate or a window function, or a TIMESTAMP outside the range a table stores (`1677-09-21` to `2262-04-11`); the table is left unchanged. Subsequent inserts can provide values for the new column:
 
 ```sql
 INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
@@ -61,6 +61,7 @@ Every existing value is converted to the new type, in memory and in the frozen v
 - the column is the primary key, a foreign key column, or a column a foreign key references;
 - an index on the column cannot hold the new type (an HNSW index holds only vectors of a known dimension);
 - a converted value is NULL and the column is NOT NULL;
+- the column becomes a TIMESTAMP and a converted value, or the default an added column gave the rows before it, lies outside the range a table stores (`1677-09-21` to `2262-04-11`);
 - two rows would hold the same key of a UNIQUE index once converted (for example `'7'` and `'07'` changed to INTEGER);
 - the column becomes a VECTOR of another dimension and a row holds a vector of the old one (values are never padded or cut).
 

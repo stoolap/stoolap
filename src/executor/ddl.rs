@@ -1085,6 +1085,10 @@ impl Executor {
                     } else {
                         None
                     };
+                    // The existing rows take the default: it must be storable
+                    if let Some(crate::core::Value::Timestamp(t)) = &default_value {
+                        crate::core::value::timestamp_in_range(*t)?;
+                    }
 
                     let mut change = self.engine.begin_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
