@@ -87,6 +87,16 @@ UNION
 SELECT id FROM table4;
 ```
 
+`INTERSECT` binds tighter than `UNION` and `EXCEPT`, which bind equally and apply from left to right. Parentheses through a derived table group a chain any other way:
+
+```sql
+SELECT 2 AS x UNION SELECT 1 EXCEPT SELECT 2;
+-- (2, 1) EXCEPT (2): 1
+
+SELECT 1 AS x EXCEPT SELECT 1 UNION SELECT 3 INTERSECT SELECT 3;
+-- ((1) EXCEPT (1)) UNION ((3) INTERSECT (3)): 3
+```
+
 ## ORDER BY and LIMIT
 
 ORDER BY and LIMIT apply to the entire combined result set:
