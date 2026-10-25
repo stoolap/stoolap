@@ -1001,9 +1001,10 @@ impl Executor {
     }
 
     /// Each row id `index` holds for one of `members`, until `out` holds
-    /// `target`; false when the index does not answer for the view the
-    /// table reads: it holds neither the transaction's own writes nor, once
-    /// a commit the statement misses landed, its keys
+    /// `target`, members a doubling batch at a time; false when the index
+    /// does not answer for the view the table reads: it holds neither the
+    /// transaction's own writes nor, once a commit the statement misses
+    /// landed, its keys
     fn index_members<'v>(
         table: &dyn Table,
         index: &dyn crate::storage::traits::Index,
@@ -1012,15 +1013,17 @@ impl Executor {
         out: &mut Vec<i64>,
     ) -> bool {
         let epoch = table.index_view_epoch();
-        for value in members {
-            if target.is_some_and(|target| out.len() >= target) {
-                break;
+        // A NULL member equals nothing, so it is not looked up
+        let mut members = members.filter(|value| !value.is_null()).peekable();
+        match target {
+            None => index.get_row_ids_in_into(&mut members, out),
+            Some(target) => {
+                let mut batch = 1;
+                while out.len() < target && members.peek().is_some() {
+                    index.get_row_ids_in_into(&mut members.by_ref().take(batch), out);
+                    batch = batch.saturating_mul(2);
+                }
             }
-            // A NULL member equals nothing, so it is not looked up
-            if value.is_null() {
-                continue;
-            }
-            index.get_row_ids_equal_into(std::slice::from_ref(value), out);
         }
         epoch.is_some() && table.index_view_epoch() == epoch
     }
@@ -1418,16 +1421,7 @@ impl Executor {
             // NOT IN with non-PK index: fall back to normal scan
             return Ok(None);
         } else if let Some(ref idx) = index {
-            let epoch = table.index_view_epoch();
-            // Index probe for each value - use _into to avoid intermediate allocations
-            for value in &values {
-                // A NULL member equals nothing, so it is not looked up
-                if value.is_null() {
-                    continue;
-                }
-                idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
-            }
-            if epoch.is_none() || table.index_view_epoch() != epoch {
+            if !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids) {
                 return Ok(None);
             }
         }
@@ -1691,18 +1685,7 @@ impl Executor {
                 }
             }
         } else if let Some(ref idx) = index {
-            // The index holds neither the transaction's own writes nor, once
-            // a commit the statement misses landed, its keys
-            let epoch = table.index_view_epoch();
-            // Index probe for each value - use _into to avoid intermediate allocations
-            for value in &values {
-                // A NULL member equals nothing, so it is not looked up
-                if value.is_null() {
-                    continue;
-                }
-                idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
-            }
-            if epoch.is_none() || table.index_view_epoch() != epoch {
+            if !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids) {
                 return Ok(None);
             }
         }

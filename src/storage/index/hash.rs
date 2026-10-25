@@ -749,7 +749,11 @@ impl Index for HashIndex {
     }
 
     /// Optimized IN list lookup - acquires lock once for all values
-    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+    fn get_row_ids_in_into(
+        &self,
+        members: &mut dyn Iterator<Item = &Value>,
+        buffer: &mut Vec<i64>,
+    ) {
         if self.closed.load(AtomicOrdering::Acquire) {
             return;
         }
@@ -759,7 +763,7 @@ impl Index for HashIndex {
         let mut found: smallvec::SmallVec<[(*const IdList, &IdList); 16]> =
             smallvec::SmallVec::new();
 
-        for value in value_list {
+        for value in members {
             // Hash without cloning - pass reference to slice
             let hash = hash_values(std::slice::from_ref(value));
             if let Some(entries) = hash_to_values.get(&hash) {

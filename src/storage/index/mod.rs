@@ -83,7 +83,7 @@ mod in_list_tests {
                 index.add(&values, id, id).unwrap();
             }
             let mut buffer = vec![-1, -1];
-            index.get_row_ids_in_into(&members, &mut buffer);
+            index.get_row_ids_in_into(&mut members.iter(), &mut buffer);
             let mut rows = buffer.split_off(2);
             assert_eq!(buffer, vec![-1, -1], "{name}: the buffer's rows are kept");
             rows.sort_unstable();

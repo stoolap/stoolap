@@ -322,20 +322,26 @@ pub trait Index: Send + Sync {
     /// Pooled RowIdVec of row IDs matching any value in the list
     fn get_row_ids_in(&self, value_list: &[Value]) -> RowIdVec {
         let mut results = RowIdVec::new();
-        self.get_row_ids_in_into(value_list, &mut results);
+        self.get_row_ids_in_into(&mut value_list.iter(), &mut results);
         results
     }
 
-    /// Appends row IDs for values in the given list to the provided buffer,
-    /// each row once: members the index reads as one key, and a row moved
-    /// from one member's key to another's while the list is read, add it once
-    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+    /// Appends row IDs for the members to the provided buffer, each row
+    /// once: members the index reads as one key, and a row moved from one
+    /// member's key to another's while the members are read, add it once
+    fn get_row_ids_in_into(
+        &self,
+        members: &mut dyn Iterator<Item = &Value>,
+        buffer: &mut Vec<i64>,
+    ) {
         // Each member is probed under its own lock, so the rows are deduplicated
         let start = buffer.len();
-        for value in value_list {
+        let mut probed = 0usize;
+        for value in members {
             self.get_row_ids_equal_into(std::slice::from_ref(value), buffer);
+            probed += 1;
         }
-        if value_list.len() > 1 {
+        if probed > 1 {
             let mut seen = rustc_hash::FxHashSet::with_capacity_and_hasher(
                 buffer.len() - start,
                 Default::default(),

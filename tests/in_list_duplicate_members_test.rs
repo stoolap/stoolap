@@ -90,45 +90,60 @@ fn duplicate_members_return_each_row_once_hot_and_sealed() {
 #[test]
 fn a_row_cannot_move_between_two_member_probes() {
     let db = Database::open("memory://a_row_cannot_move_between_two_member_probes").unwrap();
-    let other = db.clone();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
-        (),
-    )
-    .unwrap();
-    db.execute("CREATE INDEX t_k ON t(k) USING BTREE", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (6, 3), (7, 1), (8, 2)", ())
-        .unwrap();
-    let (at_index, reached) = std::sync::mpsc::channel();
-    let (key_removed, removed) = std::sync::mpsc::channel();
-    let mover = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let mover_in_hook = std::rc::Rc::clone(&mover);
-    let moved_during_probe = std::rc::Rc::new(std::cell::Cell::new(false));
-    let moved_in_hook = std::rc::Rc::clone(&moved_during_probe);
-    stoolap::test_failpoints::after_in_member_probed(move || {
-        *mover_in_hook.borrow_mut() = Some(std::thread::spawn(move || {
-            stoolap::test_failpoints::before_commit_index_capture(move || {
-                let _ = at_index.send(());
-            });
-            stoolap::test_failpoints::after_commit_index_removed(move || {
-                let _ = key_removed.send(());
-            });
-            other
-                .execute("UPDATE t SET k = 2 WHERE id = 7", ())
-                .unwrap();
-        }));
-        reached
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the UPDATE reached its index changes");
-        let waited = removed.recv_timeout(std::time::Duration::from_millis(500));
-        moved_in_hook.set(waited.is_ok());
-    });
-    assert_eq!(ids(&db, "SELECT id FROM t WHERE k IN (1, 2)"), vec![7, 8]);
-    mover.borrow_mut().take().unwrap().join().unwrap();
-    assert!(
-        !moved_during_probe.get(),
-        "the row moved while the IN list's members were read"
-    );
-    assert_eq!(ids(&db, "SELECT id FROM t WHERE k = 2"), vec![7, 8]);
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, s TEXT)",
+        "CREATE INDEX t_k ON t(k) USING BTREE",
+        "INSERT INTO t VALUES (6, 3, 'a'), (7, 1, 'b'), (8, 2, 'c')",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO p VALUES (1, 1), (2, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut failed = Vec::new();
+    for sql in [
+        "SELECT id FROM t WHERE k IN (1, 2)",
+        "SELECT id FROM t WHERE k IN (1, 2) AND s || 'x' <> 'zx'",
+        "SELECT id FROM t WHERE k IN (SELECT a FROM p)",
+        "SELECT id FROM t WHERE k IN (SELECT a FROM p) AND s || 'x' <> 'zx'",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.a = t.k) AND s || 'x' <> 'zx'",
+    ] {
+        let other = db.clone();
+        let (at_index, reached) = std::sync::mpsc::channel();
+        let (key_removed, removed) = std::sync::mpsc::channel();
+        let mover = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mover_in_hook = std::rc::Rc::clone(&mover);
+        let moved_during_probe = std::rc::Rc::new(std::cell::Cell::new(false));
+        let moved_in_hook = std::rc::Rc::clone(&moved_during_probe);
+        stoolap::test_failpoints::after_in_member_probed(move || {
+            *mover_in_hook.borrow_mut() = Some(std::thread::spawn(move || {
+                stoolap::test_failpoints::before_commit_index_capture(move || {
+                    let _ = at_index.send(());
+                });
+                stoolap::test_failpoints::after_commit_index_removed(move || {
+                    let _ = key_removed.send(());
+                });
+                other
+                    .execute("UPDATE t SET k = 2 WHERE id = 7", ())
+                    .unwrap();
+            }));
+            reached
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the UPDATE reached its index changes");
+            let waited = removed.recv_timeout(std::time::Duration::from_millis(500));
+            moved_in_hook.set(waited.is_ok());
+        });
+        assert_eq!(ids(&db, sql), vec![7, 8], "{sql}");
+        let Some(mover) = mover.borrow_mut().take() else {
+            stoolap::test_failpoints::after_in_member_probed(|| {});
+            failed.push(format!("{sql}: the index did not read the members"));
+            continue;
+        };
+        mover.join().unwrap();
+        if moved_during_probe.get() {
+            failed.push(format!("{sql}: the row moved while the members were read"));
+        }
+        assert_eq!(ids(&db, "SELECT id FROM t WHERE k = 2"), vec![7, 8]);
+        db.execute("UPDATE t SET k = 1 WHERE id = 7", ()).unwrap();
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
 }
