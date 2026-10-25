@@ -7288,6 +7288,10 @@ struct BlockState {
     bound: RefCell<Option<BoundPushdown>>,
     /// An uncorrelated block's value, once computed
     value: RefCell<Option<Value>>,
+    /// How many times its buffer was filled in this run
+    fills: std::cell::Cell<u64>,
+    /// A block reading only its ancestors' values: its answer, by the parent's fill
+    answered: RefCell<Option<(u64, BlockAnswer)>>,
     /// A keyed EXISTS or IN block's choice, once made
     keyed_choice: std::cell::Cell<Option<bool>>,
     keyed_set: RefCell<Option<CompactArc<ExistsKeys>>>,
@@ -7427,6 +7431,8 @@ impl<'a> PreparedRunner<'a> {
                     vm: RefCell::new(ExprVM::new()),
                     bound: RefCell::new(None),
                     value: RefCell::new(None),
+                    fills: std::cell::Cell::new(0),
+                    answered: RefCell::new(None),
                     keyed_choice: std::cell::Cell::new(None),
                     keyed_set: RefCell::new(None),
                     members: std::cell::OnceCell::new(),
@@ -7917,6 +7923,7 @@ impl<'a> PreparedRunner<'a> {
         }
         // Over no row: the holes besides the keys read none
         {
+            self.filled(index);
             let mut vm = self.blocks[index].vm.borrow_mut();
             let mut params = self.blocks[index].buffer.borrow_mut();
             let mut failed = self.blocks[index].failed.borrow_mut();
@@ -7968,6 +7975,37 @@ impl<'a> PreparedRunner<'a> {
         }
     }
 
+    /// Count a new fill of block `index`'s buffer
+    fn filled(&self, index: usize) {
+        let fills = &self.blocks[index].fills;
+        fills.set(fills.get() + 1);
+    }
+
+    /// The parent's fill a correlated block reading no row of its parent
+    /// answers for: one answer holds until the parent is filled again
+    fn parent_call(&self, sq: &PreparedSubquery) -> Option<u64> {
+        let parent = sq
+            .parent
+            .filter(|_| !sq.uncorrelated && sq.holes.is_empty())?;
+        Some(self.blocks[parent as usize].fills.get())
+    }
+
+    /// Block `index`'s answer kept for the parent's fill `call`
+    fn answered(&self, index: usize, call: Option<u64>) -> Option<BlockAnswer> {
+        let call = call?;
+        match self.blocks[index].answered.borrow().as_ref() {
+            Some((at, answer)) if *at == call => Some(answer.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keep `answer` as block `index`'s for the parent's fill `call`
+    fn answer_call(&self, index: usize, call: Option<u64>, answer: impl FnOnce() -> BlockAnswer) {
+        if let Some(call) = call {
+            *self.blocks[index].answered.borrow_mut() = Some((call, answer()));
+        }
+    }
+
     /// The subquery's parameter buffer for a call from `caller` at `site`:
     /// its parent's values, then its own holes over the caller's row or pair
     fn fill(
@@ -7978,6 +8016,7 @@ impl<'a> PreparedRunner<'a> {
         site: &HoleSet,
     ) -> Result<()> {
         let sq = &self.prepared.subqueries[index];
+        self.filled(index);
         let mut params = self.blocks[index].buffer.borrow_mut();
         let mut failed = self.blocks[index].failed.borrow_mut();
         failed.clear();
@@ -8450,6 +8489,10 @@ impl PreparedRunner<'_> {
                 return Ok(value.clone());
             }
         }
+        let call = self.parent_call(sq);
+        if let Some(BlockAnswer::Value(value)) = self.answered(index, call) {
+            return Ok(value);
+        }
         self.ctx.check_cancelled()?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_scalar_next();
@@ -8457,7 +8500,9 @@ impl PreparedRunner<'_> {
             return Err(Error::internal("an EXISTS block run for a value"));
         };
         if !sq.uncorrelated {
-            return self.scalar_value(index, sq, projection, caller, site);
+            let value = self.scalar_value(index, sq, projection, caller, site)?;
+            self.answer_call(index, call, || BlockAnswer::Value(value.clone()));
+            return Ok(value);
         }
         let answer = self.kept(kept, || {
             self.scalar_value(index, sq, projection, caller, site)
@@ -8738,6 +8783,10 @@ impl PreparedRunner<'_> {
                 return Ok(*exists);
             }
         }
+        let call = self.parent_call(sq);
+        if let Some(BlockAnswer::Once(exists)) = self.answered(index, call) {
+            return Ok(exists);
+        }
         let exists = match (&sq.grouping, sq.uncorrelated) {
             (Some(grouping), false) => {
                 self.with_groups(index, grouping, caller, site, |rows, params, vm| {
@@ -8786,6 +8835,7 @@ impl PreparedRunner<'_> {
         if sq.uncorrelated {
             *self.blocks[index].value.borrow_mut() = Some(Value::Boolean(exists));
         }
+        self.answer_call(index, call, || BlockAnswer::Once(exists));
         Ok(exists)
     }
 }
@@ -8848,6 +8898,27 @@ impl PreparedRunner<'_> {
                 return Err(Error::internal("a value block's members not kept"));
             };
             return set.answer(value);
+        }
+        let call = self.parent_call(sq);
+        if let Some(BlockAnswer::Members(set)) = self.answered(index, call) {
+            return set.answer(value);
+        }
+        if call.is_some() {
+            // A keyed set read for the run answers each call by lookup already
+            self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
+            let keyed = match &sq.grouping {
+                Some(grouping) => grouping.keyed.as_ref(),
+                None => kept.keyed.as_ref(),
+            };
+            if !keyed
+                .is_some_and(|plan| self.takes_keyed_set(index, plan) && self.keys_fit(index, plan))
+            {
+                let set = CompactArc::new(self.collect_members(index, members, None)?);
+                self.answer_call(index, call, || {
+                    BlockAnswer::Members(CompactArc::clone(&set))
+                });
+                return set.answer(value);
+            }
         }
         if let Some(grouping) = &sq.grouping {
             return self.with_groups(index, grouping, caller, site, |rows, params, vm| {
