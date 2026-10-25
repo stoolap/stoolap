@@ -2500,7 +2500,7 @@ fn test_a_block_over_a_view_or_cte_reads_each_statement_s_rows() {
 }
 
 #[test]
-fn test_a_block_source_is_read_before_the_statement_s_rows() {
+fn test_a_block_source_is_read_when_a_call_first_needs_it() {
     let _guard = serial();
     let db = setup("prepared_block_source_error");
     db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
@@ -2509,17 +2509,46 @@ fn test_a_block_source_is_read_before_the_statement_s_rows() {
         .unwrap();
     db.execute("CREATE VIEW mv AS SELECT id, ABS(x) AS x FROM m", ())
         .unwrap();
-    for sql in [
-        "SELECT id FROM t WHERE id > 100 AND a > (SELECT x FROM mv WHERE mv.id = t.id)",
-        "SELECT id FROM t WHERE id > 100 AND a > \
-         (SELECT w.x FROM (VALUES (1, ABS(-9223372036854775808))) AS w(k, x) WHERE w.k = t.id)",
-    ] {
-        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-        assert!(
-            error(&db, sql, ()).0.contains("overflow"),
-            "{sql}: the source's error, though no row reaches the block"
-        );
+    db.execute("CREATE VIEW unnamed AS SELECT id, ABS(x) FROM m", ())
+        .unwrap();
+    let sources = [
+        "mv",
+        "(VALUES (1, ABS(-9223372036854775808))) AS mv(id, x)",
+        "(SELECT id, ABS(x) AS x FROM m) AS mv",
+        "(SELECT value AS id, value AS x FROM generate_series(1, 2, 0)) AS mv",
+    ];
+    for source in sources {
+        for (reached, sql) in [
+            (false, format!("SELECT id FROM t WHERE id > 100 AND a > (SELECT x FROM {source} WHERE mv.id = t.id)")),
+            (false, format!("SELECT id FROM t WHERE id > 0 OR a > (SELECT x FROM {source} WHERE mv.id = t.id) ORDER BY id")),
+            (true, format!("SELECT id FROM t WHERE a > (SELECT x FROM {source} WHERE mv.id = t.id)")),
+        ] {
+            assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+            let got = db
+                .query(&sql, ())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                .map(|rows| rows.len())
+                .map_err(|e| e.to_string());
+            match reached {
+                false => assert!(
+                    got.is_ok(),
+                    "{sql}: no call needs the source, which raises nothing: {got:?}"
+                ),
+                true => assert!(
+                    got.as_ref()
+                        .is_err_and(|e| e.contains("overflow") || e.contains("step")),
+                    "{sql}: the first call reads the source and raises its error: {got:?}"
+                ),
+            }
+        }
     }
+    // A view whose column only running it names is read as the statement prepares
+    let sql =
+        "SELECT id FROM t WHERE id > 100 AND a > (SELECT id FROM unnamed WHERE unnamed.id = t.id)";
+    assert!(
+        error(&db, sql, ()).0.contains("overflow"),
+        "{sql}: read to name its columns"
+    );
 }
 
 #[test]

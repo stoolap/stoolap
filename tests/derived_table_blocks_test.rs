@@ -18,11 +18,16 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{prepared_strategy_runs, PreparedStrategy};
+use stoolap::test_failpoints::{prepared_strategy_runs, random_draws, PreparedStrategy};
 use stoolap::Database;
 
-/// The statement-per-call counter is process-wide: tests that read it take turns
+/// The statement-per-call counter is process-wide: every test here runs
+/// statement blocks or reads the counter, so they take turns
 static COUNTED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    COUNTED.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const SETUP: &[&str] = &[
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
@@ -120,7 +125,7 @@ const CASES: &[(&str, &[i64], bool)] = &[
 
 #[test]
 fn a_block_over_a_derived_table_runs_prepared_hot_and_sealed() {
-    let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = turn();
     let dir = tempfile::tempdir().unwrap();
     let mut wrong = Vec::new();
     for (context, db) in [("hot", hot("cases")), ("sealed", sealed(&dir))] {
@@ -145,6 +150,7 @@ fn a_block_over_a_derived_table_runs_prepared_hot_and_sealed() {
 
 #[test]
 fn a_select_list_block_over_a_derived_table_answers_each_row() {
+    let _turn = turn();
     let db = hot("select_list");
     for (sql, expected) in [
         (
@@ -180,6 +186,7 @@ fn a_select_list_block_over_a_derived_table_answers_each_row() {
 
 #[test]
 fn a_name_in_a_block_s_derived_table_binds_the_nearest_scope_with_it() {
+    let _turn = turn();
     let dir = tempfile::tempdir().unwrap();
     for (context, db) in [("hot", hot("names")), ("sealed", sealed(&dir))] {
         for (sql, expected) in [
@@ -222,6 +229,7 @@ fn a_name_in_a_block_s_derived_table_binds_the_nearest_scope_with_it() {
 
 #[test]
 fn a_write_reads_a_block_over_a_derived_table() {
+    let _turn = turn();
     let db = hot("writes");
     for (sql, expected) in [
         (
@@ -251,6 +259,7 @@ fn a_write_reads_a_block_over_a_derived_table() {
 
 #[test]
 fn a_correlated_derived_table_raises_its_errors_and_reads_each_statement_s_rows() {
+    let _turn = turn();
     let db = hot("errors");
     let many =
         "SELECT id FROM t WHERE a = (SELECT q.x FROM (SELECT x FROM u WHERE u.x >= t.a) AS q)";
@@ -276,4 +285,146 @@ fn a_correlated_derived_table_raises_its_errors_and_reads_each_statement_s_rows(
         Ok(ids(&[1, 2, 3])),
         "{uncorrelated}"
     );
+}
+
+#[test]
+fn a_derived_table_s_names_bind_as_its_rows_and_select_list_name_them() {
+    let _turn = turn();
+    let db = Database::open("memory://derived_table_blocks_row_names").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER)",
+        "INSERT INTO t VALUES (1, 999, 10)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO u VALUES (1, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for (sql, expected) in [
+        // The middle `x` is the column CAST(x AS INTEGER) gives c, not t's
+        (
+            "SELECT (SELECT x FROM (SELECT x FROM (SELECT CAST(x AS INTEGER) FROM u) AS c) AS d) FROM t",
+            "2",
+        ),
+        // A SELECT item reads no alias of its own list: its `a` is t's
+        (
+            "SELECT (SELECT q.a FROM (SELECT a AS a WHERE t.id = 1) AS q) FROM t",
+            "10",
+        ),
+    ] {
+        assert_eq!(answer(&db, sql), Ok(vec![vec![expected.to_string()]]), "{sql}");
+    }
+}
+
+#[test]
+fn a_view_in_a_derived_table_is_read_once_in_the_run_that_prepares_it() {
+    let _turn = turn();
+    let db = hot("view_once");
+    db.execute("CREATE VIEW rv AS SELECT RANDOM() AS n", ())
+        .unwrap();
+    let sql = "SELECT id FROM t WHERE a > (SELECT MAX(q.n) FROM (SELECT n FROM rv) AS q) - 100 \
+               ORDER BY id";
+    for run in ["prepares", "keeps its plan"] {
+        let before = random_draws();
+        assert_eq!(answer(&db, sql), Ok(ids(&[1, 2, 3])), "{run}");
+        assert_eq!(
+            random_draws() - before,
+            1,
+            "the run that {run} reads the view once"
+        );
+    }
+}
+
+#[test]
+fn an_exists_over_a_correlated_derived_table_reads_no_select_item() {
+    let _turn = turn();
+    let db = hot("exists_items");
+    db.execute(
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER, g TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO m VALUES (1, -9223372036854775808, 'p')", ())
+        .unwrap();
+    const Q: &str = "(SELECT x, g FROM m WHERE m.id = t.id) AS q";
+    for (sql, expected) in [
+        (format!("SELECT id FROM t WHERE EXISTS (SELECT ABS(q.x) FROM {Q}) ORDER BY id"), ids(&[1])),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT q.g, ABS(MIN(q.x)) FROM {Q} GROUP BY 1 HAVING COUNT(*) > 0) ORDER BY id"),
+            ids(&[1]),
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT q.x AS k, ABS(q.x) FROM {Q} GROUP BY k) ORDER BY id"),
+            ids(&[1]),
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT ABS(q.x) AS v, q.x AS k FROM {Q} WHERE k < 0) ORDER BY id"),
+            ids(&[1]),
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT COUNT(*) AS c, ABS(MIN(q.x)) FROM {Q} HAVING c = 1) ORDER BY id"),
+            ids(&[1]),
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT ABS(q.x) FROM {Q} ORDER BY ABS(q.x) LIMIT 1 OFFSET 1) ORDER BY id"),
+            ids(&[]),
+        ),
+    ] {
+        assert_eq!(answer(&db, &sql), Ok(expected), "{sql}");
+    }
+}
+
+#[test]
+fn a_block_source_no_call_needs_raises_nothing() {
+    let _turn = turn();
+    let dir = tempfile::tempdir().unwrap();
+    for (context, db) in [("hot", hot("lazy_sources")), ("sealed", sealed(&dir))] {
+        db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO m VALUES (1, -9223372036854775808)", ())
+            .unwrap();
+        db.execute("CREATE VIEW mv AS SELECT id, ABS(x) AS x FROM m", ())
+            .unwrap();
+        for source in [
+            "mv AS s",
+            "(VALUES (1, ABS(-9223372036854775808))) AS s(id, x)",
+            "(SELECT id, ABS(x) AS x FROM m) AS s",
+            "(SELECT value AS id, value AS x FROM generate_series(1, 2, 0)) AS s",
+        ] {
+            let block = format!("(SELECT MAX(s.x) FROM {source} WHERE s.id = t.id)");
+            for sql in [
+                format!("SELECT id FROM t WHERE id > 100 AND a > {block} ORDER BY id"),
+                format!("SELECT id FROM t WHERE id > 0 OR a > {block} ORDER BY id"),
+                format!("SELECT id FROM t WHERE CASE WHEN id > 0 THEN TRUE ELSE a > {block} END ORDER BY id"),
+                format!("SELECT id, CASE WHEN id > 0 THEN 0 ELSE {block} END FROM t ORDER BY id"),
+                format!(
+                    "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 0 OR MAX(id) > {} ORDER BY a",
+                    block.replace("t.id", "t.a")
+                ),
+            ] {
+                let got = answer(&db, &sql);
+                assert!(got.is_ok(), "{context}: {sql}: {got:?}");
+            }
+            let with_param = format!("SELECT id FROM t WHERE $1 = 0 OR a > {block} ORDER BY id");
+            let statement = db.prepare(&with_param).unwrap();
+            for _ in 0..2 {
+                let got: Result<Vec<_>, _> = statement.query((0i64,)).unwrap().collect();
+                assert!(got.is_ok(), "{context}: {with_param}: {:?}", got.err());
+            }
+            let needed = statement
+                .query((1i64,))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                .map_err(|e| e.to_string());
+            assert!(
+                needed
+                    .as_ref()
+                    .is_err_and(|e| e.contains("overflow") || e.contains("step")),
+                "{context}: {with_param} with 1 reads the source: {needed:?}"
+            );
+            let returning = format!(
+                "UPDATE t SET b = b WHERE id = 1 RETURNING id, CASE WHEN id > 0 THEN 0 ELSE {block} END"
+            );
+            let got = answer(&db, &returning);
+            assert!(got.is_ok(), "{context}: {returning}: {got:?}");
+        }
+    }
 }
