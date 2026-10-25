@@ -39,7 +39,7 @@ use crate::core::pattern::Pattern;
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
-use crate::executor::pushdown::{read_as_column, reads_as_column_alike};
+use crate::executor::pushdown::read_as_column;
 use crate::executor::utils::{
     derived_aggregate_column_name, extract_literal_value, string_literal_value, string_to_datatype,
 };
@@ -544,16 +544,9 @@ impl<'a> ExprCompiler<'a> {
             .read_as
             .and_then(|r| r.get(&(expr as *const Expression as usize)))
         {
-            // A value known when compiled is read as the column's type once,
-            // unless that reading depends on when it runs
+            // A value known when compiled is read as the column's type once
             match builder.take_constant_since(start) {
-                Some(value) if reads_as_column_alike(column_type, &value) => {
-                    builder.emit(Op::LoadConst(read_as_column(column_type, value)))
-                }
-                Some(value) => {
-                    builder.emit(Op::LoadConst(value));
-                    builder.emit(Op::ReadAsColumn(column_type));
-                }
+                Some(value) => builder.emit(Op::LoadConst(read_as_column(column_type, value))),
                 None => builder.emit(Op::ReadAsColumn(column_type)),
             }
         }
@@ -1367,10 +1360,9 @@ impl<'a> ExprCompiler<'a> {
                     .read_as
                     .and_then(|r| r.get(&(item as *const Expression as usize)))
                 {
-                    Some(&column_type) if reads_as_column_alike(column_type, &value) => {
+                    Some(&column_type) => {
                         crate::executor::pushdown::read_as_column(column_type, value)
                     }
-                    Some(_) => return None,
                     None => value,
                 },
             )
@@ -2233,13 +2225,14 @@ mod tests {
     }
 
     #[test]
-    fn a_time_of_day_is_read_as_a_timestamp_when_the_program_runs() {
+    fn a_time_of_day_folds_to_its_time_on_1970_01_01() {
         let columns = vec!["ts".to_string()];
-        for (sql, when_run) in [
-            ("ts = '12:00:00'", true),
-            ("ts IN ('12:00:00', '2024-01-15')", true),
-            ("ts = '2024-01-15 12:00:00'", false),
-            ("ts IN ('2024-01-15 12:00:00', '2024-01-15')", false),
+        for sql in [
+            "ts = '12:00:00'",
+            "ts IN ('12:00:00', '2024-01-15')",
+            "ts = CAST('12:00:00' AS TIMESTAMP)",
+            "ts = TIMESTAMP '12:00:00'",
+            "ts = CAST('12' || ':00' AS TIMESTAMP)",
         ] {
             let expr = parse(sql);
             let mut read_as = FxHashMap::default();
@@ -2257,29 +2250,17 @@ mod tests {
             }
             let ctx = CompileContext::with_global_registry(&columns).with_read_as(&read_as);
             let program = ExprCompiler::new(&ctx).compile(&expr).unwrap();
-            let reads = program
-                .ops()
-                .iter()
-                .any(|op| matches!(op, Op::ReadAsColumn(DataType::Timestamp)));
-            assert_eq!(reads, when_run, "{sql}: {}", program.disassemble());
-        }
-    }
-
-    #[test]
-    fn a_cast_of_a_time_of_day_is_not_folded_into_the_program() {
-        let columns = vec!["ts".to_string()];
-        let ctx = CompileContext::with_global_registry(&columns);
-        for (sql, folded) in [
-            ("ts = CAST('12:00:00' AS TIMESTAMP)", false),
-            ("ts = EXTRACT(HOUR FROM CAST('12:00' AS TIMESTAMP))", false),
-            ("ts = CAST('2024-01-15 12:00:00' AS TIMESTAMP)", true),
-        ] {
-            let program = ExprCompiler::new(&ctx).compile(&parse(sql)).unwrap();
-            let cast = program
-                .ops()
-                .iter()
-                .any(|op| matches!(op, Op::Cast(DataType::Timestamp)));
-            assert_eq!(!cast, folded, "{sql}: {}", program.disassemble());
+            let shown = program.disassemble();
+            let at_run = program.ops().iter().any(|op| {
+                matches!(
+                    op,
+                    Op::ReadAsColumn(DataType::Timestamp) | Op::Cast(DataType::Timestamp)
+                )
+            });
+            assert!(!at_run, "{sql} reads its time when compiled: {shown}");
+            if !sql.contains(" IN ") {
+                assert!(shown.contains("1970-01-01T12:00:00"), "{sql}: {shown}");
+            }
         }
     }
 }

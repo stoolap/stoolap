@@ -53,9 +53,7 @@ use super::expression::{
     QuantifiedMembers, RowFilter, SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
-use super::pushdown::{
-    self, coerce_constant, read_as_column, reads_as_column_alike, scan_compares,
-};
+use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
@@ -7268,9 +7266,6 @@ pub(crate) struct PreparedRunner<'a> {
     tables: BlockTables,
     /// Each subquery's state for this run, by its id
     blocks: Vec<BlockState>,
-    /// Whether a member read as a TIMESTAMP took today's date in this run,
-    /// so no answer it computes is kept for a later statement
-    read_the_clock: Cell<bool>,
 }
 
 /// What one run keeps for one subquery
@@ -7435,7 +7430,6 @@ impl<'a> PreparedRunner<'a> {
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
-            read_the_clock: Cell::new(false),
         }
     }
 
@@ -8319,7 +8313,7 @@ impl<'a> PreparedRunner<'a> {
             }
         }
         let answer = compute()?;
-        if let Some(stamp) = stamp.filter(|_| !self.read_the_clock.get()) {
+        if let Some(stamp) = stamp {
             cache_block_answer(&origin, key, stamp, answer.clone());
         }
         Ok(answer)
@@ -8988,18 +8982,7 @@ impl PreparedRunner<'_> {
     /// The member a candidate's SELECT expression gives, read as the tested
     /// value's column reads it
     fn member(&self, members: &Members, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<Value> {
-        Ok(self.read_member(members, vm.execute(&members.projection, exec)?))
-    }
-
-    /// `value` as `members` reads it, noting a reading that takes today's date
-    fn read_member(&self, members: &Members, value: Value) -> Value {
-        if members
-            .read_as
-            .is_some_and(|column_type| !reads_as_column_alike(column_type, &value))
-        {
-            self.read_the_clock.set(true);
-        }
-        members.read(value)
+        Ok(members.read(vm.execute(&members.projection, exec)?))
     }
 
     /// The member of a row a block's LIMIT kept: the SELECT expression's
@@ -9013,7 +8996,7 @@ impl PreparedRunner<'_> {
         params: &[Value],
     ) -> Result<Value> {
         if let Some(item) = order.item {
-            return Ok(self.read_member(members, keys.swap_remove(item)));
+            return Ok(members.read(keys.swap_remove(item)));
         }
         let exec = ExecuteContext::with_common_params(&row, params, self.transaction_id)
             .with_subquery_executor(self);
@@ -9108,9 +9091,9 @@ impl PreparedRunner<'_> {
             if let Some(statement) = &grouping.statement {
                 let values = self.statement_values(statement)?;
                 let values = match members.read_as {
-                    Some(_) => values
+                    Some(column_type) => values
                         .into_iter()
-                        .map(|value| self.read_member(members, value))
+                        .map(|value| read_as_column(column_type, value))
                         .collect(),
                     None => values,
                 };
