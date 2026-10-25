@@ -519,16 +519,21 @@ fn child_rows_exist(
     Ok(!rows.is_empty())
 }
 
-/// The filter `column = value` over `schema`, the value read as the
-/// column's type as a pushed-down equality reads it, so every layer finds
-/// the rows that compare equal whichever numeric type the other side has
+/// The filter `column = value` over `schema`. A number against a numeric
+/// column is read as the column's type as a pushed-down equality reads it,
+/// so every layer finds the rows that compare equal whichever numeric type
+/// the other side has; any other value is compared as it is, both ways
 fn key_filter(
     schema: &Schema,
     column: usize,
     value: &Value,
 ) -> crate::storage::expression::ComparisonExpr {
     let column = &schema.columns[column];
-    let value = super::pushdown::coerce_constant(Some(column.data_type), value.clone())
+    let numbers =
+        column.data_type.is_numeric() && matches!(value, Value::Integer(_) | Value::Float(_));
+    let value = numbers
+        .then(|| super::pushdown::coerce_constant(Some(column.data_type), value.clone()))
+        .flatten()
         .unwrap_or_else(|| value.clone());
     let mut expr = crate::storage::expression::ComparisonExpr::new(
         column.name.as_str(),

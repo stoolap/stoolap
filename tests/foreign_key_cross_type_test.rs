@@ -140,6 +140,38 @@ fn a_child_finds_its_parent_in_both_layers_whatever_the_types() {
 }
 
 #[test]
+fn a_text_key_the_child_check_accepts_is_found_by_the_parent_s_delete() {
+    let mut wrong = Vec::new();
+    for key in ["'01'", "'1'", "'1.0'"] {
+        for sealed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open(&dir);
+            for sql in [
+                "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE c (id INTEGER PRIMARY KEY, k TEXT REFERENCES p(id) ON DELETE RESTRICT)",
+                "INSERT INTO p VALUES (1)",
+            ] {
+                db.execute(sql, ()).unwrap();
+            }
+            if sealed {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            let inserted = db.execute(&format!("INSERT INTO c VALUES (1, {key})"), ());
+            if sealed {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            let deleted = db.execute("DELETE FROM p WHERE id = 1", ());
+            if inserted.is_ok() && deleted.is_ok() {
+                wrong.push(format!(
+                    "{key} sealed {sealed}: the child was accepted and its parent deleted"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_cascade_finds_the_grandchildren_of_a_sealed_child() {
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
