@@ -1083,6 +1083,28 @@ impl Executor {
         Ok(Some(ctx.with_statement_snapshot(snapshot)))
     }
 
+    /// `ctx` with `stmt`'s LIMIT and OFFSET read once when one draws a new
+    /// value per call and none holds a subquery, which is read after the
+    /// statement's CTEs instead; None otherwise
+    pub(crate) fn read_volatile_counts(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        slot: Option<&super::query_cache::CountsSlot>,
+    ) -> Result<Option<ExecutionContext>> {
+        let counts = [stmt.limit.as_deref(), stmt.offset.as_deref()];
+        let volatile = counts.into_iter().flatten().any(|count| {
+            !matches!(
+                count,
+                Expression::IntegerLiteral(_) | Expression::Parameter(_)
+            ) && expression_volatility(count, &self.function_registry) == Volatility::PerCall
+        });
+        if !volatile || counts.into_iter().flatten().any(Self::has_subqueries) {
+            return Ok(None);
+        }
+        self.read_row_counts(stmt, ctx, slot).map(Some)
+    }
+
     /// `ctx` with the counts the subqueries of `stmt`'s LIMIT and OFFSET
     /// answer, read once before the statement reads a row, under its
     /// snapshot; their blocks are held in `slot`
@@ -1101,6 +1123,24 @@ impl Executor {
             (stmt.offset.as_deref(), "OFFSET"),
         ];
         let counts = clauses.iter().filter_map(|(count, _)| *count);
+        // Counts without a subquery are evaluated as they are written
+        if !counts.clone().any(Self::has_subqueries) {
+            let mut read = smallvec::SmallVec::new();
+            for (count, clause) in clauses {
+                if let Some(count) = count {
+                    read.push(super::context::ReadCount {
+                        clause,
+                        address: count as *const Expression as usize,
+                        key: ExprKey::of(count),
+                        count: super::row_count::row_count(count, ctx, clause)?,
+                    });
+                }
+            }
+            return Ok(ctx.with_read_counts(super::context::ReadCounts {
+                depth: ctx.query_depth,
+                counts: read,
+            }));
+        }
         if let Err(reason) = self.dml_family(None, counts, ctx) {
             return Err(Error::invalid_argument(format!(
                 "a LIMIT or OFFSET subquery is not supported here: {reason}"
@@ -1188,17 +1228,21 @@ impl Executor {
 
         // A LIMIT or OFFSET subquery reads the snapshot the statement's CTEs
         // and rows read, so it is taken before the CTEs run
-        let reads_counts = [stmt.limit.as_deref(), stmt.offset.as_deref()]
+        let reads_blocks = [stmt.limit.as_deref(), stmt.offset.as_deref()]
             .into_iter()
             .flatten()
             .any(Self::has_subqueries);
         let snapshot_ctx;
-        let ctx = if reads_counts && ctx.statement_snapshot().is_none() {
+        let ctx = if reads_blocks && ctx.statement_snapshot().is_none() {
             snapshot_ctx = self.with_counts_snapshot(ctx)?;
             snapshot_ctx.as_ref().unwrap_or(ctx)
         } else {
             ctx
         };
+        // Without a subquery a count reads no CTE, so it is read before the
+        // CTEs, whose statement may take a path of its own
+        let volatile_ctx = self.read_volatile_counts(stmt, ctx, counts)?;
+        let ctx = volatile_ctx.as_ref().unwrap_or(ctx);
 
         // Check for CTEs (WITH clause). A statement with one keeps every
         // subquery for the aggregation entry, which runs with the CTEs bound
@@ -1239,7 +1283,7 @@ impl Executor {
         // The subquery is read once, before any path reads a row, with the
         // CTEs of the statement bound
         let counts_ctx;
-        let ctx = if reads_counts {
+        let ctx = if reads_blocks {
             counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
             &counts_ctx
         } else {

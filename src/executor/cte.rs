@@ -263,6 +263,9 @@ impl Executor {
         cte_limit_hints: Option<&StringMap<CtePushdownHint>>,
     ) -> Result<CteRegistry> {
         let mut cte_registry = CteRegistry::new();
+        // Each body counts its own rows, not the statement's around it
+        let scoped = ctx.without_read_counts();
+        let ctx = scoped.as_ref().unwrap_or(ctx);
 
         // Execute each CTE in order
         for cte in &with_clause.ctes {
@@ -338,6 +341,8 @@ impl Executor {
                         // Clone Arc data into RowVec for processing
                         // A subquery in the statement reads the earlier
                         // CTEs through the context
+                        let counted = self.read_volatile_counts(stmt, ctx, None)?;
+                        let ctx = counted.as_ref().unwrap_or(ctx);
                         return self.execute_query_on_cte_result(
                             stmt,
                             &ctx.with_cte_data(cte_registry.data()),
