@@ -1715,15 +1715,27 @@ impl Executor {
 
             if let Some(col) = col_name {
                 // Check if column exists in CTE (exact match only)
-                if cte_columns.iter().any(|c| c == &col) {
-                    // Create ORDER BY item without table qualifier
-                    let col_compact: SmartString = col.clone().into();
-                    let new_expr = Expression::Identifier(Identifier {
-                        value: col_compact.clone(),
-                        value_lower: col_compact,
-                        position: Position::new(0, 0, 0),
-                        quoted: false,
-                    });
+                if let Some(at) = cte_columns.iter().position(|c| c == &col) {
+                    // A column list names the query's items only after it
+                    // runs, so the query is ordered by the item's position
+                    let new_expr = if cte.column_names.is_empty() {
+                        let col_compact: SmartString = col.clone().into();
+                        Expression::Identifier(Identifier {
+                            value: col_compact.clone(),
+                            value_lower: col_compact,
+                            position: Position::new(0, 0, 0),
+                            quoted: false,
+                        })
+                    } else {
+                        Expression::IntegerLiteral(IntegerLiteral {
+                            token: Token::new(
+                                TokenType::Integer,
+                                (at + 1).to_string(),
+                                Position::new(0, 0, 0),
+                            ),
+                            value: at as i64 + 1,
+                        })
+                    };
                     result.push(OrderByExpression {
                         expression: new_expr,
                         ascending: order_item.ascending,
