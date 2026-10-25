@@ -96,7 +96,7 @@ const CASES: &[Case] = &[
         "sealed",
         "projected_top",
         "SELECT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id LIMIT 4 OFFSET 1",
-        "SELECT DISTINCT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id",
+        "SELECT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id",
         Some((4, 1)),
     ),
     case(
@@ -110,14 +110,14 @@ const CASES: &[Case] = &[
         "memory",
         "computed_keys",
         "SELECT * FROM t ORDER BY a + 0, id LIMIT 4 OFFSET 1",
-        "SELECT DISTINCT * FROM t ORDER BY a + 0, id",
+        "SELECT * FROM t ORDER BY a + 0, id",
         Some((4, 1)),
     ),
     case(
         "sealed",
         "computed_keys",
         "SELECT * FROM t ORDER BY a + 0 DESC, id LIMIT 4",
-        "SELECT DISTINCT * FROM t ORDER BY a + 0 DESC, id",
+        "SELECT * FROM t ORDER BY a + 0 DESC, id",
         Some((4, 0)),
     ),
     case(
@@ -138,7 +138,7 @@ const CASES: &[Case] = &[
         "memory",
         "index_ordered",
         "SELECT id, b FROM t ORDER BY c DESC NULLS LAST LIMIT 3 OFFSET 1",
-        "SELECT DISTINCT id, b FROM t ORDER BY c DESC NULLS LAST, id",
+        "SELECT id, b FROM t ORDER BY c DESC NULLS LAST, id",
         Some((3, 1)),
     ),
     case(
@@ -224,7 +224,7 @@ const CASES: &[Case] = &[
         "prepared_ordered_read",
         "SELECT t.id, (SELECT MAX(x) FROM u WHERE u.k = t.id) AS m FROM t \
          ORDER BY c DESC NULLS LAST LIMIT 2",
-        "SELECT DISTINCT t.id, (SELECT MAX(x) FROM u WHERE u.k = t.id) AS m FROM t \
+        "SELECT t.id, (SELECT MAX(x) FROM u WHERE u.k = t.id) AS m FROM t \
          ORDER BY c DESC NULLS LAST",
         Some((2, 0)),
     ),

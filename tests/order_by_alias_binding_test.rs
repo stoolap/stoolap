@@ -434,36 +434,38 @@ fn the_rule_holds_for_every_source_and_pipeline() {
     ];
     let output = vec![3, 2, 1];
     let input = vec![1, 2, 3];
-    // (SELECT items after src.id, ORDER BY, ids in order, whether a star is used)
+    // (SELECT items after src.id, ORDER BY, ids in order, whether a star is used,
+    // whether DISTINCT refuses it: a key that is no SELECT item)
     let shapes = [
-        ("-k AS k", "k", &output, 0),
-        ("-k AS k", "src.k", &input, 0),
-        ("-k AS k", "k + 0", &input, 0),
-        ("-k AS k", "2", &output, 0),
-        ("-k AS k", "k DESC, src.id", &input, 0),
-        ("k AS x", "k", &input, 0),
-        ("k AS x", "k, k * 2", &input, 0),
-        ("k AS x", "x DESC", &output, 0),
-        ("-k AS x", "x * 1", &output, 0),
-        ("-k AS x", "k", &input, 0),
-        ("*, -k AS k", "k", &output, 1),
-        ("*, -k AS k", "src.k", &input, 1),
-        ("*, -k AS k", "k + 0", &input, 1),
-        ("src.*, -k AS k", "k", &output, 2),
-        ("src.*, -k AS k", "src.k", &input, 2),
-        ("-k AS x", "(SELECT 0) + k", &input, 0),
-        ("-k AS k", "(SELECT 0) + k", &input, 0),
-        ("k AS x", "(SELECT 0) + k", &input, 0),
-        ("-k AS x", "(SELECT src.k)", &input, 0),
-        ("-k AS k", "(SELECT src.k)", &input, 0),
-        ("k AS x", "k, (SELECT -src.k)", &input, 0),
-        ("k AS x", "(SELECT -src.k) DESC", &input, 0),
-        ("-k AS k", "(SELECT 0 * src.k) + k", &input, 0),
+        ("-k AS k", "k", &output, 0, false),
+        ("-k AS k", "src.k", &input, 0, true),
+        ("-k AS k", "k + 0", &input, 0, true),
+        ("-k AS k", "2", &output, 0, false),
+        ("-k AS k", "k DESC, src.id", &input, 0, false),
+        ("k AS x", "k", &input, 0, false),
+        ("k AS x", "k, k * 2", &input, 0, true),
+        ("k AS x", "x DESC", &output, 0, false),
+        ("-k AS x", "x * 1", &output, 0, true),
+        ("-k AS x", "k", &input, 0, true),
+        ("*, -k AS k", "k", &output, 1, false),
+        ("*, -k AS k", "src.k", &input, 1, false),
+        ("*, -k AS k", "k + 0", &input, 1, true),
+        ("src.*, -k AS k", "k", &output, 2, false),
+        ("src.*, -k AS k", "src.k", &input, 2, false),
+        ("-k AS x", "(SELECT 0) + k", &input, 0, true),
+        ("-k AS k", "(SELECT 0) + k", &input, 0, true),
+        ("k AS x", "(SELECT 0) + k", &input, 0, true),
+        ("-k AS x", "(SELECT src.k)", &input, 0, true),
+        ("-k AS k", "(SELECT src.k)", &input, 0, true),
+        ("k AS x", "k, (SELECT -src.k)", &input, 0, true),
+        ("k AS x", "(SELECT -src.k) DESC", &input, 0, true),
+        ("-k AS k", "(SELECT 0 * src.k) + k", &input, 0, true),
         (
             "k AS x, k * 2 AS k",
             "(SELECT -3 * src.k) + k * 2",
             &output,
             0,
+            true,
         ),
     ];
     // (name, DISTINCT, extra item, GROUP BY, LIMIT/OFFSET, prepared)
@@ -481,20 +483,18 @@ fn the_rule_holds_for_every_source_and_pipeline() {
     let mut wrong = Vec::new();
     let mut ran = 0;
     for (source, with, from, filter, qualified_star) in sources {
-        for (items, order_by, want, star) in shapes {
+        for (items, order_by, want, star, outside_distinct) in shapes {
             if star == 2 && !qualified_star {
                 continue;
             }
             for (pipeline, distinct, window, grouped, rows, prepared) in pipelines {
                 // Out of this rule: a star under GROUP BY is refused, an alias
-                // named as a grouping column is #508, a grouped window over a
-                // view or a materialized CTE is #509, and DISTINCT ordered by
-                // a column it does not select is not this rule's to settle
+                // named as a grouping column is #508, and a grouped window over
+                // a view or a materialized CTE is #509
                 if grouped && (star > 0 || items == "-k AS k")
                     || grouped
                         && window
                         && matches!(source, "view" | "cte_columns" | "cte_materialized")
-                    || distinct && items == "-k AS x" && order_by == "k"
                 {
                     continue;
                 }
@@ -534,7 +534,16 @@ fn the_rule_holds_for_every_source_and_pipeline() {
                     first_column(&db, &sql, &[])
                 };
                 ran += 1;
-                if got.as_ref() != Ok(want) {
+                if distinct && outside_distinct {
+                    if !got
+                        .as_ref()
+                        .is_err_and(|e| e.contains("is not in the SELECT DISTINCT list"))
+                    {
+                        wrong.push(format!(
+                            "[{source}/{pipeline}] {sql}\n  got  {got:?}\n  want the DISTINCT refusal"
+                        ));
+                    }
+                } else if got.as_ref() != Ok(want) {
                     wrong.push(format!(
                         "[{source}/{pipeline}] {sql}\n  got  {got:?}\n  want {want:?}"
                     ));

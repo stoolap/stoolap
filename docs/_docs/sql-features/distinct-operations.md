@@ -117,6 +117,18 @@ SELECT DISTINCT region FROM sales ORDER BY region;
 -- West
 ```
 
+Under `SELECT DISTINCT`, every `ORDER BY` key must be one of the selected items: by position, by alias, as the same expression, or as the column an item reads. One distinct row can stand for several rows, and a key outside the list may hold a different value in each of them, so the statement is refused instead of sorted by one of them:
+
+```sql
+-- Error: ORDER BY order_date is not in the SELECT DISTINCT list
+SELECT DISTINCT customer FROM orders ORDER BY order_date DESC;
+
+-- Say which date orders each customer
+SELECT customer FROM orders GROUP BY customer ORDER BY MAX(order_date) DESC;
+```
+
+The rule applies over every source, a table, a view, a derived table, a CTE or a join, and to a `DISTINCT` subquery. `DISTINCT ON` keeps its own rule, above.
+
 ### COUNT with DISTINCT
 
 ```sql

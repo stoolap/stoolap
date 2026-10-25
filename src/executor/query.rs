@@ -1600,6 +1600,27 @@ impl Executor {
             // Mapped once: the correlated path below asks for every row
             let (mapped_columns, aggregate_slots) =
                 self.order_by_columns(stmt, &columns, layout.map(|l| &**l), set_operation);
+            // Under DISTINCT a key is a SELECT item's column: any other key
+            // may differ between the rows one distinct row stands for
+            let visible = match expected_columns {
+                0 => columns.len(),
+                visible => visible,
+            };
+            let outside = (stmt.distinct && stmt.distinct_on.is_empty() && !set_operation)
+                .then(|| {
+                    mapped_columns
+                        .iter()
+                        .position(|m| !m.is_some_and(|p| p < visible))
+                })
+                .flatten();
+            if let Some(key) = outside {
+                return Err(Error::invalid_argument(format!(
+                    "ORDER BY {key} is not in the SELECT DISTINCT list: rows merged into one \
+                     distinct row may hold different values of it. Add it to the SELECT list, \
+                     or group the rows and sort by an aggregate of it, such as MAX({key})",
+                    key = stmt.order_by[key].expression
+                )));
+            }
 
             // Check if any ORDER BY expression needs evaluation (not just column refs or position)
             let has_complex_order_by = mapped_columns.iter().any(Option::is_none);
