@@ -57,7 +57,7 @@ fn open(dsn: &str) -> Database {
         .register_scalar::<NextCount>();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
-        "INSERT INTO t SELECT value, value % 9, 'b' || value FROM generate_series(1, 200)",
+        "INSERT INTO t SELECT value, value % 9, 'b' || value FROM generate_series(1, 1000)",
         "CREATE INDEX t_a ON t (a)",
         "CREATE VIEW v AS SELECT id, a, b FROM t",
     ] {
@@ -77,10 +77,22 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT id + 0 AS k FROM (SELECT id FROM t) s ORDER BY k",
         "SELECT id FROM v ORDER BY a + 0, id",
         "SELECT t.id FROM t JOIN t u ON u.id = t.id ORDER BY t.id + 0",
+        // A column list or a second reader keeps a CTE from being inlined
+        "WITH c(x) AS (SELECT id FROM t) SELECT x, COUNT(*) FROM c GROUP BY x ORDER BY x",
+        "WITH c(x) AS (SELECT id FROM t) SELECT x, COUNT(*) FROM c GROUP BY x",
+        "SELECT id FROM t UNION ALL SELECT id FROM t",
+        "SELECT id FROM t UNION SELECT id + 1000 FROM t ORDER BY 1",
+        "WITH c(x) AS (SELECT id FROM t) SELECT x FROM c ORDER BY x",
+        "WITH c AS (SELECT id FROM t) SELECT c.id FROM c JOIN c d ON d.id = c.id ORDER BY c.id",
     ] {
         for (tail, reads) in [
             (" LIMIT NEXT_COUNT()", 1),
             (" LIMIT NEXT_COUNT() OFFSET NEXT_COUNT()", 2),
+            (" LIMIT (SELECT NEXT_COUNT())", 1),
+            (
+                " LIMIT (SELECT NEXT_COUNT()) OFFSET (SELECT NEXT_COUNT())",
+                2,
+            ),
         ] {
             let sql = format!("{shape}{tail}");
             let first = CALLS.load(Ordering::Relaxed) + 1;

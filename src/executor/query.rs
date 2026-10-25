@@ -1213,8 +1213,8 @@ impl Executor {
             .any(Self::has_subqueries);
         // A count drawing a new value per call is read once too, so that
         // every path reading the statement's rows reads the same count
-        let reads_counts = reads_blocks
-            || counts_written.into_iter().flatten().any(|count| {
+        let reads_volatile = !reads_blocks
+            && counts_written.into_iter().flatten().any(|count| {
                 !matches!(
                     count,
                     Expression::IntegerLiteral(_) | Expression::Parameter(_)
@@ -1224,6 +1224,15 @@ impl Executor {
         let ctx = if reads_blocks && ctx.statement_snapshot().is_none() {
             snapshot_ctx = self.with_counts_snapshot(ctx)?;
             snapshot_ctx.as_ref().unwrap_or(ctx)
+        } else {
+            ctx
+        };
+        // Without a subquery a count reads no CTE, so it is read before the
+        // CTEs, whose statement may take a path of its own
+        let volatile_ctx;
+        let ctx = if reads_volatile {
+            volatile_ctx = self.read_row_counts(stmt, ctx, counts)?;
+            &volatile_ctx
         } else {
             ctx
         };
@@ -1267,7 +1276,7 @@ impl Executor {
         // The subquery is read once, before any path reads a row, with the
         // CTEs of the statement bound
         let counts_ctx;
-        let ctx = if reads_counts {
+        let ctx = if reads_blocks {
             counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
             &counts_ctx
         } else {
