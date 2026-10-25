@@ -615,15 +615,15 @@ impl KeptMembers {
 /// A correlated IN block's members grouped by key
 pub type MemberKeys = FxHashMap<SmallVec<[Value; 1]>, KeptMembers>;
 
-/// A prepared block's answer for a whole run
+/// A prepared block's answer for a whole run, or for one call of its parent
 #[derive(Debug, Clone)]
 pub enum BlockAnswer {
-    /// An uncorrelated scalar block's value
+    /// A scalar block's value
     Value(Value),
-    /// An uncorrelated EXISTS block's value
+    /// An EXISTS block's value
     Once(bool),
     Keyed(CompactArc<ExistsKeys>),
-    /// An uncorrelated value block's members
+    /// A value block's members
     Members(CompactArc<KeptMembers>),
     KeyedMembers(CompactArc<MemberKeys>),
 }

@@ -17,8 +17,11 @@
 //! that holds it; and the plain conjuncts beside a correlated subquery
 //! still narrow the outer scan.
 
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
 use stoolap::Database;
+
+/// The block run counters are process-wide and every test here moves them
+static COUNTERS: Mutex<()> = Mutex::new(());
 
 fn count(db: &Database, sql: &str) -> i64 {
     db.query(sql, ())
@@ -28,9 +31,13 @@ fn count(db: &Database, sql: &str) -> i64 {
         .unwrap()
 }
 
-#[test]
-fn test_grandparent_only_subquery_folds_once() {
-    let db = Database::open("memory://nested_subquery_binding").unwrap();
+/// Row `i` of x and of y: (a, b, s)
+fn row(i: i64) -> (i64, i64, String) {
+    (i % 40, (i * 3) % 25, format!("s{}", i % 30))
+}
+
+fn tables(dsn: &str) -> Database {
+    let db = Database::open(dsn).unwrap();
     for t in ["x", "y"] {
         db.execute(
             &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT)"),
@@ -38,15 +45,33 @@ fn test_grandparent_only_subquery_folds_once() {
         )
         .unwrap();
         let rows: Vec<String> = (1..=2500)
-            .map(|i| format!("({i}, {}, {}, 's{}')", i % 40, (i * 3) % 25, i % 30))
+            .map(|i| {
+                let (a, b, s) = row(i);
+                format!("({i}, {a}, {b}, '{s}')")
+            })
             .collect();
         for chunk in rows.chunks(500) {
             db.execute(&format!("INSERT INTO {t} VALUES {}", chunk.join(", ")), ())
                 .unwrap();
         }
     }
+    db
+}
 
-    let started = Instant::now();
+/// The outer rows `id <= 20` whose count of y rows passing `passes` is above `above`
+fn expected(above: usize, passes: impl Fn(i64, i64) -> bool) -> i64 {
+    (1..=20)
+        .filter(|&i| (1..=2500).filter(|&j| passes(i, j)).count() > above)
+        .count() as i64
+}
+
+#[test]
+fn test_grandparent_only_subquery_folds_once() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let db = tables("memory://nested_subquery_binding");
+
+    #[cfg(feature = "test-failpoints")]
+    let runs = stoolap::test_failpoints::prepared_scalar_runs();
     assert_eq!(
         count(
             &db,
@@ -55,12 +80,11 @@ fn test_grandparent_only_subquery_folds_once() {
         ),
         10
     );
-    // Twenty outer rows, one inner fold each: well under a second; the
-    // per-row shape ran the inner subquery fifty thousand times
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "took {:?}",
-        started.elapsed()
+    #[cfg(feature = "test-failpoints")]
+    assert_eq!(
+        stoolap::test_failpoints::prepared_scalar_runs() - runs,
+        40,
+        "one AVG and one MIN run per outer row, not one MIN per row of y"
     );
 
     assert_eq!(
@@ -71,4 +95,90 @@ fn test_grandparent_only_subquery_folds_once() {
         ),
         20
     );
+}
+
+#[test]
+fn test_grandparent_only_exists_probes_once_per_outer_row() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let db = tables("memory://nested_subquery_binding_exists");
+    // A z row of 's7' whose a is above x.a + 20
+    let found: Vec<bool> = (0..=20)
+        .map(|i| (1..=2500).any(|k| row(k).2 == "s7" && row(k).0 > row(i).0 + 20))
+        .collect();
+    #[cfg(feature = "test-failpoints")]
+    let probes = stoolap::test_failpoints::prepared_exists_counts().0;
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM x WHERE id <= 20 AND (SELECT COUNT(*) FROM y WHERE y.b > x.b \
+             AND EXISTS (SELECT 1 FROM y z WHERE z.s = 's7' AND z.a > x.a + 20)) > 1000"
+        ),
+        expected(1000, |i, j| found[i as usize] && row(j).1 > row(i).1)
+    );
+    #[cfg(feature = "test-failpoints")]
+    assert!(
+        stoolap::test_failpoints::prepared_exists_counts().0 - probes <= 20,
+        "at most one EXISTS probe per outer row, not one per row of y"
+    );
+}
+
+#[test]
+fn test_grandparent_only_in_reads_members_once_per_outer_row() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let db = tables("memory://nested_subquery_binding_in");
+    let members: Vec<Vec<i64>> = (0..=20)
+        .map(|i| {
+            (1..=2500)
+                .filter(|&k| row(k).2 == "s7" && row(k).0 > row(i).0 + 20)
+                .map(|k| row(k).1)
+                .collect()
+        })
+        .collect();
+    #[cfg(feature = "test-failpoints")]
+    let runs = stoolap::test_failpoints::in_subquery_runs();
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM x WHERE id <= 20 AND (SELECT COUNT(*) FROM y WHERE y.b IN \
+             (SELECT z.b FROM y z WHERE z.s = 's7' AND z.a > x.a + 20)) > 100"
+        ),
+        expected(100, |i, j| members[i as usize].contains(&row(j).1))
+    );
+    #[cfg(feature = "test-failpoints")]
+    assert!(
+        stoolap::test_failpoints::in_subquery_runs() - runs <= 20,
+        "at most one member read per outer row, not one per row of y"
+    );
+}
+
+#[test]
+fn test_grandparent_only_in_over_unpushed_source_keeps_correlation() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://nested_subquery_binding_in_source").unwrap();
+    for sql in [
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE y (id INTEGER PRIMARY KEY, b INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE VIEW v AS SELECT a, b FROM w",
+        "INSERT INTO x VALUES (1, 1), (2, 2)",
+        "INSERT INTO y VALUES (1, 10)",
+        "INSERT INTO w VALUES (1, 1, 20), (2, 2, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for source in ["v", "(VALUES (1, 20), (2, 10)) AS v(a, b)"] {
+        let sql = format!(
+            "SELECT id, (SELECT COUNT(*) FROM y WHERE y.b IN \
+             (SELECT v.b FROM {source} WHERE v.a = x.a)) FROM x ORDER BY id"
+        );
+        let rows: Vec<(i64, i64)> = db
+            .query(&sql, ())
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.get(0).unwrap(), r.get(1).unwrap())
+            })
+            .collect();
+        assert_eq!(rows, vec![(1, 0), (2, 1)], "{source}");
+    }
 }
