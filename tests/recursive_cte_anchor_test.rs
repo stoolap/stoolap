@@ -27,8 +27,9 @@ fn values(db: &Database, sql: &str) -> Vec<i64> {
 #[test]
 fn a_branch_that_does_not_read_the_cte_runs_once() {
     let db = Database::open("memory://recursive_cte_anchor").unwrap();
-    db.execute("CREATE TABLE seeds (v INTEGER)", ()).unwrap();
-    db.execute("INSERT INTO seeds VALUES (50), (60)", ())
+    db.execute("CREATE TABLE seeds (v INTEGER, s INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO seeds VALUES (50, 100), (60, 200)", ())
         .unwrap();
     for (sql, want) in [
         (
@@ -59,6 +60,17 @@ fn a_branch_that_does_not_read_the_cte_runs_once() {
              UNION ALL SELECT (SELECT MAX(n) FROM s) + 0 FROM seeds WHERE v = 50 AND 0 = 1) \
              SELECT COUNT(*) FROM s",
             vec![2],
+        ),
+        // A column named like the CTE is not a read of it
+        (
+            "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT s FROM seeds WHERE v = 50 \
+             UNION ALL SELECT n + 1 FROM s WHERE n < 3) SELECT n FROM s ORDER BY n",
+            vec![1, 2, 3, 100],
+        ),
+        (
+            "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT MAX(s) - 199 FROM seeds \
+             UNION ALL SELECT n + 1 FROM s WHERE n < 3) SELECT n FROM s ORDER BY n",
+            vec![1, 1, 2, 2, 3, 3],
         ),
     ] {
         assert_eq!(values(&db, sql), want, "{sql}");
