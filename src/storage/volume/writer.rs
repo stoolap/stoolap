@@ -1833,6 +1833,9 @@ pub struct VolumeBuilder {
     row_groups: Vec<super::column::RowGroupMeta>,
     /// Rows flushed out of the accumulators so far
     flushed_rows: usize,
+    /// The first row refused for a value the volume cannot store; the
+    /// build fails with it when its groups are flushed or it is finished
+    refused: Option<Error>,
 }
 
 /// One output column's cells for a batch of rows in the column's storage
@@ -2229,6 +2232,7 @@ impl VolumeBuilder {
             bloom: None,
             row_groups: Vec::new(),
             flushed_rows: 0,
+            refused: None,
         }
     }
 
@@ -2276,6 +2280,9 @@ impl VolumeBuilder {
         &mut self,
         mut emit: impl FnMut(usize, TypedCells<'_>) -> Result<()>,
     ) -> Result<()> {
+        if let Some(e) = &self.refused {
+            return Err(e.clone());
+        }
         let rows = self.group_len();
         if rows == 0 {
             return Ok(());
@@ -2375,6 +2382,9 @@ impl VolumeBuilder {
     /// the columns. Row groups are kept only for a volume of more than
     /// one group, as `finish` keeps them
     pub fn finish_streamed(mut self) -> Result<(VolumeMeta, Vec<Vec<SmartString>>)> {
+        if let Some(e) = self.refused.take() {
+            return Err(e);
+        }
         if self.flushed_rows != self.row_count {
             return Err(Error::internal("rows left in the accumulators at finish"));
         }
@@ -2774,14 +2784,29 @@ impl VolumeBuilder {
     /// Add a row to the volume.
     pub fn add_row(&mut self, row_id: i64, row: &Row) {
         // A value written before its column changed type is stored as its
-        // cast to the column's type
+        // cast to the column's type; a TIMESTAMP outside the range has no
+        // nanoseconds to store and refuses the row before any column takes it
         if !row
             .as_slice()
             .iter()
             .zip(&self.col_storage)
-            .all(|(value, &kind)| stored_as(kind, value))
+            .all(|(value, &kind)| match (kind, value) {
+                (StorageKind::Timestamp(_), Value::Timestamp(t)) => {
+                    crate::core::value::timestamp_fits(t)
+                }
+                _ => stored_as(kind, value),
+            })
         {
             let cast = self.cast_row(row);
+            let unstorable = cast.iter().find_map(|value| match value {
+                Value::Timestamp(t) if !crate::core::value::timestamp_fits(t) => Some(*t),
+                _ => None,
+            });
+            if let Some(Err(e)) = unstorable.map(crate::core::value::timestamp_in_range) {
+                self.refused
+                    .get_or_insert_with(|| Error::internal(format!("row {row_id}: {e}")));
+                return;
+            }
             return self.add_row(row_id, &cast);
         }
         self.row_ids.push(row_id);
@@ -2869,12 +2894,9 @@ impl VolumeBuilder {
                     self.float_cols[idx].push(v);
                 }
                 StorageKind::Timestamp(idx) => {
+                    // The row was checked on entry, so every TIMESTAMP fits
                     let nanos = match value {
-                        Value::Timestamp(ts) => ts.timestamp_nanos_opt().unwrap_or_else(|| {
-                            ts.timestamp()
-                                .wrapping_mul(1_000_000_000)
-                                .wrapping_add(ts.timestamp_subsec_nanos() as i64)
-                        }),
+                        Value::Timestamp(ts) => ts.timestamp_nanos_opt().unwrap_or_default(),
                         _ => 0,
                     };
                     if self.sorted[col_idx] {
@@ -2964,6 +2986,9 @@ impl VolumeBuilder {
     /// Freeze the builder into a FrozenVolume. Rows must have been added
     /// in ascending row id order; any other order is an error
     pub fn finish(mut self) -> Result<FrozenVolume> {
+        if let Some(e) = self.refused.take() {
+            return Err(e);
+        }
         debug_assert_eq!(self.row_ids.len(), self.row_count);
         if self.flushed_rows != 0 {
             return Err(Error::internal(

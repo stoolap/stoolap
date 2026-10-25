@@ -51,6 +51,21 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
 
         handle.row_gen += 1;
         if rows_inner.advance() {
+            // A TIMESTAMP the C API cannot carry as nanoseconds is an error,
+            // not the epoch a column read would give
+            let unrepresentable = rows_inner
+                .current_row()
+                .as_slice()
+                .iter()
+                .find_map(|value| match value {
+                    Value::Timestamp(t) => crate::core::value::timestamp_nanos(t).err(),
+                    _ => None,
+                });
+            if let Some(err) = unrepresentable {
+                handle.has_row = false;
+                handle.set_error(&err.to_string());
+                return STOOLAP_ERROR;
+            }
             handle.has_row = true;
             STOOLAP_ROW
         } else {
@@ -467,10 +482,10 @@ fn write_rows(
                     }
                     DataType::Timestamp => {
                         buf.push(5);
-                        let nanos = val
-                            .as_timestamp()
-                            .map(|ts| ts.timestamp_nanos_opt().unwrap_or(0))
-                            .unwrap_or(0);
+                        let nanos = match val.as_timestamp() {
+                            Some(ts) => crate::core::value::timestamp_nanos(&ts)?,
+                            None => 0,
+                        };
                         buf.extend_from_slice(&nanos.to_le_bytes());
                     }
                     DataType::Json => {

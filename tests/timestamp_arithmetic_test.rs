@@ -15,24 +15,25 @@
 //! A TIMESTAMP moved by an INTERVAL or a number of days reads the interval
 //! one way, moves a month on the calendar with the day clamped, and is an
 //! error for a result outside years 0000 to 9999, wherever it is computed.
+//! A table stores the narrower range only, so writing past it is an error.
 
 use stoolap::{Database, Value};
 
-/// `t` holds the last and the first representable day, and interval text
+/// `t` holds the last and the first day a TIMESTAMP is computed on, and
+/// interval text; `w` stores the last hour a TIMESTAMP is stored in
 fn open(name: &str) -> Database {
     let db = Database::open(&format!("memory://timestamp_arithmetic_{name}")).unwrap();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP, s TEXT)",
-        (),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO t VALUES (1, '9999-12-31 12:00:00.5', '1 day'), \
-         (2, '0000-01-01 00:00:00', '-1 day'), (3, '2024-01-31 10:00:00.75', 'banana'), \
-         (4, '2024-01-31 10:00:00.75', '99999999999999999999 days')",
-        (),
-    )
-    .unwrap();
+    for sql in [
+        "CREATE VIEW t AS SELECT * FROM (VALUES \
+         (1, TIMESTAMP '9999-12-31 12:00:00.5', '1 day'), \
+         (2, TIMESTAMP '0000-01-01 00:00:00', '-1 day'), \
+         (3, TIMESTAMP '2024-01-31 10:00:00.75', 'banana'), \
+         (4, TIMESTAMP '2024-01-31 10:00:00.75', '99999999999999999999 days')) AS v(id, ts, s)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, ts TIMESTAMP)",
+        "INSERT INTO w VALUES (1, '2262-04-11 23:00:00')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
     db
 }
 
@@ -97,18 +98,19 @@ fn test_a_result_outside_the_range_is_an_error() {
     fails(&db, "SELECT ts + s FROM t WHERE id = 4");
 
     assert!(db
-        .execute("UPDATE t SET ts = ts + INTERVAL '1 day' WHERE id = 1", ())
+        .execute("UPDATE w SET ts = ts + INTERVAL '1 day' WHERE id = 1", ())
         .is_err());
     assert_eq!(
-        answer(&db, "SELECT ts FROM t WHERE id = 1"),
-        ts("9999-12-31 12:00:00.5")
+        answer(&db, "SELECT ts FROM w WHERE id = 1"),
+        ts("2262-04-11 23:00:00")
     );
-    assert!(db
-        .execute(
-            "INSERT INTO t (id, ts) SELECT 9, ts + 1 FROM t WHERE id = 1",
-            ()
-        )
-        .is_err());
+    for sql in [
+        "INSERT INTO w (id, ts) SELECT 9, ts + 1 FROM t WHERE id = 1",
+        "INSERT INTO w (id, ts) SELECT 9, ts FROM t WHERE id = 1",
+        "INSERT INTO w (id, ts) SELECT 9, ts FROM t WHERE id = 2",
+    ] {
+        assert!(db.execute(sql, ()).is_err(), "{sql} should fail");
+    }
 }
 
 #[test]

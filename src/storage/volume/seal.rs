@@ -50,7 +50,9 @@ pub fn seal_rows(schema: &Schema, rows: &[(i64, Row)]) -> Result<FrozenVolume> {
     for (row_id, row) in rows {
         builder.add_row(*row_id, row);
     }
-    builder.finish()
+    builder.finish().map_err(|e| {
+        crate::core::Error::internal(format!("sealing table {}: {e}", schema.table_name))
+    })
 }
 
 /// Orders two values of a clustering key column: by kind, then by value
@@ -179,6 +181,35 @@ pub fn seal_and_persist_multi(
 mod tests {
     use super::*;
     use crate::core::{DataType, SchemaBuilder, Value};
+
+    #[test]
+    fn a_row_with_a_timestamp_past_the_range_fails_the_seal() {
+        let schema = SchemaBuilder::new("events")
+            .column("id", DataType::Integer, false, true)
+            .column("ts", DataType::Timestamp, true, false)
+            .build();
+        let at = |s: &str| Value::Timestamp(crate::core::parse_timestamp(s).unwrap());
+        let row = |id: i64, ts: Value| (id, Row::from_values(vec![Value::Integer(id), ts]));
+        let rows = vec![
+            row(1, at("2024-01-01")),
+            row(2, at("9999-12-31")),
+            row(3, at("2024-01-02")),
+        ];
+        let err = match seal_rows(&schema, &rows) {
+            Ok(_) => panic!("a TIMESTAMP past the range was sealed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("sealing table events") && err.contains("row 2"),
+            "{err}"
+        );
+        assert!(err.contains("outside the range"), "{err}");
+
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &rows[1].1);
+        assert!(builder.flush_group(|_, _| Ok(())).is_err());
+        assert_eq!(builder.group_len(), 0, "the refused row took no column");
+    }
 
     #[test]
     fn test_seal_basic() {

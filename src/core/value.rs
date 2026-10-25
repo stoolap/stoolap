@@ -236,7 +236,7 @@ impl Value {
                 .ok()
                 .or_else(|| s.parse::<f64>().ok().map(|f| f as i64)),
             Value::Boolean(b) => Some(if *b { 1 } else { 0 }),
-            Value::Timestamp(t) => Some(t.timestamp_nanos_opt().unwrap_or(0)),
+            Value::Timestamp(t) => t.timestamp_nanos_opt(),
             Value::Extension(_) => None,
         }
     }
@@ -1416,6 +1416,52 @@ pub fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
         Some(ndt) => Ok(Utc.from_utc_datetime(&ndt)),
         None => parse_timestamp_formats(s),
     }
+}
+
+/// Whether `t` lies in the range a TIMESTAMP is stored and handed out in,
+/// the times whose nanoseconds since the epoch fit an i64: from
+/// 1677-09-21 00:12:43.145224192 to 2262-04-11 23:47:16.854775807 UTC
+#[inline]
+pub fn timestamp_fits(t: &DateTime<Utc>) -> bool {
+    // A year strictly inside the range fits; only the first and the last
+    // year compare the time, never the nanoseconds a write path would compute
+    (1678..=2261).contains(&chrono::Datelike::year(&t.naive_utc())) || timestamp_fits_at_the_ends(t)
+}
+
+#[cold]
+#[inline(never)]
+fn timestamp_fits_at_the_ends(t: &DateTime<Utc>) -> bool {
+    static RANGE: std::sync::LazyLock<(DateTime<Utc>, DateTime<Utc>)> =
+        std::sync::LazyLock::new(|| {
+            (
+                DateTime::from_timestamp_nanos(i64::MIN),
+                DateTime::from_timestamp_nanos(i64::MAX),
+            )
+        });
+    (RANGE.0..=RANGE.1).contains(t)
+}
+
+/// `t` when it lies in that range, else the error every place that would
+/// store it or hand it out raises
+pub fn timestamp_in_range(t: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    match timestamp_fits(&t) {
+        true => Ok(t),
+        false => Err(timestamp_range_error(&t)),
+    }
+}
+
+/// `t` as nanoseconds since the epoch, as the engine stores it; outside
+/// that range the error [`timestamp_in_range`] raises
+pub fn timestamp_nanos(t: &DateTime<Utc>) -> Result<i64> {
+    t.timestamp_nanos_opt()
+        .ok_or_else(|| timestamp_range_error(t))
+}
+
+fn timestamp_range_error(t: &DateTime<Utc>) -> Error {
+    Error::Type(format!(
+        "TIMESTAMP {t} is outside the range 1677-09-21 00:12:43.145224192 to \
+         2262-04-11 23:47:16.854775807"
+    ))
 }
 
 /// `YYYY-MM-DD`, alone or with ` ` or `T`, `HH:MM:SS` and up to nine

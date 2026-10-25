@@ -81,6 +81,12 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
     let default = next.columns[column].default_value.take();
     next.columns[column].default_value =
         default.map(|value| value.coerce_to_type(change.data_type));
+    // A change the log replays was taken when it was made
+    if let (false, Some(Value::Timestamp(t))) =
+        (shared.replaying, &next.columns[column].default_value)
+    {
+        crate::core::value::timestamp_in_range(*t)?;
+    }
     let next = CompactArc::new(next);
     let retyped = current.columns[column].data_type != change.data_type
         || current.columns[column].vector_dimensions != change.vector_dimensions;
@@ -127,6 +133,7 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         column,
         change,
         retyped || !change.nullable,
+        !shared.replaying,
     );
     // The new HNSW objects take the sealed rows before anything is decided
     let hnsw: Vec<Arc<dyn Index>> = cast
@@ -224,6 +231,7 @@ pub(super) fn repair_retyped_volumes(shared: &Shared<'_>, table: &str) -> Result
             column,
             &change,
             true,
+            false,
         );
         if let Err(error) = checked {
             cold.discard();
@@ -355,6 +363,9 @@ struct Rewrite {
     meta: SegmentMeta,
     side: Option<Arc<IndexFile>>,
     path: PathBuf,
+    /// The copies whose cast TIMESTAMP no volume stores, written NULL, by
+    /// row id: an error for a copy with authority
+    nulled: Vec<(i64, chrono::DateTime<chrono::Utc>)>,
 }
 
 /// The volumes of a table that hold the changed column in another type,
@@ -582,6 +593,7 @@ fn rewrite_volume(
     let inputs = [(seg_id, Arc::clone(source))];
     let mut transfer =
         crate::storage::volume::transfer::Transfer::new(schema, &inputs, &[mapping], &refs)?;
+    transfer.null_unstorable_casts();
     let id = crate::storage::volume::io::next_volume_id();
     let mut output = crate::storage::volume::output::VolumeFileWriter::new(
         dir,
@@ -625,13 +637,14 @@ fn rewrite_volume(
         meta,
         side,
         path,
+        nulled: transfer.take_nulled(),
     })
 }
 
-/// NOT NULL, the vector dimension and every unique index over the column,
-/// over the current committed view in the new type: each live row once,
-/// its newest copy (the hot store first, then the volumes newest first,
-/// read through their rewrites)
+/// NOT NULL, the vector dimension, the stored TIMESTAMP range when
+/// `storable`, and every unique index over the column, over the current
+/// committed view in the new type: each live row once, its newest copy (the
+/// hot store first, then the volumes newest first, read through rewrites)
 #[allow(clippy::too_many_arguments)]
 fn validate(
     store: &VersionStore,
@@ -642,10 +655,11 @@ fn validate(
     column: usize,
     change: &ColumnTypeChange<'_>,
     sealed_too: bool,
+    storable: bool,
 ) -> Result<()> {
     let mut unique = UniqueKeys::new(store, column);
     for (row_id, row) in cast.live_rows() {
-        validate_value(row.get(column), change)?;
+        validate_value(row.get(column), change, storable)?;
         unique.insert(row_id, |id| row.get(id).cloned())?;
     }
     let Some(mgr) = mgr.filter(|_| sealed_too) else {
@@ -665,7 +679,7 @@ fn validate(
     }
     let mut seen = FxHashSet::default();
     for &seg_id in snapshot.seg_ids.iter().rev() {
-        let Some((volume, mapping, dead)) =
+        let Some((volume, mapping, dead, nulled)) =
             sealed_input(mgr, &snapshot, cold, seg_id, schema, &dropped, &renames)?
         else {
             continue;
@@ -678,6 +692,10 @@ fn validate(
             {
                 continue;
             }
+            // A copy with authority never loses its value, at the open's repair too
+            if let Ok(at) = nulled.binary_search_by_key(&row_id, |&(id, _)| id) {
+                crate::core::value::timestamp_in_range(nulled[at].1)?;
+            }
             let row = volume.get_row_mapped_projected(i, &mapping, &wanted)?;
             let value = |id: usize| {
                 wanted
@@ -685,7 +703,7 @@ fn validate(
                     .position(|&w| w == id)
                     .and_then(|at| row.get(at).cloned())
             };
-            validate_value(value(column).as_ref(), change)?;
+            validate_value(value(column).as_ref(), change, storable)?;
             unique.insert(row_id, value)?;
         }
     }
@@ -694,17 +712,23 @@ fn validate(
 
 /// A volume as the change will leave it: its rewrite, read whole, or the
 /// volume itself read through its mapping, with its copies without authority
-type SealedInput = (Arc<FrozenVolume>, ColumnMapping, Arc<[u32]>);
+/// and the rewrite's copies written NULL
+type SealedInput<'c> = (
+    Arc<FrozenVolume>,
+    ColumnMapping,
+    Arc<[u32]>,
+    &'c [(i64, chrono::DateTime<chrono::Utc>)],
+);
 
-fn sealed_input(
+fn sealed_input<'c>(
     mgr: &SegmentManager,
     snapshot: &ColdSnapshot,
-    cold: &ColdCast,
+    cold: &'c ColdCast,
     seg_id: u64,
     schema: &Schema,
     dropped: &[(SmartString, u64)],
     renames: &[(SmartString, SmartString)],
-) -> Result<Option<SealedInput>> {
+) -> Result<Option<SealedInput<'c>>> {
     if let Some(rewrite) = cold.output_of(seg_id) {
         let mapping = writer::compute_column_mapping_with_drops(
             schema,
@@ -713,7 +737,12 @@ fn sealed_input(
             rewrite.meta.schema_version,
             renames,
         )?;
-        return Ok(Some((Arc::clone(&rewrite.volume), mapping, Arc::from([]))));
+        return Ok(Some((
+            Arc::clone(&rewrite.volume),
+            mapping,
+            Arc::from([]),
+            &rewrite.nulled,
+        )));
     }
     let Some(segment) = snapshot.segs.get(&seg_id) else {
         return Ok(None);
@@ -729,7 +758,7 @@ fn sealed_input(
         renames,
     )?;
     let dead = segment.dead.clone().unwrap_or_else(|| Arc::from([]));
-    Ok(Some((volume, mapping, dead)))
+    Ok(Some((volume, mapping, dead, &[])))
 }
 
 /// A unique index's name, its columns, and each key seen with the row
@@ -797,13 +826,21 @@ impl UniqueKeys {
 }
 
 /// A value of the column in the new type, checked against its definition
-fn validate_value(value: Option<&Value>, change: &ColumnTypeChange<'_>) -> Result<()> {
+/// and, when `storable`, the range a TIMESTAMP is stored in
+fn validate_value(
+    value: Option<&Value>,
+    change: &ColumnTypeChange<'_>,
+    storable: bool,
+) -> Result<()> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         if change.nullable {
             return Ok(());
         }
         return Err(Error::not_null_constraint(change.column));
     };
+    if let (true, Value::Timestamp(t)) = (storable, value) {
+        crate::core::value::timestamp_in_range(*t)?;
+    }
     if change.data_type == DataType::Vector && change.vector_dimensions > 0 {
         let got = value.vector_f32_iter().map_or(0, |values| values.len());
         if got != change.vector_dimensions as usize {

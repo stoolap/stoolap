@@ -34,6 +34,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use rustc_hash::FxHashMap;
 
 use crate::core::{DataType, Error, Result, Schema, Value};
@@ -223,11 +225,7 @@ impl Scratch {
             }
             Scratch::TimestampNanos(values, nulls) => {
                 values.push(match value {
-                    Value::Timestamp(ts) => ts.timestamp_nanos_opt().unwrap_or_else(|| {
-                        ts.timestamp()
-                            .wrapping_mul(1_000_000_000)
-                            .wrapping_add(ts.timestamp_subsec_nanos() as i64)
-                    }),
+                    Value::Timestamp(ts) => crate::core::value::timestamp_nanos(ts)?,
                     _ => 0,
                 });
                 nulls.push(false);
@@ -288,6 +286,9 @@ pub struct Transfer<'a> {
     row_ids: Vec<i64>,
     held_bytes: usize,
     peak_held_bytes: usize,
+    /// When on, each cast TIMESTAMP no volume can store is written NULL,
+    /// its row id and time noted here; when off, it fails the transfer
+    nulled: Option<Vec<(i64, DateTime<Utc>)>>,
 }
 
 impl<'a> Transfer<'a> {
@@ -369,7 +370,21 @@ impl<'a> Transfer<'a> {
             row_ids: Vec::new(),
             held_bytes: 0,
             peak_held_bytes: 0,
+            nulled: None,
         })
+    }
+
+    /// Writes each cast TIMESTAMP no volume can store as NULL from now on,
+    /// for the caller to decide which of those rows may lose it
+    pub fn null_unstorable_casts(&mut self) {
+        self.nulled.get_or_insert_with(Vec::new);
+    }
+
+    /// The rows written NULL so far, with the time each held, by row id
+    pub fn take_nulled(&mut self) -> Vec<(i64, DateTime<Utc>)> {
+        let mut nulled = self.nulled.as_mut().map(std::mem::take).unwrap_or_default();
+        nulled.sort_unstable_by_key(|&(row_id, _)| row_id);
+        nulled
     }
 
     /// The next output starts: the dictionary remaps belong to the
@@ -425,6 +440,7 @@ impl<'a> Transfer<'a> {
                 &mut self.remaps,
                 &mut self.default_ids,
                 &mut self.scratch[column],
+                &mut self.nulled,
                 sink,
             )?;
         }
@@ -577,9 +593,10 @@ fn gather(
     remaps: &mut [Vec<Vec<u32>>],
     default_ids: &mut [Vec<Option<u32>>],
     scratch: &mut Scratch,
+    nulled: &mut Option<Vec<(i64, DateTime<Utc>)>>,
     builder: &mut impl TypedSink,
 ) -> Result<()> {
-    for (&(_, input, row), &handle) in refs.iter().zip(ref_handle) {
+    for (&(row_id, input, row), &handle) in refs.iter().zip(ref_handle) {
         let handle = &handles[handle as usize];
         let physical = match &plans[input][column] {
             Source::Column(physical) => *physical,
@@ -709,6 +726,13 @@ fn gather(
             // goes through its value, cast to the output's type
             (scratch, source) => {
                 let value = source.get_value(local).coerce_to_type(data_type);
+                if let (Some(nulled), Value::Timestamp(t)) = (nulled.as_mut(), &value) {
+                    if !crate::core::value::timestamp_fits(t) {
+                        scratch.push_null();
+                        nulled.push((row_id, *t));
+                        continue;
+                    }
+                }
                 scratch.push_value(&value, &mut |text| builder.intern_text(column, text))?;
             }
         }

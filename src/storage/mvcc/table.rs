@@ -1726,18 +1726,23 @@ impl MVCCTable {
     }
 
     /// Validates and coerces a row against the schema; a row that needs no
-    /// coercion and holds no refused NULL is valid as is
-    #[inline]
+    /// coercion, holds no refused NULL and no TIMESTAMP outside the stored
+    /// range is valid as is
+    #[inline(always)]
     fn validate_and_coerce_row(&self, row: &mut Row) -> Result<()> {
         let columns = &self.cached_schema.columns;
         if row.len() == columns.len()
-            && columns.iter().zip(row.as_slice()).all(|(col, value)| {
-                if value.is_null() {
-                    col.nullable
-                } else {
-                    value.data_type() == col.data_type
-                }
-            })
+            && columns
+                .iter()
+                .zip(row.as_slice())
+                .all(|(col, value)| match value {
+                    Value::Null(_) => col.nullable,
+                    Value::Timestamp(t) => {
+                        col.data_type == DataType::Timestamp
+                            && crate::core::value::timestamp_fits(t)
+                    }
+                    _ => value.data_type() == col.data_type,
+                })
         {
             return Ok(());
         }
@@ -1773,6 +1778,11 @@ impl MVCCTable {
                     "NULL value in non-nullable column '{}'",
                     col.name
                 )));
+            }
+
+            // A TIMESTAMP the engine cannot store is refused, not wrapped
+            if let Value::Timestamp(t) = value {
+                crate::core::value::timestamp_in_range(*t)?;
             }
 
             // Check type compatibility for non-NULL values
@@ -3152,6 +3162,9 @@ impl Table for MVCCTable {
         default_expr: Option<String>,
         default_value: Option<Value>,
     ) -> Result<()> {
+        if let Some(Value::Timestamp(t)) = &default_value {
+            crate::core::value::timestamp_in_range(*t)?;
+        }
         // The version store's schema is the truth: the new column's id
         // comes from it, and the cached copy follows it whole
         let next_id = self.version_store.schema().columns.len();
@@ -5770,6 +5783,26 @@ mod tests {
 
         assert_eq!(table.name(), "test_table");
         assert_eq!(table.schema().columns.len(), 2);
+    }
+
+    #[test]
+    fn an_added_column_whose_default_is_past_the_stored_range_is_refused() {
+        let version_store = Arc::new(VersionStore::new("test_table".to_string(), test_schema()));
+        let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), 1);
+        let mut table = MVCCTable::new(1, version_store, txn_versions);
+        let far = crate::core::parse_timestamp("9999-12-31").unwrap();
+        let added = table.create_column_with_default_value(
+            "far",
+            DataType::Timestamp,
+            true,
+            Some("'9999-12-31'".to_string()),
+            Some(Value::Timestamp(far)),
+        );
+        assert!(
+            added.is_err_and(|e| e.to_string().contains("outside the range")),
+            "the default was accepted"
+        );
+        assert_eq!(table.schema().columns.len(), 2, "the column was added");
     }
 
     #[test]

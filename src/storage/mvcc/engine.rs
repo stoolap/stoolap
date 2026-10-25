@@ -1554,7 +1554,12 @@ impl MVCCEngine {
             }
             true
         })?;
-        let mut volume = builder.finish()?;
+        let mut volume = builder.finish().map_err(|e| {
+            Error::internal(format!(
+                "converting the snapshot of table {}: {e}",
+                schema.table_name
+            ))
+        })?;
         let vol_row_count = volume.meta.row_count;
 
         // Write volume file to disk and retain CompressedBlockStore for
@@ -3513,6 +3518,13 @@ impl MVCCEngine {
                         .as_deref()
                         .and_then(|expr| try_parse_default_literal(expr, data_type))
                 });
+                // A change the log replays was taken when it was made
+                if let (false, Some(Value::Timestamp(t))) = (
+                    self.loading_from_disk.load(Ordering::Acquire),
+                    &col.default_value,
+                ) {
+                    crate::core::value::timestamp_in_range(*t)?;
+                }
                 col.default_expr = default_expr;
                 col.vector_dimensions = vector_dimensions;
                 store.add_column(col)?;

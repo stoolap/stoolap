@@ -4490,3 +4490,50 @@ fn test_a_long_named_array_binds_every_slot_by_name() {
         stoolap_close(db);
     }
 }
+
+#[test]
+fn test_a_timestamp_past_the_nanosecond_range_is_an_error_not_the_epoch() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        let open = |sql: &str| {
+            let sql = cstr(sql);
+            let mut rows: *mut StoolapRows = std::ptr::null_mut();
+            assert_eq!(stoolap_query(db, sql.as_ptr(), &mut rows), STOOLAP_OK);
+            rows
+        };
+        let past = "SELECT TIMESTAMP '9999-12-31 00:00:00'";
+        let before = "SELECT TIMESTAMP '1600-01-01 00:00:00'";
+        for sql in [past, before] {
+            let rows = open(sql);
+            assert_eq!(stoolap_rows_next(rows), STOOLAP_ERROR, "{sql}: row by row");
+            assert!(read_cstr(stoolap_rows_errmsg(rows)).contains("outside the range"));
+            stoolap_rows_close(rows);
+
+            let rows = open(sql);
+            let mut buf: *mut u8 = std::ptr::null_mut();
+            let mut len: i64 = 0;
+            let rc = stoolap_rows_fetch_all(rows, &mut buf, &mut len);
+            assert_eq!(rc, STOOLAP_ERROR, "{sql}: fetch all");
+            assert!(buf.is_null());
+            assert!(read_cstr(stoolap_rows_errmsg(rows)).contains("outside the range"));
+            stoolap_rows_close(rows);
+
+            let rows = open(sql);
+            let mut chunk: *const u8 = std::ptr::null();
+            let mut n: i32 = 0;
+            let rc = stoolap_rows_fetch_chunk(rows, 10, &mut chunk, &mut len, &mut n);
+            assert_eq!(rc, STOOLAP_ERROR, "{sql}: fetch chunk");
+            stoolap_rows_close(rows);
+        }
+
+        let rows = open("SELECT TIMESTAMP '2262-01-01 00:00:00'");
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(
+            stoolap_rows_column_timestamp(rows, 0),
+            9_214_646_400_000_000_000
+        );
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
