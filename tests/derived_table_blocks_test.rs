@@ -638,3 +638,42 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
     );
     assert_eq!(answer(&db, &bound), Ok(ids(&[1, 2, 3, 4])), "{bound}");
 }
+
+#[test]
+fn a_slot_spelled_as_a_name_shares_no_cached_subquery_with_that_name() {
+    let _turn = turn();
+    // The inner `a` is t's, a slot holding 'z'; the quoted "a" no table has
+    // is the text 'a'. DISTINCT ON keeps both statements on the general path
+    let slot = "SELECT (SELECT MAX(d.c) FROM (SELECT DISTINCT ON (u.id) \
+                (SELECT COUNT(*) FROM w WHERE w.k = a) AS c FROM u) AS d) FROM t";
+    let text = "SELECT DISTINCT ON (u.id) (SELECT COUNT(*) FROM w WHERE w.k = \"a\"), $1 FROM u";
+    for slot_first in [true, false] {
+        let db = Database::open(&format!(
+            "memory://derived_table_blocks_spelled_slot_cache_{slot_first}"
+        ))
+        .unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "INSERT INTO t VALUES (1, 'z')",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+            "INSERT INTO u VALUES (1)",
+            "CREATE TABLE w (id INTEGER PRIMARY KEY, k TEXT)",
+            "INSERT INTO w VALUES (1, 'a'), (2, 'a'), (3, 'z')",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let read_text = || -> Vec<i64> {
+            db.query(text, ("z",))
+                .unwrap()
+                .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                .collect()
+        };
+        let texts = match slot_first {
+            true => None,
+            false => Some(read_text()),
+        };
+        assert_eq!(answer(&db, slot), Ok(vec![vec!["1".to_string()]]), "{slot}");
+        let texts = texts.unwrap_or_else(read_text);
+        assert_eq!(texts, [2], "{text}: the text 'a' matches two rows");
+    }
+}

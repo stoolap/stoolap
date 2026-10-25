@@ -242,8 +242,11 @@ fn a_grouped_column_keeps_the_spelling_of_its_item() {
 #[test]
 fn a_name_no_bare_word_spells_is_quoted_in_the_item_it_names() {
     let db = hot("quoted_names");
-    db.execute("CREATE TABLE q (id INTEGER PRIMARY KEY, \"A b\" INTEGER)", ())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, \"A b\" INTEGER)",
+        (),
+    )
+    .unwrap();
     db.execute("INSERT INTO q VALUES (1, 2)", ()).unwrap();
     for (sql, expected) in [
         ("SELECT \"A b\", q.\"A b\" FROM q", vec!["A b", "A b"]),

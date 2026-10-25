@@ -58,6 +58,15 @@ impl ExprKey {
         hasher.finish()
     }
 
+    /// The key of the statement `stmt` as [`Self::exact`] keys an expression;
+    /// None when it holds a prepared block, which another statement's id keys alike
+    pub(crate) fn of_statement(stmt: &SelectStatement) -> Option<Self> {
+        let mut hasher = KeyHasher::new();
+        hasher.exact = true;
+        write_statement(stmt, &mut hasher);
+        (!hasher.marked).then(|| hasher.finish())
+    }
+
     pub(crate) fn of_call(call: &FunctionCall) -> Self {
         let mut hasher = KeyHasher::new();
         write_call(call, &mut hasher);
@@ -97,6 +106,8 @@ struct KeyHasher {
     exact: bool,
     /// A column is its name alone, see [`ExprKey::by_column_name`]
     by_column_name: bool,
+    /// Whether a prepared block was met, which only its id keys
+    marked: bool,
 }
 
 impl Hasher for KeyHasher {
@@ -117,6 +128,7 @@ impl KeyHasher {
             a: AHasher::default(),
             exact: false,
             by_column_name: false,
+            marked: false,
         }
     }
 
@@ -422,6 +434,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
 fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
     hasher.flag(stmt.prepared.is_some());
     if let Some(id) = stmt.prepared {
+        hasher.marked = true;
         id.hash(hasher);
         return;
     }
