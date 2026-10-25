@@ -17,7 +17,11 @@
 //! that holds it; and the plain conjuncts beside a correlated subquery
 //! still narrow the outer scan.
 
+use std::sync::Mutex;
 use stoolap::Database;
+
+/// The block run counters are process-wide and every test here moves them
+static COUNTERS: Mutex<()> = Mutex::new(());
 
 fn count(db: &Database, sql: &str) -> i64 {
     db.query(sql, ())
@@ -63,6 +67,7 @@ fn expected(above: usize, passes: impl Fn(i64, i64) -> bool) -> i64 {
 
 #[test]
 fn test_grandparent_only_subquery_folds_once() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
     let db = tables("memory://nested_subquery_binding");
 
     #[cfg(feature = "test-failpoints")]
@@ -94,6 +99,7 @@ fn test_grandparent_only_subquery_folds_once() {
 
 #[test]
 fn test_grandparent_only_exists_probes_once_per_outer_row() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
     let db = tables("memory://nested_subquery_binding_exists");
     // A z row of 's7' whose a is above x.a + 20
     let found: Vec<bool> = (0..=20)
@@ -118,6 +124,7 @@ fn test_grandparent_only_exists_probes_once_per_outer_row() {
 
 #[test]
 fn test_grandparent_only_in_reads_members_once_per_outer_row() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
     let db = tables("memory://nested_subquery_binding_in");
     let members: Vec<Vec<i64>> = (0..=20)
         .map(|i| {
@@ -142,4 +149,36 @@ fn test_grandparent_only_in_reads_members_once_per_outer_row() {
         stoolap::test_failpoints::in_subquery_runs() - runs <= 20,
         "at most one member read per outer row, not one per row of y"
     );
+}
+
+#[test]
+fn test_grandparent_only_in_over_unpushed_source_keeps_correlation() {
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://nested_subquery_binding_in_source").unwrap();
+    for sql in [
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE y (id INTEGER PRIMARY KEY, b INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE VIEW v AS SELECT a, b FROM w",
+        "INSERT INTO x VALUES (1, 1), (2, 2)",
+        "INSERT INTO y VALUES (1, 10)",
+        "INSERT INTO w VALUES (1, 1, 20), (2, 2, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for source in ["v", "(VALUES (1, 20), (2, 10)) AS v(a, b)"] {
+        let sql = format!(
+            "SELECT id, (SELECT COUNT(*) FROM y WHERE y.b IN \
+             (SELECT v.b FROM {source} WHERE v.a = x.a)) FROM x ORDER BY id"
+        );
+        let rows: Vec<(i64, i64)> = db
+            .query(&sql, ())
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.get(0).unwrap(), r.get(1).unwrap())
+            })
+            .collect();
+        assert_eq!(rows, vec![(1, 0), (2, 1)], "{source}");
+    }
 }

@@ -9262,7 +9262,10 @@ impl PreparedRunner<'_> {
             BoundPushdown::bind(pushdown, &mut bound, values);
         }
         let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
-        let decided = sq.filter.is_none() || (bound.is_some() && pushed_whole);
+        // A plan's keys take the place of the correlation equalities
+        let candidates = sq.candidates.as_ref().filter(|_| plan.is_none());
+        let decided =
+            (sq.filter.is_none() && candidates.is_none()) || (bound.is_some() && pushed_whole);
         let mut groups: FxHashMap<SmallVec<[Value; 1]>, MemberGroup> = FxHashMap::default();
         let mut scanned = 0u64;
         'rows: while scanner.next() {
@@ -9280,6 +9283,11 @@ impl PreparedRunner<'_> {
             }
             let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
                 .with_subquery_executor(self);
+            if let Some(candidates) = candidates.filter(|_| !decided) {
+                if !vm.execute_bool_checked(candidates, &exec)? {
+                    continue;
+                }
+            }
             let passed = if decided {
                 Ok(true)
             } else {
