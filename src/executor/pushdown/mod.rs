@@ -76,12 +76,13 @@ impl<'a> PushdownContext<'a> {
         Self { schema, exec_ctx }
     }
 
-    /// Get column data type by name
+    /// The type of the column `name` names in any case, as `has_column` finds it
     pub fn column_type(&self, name: &str) -> Option<crate::core::DataType> {
-        self.schema
-            .column_index_map()
-            .get(name)
-            .and_then(|&idx| self.schema.columns.get(idx).map(|c| c.data_type))
+        // A lower-case name is found without lowering it again
+        match self.schema.column_index_map().get(name) {
+            Some(&idx) => self.schema.columns.get(idx).map(|c| c.data_type),
+            None => self.schema.get_column_type(name),
+        }
     }
 
     /// Check if a column exists in the schema
