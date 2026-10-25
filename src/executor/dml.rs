@@ -3575,15 +3575,27 @@ impl Executor {
 
             let mut rows_to_delete: Vec<(Value, Option<Row>)> = Vec::new();
             let mut rows_to_delete_by_row_id: Vec<(i64, Option<Row>)> = Vec::new();
+            // Each key's values, read as the rows are found from the column
+            // it names: a key need not name the primary key
+            let fk_columns: Vec<Option<usize>> = referencing_fks
+                .iter()
+                .map(|(_, fk)| {
+                    let referenced = fk.referenced_column.to_lowercase();
+                    schema_arc
+                        .columns
+                        .iter()
+                        .position(|c| c.name_lower == referenced)
+                })
+                .collect();
+            let mut fk_values: Vec<Vec<Value>> = vec![Vec::new(); fk_columns.len()];
             // A row to delete, by its primary key or, without one, its row id
             let mut collect = |row_id: i64, row: &Row| {
-                // The row itself is what the foreign keys are read from, so
-                // it is kept for them too
-                let row_data = if has_returning || has_referencing_fks {
-                    Some(row.clone())
-                } else {
-                    None
-                };
+                let row_data = has_returning.then(|| row.clone());
+                for (values, column) in fk_values.iter_mut().zip(&fk_columns) {
+                    if let Some(value) = column.and_then(|c| row.get(c)) {
+                        values.push(value.clone());
+                    }
+                }
                 match pk_col_idx {
                     Some(pk_idx) => {
                         if let Some(pk_value) = row.get(pk_idx) {
@@ -3724,32 +3736,16 @@ impl Executor {
             // Drop scanner to release borrow
             drop(scanner);
 
-            // Each key is read from the column it names, which is why the
-            // rows were kept: a key need not name the primary key. Every key
-            // is asked whether it refuses before any key acts, so a refusal
-            // leaves the statement having written nothing
+            // Every key is asked whether it refuses before any key acts, so a
+            // refusal leaves the statement having written nothing
             if has_referencing_fks {
-                let kept: Vec<&Row> = rows_to_delete
-                    .iter()
-                    .filter_map(|(_, row)| row.as_ref())
-                    .chain(
-                        rows_to_delete_by_row_id
-                            .iter()
-                            .filter_map(|(_, row)| row.as_ref()),
-                    )
-                    .collect();
                 let keyed_values: Vec<(&(String, crate::core::ForeignKeyConstraint), Vec<Value>)> =
                     referencing_fks
                         .iter()
-                        .filter_map(|fk_entry| {
-                            let referenced = fk_entry.1.referenced_column.to_lowercase();
-                            let idx = schema_arc
-                                .columns
-                                .iter()
-                                .position(|c| c.name_lower == referenced)?;
-                            let values: Vec<Value> =
-                                kept.iter().filter_map(|r| r.get(idx).cloned()).collect();
-                            Some((fk_entry, values))
+                        .zip(&fk_columns)
+                        .zip(fk_values)
+                        .filter_map(|((fk_entry, column), values)| {
+                            column.map(|_| (fk_entry, values))
                         })
                         .collect();
                 for (fk_entry, values) in &keyed_values {
@@ -3816,7 +3812,7 @@ impl Executor {
                     pk_expr.prepare_for_schema(&schema_arc);
                     let deleted = table.delete(Some(&pk_expr))?;
                     if deleted > 0 {
-                        if let Some(row) = row_data.filter(|_| has_returning) {
+                        if let Some(row) = row_data {
                             returning_rows.push(row);
                         }
                         delete_count += deleted;
