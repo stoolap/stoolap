@@ -5301,8 +5301,7 @@ impl Executor {
 
     /// The statement's blocks, prepared once with its plan from its ON, the
     /// WHERE `cross` it asks of the joined rows and the WHERE's conditions on
-    /// one side, `side_filters`, with the views' rows preparing read; none
-    /// without them
+    /// one side, `side_filters`; none without them
     #[allow(clippy::too_many_arguments)]
     fn statement_blocks(
         &self,
@@ -5314,12 +5313,7 @@ impl Executor {
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         (left_schema, right_schema): (Option<&Schema>, Option<&Schema>),
         ctx: &ExecutionContext,
-    ) -> Result<
-        Option<(
-            std::sync::Arc<JoinBlocks>,
-            super::prepared_select::FirstReads,
-        )>,
-    > {
+    ) -> Result<Option<std::sync::Arc<JoinBlocks>>> {
         let (
             Some(prepared),
             Some(left_alias),
@@ -5577,14 +5571,10 @@ impl Executor {
             )?,
             false => None,
         };
-        let (blocks, first) = blocks.unzip();
         let blocks_run = match blocks.as_deref() {
-            Some(blocks) => Some(
-                self.join_runner(blocks, &first.unwrap_or_default(), ctx)?
-                    .ok_or_else(|| {
-                        Error::internal("a table's columns changed while the statement prepared")
-                    })?,
-            ),
+            Some(blocks) => Some(self.join_runner(blocks, ctx)?.ok_or_else(|| {
+                Error::internal("a table's columns changed while the statement prepared")
+            })?),
             None => None,
         };
         let statement_run = match (blocks.as_deref(), blocks_run.as_ref()) {
@@ -8982,9 +8972,7 @@ impl Executor {
             plan.map_or_else(decide, |plan| plan.grouped(decide))
         };
         if in_family {
-            // The views' rows preparing read, which this run opens
-            let mut first = super::prepared_select::FirstReads::new();
-            let mut build = || {
+            let build = || {
                 let mut leaves = Vec::new();
                 let mut left_leaves = 0;
                 if let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() {
@@ -8993,14 +8981,14 @@ impl Executor {
                     self.join_leaves(&join.right, ctx, &mut leaves);
                 }
                 let sides = (left_leaves, left_width);
-                self.prepare_grouped_join(stmt, columns, (&leaves, sides), ctx, &mut first)
+                self.prepare_grouped_join(stmt, columns, (&leaves, sides), ctx)
             };
             let held = match plan {
                 Some(plan) => plan.grouped_blocks(columns, ctx.params().len(), build)?,
                 None => std::sync::Arc::new(build()?),
             };
             if let Some(held) = held.as_ref() {
-                let run = self.grouped_runner(held, &first, ctx)?.ok_or_else(|| {
+                let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
                     Error::internal("a table's columns changed while the statement prepared")
                 })?;
                 return self.group_held_rows(held, &run, ctx, rows, columns, |out| {
@@ -9112,11 +9100,9 @@ impl Executor {
             return self.execute_query_on_memory_result(branch, ctx, columns.to_vec(), rows);
         };
         let held = &*held;
-        let run = self
-            .grouped_runner(held, &grouped.first, ctx)?
-            .ok_or_else(|| {
-                Error::internal("a table's columns changed while the statement prepared")
-            })?;
+        let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
+            Error::internal("a table's columns changed while the statement prepared")
+        })?;
         let alias = grouped.scope_name().map(SmartString::from);
         if let Some((columns, rows)) = grouped.source_rows(Some(&run), ctx)? {
             return self.group_held_rows(held, &run, ctx, rows, &columns, |out| {
