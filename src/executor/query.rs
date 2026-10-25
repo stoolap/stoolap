@@ -347,7 +347,7 @@ use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult,
     LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
-    StreamingProjectionResult, TopNResult,
+    StreamingProjectionResult, TopN, TopNResult,
 };
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
@@ -780,6 +780,51 @@ fn lower_index_map(
 enum ItemSource {
     Column(usize),
     Program(SharedProgram),
+}
+
+/// Where a projection puts the rows it builds
+trait RowSink {
+    /// Room for a row of `width` values
+    fn storage(&mut self, width: usize) -> CompactVec<Value>;
+    fn put(&mut self, id: i64, row: Row);
+}
+
+impl RowSink for RowVec {
+    #[inline]
+    fn storage(&mut self, width: usize) -> CompactVec<Value> {
+        CompactVec::with_capacity(width)
+    }
+
+    #[inline]
+    fn put(&mut self, id: i64, row: Row) {
+        self.push((id, row));
+    }
+}
+
+/// The rows an ORDER BY LIMIT keeps of a projection; a row it does not
+/// keep lends its storage to the next
+struct TopSink<'t, F: Fn(&Row, &Row) -> Ordering> {
+    top: &'t mut TopN<F>,
+    spare: Option<Row>,
+}
+
+impl<F: Fn(&Row, &Row) -> Ordering> RowSink for TopSink<'_, F> {
+    #[inline]
+    fn storage(&mut self, width: usize) -> CompactVec<Value> {
+        match self.spare.take() {
+            Some(row) => {
+                let mut values = CompactVec::from_vec(row.into_values());
+                values.clear();
+                values
+            }
+            None => CompactVec::with_capacity(width),
+        }
+    }
+
+    #[inline]
+    fn put(&mut self, _id: i64, row: Row) {
+        self.spare = self.top.push(row);
+    }
 }
 
 #[cold]
@@ -3155,7 +3200,8 @@ impl Executor {
 
     /// A table scan's rows projected by the SELECT list, the names of the
     /// output columns and, for an ORDER BY, their layout; with `order_by_extra`, the ORDER BY
-    /// columns the list lacks follow, for execute_select to sort by and drop
+    /// columns the list lacks follow, for execute_select to sort by and drop.
+    /// True when only the rows an ORDER BY LIMIT keeps were kept, in order
     #[allow(clippy::too_many_arguments)]
     fn project_scanned_rows(
         &self,
@@ -3166,11 +3212,11 @@ impl Executor {
         table_alias: Option<&str>,
         order_by_extra: bool,
         ctx: &ExecutionContext,
-    ) -> Result<(RowVec, Vec<String>, Option<OutputLayout>)> {
+    ) -> Result<(RowVec, Vec<String>, Option<OutputLayout>, bool)> {
         let mut output_columns =
             self.get_output_column_names(&stmt.columns, all_columns, table_alias);
         if order_by_extra {
-            let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
+            let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -3180,18 +3226,69 @@ impl Executor {
                 ctx,
             )?;
             output_columns.extend(extra_names);
-            return Ok((projected_rows, output_columns, Some(layout)));
+            let plan = OutputProjection::Ordered(plan);
+            let (projected_rows, applied) =
+                self.run_output_projection(stmt, &plan, rows, &output_columns, Some(&layout), ctx)?;
+            return Ok((projected_rows, output_columns, Some(layout), applied));
         }
-        let projected_rows = self.project_rows_with_alias(
+        let layout = Self::shared_output_layout(stmt, all_columns, table_alias);
+        if Self::has_correlated_select_subqueries(&stmt.columns) {
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                rows,
+                all_columns,
+                Some(all_columns_lower),
+                ctx,
+                table_alias,
+            )?;
+            return Ok((projected_rows, output_columns, layout, false));
+        }
+        let plan = OutputProjection::Select(self.select_rows_plan(
             &stmt.columns,
-            rows,
             all_columns,
             Some(all_columns_lower),
             ctx,
             table_alias,
-        )?;
-        let layout = Self::shared_output_layout(stmt, all_columns, table_alias);
-        Ok((projected_rows, output_columns, layout))
+        )?);
+        let (projected_rows, applied) =
+            self.run_output_projection(stmt, &plan, rows, &output_columns, layout.as_ref(), ctx)?;
+        Ok((projected_rows, output_columns, layout, applied))
+    }
+
+    /// The rows `plan` projects of `columns`, or only those the statement's
+    /// ORDER BY LIMIT keeps, in order, when its sort reads them alone; true then
+    fn run_output_projection(
+        &self,
+        stmt: &SelectStatement,
+        plan: &OutputProjection,
+        rows: RowVec,
+        columns: &[String],
+        layout: Option<&OutputLayout>,
+        ctx: &ExecutionContext,
+    ) -> Result<(RowVec, bool)> {
+        let Some(mut top) = self.projected_top(stmt, columns, layout, ctx)? else {
+            let rows = match plan {
+                OutputProjection::Select(plan) => Self::run_select_projection(plan, rows, ctx)?,
+                OutputProjection::Ordered(plan) => {
+                    Self::run_ordered_projection(plan, rows, ctx, None)?
+                }
+            };
+            return Ok((rows, false));
+        };
+        OrderLimitPath::ProjectedTop.taken();
+        let mut kept = TopSink {
+            top: &mut top,
+            spare: None,
+        };
+        match plan {
+            OutputProjection::Select(plan) => {
+                Self::project_select_into(plan, rows, ctx, &mut kept)?
+            }
+            OutputProjection::Ordered(plan) => {
+                Self::project_ordered_into(plan, rows, ctx, None, &mut kept)?
+            }
+        }
+        Ok((top.into_row_vec(), true))
     }
 
     /// A table scan's answer when no row can match: no rows, taking the
@@ -3212,7 +3309,7 @@ impl Executor {
             classification.has_window_functions,
         ) {
             (false, false) => {
-                let (rows, columns, layout) = self.project_scanned_rows(
+                let (rows, columns, layout, applied) = self.project_scanned_rows(
                     stmt,
                     RowVec::new(),
                     all_columns,
@@ -3226,7 +3323,7 @@ impl Executor {
                 return Ok((
                     Box::new(result),
                     columns,
-                    false,
+                    applied,
                     SelectShape::laid_out(layout),
                 ));
             }
@@ -4939,7 +5036,7 @@ impl Executor {
             classification,
         );
 
-        let (projected_rows, output_columns, shape) = match deferred_projection_info {
+        let (projected_rows, output_columns, shape, applied) = match deferred_projection_info {
             Some((col_indices, output_names)) if !order_by_needs_extra_columns => {
                 // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
                 // Return all source columns; projection will be applied after TopNResult
@@ -4951,10 +5048,11 @@ impl Executor {
                         layout: Some(LaidOut::Built(OutputLayout::of_shared_input(&all_columns))),
                         visible: None,
                     },
+                    false,
                 )
             }
             _ => {
-                let (projected_rows, output_columns, layout) = self.project_scanned_rows(
+                let (projected_rows, output_columns, layout, applied) = self.project_scanned_rows(
                     stmt,
                     rows,
                     &all_columns,
@@ -4967,6 +5065,7 @@ impl Executor {
                     projected_rows,
                     output_columns,
                     SelectShape::laid_out(layout).unwrap_or_default(),
+                    applied,
                 )
             }
         };
@@ -4994,7 +5093,7 @@ impl Executor {
         let output_columns = CompactArc::new(output_columns);
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false, Some(shape)))
+        Ok((Box::new(result), output_columns, applied, Some(shape)))
     }
 
     /// Execute a JOIN source. A GROUP BY + LIMIT join fetches its left side in
@@ -7446,49 +7545,62 @@ impl Executor {
 
         // Project rows according to SELECT expressions; a column ORDER BY
         // or DISTINCT ON reads that the select list leaves out rides along
-        let (projected_rows, output_columns, layout) =
-            if self.order_by_needs_extra_columns(stmt, &columns) {
-                let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
-                    &stmt.columns,
-                    &stmt.order_by,
-                    &stmt.distinct_on,
-                    filtered_rows,
-                    &CompactArc::new(columns.clone()),
-                    subquery_alias,
-                    ctx,
-                )?;
-                let mut output_columns =
-                    self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
-                output_columns.extend(extra_names);
-                (
-                    projected_rows,
-                    CompactArc::new(output_columns),
-                    Some(layout),
-                )
-            } else {
-                let projected_rows = self.project_rows_with_alias(
-                    &stmt.columns,
-                    filtered_rows,
-                    &columns,
-                    None,
-                    ctx,
-                    subquery_alias,
-                )?;
-                let output_columns = CompactArc::new(self.get_output_column_names(
-                    &stmt.columns,
-                    &columns,
-                    subquery_alias,
-                ));
-                let layout = Self::output_layout(stmt, &columns, subquery_alias);
-                (projected_rows, output_columns, layout)
-            };
+        let mut output_columns =
+            self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
+        let (projected_rows, layout, applied) = if self.order_by_needs_extra_columns(stmt, &columns)
+        {
+            let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                filtered_rows,
+                &CompactArc::new(columns.clone()),
+                subquery_alias,
+                ctx,
+            )?;
+            output_columns.extend(extra_names);
+            let plan = OutputProjection::Ordered(plan);
+            let (projected_rows, applied) =
+                self.run_output_projection(stmt, &plan, rows, &output_columns, Some(&layout), ctx)?;
+            (projected_rows, Some(layout), applied)
+        } else if Self::has_correlated_select_subqueries(&stmt.columns) {
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                filtered_rows,
+                &columns,
+                None,
+                ctx,
+                subquery_alias,
+            )?;
+            let layout = Self::output_layout(stmt, &columns, subquery_alias);
+            (projected_rows, layout, false)
+        } else {
+            let plan = OutputProjection::Select(self.select_rows_plan(
+                &stmt.columns,
+                &columns,
+                None,
+                ctx,
+                subquery_alias,
+            )?);
+            let layout = Self::output_layout(stmt, &columns, subquery_alias);
+            let (projected_rows, applied) = self.run_output_projection(
+                stmt,
+                &plan,
+                filtered_rows,
+                &output_columns,
+                layout.as_ref(),
+                ctx,
+            )?;
+            (projected_rows, layout, applied)
+        };
 
+        let output_columns = CompactArc::new(output_columns);
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
         Ok((
             Box::new(result),
             output_columns,
-            false,
+            applied,
             SelectShape::laid_out(layout),
         ))
     }
@@ -7722,7 +7834,7 @@ impl Executor {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-            let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
+            let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -7734,6 +7846,9 @@ impl Executor {
             let mut output_columns =
                 self.get_output_column_names(&stmt.columns, &view_columns, None);
             output_columns.extend(extra_names);
+            let plan = OutputProjection::Ordered(plan);
+            let (projected_rows, applied) =
+                self.run_output_projection(stmt, &plan, rows, &output_columns, Some(&layout), ctx)?;
             let output_columns = CompactArc::new(output_columns);
             let result = ExecutorResult::with_arc_columns(
                 CompactArc::clone(&output_columns),
@@ -7742,7 +7857,7 @@ impl Executor {
             return Ok((
                 Box::new(result),
                 output_columns,
-                false,
+                applied,
                 SelectShape::laid_out(Some(layout)),
             ));
         }
@@ -9725,15 +9840,34 @@ impl Executor {
                 table_alias,
             );
         }
+        let plan = self.select_rows_plan(
+            select_exprs,
+            all_columns,
+            all_columns_lower,
+            ctx,
+            table_alias,
+        )?;
+        Self::run_select_projection(&plan, rows, ctx)
+    }
+
+    /// The plan of [`Self::project_rows_with_alias`] for a SELECT list
+    /// without correlated subqueries
+    fn select_rows_plan(
+        &self,
+        select_exprs: &[Expression],
+        all_columns: &[String],
+        all_columns_lower: Option<&[String]>,
+        ctx: &ExecutionContext,
+        table_alias: Option<&str>,
+    ) -> Result<SelectProjection> {
         // Process scalar subqueries in SELECT columns before evaluation (single-pass)
         let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
-        let plan = self.select_projection(
+        self.select_projection(
             processed.as_deref().unwrap_or(select_exprs),
             all_columns,
             all_columns_lower,
             table_alias,
-        )?;
-        Self::run_select_projection(&plan, rows, ctx)
+        )
     }
 
     /// How a SELECT list without correlated subqueries projects rows of
@@ -9926,25 +10060,43 @@ impl Executor {
         rows: RowVec,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
+        if let SelectProjection::Whole = plan {
+            return Ok(rows);
+        }
+        let mut projected = RowVec::with_capacity(rows.len());
+        Self::project_select_into(plan, rows, ctx, &mut projected)?;
+        Ok(projected)
+    }
+
+    /// The rows `plan` projects, put into `out`
+    fn project_select_into(
+        plan: &SelectProjection,
+        rows: RowVec,
+        ctx: &ExecutionContext,
+        out: &mut impl RowSink,
+    ) -> Result<()> {
         match plan {
-            SelectProjection::Whole => Ok(rows),
+            SelectProjection::Whole => {
+                for (id, row) in rows.into_iter() {
+                    out.put(id, row);
+                }
+            }
             SelectProjection::Subset(indices) => {
                 // Project rows to only include matching columns
-                let mut projected = RowVec::with_capacity(rows.len());
                 for (id, row) in rows.into_iter() {
-                    projected.push((id, row.clone_subset(indices)));
+                    out.put(id, row.clone_subset(indices));
                 }
-                Ok(projected)
             }
             SelectProjection::Take(indices) => {
-                let mut projected = RowVec::with_capacity(rows.len());
                 for (id, row) in rows.into_iter() {
-                    projected.push((id, row.take_columns(indices)));
+                    out.put(id, row.take_columns(indices));
                 }
-                Ok(projected)
             }
-            SelectProjection::Actions(actions) => Self::run_projection_actions(actions, rows, ctx),
+            SelectProjection::Actions(actions) => {
+                return Self::run_projection_actions(actions, rows, ctx, out)
+            }
         }
+        Ok(())
     }
 
     /// Project rows whose SELECT list holds a correlated subquery, binding
@@ -10472,7 +10624,8 @@ impl Executor {
         actions: &[ExprAction],
         rows: RowVec,
         ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
+        projected: &mut impl RowSink,
+    ) -> Result<()> {
         // Pre-fetch parameters for VM context
         let params = ctx.params();
         let transaction_id = ctx.transaction_id();
@@ -10486,8 +10639,6 @@ impl Executor {
             .all(|a| matches!(a, ExprAction::SimpleColumn(_)));
 
         // Project rows using pre-analyzed actions
-        let mut projected = RowVec::with_capacity(rows.len());
-
         if all_simple_columns {
             // Super fast path: just extract column indices and use take_columns
             let indices: Vec<usize> = actions
@@ -10502,7 +10653,7 @@ impl Executor {
                 .collect();
 
             for (id, row) in rows.into_iter() {
-                projected.push((id, row.take_columns(&indices)));
+                projected.put(id, row.take_columns(&indices));
             }
         } else {
             // General path: mixed actions
@@ -10511,7 +10662,7 @@ impl Executor {
 
             for (id, row) in rows.into_iter() {
                 // Use CompactVec directly instead of Vec to avoid Vec->CompactVec conversion
-                let mut values: CompactVec<Value> = CompactVec::with_capacity(values_capacity);
+                let mut values = projected.storage(values_capacity);
 
                 // Build VM context with all params in one call (faster than builder chain)
                 let vm_ctx = ExecuteContext::with_common_params(&row, params, transaction_id);
@@ -10692,11 +10843,11 @@ impl Executor {
                     }
                 }
 
-                projected.push((id, Row::from_compact_vec(values)));
+                projected.put(id, Row::from_compact_vec(values));
             }
         }
 
-        Ok(projected)
+        Ok(())
     }
 
     /// Project rows including ORDER BY columns not in SELECT
@@ -10835,11 +10986,37 @@ impl Executor {
         select_exprs: &[Expression],
         order_by: &[crate::parser::ast::OrderByExpression],
         distinct_on: &[Expression],
-        mut rows: RowVec,
+        rows: RowVec,
         all_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<(RowVec, Vec<String>, OutputLayout)> {
+        let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
+            select_exprs,
+            order_by,
+            distinct_on,
+            rows,
+            all_columns,
+            table_alias,
+            ctx,
+        )?;
+        let projected = Self::run_ordered_projection(&plan, rows, ctx, None)?;
+        Ok((projected, extra_names, layout))
+    }
+
+    /// The plan of [`Self::project_rows_with_order_by`], with the rows it
+    /// projects: a correlated SELECT item is bound into them first
+    #[allow(clippy::too_many_arguments)]
+    fn ordered_rows_plan(
+        &self,
+        select_exprs: &[Expression],
+        order_by: &[crate::parser::ast::OrderByExpression],
+        distinct_on: &[Expression],
+        mut rows: RowVec,
+        all_columns: &CompactArc<Vec<String>>,
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<(RowVec, OrderedProjection, Vec<String>, OutputLayout)> {
         // A correlated select expression is evaluated per row first, and
         // read below as the column it was bound to
         let mut bound_exprs = None;
@@ -10874,8 +11051,7 @@ impl Executor {
             table_alias,
             ctx,
         );
-        let projected = Self::run_ordered_projection(&plan, rows, ctx, None)?;
-        Ok((projected, extra_names, layout))
+        Ok((rows, plan, extra_names, layout))
     }
 
     /// What a projection keeping the ORDER BY and DISTINCT ON values the
@@ -11155,20 +11331,32 @@ impl Executor {
     /// subqueries answered by the statement's `blocks`
     fn run_ordered_projection(
         plan: &OrderedProjection,
-        mut rows: RowVec,
+        rows: RowVec,
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<RowVec> {
-        let params = blocks.and_then(|b| b.params()).unwrap_or(ctx.params());
         let mut projected = RowVec::with_capacity(rows.len());
+        Self::project_ordered_into(plan, rows, ctx, blocks, &mut projected)?;
+        Ok(projected)
+    }
+
+    /// The rows `plan` projects, put into `projected` with their positions
+    fn project_ordered_into(
+        plan: &OrderedProjection,
+        mut rows: RowVec,
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+        projected: &mut impl RowSink,
+    ) -> Result<()> {
+        let params = blocks.and_then(|b| b.params()).unwrap_or(ctx.params());
         match plan {
             OrderedProjection::Columns { select, extra } => {
                 for (row_id, row) in rows.drain_rows().enumerate() {
-                    let mut values = Vec::with_capacity(select.len() + extra.len());
+                    let mut values = projected.storage(select.len() + extra.len()).into_vec();
                     for &idx in select.iter().flatten().chain(extra) {
                         values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
                     }
-                    projected.push((row_id as i64, Row::from_values(values)));
+                    projected.put(row_id as i64, Row::from_values(values));
                 }
             }
             OrderedProjection::Items(sources) => {
@@ -11187,7 +11375,7 @@ impl Executor {
                     if let Some(blocks) = blocks {
                         exec = exec.with_subquery_executor(blocks);
                     }
-                    let mut values: CompactVec<Value> = CompactVec::with_capacity(sources.len());
+                    let mut values = projected.storage(sources.len());
                     for source in sources {
                         values.push(match source {
                             Ok(ItemSource::Column(idx)) => {
@@ -11197,11 +11385,11 @@ impl Executor {
                             Err(e) => return Err(e.clone()),
                         });
                     }
-                    projected.push((row_id as i64, Row::from_compact_vec(values)));
+                    projected.put(row_id as i64, Row::from_compact_vec(values));
                 }
             }
         }
-        Ok(projected)
+        Ok(())
     }
 
     /// Which columns an ORDER BY or DISTINCT ON projection reads by index,
@@ -11849,6 +12037,49 @@ impl Executor {
         };
         let mapped = stmt.order_by.iter().map(try_map_to_column).collect();
         (mapped, aggregate_slots)
+    }
+
+    /// The top-N the statement's ORDER BY LIMIT keeps of projected rows of
+    /// `columns`, when its sort would read them by these columns alone, as
+    /// execute_select sorts them; None when the sort comes later or reads more
+    fn projected_top(
+        &self,
+        stmt: &SelectStatement,
+        columns: &[String],
+        layout: Option<&OutputLayout>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<TopN<impl Fn(&Row, &Row) -> Ordering>>> {
+        if stmt.order_by.is_empty()
+            || stmt.distinct
+            || !stmt.distinct_on.is_empty()
+            || !stmt.set_operations.is_empty()
+        {
+            return Ok(None);
+        }
+        let (
+            Some(layout),
+            RowCounts {
+                limit: Some(limit),
+                offset,
+            },
+        ) = (layout, row_counts(stmt, ctx)?)
+        else {
+            return Ok(None);
+        };
+        let (mapped, _) = self.order_by_columns(stmt, columns, Some(layout), false);
+        let order_specs = stmt
+            .order_by
+            .iter()
+            .zip(mapped)
+            .map(|(ob, mapped)| mapped.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
+            .collect::<Option<Vec<_>>>();
+        Ok(order_specs.map(|order_specs| {
+            TopN::new(
+                move |a: &Row, b: &Row| Self::compare_rows_with_indices(a, b, &order_specs),
+                limit,
+                offset,
+            )
+        }))
     }
 
     /// Compare two rows for ORDER BY using pre-computed column indices

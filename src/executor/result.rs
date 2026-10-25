@@ -1152,6 +1152,8 @@ pub(crate) enum OrderLimitPath {
     ComputedKeys,
     /// `TopNResult` over source rows, projected after
     DeferredProjection,
+    /// A projection offering each row it builds to a `TopN`
+    ProjectedTop,
     /// Rows read in the order of an index or the primary key
     IndexOrdered,
     /// The table's top-k scan over one column
@@ -1184,10 +1186,11 @@ impl OrderLimitPath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl OrderLimitPath {
-    pub(crate) const ALL: [OrderLimitPath; 13] = [
+    pub(crate) const ALL: [OrderLimitPath; 14] = [
         OrderLimitPath::TopN,
         OrderLimitPath::ComputedKeys,
         OrderLimitPath::DeferredProjection,
+        OrderLimitPath::ProjectedTop,
         OrderLimitPath::IndexOrdered,
         OrderLimitPath::TopKScan,
         OrderLimitPath::VectorSearch,
@@ -1205,6 +1208,7 @@ impl OrderLimitPath {
             OrderLimitPath::TopN => "top_n",
             OrderLimitPath::ComputedKeys => "computed_keys",
             OrderLimitPath::DeferredProjection => "deferred_projection",
+            OrderLimitPath::ProjectedTop => "projected_top",
             OrderLimitPath::IndexOrdered => "index_ordered",
             OrderLimitPath::TopKScan => "top_k_scan",
             OrderLimitPath::VectorSearch => "vector_search",
@@ -1272,6 +1276,15 @@ impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> TopN<F> {
         }
         rows
     }
+
+    /// [`Self::into_rows`], each row numbered by its place
+    pub(crate) fn into_row_vec(self) -> RowVec {
+        self.into_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| (i as i64, row))
+            .collect()
+    }
 }
 
 /// Top-N result using a bounded heap for ORDER BY + LIMIT optimization
@@ -1320,16 +1333,8 @@ impl TopNResult {
             return Err(err);
         }
 
-        // Convert to RowVec format
-        let result_rows: RowVec = top
-            .into_rows()
-            .into_iter()
-            .enumerate()
-            .map(|(i, row)| (i as i64, row))
-            .collect();
-
         Ok(Self {
-            inner: ExecutorResult::new(columns, result_rows),
+            inner: ExecutorResult::new(columns, top.into_row_vec()),
         })
     }
 }

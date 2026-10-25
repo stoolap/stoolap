@@ -28,8 +28,8 @@ struct Case {
     ctx: &'static str,
     path: &'static str,
     sql: &'static str,
-    /// The same rows sorted whole: a DISTINCT that keeps every row turns
-    /// each shortcut off. With `cut`, it has no LIMIT or OFFSET
+    /// The same rows sorted whole, with no LIMIT or OFFSET under `cut`; a
+    /// DISTINCT that keeps every row turns off a shortcut that runs without
     reference: &'static str,
     /// The LIMIT and OFFSET cut from the reference's rows
     cut: Option<(usize, usize)>,
@@ -52,19 +52,59 @@ const fn case(
 }
 
 const CASES: &[Case] = &[
+    // A set operation's rows reach the statement's sort whole
     case(
         "memory",
         "top_n",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a, id LIMIT 5 OFFSET 2",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a, id",
+        Some((5, 2)),
+    ),
+    case(
+        "sealed",
+        "top_n",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a DESC NULLS FIRST, id LIMIT 5",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a DESC NULLS FIRST, id",
+        Some((5, 0)),
+    ),
+    case(
+        "memory",
+        "projected_top",
         "SELECT id, a * 2 AS d FROM t ORDER BY d, id LIMIT 5 OFFSET 2",
         "SELECT DISTINCT id, a * 2 AS d FROM t ORDER BY d, id",
         Some((5, 2)),
     ),
     case(
         "sealed",
-        "top_n",
+        "projected_top",
         "SELECT id, a * 2 AS d FROM t ORDER BY d DESC NULLS FIRST, id LIMIT 5",
         "SELECT DISTINCT id, a * 2 AS d FROM t ORDER BY d DESC NULLS FIRST, id",
         Some((5, 0)),
+    ),
+    case(
+        "memory",
+        "projected_top",
+        "SELECT id FROM t ORDER BY b DESC, a + 0, id LIMIT 4 OFFSET 3",
+        "SELECT id FROM t ORDER BY b DESC, a + 0, id",
+        Some((4, 3)),
+    ),
+    case(
+        "sealed",
+        "projected_top",
+        "SELECT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id LIMIT 4 OFFSET 1",
+        "SELECT DISTINCT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id",
+        Some((4, 1)),
+    ),
+    case(
+        "memory",
+        "projected_top",
+        "SELECT id FROM tv ORDER BY a + 0 DESC, id LIMIT 4",
+        "SELECT id FROM tv ORDER BY a + 0 DESC, id",
+        Some((4, 0)),
     ),
     case(
         "memory",
@@ -229,6 +269,7 @@ fn setup(db: &Database) {
         "INSERT INTO u SELECT value, value % 17, (value * 13) % 97 FROM generate_series(1, 100)",
         "CREATE INDEX u_k ON u (k)",
         "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3))",
+        "CREATE VIEW tv AS SELECT id, a, b, c FROM t",
     ] {
         db.execute(sql, ()).unwrap();
     }
