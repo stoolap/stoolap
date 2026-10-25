@@ -238,6 +238,54 @@ fn the_refusal_names_the_key_and_the_ways_to_write_it() {
     ] {
         assert!(message.contains(part), "{message}");
     }
+    let message = db
+        .query(
+            "SELECT DISTINCT a FROM t GROUP BY a, b ORDER BY MAX(id)",
+            (),
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        message.contains("once every GROUP BY item is selected") && !message.contains("MAX(MAX"),
+        "{message}"
+    );
+}
+
+#[test]
+fn every_group_selected_is_one_distinct_row() {
+    let db = Database::open("memory://distinct_order_key_groups").unwrap();
+    setup(&db);
+    for (sql, want) in [
+        (
+            "SELECT DISTINCT a FROM t GROUP BY a ORDER BY MAX(id)",
+            ["1", "2", "3"],
+        ),
+        (
+            "SELECT DISTINCT a FROM t GROUP BY a ORDER BY MAX(id) DESC",
+            ["3", "2", "1"],
+        ),
+        (
+            "SELECT DISTINCT t.a AS k FROM t GROUP BY 1 ORDER BY COUNT(*), k DESC",
+            ["3", "2", "1"],
+        ),
+    ] {
+        let got = rows(&db, sql);
+        let want: Vec<String> = want
+            .iter()
+            .map(|a| format!("[Some(Integer({a}))]"))
+            .collect();
+        assert_eq!(got, Ok(want), "{sql}");
+    }
+    // Grouping sets put one value in rows of more than one group
+    for sql in [
+        "SELECT DISTINCT a FROM t GROUP BY a, b ORDER BY MAX(id)",
+        "SELECT DISTINCT a FROM t GROUP BY ROLLUP(a) ORDER BY MAX(id)",
+    ] {
+        let refused =
+            rows(&db, sql).is_err_and(|e| e.contains("is not in the SELECT DISTINCT list"));
+        assert!(refused, "{sql}");
+    }
 }
 
 #[test]

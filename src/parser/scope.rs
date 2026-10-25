@@ -128,13 +128,21 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
     }
     let level: SmallVec<[&str; 4]> = own.map_or_else(SmallVec::new, |own| own.visible.clone());
     if let Some(key) = distinct_key_outside(select, &level) {
+        let otherwise = match crate::executor::utils::expression_contains_aggregate(key) {
+            true => String::from(
+                "an aggregate is one value per distinct row once every GROUP BY item is \
+                 selected",
+            ),
+            false => format!(
+                "to sort by something else, group the rows and sort by an aggregate of it, \
+                 such as MAX({key})"
+            ),
+        };
         return Err(ScopeError {
             message: format!(
                 "ORDER BY {key} is not in the SELECT DISTINCT list: rows merged into one \
                  distinct row may hold different values of it. Sort by a selected item, its \
-                 alias or position, or an expression of selected columns; to sort by \
-                 something else, group the rows and sort by an aggregate of it, such as \
-                 MAX({key})"
+                 alias or position, or an expression of selected columns; {otherwise}"
             ),
             position: key.position(),
         });
@@ -152,6 +160,17 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
 /// may tell apart. `level` holds the names this query's FROM entries show
 fn distinct_key_outside<'s>(select: &'s SelectStatement, level: &[&str]) -> Option<&'s Expression> {
     if !select.distinct || !select.distinct_on.is_empty() || !select.set_operations.is_empty() {
+        return None;
+    }
+    // Each group is then one distinct row, so DISTINCT merges none
+    let grouping = &select.group_by;
+    if matches!(grouping.modifier, GroupByModifier::None)
+        && !grouping.columns.is_empty()
+        && grouping
+            .columns
+            .iter()
+            .all(|key| determined(key, &select.columns, level))
+    {
         return None;
     }
     select
