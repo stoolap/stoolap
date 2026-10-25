@@ -44,6 +44,25 @@ pub use hnsw::{
 pub use multi_column::{CompositeKey, MultiColumnIndex};
 pub use pk::PkIndex;
 
+/// Calls `copy` for each found entry in the members' order, skipping one an
+/// earlier member found: members an index reads as one key find the same
+/// entry, named by the pair's first field (its address under the read lock)
+pub(crate) fn each_entry_once<K: Ord + Copy, T: Copy>(found: &[(K, T)], mut copy: impl FnMut(T)) {
+    let mut order: smallvec::SmallVec<[u32; 16]> = (0..found.len() as u32).collect();
+    order.sort_unstable_by_key(|&i| (found[i as usize].0, i));
+    let mut repeated: smallvec::SmallVec<[bool; 16]> = smallvec::smallvec![false; found.len()];
+    for pair in order.windows(2) {
+        if found[pair[0] as usize].0 == found[pair[1] as usize].0 {
+            repeated[pair[1] as usize] = true;
+        }
+    }
+    for (&(_, entry), repeated) in found.iter().zip(repeated) {
+        if !repeated {
+            copy(entry);
+        }
+    }
+}
+
 #[cfg(test)]
 mod seal_removal_tests {
     use super::*;

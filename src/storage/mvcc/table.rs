@@ -1044,10 +1044,9 @@ impl MVCCTable {
                                 &mut |row_id| row_ids.push(row_id),
                             );
                         }
-                        // Members the column reads as equal name the same rows,
-                        // and so does a row moved between two members' probes
-                        // or kept in the history; the rows keep the members' order
-                        if values.len() > 1 || row_ids.len() > probed {
+                        // The index names each row once; a row kept in the
+                        // history may be named again, and the rows keep their order
+                        if row_ids.len() > probed {
                             let mut seen = FxHashSet::with_capacity_and_hasher(
                                 row_ids.len(),
                                 Default::default(),
