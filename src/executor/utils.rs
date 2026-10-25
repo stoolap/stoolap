@@ -2052,10 +2052,9 @@ pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {
     match expr {
-        Expression::Identifier(id) => id.value.to_string(),
-        Expression::QualifiedIdentifier(qid) => {
-            format!("{}.{}", qid.qualifier.value, qid.name.value)
-        }
+        // A name as the statement's own text spells it, quoted where it must be
+        Expression::Identifier(id) => id.to_string(),
+        Expression::QualifiedIdentifier(qid) => qid.to_string(),
         Expression::IntegerLiteral(lit) => lit.value.to_string(),
         Expression::FloatLiteral(lit) => lit.value.to_string(),
         Expression::StringLiteral(lit) => lit.to_string(),

@@ -438,6 +438,8 @@ fn a_rewritten_select_item_keeps_its_name_and_binds_no_clause() {
         ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM u WHERE a = 2) q) FROM t", "2"),
         ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM (VALUES (1), (2)) GROUP BY column1) q) FROM t", "2"),
         ("SELECT (SELECT MAX(q.a) FROM (SELECT t.a FROM u GROUP BY a) q) FROM t", "10"),
+        ("SELECT (SELECT COUNT(*) FROM (SELECT SUM(id) AS a, t.a FROM u GROUP BY a) q) FROM t", "2"),
+        ("SELECT (SELECT MAX(q.\"t.a + 0\") FROM (SELECT t.a + 0 FROM u ORDER BY \"t.a + 0\") q) FROM t", "10"),
     ] {
         let line = prepared_line(&db, sql);
         if line != "Prepared: yes" {
@@ -614,6 +616,10 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
     for (sql, error) in [
         (
             format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY nosuch(q.x))"),
+            "Function not found: NOSUCH",
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT (SELECT 1) AS k FROM {Q} ORDER BY nosuch(k))"),
             "Function not found: NOSUCH",
         ),
         (

@@ -62,8 +62,7 @@ use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult}
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, dummy_token_clone,
     expression_contains_aggregate, extract_literal_value, flip_operator, infix_to_operator,
-    is_aggregate_function, item_name, named_as_written, order_by_names_an_alias,
-    strip_table_qualifier,
+    is_aggregate_function, item_name, order_by_names_an_alias, strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -74,9 +73,6 @@ const MAX_SCOPES: usize = 32;
 /// The qualifier of a column the resolver bound: NUL, which the lexer
 /// takes in no name, so no table or column can spell it
 const RESOLVED: &str = "\u{0}";
-
-/// The alias a walk gives a FROM source without one, which no name spells
-const UNNAMED_SOURCE: &str = "\u{0}s";
 
 /// Why a statement runs on the general path instead of the prepared one
 pub(crate) type OutOfFamily = &'static str;
@@ -1169,10 +1165,6 @@ struct Level<'s> {
     inside: usize,
     aliases: Vec<SmartString>,
     check: bool,
-    /// The bare names of its own columns written as `qualifier.name`: an
-    /// alias the walk gave a rewritten SELECT item would take them
-    qualify: Vec<SmartString>,
-    qualifier: SmartString,
 }
 
 /// Which clauses of a walked statement raise a name no scope has, since
@@ -1206,8 +1198,7 @@ impl StatementWalk<'_> {
         inside: usize,
         check: Check,
     ) -> Result<(SelectStatement, Vec<String>, Vec<String>)> {
-        let (mut table_expr, own) =
-            self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
+        let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
         scopes.push(&own);
         scopes.extend_from_slice(enclosing);
@@ -1226,42 +1217,12 @@ impl StatementWalk<'_> {
             inside: inside + 1,
             aliases: Vec::new(),
             check: check != Check::Off,
-            qualify: Vec::new(),
-            qualifier: SmartString::new(""),
         };
-        let columns = stmt
-            .columns
-            .iter()
-            .map(|e| self.expr(e, &items))
-            .collect::<Result<Vec<_>>>()?;
-        let qualify: Vec<SmartString> = stmt
-            .columns
-            .iter()
-            .zip(&columns)
-            .filter(|(written, item)| !matches!(written, Expression::Aliased(_)) && item != written)
-            .map(|(written, _)| SmartString::from(item_name(written).to_lowercase()))
-            .collect();
-        let mut qualifier = own
-            .tables
-            .first()
-            .map(|(name, _)| name.clone())
-            .unwrap_or_default();
-        if qualifier.is_empty() && !qualify.is_empty() {
-            qualifier = SmartString::new(UNNAMED_SOURCE);
-            let alias = Some(Identifier::new(dummy_token_clone(), UNNAMED_SOURCE));
-            match table_expr.as_mut() {
-                Some(Expression::SubquerySource(derived)) => derived.alias = alias,
-                Some(Expression::ValuesSource(values)) => values.alias = alias,
-                _ => {}
-            }
-        }
         let level = Level {
             scopes,
             inside: inside + 1,
             aliases,
             check: check == Check::All,
-            qualify,
-            qualifier,
         };
         let sorted = Level {
             check: check != Check::Off,
@@ -1300,11 +1261,11 @@ impl StatementWalk<'_> {
         };
         let walked = SelectStatement {
             distinct_on: all(self, &stmt.distinct_on)?,
-            columns: columns
-                .into_iter()
-                .zip(&stmt.columns)
-                .map(|(item, written)| named_as_written(item, written))
-                .collect(),
+            columns: stmt
+                .columns
+                .iter()
+                .map(|e| self.item(e, &items))
+                .collect::<Result<_>>()?,
             table_expr: table_expr.map(Box::new),
             where_clause: one(self, &stmt.where_clause)?,
             group_by: GroupByClause {
@@ -1361,8 +1322,6 @@ impl StatementWalk<'_> {
             inside,
             aliases: Vec::new(),
             check: check == Check::All,
-            qualify: Vec::new(),
-            qualifier: SmartString::new(""),
         };
         let untyped = |name: &SmartString, columns: &[String]| {
             ScopeTable::of(name.clone(), &untyped_schema(name, columns))
@@ -1466,15 +1425,6 @@ impl StatementWalk<'_> {
                 match chain.bare(id) {
                     Ok(Some((depth, index))) => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
-                        None if depth == 0 && level.qualify.contains(&id.value_lower) => {
-                            Ok(Expression::QualifiedIdentifier(QualifiedIdentifier {
-                                qualifier: Identifier::new(
-                                    dummy_token_clone(),
-                                    level.qualifier.clone(),
-                                ),
-                                name: id.clone(),
-                            }))
-                        }
                         None => Ok(expr.clone()),
                     },
                     Err(e) if level.check => Err(e),
@@ -1547,9 +1497,36 @@ impl StatementWalk<'_> {
         }
     }
 
+    /// What stands for the enclosing name `expr`: a slot spelled as `expr` is,
+    /// so every name the statement derives from it is the one written
     fn outer(&mut self, expr: &Expression, depth: usize, index: usize) -> Result<Expression> {
-        (self.on)(Reach::Outer(expr, depth, index))?
-            .ok_or_else(|| Error::internal("an enclosing name without its slot"))
+        let stands = (self.on)(Reach::Outer(expr, depth, index))?
+            .ok_or_else(|| Error::internal("an enclosing name without its slot"))?;
+        Ok(spelled_as(stands, expr.to_string()))
+    }
+
+    /// The SELECT item `item`, walked; an enclosing column that is the whole
+    /// item stands as a slot under the column's own name, as the item's name
+    fn item(&mut self, item: &Expression, level: &Level<'_>) -> Result<Expression> {
+        let walked = self.expr(item, level)?;
+        Ok(match item {
+            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                spelled_as(walked, item_name(item))
+            }
+            _ => walked,
+        })
+    }
+}
+
+/// `stands`, when it is a parameter, spelled `name`; a parameter is read by
+/// its index, so its spelling only names it
+fn spelled_as(stands: Expression, name: String) -> Expression {
+    match stands {
+        Expression::Parameter(parameter) => Expression::Parameter(Parameter {
+            name: SmartString::from_string(name),
+            ..parameter
+        }),
+        other => other,
     }
 }
 
@@ -2251,12 +2228,14 @@ fn existence(
     if grouped {
         check_grouped_reads(executor, &stmt, from_names, ctx)?;
     }
-    // A key holding a subquery or an aggregate has only its names bound, by the walk
     let own = CompileContext::new(from_names, &executor.function_registry);
     for ob in &stmt.order_by {
         let key = with_aliases(&ob.expression, &stmt.columns, from_names);
-        if !mentions_subquery(&key) && !expression_contains_aggregate(&key) {
-            compile_with(&own, &key)?;
+        let mut parts = Vec::new();
+        let whole = without_blocks(&key, &mut parts)?;
+        parts.push(whole);
+        for part in &parts {
+            compile_with(&own, part)?;
         }
     }
     let where_clause = stmt
@@ -2297,6 +2276,31 @@ fn existence(
         order_by: Vec::new(),
         ..stmt
     })
+}
+
+/// `expr` compiled without its blocks: a subquery reads as NULL, its names
+/// bound by the walk, the left of ANY or ALL as itself, and an aggregate as
+/// NULL, each argument it reads going to `args` to compile on its own
+fn without_blocks(expr: &Expression, args: &mut Vec<Expression>) -> Result<Expression> {
+    let null = || {
+        Expression::NullLiteral(NullLiteral {
+            token: dummy_token_clone(),
+        })
+    };
+    match expr {
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(null()),
+        Expression::AllAny(all_any) => without_blocks(&all_any.left, args),
+        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
+            for arg in &call.arguments {
+                if !matches!(arg, Expression::Star(_)) {
+                    let arg = without_blocks(arg, args)?;
+                    args.push(arg);
+                }
+            }
+            Ok(null())
+        }
+        other => rebuild(other, &mut |child| without_blocks(child, args)),
+    }
 }
 
 /// `sq`'s GROUP BY items as the general path binds a SELECT alias or a
