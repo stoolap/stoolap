@@ -223,7 +223,7 @@ impl QueryClassification {
         let select_has_correlated_subqueries = stmt
             .columns
             .iter()
-            .any(Self::expression_has_correlated_subqueries);
+            .any(super::Executor::has_correlated_subqueries);
 
         let grouped_has_subqueries = stmt
             .columns
@@ -242,7 +242,7 @@ impl QueryClassification {
         let order_by_has_correlated_subqueries = stmt
             .order_by
             .iter()
-            .any(|ob| Self::expression_has_correlated_subqueries(&ob.expression));
+            .any(|ob| super::Executor::has_correlated_subqueries(&ob.expression));
 
         // Compound classification
         let is_simple_scan = !has_joins
@@ -385,7 +385,7 @@ impl QueryClassification {
         let has_subqueries = has_exists || has_in_subquery || has_scalar_subquery || has_all_any;
 
         // Check for correlated subqueries (expensive AST traversal - cached here)
-        let has_correlated = Self::expression_has_correlated_subqueries(expr);
+        let has_correlated = super::Executor::has_correlated_subqueries(expr);
 
         (
             has_parameters,
@@ -856,334 +856,6 @@ impl QueryClassification {
     fn expression_has_nondeterministic_functions(expr: &Expression) -> bool {
         expression_volatility(expr, crate::functions::global_registry()) != Volatility::Fixed
     }
-
-    /// Check if an expression contains correlated subqueries (references outer columns)
-    /// This is an expensive check as it must examine each subquery's WHERE clause
-    fn expression_has_correlated_subqueries(expr: &Expression) -> bool {
-        match expr {
-            Expression::Exists(exists) => Self::is_subquery_correlated(&exists.subquery),
-            Expression::ScalarSubquery(subquery) => {
-                Self::is_subquery_correlated(&subquery.subquery)
-            }
-            Expression::AllAny(all_any) => {
-                Self::is_subquery_correlated(&all_any.subquery)
-                    || Self::expression_has_correlated_subqueries(&all_any.left)
-            }
-            Expression::Prefix(prefix) => {
-                // Handle NOT EXISTS
-                if let Expression::Exists(exists) = prefix.right.as_ref() {
-                    return Self::is_subquery_correlated(&exists.subquery);
-                }
-                Self::expression_has_correlated_subqueries(&prefix.right)
-            }
-            Expression::Infix(infix) => {
-                Self::expression_has_correlated_subqueries(&infix.left)
-                    || Self::expression_has_correlated_subqueries(&infix.right)
-            }
-            Expression::In(in_expr) => {
-                if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
-                    return Self::is_subquery_correlated(&subquery.subquery);
-                }
-                Self::expression_has_correlated_subqueries(&in_expr.left)
-                    || Self::expression_has_correlated_subqueries(&in_expr.right)
-            }
-            Expression::Between(between) => {
-                Self::expression_has_correlated_subqueries(&between.expr)
-                    || Self::expression_has_correlated_subqueries(&between.lower)
-                    || Self::expression_has_correlated_subqueries(&between.upper)
-            }
-            Expression::Aliased(aliased) => {
-                Self::expression_has_correlated_subqueries(&aliased.expression)
-            }
-            Expression::FunctionCall(func) => {
-                func.arguments
-                    .iter()
-                    .any(Self::expression_has_correlated_subqueries)
-                    || func
-                        .filter
-                        .as_deref()
-                        .is_some_and(Self::expression_has_correlated_subqueries)
-                    || func
-                        .order_by
-                        .iter()
-                        .any(|o| Self::expression_has_correlated_subqueries(&o.expression))
-            }
-            Expression::Case(case) => {
-                case.value
-                    .as_deref()
-                    .is_some_and(Self::expression_has_correlated_subqueries)
-                    || case.when_clauses.iter().any(|w| {
-                        Self::expression_has_correlated_subqueries(&w.condition)
-                            || Self::expression_has_correlated_subqueries(&w.then_result)
-                    })
-                    || case
-                        .else_value
-                        .as_ref()
-                        .is_some_and(|e| Self::expression_has_correlated_subqueries(e))
-            }
-            Expression::Cast(cast) => Self::expression_has_correlated_subqueries(&cast.expr),
-            Expression::Like(like) => {
-                Self::expression_has_correlated_subqueries(&like.left)
-                    || Self::expression_has_correlated_subqueries(&like.pattern)
-                    || like
-                        .escape
-                        .as_deref()
-                        .is_some_and(Self::expression_has_correlated_subqueries)
-            }
-            Expression::List(list) => list
-                .elements
-                .iter()
-                .any(Self::expression_has_correlated_subqueries),
-            Expression::ExpressionList(list) => list
-                .expressions
-                .iter()
-                .any(Self::expression_has_correlated_subqueries),
-            Expression::Distinct(distinct) => {
-                Self::expression_has_correlated_subqueries(&distinct.expr)
-            }
-            Expression::Window(window) => window
-                .function
-                .arguments
-                .iter()
-                .chain(window.function.filter.as_deref())
-                .chain(window.function.order_by.iter().map(|o| &o.expression))
-                .chain(window.partition_by.iter())
-                .chain(window.order_by.iter().map(|o| &o.expression))
-                .any(Self::expression_has_correlated_subqueries),
-            _ => false,
-        }
-    }
-
-    /// Check if a subquery is correlated (references outer table columns)
-    fn is_subquery_correlated(subquery: &SelectStatement) -> bool {
-        // Collect table names/aliases from the subquery's FROM clause
-        let subquery_tables = Self::collect_subquery_tables(&subquery.table_expr);
-
-        // Check if WHERE clause references columns not in subquery's own tables
-        if let Some(ref where_clause) = subquery.where_clause {
-            if Self::has_outer_column_reference(where_clause, &subquery_tables) {
-                return true;
-            }
-        }
-
-        // Check SELECT columns too (for scalar subqueries)
-        for col in &subquery.columns {
-            if Self::has_outer_column_reference(col, &subquery_tables) {
-                return true;
-            }
-        }
-
-        // An ORDER BY reads the parent row too, and decides what a LIMIT keeps
-        if subquery
-            .order_by
-            .iter()
-            .any(|o| Self::has_outer_column_reference(&o.expression, &subquery_tables))
-        {
-            return true;
-        }
-
-        // A derived table in the FROM may read the parent row too
-        subquery
-            .table_expr
-            .as_deref()
-            .is_some_and(|from| Self::from_has_outer_reference(from, &subquery_tables))
-    }
-
-    /// Whether a derived table in a FROM, or a join condition there, reads a
-    /// column that neither the query nor the derived table defines
-    fn from_has_outer_reference(from: &Expression, inner_tables: &[String]) -> bool {
-        match from {
-            Expression::SubquerySource(source) => {
-                Self::nested_has_outer_reference(&source.subquery, inner_tables)
-            }
-            Expression::JoinSource(join) => {
-                Self::from_has_outer_reference(&join.left, inner_tables)
-                    || Self::from_has_outer_reference(&join.right, inner_tables)
-                    || join
-                        .condition
-                        .as_deref()
-                        .is_some_and(|c| Self::has_outer_column_reference(c, inner_tables))
-            }
-            Expression::Aliased(aliased) => {
-                Self::from_has_outer_reference(&aliased.expression, inner_tables)
-            }
-            _ => false,
-        }
-    }
-
-    /// Collect table names and aliases from a subquery's FROM clause
-    fn collect_subquery_tables(table_expr: &Option<Box<Expression>>) -> Vec<String> {
-        let mut tables = Vec::new();
-        if let Some(ref expr) = table_expr {
-            Self::collect_tables_recursive(expr, &mut tables);
-        }
-        tables
-    }
-
-    /// Recursively collect table names and aliases
-    fn collect_tables_recursive(expr: &Expression, tables: &mut Vec<String>) {
-        match expr {
-            Expression::Identifier(ident) => {
-                tables.push(ident.value_lower.to_string());
-            }
-            // An alias hides the table's own name: with `FROM t t2` only
-            // `t2` qualifies inner columns, and `t` may be an outer alias.
-            Expression::Aliased(aliased) => {
-                tables.push(aliased.alias.value_lower.to_string());
-            }
-            Expression::JoinSource(join) => {
-                Self::collect_tables_recursive(&join.left, tables);
-                Self::collect_tables_recursive(&join.right, tables);
-            }
-            Expression::SubquerySource(subquery) => {
-                // Subquery has an alias, collect it
-                if let Some(ref alias) = subquery.alias {
-                    tables.push(alias.value_lower.to_string());
-                }
-            }
-            Expression::TableSource(table) => {
-                if let Some(ref alias) = table.alias {
-                    tables.push(alias.value_lower.to_string());
-                } else {
-                    tables.push(table.name.value_lower.to_string());
-                }
-            }
-            Expression::FunctionTableSource(fs) => {
-                if let Some(ref alias) = fs.alias {
-                    tables.push(alias.value_lower.to_string());
-                } else {
-                    tables.push(fs.function.value_lower.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Check if an expression references columns from tables NOT in the given list
-    fn has_outer_column_reference(expr: &Expression, inner_tables: &[String]) -> bool {
-        match expr {
-            Expression::QualifiedIdentifier(qi) => {
-                // Has table qualifier - check if it's NOT in inner tables
-                let table_ref = &qi.qualifier.value_lower;
-                // If table reference is NOT in inner tables, it's an outer reference
-                !inner_tables.iter().any(|t| t == table_ref)
-            }
-            Expression::Infix(infix) => {
-                Self::has_outer_column_reference(&infix.left, inner_tables)
-                    || Self::has_outer_column_reference(&infix.right, inner_tables)
-            }
-            Expression::Prefix(prefix) => {
-                Self::has_outer_column_reference(&prefix.right, inner_tables)
-            }
-            Expression::FunctionCall(func) => {
-                func.arguments
-                    .iter()
-                    .any(|a| Self::has_outer_column_reference(a, inner_tables))
-                    || func
-                        .filter
-                        .as_deref()
-                        .is_some_and(|f| Self::has_outer_column_reference(f, inner_tables))
-                    || func
-                        .order_by
-                        .iter()
-                        .any(|o| Self::has_outer_column_reference(&o.expression, inner_tables))
-            }
-            Expression::Case(case) => {
-                case.value
-                    .as_ref()
-                    .is_some_and(|v| Self::has_outer_column_reference(v, inner_tables))
-                    || case.when_clauses.iter().any(|w| {
-                        Self::has_outer_column_reference(&w.condition, inner_tables)
-                            || Self::has_outer_column_reference(&w.then_result, inner_tables)
-                    })
-                    || case
-                        .else_value
-                        .as_ref()
-                        .is_some_and(|e| Self::has_outer_column_reference(e, inner_tables))
-            }
-            Expression::AllAny(all_any) => {
-                Self::has_outer_column_reference(&all_any.left, inner_tables)
-                    || Self::nested_has_outer_reference(&all_any.subquery, inner_tables)
-            }
-            Expression::Cast(cast) => Self::has_outer_column_reference(&cast.expr, inner_tables),
-            Expression::Like(like) => {
-                Self::has_outer_column_reference(&like.left, inner_tables)
-                    || Self::has_outer_column_reference(&like.pattern, inner_tables)
-                    || like
-                        .escape
-                        .as_ref()
-                        .is_some_and(|e| Self::has_outer_column_reference(e, inner_tables))
-            }
-            Expression::Distinct(distinct) => {
-                Self::has_outer_column_reference(&distinct.expr, inner_tables)
-            }
-            Expression::In(in_expr) => {
-                Self::has_outer_column_reference(&in_expr.left, inner_tables)
-                    || Self::has_outer_column_reference(&in_expr.right, inner_tables)
-            }
-            Expression::Between(between) => {
-                Self::has_outer_column_reference(&between.expr, inner_tables)
-                    || Self::has_outer_column_reference(&between.lower, inner_tables)
-                    || Self::has_outer_column_reference(&between.upper, inner_tables)
-            }
-            Expression::Aliased(aliased) => {
-                Self::has_outer_column_reference(&aliased.expression, inner_tables)
-            }
-            Expression::List(list) => list
-                .elements
-                .iter()
-                .any(|e| Self::has_outer_column_reference(e, inner_tables)),
-            Expression::ExpressionList(list) => list
-                .expressions
-                .iter()
-                .any(|e| Self::has_outer_column_reference(e, inner_tables)),
-            Expression::Window(window) => window
-                .function
-                .arguments
-                .iter()
-                .chain(window.function.filter.as_deref())
-                .chain(window.function.order_by.iter().map(|o| &o.expression))
-                .chain(window.partition_by.iter())
-                .chain(window.order_by.iter().map(|o| &o.expression))
-                .any(|e| Self::has_outer_column_reference(e, inner_tables)),
-            // A subquery nested in this one may read a column from further
-            // out than either of them, which this one has to carry in
-            Expression::Exists(exists) => {
-                Self::nested_has_outer_reference(&exists.subquery, inner_tables)
-            }
-            Expression::ScalarSubquery(subquery) => {
-                Self::nested_has_outer_reference(&subquery.subquery, inner_tables)
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether a subquery nested inside another reads a column that neither
-    /// of them defines
-    fn nested_has_outer_reference(nested: &SelectStatement, inner_tables: &[String]) -> bool {
-        let mut tables = inner_tables.to_vec();
-        tables.extend(Self::collect_subquery_tables(&nested.table_expr));
-        nested
-            .where_clause
-            .as_deref()
-            .is_some_and(|where_clause| Self::has_outer_column_reference(where_clause, &tables))
-            || nested
-                .columns
-                .iter()
-                .any(|column| Self::has_outer_column_reference(column, &tables))
-            || nested
-                .having
-                .as_deref()
-                .is_some_and(|having| Self::has_outer_column_reference(having, &tables))
-            || nested
-                .order_by
-                .iter()
-                .any(|o| Self::has_outer_column_reference(&o.expression, &tables))
-            || nested
-                .table_expr
-                .as_deref()
-                .is_some_and(|from| Self::from_has_outer_reference(from, &tables))
-    }
 }
 
 /// Check if a function name is an aggregate function
@@ -1310,26 +982,9 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
     }
 }
 
-/// Hash what a subquery's classification depends on: correlation reads the
-/// FROM table/alias list plus WHERE and SELECT columns
-/// (`is_subquery_correlated`), and non-determinism reads the columns.
-fn hash_subquery_structure<H: std::hash::Hasher>(subquery: &SelectStatement, hasher: &mut H) {
-    subquery.columns.len().hash(hasher);
-    for col in &subquery.columns {
-        hash_expression_structure(col, hasher);
-    }
-    subquery.table_expr.is_some().hash(hasher);
-    if let Some(ref table_expr) = subquery.table_expr {
-        hash_table_expr_structure(table_expr, hasher);
-    }
-    if let Some(ref where_clause) = subquery.where_clause {
-        hash_expression_structure(where_clause, hasher);
-    }
-}
-
 /// Hash the join/derived-table shape of a FROM expression, mirroring what
-/// `analyze_table_source` and `collect_tables_recursive` read: join
-/// nesting, join types, and source names WITH aliases (the alias decides
+/// `analyze_table_source` and the correlation rule read: join nesting,
+/// types and conditions, and source names WITH aliases (the alias decides
 /// whether a qualified reference is local or an outer correlation).
 fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     std::mem::discriminant(expr).hash(hasher);
@@ -1338,6 +993,10 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             join.join_type.hash(hasher);
             hash_table_expr_structure(&join.left, hasher);
             hash_table_expr_structure(&join.right, hasher);
+            join.condition.is_some().hash(hasher);
+            if let Some(ref condition) = join.condition {
+                hash_expression_structure(condition, hasher);
+            }
         }
         Expression::Aliased(aliased) => {
             aliased.alias.value_lower.hash(hasher);
@@ -1357,7 +1016,7 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             if let Some(ref alias) = subquery.alias {
                 alias.value_lower.hash(hasher);
             }
-            hash_subquery_structure(&subquery.subquery, hasher);
+            hash_classification_inputs(&subquery.subquery, hasher);
         }
         Expression::FunctionTableSource(fs) => {
             fs.function.value_lower.hash(hasher);
@@ -1492,20 +1151,20 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             quantified.members.len().hash(hasher);
         }
         Expression::ScalarSubquery(subquery) => {
-            hash_subquery_structure(&subquery.subquery, hasher);
+            hash_classification_inputs(&subquery.subquery, hasher);
         }
         Expression::SubquerySource(subquery) => {
             if let Some(ref alias) = subquery.alias {
                 alias.value_lower.hash(hasher);
             }
-            hash_subquery_structure(&subquery.subquery, hasher);
+            hash_classification_inputs(&subquery.subquery, hasher);
         }
         Expression::Exists(exists) => {
-            hash_subquery_structure(&exists.subquery, hasher);
+            hash_classification_inputs(&exists.subquery, hasher);
         }
         Expression::AllAny(all_any) => {
             hash_expression_structure(&all_any.left, hasher);
-            hash_subquery_structure(&all_any.subquery, hasher);
+            hash_classification_inputs(&all_any.subquery, hasher);
         }
         Expression::QualifiedIdentifier(qi) => {
             // CRITICAL: Hash the qualifier (table name/alias) to distinguish correlated references
