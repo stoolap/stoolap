@@ -88,10 +88,10 @@ fn test_distinct_with_a_limit_and_an_offset() {
 #[test]
 fn test_distinct_sorted_by_a_column_it_does_not_read() {
     let db = setup("distinct_limit_hidden");
-    assert_eq!(
-        values(&db, "SELECT DISTINCT g FROM p ORDER BY id LIMIT 2"),
-        ["a", "b"]
-    );
+    // A key outside the list is refused: each value stands for many ids
+    assert!(db
+        .query("SELECT DISTINCT g FROM p ORDER BY id LIMIT 2", ())
+        .is_err_and(|e| e.to_string().contains("is not in the SELECT DISTINCT list")));
     assert_eq!(
         values(&db, "SELECT DISTINCT UPPER(g) FROM p ORDER BY 1 LIMIT 2"),
         ["A", "B"]

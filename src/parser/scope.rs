@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! The rule a qualifier is read by: `q.column` and `q.*` name a FROM entry
-//! of the query they are written in or of an enclosing one
+//! of the query they are written in or of an enclosing one; and under
+//! SELECT DISTINCT, every ORDER BY key is a SELECT item
 
 use smallvec::SmallVec;
 
@@ -125,12 +126,224 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
     for order in &select.order_by {
         check_expr(&order.expression, ordered)?;
     }
+    let level: SmallVec<[&str; 4]> = own.map_or_else(SmallVec::new, |own| own.visible.clone());
+    if let Some(key) = distinct_key_outside(select, &level) {
+        let otherwise = match crate::executor::utils::expression_contains_aggregate(key) {
+            true => String::from(
+                "an aggregate is one value per distinct row once every GROUP BY item is \
+                 selected",
+            ),
+            false => format!(
+                "to sort by something else, group the rows and sort by an aggregate of it, \
+                 such as MAX({key})"
+            ),
+        };
+        return Err(ScopeError {
+            message: format!(
+                "ORDER BY {key} is not in the SELECT DISTINCT list: rows merged into one \
+                 distinct row may hold different values of it. Sort by a selected item, its \
+                 alias or position, or an expression of selected columns; {otherwise}"
+            ),
+            position: key.position(),
+        });
+    }
     check_opt(select.limit.as_deref(), outer)?;
     check_opt(select.offset.as_deref(), outer)?;
     for op in &select.set_operations {
         check_select(&op.right, outer)?;
     }
     Ok(())
+}
+
+/// Under SELECT DISTINCT, the first ORDER BY key the SELECT items do not
+/// determine: one distinct row stands for several rows, which such a key
+/// may tell apart. `level` holds the names this query's FROM entries show
+fn distinct_key_outside<'s>(select: &'s SelectStatement, level: &[&str]) -> Option<&'s Expression> {
+    if !select.distinct || !select.distinct_on.is_empty() || !select.set_operations.is_empty() {
+        return None;
+    }
+    // Grouping and DISTINCT compare values alike, so each group is then one
+    // distinct row and DISTINCT merges none
+    let grouping = &select.group_by;
+    if matches!(grouping.modifier, GroupByModifier::None)
+        && !grouping.columns.is_empty()
+        && grouping
+            .columns
+            .iter()
+            .all(|key| groups_by_an_item(key, &select.columns, level))
+    {
+        return None;
+    }
+    select
+        .order_by
+        .iter()
+        .map(|order| &order.expression)
+        .find(|key| !determined(key, &select.columns, level))
+}
+
+/// Whether GROUP BY `key` is a SELECT item itself: its position, or its
+/// expression without the alias. A name is not matched to an alias, which
+/// grouping may bind to a column, nor is a value computed from an item
+fn groups_by_an_item(key: &Expression, items: &[Expression], level: &[&str]) -> bool {
+    let star = items
+        .iter()
+        .any(|item| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_)));
+    match key {
+        Expression::IntegerLiteral(position) => {
+            !star && position.value >= 1 && position.value as usize <= items.len()
+        }
+        key => items
+            .iter()
+            .any(|item| same_value(key, unaliased(item), level)),
+    }
+}
+
+/// Whether ORDER BY `key` has one value across the rows a distinct row of
+/// `items` stands for: a position in the list or an alias, an item's own
+/// expression, or a scalar expression of columns the items determine
+fn determined(key: &Expression, items: &[Expression], level: &[&str]) -> bool {
+    let star = items
+        .iter()
+        .any(|item| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_)));
+    match key {
+        // A star's width is not known here, only that it reaches past its place
+        Expression::IntegerLiteral(position) => {
+            return position.value >= 1 && (star || position.value as usize <= items.len())
+        }
+        Expression::Identifier(name)
+            if items.iter().any(|item| {
+                matches!(item, Expression::Aliased(a) if a.alias.value_lower == name.value_lower)
+            }) =>
+        {
+            return true
+        }
+        _ => {}
+    }
+    items
+        .iter()
+        .any(|item| same_value(key, unaliased(item), level))
+        || scalar_of(key, &mut |column| {
+            column_determined(column, items.iter().map(unaliased), level)
+        })
+}
+
+/// An item without its alias
+fn unaliased(item: &Expression) -> &Expression {
+    match item {
+        Expression::Aliased(aliased) => &aliased.expression,
+        item => item,
+    }
+}
+
+/// Whether a column the key reads has one value across those rows: a
+/// selected column, one a star gives, or an enclosing query's, which is
+/// constant here
+fn column_determined<'i>(
+    column: &Expression,
+    items: impl Iterator<Item = &'i Expression>,
+    level: &[&str],
+) -> bool {
+    let outer = matches!(column, Expression::QualifiedIdentifier(c)
+        if !level.contains(&c.qualifier.value_lower.as_str()));
+    outer
+        || items.into_iter().any(|item| match item {
+            Expression::Star(_) => true,
+            // A bare name is the starred table's when it is the one FROM entry
+            Expression::QualifiedStar(star) => match column {
+                Expression::QualifiedIdentifier(c) => {
+                    c.qualifier.value_lower == star.qualifier.to_lowercase()
+                }
+                _ => level == [star.qualifier.to_lowercase().as_str()],
+            },
+            item => same_column(column, item, level),
+        })
+}
+
+/// Whether `expr` is computed from its columns alone, each passing `column`:
+/// no aggregate, window or subquery, which read rows beyond the one, and no
+/// function the global registry says may answer anew per call
+fn scalar_of(expr: &Expression, column: &mut dyn FnMut(&Expression) -> bool) -> bool {
+    match expr {
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => column(expr),
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_) => true,
+        Expression::Prefix(p) => scalar_of(&p.right, column),
+        Expression::Infix(i) => scalar_of(&i.left, column) && scalar_of(&i.right, column),
+        Expression::Cast(c) => scalar_of(&c.expr, column),
+        Expression::Between(b) => {
+            scalar_of(&b.expr, column) && scalar_of(&b.lower, column) && scalar_of(&b.upper, column)
+        }
+        Expression::Like(l) => {
+            scalar_of(&l.left, column)
+                && scalar_of(&l.pattern, column)
+                && l.escape.as_deref().is_none_or(|e| scalar_of(e, column))
+        }
+        Expression::In(i) => scalar_of(&i.left, column) && scalar_of(&i.right, column),
+        Expression::List(l) => l.elements.iter().all(|e| scalar_of(e, column)),
+        Expression::ExpressionList(l) => l.expressions.iter().all(|e| scalar_of(e, column)),
+        Expression::Case(c) => {
+            c.value.as_deref().is_none_or(|v| scalar_of(v, column))
+                && c.when_clauses
+                    .iter()
+                    .all(|w| scalar_of(&w.condition, column) && scalar_of(&w.then_result, column))
+                && c.else_value.as_deref().is_none_or(|e| scalar_of(e, column))
+        }
+        Expression::FunctionCall(f) => {
+            let registry = crate::functions::registry::global_registry();
+            !registry.is_aggregate(&f.function)
+                && registry.volatility(&f.function) != crate::functions::Volatility::PerCall
+                && f.filter.is_none()
+                && f.order_by.is_empty()
+                && f.arguments.iter().all(|a| scalar_of(a, column))
+        }
+        _ => false,
+    }
+}
+
+/// Whether two column references name the same column: the same name, and
+/// a qualifier on one side only when it is an entry of this query's FROM,
+/// where a bare name of a valid statement binds
+fn same_column(a: &Expression, b: &Expression, level: &[&str]) -> bool {
+    let at_level = |q: &Identifier| level.contains(&q.value_lower.as_str());
+    match (a, b) {
+        (Expression::Identifier(x), Expression::Identifier(y)) => x.value_lower == y.value_lower,
+        (Expression::QualifiedIdentifier(x), Expression::QualifiedIdentifier(y)) => {
+            x.qualifier.value_lower == y.qualifier.value_lower
+                && x.name.value_lower == y.name.value_lower
+        }
+        (Expression::QualifiedIdentifier(q), Expression::Identifier(n))
+        | (Expression::Identifier(n), Expression::QualifiedIdentifier(q)) => {
+            at_level(&q.qualifier) && q.name.value_lower == n.value_lower
+        }
+        _ => false,
+    }
+}
+
+/// Whether two expressions compute the same value: the same tree, each pair
+/// of columns the same column. A tree reading more than its names, as a
+/// subquery or a window does, must be written alike
+fn same_value(a: &Expression, b: &Expression, level: &[&str]) -> bool {
+    use crate::executor::expr_key::ExprKey;
+    use crate::executor::utils::visit_column_refs;
+    if ExprKey::by_column_name(a) != ExprKey::by_column_name(b) {
+        return false;
+    }
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let plain =
+        visit_column_refs(a, &mut |c| left.push(c)) & visit_column_refs(b, &mut |c| right.push(c));
+    if !plain {
+        return ExprKey::of(a) == ExprKey::of(b);
+    }
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(&right)
+            .all(|(x, y)| same_column(x, y, level))
 }
 
 /// The names a FROM tree shows: each entry's alias, else its own name

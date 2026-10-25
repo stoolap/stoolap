@@ -753,7 +753,7 @@ impl Parser<'_> {
                 return None;
             }
         };
-        self.qualified = true;
+        self.scope_checked = true;
 
         // Check for qualified star (table.*)
         if self.peek_token_is_operator("*") {

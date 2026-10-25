@@ -168,6 +168,7 @@ impl Parser<'_> {
         if self.peek_token_is_keyword(Keyword::Distinct) {
             self.next_token();
             stmt.distinct = true;
+            self.scope_checked = true;
             self.parse_distinct_on(&mut stmt);
         }
 
@@ -382,6 +383,7 @@ impl Parser<'_> {
         if self.peek_token_is_keyword(Keyword::Distinct) {
             self.next_token();
             stmt.distinct = true;
+            self.scope_checked = true;
             self.parse_distinct_on(&mut stmt);
         }
 

@@ -107,7 +107,14 @@ fn the_subquerys_own_qualifier_binds_its_own_column() {
             for outer in ["parent AS p", "parent AS c"] {
                 let sql = format!("{with}SELECT ({inner}) FROM {outer}");
                 let got = rows(&db, &sql);
-                if got != want {
+                // c.b is no SELECT DISTINCT item, so that shape is refused
+                if shape.contains("DISTINCT") {
+                    if !got.as_ref().is_err_and(|e| {
+                        e.contains("ORDER BY c.b is not in the SELECT DISTINCT list")
+                    }) {
+                        wrong.push(format!("{sql}\n  got {got:?}, want the refusal"));
+                    }
+                } else if got != want {
                     wrong.push(format!("{sql}\n  got {got:?}, want {want:?}"));
                 }
             }

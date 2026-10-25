@@ -117,6 +117,28 @@ SELECT DISTINCT region FROM sales ORDER BY region;
 -- West
 ```
 
+Under `SELECT DISTINCT`, one distinct row can stand for several rows, so an `ORDER BY` key must have one value across all of them. A key may be:
+
+- a selected item, by its expression, its alias or its position (`ORDER BY 2`);
+- a selected column under its table's name or without it (`t.a` and `a` are the same column of `t`);
+- an expression of selected columns, such as `a + 1`, `a IN (1, 2)` or `CASE WHEN a > 0 THEN 1 ELSE 2 END` when `a` is selected, with no function that answers anew on each call, such as `RANDOM()`;
+- a column a star selects, or a column of an enclosing query, which is constant inside a subquery;
+- any key, aggregates included, when every GROUP BY item is a selected item itself, by its expression or position (not by an alias), and the query has no ROLLUP, CUBE or GROUPING SETS: each distinct row is then one group, as in `SELECT DISTINCT customer FROM orders GROUP BY customer ORDER BY MAX(order_date)`.
+
+Any other key, a column that is not selected or an aggregate, window or subquery that is not itself a selected item, may hold a different value in each merged row. The statement is then refused instead of being sorted by whichever row was kept:
+
+```sql
+SELECT DISTINCT customer FROM orders ORDER BY customer || '!';   -- accepted
+
+-- Error: ORDER BY order_date is not in the SELECT DISTINCT list
+SELECT DISTINCT customer FROM orders ORDER BY order_date DESC;
+
+-- Say which date orders each customer
+SELECT customer FROM orders GROUP BY customer ORDER BY MAX(order_date) DESC;
+```
+
+The rule is checked when a statement is parsed, so a view is refused when it is created. It applies over every source, a table, a view, a derived table, a CTE or a join, and to a `DISTINCT` subquery. `DISTINCT ON` keeps its own rule, above.
+
 ### COUNT with DISTINCT
 
 ```sql

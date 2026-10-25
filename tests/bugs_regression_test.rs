@@ -3019,24 +3019,28 @@ fn test_bug_73_distinct_order_by_non_select_column() {
     )
     .expect("Insert failed");
 
-    // DISTINCT with ORDER BY on column not in SELECT
+    // X stands for rows with b = 1 and b = 3, so an order by b is refused
+    let refused = db.query("SELECT DISTINCT a FROM t ORDER BY b", ());
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("is not in the SELECT DISTINCT list")),
+        "an ORDER BY key outside the SELECT DISTINCT list is refused"
+    );
+
+    // Grouping says which b orders each value
     let result = db
-        .query("SELECT DISTINCT a FROM t ORDER BY b", ())
+        .query("SELECT a FROM t GROUP BY a ORDER BY MIN(b)", ())
         .expect("Query should succeed");
 
     let rows: Vec<_> = result.collect();
-    assert_eq!(
-        rows.len(),
-        2,
-        "DISTINCT should return only 2 unique values (X, Y)"
-    );
+    assert_eq!(rows.len(), 2, "one row for each of X and Y");
 
     let values: Vec<String> = rows
         .iter()
         .map(|r| r.as_ref().unwrap().get(0).unwrap())
         .collect();
 
-    // Should be X, Y (ordered by their first appearance in b order)
     assert_eq!(values, vec!["X", "Y"]);
 
     // Without ORDER BY for comparison
