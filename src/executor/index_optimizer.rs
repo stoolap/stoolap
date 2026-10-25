@@ -839,13 +839,16 @@ impl Executor {
             && crate::executor::utils::probes_by_equality(table, column)
     }
 
-    /// The rows whose column is IN the members, by a scan that asks each
-    /// row the predicate comparison, with the remaining predicate
+    /// The rows whose column is IN, or with `not` NOT IN, the members, by a
+    /// scan that asks each row the predicate comparison, with the remaining
+    /// predicate
+    #[allow(clippy::too_many_arguments)]
     fn rows_in_members_by_scan(
         &self,
         table: &dyn Table,
         column: &str,
         members: CompactArc<PredicateSet>,
+        not: bool,
         remaining: Option<&Expression>,
         all_columns: &[String],
         ctx: &ExecutionContext,
@@ -858,7 +861,7 @@ impl Executor {
                 column.to_string(),
             ))),
             values: members,
-            not: false,
+            not,
         });
         let membership = RowFilter::new(&membership, all_columns)?.with_context(ctx);
         let remaining = self.remaining_row_filter(remaining, all_columns, ctx)?;
@@ -1219,6 +1222,12 @@ impl Executor {
             schema.columns[pk_col_idx].name_lower == column_name
         };
 
+        // Every way back to the general path is taken before the subquery
+        // runs, so it runs once: NOT IN is read here only on the primary key
+        if is_negated && !is_pk_column {
+            return Ok(None);
+        }
+
         // If not PK, check for index; a table that keeps rows outside its
         // index reads the members by its candidates, or by a scan of them,
         // when no LIMIT applies here
@@ -1297,10 +1306,7 @@ impl Executor {
         // every member read takes them; a set holding a member of another
         // domain is read by a scan that asks each row the comparison
         let members = Self::members_for_column(schema.get_column_type(&column_name), &set);
-        let scan = members.is_none();
-        if scan && is_negated {
-            return Ok(None);
-        }
+        let mut scan = members.is_none();
         let (values, unknown) =
             members.unwrap_or_else(|| (CompactArc::new(ValueSet::default()), false));
         // A member UNKNOWN to every number leaves NOT IN true for no row
@@ -1315,54 +1321,23 @@ impl Executor {
             return Ok(Some((Box::new(result), output_columns, true)));
         }
 
-        if values.is_empty() && !scan {
-            // Empty subquery result
-            if is_negated {
-                // NOT IN empty set = all rows match (fall through to normal scan)
-                return Ok(None);
-            } else {
-                // IN empty set = no rows match
-                let output_columns = CompactArc::new(self.get_output_column_names(
-                    &stmt.columns,
-                    all_columns,
-                    table_alias,
-                ));
-                let result = ExecutorResult::with_arc_columns(
-                    CompactArc::clone(&output_columns),
-                    RowVec::new(),
-                );
-                return Ok(Some((Box::new(result), output_columns, true)));
-            }
-        }
-
-        // A table that keeps rows outside its index: the members' rows by
-        // its candidates, else by a scan of the members already taken, so
-        // the subquery does not run again
-        let member_rows = if scan {
-            Some(self.rows_in_members_by_scan(
-                table,
-                &column_name,
-                set,
-                remaining_predicate.as_ref(),
+        // IN an empty set holds for no row; NOT IN one holds for every key
+        if values.is_empty() && !scan && !is_negated {
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
                 all_columns,
-                ctx,
-            )?)
-        } else if !is_pk_column && index.is_none() {
-            Self::in_member_rows(
-                table,
-                &column_name,
-                values.iter().cloned().collect(),
-                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
-                true,
-            )?
-        } else {
-            None
-        };
+                table_alias,
+            ));
+            let result =
+                ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), RowVec::new());
+            return Ok(Some((Box::new(result), output_columns, true)));
+        }
 
         // Collect row_ids: either from PK (direct) or from index probe
         // Pre-allocate based on expected size to avoid reallocations
         let mut all_row_ids = Vec::with_capacity(values.len());
-        if is_pk_column {
+        let mut member_rows = None;
+        if is_pk_column && !scan {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY:
                 // Instead of scanning the table, iterate through row_ids and exclude
@@ -1389,13 +1364,31 @@ impl Executor {
             } else {
                 all_row_ids.extend(Self::primary_key_members(values.iter()));
             }
-        } else if is_negated {
-            // NOT IN with non-PK index: fall back to normal scan
-            return Ok(None);
-        } else if let Some(ref idx) = index {
-            if !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids) {
-                return Ok(None);
-            }
+        } else if let Some(idx) = index.as_ref().filter(|_| !scan) {
+            // An index that stopped answering for the view leaves the members to the scan
+            scan = !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids);
+        } else if !scan && !is_pk_column {
+            // A table that keeps rows outside its index: the members' rows by its candidates
+            member_rows = Self::in_member_rows(
+                table,
+                &column_name,
+                values.iter().cloned().collect(),
+                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
+                true,
+            )?;
+        }
+        // The members already taken are read by a scan, so the subquery does not run again
+        if scan {
+            all_row_ids.clear();
+            member_rows = Some(self.rows_in_members_by_scan(
+                table,
+                &column_name,
+                set,
+                is_negated,
+                remaining_predicate.as_ref(),
+                all_columns,
+                ctx,
+            )?);
         }
 
         // Sort row_ids for better cache locality during version lookup

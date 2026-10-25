@@ -84,3 +84,41 @@ fn a_subquery_member_of_any_kind_answers_as_on_a_plain_column_hot_and_sealed() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     check(&db, "sealed");
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_subquery_whose_members_are_read_runs_once() {
+    let db = Database::open("memory://a_subquery_whose_members_are_read_runs_once").unwrap();
+    create(&db);
+    let mut failed = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT id FROM t WHERE id NOT IN \
+             (SELECT CASE WHEN RANDOM() < 2 THEN TRUE END FROM m) AND s || 'x' <> 'zx'",
+            vec![1, 2, 3],
+        ),
+        (
+            "SELECT id FROM t WHERE id NOT IN \
+             (SELECT i FROM m WHERE RANDOM() < 0) AND s || 'x' <> 'zx'",
+            vec![1, 2, 3],
+        ),
+        (
+            "SELECT id FROM t WHERE k NOT IN \
+             (SELECT i FROM m WHERE RANDOM() < 2) AND s || 'x' <> 'zx'",
+            vec![1, 3],
+        ),
+        (
+            "SELECT id FROM t WHERE id IN \
+             (SELECT CASE WHEN RANDOM() < 2 THEN TRUE END FROM m) AND s || 'x' <> 'zx'",
+            vec![],
+        ),
+    ] {
+        let runs = stoolap::test_failpoints::in_subquery_runs();
+        assert_eq!(ids(&db, sql), Ok(want), "{sql}");
+        let ran = stoolap::test_failpoints::in_subquery_runs() - runs;
+        if ran != 1 {
+            failed.push(format!("{sql}: the subquery ran {ran} times"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
