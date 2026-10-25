@@ -50,12 +50,17 @@ fn create(db: &Database) {
 fn check(db: &Database, phase: &str) {
     let mut failed = Vec::new();
     for column in ["id", "k", "x", "b", "ts"] {
-        for member in ["i", "t", "tn", "tb", "tt", "f", "g", "b", "ts", "j"] {
+        let members = ["i", "t", "tn", "tb", "tt", "f", "g", "b", "ts", "j"];
+        let lists = members.map(|member| format!("SELECT {member} FROM m"));
+        for list in lists.iter().map(String::as_str).chain(["2", "2, 5", "'2'"]) {
             for not in ["", "NOT "] {
-                for tail in ["", " AND s || 'x' <> 'zx'", " LIMIT 5"] {
-                    let sql = format!(
-                        "SELECT id FROM {{t}} WHERE {column} {not}IN (SELECT {member} FROM m){tail}"
-                    );
+                for tail in [
+                    "",
+                    " AND s || 'x' <> 'zx'",
+                    " LIMIT 5",
+                    " AND s || 'x' <> 'zx' AND EXISTS (SELECT 1 FROM m WHERE m.i < {t}.k)",
+                ] {
+                    let sql = format!("SELECT id FROM {{t}} WHERE {column} {not}IN ({list}){tail}");
                     let indexed = ids(db, &sql.replace("{t}", "t"));
                     let plain = ids(db, &sql.replace("{t}", "p"));
                     if indexed != plain {

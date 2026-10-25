@@ -1207,6 +1207,13 @@ impl Executor {
         if Self::is_subquery_correlated(&subquery.subquery) {
             return Ok(None);
         }
+        // A correlated conjunct beside the IN reads each row's outer columns
+        if remaining_predicate
+            .as_ref()
+            .is_some_and(Self::has_correlated_subqueries)
+        {
+            return Ok(None);
+        }
 
         // Skip if SELECT columns have correlated subqueries (need per-row context)
         // classification is passed from caller to avoid redundant cache lookups
@@ -1538,6 +1545,13 @@ impl Executor {
         // Skip if SELECT columns have correlated subqueries (need per-row context)
         // classification is passed from caller to avoid redundant cache lookups
         if classification.select_has_correlated_subqueries {
+            return Ok(None);
+        }
+        // A correlated conjunct beside the IN reads each row's outer columns
+        if remaining_predicate
+            .as_ref()
+            .is_some_and(Self::has_correlated_subqueries)
+        {
             return Ok(None);
         }
 
