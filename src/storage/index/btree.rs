@@ -878,6 +878,20 @@ impl Index for BTreeIndex {
         }
     }
 
+    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+        let sorted_values = self.sorted_values.read();
+        let mut found: smallvec::SmallVec<[(*const RowIdSet, &RowIdSet); 16]> =
+            smallvec::SmallVec::new();
+        for value in value_list {
+            if let Some(rows) = sorted_values.get(value) {
+                found.push((rows, rows));
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::in_member_probed();
+        }
+        super::each_entry_once(&found, |rows| rows.copy_into(buffer));
+    }
+
     fn get_row_ids_equal_capped_into(
         &self,
         values: &[Value],

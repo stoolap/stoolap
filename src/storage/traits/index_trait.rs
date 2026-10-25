@@ -326,15 +326,25 @@ pub trait Index: Send + Sync {
         results
     }
 
-    /// Appends row IDs for values in the given list to the provided buffer
-    ///
-    /// This enables callers to reuse the vector allocation across multiple calls.
+    /// Appends row IDs for values in the given list to the provided buffer,
+    /// each row once: members the index reads as one key, and a row moved
+    /// from one member's key to another's while the list is read, add it once
     fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
-        // Default implementation: do multiple equality lookups
+        // Each member is probed under its own lock, so the rows are deduplicated
+        let start = buffer.len();
         for value in value_list {
             self.get_row_ids_equal_into(std::slice::from_ref(value), buffer);
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::in_member_probed();
+        }
+        if value_list.len() > 1 {
+            let mut seen = rustc_hash::FxHashSet::with_capacity_and_hasher(
+                buffer.len() - start,
+                Default::default(),
+            );
+            let mut position = 0;
+            buffer.retain(|id| {
+                position += 1;
+                position <= start || seen.insert(*id)
+            });
         }
     }
 

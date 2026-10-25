@@ -621,13 +621,15 @@ impl Index for PkIndex {
 
     fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
         let inner = self.data.read();
+        let mut found: smallvec::SmallVec<[(i64, i64); 16]> = smallvec::SmallVec::new();
         for value in value_list {
             if let Value::Integer(row_id) = value {
                 if inner.contains(*row_id) {
-                    buffer.push(*row_id);
+                    found.push((*row_id, *row_id));
                 }
             }
         }
+        super::each_entry_once(&found, |row_id| buffer.push(row_id));
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {

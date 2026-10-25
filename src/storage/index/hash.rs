@@ -756,6 +756,8 @@ impl Index for HashIndex {
 
         // Single lock acquisition for all lookups
         let hash_to_values = self.hash_to_values.read();
+        let mut found: smallvec::SmallVec<[(*const IdList, &IdList); 16]> =
+            smallvec::SmallVec::new();
 
         for value in value_list {
             // Hash without cloning - pass reference to slice
@@ -764,12 +766,13 @@ impl Index for HashIndex {
                 for (stored_values, row_ids) in entries {
                     // Compare CompactArc<Value> with input value
                     if stored_values.len() == 1 && stored_values[0].as_ref() == value {
-                        row_ids.copy_into(buffer);
+                        found.push((row_ids, row_ids));
                         break;
                     }
                 }
             }
         }
+        super::each_entry_once(&found, |row_ids| row_ids.copy_into(buffer));
     }
 
     fn get_row_ids_in_range_into(
