@@ -153,9 +153,9 @@ pub struct Parser<'a> {
     /// Whether each statement's qualifiers are checked against its FROM
     /// entries; off for text the engine wrote itself
     scoped: bool,
-    /// Whether the current statement wrote a qualifier, the one thing the
-    /// scope check can refuse
-    pub(crate) qualified: bool,
+    /// Whether the current statement wrote what the scope check can refuse:
+    /// a qualifier, or a SELECT DISTINCT and its ORDER BY
+    pub(crate) scope_checked: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -176,7 +176,7 @@ impl<'a> Parser<'a> {
             max_positional: 0,
             named_slots: Vec::new(),
             scoped: true,
-            qualified: false,
+            scope_checked: false,
         }
     }
 
@@ -503,7 +503,7 @@ impl<'a> Parser<'a> {
     /// Refuses a qualifier `stmt`, parsed whole without error, writes where
     /// no FROM entry in scope has that name
     pub(crate) fn check_scopes(&mut self, stmt: &Statement) {
-        if !std::mem::take(&mut self.qualified) || !self.scoped || !self.errors.is_empty() {
+        if !std::mem::take(&mut self.scope_checked) || !self.scoped || !self.errors.is_empty() {
             return;
         }
         if let Err(error) = super::scope::check(stmt) {

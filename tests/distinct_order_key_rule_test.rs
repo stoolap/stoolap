@@ -119,6 +119,25 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
             "SELECT id FROM u WHERE k IN (SELECT DISTINCT a FROM t ORDER BY b LIMIT 1)",
             "b",
         ),
+        // A path that never reads the rows, or reads none, judges it all the same
+        (
+            "SELECT DISTINCT a FROM t WHERE a > ANY (SELECT a FROM e) ORDER BY b",
+            "b",
+        ),
+        (
+            "SELECT t.id FROM t WHERE EXISTS \
+             (SELECT DISTINCT u.k FROM u WHERE u.id = t.id ORDER BY u.x)",
+            "u.x",
+        ),
+        // A column a sort appends is no SELECT item, a star beside it or not
+        (
+            "SELECT DISTINCT t.*, COUNT(*) OVER () AS n FROM t JOIN u ON u.k = t.a ORDER BY u.x",
+            "u.x",
+        ),
+        (
+            "SELECT DISTINCT t.* FROM t JOIN u ON u.k = t.a ORDER BY x",
+            "x",
+        ),
     ] {
         if let Some(got) = refusal(rows(db, sql), key) {
             wrong.push(format!(
@@ -127,6 +146,13 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         }
     }
     for sql in [
+        // The item as written, before a SELECT subquery is folded
+        "SELECT DISTINCT (SELECT 1) AS k, COUNT(*) ORDER BY (SELECT 1)",
+        // A column the same under a qualifier the item omits, or the reverse
+        "SELECT DISTINCT a + 1 FROM t ORDER BY t.a + 1",
+        "SELECT DISTINCT t.a * 2 FROM t ORDER BY a * 2",
+        "SELECT DISTINCT t.* FROM t ORDER BY b",
+        "SELECT DISTINCT t.* FROM t JOIN u ON u.k = t.a ORDER BY t.b",
         "SELECT DISTINCT a, COUNT(*) AS n FROM t GROUP BY a ORDER BY n, a",
         "SELECT DISTINCT a FROM t WHERE id > (SELECT MIN(id) FROM t) - 1 ORDER BY a",
         "SELECT DISTINCT a FROM t UNION SELECT 7 ORDER BY 1",
@@ -183,4 +209,17 @@ fn the_refusal_names_the_key_and_the_ways_to_write_it() {
     ] {
         assert!(message.contains(part), "{message}");
     }
+}
+
+#[test]
+fn a_view_is_refused_when_it_is_created() {
+    let db = Database::open("memory://distinct_order_key_view").unwrap();
+    setup(&db);
+    let created = db.execute("CREATE VIEW w AS SELECT DISTINCT a FROM t ORDER BY b", ());
+    assert!(
+        created.as_ref().is_err_and(|e| e
+            .to_string()
+            .contains("ORDER BY b is not in the SELECT DISTINCT list")),
+        "{created:?}"
+    );
 }

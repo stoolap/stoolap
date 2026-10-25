@@ -49,6 +49,15 @@ impl ExprKey {
         hasher.finish()
     }
 
+    /// The key of `expr` with every column read as its name alone, so `t.a`
+    /// and `a` meet; whether their qualifiers agree is the caller's to ask
+    pub(crate) fn by_column_name(expr: &Expression) -> Self {
+        let mut hasher = KeyHasher::new();
+        hasher.by_column_name = true;
+        write_expr(expr, &mut hasher);
+        hasher.finish()
+    }
+
     pub(crate) fn of_call(call: &FunctionCall) -> Self {
         let mut hasher = KeyHasher::new();
         write_call(call, &mut hasher);
@@ -86,6 +95,8 @@ struct KeyHasher {
     a: AHasher,
     /// Names keep their quoting and qualification, see [`ExprKey::exact`]
     exact: bool,
+    /// A column is its name alone, see [`ExprKey::by_column_name`]
+    by_column_name: bool,
 }
 
 impl Hasher for KeyHasher {
@@ -105,6 +116,7 @@ impl KeyHasher {
             fx: FxHasher::default(),
             a: AHasher::default(),
             exact: false,
+            by_column_name: false,
         }
     }
 
@@ -220,6 +232,10 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
         Expression::Identifier(id) => {
             hasher.tag(b'I');
             hasher.name(&id.value_lower);
+        }
+        Expression::QualifiedIdentifier(qid) if hasher.by_column_name => {
+            hasher.tag(b'I');
+            hasher.name(&qid.name.value_lower);
         }
         Expression::QualifiedIdentifier(qid) if hasher.exact => {
             hasher.tag(b'Q');

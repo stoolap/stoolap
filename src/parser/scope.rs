@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! The rule a qualifier is read by: `q.column` and `q.*` name a FROM entry
-//! of the query they are written in or of an enclosing one
+//! of the query they are written in or of an enclosing one; and under
+//! SELECT DISTINCT, every ORDER BY key is a SELECT item
 
 use smallvec::SmallVec;
 
@@ -125,12 +126,99 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
     for order in &select.order_by {
         check_expr(&order.expression, ordered)?;
     }
+    if let Some(key) = distinct_key_outside(select) {
+        return Err(ScopeError {
+            message: format!(
+                "ORDER BY {key} is not in the SELECT DISTINCT list: rows merged into one \
+                 distinct row may hold different values of it. Add it to the SELECT list, \
+                 or group the rows and sort by an aggregate of it, such as MAX({key})"
+            ),
+            position: key.position(),
+        });
+    }
     check_opt(select.limit.as_deref(), outer)?;
     check_opt(select.offset.as_deref(), outer)?;
     for op in &select.set_operations {
         check_select(&op.right, outer)?;
     }
     Ok(())
+}
+
+/// Under SELECT DISTINCT, the first ORDER BY key no SELECT item gives: one
+/// distinct row stands for several rows, which such a key may tell apart
+fn distinct_key_outside(select: &SelectStatement) -> Option<&Expression> {
+    if !select.distinct || !select.distinct_on.is_empty() || !select.set_operations.is_empty() {
+        return None;
+    }
+    let one_source = select
+        .table_expr
+        .as_deref()
+        .is_some_and(|from| !matches!(from, Expression::JoinSource(_)));
+    select
+        .order_by
+        .iter()
+        .map(|order| &order.expression)
+        .find(|key| !selected(key, &select.columns, one_source))
+}
+
+/// Whether ORDER BY `key` reads a SELECT item: by position, by alias, as
+/// the same expression, or as a column a star gives
+fn selected(key: &Expression, items: &[Expression], one_source: bool) -> bool {
+    match key {
+        Expression::IntegerLiteral(_) => return true,
+        Expression::Identifier(name)
+            if items.iter().any(|item| {
+                matches!(item, Expression::Aliased(a) if a.alias.value_lower == name.value_lower)
+            }) =>
+        {
+            return true
+        }
+        _ => {}
+    }
+    items.iter().any(|item| match item {
+        Expression::Star(_) => {
+            matches!(
+                key,
+                Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
+            )
+        }
+        // Without its table's columns at hand, a bare name is the starred
+        // table's only when no other table is read
+        Expression::QualifiedStar(star) => match key {
+            Expression::QualifiedIdentifier(column) => column
+                .qualifier
+                .value_lower
+                .eq_ignore_ascii_case(&star.qualifier),
+            Expression::Identifier(_) => one_source,
+            _ => false,
+        },
+        Expression::Aliased(aliased) => same_value(key, &aliased.expression),
+        item => same_value(key, item),
+    })
+}
+
+/// Whether two expressions compute the same value: the same tree, each
+/// column the same name under qualifiers that agree, where one may omit it
+fn same_value(a: &Expression, b: &Expression) -> bool {
+    use crate::executor::expr_key::ExprKey;
+    use crate::executor::utils::visit_column_refs;
+    if ExprKey::by_column_name(a) != ExprKey::by_column_name(b) {
+        return false;
+    }
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let plain =
+        visit_column_refs(a, &mut |c| left.push(c)) & visit_column_refs(b, &mut |c| right.push(c));
+    // A subquery reads more than its names say: only the tree as written
+    if !plain {
+        return ExprKey::of(a) == ExprKey::of(b);
+    }
+    left.len() == right.len()
+        && left.iter().zip(&right).all(|pair| match pair {
+            (Expression::QualifiedIdentifier(p), Expression::QualifiedIdentifier(q)) => {
+                p.qualifier.value_lower == q.qualifier.value_lower
+            }
+            _ => true,
+        })
 }
 
 /// The names a FROM tree shows: each entry's alias, else its own name
