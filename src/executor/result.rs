@@ -1702,6 +1702,14 @@ impl AliasedResult {
             aliased_columns,
         }
     }
+
+    /// `inner` with its columns named `columns`, by position
+    pub fn renamed(inner: Box<dyn QueryResult>, columns: Vec<String>) -> Self {
+        Self {
+            inner,
+            aliased_columns: columns,
+        }
+    }
 }
 
 impl QueryResult for AliasedResult {

@@ -651,18 +651,18 @@ fn test_view_depth_limit() {
     db.execute("INSERT INTO t VALUES (1, 100)", ())
         .expect("Failed to insert");
 
-    // Create a chain of 35 nested views (exceeds limit of 32)
+    // Create a chain of nested views up to the limit of 32
     db.execute("CREATE VIEW v0 AS SELECT * FROM t", ())
         .expect("Failed to create v0");
 
-    for i in 1..35 {
+    for i in 1..32 {
         let sql = format!("CREATE VIEW v{} AS SELECT * FROM v{}", i, i - 1);
         db.execute(&sql, ())
             .unwrap_or_else(|_| panic!("Failed to create v{}", i));
     }
 
-    // Querying v34 should fail due to depth limit
-    let result = db.query("SELECT * FROM v34", ());
+    // A view one deeper runs its query when it is created, past the limit
+    let result = db.execute("CREATE VIEW v32 AS SELECT * FROM v31", ());
     match result {
         Err(e) => {
             let err_msg = e.to_string();

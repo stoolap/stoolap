@@ -64,8 +64,11 @@ const SETUP: &[&str] = &[
     "CREATE VIEW vb_list AS SELECT id, (SELECT COUNT(*) FROM u WHERE u.id = t.a) AS c FROM t",
     "CREATE VIEW vb_exists AS SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.a)",
     "CREATE VIEW vb_having AS SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING COUNT(*) > (SELECT 1)",
-    "CREATE VIEW vb_join AS SELECT t.id FROM t JOIN u ON u.id = (SELECT MIN(w.id) FROM u w WHERE w.x = t.a)",
 ];
+
+/// A view whose query cannot run until step 6, so creating it fails
+const STEP_6_VIEW: &str =
+    "CREATE VIEW vb_join AS SELECT t.id FROM t JOIN u ON u.id = (SELECT MIN(w.id) FROM u w WHERE w.x = t.a)";
 
 /// The sources over t, aliased s; the reference is t itself
 const T_SOURCES: &[Source] = &[
@@ -413,6 +416,7 @@ fn open(name: &str, sealed: bool, dir: &tempfile::TempDir) -> Database {
     for sql in SETUP {
         db.execute(sql, ()).unwrap();
     }
+    assert!(db.execute(STEP_6_VIEW, ()).is_err(), "step 6 runs it");
     if sealed {
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }

@@ -25,6 +25,17 @@ CREATE VIEW IF NOT EXISTS engineering AS
 SELECT * FROM employees WHERE department = 'Engineering';
 ```
 
+## Column Names
+
+`CREATE VIEW` runs the view's query once and records the names of its columns with the view. Rows are not fetched, but a query that has to read its input before giving its first row, such as one with GROUP BY or ORDER BY, does that work once. A query that cannot run, because it reads a table or a column that does not exist, is refused, and so is a query that names two columns alike:
+
+```sql
+CREATE VIEW v AS SELECT a, a FROM t;        -- error: column 'a' is named more than once
+CREATE VIEW v AS SELECT a, a AS a2 FROM t;  -- columns a, a2
+```
+
+The recorded names are the view's columns from then on. Renaming a column of a table the view reads keeps the view's name for it. If the view's query later gives a different number of columns, for example `SELECT *` after `ALTER TABLE ... ADD COLUMN`, reading the view is an error until the view is created again.
+
 ## Dropping Views
 
 ```sql
@@ -123,7 +134,7 @@ CREATE VIEW senior_engineers AS
 SELECT * FROM senior_employees WHERE department = 'Engineering';
 ```
 
-The maximum nesting depth of 32 levels prevents infinite recursion from circular view definitions.
+The maximum nesting depth of 32 levels prevents infinite recursion from circular view definitions. Since `CREATE VIEW` runs the view's query, a view nested deeper than that is refused when it is created.
 
 ## View Metadata
 
@@ -141,6 +152,6 @@ SHOW CREATE VIEW engineering;
 
 - View names and table names share the same namespace and cannot conflict
 - Views are read-only (INSERT, UPDATE, DELETE on views are not supported)
-- View definitions are stored in the WAL and persist across restarts
+- View definitions and their column names are stored in the WAL and persist across restarts
 - A view cannot take parameters (`$1`, `?`, `:name`): it is stored SQL with no values of its own, so `CREATE VIEW` refuses one, and reading a view stored with one is an error
 - A view's query follows the qualifier rule of every statement: `CREATE VIEW` refuses a qualified name that names no FROM entry of the view's query, and reading a view stored with one is an error. A query that reads the view names it by the view's name or alias, never by a table inside the view

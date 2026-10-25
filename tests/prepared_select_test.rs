@@ -2170,11 +2170,14 @@ fn test_a_redefined_view_answers_from_its_new_body() {
 fn test_a_view_reading_itself_stops_at_the_nesting_limit() {
     let _guard = serial();
     let db = setup("prepared_view_loop");
-    db.execute(
-        "CREATE VIEW tv AS SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)",
-        (),
-    )
-    .unwrap();
+    let view = "SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)";
+    assert!(db
+        .execute(&format!("CREATE VIEW tv AS {view}"), ())
+        .is_err());
+    // Only the engine stores one, as a database an older release wrote can hold
+    db.engine()
+        .create_view("tv", view.to_string(), None, false)
+        .unwrap();
     let (err, _) = error(
         &db,
         "SELECT id FROM tv WHERE id > (SELECT MIN(id) FROM u)",

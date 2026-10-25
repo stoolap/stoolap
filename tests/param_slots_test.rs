@@ -403,7 +403,7 @@ fn a_view_cannot_take_parameters() {
     }
     // A view stored before the rule: its own :x would take the caller's slot 1
     db.engine()
-        .create_view("old_v", "SELECT :x AS n".to_string(), false)
+        .create_view("old_v", "SELECT :x AS n".to_string(), None, false)
         .unwrap();
     let error = rows(db.query_named("SELECT :y AS a, n FROM old_v", named_params! { x: 7, y: 1 }))
         .expect_err("the old view's parameter")
@@ -411,7 +411,7 @@ fn a_view_cannot_take_parameters() {
     assert!(error.contains("a view cannot take parameters"), "{error}");
     // Run directly first, so the view's text is in the plan cache with its slots
     db.engine()
-        .create_view("old_w", "SELECT $1 AS n".to_string(), false)
+        .create_view("old_w", "SELECT $1 AS n".to_string(), None, false)
         .unwrap();
     assert_eq!(
         rows(db.query("SELECT $1 AS n", (5,))).unwrap(),
