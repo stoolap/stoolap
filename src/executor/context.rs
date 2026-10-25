@@ -1758,6 +1758,15 @@ impl ExecutionContext {
         ctx
     }
 
+    /// This context without the counts read for its statement, for a
+    /// statement of its own at the same depth; None when it carries none
+    pub(crate) fn without_read_counts(&self) -> Option<Self> {
+        self.read_counts.as_ref()?;
+        let mut ctx = self.clone();
+        ctx.read_counts = None;
+        Some(ctx)
+    }
+
     /// This context carrying `counts`, read for a statement at its depth
     pub(crate) fn with_read_counts(&self, counts: ReadCounts) -> Self {
         let mut ctx = self.clone();

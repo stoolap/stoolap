@@ -107,12 +107,62 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
     }
 }
 
+/// A CTE's own counts, read once each and apart from the statement's
+fn check_cte_bodies(db: &Database, phase: &str, wrong: &mut Vec<String>) {
+    for (sql, reads) in [
+        // The body and the statement write the same count: two reads, and
+        // the smaller, the first, cuts the rows
+        (
+            "WITH c(x) AS (SELECT id FROM t ORDER BY id LIMIT NEXT_COUNT()) \
+             SELECT x FROM c LIMIT NEXT_COUNT()",
+            2,
+        ),
+        (
+            "WITH c AS (SELECT id FROM t ORDER BY id LIMIT NEXT_COUNT()) \
+             SELECT c.id FROM c JOIN c d ON d.id = c.id LIMIT NEXT_COUNT()",
+            2,
+        ),
+        (
+            "WITH a(x) AS (SELECT id FROM t), \
+             b AS (SELECT x, COUNT(*) FROM a GROUP BY x LIMIT NEXT_COUNT() OFFSET NEXT_COUNT()) \
+             SELECT * FROM b",
+            2,
+        ),
+        (
+            "WITH a(x) AS (SELECT id FROM t), \
+             b AS (SELECT x FROM a ORDER BY x LIMIT NEXT_COUNT() OFFSET NEXT_COUNT()) \
+             SELECT * FROM b",
+            2,
+        ),
+        (
+            "SELECT x FROM (SELECT id AS x FROM t ORDER BY id LIMIT NEXT_COUNT()) s \
+             LIMIT NEXT_COUNT()",
+            2,
+        ),
+        (
+            "SELECT id FROM t WHERE id IN (SELECT id FROM t ORDER BY id LIMIT NEXT_COUNT()) \
+             LIMIT NEXT_COUNT()",
+            2,
+        ),
+    ] {
+        let first = CALLS.load(Ordering::Relaxed) + 1;
+        let rows = db.query(sql, ()).unwrap().count() as i64;
+        let calls = CALLS.load(Ordering::Relaxed) - first + 1;
+        if calls != reads || rows != first {
+            wrong.push(format!(
+                "{phase}: {sql}: {calls} calls, {rows} rows, first count {first}"
+            ));
+        }
+    }
+}
+
 #[test]
 fn a_volatile_limit_and_offset_are_read_once_on_every_path() {
     global_registry().register_scalar::<NextCount>();
     let mut wrong = Vec::new();
     let db = open("memory://limit_volatile_once");
     check(&db, "hot", &mut wrong);
+    check_cte_bodies(&db, "hot", &mut wrong);
 
     let dir = tempfile::tempdir().unwrap();
     let db = open(&format!(
@@ -123,5 +173,6 @@ fn a_volatile_limit_and_offset_are_read_once_on_every_path() {
     db.execute("UPDATE t SET a = 4 WHERE id % 30 = 0", ())
         .unwrap();
     check(&db, "sealed with hot updates", &mut wrong);
+    check_cte_bodies(&db, "sealed with hot updates", &mut wrong);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
