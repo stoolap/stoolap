@@ -130,3 +130,11 @@ SELECT id, name FROM contractors;
 | `INTERSECT ALL` | Kept (min count from both sides) |
 | `EXCEPT` | Removed |
 | `EXCEPT ALL` | Kept (subtracts one per match) |
+
+`SELECT DISTINCT` belongs to its own SELECT: in a set operation it removes duplicates from the first SELECT's rows before they are combined, and a later `ALL` keeps the duplicates the other side brings:
+
+```sql
+SELECT DISTINCT 1 AS x UNION ALL SELECT 1;
+-- 1
+-- 1
+```

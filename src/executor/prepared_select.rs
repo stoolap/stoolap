@@ -6895,14 +6895,15 @@ impl Executor {
         }
         // A DISTINCT whose output asks no block keeps the first row of each
         // value as the scan passes it; one that does is told its rows first.
-        // A first branch whose set operation removes duplicates is one too
+        // A set operation's DISTINCT is its first branch's, and a first
+        // branch whose set operation removes duplicates is one too
         let dedups_branch = stmt.set_operations.first().is_some_and(|op| {
             matches!(
                 op.operation,
                 SetOperationType::Union | SetOperationType::Intersect | SetOperationType::Except
             )
         });
-        let distinct = (((stmt.distinct && stmt.set_operations.is_empty()) || dedups_branch)
+        let distinct = ((stmt.distinct || dedups_branch)
             && !stmt
                 .columns
                 .iter()
@@ -6963,8 +6964,7 @@ impl Executor {
                 false,
                 prepared.visible,
                 prepared.layout.clone(),
-                // A branch's DISTINCT leaves the whole statement's to run
-                !branch,
+                true,
             ))
         };
         let mut rows = match read? {

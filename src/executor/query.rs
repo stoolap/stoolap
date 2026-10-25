@@ -1510,17 +1510,6 @@ impl Executor {
         } = shape.unwrap_or_default();
         let prepared_visible = prepared_visible.or(visible);
 
-        // Apply set operations (UNION, INTERSECT, EXCEPT)
-        // Pass limit+offset to enable early termination for UNION ALL
-        let mut limit_offset_applied = limit_offset_applied;
-        if !stmt.set_operations.is_empty() {
-            result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
-
-            // The set operation gathers LIMIT + OFFSET rows at most; the
-            // OFFSET is skipped and the LIMIT cut below, on the whole
-            limit_offset_applied = false;
-        }
-
         // Count expected SELECT columns (before any extra ORDER BY columns).
         // Beside a star the count is unknown, but the only columns past
         // the visible ones are then the window functions ORDER BY had
@@ -1541,6 +1530,7 @@ impl Executor {
         // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
         // DISTINCT should only consider the original SELECT columns, not the extra ORDER BY columns.
+        // A set operation's DISTINCT is its first SELECT's, so it comes first
         if stmt.distinct && stmt.distinct_on.is_empty() && !distinct_applied {
             if columns.len() > expected_columns && expected_columns > 0 {
                 // Extra ORDER BY columns present - only hash SELECT columns for distinctness
@@ -1551,6 +1541,17 @@ impl Executor {
             } else {
                 result = Box::new(DistinctResult::new(result));
             }
+        }
+
+        // Apply set operations (UNION, INTERSECT, EXCEPT)
+        // Pass limit+offset to enable early termination for UNION ALL
+        let mut limit_offset_applied = limit_offset_applied;
+        if !stmt.set_operations.is_empty() {
+            result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
+
+            // The set operation gathers LIMIT + OFFSET rows at most; the
+            // OFFSET is skipped and the LIMIT cut below, on the whole
+            limit_offset_applied = false;
         }
 
         // Apply ORDER BY (with TOP-N optimization if LIMIT is present)
