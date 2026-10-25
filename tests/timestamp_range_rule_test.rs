@@ -252,3 +252,102 @@ fn a_schema_change_that_would_store_a_timestamp_past_the_range_is_an_error() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn the_engine_refuses_an_added_column_whose_default_is_past_the_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = open("timestamp_range_engine_add_column", true, &dir);
+    let before = rows(&db, STORED).unwrap();
+    let far = chrono::DateTime::parse_from_rfc3339("9999-12-31T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    for default in [
+        (None, Some(Value::Timestamp(far))),
+        (Some("'9999-12-31'".to_string()), None),
+    ] {
+        let added = db.engine().create_column_with_default(
+            "t",
+            "far",
+            stoolap::core::DataType::Timestamp,
+            true,
+            default.clone(),
+            0,
+        );
+        assert!(
+            added
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("outside the range")),
+            "{default:?} gave {added:?}"
+        );
+        assert_eq!(rows(&db, STORED).unwrap(), before, "{default:?} changed t");
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+}
+
+#[test]
+fn a_sealed_copy_no_current_row_reads_takes_null_when_its_column_becomes_a_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/hidden_copies", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT)",
+        "INSERT INTO u VALUES (1, '9999-12-31'), (2, '9999-12-31'), (3, '2024-01-01')",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let other = db.clone();
+    let mut old = other
+        .begin_with_isolation(stoolap::IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let read_old = |tx: &mut stoolap::api::Transaction| -> Vec<String> {
+        tx.query("SELECT id, s FROM u ORDER BY id", ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| match row.get_value(i) {
+                        Some(Value::Timestamp(ts)) => ts.to_rfc3339(),
+                        Some(value) => format!("{value:?}"),
+                        None => "missing".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    assert_eq!(read_old(&mut old).len(), 3);
+    for sql in [
+        "UPDATE u SET s = '2024-01-02' WHERE id = 1",
+        "DELETE FROM u WHERE id = 2",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("ALTER TABLE u MODIFY COLUMN s TIMESTAMP", ())
+        .expect("no current row holds a time past the range");
+    let current = vec![
+        "Integer(1) 2024-01-02T00:00:00+00:00".to_string(),
+        "Integer(3) 2024-01-01T00:00:00+00:00".to_string(),
+    ];
+    assert_eq!(
+        rows(&db, "SELECT id, s FROM u ORDER BY id").unwrap(),
+        current
+    );
+    assert_eq!(
+        read_old(&mut old),
+        vec![
+            "Integer(1) Null(Timestamp)",
+            "Integer(2) Null(Timestamp)",
+            "Integer(3) 2024-01-01T00:00:00+00:00",
+        ],
+        "a snapshot from before the change reads the hidden copies as NULL"
+    );
+    old.rollback().unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, s FROM u ORDER BY id").unwrap(),
+        current
+    );
+}

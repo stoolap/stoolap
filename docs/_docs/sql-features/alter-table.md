@@ -61,7 +61,7 @@ Every existing value is converted to the new type, in memory and in the frozen v
 - the column is the primary key, a foreign key column, or a column a foreign key references;
 - an index on the column cannot hold the new type (an HNSW index holds only vectors of a known dimension);
 - a converted value is NULL and the column is NOT NULL;
-- the column becomes a TIMESTAMP and a converted value, or the default an added column gave the rows before it, lies outside the range a table stores (`1677-09-21` to `2262-04-11`);
+- the column becomes a TIMESTAMP and a converted value, or the default an added column gave the rows before it, lies outside the range a table stores (`1677-09-21` to `2262-04-11`). An earlier copy of an updated or deleted row, which only a transaction older than the change still reads, takes NULL instead;
 - two rows would hold the same key of a UNIQUE index once converted (for example `'7'` and `'07'` changed to INTEGER);
 - the column becomes a VECTOR of another dimension and a row holds a vector of the old one (values are never padded or cut).
 
