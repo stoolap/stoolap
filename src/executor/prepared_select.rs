@@ -3402,6 +3402,8 @@ impl Builder<'_> {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_slots(self.next_slot);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::prepared_blocks(subqueries.len());
         let blocks = PreparedBlocks {
             param_count,
             slot_count: self.next_slot,
@@ -3744,8 +3746,8 @@ impl Builder<'_> {
 
     /// [`Self::rewrite`] of `expr` for a look at its bound form only: its
     /// enclosing reads take the slots `outer` holds, and a new one is given
-    /// back, so the statement's buffer does not grow for it. `expr` holds
-    /// no subquery, which would prepare a block
+    /// back, so the statement's buffer does not grow for it. A block it
+    /// prepares is checked and dropped again, so no run sets it up
     fn trial_rewrite(
         &mut self,
         chain: &Chain<'_>,
@@ -3753,13 +3755,14 @@ impl Builder<'_> {
         expr: &Expression,
         outer: &FxHashMap<(usize, usize, Option<ExprKey>), usize>,
     ) -> Result<Expression> {
-        let next_slot = self.next_slot;
+        let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
         let mut trial = Rewritten {
             outer: outer.clone(),
             ..Rewritten::default()
         };
         let rewritten = self.rewrite(chain, Some(id), expr, &mut trial);
         self.next_slot = next_slot;
+        self.subqueries.truncate(blocks);
         rewritten
     }
 

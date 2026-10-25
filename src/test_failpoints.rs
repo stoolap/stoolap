@@ -1465,6 +1465,19 @@ pub(crate) fn prepared_slots(count: usize) {
     PREPARED_SLOTS.with(|slots| slots.set(count));
 }
 
+thread_local! {
+    static PREPARED_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The blocks this thread prepared last, which every run opens and sets up
+pub fn prepared_block_count() -> usize {
+    PREPARED_BLOCKS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn prepared_blocks(count: usize) {
+    PREPARED_BLOCKS.with(|blocks| blocks.set(count));
+}
+
 /// Process-wide: prepared statements that read their rows in ORDER BY
 /// order through an index or a top-k scan
 static PREPARED_ORDERED_READS: std::sync::atomic::AtomicUsize =
