@@ -2010,6 +2010,26 @@ pub fn function_call_to_string(func: &crate::parser::ast::FunctionCall) -> Strin
     format!("{}({}{})", func.function, distinct, args.join(", "))
 }
 
+/// The name a result column takes from its SELECT item on every path: its
+/// alias, a column's own name, any other item as written
+pub fn item_name(expr: &Expression) -> String {
+    match item_spelled_name(expr) {
+        Some(name) => name.to_string(),
+        None => expression_to_string(expr),
+    }
+}
+
+/// The name `item_name` gives an alias or a column, as the item spells it;
+/// None for an item named as written
+pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
+    match expr {
+        Expression::Aliased(aliased) => Some(aliased.alias.value.as_str()),
+        Expression::Identifier(id) => Some(id.value.as_str()),
+        Expression::QualifiedIdentifier(qid) => Some(qid.name.value.as_str()),
+        _ => None,
+    }
+}
+
 /// Convert expression to string representation.
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {

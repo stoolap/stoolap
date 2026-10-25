@@ -212,9 +212,9 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
         "index_count",
-        "SELECT id, (SELECT COUNT(*) FROM t AS u WHERE u.g = t.a) FROM t LIMIT 10",
+        "SELECT id, (SELECT COUNT(*) FROM t AS u WHERE u.g = t.a) AS n FROM t LIMIT 10",
         "SELECT DISTINCT ON (id) id, (SELECT COUNT(*) FROM t AS u \
-         WHERE u.g = t.a AND u.id + 0 = u.id) FROM t LIMIT 10",
+         WHERE u.g = t.a AND u.id + 0 = u.id) AS n FROM t LIMIT 10",
     ),
     (
         "memory",

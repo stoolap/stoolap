@@ -4419,25 +4419,17 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         use crate::parser::{Identifier, Position, Token, TokenType};
 
-        let mut result_columns: Vec<String> = Vec::new();
-
-        for (i, expr) in returning.iter().enumerate() {
-            match expr {
-                Expression::Star(_) => {
-                    // Expand * to all columns
-                    for col_name in column_names {
-                        result_columns.push(col_name.clone());
-                    }
-                }
-                _ => {
-                    result_columns.push(Self::get_returning_column_name(expr, i));
-                }
-            }
-        }
+        let result_columns = match prepared.and_then(|run| run.returning_names()) {
+            Some(names) => CompactArc::clone(names),
+            None => CompactArc::new(Self::returning_names(returning, column_names)),
+        };
 
         // If no source rows, return empty result
         if source_rows.is_empty() {
-            return Ok(Box::new(ExecutorResult::new(result_columns, RowVec::new())));
+            return Ok(Box::new(ExecutorResult::with_arc_columns(
+                result_columns,
+                RowVec::new(),
+            )));
         }
 
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
@@ -4457,7 +4449,10 @@ impl Executor {
                 }
                 result_rows.push((row_id as i64, Row::from_values(row_values)));
             }
-            return Ok(Box::new(ExecutorResult::new(result_columns, result_rows)));
+            return Ok(Box::new(ExecutorResult::with_arc_columns(
+                result_columns,
+                result_rows,
+            )));
         }
 
         // Pre-compile all RETURNING expressions
@@ -4498,26 +4493,23 @@ impl Executor {
             result_rows.push((row_id as i64, Row::from_values(row_values)));
         }
 
-        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
+        Ok(Box::new(ExecutorResult::with_arc_columns(
+            result_columns,
+            result_rows,
+        )))
     }
 
-    /// Get a column name for a RETURNING expression
-    fn get_returning_column_name(expr: &Expression, index: usize) -> String {
-        match expr {
-            Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-            Expression::Star(_) => "*".to_string(),
-            Expression::Aliased(aliased) => aliased.alias.value.to_string(),
-            Expression::FunctionCall(func) => {
-                let args: Vec<String> = func
-                    .arguments
-                    .iter()
-                    .map(|a| Self::get_returning_column_name(a, 0))
-                    .collect();
-                format!("{}({})", func.function, args.join(", "))
+    /// The names of the columns `returning` gives over the target's
+    /// `columns`, a star expanded
+    pub(crate) fn returning_names(returning: &[Expression], columns: &[String]) -> Vec<String> {
+        let mut names = Vec::with_capacity(returning.len());
+        for expr in returning {
+            match expr {
+                Expression::Star(_) => names.extend(columns.iter().cloned()),
+                _ => names.push(super::utils::item_name(expr)),
             }
-            _ => format!("column_{}", index),
         }
+        names
     }
 }
 

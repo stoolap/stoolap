@@ -118,11 +118,11 @@ impl Executor {
         let col_expr = &stmt.columns[0];
 
         // Extract function info (handle aliased case too)
-        let (func, alias) = match col_expr {
-            Expression::FunctionCall(func) => (func, None),
+        let func = match col_expr {
+            Expression::FunctionCall(func) => func,
             Expression::Aliased(aliased) => {
                 if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    (func, Some(aliased.alias.value.to_string()))
+                    func
                 } else {
                     return Ok(None);
                 }
@@ -176,7 +176,7 @@ impl Executor {
             crate::test_failpoints::min_max_index_answered();
             super::aggregation::AggregatePath::IndexMinMax.taken();
             // Build result - wrap columns in CompactArc once for zero-copy sharing
-            let col_name = alias.unwrap_or_else(|| super::utils::function_call_to_string(func));
+            let col_name = super::utils::item_name(col_expr);
             let columns = CompactArc::new(vec![col_name]);
             let mut rows = RowVec::with_capacity(1);
             rows.push((0, Row::from_values(vec![val])));

@@ -43,7 +43,7 @@ use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::{build_column_index_map, eq_folded};
+use super::utils::{build_column_index_map, eq_folded, item_name, item_spelled_name};
 use super::window::WindowOutput;
 use super::Executor;
 
@@ -1556,7 +1556,14 @@ impl Executor {
                 }
             });
             if columns_match {
-                // Columns match exactly, return as-is
+                // The rows are the SELECT list's, named as its items are: a
+                // slot of a column or an alias may carry another spelling
+                let mut agg_columns = agg_columns;
+                for (name, item) in agg_columns.iter_mut().zip(&stmt.columns) {
+                    if let Some(spelled) = item_spelled_name(item).filter(|s| *s != name) {
+                        *name = spelled.to_string();
+                    }
+                }
                 return Ok((agg_columns, agg_rows));
             }
         }
@@ -1580,7 +1587,7 @@ impl Executor {
             // If correlated, we need to use the original expression
             let original_expr = &stmt.columns[i];
 
-            final_columns.push(self.grouped_item_name(col_expr));
+            final_columns.push(item_name(original_expr));
             match col_expr {
                 Expression::Identifier(id) => {
                     // A name no result column carries may be another alias of a shared slot
@@ -1902,23 +1909,6 @@ impl Executor {
         }
 
         Ok((final_columns, final_rows))
-    }
-
-    /// The name a grouped statement's SELECT item `expr` shows its column under
-    pub(crate) fn grouped_item_name(&self, expr: &Expression) -> String {
-        match expr {
-            Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-            Expression::FunctionCall(func)
-                if is_aggregate_function(&func.function)
-                    || func.function.eq_ignore_ascii_case("GROUPING") =>
-            {
-                self.get_aggregate_column_name(func)
-            }
-            Expression::FunctionCall(func) => format!("{}(...)", func.function),
-            Expression::Aliased(aliased) => aliased.alias.value.to_string(),
-            other => self.expression_to_string(other),
-        }
     }
 
     /// Get the column name for an aggregate function
@@ -4008,10 +3998,9 @@ impl Executor {
                 }
                 // Get column name from argument
                 let (col, result_name) = match &func.arguments[0] {
-                    Expression::Identifier(ident) => (
-                        ident.value.to_lowercase(),
-                        aggregate_call_name("COUNT", true, &ident.value, &[]),
-                    ),
+                    Expression::Identifier(ident) => {
+                        (ident.value.to_lowercase(), item_name(&stmt.columns[0]))
+                    }
                     _ => {
                         *compiled_guard =
                             CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -4307,15 +4296,15 @@ impl Executor {
                 match func.arguments.len() {
                     0 => {
                         // COUNT(*) without explicit star is rare but handle it
-                        "COUNT(*)".to_string()
+                        item_name(&stmt.columns[0])
                     }
                     1 => {
                         match &func.arguments[0] {
-                            Expression::Star(_) => "COUNT(*)".to_string(),
+                            Expression::Star(_) => item_name(&stmt.columns[0]),
                             Expression::IntegerLiteral(lit) => {
                                 // COUNT(1) is equivalent to COUNT(*)
                                 if lit.value == 1 {
-                                    "COUNT(1)".to_string()
+                                    item_name(&stmt.columns[0])
                                 } else {
                                     *compiled_guard = CompiledExecution::NotOptimizable(
                                         self.engine.schema_epoch(),

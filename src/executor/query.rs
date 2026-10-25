@@ -357,9 +357,9 @@ use super::utils::{
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, index_join_residual, infix_to_operator, order_by_names_an_alias,
-    star_takes_every_column, string_literal_value, strip_table_qualifier, substitute_filter_column,
-    visit_column_refs,
+    get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name,
+    order_by_names_an_alias, star_takes_every_column, string_literal_value, strip_table_qualifier,
+    substitute_filter_column, visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
@@ -1395,6 +1395,24 @@ impl Executor {
         {
             match self.try_process_select_subqueries(&stmt.columns, ctx)? {
                 Some(columns) => {
+                    // A folded item keeps the name it is written under
+                    let columns = columns
+                        .into_iter()
+                        .zip(&stmt.columns)
+                        .map(|(folded, written)| match written {
+                            Expression::Aliased(_) => folded,
+                            _ if folded == *written => folded,
+                            _ => {
+                                let name = item_name(written);
+                                let token = dummy_token(&name, TokenType::Identifier);
+                                Expression::Aliased(AliasedExpression {
+                                    token: token.clone(),
+                                    expression: Box::new(folded),
+                                    alias: Identifier::new(token, name),
+                                })
+                            }
+                        })
+                        .collect();
                     bound_stmt = SelectStatement {
                         columns,
                         ..stmt.clone()
@@ -2608,16 +2626,7 @@ impl Executor {
             if !passes {
                 // WHERE clause is false, return empty result
                 // Still need to determine column names for the schema
-                let mut columns: Vec<String> = Vec::new();
-                for (i, col_expr) in stmt.columns.iter().enumerate() {
-                    let col_name = if let Expression::Aliased(aliased) = col_expr {
-                        aliased.alias.value.to_string()
-                    } else {
-                        format!("column{}", i + 1)
-                    };
-                    columns.push(col_name);
-                }
-                let columns = CompactArc::new(columns);
+                let columns = CompactArc::new(stmt.columns.iter().map(item_name).collect());
                 let result =
                     ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
                 let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
@@ -2639,14 +2648,9 @@ impl Executor {
         let mut columns = Vec::new();
         let mut values = Vec::new();
 
-        for (i, col_expr) in columns_to_use.iter().enumerate() {
-            // Get column name
-            let col_name = if let Expression::Aliased(aliased) = col_expr {
-                aliased.alias.value.to_string()
-            } else {
-                format!("column{}", i + 1)
-            };
-            columns.push(col_name);
+        for (col_expr, written) in columns_to_use.iter().zip(&stmt.columns) {
+            // Named as written, not as its subqueries were read
+            columns.push(item_name(written));
 
             // Evaluate expression, with the parent row binding outer references
             let bound = ctx
@@ -2889,7 +2893,6 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         source_columns_lower: &[String],
-        source_columns: &[String],
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Option<(Vec<usize>, Vec<String>)> {
         // Must have ORDER BY + LIMIT
@@ -2933,43 +2936,14 @@ impl Executor {
         let mut output_names = Vec::with_capacity(stmt.columns.len());
 
         for expr in &stmt.columns {
-            match expr {
-                Expression::Identifier(id) => {
-                    let idx = source_columns_lower
-                        .iter()
-                        .position(|c| c == id.value_lower.as_str())?;
-                    indices.push(idx);
-                    output_names.push(source_columns[idx].clone());
-                }
-                Expression::QualifiedIdentifier(qid) => {
-                    let idx = source_columns_lower
-                        .iter()
-                        .position(|c| c == qid.name.value_lower.as_str())?;
-                    indices.push(idx);
-                    output_names.push(source_columns[idx].clone());
-                }
-                Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                    Expression::Identifier(id) => {
-                        let idx = source_columns_lower
-                            .iter()
-                            .position(|c| c == id.value_lower.as_str())?;
-                        indices.push(idx);
-                        output_names.push(aliased.alias.value.to_string());
-                    }
-                    Expression::QualifiedIdentifier(qid) => {
-                        let idx = source_columns_lower
-                            .iter()
-                            .position(|c| c == qid.name.value_lower.as_str())?;
-                        indices.push(idx);
-                        output_names.push(aliased.alias.value.to_string());
-                    }
-                    _ => return None, // Complex expression
-                },
-                Expression::Star(_) | Expression::QualifiedStar(_) => {
-                    return None; // SELECT * doesn't benefit
-                }
-                _ => return None, // Function call, arithmetic, etc.
-            }
+            // A star does not benefit; a computed item needs the evaluator
+            let column = match unaliased_item(expr) {
+                Expression::Identifier(id) => id.value_lower.as_str(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
+                _ => return None,
+            };
+            indices.push(source_columns_lower.iter().position(|c| c == column)?);
+            output_names.push(item_name(expr));
         }
 
         Some((indices, output_names))
@@ -5030,12 +5004,8 @@ impl Executor {
         // Project rows according to SELECT expressions
         // Check if deferred projection is applicable (ORDER BY + LIMIT with simple columns)
         // This reduces allocations from O(matched_rows) to O(limit)
-        let deferred_projection_info = self.get_deferred_projection_info(
-            stmt,
-            &all_columns_lower,
-            &all_columns,
-            classification,
-        );
+        let deferred_projection_info =
+            self.get_deferred_projection_info(stmt, &all_columns_lower, classification);
 
         let (projected_rows, output_columns, shape, applied) = match deferred_projection_info {
             Some((col_indices, output_names)) if !order_by_needs_extra_columns => {
@@ -7927,8 +7897,7 @@ impl Executor {
                     // Any other expression type requires evaluation
                     has_complex_expressions = true;
                     // We'll compute the output column name later
-                    let col_name = Self::get_expression_column_name(col);
-                    output_columns.push(col_name);
+                    output_columns.push(item_name(col));
                 }
             }
         }
@@ -7960,7 +7929,7 @@ impl Executor {
                         final_output_columns.push(aliased.alias.value.to_string());
                     }
                     _ => {
-                        final_output_columns.push(Self::get_expression_column_name(col));
+                        final_output_columns.push(item_name(col));
                     }
                 }
             }
@@ -8005,7 +7974,7 @@ impl Executor {
                         cols.push(aliased.alias.value.to_string());
                     }
                     _ => {
-                        cols.push(Self::get_expression_column_name(col));
+                        cols.push(item_name(col));
                     }
                 }
             }
@@ -8168,7 +8137,7 @@ impl Executor {
         let mut proj_row_id = 0i64;
 
         // Determine output columns
-        for (i, col_expr) in stmt.columns.iter().enumerate() {
+        for col_expr in &stmt.columns {
             match col_expr {
                 Expression::Star(_) => {
                     projected_columns.extend(column_names_arc.iter().cloned());
@@ -8183,18 +8152,7 @@ impl Executor {
                         },
                     );
                 }
-                Expression::Aliased(a) => {
-                    projected_columns.push(a.alias.value.to_string());
-                }
-                Expression::Identifier(id) => {
-                    projected_columns.push(id.value.to_string());
-                }
-                Expression::QualifiedIdentifier(qi) => {
-                    projected_columns.push(qi.name.value.to_string());
-                }
-                _ => {
-                    projected_columns.push(format!("expr{}", i + 1));
-                }
+                other => projected_columns.push(item_name(other)),
             }
         }
 
@@ -11847,29 +11805,7 @@ impl Executor {
                 source(i, input);
                 continue;
             }
-            let name = match expr {
-                Expression::Identifier(id) => id.value.to_string(),
-                Expression::QualifiedIdentifier(qid) => {
-                    // For qualified identifiers, just use the base column name
-                    // Ambiguity in output is only an issue if the same base name appears
-                    // multiple times in the SELECT clause itself (handled below)
-                    qid.name.value.to_string()
-                }
-                Expression::Aliased(aliased) => aliased.alias.value.to_string(),
-                Expression::FunctionCall(func) => {
-                    // Use function name as column name
-                    func.function.to_string()
-                }
-                Expression::Cast(cast) => {
-                    // Try to derive name from inner expression
-                    match &*cast.expr {
-                        Expression::Identifier(id) => id.value.to_string(),
-                        _ => format!("CAST(expr{})", i + 1),
-                    }
-                }
-                _ => format!("expr{}", i + 1),
-            };
-            names.push(name);
+            names.push(item_name(expr));
         }
 
         names
@@ -11895,47 +11831,13 @@ impl Executor {
         let mut names = Vec::with_capacity(select_exprs.len());
 
         for expr in select_exprs {
-            match expr {
-                Expression::Identifier(id) => {
-                    if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
-                        indices.push(idx);
-                        names.push(id.value.to_string());
-                    } else {
-                        return None;
-                    }
-                }
-                Expression::QualifiedIdentifier(qid) => {
-                    if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                        indices.push(idx);
-                        names.push(qid.name.value.to_string());
-                    } else {
-                        return None;
-                    }
-                }
-                Expression::Aliased(aliased) => {
-                    // Check if inner expression is simple
-                    match &*aliased.expression {
-                        Expression::Identifier(id) => {
-                            if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
-                                indices.push(idx);
-                                names.push(aliased.alias.value.to_string());
-                            } else {
-                                return None;
-                            }
-                        }
-                        Expression::QualifiedIdentifier(qid) => {
-                            if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                                indices.push(idx);
-                                names.push(aliased.alias.value.to_string());
-                            } else {
-                                return None;
-                            }
-                        }
-                        _ => return None, // Complex expression in alias
-                    }
-                }
+            let column = match unaliased_item(expr) {
+                Expression::Identifier(id) => id.value_lower.as_str(),
+                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
                 _ => return None, // Complex expression
-            }
+            };
+            indices.push(*col_index_map.get(column)?);
+            names.push(item_name(expr));
         }
 
         Some((indices, names))
@@ -12001,11 +11903,14 @@ impl Executor {
         }
 
         // An expression the projection put in a column of its own, named
-        // after it, or one the slots above hold
+        // after it, or one the slots above hold; a set operation's branches
+        // compute an item each, so its name binds no other expression
         let find_column_for = |expr: &Expression| -> Option<usize> {
             column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
                 let name = expr.to_string();
-                columns.iter().position(|c| *c == name)
+                (!set_operation)
+                    .then(|| columns.iter().position(|c| *c == name))
+                    .flatten()
             })
         };
 
@@ -13396,41 +13301,6 @@ impl Executor {
             }),
             // For other expression types, return as-is
             _ => expr.clone(),
-        }
-    }
-
-    /// Get a default column name for an expression
-    ///
-    /// Used when evaluating complex expressions that don't have an alias.
-    /// Returns a reasonable name based on the expression type.
-    fn get_expression_column_name(expr: &Expression) -> String {
-        match expr {
-            Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-            Expression::Aliased(aliased) => aliased.alias.value.to_string(),
-            Expression::FunctionCall(func) => {
-                // Use function name as column name
-                func.function.to_string()
-            }
-            Expression::Infix(infix) => {
-                // For arithmetic, use the operator as hint
-                format!("expr_{}", infix.operator)
-            }
-            Expression::Prefix(prefix) => {
-                format!("expr_{}", prefix.operator)
-            }
-            Expression::Case(_) => "case".to_string(),
-            Expression::Cast(cast) => {
-                format!("cast_{}", cast.type_name)
-            }
-            Expression::Star(_) => "*".to_string(),
-            Expression::QualifiedStar(qs) => format!("{}.*", qs.qualifier),
-            Expression::IntegerLiteral(lit) => format!("{}", lit.value),
-            Expression::FloatLiteral(lit) => format!("{}", lit.value),
-            Expression::StringLiteral(lit) => lit.value.to_string(),
-            Expression::BooleanLiteral(lit) => format!("{}", lit.value),
-            Expression::NullLiteral(_) => "NULL".to_string(),
-            _ => "expr".to_string(),
         }
     }
 
