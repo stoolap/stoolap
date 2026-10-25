@@ -1141,6 +1141,84 @@ impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> Ord for HeapRow<F> {
     }
 }
 
+/// Every path that chooses the rows an ORDER BY with a LIMIT or OFFSET
+/// keeps. Each notes, under test-failpoints, that it chose them, for the
+/// equivalence test against the whole sort
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrderLimitPath {
+    /// `TopNResult` over the statement's rows, keys read from columns
+    TopN,
+    /// The statement's sort over keys an evaluator computes per row
+    ComputedKeys,
+    /// `TopNResult` over source rows, projected after
+    DeferredProjection,
+    /// Rows read in the order of an index or the primary key
+    IndexOrdered,
+    /// The table's top-k scan over one column
+    TopKScan,
+    /// Nearest vectors by distance, through HNSW or by brute force
+    VectorSearch,
+    /// Primary-key rows past a bound, read in key order
+    KeysetPagination,
+    /// An index nested loop join sorting its joined rows itself
+    JoinIndexSort,
+    /// A CTE grouped for a join, cut to the rows the main ORDER BY keeps
+    CteOrderLimitPushdown,
+    /// A prepared statement's rows read in a column's order
+    PreparedOrderedRead,
+    /// A prepared statement's top-N over source rows, keys being columns
+    PreparedTopRows,
+    /// A prepared statement's top-N over computed keys, items computed after
+    PreparedProjectFirst,
+    /// A prepared subquery block keeping the rows its ORDER BY LIMIT keeps
+    PreparedBlockCut,
+}
+
+impl OrderLimitPath {
+    #[inline]
+    pub(crate) fn taken(self) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::order_limit_path_taken(self as usize);
+    }
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl OrderLimitPath {
+    pub(crate) const ALL: [OrderLimitPath; 13] = [
+        OrderLimitPath::TopN,
+        OrderLimitPath::ComputedKeys,
+        OrderLimitPath::DeferredProjection,
+        OrderLimitPath::IndexOrdered,
+        OrderLimitPath::TopKScan,
+        OrderLimitPath::VectorSearch,
+        OrderLimitPath::KeysetPagination,
+        OrderLimitPath::JoinIndexSort,
+        OrderLimitPath::CteOrderLimitPushdown,
+        OrderLimitPath::PreparedOrderedRead,
+        OrderLimitPath::PreparedTopRows,
+        OrderLimitPath::PreparedProjectFirst,
+        OrderLimitPath::PreparedBlockCut,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            OrderLimitPath::TopN => "top_n",
+            OrderLimitPath::ComputedKeys => "computed_keys",
+            OrderLimitPath::DeferredProjection => "deferred_projection",
+            OrderLimitPath::IndexOrdered => "index_ordered",
+            OrderLimitPath::TopKScan => "top_k_scan",
+            OrderLimitPath::VectorSearch => "vector_search",
+            OrderLimitPath::KeysetPagination => "keyset_pagination",
+            OrderLimitPath::JoinIndexSort => "join_index_sort",
+            OrderLimitPath::CteOrderLimitPushdown => "cte_order_limit_pushdown",
+            OrderLimitPath::PreparedOrderedRead => "prepared_ordered_read",
+            OrderLimitPath::PreparedTopRows => "prepared_top_rows",
+            OrderLimitPath::PreparedProjectFirst => "prepared_project_first",
+            OrderLimitPath::PreparedBlockCut => "prepared_block_cut",
+        }
+    }
+}
+
 /// The first `limit + offset` rows by `compare` of the rows pushed, in a
 /// bounded max-heap: a row only replaces a worse one, so of rows that
 /// compare equal the first pushed are kept

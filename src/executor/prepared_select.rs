@@ -6888,9 +6888,10 @@ impl Executor {
             _ => None,
         };
         let read_in_order = ordered.is_some();
-        #[cfg(feature = "test-failpoints")]
         if read_in_order {
+            #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_ordered_read();
+            super::result::OrderLimitPath::PreparedOrderedRead.taken();
         }
         // A DISTINCT whose output asks no block keeps the first row of each
         // value as the scan passes it; one that does is told its rows first.
@@ -7025,6 +7026,7 @@ impl Executor {
                     .collect::<Vec<_>>()
             });
         if let (Some(source_order), Some(limit)) = (source_order, limit) {
+            super::result::OrderLimitPath::PreparedTopRows.taken();
             rows = top_rows(rows, source_order, limit, offset);
             limit_applied = true;
         }
@@ -7034,6 +7036,7 @@ impl Executor {
         runner.ask_rows(Some(rows.len()));
         let rows = match order.filter(|_| !limit_applied) {
             Some(order) => {
+                super::result::OrderLimitPath::PreparedProjectFirst.taken();
                 limit_applied = true;
                 projection.project_first(rows, &runner, order, limit, offset)?
             }
@@ -8627,6 +8630,9 @@ impl PreparedRunner<'_> {
         };
         let limit = count(&order.limit, "LIMIT")?;
         let offset = count(&order.offset, "OFFSET")?.unwrap_or(0);
+        if !order.keys.is_empty() && (limit.is_some() || offset > 0) {
+            super::result::OrderLimitPath::PreparedBlockCut.taken();
+        }
         let mut keep = limit.map_or(usize::MAX, |limit| limit.saturating_add(offset));
         if keep == 0 {
             return Ok(Vec::new());

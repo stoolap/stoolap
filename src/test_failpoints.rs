@@ -865,6 +865,7 @@ thread_local! {
     static QUANTIFIED_MEMBER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AGGREGATE_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static JOIN_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static ORDER_LIMIT_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static BRIDGE_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -954,6 +955,32 @@ pub fn reset_join_paths() {
 
 pub(crate) fn join_path_taken(index: usize) {
     JOIN_PATHS_TAKEN.with(|taken| taken.set(taken.get() | 1 << index));
+}
+
+/// The name of every path that chooses the rows an ORDER BY LIMIT keeps
+pub fn order_limit_paths() -> Vec<&'static str> {
+    crate::executor::result::OrderLimitPath::ALL
+        .iter()
+        .map(|path| path.name())
+        .collect()
+}
+
+/// The ORDER BY LIMIT paths that chose rows on this thread since the last reset
+pub fn order_limit_paths_taken() -> Vec<&'static str> {
+    let taken = ORDER_LIMIT_PATHS_TAKEN.with(std::cell::Cell::get);
+    crate::executor::result::OrderLimitPath::ALL
+        .iter()
+        .filter(|path| taken & (1 << **path as u32) != 0)
+        .map(|path| path.name())
+        .collect()
+}
+
+pub fn reset_order_limit_paths() {
+    ORDER_LIMIT_PATHS_TAKEN.with(|taken| taken.set(0));
+}
+
+pub(crate) fn order_limit_path_taken(index: usize) {
+    ORDER_LIMIT_PATHS_TAKEN.with(|taken| taken.set(taken.get() | 1 << index));
 }
 
 pub(crate) fn aggregate_path_taken(index: usize) {

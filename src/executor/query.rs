@@ -346,7 +346,7 @@ use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult,
-    LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
+    LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
     StreamingProjectionResult, TopNResult,
 };
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
@@ -1730,6 +1730,7 @@ impl Executor {
                 // When DISTINCT ON is active, skip early LIMIT (applied after dedup)
                 let has_distinct_on = !stmt.distinct_on.is_empty();
                 let final_rows: RowVec = if (limit.is_some() || offset > 0) && !has_distinct_on {
+                    OrderLimitPath::ComputedKeys.taken();
                     // With LIMIT/OFFSET: Only collect the rows we actually need
                     let take_count = limit.unwrap_or(usize::MAX);
                     indices
@@ -1830,6 +1831,10 @@ impl Executor {
 
                     // Apply deferred projection if applicable
                     // This reduces allocations from O(matched_rows) to O(limit)
+                    match deferred_projection {
+                        Some(_) => OrderLimitPath::DeferredProjection.taken(),
+                        None => OrderLimitPath::TopN.taken(),
+                    }
                     if let Some((col_indices, output_names)) = deferred_projection {
                         result = Box::new(StreamingProjectionResult::new(
                             result,
@@ -3651,6 +3656,7 @@ impl Executor {
                 ctx,
             )? {
                 // Note: ORDER BY + LIMIT already handles LIMIT at storage level
+                OrderLimitPath::IndexOrdered.taken();
                 return Ok((result, columns, true, None));
             }
         }
@@ -3674,6 +3680,7 @@ impl Executor {
                 table_alias.as_deref(),
                 ctx,
             )? {
+                OrderLimitPath::TopKScan.taken();
                 return Ok((result, columns, true, None));
             }
         }
@@ -3695,6 +3702,7 @@ impl Executor {
             if let Some((result, columns)) =
                 self.try_vector_search_optimization(stmt, &*table, &all_columns, ctx)?
             {
+                OrderLimitPath::VectorSearch.taken();
                 return Ok((result, columns, true, None));
             }
         }
@@ -3721,6 +3729,7 @@ impl Executor {
                 table_alias.as_deref(),
                 ctx,
             )? {
+                OrderLimitPath::KeysetPagination.taken();
                 return Ok((result, columns, true, None));
             }
         }
@@ -6416,6 +6425,7 @@ impl Executor {
                             order_limit_applied = true;
 
                             if offset > 0 || limit != usize::MAX {
+                                OrderLimitPath::JoinIndexSort.taken();
                                 final_rows = indices
                                     .into_iter()
                                     .skip(offset)
