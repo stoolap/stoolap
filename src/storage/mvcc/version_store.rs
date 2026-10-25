@@ -1836,44 +1836,52 @@ impl VersionStore {
     ) -> Result<HotCast, Error> {
         debug_assert!(is_closed(self.layout()), "cast prepared on an open table");
         let target = schema.columns[column].data_type;
-        let cast = |values: &[Value]| -> Option<CompactArc<[Value]>> {
+        let cast_as = |values: &[Value], hidden: bool| -> Option<CompactArc<[Value]>> {
             let value = values.get(column)?;
             if value.data_type() == target {
                 return None;
             }
             let mut moved = values.to_vec();
-            moved[column] = value.coerce_to_type(target);
+            moved[column] = match value.coerce_to_type(target) {
+                // A version no current row reads takes NULL, as its sealed copy does
+                Value::Timestamp(t) if hidden && !crate::core::value::timestamp_fits(&t) => {
+                    Value::Null(target)
+                }
+                cast => cast,
+            };
             Some(CompactArc::from(moved))
         };
+        let hide = |values: &[Value]| cast_as(values, true);
         let versions = self.versions.read().clone();
         let mut heads = Vec::with_capacity(versions.len());
         let mut slots = Vec::new();
         {
             let arena = self.arena.read_guard();
             for (&row_id, entry) in versions.iter() {
+                let deleted = entry.version.is_deleted();
                 let in_arena = unpack_arena_idx(entry.arena_idx)
                     .filter(|&idx| arena.meta().get(idx).is_some_and(|meta| meta.txn_id != 0));
                 let moved = match in_arena {
                     Some(idx) => {
-                        let moved = cast(&arena.data()[idx]);
+                        let moved = cast_as(&arena.data()[idx], deleted);
                         if let Some(moved) = &moved {
                             slots.push((idx, CompactArc::clone(moved)));
                         }
                         moved
                     }
-                    None => cast(entry.version.data.as_slice()),
+                    None => cast_as(entry.version.data.as_slice(), deleted),
                 };
                 let history = entry
                     .prev
                     .as_ref()
-                    .and_then(|prev| relayout_history(prev, &cast));
+                    .and_then(|prev| relayout_history(prev, &hide));
                 heads.push(CastHead {
                     row_id,
                     changed: moved.is_some() || history.is_some(),
                     data: moved
                         .map(Row::from_arc)
                         .unwrap_or_else(|| entry.version.data.clone()),
-                    deleted: entry.version.is_deleted(),
+                    deleted,
                     history,
                 });
             }

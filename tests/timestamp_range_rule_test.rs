@@ -285,16 +285,24 @@ fn the_engine_refuses_an_added_column_whose_default_is_past_the_range() {
 }
 
 #[test]
-fn a_sealed_copy_no_current_row_reads_takes_null_when_its_column_becomes_a_timestamp() {
+fn a_copy_no_current_row_reads_takes_null_when_its_column_becomes_a_timestamp() {
+    for sealed in [false, true] {
+        hidden_copies_take_null(sealed);
+    }
+}
+
+fn hidden_copies_take_null(sealed: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let dsn = format!("file://{}/hidden_copies", dir.path().display());
+    let dsn = format!("file://{}/hidden_copies_{sealed}", dir.path().display());
     let db = Database::open(&dsn).unwrap();
     for sql in [
         "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT)",
         "INSERT INTO u VALUES (1, '9999-12-31'), (2, '9999-12-31'), (3, '2024-01-01')",
-        "PRAGMA CHECKPOINT",
     ] {
         db.execute(sql, ()).unwrap();
+    }
+    if sealed {
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }
     let other = db.clone();
     let mut old = other
@@ -324,7 +332,7 @@ fn a_sealed_copy_no_current_row_reads_takes_null_when_its_column_becomes_a_times
         db.execute(sql, ()).unwrap();
     }
     db.execute("ALTER TABLE u MODIFY COLUMN s TIMESTAMP", ())
-        .expect("no current row holds a time past the range");
+        .unwrap_or_else(|e| panic!("sealed {sealed}: no current row holds a far time: {e}"));
     let current = vec![
         "Integer(1) 2024-01-02T00:00:00+00:00".to_string(),
         "Integer(3) 2024-01-01T00:00:00+00:00".to_string(),
@@ -340,7 +348,7 @@ fn a_sealed_copy_no_current_row_reads_takes_null_when_its_column_becomes_a_times
             "Integer(2) Null(Timestamp)",
             "Integer(3) 2024-01-01T00:00:00+00:00",
         ],
-        "a snapshot from before the change reads the hidden copies as NULL"
+        "sealed {sealed}: a snapshot from before the change reads the hidden copies as NULL"
     );
     old.rollback().unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
