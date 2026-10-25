@@ -256,36 +256,67 @@ fn the_refusal_names_the_key_and_the_ways_to_write_it() {
 fn every_group_selected_is_one_distinct_row() {
     let db = Database::open("memory://distinct_order_key_groups").unwrap();
     setup(&db);
-    for (sql, want) in [
-        (
-            "SELECT DISTINCT a FROM t GROUP BY a ORDER BY MAX(id)",
-            ["1", "2", "3"],
-        ),
-        (
-            "SELECT DISTINCT a FROM t GROUP BY a ORDER BY MAX(id) DESC",
-            ["3", "2", "1"],
-        ),
-        (
-            "SELECT DISTINCT t.a AS k FROM t GROUP BY 1 ORDER BY COUNT(*), k DESC",
-            ["3", "2", "1"],
-        ),
-    ] {
-        let got = rows(&db, sql);
-        let want: Vec<String> = want
-            .iter()
-            .map(|a| format!("[Some(Integer({a}))]"))
-            .collect();
-        assert_eq!(got, Ok(want), "{sql}");
+    // One INTEGER 1 and one FLOAT 1.0: two TYPEOF groups, one distinct value
+    let values = "(VALUES (1, 1, 'x'), (3, 1.0, 'y'), (2, 2, 'x')) AS t(id, a, b)";
+    let mut wrong = Vec::new();
+    for from in ["t", values] {
+        for (items, group_by) in [
+            ("a", "a"),
+            ("t.a", "a"),
+            ("a", "t.a"),
+            ("a AS k", "a"),
+            ("a AS k", "1"),
+            ("a + 1", "a + 1"),
+            ("a + 1 AS k", "1"),
+            ("a, b", "a, b"),
+            ("a, b", "2, 1"),
+            ("b, COUNT(*) AS n", "b"),
+            ("UPPER(b)", "UPPER(b)"),
+        ] {
+            for order_by in ["MAX(id)", "MAX(id) DESC", "COUNT(*), 1", "MIN(id) DESC, 1"] {
+                // Merging no rows, DISTINCT answers as the query without it
+                let sql = format!(
+                    "SELECT DISTINCT {items} FROM {from} GROUP BY {group_by} ORDER BY {order_by}"
+                );
+                let plain = sql.replacen("DISTINCT ", "", 1);
+                let (got, want) = (rows(&db, &sql), rows(&db, &plain));
+                if got.is_err() || got != want {
+                    wrong.push(format!("{sql}\n  got {got:?}, want {want:?}"));
+                }
+            }
+        }
+        for (items, group_by) in [
+            // A name grouping binds to the column, not the aggregate's alias
+            ("COUNT(*) AS a", "a"),
+            ("a AS k", "k"),
+            // A key DISTINCT does not see, or one finer than an item
+            ("a", "a, b"),
+            ("a + 1", "a"),
+            ("a", "a, TYPEOF(a)"),
+            ("a", "2"),
+            ("*", "id, a, b"),
+            // Grouping sets put one value in rows of more than one group
+            ("a", "ROLLUP(a)"),
+            ("a", "CUBE(a)"),
+            ("a", "GROUPING SETS ((a), ())"),
+        ] {
+            let sql =
+                format!("SELECT DISTINCT {items} FROM {from} GROUP BY {group_by} ORDER BY MAX(id)");
+            let got = rows(&db, &sql);
+            if !got
+                .as_ref()
+                .is_err_and(|e| e.contains("is not in the SELECT DISTINCT list"))
+            {
+                wrong.push(format!("{sql}\n  got {got:?}, want the refusal"));
+            }
+        }
     }
-    // Grouping sets put one value in rows of more than one group
-    for sql in [
-        "SELECT DISTINCT a FROM t GROUP BY a, b ORDER BY MAX(id)",
-        "SELECT DISTINCT a FROM t GROUP BY ROLLUP(a) ORDER BY MAX(id)",
-    ] {
-        let refused =
-            rows(&db, sql).is_err_and(|e| e.contains("is not in the SELECT DISTINCT list"));
-        assert!(refused, "{sql}");
-    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 #[test]

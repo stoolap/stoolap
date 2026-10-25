@@ -162,14 +162,15 @@ fn distinct_key_outside<'s>(select: &'s SelectStatement, level: &[&str]) -> Opti
     if !select.distinct || !select.distinct_on.is_empty() || !select.set_operations.is_empty() {
         return None;
     }
-    // Each group is then one distinct row, so DISTINCT merges none
+    // Grouping and DISTINCT compare values alike, so each group is then one
+    // distinct row and DISTINCT merges none
     let grouping = &select.group_by;
     if matches!(grouping.modifier, GroupByModifier::None)
         && !grouping.columns.is_empty()
         && grouping
             .columns
             .iter()
-            .all(|key| determined(key, &select.columns, level))
+            .all(|key| groups_by_an_item(key, &select.columns, level))
     {
         return None;
     }
@@ -178,6 +179,23 @@ fn distinct_key_outside<'s>(select: &'s SelectStatement, level: &[&str]) -> Opti
         .iter()
         .map(|order| &order.expression)
         .find(|key| !determined(key, &select.columns, level))
+}
+
+/// Whether GROUP BY `key` is a SELECT item itself: its position, or its
+/// expression without the alias. A name is not matched to an alias, which
+/// grouping may bind to a column, nor is a value computed from an item
+fn groups_by_an_item(key: &Expression, items: &[Expression], level: &[&str]) -> bool {
+    let star = items
+        .iter()
+        .any(|item| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_)));
+    match key {
+        Expression::IntegerLiteral(position) => {
+            !star && position.value >= 1 && position.value as usize <= items.len()
+        }
+        key => items
+            .iter()
+            .any(|item| same_value(key, unaliased(item), level)),
+    }
 }
 
 /// Whether ORDER BY `key` has one value across the rows a distinct row of
