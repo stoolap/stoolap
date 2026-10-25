@@ -2019,6 +2019,24 @@ pub fn item_name(expr: &Expression) -> String {
     }
 }
 
+/// `item`, standing for the SELECT item `written`, under the name `written`
+/// gives when `item`'s own would differ
+pub fn named_as_written(item: Expression, written: &Expression) -> Expression {
+    match written {
+        Expression::Aliased(_) => item,
+        _ if item == *written => item,
+        _ => {
+            let name = item_name(written);
+            let token = dummy_token(&name, TokenType::Identifier);
+            Expression::Aliased(AliasedExpression {
+                token: token.clone(),
+                expression: Box::new(item),
+                alias: Identifier::new(token, name),
+            })
+        }
+    }
+}
+
 /// The name `item_name` gives an alias or a column, as the item spells it;
 /// None for an item named as written
 pub fn item_spelled_name(expr: &Expression) -> Option<&str> {

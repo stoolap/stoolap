@@ -2542,13 +2542,10 @@ fn test_a_block_source_is_read_when_a_call_first_needs_it() {
             }
         }
     }
-    // A view whose column only running it names is read as the statement prepares
+    // A view's columns are recorded when it is created, so one named as written is read lazily too
     let sql =
         "SELECT id FROM t WHERE id > 100 AND a > (SELECT id FROM unnamed WHERE unnamed.id = t.id)";
-    assert!(
-        error(&db, sql, ()).0.contains("overflow"),
-        "{sql}: read to name its columns"
-    );
+    assert_eq!(ids(&db, sql, ()).0, Vec::<i64>::new(), "{sql}");
 }
 
 #[test]

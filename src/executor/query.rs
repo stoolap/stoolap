@@ -45,17 +45,6 @@ use crate::storage::traits::{Engine, QueryResult};
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
 
-/// The error a view raises when `depth` views around it are already open
-pub(super) fn check_view_depth(depth: usize) -> Result<()> {
-    if depth >= MAX_VIEW_DEPTH {
-        return Err(Error::InvalidArgument(format!(
-            "Maximum view nesting depth ({}) exceeded",
-            MAX_VIEW_DEPTH
-        )));
-    }
-    Ok(())
-}
-
 /// Threshold below which streaming NOT EXISTS with early termination outperforms
 /// bulk anti-join materialization. Queries with LIMIT below this value use the
 /// streaming InHashSet path which can terminate early, while queries without LIMIT
@@ -378,7 +367,7 @@ use super::utils::{
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name,
+    get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name, named_as_written,
     order_by_names_an_alias, star_takes_every_column, string_literal_value, strip_table_qualifier,
     substitute_filter_column, visit_column_refs,
 };
@@ -1420,19 +1409,7 @@ impl Executor {
                     let columns = columns
                         .into_iter()
                         .zip(&stmt.columns)
-                        .map(|(folded, written)| match written {
-                            Expression::Aliased(_) => folded,
-                            _ if folded == *written => folded,
-                            _ => {
-                                let name = item_name(written);
-                                let token = dummy_token(&name, TokenType::Identifier);
-                                Expression::Aliased(AliasedExpression {
-                                    token: token.clone(),
-                                    expression: Box::new(folded),
-                                    alias: Identifier::new(token, name),
-                                })
-                            }
-                        })
+                        .map(|(folded, written)| named_as_written(folded, written))
                         .collect();
                     bound_stmt = SelectStatement {
                         columns,
@@ -7660,7 +7637,13 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Check view depth to prevent stack overflow from deeply nested views
-        check_view_depth(ctx.view_depth())?;
+        let depth = ctx.view_depth();
+        if depth >= MAX_VIEW_DEPTH {
+            return Err(Error::InvalidArgument(format!(
+                "Maximum view nesting depth ({}) exceeded",
+                MAX_VIEW_DEPTH
+            )));
+        }
 
         // Parse the view's query using cache (returns Arc<Statement>, no clone)
         let view_stmt = self.parse_view_statement(&view_def.query)?;

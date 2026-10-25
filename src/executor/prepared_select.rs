@@ -35,6 +35,7 @@ use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr,
 };
+use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Scanner, Table, Transaction};
@@ -61,7 +62,7 @@ use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult}
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function, item_name,
-    order_by_names_an_alias, strip_table_qualifier,
+    named_as_written, order_by_names_an_alias, strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -1183,8 +1184,6 @@ struct StatementWalk<'w> {
     executor: &'w Executor,
     ctx: &'w ExecutionContext,
     on: &'w mut dyn FnMut(Reach<'_>) -> Result<Option<Expression>>,
-    /// The views open around the one the walk reads, beyond the context's
-    views: usize,
 }
 
 impl StatementWalk<'_> {
@@ -1228,7 +1227,7 @@ impl StatementWalk<'_> {
             check: check != Check::Off,
             ..level.clone()
         };
-        let names = output_names(stmt, &own);
+        let names = output_names(stmt, &own)?;
         let all = |walk: &mut Self, exprs: &[Expression]| {
             exprs
                 .iter()
@@ -1264,7 +1263,7 @@ impl StatementWalk<'_> {
             columns: stmt
                 .columns
                 .iter()
-                .map(|e| self.expr(e, &items))
+                .map(|e| Ok(named_as_written(self.expr(e, &items)?, e)))
                 .collect::<Result<_>>()?,
             table_expr: table_expr.map(Box::new),
             where_clause: one(self, &stmt.where_clause)?,
@@ -1336,7 +1335,7 @@ impl StatementWalk<'_> {
                 if let Some((columns, _)) = self.ctx.get_cte_by_lower(lower) {
                     untyped(&name, columns)
                 } else if let Some(view) = self.executor.engine.get_view_lowercase(lower)? {
-                    untyped(&name, &self.view_names(&view.query)?)
+                    untyped(&name, &view_names(self.executor, &view, self.ctx)?)
                 } else {
                     let schema =
                         self.executor
@@ -1412,13 +1411,6 @@ impl StatementWalk<'_> {
             scopes: &level.scopes,
         };
         let beyond = |depth: usize| depth.checked_sub(level.inside).map(|d| d + 1);
-        // A source inside whose computed column has no known name may hold
-        // a name: it stays there, never read beyond by mistake
-        let unknown = || {
-            level.scopes[..level.inside]
-                .iter()
-                .any(|scope| scope.lower.iter().any(String::is_empty))
-        };
         let nested = |exists: bool| match (level.check, exists) {
             (false, _) => Check::Off,
             (true, true) => Check::Order,
@@ -1429,13 +1421,12 @@ impl StatementWalk<'_> {
                 if level.aliases.contains(&id.value_lower) {
                     return Ok(expr.clone());
                 }
-                let unknown = unknown();
                 match chain.bare(id) {
-                    Ok(Some((depth, index))) if !unknown => match beyond(depth) {
+                    Ok(Some((depth, index))) => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
                         None => Ok(expr.clone()),
                     },
-                    Err(e) if level.check && !unknown => Err(e),
+                    Err(e) if level.check => Err(e),
                     _ => Ok(expr.clone()),
                 }
             }
@@ -1455,7 +1446,7 @@ impl StatementWalk<'_> {
                         }
                     }
                     None => {
-                        if level.check && !unknown() {
+                        if level.check {
                             chain.qualified(qualifier, &q.name.value_lower, &q.to_string())?;
                         }
                         Ok(expr.clone())
@@ -1505,57 +1496,49 @@ impl StatementWalk<'_> {
         }
     }
 
-    /// The names a view's rows have, read from its query without running it;
-    /// one name nothing spells when its source is none the walk reads
-    fn view_names(&mut self, query: &str) -> Result<Vec<String>> {
-        super::query::check_view_depth(self.ctx.view_depth() + self.views)?;
-        let parsed = self.executor.parse_view_statement(query)?;
-        let Statement::Select(select) = parsed.as_ref() else {
-            return Ok(vec![String::new()]);
-        };
-        if select.with.is_some() {
-            return Ok(vec![String::new()]);
-        }
-        self.views += 1;
-        let from = self.from(select.table_expr.as_deref(), &[], 0, Check::Off);
-        self.views -= 1;
-        Ok(match from {
-            Ok((_, own)) => output_names(select, &own),
-            Err(_) => vec![String::new()],
-        })
-    }
-
     fn outer(&mut self, expr: &Expression, depth: usize, index: usize) -> Result<Expression> {
         (self.on)(Reach::Outer(expr, depth, index))?
             .ok_or_else(|| Error::internal("an enclosing name without its slot"))
     }
 }
 
-/// The names `stmt`'s rows have over its FROM's scope `own`, as the
-/// projection spells them: an alias, a column's own name, a star's columns.
-/// A computed item without an alias has no known name: an empty one
-fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Vec<String> {
+/// The names `stmt`'s rows have over its FROM's scope `own`: a star's
+/// columns, every other item by `item_name`
+fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Vec<String>> {
     let mut names = Vec::with_capacity(stmt.columns.len());
     for item in &stmt.columns {
         match item {
-            Expression::Aliased(aliased) => names.push(aliased.alias.value.to_string()),
-            Expression::Identifier(id) => names.push(id.value.to_string()),
-            Expression::QualifiedIdentifier(q) => names.push(q.name.value.to_string()),
             Expression::Star(_) => names.extend(own.columns.iter().cloned()),
             Expression::QualifiedStar(star) => {
                 let qualifier = star.qualifier.to_lowercase();
-                match own.tables.iter().find(|(name, _)| **name == *qualifier) {
-                    Some((_, start)) => {
-                        let (_, range) = own.table(*start);
-                        names.extend(own.columns[range].iter().cloned());
-                    }
-                    None => names.push(String::new()),
-                }
+                let (_, start) = own
+                    .tables
+                    .iter()
+                    .find(|(name, _)| **name == *qualifier)
+                    .ok_or_else(|| Error::invalid_argument(unknown_qualifier(&star.qualifier)))?;
+                let (_, range) = own.table(*start);
+                names.extend(own.columns[range].iter().cloned());
             }
-            _ => names.push(String::new()),
+            _ => names.push(item_name(item)),
         }
     }
-    names
+    Ok(names)
+}
+
+/// The names of `view`'s columns, recorded when it was created; a view
+/// recorded without them runs once here, which records them
+fn view_names(
+    executor: &Executor,
+    view: &ViewDefinition,
+    ctx: &ExecutionContext,
+) -> Result<Vec<String>> {
+    if let Some(columns) = view.columns() {
+        return Ok(columns.to_vec());
+    }
+    let mut result = executor.execute_view_body(view, ctx)?;
+    let columns = result.columns().to_vec();
+    result.close()?;
+    Ok(columns)
 }
 
 /// A reference resolved to a scope of the chain and a column of its table
@@ -2204,26 +2187,12 @@ fn slot_parameter(slot: usize) -> Expression {
 /// The EXISTS block `stmt`, run as a statement, asked only whether it has
 /// a row: one value per row it returns in place of its SELECT items, each
 /// alias or position that read an item reading its expression, no ORDER
-/// BY. A WHERE alias a FROM column of no known name may hold keeps it whole
+/// BY
 fn existence(
     executor: &Executor,
     stmt: SelectStatement,
     from_names: &[String],
 ) -> Result<SelectStatement> {
-    let alias = |name: &str| {
-        stmt.columns
-            .iter()
-            .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == name))
-    };
-    let unknown = from_names.iter().any(String::is_empty);
-    if unknown
-        && stmt
-            .where_clause
-            .as_deref()
-            .is_some_and(|w| names_any(w, &alias))
-    {
-        return Ok(stmt);
-    }
     let grouped = !stmt.group_by.columns.is_empty()
         || stmt.having.is_some()
         || stmt.columns.iter().any(expression_contains_aggregate);
@@ -2760,7 +2729,7 @@ impl PreparedSubquery {
         }
         match &self.source {
             None => self.table.as_deref() == Some(table),
-            Some(BlockSource::View(_, tables, _) | BlockSource::Derived(_, tables, _)) => tables
+            Some(BlockSource::View(_, tables, _) | BlockSource::Derived(_, tables)) => tables
                 .as_ref()
                 .is_none_or(|tables| tables.iter().any(|read| read == table)),
             Some(_) => false,
@@ -2773,11 +2742,11 @@ impl PreparedSubquery {
 #[derive(Debug)]
 enum BlockSource {
     /// A view, with the tables its query reads, None when they are not
-    /// known, and its query when its columns are named without running it
-    View(SmartString, Option<Vec<SmartString>>, Option<String>),
+    /// known, and the query its columns were named for
+    View(SmartString, Option<Vec<SmartString>>, String),
     /// A derived table that reads no enclosing scope, with the tables its
-    /// statement reads, and whether its columns are named without running it
-    Derived(Box<StatementRun>, Option<Vec<SmartString>>, bool),
+    /// statement reads
+    Derived(Box<StatementRun>, Option<Vec<SmartString>>),
     Cte(SmartString),
     Values(Box<ValuesTableSource>),
     /// A table function, with the WHERE's conjuncts that narrow its range,
@@ -2791,15 +2760,9 @@ enum BlockSource {
 
 impl BlockSource {
     /// Whether its rows are read when a call first needs them, not when the
-    /// run opens: a CTE's are there already, and a source whose columns only
-    /// running it names was read when the statement prepared
+    /// run opens: a CTE's are there already
     fn lazy(&self) -> bool {
-        match self {
-            Self::View(_, _, query) => query.is_some(),
-            Self::Derived(_, _, named) => *named,
-            Self::Values(_) | Self::Function(..) => true,
-            Self::Cte(_) => false,
-        }
+        !matches!(self, Self::Cte(_))
     }
 }
 
@@ -2810,8 +2773,8 @@ type BlockCounts = (Box<Expression>, Option<Box<Expression>>);
 /// id, which the run that prepared it opens in place of reading them again
 pub(crate) type FirstReads = SmallVec<[(u16, SourceRows); 1]>;
 
-/// A source a block's FROM names, its columns, and the rows read for them
-type NamedSource = (BlockSource, Vec<String>, Option<SourceRows>);
+/// A source a block's FROM names and its columns
+type NamedSource = (BlockSource, Vec<String>);
 
 #[derive(Debug, Clone, Copy)]
 struct Narrowing {
@@ -3522,7 +3485,6 @@ impl Builder<'_> {
                 }
                 Reach::Param(_) => Ok(None),
             },
-            views: 0,
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
@@ -3568,7 +3530,6 @@ impl Builder<'_> {
                 }
                 Reach::Param(_) => Ok(None),
             },
-            views: 0,
         }
         .statement(sq, outer, 0, check)?;
         self.max_param = self.max_param.max(max_param);
@@ -3933,15 +3894,10 @@ impl Builder<'_> {
 
     /// The CTE or view a block's FROM names, a CTE before a view as the
     /// general path reads them, with its columns; None for a table. A view
-    /// whose query names every column is read when a call first needs it;
-    /// any other runs here, and its rows are the ones this run opens
+    /// is read when a call first needs it
     fn named_source(&self, name: &str) -> Result<Option<NamedSource>> {
         if let Some((columns, _)) = self.ctx.get_cte_by_lower(name) {
-            return Ok(Some((
-                BlockSource::Cte(name.into()),
-                columns.to_vec(),
-                None,
-            )));
+            return Ok(Some((BlockSource::Cte(name.into()), columns.to_vec())));
         }
         let Some(view) = self.executor.engine.get_view_lowercase(name)? else {
             return Ok(None);
@@ -3951,25 +3907,9 @@ impl Builder<'_> {
             Statement::Select(select) => self.executor.read_tables(select),
             _ => None,
         };
-        let named = StatementWalk {
-            executor: self.executor,
-            ctx: self.ctx,
-            on: &mut |_| Ok(None),
-            views: 0,
-        }
-        .view_names(&view.query)?;
-        if !named.iter().any(String::is_empty) {
-            let source = BlockSource::View(name.into(), tables, Some(view.query.clone()));
-            return Ok(Some((source, named, None)));
-        }
-        let result = self.executor.execute_view_body(&view, self.ctx)?;
-        let columns = result.columns().to_vec();
-        let rows = CompactArc::new(Executor::materialize_result(result)?.into_vec());
-        Ok(Some((
-            BlockSource::View(name.into(), tables, None),
-            columns,
-            Some(rows),
-        )))
+        let named = view_names(self.executor, &view, self.ctx)?;
+        let source = BlockSource::View(name.into(), tables, view.query.clone());
+        Ok(Some((source, named)))
     }
 
     /// Prepare `sq`, run once per row of the scope `outer[0]`, as `form`
@@ -3992,15 +3932,11 @@ impl Builder<'_> {
             let scope = ScopeTable::of(name, &schema);
             (None, Some(source), schema, scope)
         };
-        let mut first_read = None;
         let (table, source, schema, scope) = match sq.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
                 match self.named_source(&ts.name.value_lower)? {
-                    Some((source, columns, rows)) => {
-                        first_read = rows;
-                        over_source(name, source, columns)
-                    }
+                    Some((source, columns)) => over_source(name, source, columns),
                     None => {
                         let schema = executor
                             .engine
@@ -4046,9 +3982,9 @@ impl Builder<'_> {
             }
             // A derived table that reads an enclosing scope runs with the block
             // as one statement for each call; one that reads none, once per
-            // run, when a call first needs it if its columns are all named
+            // run, when a call first needs it
             Some(Expression::SubquerySource(derived)) => {
-                let (reads, named) = self.reads_enclosing(&derived.subquery, outer)?;
+                let (reads, columns) = self.reads_enclosing(&derived.subquery, outer)?;
                 if reads {
                     return self.statement_block(sq, outer, parent, form);
                 }
@@ -4057,20 +3993,11 @@ impl Builder<'_> {
                     classification: std::sync::OnceLock::new(),
                     compiled: RwLock::new(CompiledExecution::Unknown),
                 };
-                let lazy = !named.iter().any(String::is_empty);
-                let columns = match lazy {
-                    true => named,
-                    false => {
-                        let (columns, rows) = executor.statement_rows(&run, self.ctx)?;
-                        first_read = Some(CompactArc::new(rows.into_vec()));
-                        columns
-                    }
-                };
                 let tables = executor.read_tables(&derived.subquery);
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
                 over_source(
                     name.unwrap_or_default(),
-                    BlockSource::Derived(Box::new(run), tables, lazy),
+                    BlockSource::Derived(Box::new(run), tables),
                     columns,
                 )
             }
@@ -4086,9 +4013,6 @@ impl Builder<'_> {
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
         self.subqueries.push(None);
-        if let Some(rows) = first_read {
-            self.first_reads.push((id, rows));
-        }
 
         let mut scopes: Vec<&ScopeTable> = Vec::with_capacity(outer.len() + 1);
         scopes.push(&scope);
@@ -7164,7 +7088,7 @@ impl Executor {
     /// named its columns for; a view's query may have changed since
     fn source_holds(&self, source: &BlockSource) -> Result<bool> {
         Ok(match source {
-            BlockSource::View(name, _, Some(query)) => self
+            BlockSource::View(name, _, query) => self
                 .engine
                 .get_view_lowercase(name)?
                 .is_some_and(|view| view.query == *query),

@@ -300,9 +300,13 @@ fn a_derived_table_s_names_bind_as_its_rows_and_select_list_name_them() {
         db.execute(sql, ()).unwrap();
     }
     for (sql, expected) in [
-        // The middle `x` is the column CAST(x AS INTEGER) gives c, not t's
+        // c's column is named `CAST(x AS INTEGER)`, so the middle `x` is t's
         (
             "SELECT (SELECT x FROM (SELECT x FROM (SELECT CAST(x AS INTEGER) FROM u) AS c) AS d) FROM t",
+            "999",
+        ),
+        (
+            "SELECT (SELECT x FROM (SELECT \"CAST(x AS INTEGER)\" AS x FROM (SELECT CAST(x AS INTEGER) FROM u) AS c) AS d) FROM t",
             "2",
         ),
         // A SELECT item reads no alias of its own list: its `a` is t's
@@ -313,6 +317,62 @@ fn a_derived_table_s_names_bind_as_its_rows_and_select_list_name_them() {
     ] {
         assert_eq!(answer(&db, sql), Ok(vec![vec![expected.to_string()]]), "{sql}");
     }
+}
+
+#[test]
+fn a_derived_table_knows_every_source_s_names_without_running_it() {
+    let _turn = turn();
+    let db = hot("source_names");
+    for sql in [
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO m VALUES (1, -9223372036854775808)",
+        "CREATE VIEW wv AS WITH c AS (SELECT id, x FROM u) SELECT id, x FROM c",
+        "CREATE VIEW jv AS SELECT t.id AS tid, u.x FROM t JOIN u ON u.id = t.id",
+        "CREATE VIEW mw AS WITH c AS (SELECT id, x FROM m) SELECT id, x FROM c",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.engine()
+        .create_view("old", "SELECT id, x + 0 FROM u".to_string(), None, false)
+        .unwrap();
+    let over = |source: &str| {
+        format!(
+            "SELECT id, (SELECT MAX(d.y) FROM (SELECT a + 0 AS y FROM {source} AS c WHERE t.id = 1) AS d) \
+             FROM t WHERE id = 1"
+        )
+    };
+    let mut wrong = Vec::new();
+    for (sql, expected) in [
+        (
+            "SELECT id, (SELECT COUNT(*) FROM (SELECT \"hello\") AS q) FROM t WHERE id = 1".to_string(),
+            "1",
+        ),
+        (over("(SELECT x + 1 FROM u)"), "1"),
+        (over("wv"), "1"),
+        (over("jv"), "1"),
+        (over("old"), "1"),
+        (
+            "SELECT id, (SELECT MAX(q.x) FROM (SELECT x FROM jv WHERE jv.tid = t.id) AS q) FROM t WHERE id = 1"
+                .to_string(),
+            "1",
+        ),
+        (
+            "SELECT id, EXISTS (SELECT q.x AS k, ABS(q.x) FROM (SELECT id, x FROM mw WHERE mw.id = t.id) AS q \
+             WHERE k < 0) FROM t WHERE id = 1"
+                .to_string(),
+            "true",
+        ),
+    ] {
+        let line = prepared_line(&db, &sql);
+        if line != "Prepared: yes" {
+            wrong.push(format!("{sql}: {line}"));
+        }
+        let got = answer(&db, &sql);
+        if got != Ok(vec![vec!["1".to_string(), expected.to_string()]]) {
+            wrong.push(format!("{sql}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[test]
@@ -433,14 +493,15 @@ fn a_block_source_no_call_needs_raises_nothing() {
 fn a_view_that_reads_itself_raises_the_nesting_error() {
     let _turn = turn();
     let db = hot("view_cycle");
-    for sql in [
-        "CREATE VIEW v AS SELECT x FROM v",
-        "CREATE VIEW v1 AS SELECT x FROM u",
-        "CREATE VIEW v2 AS SELECT x FROM v1",
-        "DROP VIEW v1",
-        "CREATE VIEW v1 AS SELECT x FROM v2",
+    // CREATE VIEW refuses these; only the engine stores them, as an older release could
+    for (name, query) in [
+        ("v", "SELECT x FROM v"),
+        ("v1", "SELECT x FROM v2"),
+        ("v2", "SELECT x FROM v1"),
     ] {
-        db.execute(sql, ()).unwrap();
+        db.engine()
+            .create_view(name, query.to_string(), None, false)
+            .unwrap();
     }
     for sql in [
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM v WHERE v.x = t.id)",
