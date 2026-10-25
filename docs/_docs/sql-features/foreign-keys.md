@@ -270,6 +270,10 @@ CREATE TABLE bad (
 -- Error: foreign key column 'parent_id' has ON DELETE SET NULL but is NOT NULL
 ```
 
+## Matching Keys
+
+A child row belongs to the parent row whose referenced column equals the child's key: the column the foreign key names, which need not be the primary key. Keys compare as values, so an INTEGER key of 1 and a FLOAT key of 1.0 match. Every check and action finds its rows this way, whether a row was written recently or has been moved to the table's sealed storage.
+
 ## Automatic FK Indexes
 
 When a FK constraint is defined, Stoolap automatically creates an index on the FK column (unless the column already has a PRIMARY KEY or UNIQUE index). This ensures efficient:
