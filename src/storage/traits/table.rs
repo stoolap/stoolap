@@ -1046,11 +1046,13 @@ pub trait Table: Send + Sync {
     }
 
     /// An index on `column_name` whose row ids cover every visible row of
-    /// the table, so the executor may probe it directly. A table that keeps
-    /// part of its rows outside the index returns None and the executor
-    /// scans instead.
+    /// the table, so the executor may probe it by equality directly. A table
+    /// that keeps part of its rows outside the index, or an HNSW index,
+    /// which finds neighbours and no equal keys, returns None and the
+    /// executor scans instead.
     fn lookup_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
         self.get_index_on_column(column_name)
+            .filter(|index| index.index_type() != IndexType::Hnsw)
     }
 
     /// Whether the table holds rows sealed out of its hot store
