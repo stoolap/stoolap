@@ -138,21 +138,16 @@ fn parent_row_exists(
     // The filter's positions come from the handle that reads the rows
     let parent_schema = parent.schema_arc();
 
-    let (_, ref_col) = parent_schema.find_column(parent_column).ok_or_else(|| {
+    let (ref_idx, _) = parent_schema.find_column(parent_column).ok_or_else(|| {
         Error::internal(format!(
             "foreign key references non-existent column '{}' in table '{}'",
             parent_column, parent_table
         ))
     })?;
 
-    // Build a ComparisonExpr for `column = value` — the storage layer will use
-    // PK fast path (O(1)) or secondary index (O(log N)) when available
-    let mut expr = crate::storage::expression::ComparisonExpr::new(
-        ref_col.name.as_str(),
-        crate::core::Operator::Eq,
-        value.clone(),
-    );
-    expr.prepare_for_schema(&parent_schema);
+    // The storage layer uses the PK fast path (O(1)) or a secondary index
+    // (O(log N)) when available
+    let expr = key_filter(&parent_schema, ref_idx, value);
 
     let rows = parent.collect_rows_with_limit_unordered(Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
@@ -265,13 +260,7 @@ fn pre_check_delete_recursive(
                 // column, whether or not it is the child's primary key
                 let child_handle = engine.get_table_for_txn(txn_id, child_table_name)?;
                 let child_schema = child_handle.schema_arc();
-                let col_name = &child_schema.columns[key_position(&child_schema, fk)?].name;
-                let mut filter = crate::storage::expression::ComparisonExpr::new(
-                    col_name.as_str(),
-                    crate::core::Operator::Eq,
-                    value.clone(),
-                );
-                filter.prepare_for_schema(&child_schema);
+                let filter = key_filter(&child_schema, key_position(&child_schema, fk)?, value);
                 let rows = child_handle.collect_all_rows(Some(&filter))?;
                 for gfk_entry in grandchild_fks.iter() {
                     let referenced = gfk_entry.1.referenced_column.to_lowercase();
@@ -520,17 +509,34 @@ fn child_rows_exist(
     let child = engine.get_table_for_txn(txn_id, child_table)?;
     let child_schema = child.schema();
 
-    // Build a ComparisonExpr for `fk_column = parent_pk_value`
-    let col_name = &child_schema.columns[key_position(child_schema, fk)?].name;
-    let mut expr = crate::storage::expression::ComparisonExpr::new(
-        col_name.as_str(),
-        crate::core::Operator::Eq,
-        parent_pk_value.clone(),
+    let expr = key_filter(
+        child_schema,
+        key_position(child_schema, fk)?,
+        parent_pk_value,
     );
-    expr.prepare_for_schema(child_schema);
 
     let rows = child.collect_rows_with_limit_unordered(Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
+}
+
+/// The filter `column = value` over `schema`, the value read as the
+/// column's type as a pushed-down equality reads it, so every layer finds
+/// the rows that compare equal whichever numeric type the other side has
+fn key_filter(
+    schema: &Schema,
+    column: usize,
+    value: &Value,
+) -> crate::storage::expression::ComparisonExpr {
+    let column = &schema.columns[column];
+    let value = super::pushdown::coerce_constant(Some(column.data_type), value.clone())
+        .unwrap_or_else(|| value.clone());
+    let mut expr = crate::storage::expression::ComparisonExpr::new(
+        column.name.as_str(),
+        crate::core::Operator::Eq,
+        value,
+    );
+    expr.prepare_for_schema(schema);
+    expr
 }
 
 /// The position of `fk`'s column in the schema of the child handle that
@@ -594,13 +600,11 @@ fn cascade_delete_recursive(
         let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
         let child_schema = child_handle.schema_arc();
         // Use filtered scan instead of full table scan
-        let col_name = &child_schema.columns[key_position(&child_schema, fk)?].name;
-        let mut filter = crate::storage::expression::ComparisonExpr::new(
-            col_name.as_str(),
-            crate::core::Operator::Eq,
-            parent_pk_value.clone(),
+        let filter = key_filter(
+            &child_schema,
+            key_position(&child_schema, fk)?,
+            parent_pk_value,
         );
-        filter.prepare_for_schema(&child_schema);
         let rows = child_handle.collect_all_rows(Some(&filter))?;
         for (gfk_idx, (_, grandchild_fk)) in grandchild_fks.iter().enumerate() {
             let referenced = grandchild_fk.referenced_column.to_lowercase();
@@ -651,13 +655,11 @@ fn cascade_delete_recursive(
     // Now delete the matching child rows (safe — RESTRICT checks passed above)
     let mut child = engine.get_table_for_txn(txn_id, child_table)?;
     let child_schema = child.schema();
-    let col_name = &child_schema.columns[key_position(child_schema, fk)?].name;
-    let mut expr = crate::storage::expression::ComparisonExpr::new(
-        col_name.as_str(),
-        crate::core::Operator::Eq,
-        parent_pk_value.clone(),
+    let expr = key_filter(
+        child_schema,
+        key_position(child_schema, fk)?,
+        parent_pk_value,
     );
-    expr.prepare_for_schema(child_schema);
 
     let count = child.delete(Some(&expr))?;
     // Do NOT commit here — changes stay in TransactionVersionStore and are committed
@@ -797,12 +799,7 @@ fn cascade_update_recursive(
             ),
         ));
     }
-    let mut expr = crate::storage::expression::ComparisonExpr::new(
-        col_name.as_str(),
-        crate::core::Operator::Eq,
-        old_value.clone(),
-    );
-    expr.prepare_for_schema(child_schema);
+    let expr = key_filter(child_schema, col_idx, old_value);
     let checks =
         super::dml::checks_reading(super::dml::compile_check_programs(child_schema)?, |c| {
             c == col_idx
@@ -892,13 +889,7 @@ fn set_null_on_delete(
     }
 
     let null_val = Value::null(child_schema.columns[col_idx].data_type);
-    let col_name = &child_schema.columns[col_idx].name;
-    let mut expr = crate::storage::expression::ComparisonExpr::new(
-        col_name.as_str(),
-        crate::core::Operator::Eq,
-        parent_pk_value.clone(),
-    );
-    expr.prepare_for_schema(child_schema);
+    let expr = key_filter(child_schema, col_idx, parent_pk_value);
     let checks =
         super::dml::checks_reading(super::dml::compile_check_programs(child_schema)?, |c| {
             c == col_idx
