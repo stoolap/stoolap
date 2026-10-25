@@ -30,7 +30,7 @@ use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
 use super::aggregation::Modifiers;
-use super::context::{cache_in_subquery, get_cached_in_subquery_with_kinds, ExecutionContext};
+use super::context::{cache_in_subquery, get_cached_in_subquery_set, ExecutionContext};
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
@@ -839,13 +839,16 @@ impl Executor {
             && crate::executor::utils::probes_by_equality(table, column)
     }
 
-    /// The rows whose column is IN the members, by a scan that asks each
-    /// row the predicate comparison, with the remaining predicate
+    /// The rows whose column is IN, or with `not` NOT IN, the members, by a
+    /// scan that asks each row the predicate comparison, with the remaining
+    /// predicate
+    #[allow(clippy::too_many_arguments)]
     fn rows_in_members_by_scan(
         &self,
         table: &dyn Table,
         column: &str,
-        members: Vec<Value>,
+        members: CompactArc<PredicateSet>,
+        not: bool,
         remaining: Option<&Expression>,
         all_columns: &[String],
         ctx: &ExecutionContext,
@@ -857,10 +860,8 @@ impl Executor {
                 token(),
                 column.to_string(),
             ))),
-            values: CompactArc::new(PredicateSet::of(CompactArc::new(
-                members.into_iter().collect(),
-            ))),
-            not: false,
+            values: members,
+            not,
         });
         let membership = RowFilter::new(&membership, all_columns)?.with_context(ctx);
         let remaining = self.remaining_row_filter(remaining, all_columns, ctx)?;
@@ -1206,6 +1207,13 @@ impl Executor {
         if Self::is_subquery_correlated(&subquery.subquery) {
             return Ok(None);
         }
+        // A correlated conjunct beside the IN reads each row's outer columns
+        if remaining_predicate
+            .as_ref()
+            .is_some_and(Self::has_correlated_subqueries)
+        {
+            return Ok(None);
+        }
 
         // Skip if SELECT columns have correlated subqueries (need per-row context)
         // classification is passed from caller to avoid redundant cache lookups
@@ -1220,6 +1228,12 @@ impl Executor {
             let pk_col_idx = pk_indices[0];
             schema.columns[pk_col_idx].name_lower == column_name
         };
+
+        // Every way back to the general path is taken before the subquery
+        // runs, so it runs once: NOT IN is read here only on the primary key
+        if is_negated && !is_pk_column {
+            return Ok(None);
+        }
 
         // If not PK, check for index; a table that keeps rows outside its
         // index reads the members by its candidates, or by a scan of them,
@@ -1242,15 +1256,14 @@ impl Executor {
             None
         };
 
-        // Execute the subquery to get values (with caching for
+        // Execute the subquery to get its members (with caching for
         // non-correlated subqueries, under the stamp taken before the read)
         let cache_slot = self.subquery_cache_slot(&subquery.subquery, ctx);
-        // A cached list comes with its kinds, taken when it was cached
         let cached = cache_slot
             .as_ref()
-            .and_then(|(key, stamp)| get_cached_in_subquery_with_kinds(key, stamp));
-        let (mut values, has_texts, has_non_texts) = if let Some((cached, kinds)) = cached {
-            (cached, kinds.texts, kinds.non_texts)
+            .and_then(|(key, stamp)| get_cached_in_subquery_set(key, stamp));
+        let set = if let Some(set) = cached {
+            set
         } else {
             let subquery_ctx = ctx.with_incremented_query_depth();
             #[cfg(any(test, feature = "test-failpoints"))]
@@ -1259,7 +1272,7 @@ impl Executor {
 
             // Collect all values from the first column
             let mut values = Vec::new();
-            let (mut has_null, mut texts, mut non_texts) = (false, false, false);
+            let mut has_null = false;
             while result.next() {
                 let row = result.row();
                 if !row.is_empty() {
@@ -1267,11 +1280,7 @@ impl Executor {
                         .get(0)
                         .cloned()
                         .unwrap_or_else(crate::core::Value::null_unknown);
-                    match value {
-                        Value::Null(_) => has_null = true,
-                        Value::Text(_) => texts = true,
-                        _ => non_texts = true,
-                    }
+                    has_null |= value.is_null();
                     values.push(value);
                 }
             }
@@ -1295,97 +1304,53 @@ impl Executor {
             if let Some((key, stamp)) = cache_slot {
                 cache_in_subquery(key, stamp, values.clone());
             }
-            (values, texts, non_texts)
+            CompactArc::new(PredicateSet::of(CompactArc::new(
+                values.into_iter().collect(),
+            )))
         };
 
-        // The members as the comparison reads them against the column. A
-        // member UNKNOWN to every number leaves NOT IN true for no row; a
-        // TEXT column is read by a scan for a set holding a non-TEXT member
-        let mut text_scan = false;
-        match schema.get_column_type(&column_name) {
-            Some(DataType::Integer | DataType::Float) if has_texts => {
-                let (numbers, unknown) = numeric_members(values.iter());
-                if is_negated && unknown {
-                    let output_columns = CompactArc::new(self.get_output_column_names(
-                        &stmt.columns,
-                        all_columns,
-                        table_alias,
-                    ));
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&output_columns),
-                        RowVec::new(),
-                    );
-                    return Ok(Some((Box::new(result), output_columns, true)));
-                }
-                values = numbers;
-            }
-            Some(DataType::Text) if !is_negated && has_non_texts => text_scan = true,
-            _ => {}
-        }
-
-        if values.is_empty() {
-            // Empty subquery result
-            if is_negated {
-                // NOT IN empty set = all rows match (fall through to normal scan)
-                return Ok(None);
-            } else {
-                // IN empty set = no rows match
-                let output_columns = CompactArc::new(self.get_output_column_names(
-                    &stmt.columns,
-                    all_columns,
-                    table_alias,
-                ));
-                let result = ExecutorResult::with_arc_columns(
-                    CompactArc::clone(&output_columns),
-                    RowVec::new(),
-                );
-                return Ok(Some((Box::new(result), output_columns, true)));
-            }
-        }
-
-        // A table that keeps rows outside its index: the members' rows by
-        // its candidates, else by a scan of the members already taken, so
-        // the subquery does not run again
-        let member_rows = if text_scan {
-            Some(self.rows_in_members_by_scan(
-                table,
-                &column_name,
-                std::mem::take(&mut values),
-                remaining_predicate.as_ref(),
+        // The members as the comparison reads them against the column, as
+        // every member read takes them; a set holding a member of another
+        // domain is read by a scan that asks each row the comparison
+        let members = Self::members_for_column(schema.get_column_type(&column_name), &set);
+        let mut scan = members.is_none();
+        let (values, unknown) =
+            members.unwrap_or_else(|| (CompactArc::new(ValueSet::default()), false));
+        // A member UNKNOWN to every number leaves NOT IN true for no row
+        if is_negated && unknown {
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
                 all_columns,
-                ctx,
-            )?)
-        } else if !is_pk_column && index.is_none() {
-            Self::in_member_rows(
-                table,
-                &column_name,
-                std::mem::take(&mut values),
-                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
-                true,
-            )?
-        } else {
-            None
-        };
+                table_alias,
+            ));
+            let result =
+                ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), RowVec::new());
+            return Ok(Some((Box::new(result), output_columns, true)));
+        }
+
+        // IN an empty set holds for no row; NOT IN one holds for every key
+        if values.is_empty() && !scan && !is_negated {
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
+                all_columns,
+                table_alias,
+            ));
+            let result =
+                ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), RowVec::new());
+            return Ok(Some((Box::new(result), output_columns, true)));
+        }
 
         // Collect row_ids: either from PK (direct) or from index probe
         // Pre-allocate based on expected size to avoid reallocations
         let mut all_row_ids = Vec::with_capacity(values.len());
-        if is_pk_column {
+        let mut member_rows = None;
+        if is_pk_column && !scan {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY:
                 // Instead of scanning the table, iterate through row_ids and exclude
                 // This is O(row_count) but with O(1) hashset lookup, which is faster
                 // than table scan because we only touch row_ids, not full rows
-                // A member is the key it equals, a float read as the
-                // comparison reads it
-                let exclusion_set: I64Set = values
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Integer(id) => Some(*id),
-                        Value::Float(f) => Self::lossless_float_key(*f),
-                        _ => None,
-                    })
-                    .collect();
+                let exclusion_set: I64Set = Self::primary_key_members(values.iter()).collect();
 
                 // Calculate LIMIT + OFFSET to know how many row_ids we need
                 let counts = row_counts(stmt, ctx)?;
@@ -1404,27 +1369,33 @@ impl Executor {
                 // left out: keys are the rows' ids, not a count of them
                 all_row_ids = table.visible_row_ids_excluding(&exclusion_set, target)?;
             } else {
-                // IN: PRIMARY KEY - the value is the row id, a float read as
-                // the comparison reads it
-                for value in &values {
-                    match value {
-                        Value::Integer(id) => all_row_ids.push(*id),
-                        Value::Float(f) => {
-                            if let Some(id) = Self::lossless_float_key(*f) {
-                                all_row_ids.push(id);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                all_row_ids.extend(Self::primary_key_members(values.iter()));
             }
-        } else if is_negated {
-            // NOT IN with non-PK index: fall back to normal scan
-            return Ok(None);
-        } else if let Some(ref idx) = index {
-            if !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids) {
-                return Ok(None);
-            }
+        } else if let Some(idx) = index.as_ref().filter(|_| !scan) {
+            // An index that stopped answering for the view leaves the members to the scan
+            scan = !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids);
+        } else if !scan && !is_pk_column {
+            // A table that keeps rows outside its index: the members' rows by its candidates
+            member_rows = Self::in_member_rows(
+                table,
+                &column_name,
+                values.iter().cloned().collect(),
+                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
+                true,
+            )?;
+        }
+        // The members already taken are read by a scan, so the subquery does not run again
+        if scan {
+            all_row_ids.clear();
+            member_rows = Some(self.rows_in_members_by_scan(
+                table,
+                &column_name,
+                set,
+                is_negated,
+                remaining_predicate.as_ref(),
+                all_columns,
+                ctx,
+            )?);
         }
 
         // Sort row_ids for better cache locality during version lookup
@@ -1576,6 +1547,13 @@ impl Executor {
         if classification.select_has_correlated_subqueries {
             return Ok(None);
         }
+        // A correlated conjunct beside the IN reads each row's outer columns
+        if remaining_predicate
+            .as_ref()
+            .is_some_and(Self::has_correlated_subqueries)
+        {
+            return Ok(None);
+        }
 
         // The members as an equality against the column reads each, so the
         // index is asked for the column's own keys; a number against a TEXT
@@ -1670,21 +1648,8 @@ impl Executor {
         // Pre-allocate based on expected size to avoid reallocations
         let mut all_row_ids = Vec::with_capacity(values.len());
         if is_pk_column {
-            // PRIMARY KEY: the value is the row id. A float holding an
-            // integer is that key and one that does not matches nothing, as
-            // the comparison reads them; any other type is left to it
-            for value in &values {
-                match value {
-                    Value::Integer(id) => all_row_ids.push(*id),
-                    Value::Float(f) => {
-                        if let Some(id) = Self::lossless_float_key(*f) {
-                            all_row_ids.push(id);
-                        }
-                    }
-                    Value::Null(_) => {}
-                    _ => return Ok(None),
-                }
-            }
+            // A member that is no key matches no row of an IN
+            all_row_ids.extend(Self::primary_key_members(values.iter()));
         } else if let Some(ref idx) = index {
             if !Self::index_members(table, idx.as_ref(), values.iter(), None, &mut all_row_ids) {
                 return Ok(None);

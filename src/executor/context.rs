@@ -115,21 +115,8 @@ pub fn cache_scalar_subquery(key: String, stamp: SubqueryStamp, value: Value) {
 // LRU-bounded to prevent unbounded memory growth.
 
 /// Cached IN subquery entry: (the stamp it was read under, result values,
-/// lazily built shared hash set for single-column IN, the values' kinds)
-type InSubqueryCacheEntry = (
-    SubqueryStamp,
-    Vec<Value>,
-    Option<CompactArc<PredicateSet>>,
-    MemberKinds,
-);
-
-/// Whether a list of values holds a TEXT and whether it holds a value that
-/// is neither TEXT nor NULL
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MemberKinds {
-    pub texts: bool,
-    pub non_texts: bool,
-}
+/// lazily built shared hash set for single-column IN)
+type InSubqueryCacheEntry = (SubqueryStamp, Vec<Value>, Option<CompactArc<PredicateSet>>);
 
 thread_local! {
     static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
@@ -171,15 +158,6 @@ pub fn get_cached_in_subquery(key: &str, stamp: &SubqueryStamp) -> Option<Vec<Va
     with_in_subquery_entry(key, stamp, |entry| entry.1.clone())
 }
 
-/// A cached IN subquery result with the kinds of its values, taken when
-/// it was cached
-pub fn get_cached_in_subquery_with_kinds(
-    key: &str,
-    stamp: &SubqueryStamp,
-) -> Option<(Vec<Value>, MemberKinds)> {
-    with_in_subquery_entry(key, stamp, |entry| (entry.1.clone(), entry.3))
-}
-
 /// Get a cached IN subquery result as a shared hash set, building and
 /// memoizing the set inside the entry on first request. Later hits are
 /// an Arc clone: no value clones, no set rebuild.
@@ -204,16 +182,11 @@ pub fn get_cached_in_subquery_set(
 /// reads this cache and keeps no row for such a set, which its readers
 /// decide on a fresh list alone
 pub fn cache_in_subquery(key: String, stamp: SubqueryStamp, values: Vec<Value>) {
-    let mut kinds = MemberKinds::default();
-    for value in &values {
-        match value {
-            Value::Null(_) => return,
-            Value::Text(_) => kinds.texts = true,
-            _ => kinds.non_texts = true,
-        }
+    if values.iter().any(Value::is_null) {
+        return;
     }
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (stamp, values, None, kinds));
+        cache.borrow_mut().put(key, (stamp, values, None));
     });
 }
 
