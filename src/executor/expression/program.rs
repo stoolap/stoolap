@@ -19,7 +19,7 @@
 // - A sequence of operations (the "bytecode")
 // - Metadata for efficient execution
 
-use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use super::ops::Op;
 use crate::core::Value;
@@ -52,6 +52,10 @@ pub struct Program {
     /// re-execution
     cow_supported: bool,
 
+    /// What binding the program to its execution's parameters reads, for a
+    /// program that loads one
+    binding: Option<Box<Binding>>,
+
     /// Source expression string (for debugging)
     #[cfg(debug_assertions)]
     source: Option<String>,
@@ -61,8 +65,14 @@ impl Program {
     /// Create a new program from operations.
     /// Automatically applies peephole optimizations (instruction fusion).
     pub fn new(ops: Vec<Op>) -> Self {
+        Self::with_folds(ops, Vec::new())
+    }
+
+    /// [`Self::new`] with the ranges of `ops` that fold once the
+    /// execution's parameters are known
+    pub fn with_folds(ops: Vec<Op>, mut folds: Vec<(u16, u16)>) -> Self {
         // Apply peephole optimizations
-        let ops = Self::peephole_optimize(ops);
+        let ops = Self::peephole_optimize(ops, &mut folds);
 
         let max_stack_depth = Self::compute_stack_depth(&ops);
         let needs_outer_context = ops.iter().any(|op| matches!(op, Op::LoadOuterColumn(_)));
@@ -78,6 +88,7 @@ impl Program {
         });
 
         let cow_supported = Self::compute_cow_supported(&ops, max_stack_depth);
+        let binding = Binding::of(&ops, folds);
 
         Self {
             ops,
@@ -86,6 +97,7 @@ impl Program {
             needs_second_row,
             has_subqueries,
             cow_supported,
+            binding,
             #[cfg(debug_assertions)]
             source: None,
         }
@@ -113,6 +125,7 @@ impl Program {
         });
 
         let cow_supported = Self::compute_cow_supported(&ops, max_stack_depth);
+        let binding = Binding::of(&ops, Vec::new());
 
         Self {
             ops,
@@ -121,6 +134,7 @@ impl Program {
             needs_second_row,
             has_subqueries,
             cow_supported,
+            binding,
             #[cfg(debug_assertions)]
             source: None,
         }
@@ -144,6 +158,182 @@ impl Program {
             })
             .collect();
         Self::new_unoptimized(ops)
+    }
+
+    /// This program with each parameter it loads taken from `params`, as the
+    /// compiler builds it from those values written as literals; None when
+    /// it loads none, or when binding does not shrink it: a parameter loads
+    /// at the cost of its value. A parameter `params` lacks keeps its error
+    pub fn bind(&self, params: &[Value]) -> Option<Self> {
+        let binding = self.binding.as_deref()?;
+        if binding.shrinks.get() == Some(&false) {
+            return None;
+        }
+        let bound = self.bind_with(|op| match op {
+            Op::LoadParam(slot) => params.get(*slot as usize).cloned().map(Op::LoadConst),
+            _ => None,
+        })?;
+        let shrinks = bound.ops.len() < self.ops.len();
+        // No value changes what fusion makes of a parameter no fold holds
+        // and no op takes, so the first bind of such a program settles it
+        let settled = binding.folds.is_empty()
+            && !self.ops.windows(2).any(|pair| {
+                matches!(pair[0], Op::LoadParam(_)) && super::compiler::takes_values(&pair[1])
+            });
+        if settled {
+            let _ = binding.shrinks.set(shrinks);
+        }
+        shrinks.then_some(bound)
+    }
+
+    /// Whether this program loads a parameter and a bind found that binding
+    /// the parameters never shrinks it
+    pub fn bind_never_shrinks(&self) -> bool {
+        self.binding
+            .as_deref()
+            .is_some_and(|binding| binding.shrinks.get() == Some(&false))
+    }
+
+    /// This program with each op `known` replaces taken as its replacement,
+    /// each range the compiler marked folded once what it reads is known, and
+    /// a value so known taken by the op after as the compiler builds that op
+    /// from the value written as a literal; None when `known` replaces none
+    pub fn bind_with(&self, known: impl Fn(&Op) -> Option<Op>) -> Option<Self> {
+        let replaced: SmallVec<[(usize, Op); 4]> = self
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| known(op).map(|op| (at, op)))
+            .collect();
+        if replaced.is_empty() {
+            return None;
+        }
+        let mut source = self.ops.clone();
+        let targets = JumpTargets::of(&mut source);
+        let replaced_at: SmallVec<[usize; 4]> = replaced.iter().map(|(at, _)| *at).collect();
+        for (at, op) in replaced {
+            source[at] = op;
+        }
+        let folded = self.folded(&source, &replaced_at, &targets);
+        let mut ops: Vec<Op> = Vec::with_capacity(source.len());
+        // Of each op emitted: whether it loads a value known only now, and
+        // the first position it stands for
+        let mut emitted: SmallVec<[(bool, usize); 16]> = SmallVec::new();
+        let mut position_map: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut at = 0;
+        while at < source.len() {
+            let here = ops.len();
+            let (op, next, known_now) = match folded.iter().find(|(start, ..)| *start == at) {
+                Some((start, end, value)) => {
+                    position_map.extend((*start..*end).map(|_| here));
+                    (Op::LoadConst(value.clone()), *end, true)
+                }
+                None => {
+                    position_map.push(here);
+                    let op = std::mem::replace(&mut source[at], Op::Return);
+                    (op, at + 1, replaced_at.contains(&at))
+                }
+            };
+            let after = source.get(next).map(|op| (next, op));
+            if let Some((first, takes_next, taken)) =
+                Self::taken_by(&op, at, after, &ops, &emitted, &targets)
+            {
+                ops.truncate(first);
+                emitted.truncate(first);
+                for position in position_map.iter_mut().rev() {
+                    if *position <= first {
+                        break;
+                    }
+                    *position = first;
+                }
+                ops.push(taken);
+                emitted.push((false, at));
+                if takes_next {
+                    position_map.push(first);
+                    at = next + 1;
+                    continue;
+                }
+            } else {
+                ops.push(op);
+                emitted.push((known_now, at));
+            }
+            at = next;
+        }
+        position_map.push(ops.len());
+        Self::adjust_jump_targets(&mut ops, &position_map);
+        Some(Self::new(ops))
+    }
+
+    /// When `op`, at position `at`, takes the constants the last of `ops`
+    /// load, one of them known only now: where the first of them stands,
+    /// whether it takes the op after, `next`, too, and the op the compiler
+    /// builds in their place. No jump may land on `op`, past the first
+    /// value, or on `next` taken
+    fn taken_by(
+        op: &Op,
+        at: usize,
+        next: Option<(usize, &Op)>,
+        ops: &[Op],
+        emitted: &[(bool, usize)],
+        targets: &JumpTargets,
+    ) -> Option<(usize, bool, Op)> {
+        if !matches!(ops.last(), Some(Op::LoadConst(_) | Op::LoadNull(_))) || targets.contains(&at)
+        {
+            return None;
+        }
+        let mut values: SmallVec<[Value; 4]> = ops
+            .iter()
+            .rev()
+            .map_while(|op| match op {
+                Op::LoadConst(value) => Some(value.clone()),
+                Op::LoadNull(data_type) => Some(Value::Null(*data_type)),
+                _ => None,
+            })
+            .collect();
+        values.reverse();
+        let values: SmallVec<[&Value; 4]> = values.iter().collect();
+        let next = next.filter(|(position, _)| !targets.contains(position));
+        let (count, takes_next, taken) =
+            super::compiler::bound_consumer(op, &values, next.map(|(_, op)| op))?;
+        let first = ops.len() - count;
+        let taken_values = &emitted[first..];
+        (taken_values.iter().any(|(known, _)| *known)
+            && taken_values[1..]
+                .iter()
+                .all(|(_, position)| !targets.contains(position)))
+        .then_some((first, takes_next, taken))
+    }
+
+    /// The marked ranges of `source` that fold now, with their values: each
+    /// that holds an op replaced at `replaced`, the outermost first; one
+    /// whose fold errors leaves the ranges inside it to fold
+    fn folded(
+        &self,
+        source: &[Op],
+        replaced: &[usize],
+        targets: &JumpTargets,
+    ) -> SmallVec<[(usize, usize, Value); 2]> {
+        let marked = self.binding.as_deref().map_or(&[][..], |b| &b.folds[..]);
+        let mut folds: SmallVec<[(usize, usize); 4]> = marked
+            .iter()
+            .map(|&(start, end)| (usize::from(start), usize::from(end)))
+            .filter(|(start, end)| replaced.iter().any(|at| (*start..*end).contains(at)))
+            .collect();
+        folds.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+        let mut folded: SmallVec<[(usize, usize, Value); 2]> = SmallVec::new();
+        for (start, end) in folds {
+            if folded.iter().any(|(s, e, _)| start >= *s && end <= *e) {
+                continue;
+            }
+            debug_assert!(
+                !(start + 1..end).any(|position| targets.contains(&position)),
+                "a jump lands inside a range marked to fold"
+            );
+            if let Some(value) = super::compiler::fold_ops(&source[start..end]) {
+                folded.push((start, end, value));
+            }
+        }
+        folded
     }
 
     /// Create an empty program that returns NULL
@@ -387,7 +577,9 @@ impl Program {
     /// Apply peephole optimizations to fuse common instruction patterns.
     /// This is called automatically when creating a program via `new()`.
     pub fn optimize(mut self) -> Self {
-        self.ops = Self::peephole_optimize(self.ops);
+        let mut folds = self.binding.take().map(|b| b.folds).unwrap_or_default();
+        self.ops = Self::peephole_optimize(self.ops, &mut folds);
+        self.binding = Binding::of(&self.ops, folds);
         // Recalculate metadata after optimization
         self.max_stack_depth = Self::compute_stack_depth(&self.ops);
         self.cow_supported = Self::compute_cow_supported(&self.ops, self.max_stack_depth);
@@ -468,7 +660,7 @@ impl Program {
     }
 
     /// Peephole optimizer: fuse common instruction patterns into single ops
-    fn peephole_optimize(mut ops: Vec<Op>) -> Vec<Op> {
+    fn peephole_optimize(mut ops: Vec<Op>, folds: &mut Vec<(u16, u16)>) -> Vec<Op> {
         if ops.len() < 2 {
             return ops;
         }
@@ -476,29 +668,11 @@ impl Program {
         // Build a set of positions that are jump targets - we can't fuse instructions
         // that are jump targets because that would make the jump land in the middle
         // of what becomes a single instruction.
-        let mut jump_targets = FxHashSet::default();
-        for op in &ops {
-            match op {
-                Op::And(t)
-                | Op::Or(t)
-                | Op::Jump(t)
-                | Op::JumpIfTrue(t)
-                | Op::JumpIfFalse(t)
-                | Op::JumpIfNull(t)
-                | Op::JumpIfNotNull(t)
-                | Op::PopJumpIfTrue(t)
-                | Op::PopJumpIfFalse(t)
-                | Op::CaseWhen(t)
-                | Op::CaseThen(t) => {
-                    jump_targets.insert(*t as usize);
-                }
-                _ => {}
-            }
-        }
+        let jump_targets = JumpTargets::of(&mut ops);
 
         let mut result = Vec::with_capacity(ops.len());
         // Map from old instruction position to new instruction position
-        let mut position_map: Vec<usize> = Vec::with_capacity(ops.len());
+        let mut position_map: SmallVec<[usize; 32]> = SmallVec::with_capacity(ops.len());
         let mut i = 0;
 
         while i < ops.len() {
@@ -606,34 +780,95 @@ impl Program {
         // If we fused anything, we need to adjust jump targets
         if result.len() != ops.len() {
             Self::adjust_jump_targets(&mut result, &position_map);
+            Self::adjust_folds(folds, &position_map, result.len());
         }
 
         result
     }
 
+    /// The fold ranges at their positions after fusion; a range an op fused
+    /// across its edge folds no more
+    fn adjust_folds(folds: &mut Vec<(u16, u16)>, position_map: &[usize], len: usize) {
+        let at = |old: u16| position_map.get(usize::from(old)).copied().unwrap_or(len);
+        folds.retain_mut(|(start, end)| {
+            let edges_kept =
+                (*start == 0 || at(*start - 1) != at(*start)) && at(*end - 1) != at(*end);
+            (*start, *end) = (at(*start) as u16, at(*end) as u16);
+            edges_kept
+        });
+    }
+
     /// Adjust jump targets after peephole optimization using the position map.
     fn adjust_jump_targets(ops: &mut [Op], position_map: &[usize]) {
-        for op in ops.iter_mut() {
-            match op {
-                Op::And(t)
-                | Op::Or(t)
-                | Op::Jump(t)
-                | Op::JumpIfTrue(t)
-                | Op::JumpIfFalse(t)
-                | Op::JumpIfNull(t)
-                | Op::JumpIfNotNull(t)
-                | Op::PopJumpIfTrue(t)
-                | Op::PopJumpIfFalse(t)
-                | Op::CaseWhen(t)
-                | Op::CaseThen(t) => {
-                    let old_target = *t as usize;
-                    if old_target < position_map.len() {
-                        *t = position_map[old_target] as u16;
-                    }
-                }
-                _ => {}
+        for t in ops.iter_mut().filter_map(jump_target) {
+            let old_target = *t as usize;
+            if old_target < position_map.len() {
+                *t = position_map[old_target] as u16;
             }
         }
+    }
+}
+
+/// What binding a program to its execution's parameters reads beside its ops
+#[derive(Clone)]
+struct Binding {
+    /// The ranges of ops that fold into one value once the parameters are
+    /// known, as the compiler marked them
+    folds: Vec<(u16, u16)>,
+    /// Whether binding the parameters shrinks the program, once a bind
+    /// found it out for every value
+    shrinks: std::sync::OnceLock<bool>,
+}
+
+impl Binding {
+    /// The binding of a program of `ops`, when one loads a parameter
+    fn of(ops: &[Op], folds: Vec<(u16, u16)>) -> Option<Box<Self>> {
+        ops.iter()
+            .any(|op| matches!(op, Op::LoadParam(_)))
+            .then(|| {
+                Box::new(Self {
+                    folds,
+                    shrinks: std::sync::OnceLock::new(),
+                })
+            })
+    }
+}
+
+/// The positions some op of a program jumps to
+struct JumpTargets(SmallVec<[bool; 32]>);
+
+impl JumpTargets {
+    fn of(ops: &mut [Op]) -> Self {
+        let mut targets: SmallVec<[bool; 32]> = smallvec::smallvec![false; ops.len() + 1];
+        for t in ops.iter_mut().filter_map(jump_target) {
+            if let Some(target) = targets.get_mut(usize::from(*t)) {
+                *target = true;
+            }
+        }
+        Self(targets)
+    }
+
+    #[inline]
+    fn contains(&self, position: &usize) -> bool {
+        self.0.get(*position).copied().unwrap_or(false)
+    }
+}
+
+/// The position `op` jumps to, when it jumps
+fn jump_target(op: &mut Op) -> Option<&mut u16> {
+    match op {
+        Op::And(t)
+        | Op::Or(t)
+        | Op::Jump(t)
+        | Op::JumpIfTrue(t)
+        | Op::JumpIfFalse(t)
+        | Op::JumpIfNull(t)
+        | Op::JumpIfNotNull(t)
+        | Op::PopJumpIfTrue(t)
+        | Op::PopJumpIfFalse(t)
+        | Op::CaseWhen(t)
+        | Op::CaseThen(t) => Some(t),
+        _ => None,
     }
 }
 
@@ -652,24 +887,56 @@ impl std::fmt::Debug for Program {
 /// Builder for constructing programs
 pub struct ProgramBuilder {
     ops: Vec<Op>,
+    /// The ranges of ops that fold once the execution's parameters are known
+    folds: Vec<(u16, u16)>,
+    /// How many parameter loads were emitted
+    params_loaded: u32,
 }
 
 impl ProgramBuilder {
     pub fn new() -> Self {
         Self {
             ops: Vec::with_capacity(32),
+            folds: Vec::new(),
+            params_loaded: 0,
         }
     }
 
     /// A builder emitting into `ops`, emptied, to reuse its capacity
     pub fn reusing(mut ops: Vec<Op>) -> Self {
         ops.clear();
-        Self { ops }
+        Self {
+            ops,
+            folds: Vec::new(),
+            params_loaded: 0,
+        }
+    }
+
+    /// How many parameter loads were emitted so far
+    #[inline]
+    pub fn params_loaded(&self) -> u32 {
+        self.params_loaded
+    }
+
+    /// How many ops were emitted since `start`, none when the program has
+    /// grown past what a position holds
+    pub fn emitted_since(&self, start: u16) -> usize {
+        match u16::try_from(self.ops.len()) {
+            Ok(end) => usize::from(end - start),
+            Err(_) => 0,
+        }
+    }
+
+    /// The ops emitted since `start` fold into one value once the
+    /// execution's parameters are known
+    pub fn mark_fold(&mut self, start: u16) {
+        self.folds.push((start, self.position()));
     }
 
     /// Emit an operation
     #[inline]
     pub fn emit(&mut self, op: Op) {
+        self.params_loaded += u32::from(matches!(op, Op::LoadParam(_)));
         self.ops.push(op);
     }
 
@@ -716,7 +983,7 @@ impl ProgramBuilder {
 
     /// Build the final program
     pub fn build(self) -> Program {
-        Program::new(self.ops)
+        Program::with_folds(self.ops, self.folds)
     }
 
     /// Build without peephole optimization (for tiny fold programs)

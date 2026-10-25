@@ -99,7 +99,8 @@ impl<'a> RowPrograms<'a> {
         let programs = exprs
             .into_iter()
             .map(|expr| match (blocks, slots) {
-                (None, None) => compile_expression(expr, columns),
+                (None, None) => compile_expression(expr, columns)
+                    .map(|program| bind_params(program, ctx.params())),
                 _ => {
                     let program = compile_over_slots(
                         expr,
@@ -108,7 +109,7 @@ impl<'a> RowPrograms<'a> {
                         slots,
                         None,
                         blocks.is_some(),
-                        blocks.map(|blocks| slot_params(ctx, Some(blocks))),
+                        Some(slot_params(ctx, blocks)),
                     )?;
                     Ok(blocks
                         .and_then(|blocks| blocks.bind_members(&program))
@@ -552,9 +553,9 @@ use super::aggregation::{compile_over_slots, slot_context, slot_params, with_blo
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
-    compile_expression, compile_once, compute_expression_hash, evaluate_once, execute_context,
-    execute_once, literal_value, CompileContext, ExprCompiler, ExprVM, Program, SharedProgram,
-    SubqueryExecutor,
+    bind_params, compile_expression, compile_once, compute_expression_hash, evaluate_once,
+    execute_context, execute_once, literal_value, CompileContext, ExprCompiler, ExprVM, Program,
+    SharedProgram, SubqueryExecutor,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};

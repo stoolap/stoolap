@@ -371,6 +371,8 @@ impl ExprVM {
     }
 
     pub fn execute(&mut self, program: &Program, ctx: &ExecuteContext) -> Result<Value> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::program_ran(program);
         // Ensure stack has enough capacity
         if self.stack.capacity() < program.max_stack_depth() {
             self.stack
@@ -1929,6 +1931,8 @@ impl ExprVM {
         if !program.cow_supported() {
             return self.execute(program, ctx);
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::program_ran(program);
 
         // Local stack with borrowed values - lifetime tied to this execution
         let mut stack: SmallVec<[StackValue<'a>; STACK_INLINE_CAPACITY]> = SmallVec::new();
@@ -2573,6 +2577,8 @@ impl ExprVM {
     /// the full VM loop overhead for simple comparisons.
     #[inline]
     pub fn execute_bool(&mut self, program: &Program, ctx: &ExecuteContext) -> bool {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::program_ran(program);
         let ops = program.ops();
 
         // Fast path: Single comparison + Return (most common filter)
@@ -2655,6 +2661,8 @@ impl ExprVM {
         program: &Program,
         ctx: &ExecuteContext,
     ) -> crate::core::Result<bool> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::program_ran(program);
         let ops = program.ops();
 
         // Fast path: Single comparison + Return (most common filter)

@@ -557,7 +557,7 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         }
 
-        let Some(pattern) = extract_pattern(&like.pattern) else {
+        let Some(pattern) = extract_pattern(&like.pattern, ctx) else {
             return PushdownResult::CannotPush;
         };
 
@@ -602,7 +602,7 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         }
 
-        let pattern = match extract_pattern(&infix.right) {
+        let pattern = match extract_pattern(&infix.right, ctx) {
             Some(p) => p,
             None => return PushdownResult::CannotPush,
         };
@@ -630,10 +630,11 @@ impl LikeRule {
     }
 }
 
-/// A literal pattern read as its text form, a typed literal by its value;
-/// None for a NULL or a pattern read per row, which stays in memory
-fn extract_pattern(expr: &ast::Expression) -> Option<String> {
-    crate::executor::utils::extract_literal_value(expr)?.as_string()
+/// A pattern known for the statement, a literal, a parameter or a constant,
+/// read as its text form; None for a NULL or a pattern read per row, which
+/// stays in memory
+fn extract_pattern(expr: &ast::Expression, ctx: &PushdownContext<'_>) -> Option<String> {
+    extract_literal_with_ctx(expr, ctx)?.as_string()
 }
 
 // =============================================================================

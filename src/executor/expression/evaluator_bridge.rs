@@ -107,6 +107,15 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
     (h1.finish(), h2.finish())
 }
 
+/// `program` with the parameters it loads bound to `params`, or as it is
+/// when it loads none
+pub(crate) fn bind_params(program: SharedProgram, params: &[Value]) -> SharedProgram {
+    match program.bind(params) {
+        Some(bound) => CompactArc::new(bound),
+        None => program,
+    }
+}
+
 /// Each aliased slot at the width the program loads it with
 fn alias_slots(aliases: &FxHashMap<ExprKey, usize>) -> FxHashMap<ExprKey, u16> {
     aliases
@@ -445,9 +454,24 @@ pub fn compile_expression_with_context(
     outer_columns: Option<&[String]>,
     function_registry: &FunctionRegistry,
 ) -> Result<SharedProgram> {
+    compile_expression_with_params(expr, columns, outer_columns, &[], function_registry)
+}
+
+/// [`compile_expression_with_context`] for one execution, each parameter
+/// compiled as the value `params` holds for it
+pub(crate) fn compile_expression_with_params(
+    expr: &Expression,
+    columns: &[String],
+    outer_columns: Option<&[String]>,
+    params: &[Value],
+    function_registry: &FunctionRegistry,
+) -> Result<SharedProgram> {
     let mut ctx = CompileContext::new(columns, function_registry);
     if let Some(outer_cols) = outer_columns {
         ctx = ctx.with_outer_columns(outer_cols);
+    }
+    if !params.is_empty() {
+        ctx = ctx.with_params(params);
     }
     let compiler = ExprCompiler::new(&ctx);
     compiler
@@ -534,6 +558,7 @@ impl RowFilter {
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed (both use CompactArc<Vec<Value>>)
         self.params = CompactArc::clone(ctx.params_arc());
+        self.program = bind_params(self.program, &self.params);
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -541,6 +566,7 @@ impl RowFilter {
     /// The parameters the program reads, in place of the context's
     pub(crate) fn with_params(mut self, params: CompactArc<ParamVec>) -> Self {
         self.params = params;
+        self.program = bind_params(self.program, &self.params);
         self
     }
 
@@ -708,6 +734,7 @@ impl JoinFilter {
     #[inline]
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         self.params = CompactArc::clone(ctx.params_arc());
+        self.program = bind_params(self.program, &self.params);
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -860,6 +887,7 @@ impl ExpressionEval {
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
         self.params = CompactArc::clone(ctx.params_arc());
+        self.program = bind_params(self.program, &self.params);
         if let Some(outer) = ctx.outer_row() {
             // Clone the map directly (CompactArc<str> clones are cheap)
             let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1040,7 +1068,11 @@ impl<'a> CompiledEvaluator<'a> {
     /// PERF: `params` shares the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
-        self.params = CompactArc::clone(ctx.params_arc());
+        // A program compiled before holds the parameters it was compiled with
+        if !CompactArc::ptr_eq(&self.params, ctx.params_arc()) {
+            self.params = CompactArc::clone(ctx.params_arc());
+            self.local_cache.clear();
+        }
 
         // Set outer row context for correlated subqueries
         if let Some(outer) = ctx.outer_row() {
@@ -1463,6 +1495,11 @@ impl<'a> CompiledEvaluator<'a> {
         // Add column aliases
         if !self.column_aliases.is_empty() {
             ctx = ctx.with_column_aliases(self.column_aliases.clone());
+        }
+
+        // The parameters are known here: each compiles as its value
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
         }
 
         let compiler = ExprCompiler::new(&ctx);

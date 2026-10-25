@@ -872,6 +872,35 @@ thread_local! {
     static PROGRAM_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+static RECORDING_PROGRAMS: AtomicBool = AtomicBool::new(false);
+static PROGRAMS_RAN: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+/// Every program the expression VM ran while `run` ran, on any thread, as
+/// its listing with how many times the VM was entered for it (a boolean
+/// entry that falls back counts twice), in the order first run
+pub fn programs_ran(run: impl FnOnce()) -> Vec<(String, usize)> {
+    PROGRAMS_RAN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    RECORDING_PROGRAMS.store(true, std::sync::atomic::Ordering::SeqCst);
+    run();
+    RECORDING_PROGRAMS.store(false, std::sync::atomic::Ordering::SeqCst);
+    std::mem::take(&mut *PROGRAMS_RAN.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+pub(crate) fn program_ran(program: &crate::executor::expression::Program) {
+    if !RECORDING_PROGRAMS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let listing = program.disassemble();
+    let mut ran = PROGRAMS_RAN.lock().unwrap_or_else(|e| e.into_inner());
+    match ran.iter_mut().find(|(seen, _)| *seen == listing) {
+        Some((_, times)) => *times += 1,
+        None => ran.push((listing, 1)),
+    }
+}
+
 /// Expressions this thread compiled into programs, so far
 pub fn program_compiles() -> usize {
     PROGRAM_COMPILES.with(std::cell::Cell::get)

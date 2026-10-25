@@ -123,7 +123,9 @@ pub(crate) fn scan_compares(data_type: crate::core::DataType) -> bool {
 
 /// A value compared with a column of `column_type` as the scan reads it,
 /// for a program that compares it itself. A value the comparison does not
-/// read as the column's type stays as it is for the comparison's own rule
+/// read as the column's type stays as it is for the comparison's own rule.
+/// Out of line: inlined into the VM's op loop, it costs every op registers
+#[inline(never)]
 pub(crate) fn read_as_column(column_type: crate::core::DataType, value: Value) -> Value {
     if !reads_as_column(column_type, &value) {
         return value;
