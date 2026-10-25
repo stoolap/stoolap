@@ -1333,12 +1333,8 @@ impl Executor {
                     *count += 1;
                 }
             }
-            Expression::Identifier(id) => {
-                let name: &str = id.value_lower.as_str();
-                if let Some(count) = ref_counts.get_mut(name) {
-                    *count += 1;
-                }
-            }
+            // A bare name is a column: a source is parsed as a TableSource
+            Expression::Identifier(_) => {}
             Expression::JoinSource(js) => {
                 self.count_cte_references_in_expr(&js.left, ref_counts);
                 self.count_cte_references_in_expr(&js.right, ref_counts);
