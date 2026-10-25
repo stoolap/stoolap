@@ -27,9 +27,8 @@ fn ids(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
     Ok(out)
 }
 
-#[test]
-fn a_subquery_reading_the_outer_row_in_its_having_is_correlated() {
-    let db = Database::open("memory://a_subquery_reading_the_outer_row_in_its_having").unwrap();
+fn create(dsn: &str) -> Database {
+    let db = Database::open(dsn).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, s TEXT)",
         "INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c')",
@@ -39,6 +38,57 @@ fn a_subquery_reading_the_outer_row_in_its_having_is_correlated() {
     ] {
         db.execute(sql, ()).unwrap();
     }
+    db
+}
+
+/// Each subquery beside one that differs only where it reads the outer
+/// row, with the answer of each
+const TWINS: [(&str, &[i64], &str, &[i64]); 2] = [
+    (
+        "(SELECT COUNT(*) FROM u HAVING COUNT(*) > 1) = 2",
+        &[1, 2, 3],
+        "(SELECT COUNT(*) FROM u HAVING COUNT(*) > t.k) = 2",
+        &[1],
+    ),
+    (
+        "(SELECT u.id FROM u ORDER BY (u.id - 1) * (u.id - 1) LIMIT 1) = 2",
+        &[],
+        "(SELECT u.id FROM u ORDER BY (u.id - t.k) * (u.id - t.k) LIMIT 1) = 2",
+        &[2, 3],
+    ),
+];
+
+fn check_twins(db: &Database, correlated_first: bool) {
+    let mut failed = Vec::new();
+    for (plain, plain_ids, correlated, correlated_ids) in TWINS {
+        let mut order = [(plain, plain_ids), (correlated, correlated_ids)];
+        if correlated_first {
+            order.reverse();
+        }
+        for (subquery, want) in order {
+            let sql = format!("SELECT id FROM t WHERE s || 'x' <> 'zx' AND {subquery}");
+            let got = ids(db, &sql);
+            if got.as_deref() != Ok(want) {
+                failed.push(format!("{sql}: {got:?}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+#[test]
+fn a_correlated_subquery_after_its_uncorrelated_twin_reads_the_outer_row() {
+    check_twins(&create("memory://correlated_after_its_twin"), false);
+}
+
+#[test]
+fn an_uncorrelated_subquery_after_its_correlated_twin_answers_alike() {
+    check_twins(&create("memory://uncorrelated_after_its_twin"), true);
+}
+
+#[test]
+fn a_subquery_reading_the_outer_row_in_its_having_is_correlated() {
+    let db = create("memory://a_subquery_reading_the_outer_row_in_its_having");
     let having = "(SELECT COUNT(*) FROM u HAVING COUNT(*) > t.k) = 2";
     let mut failed = Vec::new();
     for filter in [

@@ -982,26 +982,9 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
     }
 }
 
-/// Hash what a subquery's classification depends on: correlation reads the
-/// FROM table/alias list plus WHERE and SELECT columns
-/// (`is_subquery_correlated`), and non-determinism reads the columns.
-fn hash_subquery_structure<H: std::hash::Hasher>(subquery: &SelectStatement, hasher: &mut H) {
-    subquery.columns.len().hash(hasher);
-    for col in &subquery.columns {
-        hash_expression_structure(col, hasher);
-    }
-    subquery.table_expr.is_some().hash(hasher);
-    if let Some(ref table_expr) = subquery.table_expr {
-        hash_table_expr_structure(table_expr, hasher);
-    }
-    if let Some(ref where_clause) = subquery.where_clause {
-        hash_expression_structure(where_clause, hasher);
-    }
-}
-
 /// Hash the join/derived-table shape of a FROM expression, mirroring what
-/// `analyze_table_source` and `collect_tables_recursive` read: join
-/// nesting, join types, and source names WITH aliases (the alias decides
+/// `analyze_table_source` and the correlation rule read: join nesting,
+/// types and conditions, and source names WITH aliases (the alias decides
 /// whether a qualified reference is local or an outer correlation).
 fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     std::mem::discriminant(expr).hash(hasher);
@@ -1010,6 +993,10 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             join.join_type.hash(hasher);
             hash_table_expr_structure(&join.left, hasher);
             hash_table_expr_structure(&join.right, hasher);
+            join.condition.is_some().hash(hasher);
+            if let Some(ref condition) = join.condition {
+                hash_expression_structure(condition, hasher);
+            }
         }
         Expression::Aliased(aliased) => {
             aliased.alias.value_lower.hash(hasher);
@@ -1029,7 +1016,7 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             if let Some(ref alias) = subquery.alias {
                 alias.value_lower.hash(hasher);
             }
-            hash_subquery_structure(&subquery.subquery, hasher);
+            hash_classification_inputs(&subquery.subquery, hasher);
         }
         Expression::FunctionTableSource(fs) => {
             fs.function.value_lower.hash(hasher);
@@ -1164,20 +1151,20 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             quantified.members.len().hash(hasher);
         }
         Expression::ScalarSubquery(subquery) => {
-            hash_subquery_structure(&subquery.subquery, hasher);
+            hash_classification_inputs(&subquery.subquery, hasher);
         }
         Expression::SubquerySource(subquery) => {
             if let Some(ref alias) = subquery.alias {
                 alias.value_lower.hash(hasher);
             }
-            hash_subquery_structure(&subquery.subquery, hasher);
+            hash_classification_inputs(&subquery.subquery, hasher);
         }
         Expression::Exists(exists) => {
-            hash_subquery_structure(&exists.subquery, hasher);
+            hash_classification_inputs(&exists.subquery, hasher);
         }
         Expression::AllAny(all_any) => {
             hash_expression_structure(&all_any.left, hasher);
-            hash_subquery_structure(&all_any.subquery, hasher);
+            hash_classification_inputs(&all_any.subquery, hasher);
         }
         Expression::QualifiedIdentifier(qi) => {
             // CRITICAL: Hash the qualifier (table name/alias) to distinguish correlated references
