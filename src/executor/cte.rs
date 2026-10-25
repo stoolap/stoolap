@@ -438,7 +438,22 @@ impl Executor {
             anchor_columns
         };
 
-        let all_rows = Self::materialize_result(result)?;
+        let mut all_rows = Self::materialize_result(result)?;
+
+        // A branch that does not read the CTE belongs to the first: it runs
+        // once, and its rows start the recursion with the first's
+        let mut recursive_members = Vec::with_capacity(stmt.set_operations.len());
+        for set_op in &stmt.set_operations {
+            if self.statement_reads_cte(&set_op.right, cte_name) {
+                recursive_members.push(&set_op.right);
+                continue;
+            }
+            let (_, rows) = self.execute_cte_query(&set_op.right, ctx, cte_registry)?;
+            let base_id = all_rows.len() as i64;
+            for (i, (_, row)) in rows.into_iter().enumerate() {
+                all_rows.push((base_id + i as i64, row));
+            }
+        }
 
         // If no anchor rows, return empty result
         if all_rows.is_empty() {
@@ -480,10 +495,8 @@ impl Executor {
 
             // Execute each recursive member
             let mut new_rows = RowVec::new();
-            for set_op in &stmt.set_operations {
-                // The recursive member is in set_op.right
-                let recursive_result =
-                    self.execute_cte_query(&set_op.right, ctx, &mut temp_registry)?;
+            for member in &recursive_members {
+                let recursive_result = self.execute_cte_query(member, ctx, &mut temp_registry)?;
 
                 // Extend with rows from recursive result, renumbering row IDs
                 let base_id = new_rows.len() as i64;
@@ -1210,6 +1223,15 @@ impl Executor {
             }
             _ => false,
         }
+    }
+
+    /// Whether `stmt` reads the CTE named `name`, in any of its clauses
+    fn statement_reads_cte(&self, stmt: &SelectStatement, name: &str) -> bool {
+        let name = name.to_lowercase();
+        let mut counts: StringMap<usize> = StringMap::new();
+        counts.insert(name.clone(), 0);
+        self.count_cte_references_in_stmt(stmt, &mut counts);
+        counts.get(&name).is_some_and(|&count| count > 0)
     }
 
     /// Count CTE references in a SELECT statement
