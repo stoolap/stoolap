@@ -183,9 +183,9 @@ const CASES: &[Case] = &[
         "memory",
         "prepared_ordered_read",
         "SELECT t.id, (SELECT MAX(x) FROM u WHERE u.k = t.id) AS m FROM t \
-         ORDER BY c DESC LIMIT 2",
+         ORDER BY c DESC NULLS LAST LIMIT 2",
         "SELECT DISTINCT t.id, (SELECT MAX(x) FROM u WHERE u.k = t.id) AS m FROM t \
-         ORDER BY c DESC, t.id",
+         ORDER BY c DESC NULLS LAST",
         Some((2, 0)),
     ),
     case(
