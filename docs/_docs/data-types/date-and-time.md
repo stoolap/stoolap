@@ -54,11 +54,21 @@ Based on the implementation, Stoolap recognizes various date and time formats:
 15/05/2023                    -- European format (day/month/year)
 ```
 
+A date in either of the last two forms that both can read, such as `03/04/2024`, is read as the US form, month before day: March 4. A year is always written with four digits (`0024-03-04` for the year 24), so `24-03-04` or `3/4/24` reads as no TIMESTAMP and `CAST` gives NULL.
+
 ### Time Only
 ```
 14:30:45.123                  -- Time with milliseconds
 14:30:45                      -- Standard time
 14:30                         -- Hours and minutes only
+```
+
+A time of day alone, read as a TIMESTAMP, is that time on 1970-01-01 (UTC), the same whenever and wherever it is read: `'12:00:00'` is `1970-01-01 12:00:00`. A `TIME` column stores a TIMESTAMP, so its values compare as times of day: `tm < '13:00'` keeps every row before one o'clock, whichever day it was written. For today at a time of day, write it from the clock: `CURRENT_DATE + INTERVAL '12 hours'`.
+
+Before version 0.5.0 a time of day alone took the date it was read on. A `TIME` column written by an earlier version holds those dates; this moves its values onto 1970-01-01, keeping whole seconds:
+
+```sql
+UPDATE events SET start_time = CAST(TO_CHAR(start_time, 'HH24:MI:SS') AS TIMESTAMP);
 ```
 
 ## Date and Time Functions

@@ -40,11 +40,16 @@ const TIMESTAMP_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%S",       // ISO without timezone
     "%Y-%m-%d %H:%M:%S%.f",    // SQL-style with fractional seconds
     "%Y-%m-%d %H:%M:%S",       // SQL-style
-    "%Y-%m-%d",                // Date only
     "%Y/%m/%d %H:%M:%S",       // Alternative with slashes
-    "%Y/%m/%d",                // Alternative date only
-    "%m/%d/%Y",                // US format
-    "%d/%m/%Y",                // European format
+];
+
+/// Date only formats, read at midnight; an input both of the last two read
+/// is read as the first, month before day
+const DATE_FORMATS: &[&str] = &[
+    "%Y-%m-%d", // Date only
+    "%Y/%m/%d", // Alternative date only
+    "%m/%d/%Y", // US format
+    "%d/%m/%Y", // European format
 ];
 
 const TIME_FORMATS: &[&str] = &[
@@ -1447,45 +1452,41 @@ fn parse_iso_fast(b: &[u8]) -> Option<NaiveDateTime> {
 fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
     #[cfg(test)]
     TS_FORMAT_PARSES.with(|count| count.set(count.get() + 1));
-    parse_timestamp_dated(s).map(|(timestamp, _)| timestamp)
-}
-
-/// Whether `s` reads as a TIMESTAMP only as a time of day, which takes the
-/// date of the day it is read on, so the same text reads differently later
-pub fn timestamp_reads_the_clock(s: &str) -> bool {
-    let s = s.trim();
-    parse_iso_fast(s.as_bytes()).is_none() && matches!(parse_timestamp_dated(s), Ok((_, true)))
-}
-
-/// [`parse_timestamp_formats`]'s timestamp, and whether it took today's date
-fn parse_timestamp_dated(s: &str) -> Result<(DateTime<Utc>, bool)> {
-    // Try each timestamp format
-    for format in TIMESTAMP_FORMATS {
-        if let Ok(dt) = DateTime::parse_from_str(s, format) {
-            return Ok((dt.with_timezone(&Utc), false));
+    if four_digit_year(s) {
+        for format in TIMESTAMP_FORMATS {
+            if let Ok(dt) = DateTime::parse_from_str(s, format) {
+                return Ok(dt.with_timezone(&Utc));
+            }
+            // Try parsing as naive datetime and assume UTC
+            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, format) {
+                return Ok(Utc.from_utc_datetime(&ndt));
+            }
         }
-        // Try parsing as naive datetime and assume UTC
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, format) {
-            return Ok((Utc.from_utc_datetime(&ndt), false));
+        for format in DATE_FORMATS {
+            if let Ok(date) = NaiveDate::parse_from_str(s, format) {
+                return Ok(Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN)));
+            }
         }
     }
-
-    // Try date-only formats
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let datetime = date.and_hms_opt(0, 0, 0).unwrap();
-        return Ok((Utc.from_utc_datetime(&datetime), false));
-    }
-
-    // Try time-only formats (use today's date)
+    // A time of day alone is read on 1970-01-01, the same whenever it is read
     for format in TIME_FORMATS {
         if let Ok(time) = NaiveTime::parse_from_str(s, format) {
-            let today = Utc::now().date_naive();
-            let datetime = today.and_time(time);
-            return Ok((Utc.from_utc_datetime(&datetime), true));
+            return Ok(Utc.from_utc_datetime(&NaiveDate::default().and_time(time)));
         }
     }
-
     Err(Error::parse(format!("invalid timestamp format: {}", s)))
+}
+
+/// Whether the date `s` starts with writes its year with four digits, first
+/// as in `2024-03-04` or last as in `03/04/2024`
+fn four_digit_year(s: &str) -> bool {
+    let digits = |b: &[u8]| b.iter().all(u8::is_ascii_digit);
+    let b = s.as_bytes();
+    let date = s.split([' ', 'T']).next().unwrap_or(s).as_bytes();
+    let year_first = b.len() > 4 && digits(&b[..4]) && matches!(b[4], b'-' | b'/');
+    let year_last =
+        date.len() > 5 && date[date.len() - 5] == b'/' && digits(&date[date.len() - 4..]);
+    year_first || year_last
 }
 
 /// Format a float value consistently
@@ -2050,17 +2051,29 @@ mod tests {
     }
 
     #[test]
-    fn a_time_of_day_alone_reads_the_clock() {
-        for text in ["12:00:00", " 12:00:00 ", "12:00"] {
-            assert!(timestamp_reads_the_clock(text), "{text:?}");
+    fn a_text_reads_as_one_timestamp_whenever_it_is_read() {
+        let at = |text: &str| parse_timestamp(text).ok().map(|ts| ts.to_rfc3339());
+        for (text, want) in [
+            ("12:00:00", "1970-01-01T12:00:00+00:00"),
+            (" 12:00 ", "1970-01-01T12:00:00+00:00"),
+            ("12:00:00.5", "1970-01-01T12:00:00.500+00:00"),
+            ("2024-03-04", "2024-03-04T00:00:00+00:00"),
+            ("2024/03/04", "2024-03-04T00:00:00+00:00"),
+            ("03/04/2024", "2024-03-04T00:00:00+00:00"),
+            ("15/05/2023", "2023-05-15T00:00:00+00:00"),
+            ("2024/03/04 05:06:07", "2024-03-04T05:06:07+00:00"),
+            ("0024-03-04", "0024-03-04T00:00:00+00:00"),
+        ] {
+            assert_eq!(at(text).as_deref(), Some(want), "{text:?}");
         }
         for text in [
-            "2024-01-15",
-            "2024-01-15 12:00:00",
-            "2024-01-15T12:00:00Z",
+            "24-03-04",
+            "24/03/04",
+            "3/4/24",
             "not a date",
+            "24-03-04 05:06:07",
         ] {
-            assert!(!timestamp_reads_the_clock(text), "{text:?}");
+            assert_eq!(at(text), None, "{text:?} writes no four digit year");
         }
     }
 

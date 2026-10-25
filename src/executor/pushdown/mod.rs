@@ -130,18 +130,6 @@ pub(crate) fn read_as_column(column_type: crate::core::DataType, value: Value) -
     coerce_constant(Some(column_type), value).unwrap_or_else(Value::null_unknown)
 }
 
-/// Whether [`read_as_column`] gives `value` the same reading whenever it
-/// runs, so a program may read it once when compiled: a TEXT time of day
-/// read as a TIMESTAMP takes the date it is read on
-pub(crate) fn reads_as_column_alike(column_type: crate::core::DataType, value: &Value) -> bool {
-    match (column_type, value) {
-        (crate::core::DataType::Timestamp, Value::Text(text)) => {
-            !crate::core::value::timestamp_reads_the_clock(text)
-        }
-        _ => true,
-    }
-}
-
 /// Whether the comparison reads `value` as a value of `column_type`, so
 /// converting it keeps the answer: a NULL, a value of that type or of the
 /// same number domain, or a TEXT read as a number, BOOLEAN or TIMESTAMP
