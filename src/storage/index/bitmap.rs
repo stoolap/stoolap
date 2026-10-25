@@ -832,14 +832,18 @@ impl Index for BitmapIndex {
         }
     }
 
-    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+    fn get_row_ids_in_into(
+        &self,
+        members: &mut dyn Iterator<Item = &Value>,
+        buffer: &mut Vec<i64>,
+    ) {
         if self.closed.load(AtomicOrdering::Acquire) || self.column_ids.len() != 1 {
             return;
         }
         let bitmaps = self.bitmaps.read();
         let mut found: smallvec::SmallVec<[(*const RoaringTreemap, &RoaringTreemap); 16]> =
             smallvec::SmallVec::new();
-        for value in value_list {
+        for value in members {
             if let Some(bitmap) = bitmaps.get(value) {
                 found.push((bitmap, bitmap));
             }

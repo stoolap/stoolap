@@ -619,10 +619,14 @@ impl Index for PkIndex {
         }
     }
 
-    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+    fn get_row_ids_in_into(
+        &self,
+        members: &mut dyn Iterator<Item = &Value>,
+        buffer: &mut Vec<i64>,
+    ) {
         let inner = self.data.read();
         let mut found: smallvec::SmallVec<[(i64, i64); 16]> = smallvec::SmallVec::new();
-        for value in value_list {
+        for value in members {
             if let Value::Integer(row_id) = value {
                 if inner.contains(*row_id) {
                     found.push((*row_id, *row_id));
@@ -1202,11 +1206,12 @@ mod tests {
         // get_row_ids_in_into for overflow
         buf.clear();
         idx.get_row_ids_in_into(
-            &[
+            &mut [
                 Value::Integer(50_000_000),
                 Value::Integer(i64::MAX - 1),
                 Value::Integer(999),
-            ],
+            ]
+            .iter(),
             &mut buf,
         );
         assert_eq!(buf.len(), 2);
@@ -1329,11 +1334,12 @@ mod tests {
         // get_row_ids_in_into
         let mut buf = Vec::new();
         idx.get_row_ids_in_into(
-            &[
+            &mut [
                 Value::Integer(i64::MIN),
                 Value::Integer(0),
                 Value::Integer(999),
-            ],
+            ]
+            .iter(),
             &mut buf,
         );
         assert_eq!(buf.len(), 2);

@@ -878,11 +878,15 @@ impl Index for BTreeIndex {
         }
     }
 
-    fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
+    fn get_row_ids_in_into(
+        &self,
+        members: &mut dyn Iterator<Item = &Value>,
+        buffer: &mut Vec<i64>,
+    ) {
         let sorted_values = self.sorted_values.read();
         let mut found: smallvec::SmallVec<[(*const RowIdSet, &RowIdSet); 16]> =
             smallvec::SmallVec::new();
-        for value in value_list {
+        for value in members {
             if let Some(rows) = sorted_values.get(value) {
                 found.push((rows, rows));
             }
