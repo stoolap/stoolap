@@ -24,6 +24,8 @@ gem "stoolap"
 
 Requires Ruby `>= 3.3` and a stable [Rust toolchain](https://rustup.rs) at install time. The native extension is compiled from source on your machine via rake-compiler + rb-sys.
 
+The 0.5.0 driver, built on the Stoolap 0.5.0 engine, is in beta. Until the final release, install it with `gem install stoolap --pre`, or pin it in your `Gemfile` with `gem "stoolap", "0.5.0.beta.1"`. The beta pulls the engine from GitHub at install time, so `git` and network access are needed while it compiles.
+
 ## Quick Start
 
 ```ruby
@@ -203,7 +205,7 @@ changes = db.execute_batch(
 
 ## Prepared Statements
 
-Prepared statements parse SQL once, cache the execution plan, and also cache the column-key `String`s on the first query so repeated calls do not re-allocate keys.
+Prepared statements parse SQL once and cache the execution plan. They also cache the frozen column-key `String`s of their result, so repeated calls do not allocate keys; the cache is rebuilt when the result columns change, for example after `ALTER TABLE`.
 
 ```ruby
 insert = db.prepare("INSERT INTO users VALUES ($1, $2, $3)")
@@ -354,6 +356,13 @@ db.query("SELECT * FROM users WHERE id = :id", { "@id" => 1 })
 db.query("SELECT * FROM users WHERE id = :id", { "$id" => 1 })
 ```
 
+Rules for parameter values:
+
+- A named placeholder without a value in the Hash raises `Stoolap::Error` (`named parameter :id has no value`). Keys that the SQL does not use are ignored.
+- A positional Array shorter than the number of placeholders raises `Stoolap::Error`.
+- A Hash needs `:name` placeholders in the SQL; pass an Array for `$1, $2, ...`.
+- `:name` inside a string literal is plain text, not a placeholder.
+
 ## Error Handling
 
 All database errors raise `Stoolap::Error` (a subclass of `StandardError`):
@@ -404,6 +413,13 @@ end
 | `Stoolap::Vector` | `VECTOR(N)` | See below |
 
 Any other type passed as a parameter raises `TypeError`.
+
+Query results map back the same way, with these differences:
+
+- `TIMESTAMP` columns come back as UTC `Time` objects with nanosecond precision.
+- `JSON` columns come back as their JSON text in a `String`; call `JSON.parse` to get a `Hash` or `Array`.
+- `VECTOR` columns come back as `Array<Float>`.
+- Result Hash keys are frozen `String`s. When two columns share a name, the last one wins; alias them to keep both.
 
 ## Vector Similarity Search
 
