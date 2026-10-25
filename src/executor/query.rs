@@ -2257,19 +2257,13 @@ impl Executor {
                     }
                     _ => {
                         // The SELECT column computing the same expression, else the
-                        // hidden column carried for it, as ORDER BY reads them, else
-                        // the column named after it
+                        // hidden column carried for it, as ORDER BY reads them
                         let key = ExprKey::of(expr);
-                        item_column(expr)
-                            .or_else(|| {
-                                result_columns
-                                    .iter()
-                                    .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
-                            })
-                            .or_else(|| {
-                                let expr_str = expr.to_string();
-                                result_columns.iter().position(|c| *c == expr_str)
-                            })
+                        item_column(expr).or_else(|| {
+                            result_columns
+                                .iter()
+                                .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
+                        })
                     }
                 };
                 bound.or_else(hidden)
@@ -2811,8 +2805,8 @@ impl Executor {
                     }
                 }
                 Expression::IntegerLiteral(_) => {}
-                // An expression is read from a column of its own, unless the
-                // SELECT list already has it under a name. A subquery reads
+                // An expression is read from a column of its own, unless a
+                // SELECT item computes it. A subquery reads
                 // the parent row per row, which the sort does for itself
                 other
                     if !matches!(
@@ -2820,13 +2814,12 @@ impl Executor {
                         Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
                     ) && !Self::has_subqueries(other) =>
                 {
-                    let name = other.to_string();
                     let key = ExprKey::of(other);
-                    let aliased = stmt.columns.iter().any(|expr| match expr {
-                        Expression::Aliased(a) => ExprKey::of(&a.expression) == key,
-                        _ => false,
-                    });
-                    if !aliased && !select_columns.contains(name.to_lowercase().as_str()) {
+                    if !stmt
+                        .columns
+                        .iter()
+                        .any(|item| ExprKey::of(unaliased_item(item)) == key)
+                    {
                         return true;
                     }
                 }
@@ -11505,11 +11498,10 @@ impl Executor {
                         ),
                     } =>
                 {
-                    let name = other.to_string();
                     let key = ExprKey::of(other);
-                    if !select_column_names
+                    if !select_exprs
                         .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&name))
+                        .any(|item| ExprKey::of(unaliased_item(item)) == key)
                         && !computed_order_by.iter().any(|e| ExprKey::of(e) == key)
                     {
                         computed_order_by.push(other);
@@ -11631,8 +11623,12 @@ impl Executor {
             .iter()
             .map(|idx| all_columns[*idx].clone())
             .collect();
-        extra_names.extend(computed_order_by.iter().map(|expr| expr.to_string()));
-        extra_names.extend(computed_distinct_on.iter().map(|expr| expr.to_string()));
+        extra_names.extend(
+            computed_order_by
+                .iter()
+                .chain(&computed_distinct_on)
+                .map(|expr| ExprKey::of(expr).hidden_column_name()),
+        );
         let computed = computed_order_by.len() + computed_distinct_on.len();
         let extra_sources = extra_order_indices
             .iter()
@@ -11951,17 +11947,11 @@ impl Executor {
             }
         }
 
-        // An expression the projection put in a column of its own, named
-        // after it, or one the slots above hold; a set operation's branches
-        // compute an item each, so its name binds no other expression
-        let find_column_for = |expr: &Expression| -> Option<usize> {
-            column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
-                let name = expr.to_string();
-                (!set_operation)
-                    .then(|| columns.iter().position(|c| *c == name))
-                    .flatten()
-            })
-        };
+        // An expression an item computes, or one the projection carried in a
+        // column named after its identity, never an output name spelled
+        // like it
+        let find_column_for =
+            |expr: &Expression| -> Option<usize> { column_slots.get(&ExprKey::of(expr)).copied() };
 
         // Each ORDER BY item by its binding: an ordinal by position, a
         // plain name by the column the layout says holds what it reads,

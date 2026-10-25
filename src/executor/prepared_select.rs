@@ -4009,7 +4009,7 @@ impl PreparedProjection {
             });
         }
         // A key reading a SELECT alias reads the value the projection gave
-        // it, under the key's own text, which is how the sort finds it
+        // it, in a column named after the key's identity, as the sort finds it
         let mut extra_names = plan.extra_names;
         let mut extra_sources = plan.extra_sources;
         // Each alias reference is bound to its position by node, not by name,
@@ -4037,7 +4037,7 @@ impl PreparedProjection {
         }
         let alias_ctx = CompileContext::new(columns, registry).with_row2_bindings(&bindings);
         for key in keys {
-            let name = key.to_string();
+            let name = ExprKey::of(key).hidden_column_name();
             if extra_names.contains(&name) {
                 continue;
             }

@@ -778,12 +778,9 @@ impl Executor {
                 // Named by its identity, which the sort reads, so a visible
                 // column that only writes alike is never taken for it
                 let key = ExprKey::of(expr);
-                let written = expr.to_string();
                 let carried = keys.contains(&key)
                     || stmt.columns.iter().any(|c| match c {
-                        Expression::Aliased(a) => {
-                            a.alias.value.as_str() == written || ExprKey::of(&a.expression) == key
-                        }
+                        Expression::Aliased(a) => ExprKey::of(&a.expression) == key,
                         _ => false,
                     });
                 if carried {
