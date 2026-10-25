@@ -25,6 +25,7 @@
 
 use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, SchemaBuilder};
 use crate::parser::ast::*;
+use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
@@ -1314,22 +1315,39 @@ impl Executor {
     pub(crate) fn execute_create_view(
         &self,
         stmt: &CreateViewStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let _ddl = self.engine.ddl_guard();
         let view_name = &stmt.view_name.value;
+        if stmt.if_not_exists && self.engine.get_view(view_name)?.is_some() {
+            return Ok(Box::new(ExecResult::empty()));
+        }
+        let query_sql = stmt.query.to_string();
+        // The view's columns are the ones its query names, its rows not fetched
+        let view = ViewDefinition::new(view_name, query_sql);
+        let mut result = self.execute_view_body(&view, ctx)?;
+        let columns = result.columns().to_vec();
+        result.close()?;
+        // Two names alike as a reference resolves them, lowercase
+        let lower: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
+        for (i, column) in columns.iter().enumerate() {
+            if lower[..i].contains(&lower[i]) {
+                return Err(Error::invalid_argument(format!(
+                    "column '{}' is named more than once in view '{}'",
+                    column, view_name
+                )));
+            }
+        }
+
+        let _ddl = self.engine.ddl_guard();
 
         // Check if a table with the same name exists
         if self.engine.table_exists(view_name)? {
             return Err(Error::TableAlreadyExists(view_name.to_string()));
         }
 
-        // Convert the query to SQL string
-        let query_sql = stmt.query.to_string();
-
         // Create the view (engine handles if_not_exists logic)
         self.engine
-            .create_view(view_name, query_sql, stmt.if_not_exists)?;
+            .create_view(view_name, view.query, Some(columns), stmt.if_not_exists)?;
 
         Ok(Box::new(ExecResult::empty()))
     }

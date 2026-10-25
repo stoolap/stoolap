@@ -1702,6 +1702,14 @@ impl AliasedResult {
             aliased_columns,
         }
     }
+
+    /// `inner` with its columns named `columns`, by position
+    pub fn renamed(inner: Box<dyn QueryResult>, columns: Vec<String>) -> Self {
+        Self {
+            inner,
+            aliased_columns: columns,
+        }
+    }
 }
 
 impl QueryResult for AliasedResult {
@@ -1739,6 +1747,18 @@ impl QueryResult for AliasedResult {
 
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.inner.last_error()
+    }
+
+    fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+        self.inner.try_into_arc_rows()
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        self.inner.estimated_count()
+    }
+
+    fn exact_len(&self) -> Option<usize> {
+        self.inner.exact_len()
     }
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
@@ -2444,5 +2464,16 @@ mod tests {
 
         assert!(result.next());
         assert_eq!(result.row().get(1), Some(&Value::text("Alice")));
+    }
+
+    #[test]
+    fn a_renamed_result_hands_on_its_shared_rows_and_length() {
+        let rows = CompactArc::new(vec![Row::from_values(vec![Value::Integer(1)])]);
+        let inner = ExecutorResult::with_shared_rows(vec!["a".to_string()], rows.clone());
+        let mut result = AliasedResult::renamed(Box::new(inner), vec!["b".to_string()]);
+        assert_eq!(result.columns(), &["b"]);
+        assert_eq!(result.exact_len(), Some(1));
+        let taken = result.try_into_arc_rows().expect("the inner result's rows");
+        assert!(CompactArc::ptr_eq(&taken, &rows), "the same shared rows");
     }
 }

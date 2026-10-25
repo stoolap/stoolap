@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 use std::path::Path;
 
@@ -507,6 +507,9 @@ pub struct ViewDefinition {
     pub original_name: String,
     /// The SQL query string that defines the view
     pub query: String,
+    /// The names of its columns, fixed when it was created; a view recorded
+    /// without them takes the ones its query first gives
+    columns: OnceLock<Vec<String>>,
 }
 
 impl ViewDefinition {
@@ -516,7 +519,18 @@ impl ViewDefinition {
             name: name.to_lowercase(),
             original_name: name.to_string(),
             query,
+            columns: OnceLock::new(),
         }
+    }
+
+    /// The names of its columns, None until they are known
+    pub fn columns(&self) -> Option<&[String]> {
+        self.columns.get().map(Vec::as_slice)
+    }
+
+    /// Fix the names of its columns, unless they are fixed already
+    pub fn record_columns(&self, columns: Vec<String>) -> &[String] {
+        self.columns.get_or_init(|| columns)
     }
 
     /// Serialize view definition to binary format for WAL
@@ -530,6 +544,15 @@ impl ViewDefinition {
         // Query (length-prefixed, using u32 for longer queries)
         buf.extend_from_slice(&(self.query.len() as u32).to_le_bytes());
         buf.extend_from_slice(self.query.as_bytes());
+
+        // Column names, after the query, where a reader before them stops
+        if let Some(columns) = self.columns() {
+            buf.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+            for column in columns {
+                buf.extend_from_slice(&(column.len() as u32).to_le_bytes());
+                buf.extend_from_slice(column.as_bytes());
+            }
+        }
 
         buf
     }
@@ -568,8 +591,29 @@ impl ViewDefinition {
         }
         let query = String::from_utf8(data[pos..pos + query_len].to_vec())
             .map_err(|e| crate::core::Error::internal(format!("invalid view query: {}", e)))?;
+        pos += query_len;
 
-        Ok(Self::new(&original_name, query))
+        let view = Self::new(&original_name, query);
+        if pos == data.len() {
+            return Ok(view);
+        }
+        let invalid = || crate::core::Error::internal("invalid view: bad column names");
+        let read_u32 = |pos: &mut usize| {
+            let bytes = data.get(*pos..*pos + 4).ok_or_else(invalid)?;
+            *pos += 4;
+            let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+            Ok::<_, crate::core::Error>(u32::from_le_bytes(bytes) as usize)
+        };
+        let count = read_u32(&mut pos)?;
+        let mut columns = Vec::with_capacity(count.min(data.len()));
+        for _ in 0..count {
+            let len = read_u32(&mut pos)?;
+            let bytes = data.get(pos..pos + len).ok_or_else(invalid)?;
+            columns.push(String::from_utf8(bytes.to_vec()).map_err(|_| invalid())?);
+            pos += len;
+        }
+        view.record_columns(columns);
+        Ok(view)
     }
 }
 
@@ -4552,8 +4596,15 @@ impl MVCCEngine {
 
     // --- View Management Methods ---
 
-    /// Create a new view
-    pub fn create_view(&self, name: &str, query: String, if_not_exists: bool) -> Result<()> {
+    /// Create a new view with the names of its columns, None when they are
+    /// to be taken from the rows its query first gives
+    pub fn create_view(
+        &self,
+        name: &str,
+        query: String,
+        columns: Option<Vec<String>>,
+        if_not_exists: bool,
+    ) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
         if !self.is_open() {
@@ -4586,6 +4637,9 @@ impl MVCCEngine {
 
         // Create the view definition wrapped in Arc for cheap cloning
         let view_def = Arc::new(ViewDefinition::new(name, query));
+        if let Some(columns) = columns {
+            view_def.record_columns(columns);
+        }
         views.insert(name_lower.clone(), Arc::clone(&view_def));
         // A plan reading a view of this name prepares again
         self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
@@ -5334,35 +5388,13 @@ impl MVCCEngine {
             let entry_data = &data[pos..pos + entry_len];
             pos += entry_len;
 
-            // ViewDefinition format: name_len(u16) + name + query_len(u32) + query
-            let mut vpos = 0;
-            if vpos + 2 > entry_data.len() {
+            let Ok(view_def) = ViewDefinition::deserialize(entry_data) else {
                 continue;
-            }
-            let name_len =
-                u16::from_le_bytes(entry_data[vpos..vpos + 2].try_into().unwrap()) as usize;
-            vpos += 2;
-            if vpos + name_len > entry_data.len() {
-                continue;
-            }
-            let view_name = String::from_utf8_lossy(&entry_data[vpos..vpos + name_len]).to_string();
-            vpos += name_len;
-            if vpos + 4 > entry_data.len() {
-                continue;
-            }
-            let query_len =
-                u32::from_le_bytes(entry_data[vpos..vpos + 4].try_into().unwrap()) as usize;
-            vpos += 4;
-            if vpos + query_len > entry_data.len() {
-                continue;
-            }
-            let query = String::from_utf8_lossy(&entry_data[vpos..vpos + query_len]).to_string();
-
-            let view_def = Arc::new(ViewDefinition::new(&view_name, query));
+            };
             self.views
                 .write()
                 .unwrap()
-                .insert(view_name.to_lowercase(), view_def);
+                .insert(view_def.name.clone(), Arc::new(view_def));
         }
     }
 
@@ -5616,14 +5648,11 @@ impl MVCCEngine {
         };
 
         // Save current views as fallback (if no ddl.bin)
-        let saved_views: Vec<(String, String)> = if ddl_data.is_some() {
+        let saved_views: Vec<Arc<ViewDefinition>> = if ddl_data.is_some() {
             Vec::new()
         } else {
             let views = self.views.read().unwrap();
-            views
-                .values()
-                .map(|v| (v.original_name.clone(), v.query.clone()))
-                .collect()
+            views.values().cloned().collect()
         };
 
         // === Destructive step: clear current state ===
@@ -5758,12 +5787,11 @@ impl MVCCEngine {
             drop(stores);
 
             // Fallback: recreate views from in-memory saved state
-            for (name, query) in &saved_views {
-                let view_def = Arc::new(ViewDefinition::new(name, query.clone()));
+            for view_def in saved_views {
                 self.views
                     .write()
                     .unwrap()
-                    .insert(name.to_lowercase(), view_def);
+                    .insert(view_def.name.clone(), view_def);
             }
         }
 

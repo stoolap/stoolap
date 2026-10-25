@@ -345,9 +345,9 @@ use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
-    DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult,
-    LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
-    StreamingProjectionResult, TopN, TopNResult,
+    AliasedResult, DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult,
+    FilteredResult, LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, RadixOrderSpec,
+    ScannerResult, StreamingProjectionResult, TopN, TopNResult,
 };
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
@@ -7650,7 +7650,23 @@ impl Executor {
 
         // Execute the view's query with incremented depth
         let nested_ctx = ctx.with_incremented_view_depth();
-        self.execute_select(view_select, &nested_ctx)
+        let result = self.execute_select(view_select, &nested_ctx)?;
+        let columns = match view_def.columns() {
+            Some(columns) => columns,
+            None => view_def.record_columns(result.columns().to_vec()),
+        };
+        if columns.len() != result.columns().len() {
+            return Err(Error::InvalidArgument(format!(
+                "view '{}' has {} columns but its query now gives {}: create the view again",
+                view_def.original_name,
+                columns.len(),
+                result.columns().len()
+            )));
+        }
+        if columns == result.columns() {
+            return Ok(result);
+        }
+        Ok(Box::new(AliasedResult::renamed(result, columns.to_vec())))
     }
 
     /// Execute a view as a subquery
