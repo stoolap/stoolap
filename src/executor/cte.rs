@@ -1767,6 +1767,7 @@ impl Executor {
 
         // Push ORDER BY if provided and CTE doesn't have one
         if !hint.order_by.is_empty() && modified_stmt.order_by.is_empty() {
+            super::result::OrderLimitPath::CteOrderLimitPushdown.taken();
             modified_stmt.order_by = hint.order_by.clone();
         }
 
