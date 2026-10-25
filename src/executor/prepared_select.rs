@@ -60,7 +60,7 @@ use super::query_classification::{get_classification, QueryClassification};
 use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
-    extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
+    extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function, item_name,
     order_by_names_an_alias, strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
@@ -4697,7 +4697,7 @@ impl PreparedGrouped {
                     alias: aliased.alias.clone(),
                 }),
                 column => {
-                    let name = executor.grouped_item_name(column);
+                    let name = item_name(column);
                     Expression::Aliased(AliasedExpression {
                         token: Token::new(TokenType::Identifier, &name, Position::default()),
                         expression: Box::new(output(column, key)?),
@@ -5155,6 +5155,8 @@ pub struct PreparedDml {
 struct PreparedReturning {
     /// The target's columns the row returned is laid out for
     columns: CompactArc<Vec<String>>,
+    /// The names of the result's columns, shared by every execution
+    names: CompactArc<Vec<String>>,
     programs: Vec<SharedProgram>,
     /// A value read for each row returned holds a block that reads the target
     reads_target: bool,
@@ -5434,8 +5436,10 @@ impl PreparedDml {
                 let over_returned =
                     CompileContext::new(&scope.columns, &executor.function_registry)
                         .with_prepared_subqueries();
+                let columns = sites.schema.column_names_arc();
                 Some(PreparedReturning {
-                    columns: sites.schema.column_names_arc(),
+                    names: CompactArc::new(Executor::returning_names(sites.values, &columns)),
+                    columns,
                     programs: values
                         .iter()
                         .map(|value| compile_with(&over_returned, value))
@@ -6061,6 +6065,15 @@ impl<'a> DmlRunner<'a> {
             .returning
             .as_ref()
             .map(|returning| returning.programs.as_slice())
+    }
+
+    /// The names of the RETURNING's result columns; None without a
+    /// prepared RETURNING
+    pub(crate) fn returning_names(&self) -> Option<&'a CompactArc<Vec<String>>> {
+        self.prepared
+            .returning
+            .as_ref()
+            .map(|returning| &returning.names)
     }
 
     /// Whether a RETURNING value read for each row returned holds a block

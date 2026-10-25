@@ -45,7 +45,7 @@ use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, static_row_counts};
 use super::utils::{
-    build_column_index_map, for_each_qualified_star_column, order_by_names_an_alias,
+    build_column_index_map, for_each_qualified_star_column, item_name, order_by_names_an_alias,
 };
 use super::Executor;
 
@@ -708,7 +708,7 @@ impl Executor {
 
         // Determine output columns
         let output_columns = self.resolve_cte_output_columns_from_exprs(
-            columns_to_use,
+            &stmt.columns,
             &cte_columns,
             cte_alias.as_deref(),
         )?;
@@ -797,7 +797,7 @@ impl Executor {
         }
     }
 
-    /// Resolve output column names from expression list (for processed subqueries)
+    /// The output column names of the SELECT items `columns` as written
     fn resolve_cte_output_columns_from_exprs(
         &self,
         columns: &[Expression],
@@ -806,7 +806,7 @@ impl Executor {
     ) -> Result<Vec<String>> {
         let mut output_columns = Vec::new();
 
-        for (i, col_expr) in columns.iter().enumerate() {
+        for col_expr in columns {
             match col_expr {
                 Expression::Star(_) => {
                     output_columns.extend(cte_columns.iter().cloned());
@@ -819,15 +819,7 @@ impl Executor {
                         |idx, start| output_columns.push(cte_columns[idx][start..].to_string()),
                     );
                 }
-                Expression::Identifier(id) => {
-                    output_columns.push(id.value.to_string());
-                }
-                Expression::Aliased(aliased) => {
-                    output_columns.push(aliased.alias.value.to_string());
-                }
-                _ => {
-                    output_columns.push(format!("expr{}", i + 1));
-                }
+                other => output_columns.push(item_name(other)),
             }
         }
 

@@ -249,12 +249,15 @@ fn a_prepared_returning_reads_each_execution_s_tables_and_parameters() {
     let names = |result: stoolap::Rows| result.columns().to_vec();
     assert_eq!(
         names(insert.query((5i64,)).unwrap()),
-        ["id", "b", "column_1"]
+        ["id", "b", "(SELECT x FROM u WHERE (u.id = t.b))"]
     );
     db.execute("ALTER TABLE t ADD COLUMN c INTEGER", ())
         .unwrap();
     let result = insert.query((6i64,)).unwrap();
-    assert_eq!(result.columns(), ["id", "b", "c", "column_1"]);
+    assert_eq!(
+        result.columns(),
+        ["id", "b", "c", "(SELECT x FROM u WHERE (u.id = t.b))"]
+    );
     let row = result.into_iter().next().unwrap().unwrap();
     let got: (i64, i64, Option<i64>, i64) = (
         row.get(0).unwrap(),

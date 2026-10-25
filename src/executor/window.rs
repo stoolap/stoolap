@@ -560,7 +560,7 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr,
+    get_table_alias_from_expr, item_name,
 };
 use super::volatility::expression_volatility;
 use super::Executor;
@@ -1990,7 +1990,7 @@ impl Executor {
                         format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
                     if let Some(&idx) = col_index_map.get(&full_name) {
                         items.push(SelectItem {
-                            output_name: format!("{}.{}", qid.qualifier.value, qid.name.value),
+                            output_name: item_name(col_expr),
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
@@ -2002,7 +2002,7 @@ impl Executor {
                     } else {
                         // Column not found - treat as expression and let evaluator handle it
                         items.push(SelectItem {
-                            output_name: format!("{}.{}", qid.qualifier.value, qid.name.value),
+                            output_name: item_name(col_expr),
                             source: SelectItemSource::Expression(col_expr.clone()),
                         });
                     }
@@ -2050,7 +2050,7 @@ impl Executor {
                             wf_idx += 1;
                         }
                         items.push(SelectItem {
-                            output_name: format!("expr_{}", items.len()),
+                            output_name: item_name(col_expr),
                             source: SelectItemSource::ExpressionWithWindow(
                                 col_expr.clone(),
                                 wf_names,
@@ -2058,24 +2058,14 @@ impl Executor {
                         });
                     } else {
                         // An aggregate computed before the window reads its slot
-                        if let Some(&idx) = group_slots.get(&ExprKey::of_call(func)) {
-                            let output_name = match func.arguments.as_slice() {
-                                [] | [Expression::Star(_)] => format!("{}(*)", func.function),
-                                [Expression::Identifier(id)] => {
-                                    format!("{}({})", func.function, id.value)
-                                }
-                                _ => format!("expr_{}", items.len()),
-                            };
-                            items.push(SelectItem {
-                                output_name,
-                                source: SelectItemSource::BaseColumn(idx),
-                            });
-                        } else {
-                            items.push(SelectItem {
-                                output_name: format!("expr_{}", items.len()),
-                                source: SelectItemSource::Expression(col_expr.clone()),
-                            });
-                        }
+                        let source = match group_slots.get(&ExprKey::of_call(func)) {
+                            Some(&idx) => SelectItemSource::BaseColumn(idx),
+                            None => SelectItemSource::Expression(col_expr.clone()),
+                        };
+                        items.push(SelectItem {
+                            output_name: item_name(col_expr),
+                            source,
+                        });
                     }
                 }
                 _ => {
@@ -2094,7 +2084,7 @@ impl Executor {
                             wf_idx += 1;
                         }
                         items.push(SelectItem {
-                            output_name: format!("expr_{}", items.len()),
+                            output_name: item_name(col_expr),
                             source: SelectItemSource::ExpressionWithWindow(
                                 col_expr.clone(),
                                 wf_names,
@@ -2102,7 +2092,7 @@ impl Executor {
                         });
                     } else {
                         items.push(SelectItem {
-                            output_name: format!("expr_{}", items.len()),
+                            output_name: item_name(col_expr),
                             source: SelectItemSource::Expression(col_expr.clone()),
                         });
                     }

@@ -27,11 +27,9 @@ enum State {
     Right,
     /// An error that changes nothing, until the plan step named prepares it
     Fails(&'static str),
-    /// The right rows under other column names, until the issue named is fixed
-    WrongNames(&'static str),
 }
 
-use State::{Fails, Right, WrongNames};
+use State::{Fails, Right};
 
 /// A source over t or u: the WITH it needs, what FROM names, and whether
 /// it holds every column of the table it copies
@@ -389,7 +387,6 @@ fn state(source: &str, cell: &str) -> State {
     const STEP_6: State = Fails("step 6");
     const GRAMMAR: State = Fails("step 6, grammar first");
     match (source, cell) {
-        ("cte_columns" | "recursive" | "series", "limit") => WrongNames("#581"),
         ("series", "body_argument") => GRAMMAR,
         ("cte" | "cte_columns", "insert_values" | "on_conflict_set") => GRAMMAR,
         (_, "join_on_correlated") => STEP_6,
@@ -483,6 +480,23 @@ fn read(db: &Database, sql: &str, context: Context) -> Result<Vec<Vec<String>>, 
     }
 }
 
+/// `want` with its header named over `source`, not `reference`: an item
+/// holding the source is named as written, the source with it
+fn named_over(
+    want: Result<Vec<Vec<String>>, String>,
+    reference: Source,
+    source: Source,
+) -> Result<Vec<Vec<String>>, String> {
+    want.map(|mut rows| {
+        if let Some(header) = rows.first_mut() {
+            for name in header {
+                *name = name.replace(reference.from, source.from);
+            }
+        }
+        rows
+    })
+}
+
 /// That a cell gave what its state says, else a line for the report
 fn judge(
     what: String,
@@ -505,16 +519,6 @@ fn judge(
         )),
         (Fails(owner), Ok(got)) => wrong.push(format!(
             "{what}: gave {got:?}, want {want:?} or an error until {owner}"
-        )),
-        (WrongNames(issue), Ok(got)) if got == want => wrong.push(format!(
-            "{what}: now names its columns right, mark it Right ({issue})"
-        )),
-        (WrongNames(_), Ok(got)) if got[1..] == want[1..] => {}
-        (WrongNames(issue), Ok(got)) => wrong.push(format!(
-            "{what}: gave {got:?}, want {want:?} under other names ({issue})"
-        )),
-        (WrongNames(issue), Err(e)) => wrong.push(format!(
-            "{what}: known wrong names ({issue}), now fails: {e}"
         )),
     }
 }
@@ -546,7 +550,7 @@ fn reads(
                         what,
                         state(source.label, template.name),
                         read(&db, &sql, context),
-                        read(&db, &want, context),
+                        named_over(read(&db, &want, context), reference, *source),
                         &mut wrong,
                     );
                 }
@@ -686,7 +690,7 @@ fn a_write_reading_a_source() {
                         format!("{}/{} sealed {sealed}: {sql}", source.label, template.name),
                         state(source.label, template.name),
                         got,
-                        want.clone(),
+                        named_over(want.clone(), reference, *source),
                         &mut wrong,
                     );
                 }

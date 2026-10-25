@@ -615,13 +615,6 @@ impl Executor {
         let mut schema_builder = SchemaBuilder::new(table_name);
 
         for (i, col_name) in columns.iter().enumerate() {
-            // Extract base column name (without table prefix)
-            let base_name = if let Some(pos) = col_name.rfind('.') {
-                &col_name[pos + 1..]
-            } else {
-                col_name.as_str()
-            };
-
             // Infer data type from first row if available
             let data_type = if let Some(first_row) = rows.first() {
                 if let Some(value) = first_row.get(i) {
@@ -633,7 +626,7 @@ impl Executor {
                 DataType::Text // Default to TEXT for empty result
             };
 
-            schema_builder = schema_builder.add_nullable(base_name, data_type);
+            schema_builder = schema_builder.add_nullable(col_name, data_type);
         }
 
         let schema = schema_builder.build();
