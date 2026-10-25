@@ -168,34 +168,6 @@ pub(crate) fn find_referencing_fks(
     engine.find_referencing_fks(parent_table)
 }
 
-/// Enforce referential actions for DELETE from a parent table.
-/// Accepts an iterator of PK values to avoid allocating a separate Vec.
-///
-/// All CASCADE/SET NULL operations use `txn_id` to participate in the caller's
-/// transaction, ensuring atomicity (rollback undoes cascade effects).
-///
-/// For each deleted PK value, checks all child tables:
-/// - RESTRICT/NO ACTION: error if child rows exist
-/// - CASCADE: delete matching child rows (batched per child table)
-/// - SET NULL: set FK column to NULL in matching child rows (batched per child table)
-///
-/// Returns the total count of cascaded/affected child rows.
-pub(crate) fn enforce_delete_actions_iter<'a>(
-    engine: &MVCCEngine,
-    txn_id: i64,
-    parent_table: &str,
-    deleted_pk_values: impl Iterator<Item = &'a Value>,
-    referencing_fks: &[(String, ForeignKeyConstraint)],
-) -> Result<i32> {
-    if referencing_fks.is_empty() {
-        return Ok(0);
-    }
-
-    let values: Vec<&Value> = deleted_pk_values.collect();
-    pre_check_delete_keys(engine, txn_id, parent_table, &values, referencing_fks)?;
-    apply_delete_actions(engine, txn_id, parent_table, &values, referencing_fks)
-}
-
 /// Ask every key that can refuse the delete before the first change is
 /// made, so a refusal leaves the statement having written nothing.
 ///

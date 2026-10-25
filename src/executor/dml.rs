@@ -3577,9 +3577,9 @@ impl Executor {
             let mut rows_to_delete_by_row_id: Vec<(i64, Option<Row>)> = Vec::new();
             // A row to delete, by its primary key or, without one, its row id
             let mut collect = |row_id: i64, row: &Row| {
-                // Without a primary key the row itself is what the
-                // foreign keys are read from, so it is kept for them too
-                let row_data = if has_returning || (has_referencing_fks && pk_col_idx.is_none()) {
+                // The row itself is what the foreign keys are read from, so
+                // it is kept for them too
+                let row_data = if has_returning || has_referencing_fks {
                     Some(row.clone())
                 } else {
                     None
@@ -3724,21 +3724,20 @@ impl Executor {
             // Drop scanner to release borrow
             drop(scanner);
 
-            // FK enforcement: check/cascade referencing child tables before deleting
-            if has_referencing_fks && !rows_to_delete.is_empty() {
-                super::foreign_key::enforce_delete_actions_iter(
-                    &self.engine,
-                    table.txn_id(),
-                    table_name,
-                    rows_to_delete.iter().map(|(pk, _)| pk),
-                    &referencing_fks,
-                )?;
-            }
-            // Without a primary key each key is read from the column it
-            // names, which is why the rows were kept. Every key is asked
-            // whether it refuses before any key acts, so a refusal leaves
-            // the statement having written nothing
-            if has_referencing_fks && !rows_to_delete_by_row_id.is_empty() {
+            // Each key is read from the column it names, which is why the
+            // rows were kept: a key need not name the primary key. Every key
+            // is asked whether it refuses before any key acts, so a refusal
+            // leaves the statement having written nothing
+            if has_referencing_fks {
+                let kept: Vec<&Row> = rows_to_delete
+                    .iter()
+                    .filter_map(|(_, row)| row.as_ref())
+                    .chain(
+                        rows_to_delete_by_row_id
+                            .iter()
+                            .filter_map(|(_, row)| row.as_ref()),
+                    )
+                    .collect();
                 let keyed_values: Vec<(&(String, crate::core::ForeignKeyConstraint), Vec<Value>)> =
                     referencing_fks
                         .iter()
@@ -3748,12 +3747,8 @@ impl Executor {
                                 .columns
                                 .iter()
                                 .position(|c| c.name_lower == referenced)?;
-                            let values: Vec<Value> = rows_to_delete_by_row_id
-                                .iter()
-                                .filter_map(|(_, row)| {
-                                    row.as_ref().and_then(|r| r.get(idx).cloned())
-                                })
-                                .collect();
+                            let values: Vec<Value> =
+                                kept.iter().filter_map(|r| r.get(idx).cloned()).collect();
                             Some((fk_entry, values))
                         })
                         .collect();
@@ -3821,7 +3816,7 @@ impl Executor {
                     pk_expr.prepare_for_schema(&schema_arc);
                     let deleted = table.delete(Some(&pk_expr))?;
                     if deleted > 0 {
-                        if let Some(row) = row_data {
+                        if let Some(row) = row_data.filter(|_| has_returning) {
                             returning_rows.push(row);
                         }
                         delete_count += deleted;
