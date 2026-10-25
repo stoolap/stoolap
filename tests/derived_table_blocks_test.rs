@@ -623,6 +623,10 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
             "Function not found: NOSUCH",
         ),
         (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT (SELECT nosuch(1)) AS k FROM {Q} ORDER BY k)"),
+            "Function not found: NOSUCH",
+        ),
+        (
             format!("SELECT id FROM t WHERE EXISTS (SELECT q.x FROM {G} GROUP BY q.g)"),
             "Column 'q.x' not found",
         ),
@@ -637,6 +641,12 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
         "SELECT id FROM t WHERE EXISTS (SELECT q.x AS k FROM {Q} ORDER BY k, q.x, x, t.a, ABS(q.x - 9223372036854775807 - 10)) ORDER BY id"
     );
     assert_eq!(answer(&db, &bound), Ok(ids(&[1, 2, 3, 4])), "{bound}");
+    for test in ["IN", "NOT IN"] {
+        let sql = format!(
+            "SELECT id FROM t WHERE EXISTS (SELECT q.x {test} (SELECT 1) AS k FROM {Q} ORDER BY k) ORDER BY id"
+        );
+        assert_eq!(answer(&db, &sql), Ok(ids(&[1, 2, 3, 4])), "{sql}");
+    }
 }
 
 #[test]

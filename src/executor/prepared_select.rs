@@ -60,9 +60,9 @@ use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
-    build_column_index_map, combine_predicates_with_and, dummy_token_clone,
-    expression_contains_aggregate, extract_literal_value, flip_operator, infix_to_operator,
-    is_aggregate_function, item_name, order_by_names_an_alias, strip_table_qualifier,
+    build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
+    extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function, item_name,
+    order_by_names_an_alias, strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -2228,16 +2228,6 @@ fn existence(
     if grouped {
         check_grouped_reads(executor, &stmt, from_names, ctx)?;
     }
-    let own = CompileContext::new(from_names, &executor.function_registry);
-    for ob in &stmt.order_by {
-        let key = with_aliases(&ob.expression, &stmt.columns, from_names);
-        let mut parts = Vec::new();
-        let whole = without_blocks(&key, &mut parts)?;
-        parts.push(whole);
-        for part in &parts {
-            compile_with(&own, part)?;
-        }
-    }
     let where_clause = stmt
         .where_clause
         .as_deref()
@@ -2276,31 +2266,6 @@ fn existence(
         order_by: Vec::new(),
         ..stmt
     })
-}
-
-/// `expr` compiled without its blocks: a subquery reads as NULL, its names
-/// bound by the walk, the left of ANY or ALL as itself, and an aggregate as
-/// NULL, each argument it reads going to `args` to compile on its own
-fn without_blocks(expr: &Expression, args: &mut Vec<Expression>) -> Result<Expression> {
-    let null = || {
-        Expression::NullLiteral(NullLiteral {
-            token: dummy_token_clone(),
-        })
-    };
-    match expr {
-        Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(null()),
-        Expression::AllAny(all_any) => without_blocks(&all_any.left, args),
-        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
-            for arg in &call.arguments {
-                if !matches!(arg, Expression::Star(_)) {
-                    let arg = without_blocks(arg, args)?;
-                    args.push(arg);
-                }
-            }
-            Ok(null())
-        }
-        other => rebuild(other, &mut |child| without_blocks(child, args)),
-    }
 }
 
 /// `sq`'s GROUP BY items as the general path binds a SELECT alias or a
@@ -3550,6 +3515,37 @@ impl Builder<'_> {
         Ok((reads, names))
     }
 
+    /// Bind the ORDER BY the EXISTS block `sq` runs without, as a block binds
+    /// a key that chooses no row, over its derived table's `columns`
+    fn bind_dropped_order(
+        &mut self,
+        sq: &SelectStatement,
+        columns: &[String],
+        outer: &[&ScopeTable],
+        id: u16,
+        work: &Rewritten,
+    ) -> Result<()> {
+        let name = match sq.table_expr.as_deref() {
+            Some(Expression::SubquerySource(derived)) => derived.alias.as_ref(),
+            _ => None,
+        };
+        let name = name.map(|a| a.value_lower.clone()).unwrap_or_default();
+        let schema = untyped_schema(&name, columns);
+        let own = ScopeTable::of(name, &schema);
+        let mut scopes = Vec::with_capacity(outer.len() + 1);
+        scopes.push(&own);
+        scopes.extend_from_slice(outer);
+        let chain = Chain { scopes: &scopes };
+        let registry = &self.executor.function_registry;
+        let compile = CompileContext::new(&own.columns, registry).with_prepared_subqueries();
+        for ob in &sq.order_by {
+            let key = with_aliases(&ob.expression, &sq.columns, &own.columns);
+            let key = self.trial_rewrite(&chain, id, &key, &work.outer)?;
+            compile_with(&compile, &key)?;
+        }
+        Ok(())
+    }
+
     /// The block `sq`, whose derived table reads an enclosing scope, run as
     /// one statement for each call: each name it binds beyond itself reads
     /// a slot its parent fills, as any block's does
@@ -3593,7 +3589,10 @@ impl Builder<'_> {
         .statement(sq, outer, 0, check)?;
         self.max_param = self.max_param.max(max_param);
         let statement = match form {
-            Form::Exists(_) => existence(executor, statement, &from_names, ctx)?,
+            Form::Exists(_) => {
+                self.bind_dropped_order(sq, &from_names, outer, id, &work)?;
+                existence(executor, statement, &from_names, ctx)?
+            }
             _ => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
