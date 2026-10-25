@@ -257,6 +257,21 @@ pub(crate) fn ungrouped_column(name: &str) -> crate::core::Error {
     ))
 }
 
+/// The error the grouped `stmt` raises when it runs over `source` and reads
+/// a column outside its groups, raised without running it
+pub(crate) fn check_grouped_reads(
+    executor: &Executor,
+    stmt: &SelectStatement,
+    source: &[String],
+    ctx: &ExecutionContext,
+) -> Result<()> {
+    let items = executor.parse_group_by(stmt, source)?;
+    match ungrouped_read(stmt, &items, source, ctx) {
+        Some(name) => Err(ungrouped_column(&name)),
+        None => Ok(()),
+    }
+}
+
 /// A column of `source` that `stmt` reads outside every GROUP BY item and
 /// aggregate call, in its SELECT list, HAVING or ORDER BY. Each name binds
 /// as the compiler binds it, the outer row of `ctx` included; a HAVING name

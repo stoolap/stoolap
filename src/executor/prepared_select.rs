@@ -41,8 +41,8 @@ use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Scanner, Table, Transaction};
 
 use super::aggregation::{
-    aggregate_slot_keys, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
-    Modifiers, SqlAggregateFunction, COUNT_STAR,
+    aggregate_slot_keys, check_grouped_reads, grouping_items, ungrouped_column, AggregatePath,
+    CallInputs, GroupByItem, Modifiers, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -60,9 +60,10 @@ use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult};
 use super::utils::{
-    build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
-    extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function, item_name,
-    named_as_written, order_by_names_an_alias, strip_table_qualifier,
+    build_column_index_map, combine_predicates_with_and, dummy_token_clone,
+    expression_contains_aggregate, extract_literal_value, flip_operator, infix_to_operator,
+    is_aggregate_function, item_name, named_as_written, order_by_names_an_alias,
+    strip_table_qualifier,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -73,6 +74,9 @@ const MAX_SCOPES: usize = 32;
 /// The qualifier of a column the resolver bound: NUL, which the lexer
 /// takes in no name, so no table or column can spell it
 const RESOLVED: &str = "\u{0}";
+
+/// The alias a walk gives a FROM source without one, which no name spells
+const UNNAMED_SOURCE: &str = "\u{0}s";
 
 /// Why a statement runs on the general path instead of the prepared one
 pub(crate) type OutOfFamily = &'static str;
@@ -1165,6 +1169,10 @@ struct Level<'s> {
     inside: usize,
     aliases: Vec<SmartString>,
     check: bool,
+    /// The bare names of its own columns written as `qualifier.name`: an
+    /// alias the walk gave a rewritten SELECT item would take them
+    qualify: Vec<SmartString>,
+    qualifier: SmartString,
 }
 
 /// Which clauses of a walked statement raise a name no scope has, since
@@ -1198,7 +1206,8 @@ impl StatementWalk<'_> {
         inside: usize,
         check: Check,
     ) -> Result<(SelectStatement, Vec<String>, Vec<String>)> {
-        let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
+        let (mut table_expr, own) =
+            self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
         scopes.push(&own);
         scopes.extend_from_slice(enclosing);
@@ -1210,18 +1219,49 @@ impl StatementWalk<'_> {
                 _ => None,
             })
             .collect();
-        // A SELECT item reads no alias of its own list; the clauses after it do
+        // A SELECT item reads no alias of its own list; the clauses after it
+        // do. Its names are bound even where the statement runs without it
         let items = Level {
             scopes: scopes.clone(),
             inside: inside + 1,
             aliases: Vec::new(),
-            check: check == Check::All,
+            check: check != Check::Off,
+            qualify: Vec::new(),
+            qualifier: SmartString::new(""),
         };
+        let columns = stmt
+            .columns
+            .iter()
+            .map(|e| self.expr(e, &items))
+            .collect::<Result<Vec<_>>>()?;
+        let qualify: Vec<SmartString> = stmt
+            .columns
+            .iter()
+            .zip(&columns)
+            .filter(|(written, item)| !matches!(written, Expression::Aliased(_)) && item != written)
+            .map(|(written, _)| SmartString::from(item_name(written).to_lowercase()))
+            .collect();
+        let mut qualifier = own
+            .tables
+            .first()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
+        if qualifier.is_empty() && !qualify.is_empty() {
+            qualifier = SmartString::new(UNNAMED_SOURCE);
+            let alias = Some(Identifier::new(dummy_token_clone(), UNNAMED_SOURCE));
+            match table_expr.as_mut() {
+                Some(Expression::SubquerySource(derived)) => derived.alias = alias,
+                Some(Expression::ValuesSource(values)) => values.alias = alias,
+                _ => {}
+            }
+        }
         let level = Level {
             scopes,
             inside: inside + 1,
             aliases,
             check: check == Check::All,
+            qualify,
+            qualifier,
         };
         let sorted = Level {
             check: check != Check::Off,
@@ -1260,11 +1300,11 @@ impl StatementWalk<'_> {
         };
         let walked = SelectStatement {
             distinct_on: all(self, &stmt.distinct_on)?,
-            columns: stmt
-                .columns
-                .iter()
-                .map(|e| Ok(named_as_written(self.expr(e, &items)?, e)))
-                .collect::<Result<_>>()?,
+            columns: columns
+                .into_iter()
+                .zip(&stmt.columns)
+                .map(|(item, written)| named_as_written(item, written))
+                .collect(),
             table_expr: table_expr.map(Box::new),
             where_clause: one(self, &stmt.where_clause)?,
             group_by: GroupByClause {
@@ -1321,6 +1361,8 @@ impl StatementWalk<'_> {
             inside,
             aliases: Vec::new(),
             check: check == Check::All,
+            qualify: Vec::new(),
+            qualifier: SmartString::new(""),
         };
         let untyped = |name: &SmartString, columns: &[String]| {
             ScopeTable::of(name.clone(), &untyped_schema(name, columns))
@@ -1424,6 +1466,15 @@ impl StatementWalk<'_> {
                 match chain.bare(id) {
                     Ok(Some((depth, index))) => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
+                        None if depth == 0 && level.qualify.contains(&id.value_lower) => {
+                            Ok(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                                qualifier: Identifier::new(
+                                    dummy_token_clone(),
+                                    level.qualifier.clone(),
+                                ),
+                                name: id.clone(),
+                            }))
+                        }
                         None => Ok(expr.clone()),
                     },
                     Err(e) if level.check => Err(e),
@@ -2187,15 +2238,27 @@ fn slot_parameter(slot: usize) -> Expression {
 /// The EXISTS block `stmt`, run as a statement, asked only whether it has
 /// a row: one value per row it returns in place of its SELECT items, each
 /// alias or position that read an item reading its expression, no ORDER
-/// BY
+/// BY. What it drops is still bound, as the general path binds it
 fn existence(
     executor: &Executor,
     stmt: SelectStatement,
     from_names: &[String],
+    ctx: &ExecutionContext,
 ) -> Result<SelectStatement> {
     let grouped = !stmt.group_by.columns.is_empty()
         || stmt.having.is_some()
         || stmt.columns.iter().any(expression_contains_aggregate);
+    if grouped {
+        check_grouped_reads(executor, &stmt, from_names, ctx)?;
+    }
+    // A key holding a subquery or an aggregate has only its names bound, by the walk
+    let own = CompileContext::new(from_names, &executor.function_registry);
+    for ob in &stmt.order_by {
+        let key = with_aliases(&ob.expression, &stmt.columns, from_names);
+        if !mentions_subquery(&key) && !expression_contains_aggregate(&key) {
+            compile_with(&own, &key)?;
+        }
+    }
     let where_clause = stmt
         .where_clause
         .as_deref()
@@ -3526,7 +3589,7 @@ impl Builder<'_> {
         .statement(sq, outer, 0, check)?;
         self.max_param = self.max_param.max(max_param);
         let statement = match form {
-            Form::Exists(_) => existence(executor, statement, &from_names)?,
+            Form::Exists(_) => existence(executor, statement, &from_names, ctx)?,
             _ => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);

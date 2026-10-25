@@ -395,6 +395,63 @@ fn a_view_in_a_derived_table_is_read_once_in_the_run_that_prepares_it() {
 }
 
 #[test]
+fn a_view_recorded_without_names_is_read_again_only_by_the_first_statement() {
+    let _turn = turn();
+    let db = hot("view_unnamed_once");
+    db.engine()
+        .create_view("rv", "SELECT RANDOM() AS n".to_string(), None, false)
+        .unwrap();
+    let sql = "SELECT id FROM t WHERE a > (SELECT MAX(q.n) FROM (SELECT n FROM rv) AS q) - 100 \
+               ORDER BY id";
+    for (run, draws) in [("names it", 2), ("keeps its plan", 1)] {
+        let before = random_draws();
+        assert_eq!(answer(&db, sql), Ok(ids(&[1, 2, 3])), "{run}");
+        assert_eq!(random_draws() - before, draws, "the run that {run}");
+    }
+    let other = "SELECT id FROM t WHERE a > (SELECT MAX(n) FROM rv) - 100 ORDER BY id";
+    let before = random_draws();
+    assert_eq!(answer(&db, other), Ok(ids(&[1, 2, 3])), "{other}");
+    assert_eq!(
+        random_draws() - before,
+        1,
+        "a statement after the names are recorded"
+    );
+}
+
+#[test]
+fn a_rewritten_select_item_keeps_its_name_and_binds_no_clause() {
+    let _turn = turn();
+    let db = Database::open("memory://derived_table_blocks_item_alias").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 10)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO u VALUES (1, 1), (2, 2), (3, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (sql, expected) in [
+        ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM u GROUP BY a) q) FROM t", "2"),
+        ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM u GROUP BY u.a HAVING a > 1) q) FROM t", "1"),
+        ("SELECT (SELECT MAX(q.k) FROM (SELECT u.a AS k, t.a FROM u ORDER BY a DESC LIMIT 1) q) FROM t", "2"),
+        ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM u WHERE a = 2) q) FROM t", "2"),
+        ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM (VALUES (1), (2)) GROUP BY column1) q) FROM t", "2"),
+        ("SELECT (SELECT MAX(q.a) FROM (SELECT t.a FROM u GROUP BY a) q) FROM t", "10"),
+    ] {
+        let line = prepared_line(&db, sql);
+        if line != "Prepared: yes" {
+            wrong.push(format!("{sql}: {line}"));
+        }
+        let got = answer(&db, sql);
+        if got != Ok(vec![vec![expected.to_string()]]) {
+            wrong.push(format!("{sql}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn an_exists_over_a_correlated_derived_table_reads_no_select_item() {
     let _turn = turn();
     let db = hot("exists_items");
@@ -541,11 +598,32 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
             format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY ABS(missing))"),
             "missing",
         ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT q.missing AS k FROM {Q} ORDER BY k)"),
+            "q.missing",
+        ),
     ] {
         let got = answer(&db, &sql);
         assert!(
             got.as_ref()
                 .is_err_and(|e| e.contains(&format!("'{missing}' not found"))),
+            "{sql}: {got:?}"
+        );
+    }
+    const G: &str = "(SELECT x, g FROM u WHERE u.id = t.id) AS q";
+    for (sql, error) in [
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {Q} ORDER BY nosuch(q.x))"),
+            "Function not found: NOSUCH",
+        ),
+        (
+            format!("SELECT id FROM t WHERE EXISTS (SELECT q.x FROM {G} GROUP BY q.g)"),
+            "Column 'q.x' not found",
+        ),
+    ] {
+        let got = answer(&db, &sql);
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains(error)),
             "{sql}: {got:?}"
         );
     }
