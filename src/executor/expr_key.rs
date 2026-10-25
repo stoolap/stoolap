@@ -23,7 +23,7 @@ use rustc_hash::FxHasher;
 use crate::core::Value;
 use crate::parser::ast::{
     AllAnyType, Expression, FunctionCall, GroupByModifier, Identifier, OrderByExpression,
-    SelectStatement,
+    SelectStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
 };
 
 /// Two expressions share a key when they are the same computation. The key
@@ -56,6 +56,15 @@ impl ExprKey {
         hasher.by_column_name = true;
         write_expr(expr, &mut hasher);
         hasher.finish()
+    }
+
+    /// The key of the statement `stmt` as [`Self::exact`] keys an expression;
+    /// None when it holds a prepared block, which another statement's id keys alike
+    pub(crate) fn of_statement(stmt: &SelectStatement) -> Option<Self> {
+        let mut hasher = KeyHasher::new();
+        hasher.exact = true;
+        write_statement(stmt, &mut hasher);
+        (!hasher.marked).then(|| hasher.finish())
     }
 
     pub(crate) fn of_call(call: &FunctionCall) -> Self {
@@ -97,6 +106,8 @@ struct KeyHasher {
     exact: bool,
     /// A column is its name alone, see [`ExprKey::by_column_name`]
     by_column_name: bool,
+    /// Whether a prepared block was met, which only its id keys
+    marked: bool,
 }
 
 impl Hasher for KeyHasher {
@@ -117,6 +128,7 @@ impl KeyHasher {
             a: AHasher::default(),
             exact: false,
             by_column_name: false,
+            marked: false,
         }
     }
 
@@ -374,13 +386,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             write_call(&window.function, hasher);
             write_list(&window.partition_by, hasher);
             write_order_by(&window.order_by, hasher);
-            match &window.frame {
-                Some(frame) => {
-                    hasher.flag(true);
-                    hasher.text(&frame.to_string());
-                }
-                None => hasher.flag(false),
-            }
+            write_frame(window.frame.as_ref(), hasher);
             match &window.window_ref {
                 Some(name) => {
                     hasher.flag(true);
@@ -409,10 +415,38 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             write_expr(&all_any.left, hasher);
             write_statement(&all_any.subquery, hasher);
         }
-        // Table sources read the same when they print the same
-        other => {
-            hasher.tag(b'?');
-            hasher.text(&other.to_string());
+        Expression::Default(_) => hasher.tag(b'D'),
+        Expression::TableSource(_)
+        | Expression::JoinSource(_)
+        | Expression::SubquerySource(_)
+        | Expression::ValuesSource(_)
+        | Expression::FunctionTableSource(_)
+        | Expression::CteReference(_) => write_source(expr, hasher),
+    }
+}
+
+/// A window frame by its parts, each offset as the expression it is
+fn write_frame(frame: Option<&WindowFrame>, hasher: &mut KeyHasher) {
+    let bound = |bound: &WindowFrameBound, hasher: &mut KeyHasher| match bound {
+        WindowFrameBound::CurrentRow => hasher.tag(b'c'),
+        WindowFrameBound::UnboundedPreceding => hasher.tag(b'u'),
+        WindowFrameBound::UnboundedFollowing => hasher.tag(b'U'),
+        WindowFrameBound::Preceding(offset) => {
+            hasher.tag(b'p');
+            write_expr(offset, hasher);
+        }
+        WindowFrameBound::Following(offset) => {
+            hasher.tag(b'f');
+            write_expr(offset, hasher);
+        }
+    };
+    hasher.flag(frame.is_some());
+    if let Some(frame) = frame {
+        hasher.flag(matches!(frame.unit, WindowFrameUnit::Rows));
+        bound(&frame.start, hasher);
+        hasher.flag(frame.end.is_some());
+        if let Some(end) = &frame.end {
+            bound(end, hasher);
         }
     }
 }
@@ -422,6 +456,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
 fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
     hasher.flag(stmt.prepared.is_some());
     if let Some(id) = stmt.prepared {
+        hasher.marked = true;
         id.hash(hasher);
         return;
     }
@@ -477,10 +512,7 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
         hasher.name(&window.name);
         write_list(&window.partition_by, hasher);
         write_order_by(&window.order_by, hasher);
-        hasher.flag(window.frame.is_some());
-        if let Some(frame) = &window.frame {
-            hasher.text(&frame.to_string());
-        }
+        write_frame(window.frame.as_ref(), hasher);
     }
     write_order_by(&stmt.order_by, hasher);
     write_optional(stmt.limit.as_deref(), hasher);

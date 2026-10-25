@@ -1019,6 +1019,11 @@ fn test_classifier_rules() {
         format!("SELECT id, {sq} FROM t ORDER BY {sq} DESC, id LIMIT 3 OFFSET $1"),
         format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),
         format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u"),
+        "SELECT id FROM t WHERE a > (SELECT q.v FROM (SELECT id, v FROM u) AS q WHERE q.id = t.id)"
+            .to_string(),
+        "SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT v FROM u WHERE u.id <> t.b) AS q \
+         WHERE q.v = t.id)"
+            .to_string(),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1099,6 +1104,22 @@ fn test_classifier_rules() {
             "SELECT id FROM t WHERE a > (SELECT v FROM u JOIN t AS x ON x.id = u.id WHERE u.id = t.id)"
                 .to_string(),
             "FROM is not one table",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.v FROM u JOIN uv ON uv.id = u.id) \
+             AS q WHERE q.v = t.a)"
+                .to_string(),
+            "a derived table over a join",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u LIMIT t.a) AS q)".to_string(),
+            "a derived table's LIMIT or OFFSET naming a column",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u WHERE v IN \
+             (SELECT x.v FROM u AS x LIMIT t.a)) AS q)"
+                .to_string(),
+            "a derived table's LIMIT or OFFSET naming a column",
         ),
         (
             format!(
@@ -2479,7 +2500,7 @@ fn test_a_block_over_a_view_or_cte_reads_each_statement_s_rows() {
 }
 
 #[test]
-fn test_a_block_source_is_read_before_the_statement_s_rows() {
+fn test_a_block_source_is_read_when_a_call_first_needs_it() {
     let _guard = serial();
     let db = setup("prepared_block_source_error");
     db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)", ())
@@ -2488,17 +2509,43 @@ fn test_a_block_source_is_read_before_the_statement_s_rows() {
         .unwrap();
     db.execute("CREATE VIEW mv AS SELECT id, ABS(x) AS x FROM m", ())
         .unwrap();
-    for sql in [
-        "SELECT id FROM t WHERE id > 100 AND a > (SELECT x FROM mv WHERE mv.id = t.id)",
-        "SELECT id FROM t WHERE id > 100 AND a > \
-         (SELECT w.x FROM (VALUES (1, ABS(-9223372036854775808))) AS w(k, x) WHERE w.k = t.id)",
-    ] {
-        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-        assert!(
-            error(&db, sql, ()).0.contains("overflow"),
-            "{sql}: the source's error, though no row reaches the block"
-        );
+    db.execute("CREATE VIEW unnamed AS SELECT id, ABS(x) FROM m", ())
+        .unwrap();
+    let sources = [
+        "mv",
+        "(VALUES (1, ABS(-9223372036854775808))) AS mv(id, x)",
+        "(SELECT id, ABS(x) AS x FROM m) AS mv",
+        "(SELECT value AS id, value AS x FROM generate_series(1, 2, 0)) AS mv",
+    ];
+    for source in sources {
+        for (reached, sql) in [
+            (false, format!("SELECT id FROM t WHERE id > 100 AND a > (SELECT x FROM {source} WHERE mv.id = t.id)")),
+            (false, format!("SELECT id FROM t WHERE id > 0 OR a > (SELECT x FROM {source} WHERE mv.id = t.id) ORDER BY id")),
+            (true, format!("SELECT id FROM t WHERE a > (SELECT x FROM {source} WHERE mv.id = t.id)")),
+        ] {
+            assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+            let got = db
+                .query(&sql, ())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                .map(|rows| rows.len())
+                .map_err(|e| e.to_string());
+            match reached {
+                false => assert!(
+                    got.is_ok(),
+                    "{sql}: no call needs the source, which raises nothing: {got:?}"
+                ),
+                true => assert!(
+                    got.as_ref()
+                        .is_err_and(|e| e.contains("overflow") || e.contains("step")),
+                    "{sql}: the first call reads the source and raises its error: {got:?}"
+                ),
+            }
+        }
     }
+    // A view's columns are recorded when it is created, so one named as written is read lazily too
+    let sql =
+        "SELECT id FROM t WHERE id > 100 AND a > (SELECT id FROM unnamed WHERE unnamed.id = t.id)";
+    assert_eq!(ids(&db, sql, ()).0, Vec::<i64>::new(), "{sql}");
 }
 
 #[test]

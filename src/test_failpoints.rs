@@ -1465,6 +1465,19 @@ pub(crate) fn prepared_slots(count: usize) {
     PREPARED_SLOTS.with(|slots| slots.set(count));
 }
 
+thread_local! {
+    static PREPARED_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The blocks this thread prepared last, which every run opens and sets up
+pub fn prepared_block_count() -> usize {
+    PREPARED_BLOCKS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn prepared_blocks(count: usize) {
+    PREPARED_BLOCKS.with(|blocks| blocks.set(count));
+}
+
 /// Process-wide: prepared statements that read their rows in ORDER BY
 /// order through an index or a top-k scan
 static PREPARED_ORDERED_READS: std::sync::atomic::AtomicUsize =
@@ -1581,10 +1594,13 @@ pub enum PreparedStrategy {
     /// An uncorrelated block's members read before the rows of a source
     /// that is no table, its conjunct tested over them
     RowsTakeMembers,
+    /// A block whose derived table reads an enclosing scope, run per call
+    /// as a statement of its own
+    BlockStatement,
 }
 
 impl PreparedStrategy {
-    pub const ALL: [PreparedStrategy; 12] = [
+    pub const ALL: [PreparedStrategy; 13] = [
         PreparedStrategy::Probe,
         PreparedStrategy::Once,
         PreparedStrategy::KeyedSet,
@@ -1597,12 +1613,13 @@ impl PreparedStrategy {
         PreparedStrategy::Statement,
         PreparedStrategy::ScanTakesMembers,
         PreparedStrategy::RowsTakeMembers,
+        PreparedStrategy::BlockStatement,
     ];
 }
 
 /// Process-wide: how often each prepared strategy answered
-static PREPARED_STRATEGY_RUNS: [std::sync::atomic::AtomicUsize; 12] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 12];
+static PREPARED_STRATEGY_RUNS: [std::sync::atomic::AtomicUsize; 13] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 13];
 
 /// How often `strategy` answered, so far
 pub fn prepared_strategy_runs(strategy: PreparedStrategy) -> usize {

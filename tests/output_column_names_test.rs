@@ -238,3 +238,27 @@ fn a_grouped_column_keeps_the_spelling_of_its_item() {
     }
     assert_eq!(names(&db, "SELECT A FROM t GROUP BY a"), ["A"]);
 }
+
+#[test]
+fn a_name_no_bare_word_spells_is_quoted_in_the_item_it_names() {
+    let db = hot("quoted_names");
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, \"A b\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO q VALUES (1, 2)", ()).unwrap();
+    for (sql, expected) in [
+        ("SELECT \"A b\", q.\"A b\" FROM q", vec!["A b", "A b"]),
+        (
+            "SELECT \"A b\" + 1, q.\"A b\" * 2, ABS(\"A b\") FROM q",
+            vec!["\"A b\" + 1", "q.\"A b\" * 2", "ABS(\"A b\")"],
+        ),
+        (
+            "SELECT \"A b\" + 1, COUNT(*) FROM q GROUP BY \"A b\"",
+            vec!["\"A b\" + 1", "COUNT(*)"],
+        ),
+    ] {
+        assert_eq!(names(&db, sql), expected, "{sql}");
+    }
+}

@@ -2019,6 +2019,24 @@ pub fn item_name(expr: &Expression) -> String {
     }
 }
 
+/// `item`, standing for the SELECT item `written`, under the name `written`
+/// gives when `item`'s own would differ
+pub fn named_as_written(item: Expression, written: &Expression) -> Expression {
+    match written {
+        Expression::Aliased(_) => item,
+        _ if item == *written => item,
+        _ => {
+            let name = item_name(written);
+            let token = dummy_token(&name, TokenType::Identifier);
+            Expression::Aliased(AliasedExpression {
+                token: token.clone(),
+                expression: Box::new(item),
+                alias: Identifier::new(token, name),
+            })
+        }
+    }
+}
+
 /// The name `item_name` gives an alias or a column, as the item spells it;
 /// None for an item named as written
 pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
@@ -2034,10 +2052,9 @@ pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {
     match expr {
-        Expression::Identifier(id) => id.value.to_string(),
-        Expression::QualifiedIdentifier(qid) => {
-            format!("{}.{}", qid.qualifier.value, qid.name.value)
-        }
+        // A name as the statement's own text spells it, quoted where it must be
+        Expression::Identifier(id) => id.to_string(),
+        Expression::QualifiedIdentifier(qid) => qid.to_string(),
         Expression::IntegerLiteral(lit) => lit.value.to_string(),
         Expression::FloatLiteral(lit) => lit.value.to_string(),
         Expression::StringLiteral(lit) => lit.to_string(),

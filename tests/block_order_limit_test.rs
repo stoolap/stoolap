@@ -515,3 +515,27 @@ fn a_key_looked_at_only_takes_no_slot_of_its_own() {
         "a key that chooses no row reads no enclosing value"
     );
 }
+
+#[test]
+fn a_block_in_a_key_that_chooses_no_row_is_not_kept_to_run() {
+    use stoolap::test_failpoints::prepared_block_count;
+    let _guard = serial();
+    let db = setup("block_order_dropped_blocks");
+    let blocks = |sql: &str| {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        column(&db, sql, 0, ());
+        prepared_block_count()
+    };
+    for from in [
+        "u WHERE u.id = t.id",
+        "(SELECT x FROM u WHERE u.id = t.id) q",
+    ] {
+        let sql = |key: &str| {
+            format!(
+                "SELECT id FROM t WHERE EXISTS (SELECT (SELECT MAX(x) FROM u) AS k, x \
+                 FROM {from} ORDER BY {key}) ORDER BY id"
+            )
+        };
+        assert_eq!(blocks(&sql("k")), blocks(&sql("x")), "{from}");
+    }
+}

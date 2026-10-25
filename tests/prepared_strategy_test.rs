@@ -72,6 +72,12 @@ const CORPUS: &[(&str, &[i64])] = &[
     ("SELECT id FROM t WHERE x = (SELECT MIN(v) FROM u WHERE u.k = t.k HAVING MIN(v) < t.x + 1) ORDER BY id", &[1, 4]),
     ("SELECT id FROM t WHERE x > (SELECT AVG(v) FROM u) ORDER BY id", &[5]),
     ("SELECT id FROM (SELECT id, x FROM t) AS t WHERE x IN (SELECT v FROM u) ORDER BY id", &[1, 4]),
+    ("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT k FROM u) AS q WHERE q.k = t.k) ORDER BY id", &[1, 2, 4]),
+    ("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u WHERE u.k = t.k) AS q WHERE q.v > 1) ORDER BY id", &[1, 4]),
+    ("SELECT id FROM t WHERE x IN (SELECT q.v FROM (SELECT v FROM u WHERE u.k = t.k) AS q) ORDER BY id", &[1, 4]),
+    ("SELECT id FROM t WHERE x NOT IN (SELECT q.v FROM (SELECT v FROM u WHERE u.k = t.k) AS q) ORDER BY id", &[3, 5]),
+    ("SELECT id FROM t WHERE x < (SELECT MAX(q.v) FROM (SELECT v FROM u WHERE u.k = t.k) AS q) ORDER BY id", &[1]),
+    ("SELECT id FROM t WHERE x >= ALL (SELECT q.v FROM (SELECT v FROM u WHERE u.k = t.k) AS q) ORDER BY id", &[3, 4, 5]),
 ];
 
 #[test]

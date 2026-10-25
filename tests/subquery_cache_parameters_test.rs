@@ -161,3 +161,32 @@ fn test_a_parameter_of_another_type_is_another_value() {
         assert_eq!(found, expected, "{named} with {value:?}");
     }
 }
+
+#[test]
+fn a_window_frame_offset_reads_its_own_parameter_slot() {
+    let frame = "ROWS BETWEEN ? PRECEDING AND CURRENT ROW";
+    for (window, sum) in [
+        format!("(SELECT SUM(x) OVER (ORDER BY id {frame}) FROM a ORDER BY id DESC LIMIT 1)"),
+        format!(
+            "(SELECT SUM(x) OVER w FROM a WINDOW w AS (ORDER BY id {frame}) ORDER BY id DESC LIMIT 1)"
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let db = setup(&format!("cache_window_frame_slots_{window}"));
+        let read = |sql: &str, column: usize| -> i64 {
+            db.query(sql, (0i64, 1i64))
+                .unwrap()
+                .map(|row| row.unwrap().get::<i64>(column).unwrap())
+                .next()
+                .unwrap()
+        };
+        // The frame's `?` is the second parameter here and the first below:
+        // the two subqueries print alike and read different slots
+        let second = format!("SELECT DISTINCT ON (b.bid) ?, {sum} FROM b WHERE b.bid = 1");
+        assert_eq!(read(&second, 1), 5, "{second}: one row before the last, 2 + 3");
+        let first = format!("SELECT DISTINCT ON (b.bid) {sum}, ? FROM b WHERE b.bid = 1");
+        assert_eq!(read(&first, 0), 3, "{first}: no row before the last");
+    }
+}

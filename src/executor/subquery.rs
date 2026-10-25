@@ -43,6 +43,7 @@ use super::context::{
     subquery_cache_tables, BatchAggregate, BatchAggregateLookupInfo, CacheTables, ExecutionContext,
     ExistsCorrelationInfo, SemiJoinOrigin, SubqueryStamp,
 };
+use super::expr_key::ExprKey;
 use super::expression::compute_expression_hash;
 use super::index_optimizer::SetTest;
 use super::operator::{ColumnInfo, MaterializedOperator, Operator};
@@ -2899,13 +2900,13 @@ impl Executor {
                 .any(|order| Self::has_subqueries(&order.expression))
     }
 
-    /// The cache key of a subquery that reads no outer row: its text and the
-    /// bindings behind it, since a parameter prints as its marker and one
-    /// text would otherwise answer for two executions. None when the text
-    /// holds an anonymous marker, which two bindings of one statement share.
-    /// The bindings go in debug form: it carries the type a value prints
-    /// without, and escapes a separator a text could otherwise hold. None
-    /// too for a subquery whose answer may change with the statement
+    /// The cache key of a subquery that reads no outer row: its structure,
+    /// each parameter by its slot, and the bindings behind it, since one
+    /// structure would otherwise answer for two executions. Its text is no
+    /// key: a parameter may print as the name it stands for. The bindings go
+    /// in debug form, which carries the type a value prints without. None
+    /// for a subquery whose answer may change with the statement, or that
+    /// holds a prepared block
     pub(crate) fn subquery_cache_key(
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
@@ -2914,10 +2915,7 @@ impl Executor {
         if Self::varies_by_statement(subquery, ctx) {
             return None;
         }
-        let mut key = subquery.to_string();
-        if key.contains('?') {
-            return None;
-        }
+        let mut key = format!("{:?}", ExprKey::of_statement(subquery)?);
         for value in ctx.params() {
             let _ = write!(key, "\u{1}{value:?}");
         }
