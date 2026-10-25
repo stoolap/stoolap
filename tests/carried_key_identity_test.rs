@@ -63,7 +63,7 @@ const SOURCES: [(&str, &str); 5] = [
 const FILTERS: [&str; 2] = ["", " WHERE c.id > (SELECT MIN(id) FROM child) - 1"];
 
 /// (items with `{alias}`, key, the DISTINCT ON head or none)
-const SHAPES: [(&str, &str, &str); 12] = [
+const SHAPES: [(&str, &str, &str); 15] = [
     ("c.b AS \"{alias}\"", "ABS(c.a - 2)", ""),
     ("c.b AS \"{alias}\"", "c.a + 0", ""),
     ("c.b AS \"{alias}\"", "-c.a", ""),
@@ -82,6 +82,22 @@ const SHAPES: [(&str, &str, &str); 12] = [
     ("c.b AS \"{alias}\"", "c.a % 2", "DISTINCT ON (c.a % 2) "),
     ("c.b AS \"{alias}\"", "c.a * 0", "DISTINCT ON (c.a * 0) "),
     ("c.b AS \"{alias}\"", "c.a + 0", "DISTINCT ON (c.a + 0) "),
+    // A window key
+    (
+        "c.b AS \"{alias}\"",
+        "ROW_NUMBER() OVER (ORDER BY c.a, c.id)",
+        "",
+    ),
+    (
+        "c.b AS \"{alias}\", ROW_NUMBER() OVER () AS n",
+        "ROW_NUMBER() OVER (ORDER BY c.a, c.id)",
+        "",
+    ),
+    (
+        "c.b AS \"{alias}\"",
+        "RANK() OVER (PARTITION BY c.a % 2 ORDER BY c.a, c.id)",
+        "",
+    ),
 ];
 
 #[test]
@@ -104,9 +120,9 @@ fn an_output_spelled_like_a_key_does_not_answer_for_it() {
                     let sql = query(&spelled(key));
                     let got = rows(&db, &sql);
                     cases += 1;
-                    // #664: a computed DISTINCT ON key over a derived source
-                    // with a WHERE subquery fails whatever the item is called
-                    let known = head.starts_with("DISTINCT ON")
+                    // #664: a computed DISTINCT ON or window key over a derived
+                    // source with a WHERE subquery fails whatever the item is called
+                    let known = (head.starts_with("DISTINCT ON") || key.contains("OVER"))
                         && !filter.is_empty()
                         && from != "child AS c"
                         && !from.contains("JOIN");
