@@ -50,7 +50,7 @@ impl ExprKey {
     }
 
     /// The key of `expr` with every column read as its name alone, so `t.a`
-    /// and `a` meet; whether their qualifiers agree is the caller's to ask
+    /// and `a` meet; whether they name the same column is the caller's to ask
     pub(crate) fn by_column_name(expr: &Expression) -> Self {
         let mut hasher = KeyHasher::new();
         hasher.by_column_name = true;

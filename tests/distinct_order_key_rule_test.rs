@@ -73,7 +73,6 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         for (items, order_by, key) in [
             ("t.a", "t.b", "t.b"),
             ("t.a", "t.id", "t.id"),
-            ("t.a", "t.a + 1", "(t.a + 1)"),
             ("t.a", "t.a, t.b DESC", "t.b"),
             ("t.a AS k", "t.b", "t.b"),
             ("t.id", "t.b", "t.b"),
@@ -83,6 +82,8 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
                 "(SELECT MAX(x) FROM u WHERE (u.k = t.a))",
             ),
             ("t.a", "t.b LIMIT 2", "t.b"),
+            // A position past the list
+            ("t.a", "2", "2"),
         ] {
             let sql = format!("{with}SELECT DISTINCT {items} FROM {from} ORDER BY {order_by}");
             let key = if key.is_empty() { order_by } else { key };
@@ -94,9 +95,16 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         }
         for (items, order_by) in [
             ("t.a", "t.a"),
+            ("a", "a DESC"),
+            // The same column under a qualifier of this query's FROM, or none
             ("t.a", "a"),
             ("a", "t.a DESC"),
+            // A value the selected columns compute
+            ("t.a", "t.a + 1"),
+            ("a", "-a, t.a * 2"),
+            ("t.a", "CASE WHEN a > 1 THEN 0 ELSE 1 END"),
             ("t.a AS k", "k"),
+            ("t.a, t.b", "2"),
             ("t.a", "1"),
             ("t.a + 1", "t.a + 1"),
             ("t.a, t.b", "t.b, t.a"),
@@ -138,6 +146,11 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
             "SELECT DISTINCT t.* FROM t JOIN u ON u.k = t.a ORDER BY x",
             "x",
         ),
+        // The inner query's column, though the outer one has a column of its name
+        (
+            "SELECT (SELECT DISTINCT p.a FROM e AS c ORDER BY a LIMIT 1) FROM t AS p",
+            "a",
+        ),
     ] {
         if let Some(got) = refusal(rows(db, sql), key) {
             wrong.push(format!(
@@ -148,11 +161,16 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
     for sql in [
         // The item as written, before a SELECT subquery is folded
         "SELECT DISTINCT (SELECT 1) AS k, COUNT(*) ORDER BY (SELECT 1)",
-        // A column the same under a qualifier the item omits, or the reverse
+        // An item and its key written alike
+        "SELECT DISTINCT a + 1 FROM t ORDER BY a + 1",
         "SELECT DISTINCT a + 1 FROM t ORDER BY t.a + 1",
-        "SELECT DISTINCT t.a * 2 FROM t ORDER BY a * 2",
+        "SELECT DISTINCT COUNT(t.a) AS n FROM t GROUP BY a ORDER BY COUNT(a)",
         "SELECT DISTINCT t.* FROM t ORDER BY b",
+        // An enclosing query's column is constant in the subquery
+        "SELECT (SELECT DISTINCT c.a FROM e AS c ORDER BY p.b LIMIT 1) FROM t AS p",
+        "SELECT DISTINCT SUM(a) OVER () AS total FROM t ORDER BY SUM(a) OVER ()",
         "SELECT DISTINCT t.* FROM t JOIN u ON u.k = t.a ORDER BY t.b",
+        "SELECT DISTINCT \"Ä\".* FROM t AS \"Ä\" ORDER BY \"Ä\".a",
         "SELECT DISTINCT a, COUNT(*) AS n FROM t GROUP BY a ORDER BY n, a",
         "SELECT DISTINCT a FROM t WHERE id > (SELECT MIN(id) FROM t) - 1 ORDER BY a",
         "SELECT DISTINCT a FROM t UNION SELECT 7 ORDER BY 1",
@@ -160,6 +178,10 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         if let Err(e) = rows(db, sql) {
             wrong.push(format!("{phase}: {sql}\n  refused: {e}"));
         }
+    }
+    let sql = "SELECT DISTINCT SUM(a) OVER () AS total FROM t ORDER BY SUM(t.a) OVER ()";
+    if !rows(db, sql).is_err_and(|e| e.contains("is not in the SELECT DISTINCT list")) {
+        wrong.push(format!("{phase}: {sql}\n  want the refusal"));
     }
     let prepared = db.prepare("SELECT DISTINCT a FROM t WHERE id > $1 ORDER BY b");
     let refused = match prepared {
@@ -204,7 +226,7 @@ fn the_refusal_names_the_key_and_the_ways_to_write_it() {
         .to_string();
     for part in [
         "ORDER BY b is not in the SELECT DISTINCT list",
-        "Add it to the SELECT list",
+        "Sort by a selected item",
         "MAX(b)",
     ] {
         assert!(message.contains(part), "{message}");

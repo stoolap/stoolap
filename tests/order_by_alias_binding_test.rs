@@ -435,7 +435,7 @@ fn the_rule_holds_for_every_source_and_pipeline() {
     let output = vec![3, 2, 1];
     let input = vec![1, 2, 3];
     // (SELECT items after src.id, ORDER BY, ids in order, whether a star is used,
-    // whether DISTINCT refuses it: a key that is no SELECT item)
+    // whether DISTINCT refuses it: a key the SELECT items do not determine)
     let shapes = [
         ("-k AS k", "k", &output, 0, false),
         ("-k AS k", "src.k", &input, 0, true),
@@ -443,13 +443,13 @@ fn the_rule_holds_for_every_source_and_pipeline() {
         ("-k AS k", "2", &output, 0, false),
         ("-k AS k", "k DESC, src.id", &input, 0, false),
         ("k AS x", "k", &input, 0, false),
-        ("k AS x", "k, k * 2", &input, 0, true),
+        ("k AS x", "k, k * 2", &input, 0, false),
         ("k AS x", "x DESC", &output, 0, false),
         ("-k AS x", "x * 1", &output, 0, true),
         ("-k AS x", "k", &input, 0, true),
         ("*, -k AS k", "k", &output, 1, false),
         ("*, -k AS k", "src.k", &input, 1, false),
-        ("*, -k AS k", "k + 0", &input, 1, true),
+        ("*, -k AS k", "k + 0", &input, 1, false),
         ("src.*, -k AS k", "k", &output, 2, false),
         ("src.*, -k AS k", "src.k", &input, 2, false),
         ("-k AS x", "(SELECT 0) + k", &input, 0, true),
