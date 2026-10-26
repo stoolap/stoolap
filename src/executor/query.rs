@@ -99,12 +99,12 @@ impl OutputLayout {
         }
     }
 
-    /// How many columns the SELECT list shows, before those appended for
-    /// the sort keys
-    fn shown(&self) -> usize {
+    /// How many columns the first `items` SELECT items show, before those
+    /// appended for the sort keys, a hidden key item among them
+    fn shown(&self, items: usize) -> usize {
         self.sources
             .iter()
-            .take_while(|source| source.item.is_some())
+            .take_while(|source| source.item.is_some_and(|item| item < items))
             .count()
     }
 
@@ -167,12 +167,14 @@ fn reads_input(from: Option<&Expression>, qid: &QualifiedIdentifier) -> bool {
 }
 
 /// `stmt`'s sort keys: its ORDER BY keys, then its DISTINCT ON keys, which
-/// are bound, carried and read as ORDER BY keys are
+/// are bound, carried and read as ORDER BY keys are. A set operation's
+/// branch carries no DISTINCT ON key: one reads its first branch's items
 fn sort_keys(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
+    let carried = stmt.set_operations.is_empty();
     stmt.order_by
         .iter()
         .map(|ob| &ob.expression)
-        .chain(&stmt.distinct_on)
+        .chain(stmt.distinct_on.iter().filter(move |_| carried))
 }
 
 /// Each input column `stmt`'s sort keys read by their binding, with the
@@ -1545,24 +1547,25 @@ impl Executor {
         let prepared_visible = prepared_visible.or(visible);
 
         // Count expected SELECT columns (before any extra ORDER BY columns).
-        // Beside a star the count is unknown, but the only columns past
-        // the visible ones are then the window functions ORDER BY had
-        // computed for it, so those are counted off the end, or the
-        // columns the layout says no SELECT item gives
-        let expected_columns = match prepared_visible
-            .unwrap_or_else(|| self.count_select_columns(stmt))
-        {
-            0 if hidden_windows + hidden_keys > 0 => {
-                let hidden = hidden_windows + hidden_keys;
-                if hidden > 0 {
-                    columns.len().saturating_sub(hidden)
-                } else {
-                    0
+        // Beside a star the count is unknown: the layout says which columns
+        // a SELECT item gives; without one, the only columns past the
+        // visible ones are the window functions ORDER BY had computed for
+        // it, so those are counted off the end
+        let expected_columns =
+            match prepared_visible.unwrap_or_else(|| self.count_select_columns(stmt)) {
+                0 if stmt.set_operations.is_empty() && layout.is_some() => {
+                    layout.as_deref().map_or(0, |l| l.shown(written_items))
                 }
-            }
-            0 if stmt.set_operations.is_empty() => layout.as_deref().map_or(0, OutputLayout::shown),
-            counted => counted,
-        };
+                0 if hidden_windows + hidden_keys > 0 => {
+                    let hidden = hidden_windows + hidden_keys;
+                    if hidden > 0 {
+                        columns.len().saturating_sub(hidden)
+                    } else {
+                        0
+                    }
+                }
+                counted => counted,
+            };
 
         // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
@@ -2044,15 +2047,17 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let columns = CompactArc::new(result.columns().to_vec());
         let set_operation = !stmt.set_operations.is_empty();
+        // A set operation's rows keep where its first branch put its items,
+        // which the layout says; only without one do output names stand
         let (mut mapped, mut slots) = self.key_columns(
             stmt,
             stmt.distinct_on.iter(),
             &columns,
             layout,
-            set_operation,
+            set_operation && layout.is_none(),
         );
         // A position names one of the columns the SELECT list shows
-        let shown = layout.map_or(columns.len(), OutputLayout::shown);
+        let shown = layout.map_or(columns.len(), |l| l.shown(stmt.columns.len()));
         for (column, key) in mapped.iter_mut().zip(&stmt.distinct_on) {
             if let Expression::IntegerLiteral(lit) = key {
                 *column = column.filter(|&c| lit.value >= 1 && c < shown);

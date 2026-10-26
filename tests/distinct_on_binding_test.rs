@@ -78,7 +78,7 @@ const FILTERS: [(&str, &str); 2] = [
 ];
 
 /// (name, items, DISTINCT ON key, the key written out over the input)
-const SHAPES: [(&str, &str, &str, &str); 17] = [
+const SHAPES: [(&str, &str, &str, &str); 20] = [
     ("column", "c.b", "c.a", "c.a"),
     ("bare column", "c.b", "a", "c.a"),
     ("computed", "c.b", "c.a % 2", "c.a % 2"),
@@ -122,6 +122,20 @@ const SHAPES: [(&str, &str, &str, &str); 17] = [
         "p.b + c.a % 2",
         "c.a % 2",
     ),
+    // `{k}` is a column the star may not show: the join's other side
+    ("qualified star, other column", "c.*", "{k} % 2", "{k} % 2"),
+    (
+        "windowed star",
+        "*, ROW_NUMBER() OVER () * 0 AS w",
+        "{k} % 2",
+        "{k} % 2",
+    ),
+    (
+        "windowed qualified star",
+        "c.*, ROW_NUMBER() OVER () * 0 AS w",
+        "{k} % 2",
+        "{k} % 2",
+    ),
 ];
 
 /// Where the query stands: alone, as a derived table, or as scalar subqueries
@@ -144,7 +158,9 @@ fn a_distinct_on_key_answers_as_its_written_out_key() {
         } else {
             "child AS c"
         };
+        let other = if from.contains("JOIN") { "s.k" } else { "c.a" };
         for (name, items, key, written) in SHAPES {
+            let (key, written) = (&*key.replace("{k}", other), &*written.replace("{k}", other));
             let enclosing = key.contains("p.");
             // A star written out as its columns
             let star = if from.contains("JOIN") {
@@ -241,6 +257,42 @@ fn a_distinct_on_key_answers_as_its_written_out_key() {
         "{total} of {cases} wrong:\n{}",
         table.join("\n")
     );
+}
+
+#[test]
+fn a_set_operation_reads_a_key_its_first_branch_selects() {
+    let db = Database::open("memory://distinct_on_binding_set_operation").unwrap();
+    setup(&db);
+    // (first branch's item, key): each key is that item's value
+    let shapes = [
+        ("c.a % 2", "c.a % 2"),
+        ("c.a % 2 AS m", "m"),
+        ("c.a % 2 AS m", "c.a % 2"),
+        ("c.a % 2", "1"),
+        ("c.a", "c.a"),
+        ("c.a", "a"),
+    ];
+    let mut wrong = Vec::new();
+    for (_, with, from) in SOURCES {
+        for (item, key) in shapes {
+            let unaliased = item.split(" AS ").next().unwrap_or(item);
+            let sql = format!(
+                "{with}SELECT DISTINCT ON ({key}) {item} FROM {from} \
+                 UNION ALL SELECT {unaliased} FROM {from}"
+            );
+            let all = format!("{with}SELECT {unaliased} FROM {from}");
+            let mut want = collect(db.query(&all, ())).unwrap_or_else(|e| panic!("{all}: {e}"));
+            want.sort();
+            want.dedup();
+            for (run, got) in runs(&db, &sql) {
+                let got = got.map(|rows| sorted(rows, true));
+                if got.as_ref() != Ok(&want) {
+                    wrong.push(format!("{sql} ({run}): {got:?}, want {want:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[test]
