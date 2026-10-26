@@ -396,6 +396,72 @@ fn a_key_that_is_the_select_item_answers_with_the_value_it_sorted() {
 }
 
 #[test]
+fn a_row_block_binds_its_order_by_names_as_a_value_block_does() {
+    let _guard = serial();
+    let db = setup("block_order_row_binding");
+    for (item, key) in [
+        ("-u.id AS id", "id"),
+        ("-u.id AS id", "id + 0"),
+        ("-u.x AS k", "k"),
+        ("-u.x AS y", "-y"),
+        ("x * 2", "x * 2 DESC"),
+    ] {
+        let value = format!("(SELECT {item} FROM u WHERE u.k = t.id ORDER BY {key} LIMIT 1)");
+        for (row, block) in [
+            (format!("({value}, 0)"), format!("{item}, 0")),
+            (format!("(0, {value})"), format!("0, {item}")),
+        ] {
+            let block = format!("SELECT {block} FROM u WHERE u.k = t.id ORDER BY {key} LIMIT 1");
+            for (sql, want) in [
+                (
+                    format!("SELECT id FROM t WHERE {row} IS NOT DISTINCT FROM ({block})"),
+                    vec![Some(1), Some(2), Some(3)],
+                ),
+                (
+                    format!("SELECT id FROM t WHERE {row} IN ({block})"),
+                    column(
+                        &db,
+                        &format!("SELECT id FROM t WHERE {value} IS NOT NULL"),
+                        0,
+                        (),
+                    ),
+                ),
+            ] {
+                assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+                assert_eq!(column(&db, &sql, 0, ()), want, "{sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_row_block_key_that_is_a_value_answers_with_the_value_it_sorted() {
+    let _guard = serial();
+    let db = setup("block_order_row_value");
+    for sql in [
+        "SELECT (0.5, 0) < (SELECT RANDOM() AS r, 0 FROM u ORDER BY r LIMIT 1) FROM t",
+        "SELECT (0.5, 0) > ANY (SELECT 0 + RANDOM(), 0 FROM u ORDER BY 0 + RANDOM() LIMIT 1) \
+         FROM t",
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let draws = random_draws();
+        let found = db.query(sql, ()).unwrap().collect::<Result<Vec<_>, _>>();
+        assert_eq!(found.unwrap().len(), 4);
+        assert_eq!(
+            random_draws() - draws,
+            8,
+            "{sql}: one run, one draw per inner row and none for the answer"
+        );
+    }
+    let refused =
+        "SELECT (0.5, 0) < (SELECT RANDOM() AS r, 0 FROM u ORDER BY r + 0 LIMIT 1) FROM t";
+    assert_eq!(
+        prepared_line(&db, refused),
+        "Prepared: no (an ORDER BY expression reading a volatile SELECT alias)"
+    );
+}
+
+#[test]
 fn an_exists_reads_no_row_past_the_first_its_offset_leaves() {
     let _guard = serial();
     let db = setup("block_order_exists_stops");

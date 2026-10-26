@@ -525,14 +525,20 @@ impl<'a> Family<'a> {
         // Keys that choose no row are bound but never computed
         let chooses =
             !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
-        let volatile_alias = match sq.columns.as_slice() {
-            [Expression::Aliased(item)]
-                if volatile(&item.expression, &self.executor.function_registry) =>
-            {
-                Some(&item.alias.value_lower)
-            }
-            _ => None,
-        };
+        let volatile_aliases: SmallVec<[&str; 1]> = sq
+            .columns
+            .iter()
+            .filter_map(|column| match column {
+                Expression::Aliased(item)
+                    if volatile(&item.expression, &self.executor.function_registry) =>
+                {
+                    Some(item.alias.value_lower.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let reads_volatile_alias =
+            |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
         let mut found = false;
         for ob in &sq.order_by {
             let key = &ob.expression;
@@ -543,10 +549,8 @@ impl<'a> Family<'a> {
             if !chooses && mentions_subquery(key) {
                 return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
             }
-            if let Some(alias) = volatile_alias.filter(|_| !order_by_names_an_alias(key, sq)) {
-                if names_any(key, &|name| name == alias.as_str()) {
-                    return Err("an ORDER BY expression reading a volatile SELECT alias");
-                }
+            if !order_by_names_an_alias(key, sq) && reads_volatile_alias(key) {
+                return Err("an ORDER BY expression reading a volatile SELECT alias");
             }
             self.expression(key, scopes, Site::Values, &mut found)?;
         }
@@ -557,10 +561,8 @@ impl<'a> Family<'a> {
             if mentions_subquery(key) {
                 return Err("a subquery block's DISTINCT ON key holding a subquery");
             }
-            if let Some(alias) = volatile_alias {
-                if names_any(key, &|name| name == alias.as_str()) {
-                    return Err("a DISTINCT ON key reading a volatile SELECT alias");
-                }
+            if reads_volatile_alias(key) {
+                return Err("a DISTINCT ON key reading a volatile SELECT alias");
             }
             self.expression(key, scopes, Site::Values, &mut found)?;
         }
@@ -2969,6 +2971,9 @@ struct BlockOrder {
     keys: Vec<(Option<SharedProgram>, bool, Option<bool>)>,
     /// The first key that is the SELECT item, which the answer reads
     item: Option<usize>,
+    /// For each of a row's values, the key that is it, which the member
+    /// reads; empty for a single item
+    values: Vec<Option<usize>>,
     /// The DISTINCT ON keys over the block's row: the first row in order of
     /// each of their values is kept, before the OFFSET
     distinct: Vec<SharedProgram>,
@@ -4499,13 +4504,41 @@ impl Builder<'_> {
         let cut =
             sq.limit.is_some() || sq.offset.is_some() || (!sq.distinct_on.is_empty() && !exists);
         let chooses = cut && !exists;
-        // A row's values each sort as the expression they are
         let item = projection.and(sq.columns.first());
         let (mut order_keys, mut bound_only) = (Vec::new(), Vec::new());
+        // For each of a row's values, the key that sorts by it, whose value
+        // the member reads
+        let mut row_keys = vec![None; if values.len() > 1 { values.len() } else { 0 }];
         if matches!(form, Form::Exists(_)) {
             check_block_positions(sq, scope.columns.len())?;
         }
         for ob in &sq.order_by {
+            // A key naming one of a row's values, by its alias or as written,
+            // sorts by that value as a single item's does
+            if !row_keys.is_empty() && chooses {
+                let named = match &ob.expression {
+                    Expression::Identifier(name) if order_by_names_an_alias(&ob.expression, sq) => {
+                        sq.columns.iter().position(|column| {
+                            matches!(column, Expression::Aliased(a)
+                                if a.alias.value_lower == name.value_lower)
+                        })
+                    }
+                    key if !mentions_subquery(key) => self
+                        .trial_rewrite(&chain, id, key, &work.outer)
+                        .ok()
+                        .and_then(|key| {
+                            values
+                                .iter()
+                                .position(|value| ExprKey::exact(value) == ExprKey::exact(&key))
+                        }),
+                    _ => None,
+                };
+                if let Some(at) = named {
+                    row_keys[at].get_or_insert(order_keys.len());
+                    order_keys.push((Some(values[at].clone()), ob.ascending, ob.nulls_first));
+                    continue;
+                }
+            }
             // A bare alias sorts by the item's value
             let alias = item.is_some() && order_by_names_an_alias(&ob.expression, sq);
             let key = match alias {
@@ -4673,6 +4706,7 @@ impl Builder<'_> {
                 };
                 Some(Box::new(BlockOrder {
                     item: order_keys.iter().position(|(key, ..)| key.is_none()),
+                    values: row_keys,
                     keys: order_keys
                         .iter()
                         .map(|(key, ascending, nulls)| {
@@ -11295,7 +11329,18 @@ impl PreparedRunner<'_> {
         }
         let exec = ExecuteContext::with_common_params(&row, params, self.transaction_id)
             .with_subquery_executor(self);
-        self.candidate(members, vm, &exec)
+        if order.values.is_empty() {
+            return self.candidate(members, vm, &exec);
+        }
+        let programs = std::iter::once(&members.projection).chain(&members.rest);
+        let mut values = SmallVec::with_capacity(order.values.len());
+        for (key, program) in order.values.iter().zip(programs) {
+            values.push(match key {
+                Some(key) => std::mem::replace(&mut keys[*key], Value::null_unknown()),
+                None => vm.execute(program, &exec)?,
+            });
+        }
+        Ok(Member::Row(values))
     }
 
     /// `value` tested by the probe against the buffer filled: a member that
