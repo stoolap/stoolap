@@ -475,8 +475,6 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
-        self.order(sq, scopes, false)?;
-        self.block_from(sq.table_expr.as_deref())?;
         let [column] = sq.columns.as_slice() else {
             return Err("a subquery block without exactly one SELECT expression");
         };
@@ -484,6 +482,11 @@ impl<'a> Family<'a> {
         if matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
             return Err("a subquery block selecting *");
         }
+        if windowed_block(sq) {
+            return self.derived(sq);
+        }
+        self.order(sq, scopes, false)?;
+        self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
         self.expression(column, scopes, list_site(sq), &mut found)?;
         self.grouping(sq, scopes)?;
@@ -616,6 +619,9 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
+        if windowed_block(sq) {
+            return self.derived(sq);
+        }
         self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
@@ -673,6 +679,15 @@ fn grouped_block(sq: &SelectStatement) -> bool {
         || matches!(sq.group_by.modifier, GroupByModifier::GroupingSets(_))
         || sq.having.is_some()
         || sq.columns.iter().any(expression_contains_aggregate)
+}
+
+/// A block whose SELECT list or ORDER BY computes a window function, which
+/// runs as one statement for each call
+fn windowed_block(sq: &SelectStatement) -> bool {
+    sq.columns
+        .iter()
+        .chain(sq.order_by.iter().map(|ob| &ob.expression))
+        .any(QueryClassification::expression_has_window_function)
 }
 
 /// What a block's SELECT list may hold
@@ -3600,9 +3615,9 @@ impl Builder<'_> {
         Ok(())
     }
 
-    /// The block `sq`, whose derived table reads an enclosing scope, run as
-    /// one statement for each call: each name it binds beyond itself reads
-    /// a slot its parent fills, as any block's does
+    /// The block `sq`, whose derived table reads an enclosing scope or which
+    /// computes a window function, run as one statement for each call: each
+    /// name it binds beyond itself reads a slot its parent fills
     fn statement_block(
         &mut self,
         sq: &SelectStatement,
@@ -4035,6 +4050,9 @@ impl Builder<'_> {
         parent: Option<u16>,
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
+        if windowed_block(sq) {
+            return self.statement_block(sq, outer, parent, form);
+        }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities
         let picks = grouped_block(sq) || !matches!(form, Form::Scalar);
         let executor = self.executor;
