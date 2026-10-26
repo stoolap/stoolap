@@ -1497,6 +1497,26 @@ fn parse_iso_fast(b: &[u8]) -> Option<NaiveDateTime> {
     date.and_hms_nano_opt(hour, minute, second, nanos)
 }
 
+/// Whether `s` ends with a zone written as `Z`, or a sign and `HH`, `HHMM` or
+/// `HH:MM`; chrono's `%#z` reads a lone `+HH:` too
+fn zone_written(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.last() == Some(&b'Z') {
+        return true;
+    }
+    // The zone's sign comes after the date's dashes and the time
+    let Some(sign) = b.iter().rposition(|&c| c == b'+' || c == b'-') else {
+        return false;
+    };
+    let digits = |part: &[u8]| part.iter().all(u8::is_ascii_digit);
+    sign >= 19
+        && match &b[sign + 1..] {
+            zone @ ([_, _] | [_, _, _, _]) => digits(zone),
+            [h1, h2, b':', m1, m2] => digits(&[*h1, *h2, *m1, *m2]),
+            _ => false,
+        }
+}
+
 /// `parse_timestamp` through chrono's parser, one format after another
 fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
     #[cfg(test)]
@@ -1505,6 +1525,9 @@ fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
         for format in TIMESTAMP_FORMATS {
             // A zone the format reads is never dropped: a time without one is UTC
             if format.ends_with('z') {
+                if !zone_written(s) {
+                    continue;
+                }
                 if let Ok(dt) = DateTime::parse_from_str(s, format) {
                     return Ok(dt.with_timezone(&Utc));
                 }
@@ -2151,6 +2174,14 @@ mod tests {
             "2024-01-10 00:00:00 UTC",
             "2024-01-10 00:00:00+5",
             "2024-01-10 00:00:00+25:00",
+            "2024-01-10T03:00:00+03:",
+            "2024-01-10 03:00:00+03:",
+            "2024-01-10 03:00:00+3:00",
+            "2024-01-10 03:00:00+03:0",
+            "2024-01-10 03:00:00+030",
+            "2024-01-10 03:00:00+03:00:00",
+            "2024-01-10 03:00:00 + 03:00",
+            "2024-01-10 03:00:00z",
         ] {
             assert_eq!(at(text), None, "{text:?}");
         }

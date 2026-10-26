@@ -151,13 +151,19 @@ fn a_sealed_zone_after_the_time_reads_as_its_instant_in_every_context() {
 }
 
 #[test]
-fn a_zone_out_of_range_reads_as_no_timestamp() {
+fn a_zone_out_of_range_or_not_written_whole_reads_as_no_timestamp() {
     let db = Database::open("memory://a_zone_out_of_range_reads_as_no_timestamp").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP)", ())
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, '2024-01-10 00:00:00')", ())
         .unwrap();
-    for text in ["2024-01-10 00:00:00+25:00", "2024-01-10T00:00:00+25:00"] {
+    for text in [
+        "2024-01-10 00:00:00+25:00",
+        "2024-01-10T00:00:00+25:00",
+        "2024-01-10T03:00:00+03:",
+        "2024-01-10 03:00:00+03:",
+        "2024-01-10 03:00:00+03:0",
+    ] {
         assert_eq!(
             truth(
                 &db,
@@ -188,6 +194,7 @@ fn a_typed_literal_that_reads_as_no_timestamp_is_an_error() {
         "SELECT TIMESTAMP 'not a date'",
         "SELECT DATE '2024-13-01'",
         "SELECT TIMESTAMP '2024-01-10 00:00:00+25:00'",
+        "SELECT TIMESTAMP '2024-01-10T03:00:00+03:'",
     ] {
         let failed = db
             .query(sql, ())
