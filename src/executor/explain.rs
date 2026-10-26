@@ -602,9 +602,9 @@ impl Executor {
         // A join with CTEs keeps its plan as execution keeps it, its CTE
         // sides named by their bodies
         let ctx = match select.with.as_ref() {
-            Some(with) if self.join_keeps_plan(select, with) => self
-                .named_ctes(with)
-                .map_err(|_| "a CTE not named before it runs")?,
+            Some(with) if self.join_keeps_plan(select, with) => {
+                self.named_ctes(with).map_err(|_| "a WITH clause")?
+            }
             Some(_) => return Err("a WITH clause"),
             None => ExecutionContext::new(),
         };

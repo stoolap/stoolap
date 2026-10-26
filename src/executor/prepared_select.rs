@@ -6436,6 +6436,11 @@ impl JoinBlocks {
         })
     }
 
+    /// Whether the statement holds a condition on side `side` alone
+    pub(crate) fn side_asks(&self, side: usize) -> bool {
+        self.side_wheres[side].is_some()
+    }
+
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
     fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
@@ -6872,9 +6877,10 @@ impl Executor {
         )))
     }
 
-    /// The rows of `result`, side `expr` read whole, side `side` of the join
-    /// `held` prepared, that its conditions on that side pass and the
-    /// `extra` ones too: from the `offset`-th up to `limit` of them
+    /// `result`, side `expr` as the general path read it, side `side` of the
+    /// join `held` prepared, cut to the rows its conditions on that side and
+    /// the `extra` ones pass: as it is read, or read whole first when a
+    /// condition asks a block of each row
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn join_source_side_rows(
         &self,
@@ -6884,8 +6890,6 @@ impl Executor {
         (expr, result): (&Expression, Box<dyn crate::storage::traits::QueryResult>),
         ctx: &ExecutionContext,
         extra: Option<&Expression>,
-        limit: Option<usize>,
-        offset: usize,
     ) -> Result<Box<dyn crate::storage::traits::QueryResult>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
@@ -6893,6 +6897,30 @@ impl Executor {
         let alias = alias.as_str();
         let columns = CompactArc::new(result.columns().to_vec());
         held.rows_fit(side, alias, &columns)?;
+        // A side with no condition of its own passes on as the join reads it
+        let Some(where_) = &held.side_wheres[side] else {
+            return Ok(result);
+        };
+        let extra = extra.map(|extra| strip_table_qualifier(extra, alias));
+        let filter = extra
+            .as_ref()
+            .map(|extra| RowFilter::new(extra, &columns).map(|f| f.with_context(ctx)))
+            .transpose()?;
+        // Conditions that ask no block of a row pass on as the join reads it,
+        // as a table side's do
+        if let Some(bound) = run.bound_program(&where_.program) {
+            let mut own = RowFilter::from_program(bound).with_context(ctx);
+            // The values the run computed once sit past the statement's own
+            if run.base.len() > ctx.params().len() {
+                own = own.with_params(CompactArc::new(run.base.clone()));
+            }
+            let result: Box<dyn crate::storage::traits::QueryResult> =
+                Box::new(FilteredResult::from_filter(result, own));
+            return Ok(match filter {
+                Some(filter) => Box::new(FilteredResult::from_filter(result, filter)),
+                None => result,
+            });
+        }
         // Streamed, as a side's rows are read once and kept only when they pass
         let mut result = result;
         let mut id = 0i64;
@@ -6902,27 +6930,9 @@ impl Executor {
                 (id - 1, result.take_row())
             })
         });
-        let extra = extra.map(|extra| strip_table_qualifier(extra, alias));
-        let filter = extra
-            .as_ref()
-            .map(|extra| RowFilter::new(extra, &columns).map(|f| f.with_context(ctx)))
-            .transpose()?;
-        let mut kept = SideKeep::new(filter.as_ref(), offset, limit);
-        if limit != Some(0) {
-            match &held.side_wheres[side] {
-                Some(where_) => {
-                    let keep = |id: i64, _: u64, row: Row| kept.keep(id, row);
-                    run.rows_passing(where_, source.into_iter().map(Ok), ctx, None, keep)?;
-                }
-                None => {
-                    for (id, row) in source {
-                        if !kept.keep(id, row) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let mut kept = SideKeep::new(filter.as_ref(), 0, None);
+        let keep = |id: i64, _: u64, row: Row| kept.keep(id, row);
+        run.rows_passing(where_, source.into_iter().map(Ok), ctx, None, keep)?;
         if let Some(err) = result.last_error() {
             return Err(err);
         }

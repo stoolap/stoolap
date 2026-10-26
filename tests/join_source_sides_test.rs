@@ -235,3 +235,120 @@ fn a_join_whose_limit_is_cut_into_a_cte_it_keeps_runs_as_explain_says() {
         );
     }
 }
+
+/// `sql` as a derived table's statement, which holds no plan, so the
+/// general path answers it
+fn general(sql: &str) -> String {
+    format!("SELECT * FROM ({sql}) AS general")
+}
+
+#[test]
+fn a_side_without_a_name_runs_on_the_general_path() {
+    let _guard = serial();
+    let db = hot("unnamed");
+    for side in ["(VALUES (1), (2))", "(SELECT id FROM u)"] {
+        for shape in [
+            "SELECT t.id FROM t JOIN {s} ON t.id = (SELECT MIN(y) FROM w)",
+            "SELECT t.id FROM t JOIN {s} ON TRUE WHERE t.id = (SELECT MIN(y) FROM w)",
+            "SELECT t.id, (SELECT MAX(y) FROM w) FROM t JOIN {s} ON TRUE",
+        ] {
+            let sql = shape.replace("{s}", side);
+            assert_eq!(answer(&db, &sql), answer(&db, &general(&sql)), "{sql}");
+            assert_eq!(
+                prepared_line(&db, &sql),
+                "Prepared: no (a side without a name)",
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
+    use stoolap::test_failpoints::{random_draws, tvf_rows};
+    let _guard = serial();
+    let db = Database::open("memory://join_source_sides_read_once").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO t SELECT g.value, g.value % 7, g.value FROM generate_series(1, 20) g",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO u SELECT g.value, g.value % 1000 FROM generate_series(1, 5000) g",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO w VALUES (1, 1), (2, 2)",
+        "CREATE VIEW ru AS SELECT id, x, RANDOM() AS r FROM u",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let count = |sql: &str| answer(&db, sql).map(|rows| rows.len());
+    let draws = |sql: &str| {
+        let before = random_draws();
+        (count(sql), random_draws() - before)
+    };
+    let mut wrong = Vec::new();
+    for (with, side) in [
+        ("", "(SELECT id, x, RANDOM() AS r FROM u) AS s"),
+        ("", "ru AS s"),
+        ("WITH s AS (SELECT id, x, RANDOM() AS r FROM u) ", "s"),
+        ("WITH s (id, x, r) AS (SELECT id, x, RANDOM() FROM u) ", "s"),
+    ] {
+        for shape in [
+            "SELECT s.id, (SELECT 1) FROM {s} JOIN t ON t.a = s.id LIMIT 1",
+            "SELECT s.id, t.id FROM {s} JOIN t ON t.id = s.x \
+             WHERE t.b > (SELECT MIN(x) FROM w) LIMIT 15",
+            "SELECT s.id, t.id FROM {s} JOIN t ON t.id = s.x \
+             WHERE s.id IN (SELECT x FROM w) LIMIT 1",
+        ] {
+            let sql = format!("{with}{}", shape.replace("{s}", side));
+            let reference = format!("{with}{}", general(&shape.replace("{s}", side)));
+            let (got, want) = (draws(&sql), draws(&reference));
+            if got.0 != want.0 || got.1 > want.1 {
+                wrong.push(format!(
+                    "{sql}: rows and draws {got:?}, the general path {want:?}"
+                ));
+            }
+        }
+    }
+    let generated = |sql: &str| {
+        let before = tvf_rows();
+        (count(sql), tvf_rows() - before)
+    };
+    for series in [
+        "SELECT s.id, (SELECT 1) FROM generate_series(1, 100000) AS s (id) \
+         JOIN t ON t.a = s.id LIMIT 1",
+        "SELECT s.id, t.id FROM generate_series(1, 100000) AS s (id) JOIN t ON t.a = s.id \
+         WHERE s.id IN (SELECT x FROM w) LIMIT 1",
+    ] {
+        let (got, want) = (generated(series), generated(&general(series)));
+        if got.0 != want.0 || got.1 > want.1 {
+            wrong.push(format!(
+                "{series}: rows and generated {got:?}, the general path {want:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_cte_not_named_before_it_runs_keeps_the_cte_path_as_explain_says() {
+    let _guard = serial();
+    let db = hot("cte_over_join");
+    let with = "WITH c AS (SELECT u.id FROM u JOIN w ON w.id = u.id) ";
+    let join = "SELECT a.id FROM c a JOIN c b ON a.id = b.id \
+                WHERE EXISTS (SELECT 1 FROM t WHERE t.id = a.id)";
+    let sql = &format!("{with}{join}");
+    let (got, ran) = run(&db, sql);
+    assert_eq!(
+        got,
+        answer(&db, &format!("{with}{}", general(join))),
+        "{sql}"
+    );
+    assert_eq!(
+        prepared_line(&db, sql),
+        "Prepared: no (a WITH clause)",
+        "{sql}"
+    );
+    assert!(
+        !ran.is_empty(),
+        "{sql}: the CTE path runs the join without its plan"
+    );
+}

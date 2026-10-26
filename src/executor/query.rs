@@ -5121,7 +5121,8 @@ impl Executor {
 
     /// Whether a join of two sources with a subquery in a clause keeps its
     /// plan, its CTEs bound or inlined, so its blocks may run; a join whose
-    /// LIMIT the CTE path cuts into a CTE it does not inline stays there
+    /// LIMIT the CTE path cuts into a CTE it does not inline, or with a CTE
+    /// not named before it runs, stays there
     pub(crate) fn join_keeps_plan(&self, stmt: &SelectStatement, with: &WithClause) -> bool {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return false;
@@ -5135,6 +5136,7 @@ impl Executor {
                 || join.condition.as_deref().is_some_and(Self::has_subqueries))
             && (self.compute_cte_limit_hints(stmt, with).is_empty()
                 || self.try_inline_ctes(stmt, with).is_some())
+            && self.named_ctes(with).is_ok()
     }
 
     /// Each side's columns as the join's blocks read them, a base table's
@@ -5180,6 +5182,10 @@ impl Executor {
                 false => "a side read with AS OF or not named before it is read",
             });
         };
+        // The blocks qualify each side's columns by its name
+        if left_alias.is_none() || right_alias.is_none() {
+            return Err("a side without a name");
+        }
         let schemas = (Some(&**left), Some(&**right));
         let on = join_source.condition.as_deref();
         let on_subqueries = on.is_some_and(Self::has_subqueries);
@@ -8708,23 +8714,24 @@ impl Executor {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<OuterFetch> {
-        // A side the blocks read as rows is read whole by the one read below,
-        // then asked its conditions
+        // A side the blocks read as rows is read by the one read below, as the
+        // general path reads it; conditions of its own are asked of its whole
+        // rows after the read
         let rows = side
             .run
             .filter(|(run, index)| run.blocks.rows_sides[*index]);
-        let asked = (extra, limit, offset);
-        let (side, extra, limit, offset) = match rows {
-            Some(_) => (
-                SideRead {
-                    filter: None,
-                    run: None,
-                },
-                None,
-                None,
-                0,
-            ),
-            None => (side, extra, limit, offset),
+        let asks = rows.filter(|(run, index)| run.blocks.side_asks(*index));
+        let asked = asks.and(extra);
+        let side = match rows {
+            Some(_) => SideRead {
+                filter: None,
+                run: None,
+            },
+            None => side,
+        };
+        let (extra, limit, offset) = match asks {
+            Some(_) => (None, None, 0),
+            None => (extra, limit, offset),
         };
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
             let alias = ts.alias.as_ref().unwrap_or(&ts.name).value.as_str();
@@ -8758,19 +8765,10 @@ impl Executor {
             expr, ctx, filter, limit, offset, read_out,
         )?;
         if let Some((run, index)) = rows {
-            let (extra, limit, offset) = asked;
-            let (result, columns, _, _) = fetched;
-            let result = self.join_source_side_rows(
-                run.blocks,
-                run.run,
-                index,
-                (expr, result),
-                ctx,
-                extra,
-                limit,
-                offset,
-            )?;
-            return Ok((result, columns, limit.is_some(), None));
+            let (result, columns, bounded, _) = fetched;
+            let result =
+                self.join_source_side_rows(run.blocks, run.run, index, (expr, result), ctx, asked)?;
+            return Ok((result, columns, bounded, None));
         }
         if let Some((run, index)) = side.run {
             let (_, schema) =
