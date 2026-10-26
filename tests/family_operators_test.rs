@@ -131,6 +131,11 @@ fn every_expression_form_answers_on_the_prepared_path_as_with_the_value_written(
     for form in [
         "ts + INTERVAL '1 day' > '2024-01-06 00:00:00'",
         "ts - INTERVAL '36 hours' < '2024-01-04 00:00:00'",
+        "(k, id) = (1, 1)",
+        "(k, id) < (2, 9)",
+        "(k, id) IS NOT DISTINCT FROM (NULL, 3)",
+        "(k, id) IN ((1, 1), (4, 4))",
+        "(k, id) NOT IN ((1, id), (k, 9))",
     ] {
         for (shape, written) in [
             (
@@ -166,6 +171,20 @@ fn every_expression_form_answers_on_the_prepared_path_as_with_the_value_written(
         (
             "SELECT id FROM t WHERE ts - INTERVAL '1 day' < (SELECT ts FROM u WHERE u.id = t.id)",
             "SELECT id FROM t WHERE id IN (1, 2)",
+        ),
+        (
+            "SELECT id FROM t WHERE (k, (SELECT MAX(id) FROM u)) = (2, 2)",
+            "SELECT id FROM t WHERE (k, 2) = (2, 2)",
+        ),
+        (
+            "SELECT t.id FROM t JOIN u ON (t.id, t.k) = (u.id, u.id) \
+             AND t.k > (SELECT MIN(id) FROM u) - 1",
+            "SELECT t.id FROM t JOIN u ON t.id = u.id AND t.k = u.id",
+        ),
+        (
+            "SELECT id, (k, (SELECT u.id FROM u WHERE u.id = t.id)) = (1, 1) FROM t",
+            "SELECT id, CASE id WHEN 1 THEN TRUE WHEN 3 THEN CAST(NULL AS BOOLEAN) ELSE FALSE END \
+             FROM t",
         ),
     ] {
         let path = prepared_line(&db, shape);

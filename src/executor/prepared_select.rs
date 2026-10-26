@@ -358,6 +358,8 @@ impl<'a> Family<'a> {
                 case.else_value.as_deref().map_or(Ok(()), walk)
             }
             Expression::Cast(cast) => walk(&cast.expr),
+            Expression::List(list) => list.elements.iter().try_for_each(walk),
+            Expression::ExpressionList(list) => list.expressions.iter().try_for_each(walk),
             Expression::FunctionCall(call) => {
                 if is_aggregate_function(&call.function) {
                     if !matches!(
