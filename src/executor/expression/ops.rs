@@ -26,7 +26,7 @@ use crate::common::CompactArc;
 
 use crate::core::interval::IntervalUnit;
 use crate::core::pattern::Pattern;
-use crate::core::predicate::{sql_compare, sql_eq, PredicateSet};
+use crate::core::predicate::{sql_compare, sql_eq, sql_rows_distinct, PredicateSet};
 use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
 
@@ -102,6 +102,15 @@ pub enum Op {
     /// IS NOT DISTINCT FROM (NULL-safe equal)
     /// Stack: [a, b] -> [bool]
     IsNotDistinctFrom,
+
+    /// Two rows of N values compared: (a1, .., aN) op (b1, .., bN)
+    /// Stack: [a1, .., aN, b1, .., bN] -> [bool]
+    CompareRows(CompareOp, u16),
+
+    /// Two rows of N values, IS DISTINCT FROM, or IS NOT DISTINCT FROM when
+    /// negated
+    /// Stack: [a1, .., aN, b1, .., bN] -> [bool]
+    RowsDistinct(bool, u16),
 
     // =========================================================================
     // FUSED COMPARISON OPERATIONS - Single instruction for column vs constant
@@ -345,6 +354,10 @@ pub enum Op {
         negated: bool,
     },
 
+    /// A row of N values IN a list of K rows of N values read per row
+    /// Stack: [a1, .., aN, r1_1, .., r1_N, .., rK_N] -> [bool]
+    InRows(u16, u32),
+
     // =========================================================================
     // BOOLEAN CHECKS
     // =========================================================================
@@ -491,6 +504,11 @@ pub enum Op {
     /// Execute `value op ALL` (true) or `value op ANY` (false): TRUE, FALSE or UNKNOWN
     /// Stack: [value] -> [bool or NULL]
     ExecQuantified(u16, CompareOp, bool), // Subquery index, comparison operator, ALL
+
+    /// A row of N values tested against a row block's members, by the IN,
+    /// ANY or ALL test the block answers: TRUE, FALSE or UNKNOWN
+    /// Stack: [a1, .., aN] -> [bool or NULL]
+    ExecRowMembers(u16, u16), // Subquery index, N
 
     // =========================================================================
     // AGGREGATE REFERENCES (post-aggregation)
@@ -657,6 +675,188 @@ impl CompareOp {
     pub fn compare(&self, a: &Value, b: &Value) -> Option<bool> {
         QuantifiedMembers::compares(*self, a, b)
     }
+
+    /// `(a1, ..) op (b1, ..)` over two rows of one width: `=` holds when
+    /// every pair is equal, `<>` when one is not; an ordering is the first
+    /// unequal pair's, UNKNOWN when that pair's equality is
+    pub fn compare_rows(&self, a: &[Value], b: &[Value]) -> Option<bool> {
+        debug_assert_eq!(a.len(), b.len());
+        match self {
+            CompareOp::Eq => return rows_equal(a, b),
+            CompareOp::Ne => return rows_equal(a, b).map(|eq| !eq),
+            _ => {}
+        }
+        for (x, y) in a.iter().zip(b) {
+            match QuantifiedMembers::compares(CompareOp::Eq, x, y) {
+                Some(true) => {}
+                Some(false) => return self.compare(x, y),
+                None => return None,
+            }
+        }
+        Some(matches!(self, CompareOp::Le | CompareOp::Ge))
+    }
+}
+
+/// `=` over two rows: false when a pair is unequal, else UNKNOWN when a
+/// pair's equality is, else true
+#[inline]
+fn rows_equal(a: &[Value], b: &[Value]) -> Option<bool> {
+    let mut equal = Some(true);
+    for (x, y) in a.iter().zip(b) {
+        match QuantifiedMembers::compares(CompareOp::Eq, x, y) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => equal = None,
+        }
+    }
+    equal
+}
+
+/// `row IN (list)`: true when a row of the list equals `row`, else UNKNOWN
+/// when one's equality is, else false
+pub fn row_in<'v>(row: &[Value], list: impl IntoIterator<Item = &'v [Value]>) -> Option<bool> {
+    quantified_rows(CompareOp::Eq, false, row, list)
+}
+
+/// `row op ALL (members)` when `all`, else `row op ANY (members)`: a member
+/// that settles it wins (TRUE for ANY, FALSE for ALL), else UNKNOWN when
+/// one's comparison is; over no members ANY is FALSE and ALL TRUE
+pub fn quantified_rows<'v>(
+    op: CompareOp,
+    all: bool,
+    row: &[Value],
+    members: impl IntoIterator<Item = &'v [Value]>,
+) -> Option<bool> {
+    // The operator chosen once, so a member costs its comparison alone
+    match op {
+        CompareOp::Eq => settle_rows(all, members, |member| rows_equal(row, member)),
+        CompareOp::Ne => settle_rows(all, members, |member| rows_equal(row, member).map(|eq| !eq)),
+        _ => settle_rows(all, members, |member| op.compare_rows(row, member)),
+    }
+}
+
+/// [`quantified_rows`] over the members' answers
+#[inline(always)]
+fn settle_rows<'v>(
+    all: bool,
+    members: impl IntoIterator<Item = &'v [Value]>,
+    compare: impl Fn(&[Value]) -> Option<bool>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for member in members {
+        match compare(member) {
+            Some(answer) if answer != all => return Some(answer),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(all)
+}
+
+/// How two rows compare: by an operator, or IS [NOT] DISTINCT FROM
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowComparison {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Distinct,
+    NotDistinct,
+}
+
+impl RowComparison {
+    pub fn answer(self, a: &[Value], b: &[Value]) -> Option<bool> {
+        let op = match self {
+            RowComparison::Eq => CompareOp::Eq,
+            RowComparison::Ne => CompareOp::Ne,
+            RowComparison::Lt => CompareOp::Lt,
+            RowComparison::Le => CompareOp::Le,
+            RowComparison::Gt => CompareOp::Gt,
+            RowComparison::Ge => CompareOp::Ge,
+            RowComparison::Distinct => return Some(sql_rows_distinct(a, b)),
+            RowComparison::NotDistinct => return Some(!sql_rows_distinct(a, b)),
+        };
+        op.compare_rows(a, b)
+    }
+
+    /// The comparison with its sides swapped
+    pub fn flipped(self) -> Self {
+        match self {
+            RowComparison::Lt => RowComparison::Gt,
+            RowComparison::Le => RowComparison::Ge,
+            RowComparison::Gt => RowComparison::Lt,
+            RowComparison::Ge => RowComparison::Le,
+            other => other,
+        }
+    }
+}
+
+/// What a row block's members answer for a row
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowTest {
+    /// `row op ANY (members)`, or `op ALL` when true; IN is `=` ANY
+    Quantified(CompareOp, bool),
+    /// `row` compared with the one member, every value NULL for none
+    One(RowComparison),
+}
+
+/// A row block's members, `width` values each, as `test` asks them
+#[derive(Debug, Clone)]
+pub struct RowMembers {
+    test: RowTest,
+    width: usize,
+    values: Vec<Value>,
+}
+
+impl RowMembers {
+    /// `values` holds the members' values in turn, `width` of them each; a
+    /// row compared with the one member is compared with NULLs for none
+    pub fn new(test: RowTest, width: usize, mut values: Vec<Value>) -> Self {
+        debug_assert!(width > 1 && values.len().is_multiple_of(width));
+        if matches!(test, RowTest::One(_)) && values.is_empty() {
+            values.resize(width, Value::null_unknown());
+        }
+        Self {
+            test,
+            width,
+            values,
+        }
+    }
+
+    /// The answer for `row`; more than one member for a row compared with
+    /// one is an error
+    pub fn answer(&self, row: &[Value]) -> crate::core::Result<Option<bool>> {
+        match self.test {
+            RowTest::Quantified(op, all) => Ok(quantified_rows(
+                op,
+                all,
+                row,
+                self.values.chunks_exact(self.width),
+            )),
+            RowTest::One(comparison) => match self.values.len() == self.width {
+                true => Ok(comparison.answer(row, &self.values)),
+                false => Err(more_than_one_row()),
+            },
+        }
+    }
+
+    /// The answer one member settles: TRUE for ANY, FALSE for ALL; none
+    /// for a row compared with the one member
+    pub fn decides(&self) -> Option<bool> {
+        match self.test {
+            RowTest::Quantified(_, all) => Some(!all),
+            RowTest::One(_) => None,
+        }
+    }
+}
+
+/// A subquery read for one row's value or values gave more
+pub(crate) fn more_than_one_row() -> crate::core::Error {
+    crate::core::Error::Internal {
+        message: "scalar subquery returned more than one row".to_string(),
+    }
 }
 
 // Make Op Debug-printable (without showing full function pointers)
@@ -780,6 +980,11 @@ impl std::fmt::Debug for Op {
                     negated
                 )
             }
+            Op::InRows(width, count) => write!(f, "InRows({}, {})", width, count),
+            Op::CompareRows(op, width) => write!(f, "CompareRows({:?}, {})", op, width),
+            Op::RowsDistinct(negated, width) => {
+                write!(f, "RowsDistinct(negated={}, {})", negated, width)
+            }
             Op::IsTrue => write!(f, "IsTrue"),
             Op::IsNotTrue => write!(f, "IsNotTrue"),
             Op::IsFalse => write!(f, "IsFalse"),
@@ -811,6 +1016,7 @@ impl std::fmt::Debug for Op {
             Op::ExecScalarSubquery(idx) => write!(f, "ExecScalarSubquery({})", idx),
             Op::ExecExists(idx) => write!(f, "ExecExists({})", idx),
             Op::ExecInSubquery(idx) => write!(f, "ExecInSubquery({})", idx),
+            Op::ExecRowMembers(idx, width) => write!(f, "ExecRowMembers({}, {})", idx, width),
             Op::ExecQuantified(idx, op, all) => {
                 write!(f, "ExecQuantified({}, {:?}, {})", idx, op, all)
             }

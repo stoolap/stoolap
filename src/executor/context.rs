@@ -556,6 +556,8 @@ pub enum MemberSet {
     /// program is bound to
     SharedIn(CompactArc<PredicateSet>),
     Quantified(super::expression::QuantifiedMembers),
+    /// A row block's members, which a row of their width is tested against
+    Rows(super::expression::RowMembers),
 }
 
 /// A value block's members for a whole run, and the first error one of
@@ -576,13 +578,48 @@ impl KeptMembers {
             MemberSet::In(set) => (set.contains(value), true),
             MemberSet::SharedIn(set) => (set.contains(value), true),
             MemberSet::Quantified(members) => (members.answer(value), !members.parts().1),
+            MemberSet::Rows(_) => return Err(one_value_against_rows()),
         };
+        self.settle(answer, decides)
+    }
+
+    /// `row` tested against a row block's members as [`Self::answer`] tests
+    /// a value
+    pub(crate) fn answer_row(&self, row: &[Value]) -> crate::core::Result<Option<bool>> {
+        let MemberSet::Rows(members) = &self.set else {
+            return Err(one_value_against_rows());
+        };
+        match (members.decides(), &self.failed) {
+            (Some(decides), _) => self.settle(members.answer(row)?, decides),
+            // A row compared with the one member has no member that decides
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => members.answer(row),
+        }
+    }
+
+    /// `tested`, one value or a row, as [`Self::answer`] or
+    /// [`Self::answer_row`] tests it
+    #[inline]
+    pub(crate) fn answer_values(&self, tested: &[Value]) -> crate::core::Result<Option<bool>> {
+        match tested {
+            [value] => self.answer(value),
+            row => self.answer_row(row),
+        }
+    }
+
+    #[inline]
+    fn settle(&self, answer: Option<bool>, decides: bool) -> crate::core::Result<Option<bool>> {
         match (&self.failed, answer) {
             (_, Some(answer)) if answer == decides => Ok(Some(answer)),
             (Some(e), _) => Err(e.clone()),
             (None, answer) => Ok(answer),
         }
     }
+}
+
+#[cold]
+fn one_value_against_rows() -> crate::core::Error {
+    crate::core::Error::internal("a value and a block's members of other widths")
 }
 
 /// A correlated IN block's members grouped by key

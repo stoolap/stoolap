@@ -52,8 +52,9 @@ use super::context::{
 };
 use super::expr_key::ExprKey;
 use super::expression::{
-    CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, Op,
-    QuantifiedMembers, RowFilter, SharedProgram, SubqueryExecutor,
+    more_than_one_row, CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler,
+    ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter, RowMembers, RowTest, SharedProgram,
+    SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::projection::{Item, Projection};
@@ -302,10 +303,19 @@ impl<'a> Family<'a> {
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
             | Expression::Parameter(_) => Ok(()),
             Expression::Infix(infix) => {
                 if infix.op_type == InfixOperator::Other {
                     return Err("an operator outside the family");
+                }
+                if let Some((row, sq, _)) = row_subquery(infix) {
+                    if !subqueries {
+                        return Err("a subquery outside WHERE and the subquery blocks");
+                    }
+                    self.expression(row, scopes, site.operand(), found)?;
+                    *found = true;
+                    return self.block(&sq.subquery, scopes + 1, width(row));
                 }
                 walk(&infix.left)?;
                 walk(&infix.right)
@@ -329,12 +339,9 @@ impl<'a> Family<'a> {
                         if !subqueries {
                             return Err("a subquery outside WHERE and the subquery blocks");
                         }
-                        if is_tuple(&in_expr.left) {
-                            return Err("a tuple on the left of IN (subquery)");
-                        }
                         self.expression(&in_expr.left, scopes, site.operand(), found)?;
                         *found = true;
-                        return self.block(&sq.subquery, scopes + 1);
+                        return self.block(&sq.subquery, scopes + 1, width(&in_expr.left));
                     }
                     _ => return Err("IN over something other than a list"),
                 };
@@ -357,6 +364,8 @@ impl<'a> Family<'a> {
                 case.else_value.as_deref().map_or(Ok(()), walk)
             }
             Expression::Cast(cast) => walk(&cast.expr),
+            Expression::List(list) => list.elements.iter().try_for_each(walk),
+            Expression::ExpressionList(list) => list.expressions.iter().try_for_each(walk),
             Expression::FunctionCall(call) => {
                 if is_aggregate_function(&call.function) {
                     if !matches!(
@@ -377,7 +386,7 @@ impl<'a> Family<'a> {
                     return Err("a subquery outside WHERE and the subquery blocks");
                 }
                 *found = true;
-                self.block(&sq.subquery, scopes + 1)
+                self.block(&sq.subquery, scopes + 1, 1)
             }
             Expression::Exists(exists) => {
                 if !subqueries {
@@ -393,12 +402,9 @@ impl<'a> Family<'a> {
                 if QuantifiedMembers::operator(&all_any.operator).is_none() {
                     return Err("an operator outside the family");
                 }
-                if is_tuple(&all_any.left) {
-                    return Err("a tuple on the left of ANY or ALL");
-                }
                 self.expression(&all_any.left, scopes, site.operand(), found)?;
                 *found = true;
-                self.block(&all_any.subquery, scopes + 1)
+                self.block(&all_any.subquery, scopes + 1, width(&all_any.left))
             }
             Expression::Window(window) => {
                 let inner = match site {
@@ -446,11 +452,13 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// One subquery block whose chain holds `scopes` scopes
+    /// One subquery block whose chain holds `scopes` scopes, selecting the
+    /// `width` values of the row it is compared with, one for a value
     fn block(
         &self,
         sq: &'a SelectStatement,
         scopes: usize,
+        width: usize,
     ) -> std::result::Result<(), OutOfFamily> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
@@ -458,11 +466,14 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
-        let [column] = sq.columns.as_slice() else {
-            return Err("a subquery block without exactly one SELECT expression");
-        };
-        let column = unaliased(column);
-        if matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
+        if sq.columns.len() != width {
+            return Err(match width {
+                1 => "a subquery block without exactly one SELECT expression",
+                _ => "a subquery block selecting another number of values than its row holds",
+            });
+        }
+        let columns = || sq.columns.iter().map(unaliased);
+        if columns().any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_))) {
             return Err("a subquery block selecting *");
         }
         if windowed_block(sq) {
@@ -471,7 +482,9 @@ impl<'a> Family<'a> {
         self.order(sq, scopes, false)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
-        self.expression(column, scopes, list_site(sq), &mut found)?;
+        for column in columns() {
+            self.expression(column, scopes, list_site(sq), &mut found)?;
+        }
         self.grouping(sq, scopes)?;
         match sq.where_clause.as_deref() {
             Some(where_clause) => {
@@ -512,14 +525,20 @@ impl<'a> Family<'a> {
         // Keys that choose no row are bound but never computed
         let chooses =
             !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
-        let volatile_alias = match sq.columns.as_slice() {
-            [Expression::Aliased(item)]
-                if volatile(&item.expression, &self.executor.function_registry) =>
-            {
-                Some(&item.alias.value_lower)
-            }
-            _ => None,
-        };
+        let volatile_aliases: SmallVec<[&str; 1]> = sq
+            .columns
+            .iter()
+            .filter_map(|column| match column {
+                Expression::Aliased(item)
+                    if volatile(&item.expression, &self.executor.function_registry) =>
+                {
+                    Some(item.alias.value_lower.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let reads_volatile_alias =
+            |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
         let mut found = false;
         for ob in &sq.order_by {
             let key = &ob.expression;
@@ -530,10 +549,8 @@ impl<'a> Family<'a> {
             if !chooses && mentions_subquery(key) {
                 return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
             }
-            if let Some(alias) = volatile_alias.filter(|_| !order_by_names_an_alias(key, sq)) {
-                if names_any(key, &|name| name == alias.as_str()) {
-                    return Err("an ORDER BY expression reading a volatile SELECT alias");
-                }
+            if !order_by_names_an_alias(key, sq) && reads_volatile_alias(key) {
+                return Err("an ORDER BY expression reading a volatile SELECT alias");
             }
             self.expression(key, scopes, Site::Values, &mut found)?;
         }
@@ -544,10 +561,8 @@ impl<'a> Family<'a> {
             if mentions_subquery(key) {
                 return Err("a subquery block's DISTINCT ON key holding a subquery");
             }
-            if let Some(alias) = volatile_alias {
-                if names_any(key, &|name| name == alias.as_str()) {
-                    return Err("a DISTINCT ON key reading a volatile SELECT alias");
-                }
+            if reads_volatile_alias(key) {
+                return Err("a DISTINCT ON key reading a volatile SELECT alias");
             }
             self.expression(key, scopes, Site::Values, &mut found)?;
         }
@@ -701,12 +716,59 @@ fn list_site(sq: &SelectStatement) -> Site {
     }
 }
 
-/// `(a, b)`: more than one value on the left of a set test
-fn is_tuple(expr: &Expression) -> bool {
+/// `(a, b) op (SELECT x, y ..)`, either way round: the row, the block, and
+/// the comparison with the row on its left
+fn row_subquery(infix: &InfixExpression) -> Option<(&Expression, &ScalarSubquery, RowComparison)> {
+    let comparison = match infix.op_type {
+        InfixOperator::Equal => RowComparison::Eq,
+        InfixOperator::NotEqual => RowComparison::Ne,
+        InfixOperator::LessThan => RowComparison::Lt,
+        InfixOperator::LessEqual => RowComparison::Le,
+        InfixOperator::GreaterThan => RowComparison::Gt,
+        InfixOperator::GreaterEqual => RowComparison::Ge,
+        InfixOperator::IsDistinctFrom => RowComparison::Distinct,
+        InfixOperator::IsNotDistinctFrom => RowComparison::NotDistinct,
+        _ => return None,
+    };
+    match (&*infix.left, &*infix.right) {
+        (row, Expression::ScalarSubquery(sq)) if width(row) > 1 => Some((row, sq, comparison)),
+        (Expression::ScalarSubquery(sq), row) if width(row) > 1 => {
+            Some((row, sq, comparison.flipped()))
+        }
+        _ => None,
+    }
+}
+
+/// `infix` with its row and its block replaced, each on its side
+fn row_against(
+    infix: &InfixExpression,
+    row: Expression,
+    block: &ScalarSubquery,
+    mark: Box<SelectStatement>,
+) -> Expression {
+    let block = Expression::ScalarSubquery(ScalarSubquery {
+        token: block.token.clone(),
+        subquery: mark,
+    });
+    let (left, right) = match &*infix.right {
+        Expression::ScalarSubquery(_) => (row, block),
+        _ => (block, row),
+    };
+    Expression::Infix(InfixExpression {
+        token: infix.token.clone(),
+        left: Box::new(left),
+        operator: infix.operator.clone(),
+        op_type: infix.op_type,
+        right: Box::new(right),
+    })
+}
+
+/// The values `expr` holds: a row's, `(a, b)`, else one
+fn width(expr: &Expression) -> usize {
     match expr {
-        Expression::List(list) => list.elements.len() > 1,
-        Expression::ExpressionList(list) => list.expressions.len() > 1,
-        _ => false,
+        Expression::List(list) => list.elements.len().max(1),
+        Expression::ExpressionList(list) => list.expressions.len().max(1),
+        _ => 1,
     }
 }
 
@@ -2919,6 +2981,11 @@ struct BlockOrder {
     keys: Vec<(Option<SharedProgram>, bool, Option<bool>)>,
     /// The first key that is the SELECT item, which the answer reads
     item: Option<usize>,
+    /// For each of a row's values, the key that is it, which the member
+    /// reads; empty for a single item
+    values: Vec<Option<usize>>,
+    /// A row's key that names a value again, and the key that computed it
+    repeats: Vec<(usize, usize)>,
     /// The DISTINCT ON keys over the block's row: the first row in order of
     /// each of their values is kept, before the OFFSET
     distinct: Vec<SharedProgram>,
@@ -3270,6 +3337,8 @@ enum MemberTest {
     In,
     /// The operator, and whether it is ALL
     Quantified(CompareOp, bool),
+    /// A row compared with the block's one row, `(a, b) = (SELECT x, y ..)`
+    One(RowComparison),
 }
 
 impl MemberTest {
@@ -3284,11 +3353,18 @@ impl MemberTest {
 #[derive(Debug)]
 struct Members {
     projection: SharedProgram,
+    /// A row's values after the first, which `projection` reads
+    rest: Vec<SharedProgram>,
     read_as: Option<DataType>,
     test: MemberTest,
 }
 
 impl Members {
+    /// The values a member holds: one, or a row's
+    fn width(&self) -> usize {
+        1 + self.rest.len()
+    }
+
     /// A value of the SELECT expression as the tested value's column reads it
     fn read(&self, value: Value) -> Value {
         match self.read_as {
@@ -3969,6 +4045,20 @@ impl Builder<'_> {
             {
                 Ok(expr.clone())
             }
+            Expression::Infix(infix) => match row_subquery(infix) {
+                Some((row, nested, comparison)) if nested.subquery.prepared.is_none() => {
+                    let form = Form::Members {
+                        block: &nested.subquery,
+                        read_as: None,
+                        test: MemberTest::One(comparison),
+                    };
+                    let row = self.rewrite_blocks(chain, row)?;
+                    let mark = self.nested(chain, None, &nested.subquery, form, &mut work)?;
+                    Ok(row_against(infix, row, nested, mark))
+                }
+                Some(_) => Ok(expr.clone()),
+                None => rebuild(expr, &mut |child| self.rewrite_blocks(chain, child)),
+            },
             Expression::ScalarSubquery(_) | Expression::Exists(_) => {
                 self.rewrite(chain, None, expr, &mut work)
             }
@@ -4146,6 +4236,19 @@ impl Builder<'_> {
                     subquery: mark,
                 }))
             }
+            Expression::Infix(infix) => match row_subquery(infix) {
+                Some((row, nested, comparison)) => {
+                    let form = Form::Members {
+                        block: &nested.subquery,
+                        read_as: None,
+                        test: MemberTest::One(comparison),
+                    };
+                    let row = self.rewrite(chain, id, row, work)?;
+                    let mark = self.nested(chain, id, &nested.subquery, form, work)?;
+                    Ok(row_against(infix, row, nested, mark))
+                }
+                None => rebuild(expr, &mut |child| self.rewrite(chain, id, child, work)),
+            },
             other => rebuild(other, &mut |child| self.rewrite(chain, id, child, work)),
         }
     }
@@ -4391,12 +4494,16 @@ impl Builder<'_> {
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
-        let projection = match form {
-            Form::Exists(_) => None,
-            Form::Scalar | Form::Members { .. } => {
-                Some(self.rewrite(&chain, Some(id), unaliased(&sq.columns[0]), &mut work)?)
-            }
+        // The SELECT values a member is read from: one, or a row's
+        let values = match form {
+            Form::Exists(_) => Vec::new(),
+            Form::Scalar | Form::Members { .. } => sq
+                .columns
+                .iter()
+                .map(|column| self.rewrite(&chain, Some(id), unaliased(column), &mut work))
+                .collect::<Result<Vec<_>>>()?,
         };
+        let projection = values.first().filter(|_| values.len() == 1);
         let where_clause = sq
             .where_clause
             .as_deref()
@@ -4444,15 +4551,52 @@ impl Builder<'_> {
         let cut =
             sq.limit.is_some() || sq.offset.is_some() || (!sq.distinct_on.is_empty() && !exists);
         let chooses = cut && !exists;
-        let item = sq
-            .columns
-            .first()
-            .filter(|_| !matches!(form, Form::Exists(_)));
+        let item = projection.and(sq.columns.first());
         let (mut order_keys, mut bound_only) = (Vec::new(), Vec::new());
+        // For each of a row's values, the key that sorts by it, whose value
+        // the member reads
+        let mut row_keys = vec![None; if values.len() > 1 { values.len() } else { 0 }];
+        let mut repeats = Vec::new();
         if matches!(form, Form::Exists(_)) {
             check_block_positions(sq, scope.columns.len())?;
         }
         for ob in &sq.order_by {
+            // A key naming one of a row's values, by its alias or as written,
+            // sorts by that value as a single item's does
+            if !row_keys.is_empty() && chooses {
+                let named = match &ob.expression {
+                    Expression::Identifier(name) if order_by_names_an_alias(&ob.expression, sq) => {
+                        sq.columns.iter().position(|column| {
+                            matches!(column, Expression::Aliased(a)
+                                if a.alias.value_lower == name.value_lower)
+                        })
+                    }
+                    key if !mentions_subquery(key) => self
+                        .trial_rewrite(&chain, id, key, &work.outer)
+                        .ok()
+                        .and_then(|key| {
+                            values
+                                .iter()
+                                .position(|value| ExprKey::exact(value) == ExprKey::exact(&key))
+                        }),
+                    _ => None,
+                };
+                if let Some(at) = named {
+                    // A value named again sorts by the value its first key computed
+                    let key = match row_keys[at] {
+                        Some(first) => {
+                            repeats.push((order_keys.len(), first));
+                            None
+                        }
+                        None => {
+                            row_keys[at] = Some(order_keys.len());
+                            Some(values[at].clone())
+                        }
+                    };
+                    order_keys.push((key, ob.ascending, ob.nulls_first));
+                    continue;
+                }
+            }
             // A bare alias sorts by the item's value
             let alias = item.is_some() && order_by_names_an_alias(&ob.expression, sq);
             let key = match alias {
@@ -4507,7 +4651,7 @@ impl Builder<'_> {
         }
         let grouped = if grouped_block(sq) {
             let exists = matches!(form, Form::Exists(_));
-            Some(self.grouping(&chain, id, sq, projection.as_ref(), exists, &mut work)?)
+            Some(self.grouping(&chain, id, sq, &values, exists, &mut work)?)
         } else {
             None
         };
@@ -4523,14 +4667,26 @@ impl Builder<'_> {
             Some(expr) => compile_with(&own, expr).map(Some),
             None => Ok(None),
         };
-        let projection_program = || match grouped.as_ref().and_then(|g| g.projection.as_ref()) {
-            Some(over_slots) => Ok(CompactArc::clone(over_slots)),
-            None => compile(&projection)?
-                .ok_or_else(|| Error::internal("a prepared subquery without a SELECT expression")),
+        // The first SELECT value's program, and a row's others
+        let projection_programs = || -> Result<(SharedProgram, Vec<SharedProgram>)> {
+            let mut programs = match grouped.as_ref().filter(|g| !g.projection.is_empty()) {
+                Some(grouped) => grouped.projection.clone(),
+                None => values
+                    .iter()
+                    .map(|value| compile_with(&own, value))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            if programs.is_empty() {
+                return Err(Error::internal(
+                    "a prepared subquery without a SELECT expression",
+                ));
+            }
+            let first = programs.remove(0);
+            Ok((first, programs))
         };
         let (identity, signature, keyed_test) = block_identity(sq, form);
         let mut others = SmallVec::new();
-        for expr in projection.iter().chain(&filter) {
+        for expr in values.iter().chain(&filter) {
             slots_read(expr, &mut others);
         }
         if let Some(grouped) = &grouped {
@@ -4552,20 +4708,24 @@ impl Builder<'_> {
             keyed,
         };
         let answer = match form {
-            Form::Scalar => Answer::Value(projection_program()?, kept),
-            Form::Members { read_as, test, .. } => Answer::Members(
-                kept,
-                Members {
-                    projection: projection_program()?,
-                    read_as,
-                    test,
-                },
-            ),
+            Form::Scalar => Answer::Value(projection_programs()?.0, kept),
+            Form::Members { read_as, test, .. } => {
+                let (projection, rest) = projection_programs()?;
+                Answer::Members(
+                    kept,
+                    Members {
+                        projection,
+                        rest,
+                        read_as,
+                        test,
+                    },
+                )
+            }
             Form::Exists(_) => Answer::Exists(kept),
         };
         let mut reads = SmallVec::new();
         let counts = sq.limit.iter().chain(&sq.offset).map(|count| &**count);
-        for expr in projection
+        for expr in values
             .iter()
             .chain(&candidates)
             .chain(&filter)
@@ -4603,7 +4763,12 @@ impl Builder<'_> {
                     count.as_deref().map(|c| compile_with(&own, c)).transpose()
                 };
                 Some(Box::new(BlockOrder {
-                    item: order_keys.iter().position(|(key, ..)| key.is_none()),
+                    item: match row_keys.is_empty() {
+                        true => order_keys.iter().position(|(key, ..)| key.is_none()),
+                        false => None,
+                    },
+                    values: row_keys,
+                    repeats,
                     keys: order_keys
                         .iter()
                         .map(|(key, ascending, nulls)| {
@@ -4686,7 +4851,7 @@ impl Builder<'_> {
         chain: &Chain<'_>,
         id: u16,
         sq: &SelectStatement,
-        projection: Option<&Expression>,
+        projection: &[Expression],
         exists: bool,
         work: &mut Rewritten,
     ) -> Result<Grouped> {
@@ -4719,7 +4884,7 @@ impl Builder<'_> {
                 }
             }
         }
-        for expr in projection.into_iter().chain(&having).chain(&listed) {
+        for expr in projection.iter().chain(&having).chain(&listed) {
             if let Some(name) = ungrouped(expr, &item_keys) {
                 return Err(ungrouped_column(&name));
             }
@@ -4730,7 +4895,7 @@ impl Builder<'_> {
             token: sq.token.clone(),
             distinct: false,
             distinct_on: Vec::new(),
-            columns: projection.into_iter().cloned().collect(),
+            columns: projection.to_vec(),
             with: None,
             table_expr: None,
             where_clause: None,
@@ -4779,8 +4944,9 @@ impl Builder<'_> {
         let names: Vec<String> = (0..width).map(|i| format!("{RESOLVED}#{i}")).collect();
         let over_slots = CompileContext::new(&names, registry).with_expression_aliases(slots);
         let projection = projection
+            .iter()
             .map(|expr| compile_with(&over_slots, expr))
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         let having_program = having
             .as_ref()
             .map(|expr| compile_with(&over_slots, expr))
@@ -4869,7 +5035,8 @@ impl Builder<'_> {
 /// expression over the slot rows, and the slots its items and HAVING read
 struct Grouped {
     grouping: Grouping,
-    projection: Option<SharedProgram>,
+    /// Each SELECT value over a slot row
+    projection: Vec<SharedProgram>,
     reads: SmallVec<[usize; 2]>,
 }
 
@@ -9190,7 +9357,12 @@ impl<'a> PreparedRunner<'a> {
         let empty = Row::new();
         let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
         for &id in ids {
-            self.members_answer(usize::from(id), &Value::null_unknown(), &caller, holes)?;
+            let width = match &self.prepared.subqueries[usize::from(id)].answer {
+                Answer::Members(_, members) => members.width(),
+                _ => 1,
+            };
+            let nulls: SmallVec<[Value; 2]> = smallvec::smallvec![Value::null_unknown(); width];
+            self.members_answer(usize::from(id), &nulls, &caller, holes)?;
         }
         Ok(())
     }
@@ -9423,8 +9595,9 @@ impl<'a> PreparedRunner<'a> {
             }
         };
         Ok(match &set.set {
-            // A key's set is a correlated block's, which no scan takes
-            MemberSet::In(_) => SetScan::Program,
+            // A key's set is a correlated block's, which no scan takes, and
+            // a row's is tested against no column
+            MemberSet::In(_) | MemberSet::Rows(_) => SetScan::Program,
             MemberSet::SharedIn(set_of) => {
                 let members = set_of.members();
                 let mut values = members.iter().filter(|v| !v.is_null()).cloned();
@@ -10178,7 +10351,8 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         value: &Value,
         caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, value, caller, self.holes)
+        let tested = std::slice::from_ref(value);
+        self.members_answer(subquery_index as usize, tested, caller, self.holes)
     }
 
     fn execute_quantified(
@@ -10189,7 +10363,17 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         _all: bool,
         caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, value, caller, self.holes)
+        let tested = std::slice::from_ref(value);
+        self.members_answer(subquery_index as usize, tested, caller, self.holes)
+    }
+
+    fn execute_row_members(
+        &self,
+        subquery_index: u16,
+        row: &[Value],
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.row_members_answer(subquery_index as usize, row, caller, self.holes)
     }
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
@@ -10237,8 +10421,9 @@ impl SubqueryExecutor for SiteRunner<'_> {
         value: &Value,
         caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
+        let tested = std::slice::from_ref(value);
         self.runner
-            .members_answer(subquery_index as usize, value, caller, self.holes)
+            .members_answer(subquery_index as usize, tested, caller, self.holes)
     }
 
     fn execute_quantified(
@@ -10249,8 +10434,19 @@ impl SubqueryExecutor for SiteRunner<'_> {
         _all: bool,
         caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
+        let tested = std::slice::from_ref(value);
         self.runner
-            .members_answer(subquery_index as usize, value, caller, self.holes)
+            .members_answer(subquery_index as usize, tested, caller, self.holes)
+    }
+
+    fn execute_row_members(
+        &self,
+        subquery_index: u16,
+        row: &[Value],
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.runner
+            .row_members_answer(subquery_index as usize, row, caller, self.holes)
     }
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
@@ -10339,7 +10535,7 @@ impl PreparedRunner<'_> {
             let Some(statement) = &grouping.statement else {
                 return self.grouped_value(index, grouping, projection, caller, site);
             };
-            let mut values = self.statement_values(statement)?;
+            let mut values = self.statement_values(statement, 1)?;
             if values.len() > 1 {
                 return Err(more_than_one_row());
             }
@@ -10537,10 +10733,12 @@ impl PreparedRunner<'_> {
             }
             let mut keys: SmallVec<[Value; 2]> = SmallVec::new();
             for (i, (key, ..)) in order.keys.iter().enumerate() {
-                let value = match (key, order.item) {
-                    (Some(key), _) => vm.execute(key, &exec)?,
-                    (None, Some(first)) if first < i => keys[first].clone(),
-                    (None, _) => {
+                let repeated = order.repeats.iter().find(|(at, _)| *at == i);
+                let value = match (key, order.item, repeated) {
+                    (Some(key), ..) => vm.execute(key, &exec)?,
+                    (None, _, Some(&(_, first))) => keys[first].clone(),
+                    (None, Some(first), None) if first < i => keys[first].clone(),
+                    (None, ..) => {
                         let item =
                             item.ok_or_else(|| Error::internal("a sort key without item"))?;
                         vm.execute(item, &exec)?
@@ -10637,7 +10835,7 @@ impl PreparedRunner<'_> {
                         statement: Some(statement),
                         ..
                     }) => self
-                        .statement_values(statement)
+                        .statement_values(statement, 1)
                         .map(|rows| !rows.is_empty()),
                     Some(grouping) => {
                         self.with_groups(index, grouping, caller, site, |rows, params, vm| {
@@ -10685,15 +10883,21 @@ fn first_value(row: Row) -> Value {
     }
 }
 
-fn more_than_one_row() -> Error {
-    Error::Internal {
-        message: "scalar subquery returned more than one row".to_string(),
-    }
-}
-
 /// `values` as `test` asks them, NULL members included; an uncorrelated
-/// block's IN set `shared`, a key's kept in place
-fn member_set(test: MemberTest, values: Vec<Value>, shared: bool) -> MemberSet {
+/// block's IN set `shared`, a key's kept in place. A row block's members
+/// are `width` values each
+fn member_set(test: MemberTest, width: usize, values: Vec<Value>, shared: bool) -> MemberSet {
+    let (op, all) = match test {
+        MemberTest::One(comparison) => {
+            return MemberSet::Rows(RowMembers::new(RowTest::One(comparison), width, values));
+        }
+        MemberTest::In => (CompareOp::Eq, false),
+        MemberTest::Quantified(op, all) => (op, all),
+    };
+    if width > 1 {
+        let test = RowTest::Quantified(op, all);
+        return MemberSet::Rows(RowMembers::new(test, width, values));
+    }
     match test {
         MemberTest::In => {
             let set = PredicateSet::of(CompactArc::new(values.into_iter().collect()));
@@ -10702,7 +10906,7 @@ fn member_set(test: MemberTest, values: Vec<Value>, shared: bool) -> MemberSet {
                 false => MemberSet::In(set),
             }
         }
-        MemberTest::Quantified(op, all) => {
+        _ => {
             let has_null = values.iter().any(Value::is_null);
             let members: Vec<Value> = values.into_iter().filter(|v| !v.is_null()).collect();
             MemberSet::Quantified(QuantifiedMembers::new(
@@ -10716,11 +10920,60 @@ fn member_set(test: MemberTest, values: Vec<Value>, shared: bool) -> MemberSet {
 }
 
 impl PreparedRunner<'_> {
-    /// A value block's answer to `value` for the row it runs for
+    /// A row block's answer to `row` for the row it runs for. A row compared
+    /// with the block's one row reads every row the block gives first; an
+    /// uncorrelated block keeps them for the run
+    fn row_members_answer(
+        &self,
+        index: usize,
+        row: &[Value],
+        caller: &ExecuteContext,
+        site: &HoleSet,
+    ) -> Result<Option<bool>> {
+        let sq = &self.prepared.subqueries[index];
+        let one = match &sq.answer {
+            Answer::Members(_, members) => matches!(members.test, MemberTest::One(_)),
+            Answer::Statement(_, block) => {
+                matches!(block.form, StatementForm::Members(_, MemberTest::One(_)))
+            }
+            _ => false,
+        };
+        if !one || sq.uncorrelated {
+            return self.members_answer(index, row, caller, site);
+        }
+        let set = match &sq.answer {
+            Answer::Statement(_, block) => {
+                let StatementForm::Members(read_as, test) = block.form else {
+                    return Err(Error::internal("a block run for its members that has none"));
+                };
+                let mut rows = self.block_statement(index, block, caller, site)?;
+                let mut values = Vec::new();
+                while rows.next() {
+                    Member::of_row(rows.take_row(), row.len(), read_as).push_into(&mut values);
+                }
+                if let Some(e) = rows.last_error() {
+                    return Err(e);
+                }
+                KeptMembers {
+                    set: member_set(test, row.len(), values, false),
+                    failed: None,
+                }
+            }
+            Answer::Members(_, members) => {
+                self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
+                self.collect_members(index, members, None)?
+            }
+            _ => return Err(Error::internal("a block run for its members that has none")),
+        };
+        set.answer_row(row)
+    }
+
+    /// A value block's answer to `tested`, a value or a row of the block's
+    /// width, for the row it runs for
     fn members_answer(
         &self,
         index: usize,
-        value: &Value,
+        tested: &[Value],
         caller: &ExecuteContext,
         site: &HoleSet,
     ) -> Result<Option<bool>> {
@@ -10736,12 +10989,8 @@ impl PreparedRunner<'_> {
             let mut rows = self.block_statement(index, block, caller, site)?;
             let mut fold = MemberFold::new(test);
             while rows.next() {
-                let member = first_value(rows.take_row());
-                let member = match read_as {
-                    Some(column_type) => read_as_column(column_type, member),
-                    None => member,
-                };
-                if let Some(answer) = fold.member(value, Ok(member))? {
+                let member = Member::of_row(rows.take_row(), tested.len(), read_as);
+                if let Some(answer) = fold.take(tested, Ok(member))? {
                     return Ok(Some(answer));
                 }
             }
@@ -10763,11 +11012,11 @@ impl PreparedRunner<'_> {
             let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
                 return Err(Error::internal("a value block's members not kept"));
             };
-            return set.answer(value);
+            return set.answer_values(tested);
         }
         let call = self.parent_call(sq);
         if let Some(BlockAnswer::Members(set)) = self.answered(index, call) {
-            return set.answer(value);
+            return set.answer_values(tested);
         }
         if call.is_some() {
             // A keyed set read for the run answers each call by lookup already
@@ -10783,36 +11032,61 @@ impl PreparedRunner<'_> {
                 self.answer_call(index, call, || {
                     BlockAnswer::Members(CompactArc::clone(&set))
                 });
-                return set.answer(value);
+                return set.answer_values(tested);
             }
         }
         if let Some(grouping) = &sq.grouping {
-            return self.with_groups(index, grouping, caller, site, |rows, params, vm| {
-                let mut fold = MemberFold::new(members.test);
-                for slot_row in rows {
-                    let exec = self.slot_context(slot_row, params);
-                    match self.group_passes(grouping, vm, &exec) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            fold.fail(e)?;
-                            continue;
-                        }
-                    }
-                    if let Some(answer) = fold.member(value, self.member(members, vm, &exec))? {
-                        return Ok(Some(answer));
-                    }
+            return match tested {
+                [value] => {
+                    self.fold_groups(index, grouping, members, caller, site, |fold, vm, exec| {
+                        fold.member(value, self.member(members, vm, exec))
+                    })
                 }
-                fold.finish()
-            });
+                row => {
+                    self.fold_groups(index, grouping, members, caller, site, |fold, vm, exec| {
+                        fold.row(row, self.member_row(members, vm, exec))
+                    })
+                }
+            };
         }
         self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
         match &kept.keyed {
             Some(plan) if self.takes_keyed_set(index, plan) && self.keys_fit(index, plan) => {
-                self.keyed_members_answer(index, kept, members, plan, value)
+                self.keyed_members_answer(index, kept, members, plan, tested)
             }
-            _ => self.probe_members(index, members, value),
+            _ => self.probe_members(index, members, tested),
         }
+    }
+
+    /// A grouped block's answer for the call: `take` folds each passing
+    /// group's member
+    fn fold_groups(
+        &self,
+        index: usize,
+        grouping: &Grouping,
+        members: &Members,
+        caller: &ExecuteContext,
+        site: &HoleSet,
+        mut take: impl FnMut(&mut MemberFold, &mut ExprVM, &ExecuteContext) -> Result<Option<bool>>,
+    ) -> Result<Option<bool>> {
+        self.with_groups(index, grouping, caller, site, |rows, params, vm| {
+            let mut fold = MemberFold::new(members.test);
+            for slot_row in rows {
+                let exec = self.slot_context(slot_row, params);
+                match self.group_passes(grouping, vm, &exec) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        fold.fail(e)?;
+                        continue;
+                    }
+                }
+                if let Some(answer) = take(&mut fold, vm, &exec)? {
+                    return Ok(Some(answer));
+                }
+            }
+            fold.finish()
+        })
     }
 
     /// An uncorrelated value block's members, read once per run on first
@@ -10938,7 +11212,7 @@ impl PreparedRunner<'_> {
         Some(match &set.set {
             MemberSet::SharedIn(set) => Op::InSet(CompactArc::clone(set)),
             MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
-            MemberSet::In(_) => return None,
+            MemberSet::In(_) | MemberSet::Rows(_) => return None,
         })
     }
 
@@ -11055,6 +11329,64 @@ impl PreparedRunner<'_> {
         Ok(members.read(vm.execute(&members.projection, exec)?))
     }
 
+    /// The values a candidate gives a row block's members
+    fn member_row(
+        &self,
+        members: &Members,
+        vm: &mut ExprVM,
+        exec: &ExecuteContext,
+    ) -> Result<SmallVec<[Value; 2]>> {
+        std::iter::once(&members.projection)
+            .chain(&members.rest)
+            .map(|program| vm.execute(program, exec))
+            .collect()
+    }
+
+    /// The candidate's member, a value or a row's values
+    fn candidate(
+        &self,
+        members: &Members,
+        vm: &mut ExprVM,
+        exec: &ExecuteContext,
+    ) -> Result<Member> {
+        match members.rest.is_empty() {
+            true => self.member(members, vm, exec).map(Member::Value),
+            false => self.member_row(members, vm, exec).map(Member::Row),
+        }
+    }
+
+    /// `fold` given the candidate's member, tested against `tested`
+    #[inline(always)]
+    fn fold_member(
+        &self,
+        fold: &mut MemberFold,
+        tested: &[Value],
+        members: &Members,
+        vm: &mut ExprVM,
+        exec: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        match tested {
+            [value] => fold.member(value, self.member(members, vm, exec)),
+            row => fold.row(row, self.member_row(members, vm, exec)),
+        }
+    }
+
+    /// Appends the candidate's member, a value or a row's values, to `values`
+    #[inline]
+    fn push_member(
+        &self,
+        members: &Members,
+        vm: &mut ExprVM,
+        exec: &ExecuteContext,
+        values: &mut Vec<Value>,
+    ) -> Result<()> {
+        match members.rest.is_empty() {
+            true => values.push(self.member(members, vm, exec)?),
+            false => values.extend(self.member_row(members, vm, exec)?),
+        }
+        Ok(())
+    }
+
     /// The member of a row a block's LIMIT kept: the SELECT expression's
     /// value its sort computed, or the expression over the row
     fn cut_member(
@@ -11064,13 +11396,24 @@ impl PreparedRunner<'_> {
         (mut keys, row): (SmallVec<[Value; 2]>, Row),
         vm: &mut ExprVM,
         params: &[Value],
-    ) -> Result<Value> {
+    ) -> Result<Member> {
         if let Some(item) = order.item {
-            return Ok(members.read(keys.swap_remove(item)));
+            return Ok(Member::Value(members.read(keys.swap_remove(item))));
         }
         let exec = ExecuteContext::with_common_params(&row, params, self.transaction_id)
             .with_subquery_executor(self);
-        self.member(members, vm, &exec)
+        if order.values.is_empty() {
+            return self.candidate(members, vm, &exec);
+        }
+        let programs = std::iter::once(&members.projection).chain(&members.rest);
+        let mut values = SmallVec::with_capacity(order.values.len());
+        for (key, program) in order.values.iter().zip(programs) {
+            values.push(match key {
+                Some(key) => std::mem::replace(&mut keys[*key], Value::null_unknown()),
+                None => vm.execute(program, &exec)?,
+            });
+        }
+        Ok(Member::Row(values))
     }
 
     /// `value` tested by the probe against the buffer filled: a member that
@@ -11080,7 +11423,7 @@ impl PreparedRunner<'_> {
         &self,
         index: usize,
         members: &Members,
-        value: &Value,
+        tested: &[Value],
     ) -> Result<Option<bool>> {
         self.ctx.check_cancelled()?;
         #[cfg(feature = "test-failpoints")]
@@ -11096,7 +11439,7 @@ impl PreparedRunner<'_> {
             let mut fold = MemberFold::new(members.test);
             for row in rows {
                 let member = self.cut_member(members, order, row, &mut vm, &params);
-                if let Some(answer) = fold.member(value, member)? {
+                if let Some(answer) = fold.take(tested, member)? {
                     return Ok(Some(answer));
                 }
             }
@@ -11138,7 +11481,7 @@ impl PreparedRunner<'_> {
                     }
                 }
             }
-            if let Some(answer) = fold.member(value, self.member(members, &mut vm, &exec))? {
+            if let Some(answer) = self.fold_member(&mut fold, tested, members, &mut vm, &exec)? {
                 return Ok(Some(answer));
             }
         }
@@ -11157,9 +11500,10 @@ impl PreparedRunner<'_> {
         members: &Members,
         plan: Option<&KeyedPlan>,
     ) -> Result<KeptMembers> {
+        let width = members.width();
         if let Some(grouping) = &self.prepared.subqueries[index].grouping {
             if let Some(statement) = &grouping.statement {
-                let values = self.statement_values(statement)?;
+                let values = self.statement_values(statement, width)?;
                 let values = match members.read_as {
                     Some(column_type) => values
                         .into_iter()
@@ -11168,36 +11512,33 @@ impl PreparedRunner<'_> {
                     None => values,
                 };
                 return Ok(KeptMembers {
-                    set: member_set(members.test, values, true),
+                    set: member_set(members.test, width, values, true),
                     failed: None,
                 });
             }
             let rows = self.group_rows(index, grouping)?;
             let mut vm = self.blocks[index].vm.borrow_mut();
             let params = self.blocks[index].buffer.borrow();
-            let (mut values, mut failed) = (Vec::with_capacity(rows.len()), None);
+            let (mut values, mut failed) = (Vec::with_capacity(rows.len() * width), None);
             for slot_row in &rows {
                 let exec = self.slot_context(slot_row, &params);
-                let member = match self.group_passes(grouping, &mut vm, &exec) {
-                    Ok(true) => self.member(members, &mut vm, &exec),
+                let pushed = match self.group_passes(grouping, &mut vm, &exec) {
+                    Ok(true) => self.push_member(members, &mut vm, &exec, &mut values),
                     Ok(false) => continue,
                     Err(e) => Err(e),
                 };
-                match member {
-                    Ok(member) => values.push(member),
-                    Err(e) => {
-                        failed.get_or_insert(deferred(e)?);
-                    }
+                if let Err(e) = pushed {
+                    failed.get_or_insert(deferred(e)?);
                 }
             }
             return Ok(KeptMembers {
-                set: member_set(members.test, values, true),
+                set: member_set(members.test, width, values, true),
                 failed,
             });
         }
         let mut grouped = self.group_members(index, members, plan)?;
         Ok(grouped.remove(&[][..]).unwrap_or_else(|| KeptMembers {
-            set: member_set(members.test, Vec::new(), true),
+            set: member_set(members.test, width, Vec::new(), true),
             failed: None,
         }))
     }
@@ -11221,16 +11562,16 @@ impl PreparedRunner<'_> {
             let rows = self.cut_rows(index, order, Some(&members.projection), false)?;
             let mut vm = self.blocks[index].vm.borrow_mut();
             let params = self.blocks[index].buffer.borrow();
-            let (mut values, mut failed) = (Vec::with_capacity(rows.len()), None);
+            let (mut values, mut failed) = (Vec::with_capacity(rows.len() * members.width()), None);
             for row in rows {
                 match self.cut_member(members, order, row, &mut vm, &params) {
-                    Ok(member) => values.push(member),
+                    Ok(member) => member.push_into(&mut values),
                     Err(e) => {
                         failed.get_or_insert(deferred(e)?);
                     }
                 }
             }
-            let set = member_set(members.test, values, true);
+            let set = member_set(members.test, members.width(), values, true);
             return Ok(std::iter::once((SmallVec::new(), KeptMembers { set, failed })).collect());
         }
         let mut vm = self.blocks[index].vm.borrow_mut();
@@ -11277,17 +11618,14 @@ impl PreparedRunner<'_> {
             } else {
                 self.passes_rest(sq, &mut vm, &exec, &slots_failed)
             };
-            let member = match passed {
-                Ok(true) => self.member(members, &mut vm, &exec),
-                Ok(false) => continue,
-                Err(e) => Err(e),
-            };
+            if let Ok(false) = passed {
+                continue;
+            }
             let group = groups.entry(key).or_default();
-            match member {
-                Ok(member) => group.0.push(member),
-                Err(e) => {
-                    group.1.get_or_insert(deferred(e)?);
-                }
+            let pushed =
+                passed.and_then(|_| self.push_member(members, &mut vm, &exec, &mut group.0));
+            if let Err(e) = pushed {
+                group.1.get_or_insert(deferred(e)?);
             }
         }
         if let Some(err) = scanner.err() {
@@ -11299,7 +11637,7 @@ impl PreparedRunner<'_> {
                 (
                     key,
                     KeptMembers {
-                        set: member_set(members.test, values, plan.is_none()),
+                        set: member_set(members.test, members.width(), values, plan.is_none()),
                         failed,
                     },
                 )
@@ -11381,7 +11719,7 @@ impl PreparedRunner<'_> {
         kept: &Kept,
         members: &Members,
         plan: &KeyedPlan,
-        value: &Value,
+        tested: &[Value],
     ) -> Result<Option<bool>> {
         if self.blocks[index].members.get().is_none() {
             #[cfg(feature = "test-failpoints")]
@@ -11415,8 +11753,43 @@ impl PreparedRunner<'_> {
             }
         };
         match group {
-            Some(group) => group.answer(value),
+            Some(group) => group.answer_values(tested),
             None => no_candidates,
+        }
+    }
+}
+
+/// What a candidate gives a block's members: its SELECT value, or a row's
+/// values
+enum Member {
+    Value(Value),
+    Row(SmallVec<[Value; 2]>),
+}
+
+impl Member {
+    /// A statement block's row as a member of `width` values
+    fn of_row(row: Row, width: usize, read_as: Option<DataType>) -> Self {
+        match width {
+            1 => {
+                let member = first_value(row);
+                Member::Value(match read_as {
+                    Some(column_type) => read_as_column(column_type, member),
+                    None => member,
+                })
+            }
+            _ => {
+                let mut values = row.into_values();
+                values.resize(width, Value::null_unknown());
+                Member::Row(values.into_iter().collect())
+            }
+        }
+    }
+
+    /// Appends the member's values to `values`
+    fn push_into(self, values: &mut Vec<Value>) {
+        match self {
+            Member::Value(value) => values.push(value),
+            Member::Row(row) => values.extend(row),
         }
     }
 }
@@ -11434,8 +11807,12 @@ struct MemberFold {
 
 impl MemberFold {
     fn new(test: MemberTest) -> Self {
+        debug_assert!(
+            !matches!(test, MemberTest::One(_)),
+            "a row compared with a block's one row reads all its rows first"
+        );
         let (op, decides) = match test {
-            MemberTest::In => (CompareOp::Eq, true),
+            MemberTest::In | MemberTest::One(_) => (CompareOp::Eq, true),
             MemberTest::Quantified(op, all) => (op, !all),
         };
         Self {
@@ -11461,6 +11838,38 @@ impl MemberFold {
             Err(e) => self.fail(e)?,
         }
         Ok(None)
+    }
+
+    /// The answer, once a row block's `member` settles the test of `row`
+    fn row(&mut self, row: &[Value], member: Result<SmallVec<[Value; 2]>>) -> Result<Option<bool>> {
+        match member {
+            Ok(member) => Ok(self.settle(self.op.compare_rows(row, &member))),
+            Err(e) => self.fail(e).map(|_| None),
+        }
+    }
+
+    /// [`Self::member`] or [`Self::row`], as `tested` and `member` are
+    fn take(&mut self, tested: &[Value], member: Result<Member>) -> Result<Option<bool>> {
+        match (tested, member) {
+            ([value], Ok(Member::Value(member))) => self.member(value, Ok(member)),
+            (row, Ok(Member::Row(member))) => self.row(row, Ok(member)),
+            (_, Err(e)) => self.fail(e).map(|_| None),
+            _ => Err(Error::internal("a block's members of another width")),
+        }
+    }
+
+    /// The answer one member's comparison settles
+    #[inline]
+    fn settle(&mut self, answer: Option<bool>) -> Option<bool> {
+        self.any = true;
+        match answer {
+            Some(answer) if answer == self.decides => Some(answer),
+            Some(_) => None,
+            None => {
+                self.unknown = true;
+                None
+            }
+        }
     }
 
     /// Keeps the first error a candidate raised; a cancel ends the test
@@ -11508,7 +11917,7 @@ impl PreparedRunner<'_> {
         )
     }
 
-    fn statement_values(&self, run: &StatementRun) -> Result<Vec<Value>> {
+    fn statement_values(&self, run: &StatementRun, width: usize) -> Result<Vec<Value>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::Statement,
@@ -11522,12 +11931,7 @@ impl PreparedRunner<'_> {
         )?;
         let mut values = Vec::new();
         while result.next() {
-            let mut row = result.take_row().into_values();
-            values.push(if row.is_empty() {
-                Value::null_unknown()
-            } else {
-                row.swap_remove(0)
-            });
+            Member::of_row(result.take_row(), width, None).push_into(&mut values);
         }
         match result.last_error() {
             Some(e) => Err(e),

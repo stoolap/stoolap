@@ -114,3 +114,87 @@ fn every_operator_answers_on_the_prepared_path_as_with_the_value_written() {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+#[test]
+fn every_expression_form_answers_on_the_prepared_path_as_with_the_value_written() {
+    let db = Database::open("memory://every_expression_form_answers_on_the_prepared_path").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, ts TIMESTAMP)",
+        "INSERT INTO t VALUES (1, 1, '2024-01-01 00:00:00'), (2, 2, '2024-01-05 00:00:00'), \
+         (3, NULL, '2024-01-09 00:00:00'), (4, 4, '2024-01-10 00:00:00')",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, ts TIMESTAMP)",
+        "INSERT INTO u VALUES (1, '2024-01-02 00:00:00'), (2, '2024-01-10 00:00:00')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut failed = Vec::new();
+    for form in [
+        "ts + INTERVAL '1 day' > '2024-01-06 00:00:00'",
+        "ts - INTERVAL '36 hours' < '2024-01-04 00:00:00'",
+        "(k, id) = (1, 1)",
+        "(k, id) < (2, 9)",
+        "(k, id) IS NOT DISTINCT FROM (NULL, 3)",
+        "(k, id) IN ((1, 1), (4, 4))",
+        "(k, id) NOT IN ((1, id), (k, 9))",
+    ] {
+        for (shape, written) in [
+            (
+                format!("SELECT id FROM t WHERE {form} AND id > (SELECT MIN(id) FROM u)"),
+                format!("SELECT id FROM t WHERE {form} AND id > 1"),
+            ),
+            (
+                format!(
+                    "SELECT id FROM t WHERE {form} AND EXISTS (SELECT 1 FROM u WHERE u.id = t.id)"
+                ),
+                format!("SELECT id FROM t WHERE {form} AND id IN (1, 2)"),
+            ),
+            (
+                format!("SELECT id, ({form}) AS o, (SELECT MAX(id) FROM u) AS m FROM t"),
+                format!("SELECT id, ({form}) AS o, 2 AS m FROM t"),
+            ),
+        ] {
+            let path = prepared_line(&db, &shape);
+            if path != "Prepared: yes" {
+                failed.push(format!("{shape}: {path}"));
+            }
+            let (got, want) = (rows(&db, &shape), rows(&db, &written));
+            if got != want {
+                failed.push(format!("{shape}: {got:?}, written {want:?}"));
+            }
+        }
+    }
+    for (shape, written) in [
+        (
+            "SELECT id FROM t WHERE ts > (SELECT MAX(ts) FROM u) - INTERVAL '2 days'",
+            "SELECT id FROM t WHERE ts > TIMESTAMP '2024-01-10 00:00:00' - INTERVAL '2 days'",
+        ),
+        (
+            "SELECT id FROM t WHERE ts - INTERVAL '1 day' < (SELECT ts FROM u WHERE u.id = t.id)",
+            "SELECT id FROM t WHERE id IN (1, 2)",
+        ),
+        (
+            "SELECT id FROM t WHERE (k, (SELECT MAX(id) FROM u)) = (2, 2)",
+            "SELECT id FROM t WHERE (k, 2) = (2, 2)",
+        ),
+        (
+            "SELECT t.id FROM t JOIN u ON (t.id, t.k) = (u.id, u.id) \
+             AND t.k > (SELECT MIN(id) FROM u) - 1",
+            "SELECT t.id FROM t JOIN u ON t.id = u.id AND t.k = u.id",
+        ),
+        (
+            "SELECT id, (k, (SELECT u.id FROM u WHERE u.id = t.id)) = (1, 1) FROM t",
+            "SELECT id, CASE id WHEN 1 THEN TRUE WHEN 3 THEN CAST(NULL AS BOOLEAN) ELSE FALSE END \
+             FROM t",
+        ),
+    ] {
+        let path = prepared_line(&db, shape);
+        if path != "Prepared: yes" {
+            failed.push(format!("{shape}: {path}"));
+        }
+        let (got, want) = (rows(&db, shape), rows(&db, written));
+        if got != want {
+            failed.push(format!("{shape}: {got:?}, written {want:?}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}

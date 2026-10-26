@@ -422,14 +422,9 @@ fn an_on_block_reads_the_transaction_s_own_writes() {
     );
 }
 
-/// Tuples stay outside the subquery family: an ON with a subquery beside
-/// one is not prepared
-const TUPLE_FORMS: &[&str] = &[
+const PAIR_FORMS: &[&str] = &[
     "(l.id, r.id) IN ((1, 1), (6, 1), (11, 11))",
     "(l.g, l.k) = (r.w, r.k)",
-];
-
-const PAIR_FORMS: &[&str] = &[
     "l.id + r.id BETWEEN 5 AND 40",
     "l.id NOT BETWEEN 3 AND 5",
     "CASE WHEN l.k > 3 THEN r.w ELSE l.g END = r.w",
@@ -458,7 +453,7 @@ fn a_join_rewrites_every_condition_form_beside_its_blocks() {
     fill(&db);
     let exists = "EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)";
     let mut shapes: Vec<(String, String)> = Vec::new();
-    for form in TUPLE_FORMS.iter().chain(PAIR_FORMS) {
+    for form in PAIR_FORMS {
         let moved = format!(
             "SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.g = r.w AND {form} WHERE {exists}"
         );
@@ -467,9 +462,6 @@ fn a_join_rewrites_every_condition_form_beside_its_blocks() {
             format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON {form} WHERE {exists}"),
         ));
         shapes.push((moved.clone(), moved.clone()));
-        if TUPLE_FORMS.contains(form) {
-            continue;
-        }
         shapes.push((
             format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.g = r.w AND {form} AND {exists}"),
             moved,
@@ -651,7 +643,7 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
         ),
         (
             format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND (l.g, l.k) = (r.w, r.k) AND {exists}"),
-            "Prepared: no (an expression form outside the family)".to_string(),
+            "Prepared: yes".to_string(),
         ),
     ];
     let mut wrong = Vec::new();

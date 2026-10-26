@@ -26,13 +26,13 @@ use std::borrow::Cow;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::ops::{CompareOp, IntervalStep, Op};
+use super::ops::{row_in, CompareOp, IntervalStep, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::pattern::Pattern;
-use crate::core::predicate::{sql_compare, sql_distinct, sql_eq};
+use crate::core::predicate::{sql_compare, sql_distinct, sql_eq, sql_rows_distinct};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Error, Result, Row, Value, NULL_VALUE};
 use crate::executor::context::KeptMembers;
@@ -289,6 +289,16 @@ pub trait SubqueryExecutor {
         all: bool,
         ctx: &ExecuteContext,
     ) -> Result<Option<bool>>;
+
+    /// `row` tested against a row block's members by the test it answers
+    fn execute_row_members(
+        &self,
+        _subquery_index: u16,
+        _row: &[Value],
+        _ctx: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        Err(no_subquery_executor())
+    }
 
     /// An uncorrelated block's members once this run has read them, which
     /// the VM tests in place of calling the block
@@ -650,6 +660,24 @@ impl ExprVM {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     self.stack.push(Value::Boolean(!sql_distinct(&a, &b)));
+                    pc += 1;
+                }
+
+                Op::CompareRows(op, width) => {
+                    let start = self.stack.len().saturating_sub(2 * *width as usize);
+                    let (a, b) = self.stack[start..].split_at(*width as usize);
+                    let result = truth(op.compare_rows(a, b));
+                    self.stack.truncate(start);
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::RowsDistinct(negated, width) => {
+                    let start = self.stack.len().saturating_sub(2 * *width as usize);
+                    let (a, b) = self.stack[start..].split_at(*width as usize);
+                    let result = Value::Boolean(sql_rows_distinct(a, b) != *negated);
+                    self.stack.truncate(start);
+                    self.stack.push(result);
                     pc += 1;
                 }
 
@@ -1367,39 +1395,23 @@ impl ExprVM {
                     let tuple_size = *tuple_size as usize;
                     let start = self.stack.len().saturating_sub(tuple_size);
 
-                    // Reuse args_buffer to avoid allocation
-                    self.args_buffer.clear();
-                    self.args_buffer.extend(self.stack.drain(start..));
-
-                    // OR over the tuples of an AND over their columns, each
-                    // with UNKNOWN as SQL has it
-                    let mut found = Some(false);
-                    for tuple in values.iter() {
-                        if tuple.len() != self.args_buffer.len() {
-                            continue;
-                        }
-                        let mut equal = Some(true);
-                        for (member, probe) in tuple.iter().zip(self.args_buffer.iter()) {
-                            match sql_eq(probe, member) {
-                                Some(true) => {}
-                                Some(false) => {
-                                    equal = Some(false);
-                                    break;
-                                }
-                                None => equal = None,
-                            }
-                        }
-                        match equal {
-                            Some(true) => {
-                                found = Some(true);
-                                break;
-                            }
-                            Some(false) => {}
-                            None => found = None,
-                        }
-                    }
+                    let found = row_in(&self.stack[start..], values.iter().map(Vec::as_slice));
+                    self.stack.truncate(start);
                     let result = if *negated { found.map(|f| !f) } else { found };
                     self.stack.push(truth(result));
+                    pc += 1;
+                }
+
+                Op::InRows(width, count) => {
+                    let width = *width as usize;
+                    let start = self
+                        .stack
+                        .len()
+                        .saturating_sub(width.saturating_mul(*count as usize + 1));
+                    let (row, list) = self.stack[start..].split_at(width);
+                    let result = truth(row_in(row, list.chunks_exact(width)));
+                    self.stack.truncate(start);
+                    self.stack.push(result);
                     pc += 1;
                 }
 
@@ -1778,6 +1790,11 @@ impl ExprVM {
                         None => executor.execute_quantified(*idx, &v, *compare_op, *all, ctx)?,
                     };
                     self.stack.push(truth(answer));
+                    pc += 1;
+                }
+
+                Op::ExecRowMembers(idx, width) => {
+                    self.row_members(*idx, *width, ctx)?;
                     pc += 1;
                 }
 
@@ -2897,6 +2914,22 @@ impl ExprVM {
             Value::Null(_) => None,
             _ => Some(true),
         }
+    }
+
+    /// The top `width` values tested against block `index`'s members,
+    /// replaced by the answer
+    #[inline(never)]
+    fn row_members(&mut self, index: u16, width: u16, ctx: &ExecuteContext) -> Result<()> {
+        let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+        let start = self.stack.len().saturating_sub(width as usize);
+        let row = &self.stack[start..];
+        let answer = match executor.kept_members(index) {
+            Some(kept) => kept.answer_row(row)?,
+            None => executor.execute_row_members(index, row, ctx)?,
+        };
+        self.stack.truncate(start);
+        self.stack.push(truth(answer));
+        Ok(())
     }
 
     #[inline]

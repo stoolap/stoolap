@@ -225,17 +225,18 @@ fn test_a_set_test_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id FROM t WHERE x >= ALL (SELECT v + 1 FROM u WHERE u.k = t.k) LIMIT 2",
         "SELECT id FROM t WHERE x IN (SELECT MAX(v) FROM u)",
         "SELECT id, x IN (SELECT v FROM u) FROM t WHERE x IN (SELECT v FROM u)",
+        "SELECT id FROM t WHERE (x, k) IN (SELECT v, k FROM u)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
     for (sql, reason) in [
         (
-            "SELECT id FROM t WHERE (x, k) IN (SELECT v, k FROM u)",
-            "a tuple on the left of IN (subquery)",
-        ),
-        (
             "SELECT id FROM t WHERE x IN (SELECT v, k FROM u)",
             "a subquery block without exactly one SELECT expression",
+        ),
+        (
+            "SELECT id FROM t WHERE (x, k) IN (SELECT v FROM u)",
+            "a subquery block selecting another number of values than its row holds",
         ),
     ] {
         assert_eq!(

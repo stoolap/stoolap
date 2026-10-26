@@ -214,6 +214,12 @@ pub fn sql_distinct(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Two rows of one width are distinct when a pair of their values is
+pub fn sql_rows_distinct(a: &[Value], b: &[Value]) -> bool {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).any(|(x, y)| sql_distinct(x, y))
+}
+
 /// The kinds of the values a column or set holds, as one bit each
 pub mod kind {
     use super::super::DataType;

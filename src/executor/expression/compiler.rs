@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{IntervalStep, Op, QuantifiedMembers};
+use super::ops::{CompareOp, IntervalStep, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::interval::IntervalUnit;
@@ -730,6 +730,11 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === LIST ===
+            Expression::List(_) | Expression::ExpressionList(_) if row_values(expr).is_some() => {
+                return Err(CompileError::TypeError(
+                    "a row of values stands where one value is read".to_string(),
+                ));
+            }
             Expression::List(list) => {
                 if list.elements.is_empty() {
                     builder.emit(Op::LoadNull(DataType::Null));
@@ -777,6 +782,9 @@ impl<'a> ExprCompiler<'a> {
                             all_any.operator
                         ))
                     })?;
+                if let Some(row) = row_values(&all_any.left) {
+                    return self.compile_row_members(id, row.iter(), builder);
+                }
                 self.compile_expr(&all_any.left, builder)?;
                 let all = matches!(all_any.all_any_type, AllAnyType::All);
                 builder.emit(Op::ExecQuantified(id, compare_op, all));
@@ -836,6 +844,9 @@ impl<'a> ExprCompiler<'a> {
         infix: &InfixExpression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        if self.compile_row_comparison(infix, builder)? {
+            return Ok(());
+        }
         match infix.op_type {
             // Short-circuit AND
             InfixOperator::And => {
@@ -1311,6 +1322,80 @@ impl<'a> ExprCompiler<'a> {
         Ok(true)
     }
 
+    /// Compile `infix` when a side is a row: two rows of one width compared
+    /// value by value, each value read once; false when neither side is one
+    fn compile_row_comparison(
+        &self,
+        infix: &InfixExpression,
+        builder: &mut ProgramBuilder,
+    ) -> Result<bool, CompileError> {
+        let (left, right) = (row_values(&infix.left), row_values(&infix.right));
+        if left.is_none() && right.is_none() {
+            return Ok(false);
+        }
+        let op: fn(u16) -> Op = match infix.op_type {
+            InfixOperator::Equal => |width| Op::CompareRows(CompareOp::Eq, width),
+            InfixOperator::NotEqual => |width| Op::CompareRows(CompareOp::Ne, width),
+            InfixOperator::LessThan => |width| Op::CompareRows(CompareOp::Lt, width),
+            InfixOperator::LessEqual => |width| Op::CompareRows(CompareOp::Le, width),
+            InfixOperator::GreaterThan => |width| Op::CompareRows(CompareOp::Gt, width),
+            InfixOperator::GreaterEqual => |width| Op::CompareRows(CompareOp::Ge, width),
+            InfixOperator::IsDistinctFrom => |width| Op::RowsDistinct(false, width),
+            InfixOperator::IsNotDistinctFrom => |width| Op::RowsDistinct(true, width),
+            _ => {
+                return Err(CompileError::TypeError(format!(
+                    "a row takes no {}",
+                    infix.operator
+                )))
+            }
+        };
+        // A block a row is compared with holds the comparison, and its one row
+        if let (Expression::ScalarSubquery(sq), _, None, Some(row))
+        | (_, Expression::ScalarSubquery(sq), Some(row), None) =
+            (&*infix.left, &*infix.right, left, right)
+        {
+            let id = self.subquery_id(&sq.subquery, "row subquery")?;
+            self.compile_row_members(id, row.iter(), builder)?;
+            return Ok(true);
+        }
+        let (left, right) = match (left, right) {
+            (Some(left), Some(right)) if left.len() == right.len() => (left, right),
+            (left, right) => {
+                let width = |row: Option<&[Expression]>| row.map_or(1, <[Expression]>::len);
+                return Err(CompileError::TypeError(format!(
+                    "a row of {} values compared with {} values",
+                    width(left),
+                    width(right)
+                )));
+            }
+        };
+        let width = u16::try_from(left.len()).map_err(|_| {
+            CompileError::UnsupportedExpression(format!("a row of {} values", left.len()))
+        })?;
+        for value in left.iter().chain(right) {
+            self.compile_expr(value, builder)?;
+        }
+        builder.emit(op(width));
+        Ok(true)
+    }
+
+    /// Compile `row` tested against the members of block `id`
+    fn compile_row_members<'e>(
+        &self,
+        id: u16,
+        row: impl ExactSizeIterator<Item = &'e Expression>,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
+        let width = u16::try_from(row.len()).map_err(|_| {
+            CompileError::UnsupportedExpression(format!("a row of {} values", row.len()))
+        })?;
+        for value in row {
+            self.compile_expr(value, builder)?;
+        }
+        builder.emit(Op::ExecRowMembers(id, width));
+        Ok(())
+    }
+
     /// Compile an IN expression
     fn compile_in(
         &self,
@@ -1459,42 +1544,65 @@ impl<'a> ExprCompiler<'a> {
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
         let tuple_size = left_columns.len();
-
-        // Extract tuples from right side
-        let mut tuple_values: Vec<Vec<Value>> = Vec::new();
-        let mut all_constant = true;
-
-        match &*in_expr.right {
-            Expression::List(list) => {
-                for item in &list.elements {
-                    if let Some(tuple) = self.extract_tuple_values(item, tuple_size) {
-                        tuple_values.push(tuple);
-                    } else {
-                        all_constant = false;
-                        break;
-                    }
+        let items: &[Expression] = match &*in_expr.right {
+            Expression::List(list) => &list.elements,
+            Expression::ExpressionList(list) => &list.expressions,
+            Expression::ScalarSubquery(sq) => {
+                let id = self.subquery_id(&sq.subquery, "IN (subquery)")?;
+                self.compile_row_members(id, left_columns.iter().copied(), builder)?;
+                if in_expr.not {
+                    builder.emit(Op::Not);
                 }
-            }
-            Expression::ExpressionList(list) => {
-                for item in &list.expressions {
-                    if let Some(tuple) = self.extract_tuple_values(item, tuple_size) {
-                        tuple_values.push(tuple);
-                    } else {
-                        all_constant = false;
-                        break;
-                    }
-                }
+                return Ok(());
             }
             _ => {
-                all_constant = false;
+                return Err(CompileError::UnsupportedExpression(
+                    "Dynamic multi-column IN not yet supported in VM".to_string(),
+                ))
+            }
+        };
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            match row_values(item) {
+                Some(row) if row.len() == tuple_size => rows.push(row),
+                row => {
+                    return Err(CompileError::TypeError(format!(
+                        "a row of {} values compared with {} values",
+                        tuple_size,
+                        row.map_or(1, <[Expression]>::len)
+                    )))
+                }
             }
         }
 
-        if !all_constant || tuple_values.is_empty() {
-            return Err(CompileError::UnsupportedExpression(
-                "Dynamic multi-column IN not yet supported in VM".to_string(),
-            ));
-        }
+        // Extract tuples from right side
+        let tuple_values: Option<Vec<Vec<Value>>> = rows
+            .iter()
+            .map(|row| row.iter().map(try_eval_constant).collect())
+            .collect();
+        let Some(tuple_values) = tuple_values.filter(|values| !values.is_empty()) else {
+            let width = u16::try_from(tuple_size).map_err(|_| {
+                CompileError::UnsupportedExpression(format!("a row of {} values", tuple_size))
+            })?;
+            let count = u32::try_from(rows.len()).map_err(|_| {
+                CompileError::UnsupportedExpression(format!(
+                    "IN list holds {} items, more than an expression can hold",
+                    rows.len()
+                ))
+            })?;
+            for value in left_columns
+                .iter()
+                .copied()
+                .chain(rows.iter().copied().flatten())
+            {
+                self.compile_expr(value, builder)?;
+            }
+            builder.emit(Op::InRows(width, count));
+            if in_expr.not {
+                builder.emit(Op::Not);
+            }
+            return Ok(());
+        };
 
         // Compile each column expression to push onto stack
         for col in left_columns {
@@ -1509,26 +1617,6 @@ impl<'a> ExprCompiler<'a> {
         });
 
         Ok(())
-    }
-
-    /// Extract tuple values from an expression (e.g., (1, 2) -> [1, 2])
-    fn extract_tuple_values(&self, expr: &Expression, expected_size: usize) -> Option<Vec<Value>> {
-        let elements: Vec<&Expression> = match expr {
-            Expression::List(list) => list.elements.iter().collect(),
-            Expression::ExpressionList(list) => list.expressions.iter().collect(),
-            _ => return None,
-        };
-
-        if elements.len() != expected_size {
-            return None;
-        }
-
-        let mut values = Vec::with_capacity(expected_size);
-        for element in elements {
-            values.push(try_eval_constant(element)?);
-        }
-
-        Some(values)
     }
 
     /// Compile a LIKE expression
@@ -2150,6 +2238,15 @@ pub(crate) fn literal_value(expr: &Expression) -> Option<Value> {
         Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::Null(DataType::Null)),
+        _ => None,
+    }
+}
+
+/// The values of a row, `(a, b)`: a list of more than one
+fn row_values(expr: &Expression) -> Option<&[Expression]> {
+    match expr {
+        Expression::List(list) if list.elements.len() > 1 => Some(&list.elements),
+        Expression::ExpressionList(list) if list.expressions.len() > 1 => Some(&list.expressions),
         _ => None,
     }
 }

@@ -20,6 +20,28 @@ Stoolap supports a comprehensive set of SQL operators for building expressions i
 | `>` | Greater than | `WHERE score > 90` |
 | `>=` | Greater than or equal | `WHERE date >= '2024-01-01'` |
 
+### Row Comparisons
+
+Two rows of the same number of values compare value by value, each pair as two values compare. `=` is false when a pair is unequal, else NULL when a pair holds a NULL, else true; `<>` is its negation. `<`, `<=`, `>` and `>=` are decided by the first pair that is not equal, and are NULL when that pair holds a NULL. `IS DISTINCT FROM` is true when any pair is distinct, and `IS NOT DISTINCT FROM` is its negation.
+
+```sql
+SELECT (1, 2) = (1, 2);          -- true
+SELECT (1, NULL) = (2, 3);       -- false: the first pair decides
+SELECT (1, NULL) = (1, 3);       -- NULL
+SELECT (1, 2) < (1, 3);          -- true
+SELECT (1, 2) < (2, NULL);       -- true: the first pair decides
+SELECT (1, NULL) < (1, 3);       -- NULL
+SELECT (1, NULL) IS NOT DISTINCT FROM (1, NULL);  -- true
+```
+
+A row `IN` a list of rows is true when a row of the list equals it, else NULL when the equality with one is NULL, else false; `NOT IN` is its negation. The rows of the list may hold any expression, such as `(a, b) IN ((1, 2), (b, a))`.
+
+A row tested against a subquery that selects as many values, `(a, b) IN (SELECT x, y FROM u)` or `(a, b) < ANY (SELECT x, y FROM u)`, compares the row with each row the subquery gives by the same rule. `IN` and `op ANY` are true when one comparison is true, else NULL when one is NULL, else false; `op ALL` is false when one comparison is false, else NULL when one is NULL, else true. Over no rows `IN` and `ANY` are false and `ALL` is true.
+
+A row compared with a subquery that selects as many values, `(a, b) = (SELECT x, y FROM u WHERE u.id = t.id)`, either way round, compares it with the one row the subquery gives, by the same rule. A subquery that gives no row gives a row of NULLs, and one that gives more than one row is an error.
+
+A row is compared only with a row of as many values: `(1, 2) = (1, 2, 3)` and `(1, 2) = 1` are errors, and so is a row anywhere a single value is read, such as `SELECT (1, 2)` or `(1, 2) IS NULL`.
+
 ## Logical Operators
 
 | Operator | Description | Example |

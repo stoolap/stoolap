@@ -1064,8 +1064,8 @@ fn test_classifier_rules() {
     }
     let no = [
         (
-            "SELECT id FROM t WHERE (id, a) IN (SELECT id, v FROM u)".to_string(),
-            "a tuple on the left of IN (subquery)",
+            "SELECT id FROM t WHERE (id, a) IN (SELECT id, v, a FROM u)".to_string(),
+            "a subquery block selecting another number of values than its row holds",
         ),
         (
             format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
