@@ -260,6 +260,17 @@ pub(crate) fn ungrouped_column(name: &str) -> crate::core::Error {
     ))
 }
 
+/// Whether `name`, a GROUP BY column the input does not hold, is a column of
+/// the outer row `ctx` runs for
+fn names_outer_column(name: &str, ctx: &ExecutionContext) -> bool {
+    let Some(outer) = ctx.outer_row() else {
+        return false;
+    };
+    let lower = name.to_lowercase();
+    outer.contains_key(lower.as_str())
+        || split_qualified(&lower).is_some_and(|(_, bare)| outer.contains_key(bare))
+}
+
 /// The error the grouped `stmt` raises when it runs over `source` and reads
 /// a column outside its groups, raised without running it
 pub(crate) fn check_grouped_reads(
@@ -909,7 +920,14 @@ impl<'a> RowFeed<'a> {
                     GroupByItem::Column(name) => {
                         match Executor::lookup_column_index(&name.to_lowercase(), col_index_map) {
                             Some(idx) => KeyItem::Column(idx),
-                            None => KeyItem::Null,
+                            // The outer row's column is one value for every row
+                            None if names_outer_column(name, ctx) => KeyItem::Null,
+                            None => {
+                                return Err(ungrouped_column(&match split_qualified(name) {
+                                    Some((table, column)) => format!("{table}.{column}"),
+                                    None => name.clone(),
+                                }))
+                            }
                         }
                     }
                     GroupByItem::Expression { expr, .. } => KeyItem::Program(compile(expr)?),
