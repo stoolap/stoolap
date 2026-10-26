@@ -11630,38 +11630,6 @@ impl PreparedRunner<'_> {
         }
     }
 
-    /// Whether every block `program` asks is uncorrelated, so it may be bound
-    /// once the run has read them
-    pub(crate) fn binds_once_read(&self, program: &SharedProgram) -> bool {
-        program.ops().iter().all(|op| match *op {
-            Op::ExecScalarSubquery(index)
-            | Op::ExecExists(index)
-            | Op::ExecInSubquery(index)
-            | Op::ExecQuantified(index, ..) => self
-                .prepared
-                .subqueries
-                .get(usize::from(index))
-                .is_some_and(|sq| sq.uncorrelated),
-            _ => true,
-        })
-    }
-
-    /// `program` bound to what this run already holds, its run slots and the
-    /// values it has read, reading nothing; None when it asks a block whose
-    /// answer is not read yet, which a row reads when it needs it
-    pub(crate) fn bound_known(&self, program: &SharedProgram) -> Option<SharedProgram> {
-        let unread_set = program.ops().iter().any(|op| match *op {
-            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) => {
-                self.blocks[usize::from(index)].members.get().is_none()
-            }
-            _ => false,
-        });
-        match unread_set {
-            true => None,
-            false => self.bound_program(program),
-        }
-    }
-
     /// `program` bound to all this run knows now; one that asks no
     /// uncorrelated block binds only when that shrinks it
     fn bound_now(&self, program: &SharedProgram, asks_blocks: bool) -> SharedProgram {
@@ -11732,7 +11700,7 @@ impl PreparedRunner<'_> {
 
     /// Whether `bound` was bound again, a block it asks having been read since
     #[inline]
-    fn rebound(&self, bound: &mut Bound) -> bool {
+    pub(crate) fn rebound(&self, bound: &mut Bound) -> bool {
         let read = bound.pending.iter().any(|op| self.knows(op));
         if read {
             *bound = self.bind(&bound.source);

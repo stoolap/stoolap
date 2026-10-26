@@ -336,13 +336,12 @@ struct SideRead<'a> {
     run: Option<(StatementRun<'a>, usize)>,
 }
 
-/// A WHERE asked of joined rows: each row asks it as written, and once the
-/// statement's run holds every value it asks, it is bound to them, so a
-/// value no row reaches is never read
+/// A WHERE asked of joined rows, bound to what the statement's run holds
+/// and bound again when a row reads a value it asks, so a value no row
+/// reaches is never read
 struct JoinedWhere<'r, 'p> {
     filter: RowFilter,
-    program: SharedProgram,
-    run: Option<&'r super::prepared_select::PreparedRunner<'p>>,
+    bound: Option<(Bound, &'r super::prepared_select::PreparedRunner<'p>)>,
     ctx: &'r ExecutionContext,
 }
 
@@ -352,23 +351,27 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
         run: Option<&'r super::prepared_select::PreparedRunner<'p>>,
         ctx: &'r ExecutionContext,
     ) -> Self {
-        let filter = RowFilter::from_program(CompactArc::clone(&program)).with_context(ctx);
-        // One that asks a correlated block is never bound
-        let run = run.filter(|run| program.has_subqueries() && run.binds_once_read(&program));
+        let mut bound = run
+            .filter(|_| program.has_subqueries())
+            .map(|run| (run.bind(&program), run));
+        let program = match bound.as_mut() {
+            Some((bound, run)) => CompactArc::clone(run.current(bound)),
+            None => program,
+        };
         Self {
-            filter,
-            program,
-            run,
+            filter: RowFilter::from_program(program).with_context(ctx),
+            bound,
             ctx,
         }
     }
 
     fn matches(&mut self, row: &Row, blocks: Option<&dyn SubqueryExecutor>) -> Result<bool> {
         let passed = self.filter.matches_checked_with(row, blocks)?;
-        if let Some(bound) = self.run.and_then(|run| run.bound_known(&self.program)) {
-            self.filter = RowFilter::from_program(CompactArc::clone(&bound)).with_context(self.ctx);
-            self.program = bound;
-            self.run = None;
+        if let Some((bound, run)) = self.bound.as_mut() {
+            if run.rebound(bound) {
+                let program = CompactArc::clone(run.current(bound));
+                self.filter = RowFilter::from_program(program).with_context(self.ctx);
+            }
         }
         Ok(passed)
     }
@@ -408,7 +411,7 @@ use super::parallel::{self, ParallelConfig};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
-use super::prepared_select::{names_any_within, JoinBlocks, OutOfFamily};
+use super::prepared_select::{names_any_within, Bound, JoinBlocks, OutOfFamily};
 use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
