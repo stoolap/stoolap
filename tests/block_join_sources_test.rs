@@ -521,6 +521,33 @@ fn a_block_over_a_join_is_bound_when_prepared_and_run_when_asked() {
             Err("Compile error: Column 'x' not found".to_string()),
         ),
         (
+            "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
+             AND EXISTS (SELECT 1 FROM z) GROUP BY v.x)",
+            ungrouped.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u JOIN u AS v ON v.id = u.id \
+             WHERE u.no_such_column = 1 AND EXISTS (SELECT 1 FROM z))",
+            Err("column 'u.no_such_column' not found".to_string()),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u WHERE u.no_such_column = 1 \
+             AND EXISTS (SELECT 1 FROM z))",
+            Err("column 'u.no_such_column' not found".to_string()),
+        ),
+        (
+            "SELECT id, (SELECT LENGTH(STRING_AGG(CAST(u.id AS TEXT), CASE WHEN one.id IS NULL \
+             THEN CAST(ABS(-9223372036854775807 - 1) AS TEXT) ELSE ',' END)) + ROW_NUMBER() \
+             OVER () FROM u JOIN w ON w.id = u.id) FROM one",
+            Ok(vec!["1|6".to_string()]),
+        ),
+        (
+            "SELECT id, (SELECT LENGTH(STRING_AGG(CAST(u.id AS TEXT), CASE WHEN one.id IS NULL \
+             THEN CAST(ABS(-9223372036854775807 - 1) AS TEXT) ELSE ',' END)) FROM u JOIN w \
+             ON w.id = u.id) FROM one",
+            Ok(vec!["1|5".to_string()]),
+        ),
+        (
             "SELECT id, (SELECT ABS(COUNT(*) - 9223372036854775807 - 1) FROM u JOIN w \
              ON w.id = u.id) FROM one",
             Ok(vec!["1|9223372036854775805".to_string()]),

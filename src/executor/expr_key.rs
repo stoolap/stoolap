@@ -49,14 +49,6 @@ impl ExprKey {
         hasher.finish()
     }
 
-    /// The key of `stmt` as [`Self::exact`] takes one of an expression
-    pub(crate) fn exact_statement(stmt: &SelectStatement) -> Self {
-        let mut hasher = KeyHasher::new();
-        hasher.exact = true;
-        write_statement(stmt, &mut hasher);
-        hasher.finish()
-    }
-
     /// The key of `expr` with every column read as its name alone, so `t.a`
     /// and `a` meet; whether they name the same column is the caller's to ask
     pub(crate) fn by_column_name(expr: &Expression) -> Self {

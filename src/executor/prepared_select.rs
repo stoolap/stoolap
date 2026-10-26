@@ -1162,6 +1162,50 @@ impl ScopeTable {
         }
     }
 
+    /// This scope read by position, as `joined`'s is: a name two of its
+    /// tables share binds the one its qualifier names, never the first
+    fn by_position(&self) -> Self {
+        let width = self.lower.len();
+        Self {
+            tables: self.tables.clone(),
+            columns: CompactArc::new((0..width).map(|i| format!("{RESOLVED}#{i}")).collect()),
+            lower: CompactArc::clone(&self.lower),
+            types: self.types.clone(),
+        }
+    }
+
+    /// The column a program name `name` of this scope reads: a position
+    /// name, or a resolved own name
+    fn column_of(&self, name: &str) -> Option<usize> {
+        let name = name.strip_prefix(RESOLVED)?;
+        match name.strip_prefix('#') {
+            Some(at) => at.parse().ok().filter(|at| *at < self.lower.len()),
+            None => {
+                let name = name.strip_prefix(QUALIFIER_SEP)?;
+                self.lower.iter().position(|c| c == name)
+            }
+        }
+    }
+
+    /// Whether more than one of its tables has a column named `name`
+    fn shared(&self, name: &str) -> bool {
+        let mut tables = self.tables.iter().enumerate().filter(|(at, _)| {
+            let (_, range) = self.table(self.tables[*at].1);
+            self.lower[range].iter().any(|c| c == name)
+        });
+        tables.next().is_some() && tables.next().is_some()
+    }
+
+    /// Column `at` as a reference spells it: qualified by its table when
+    /// the scope has more than one
+    fn spelled(&self, at: usize) -> String {
+        let table = self.tables.iter().rev().find(|(_, start)| *start <= at);
+        match table {
+            Some((table, _)) if self.tables.len() > 1 => format!("{table}.{}", self.lower[at]),
+            _ => self.lower[at].clone(),
+        }
+    }
+
     /// The scope of a block without FROM: no columns, and no name a
     /// qualifier could find, so every name reads an enclosing scope
     fn unnamed() -> Self {
@@ -2476,14 +2520,6 @@ fn slot_parameter(slot: usize) -> Expression {
     })
 }
 
-/// Whether `stmt` aggregates its rows: it groups, has a HAVING, or a SELECT
-/// item calls an aggregate outside a window
-fn aggregates(stmt: &SelectStatement) -> bool {
-    !stmt.group_by.columns.is_empty()
-        || stmt.having.is_some()
-        || stmt.columns.iter().any(expression_contains_aggregate)
-}
-
 /// The EXISTS block `stmt`, run as a statement, asked only whether it has
 /// a row: one value per row it returns in place of its SELECT items, each
 /// alias or position that read an item reading its expression, no ORDER
@@ -2494,7 +2530,9 @@ fn existence(
     from_names: &[String],
     ctx: &ExecutionContext,
 ) -> Result<SelectStatement> {
-    let grouped = aggregates(&stmt);
+    let grouped = !stmt.group_by.columns.is_empty()
+        || stmt.having.is_some()
+        || stmt.columns.iter().any(expression_contains_aggregate);
     if grouped {
         check_grouped_reads(executor, &stmt, from_names, ctx)?;
     }
@@ -4090,6 +4128,84 @@ impl Builder<'_> {
         Ok(())
     }
 
+    /// Bind the block `sq` over a join as a block over one table is bound
+    /// when prepared, computing nothing: its clauses over its FROM's scope
+    /// `own` read by position, its grouping checked as `grouping` checks it.
+    /// A window function, or a bare name two of its tables have, binds when
+    /// the block runs, which binds that name as the prepared side cannot know
+    fn bind_join_block(
+        &mut self,
+        sq: &SelectStatement,
+        own: &ScopeTable,
+        outer: &[&ScopeTable],
+        id: u16,
+        work: &Rewritten,
+        exists: bool,
+    ) -> Result<()> {
+        let clauses = sq
+            .columns
+            .iter()
+            .chain(sq.where_clause.as_deref())
+            .chain(&sq.group_by.columns)
+            .chain(sq.having.as_deref())
+            .chain(sq.order_by.iter().map(|ob| &ob.expression))
+            .chain(&sq.distinct_on);
+        if clauses
+            .into_iter()
+            .any(|e| names_any(e, &|name| own.shared(name)))
+        {
+            return Ok(());
+        }
+        let scope = own.by_position();
+        let mut scopes = Vec::with_capacity(outer.len() + 1);
+        scopes.push(&scope);
+        scopes.extend_from_slice(outer);
+        let chain = Chain { scopes: &scopes };
+        let registry = &self.executor.function_registry;
+        let compile = CompileContext::new(&scope.columns, registry).with_prepared_subqueries();
+        let windowed = windowed_block(sq);
+        let grouped = grouped_block(sq) && !windowed;
+        let items: Vec<&Expression> = sq
+            .columns
+            .iter()
+            .filter(|c| !matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            .map(unaliased)
+            .collect();
+        let named = |expr: &Expression| with_aliases(expr, &sq.columns, &scope.lower).into_owned();
+        let mut bound: Vec<Expression> =
+            sq.where_clause.as_deref().map(named).into_iter().collect();
+        if !windowed {
+            bound.extend(sq.order_by.iter().map(|ob| named(&ob.expression)));
+            bound.extend(sq.distinct_on.iter().map(named));
+        }
+        if !grouped && !windowed {
+            bound.extend(items.iter().map(|item| (*item).clone()));
+        }
+        for expr in &bound {
+            let expr = self.trial_rewrite(&chain, id, expr, &work.outer)?;
+            compile_with(&compile, &expr)?;
+        }
+        if grouped {
+            let values = match exists {
+                true => Vec::new(),
+                false => items
+                    .iter()
+                    .map(|item| self.trial_rewrite(&chain, id, item, &work.outer))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
+            let mut trial = Rewritten {
+                outer: work.outer.clone(),
+                ..Rewritten::default()
+            };
+            let grouping = self.grouping(&chain, id, sq, &values, exists, &mut trial);
+            self.next_slot = next_slot;
+            self.subqueries.truncate(blocks);
+            grouping?;
+        }
+        Ok(())
+    }
+
     /// The block `sq`, whose FROM is a join or a derived table reading an
     /// enclosing scope, or which computes a window function, run as one
     /// statement: each name it binds beyond itself reads a slot its parent
@@ -4115,10 +4231,6 @@ impl Builder<'_> {
         // rows its items choose, by a window or a DISTINCT ON, runs as written
         let dropped =
             matches!(form, Form::Exists(_)) && !windowed_block(sq) && sq.distinct_on.is_empty();
-        let check = match dropped {
-            true => Check::Order,
-            false => Check::Off,
-        };
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
@@ -4143,30 +4255,27 @@ impl Builder<'_> {
                 }
             },
         }
-        .statement(sq, outer, 0, check)?;
+        .statement(sq, outer, 0, Check::All)?;
         self.max_param = self.max_param.max(max_param);
+        let joined = own.tables.len() > 1;
+        if joined {
+            if dropped {
+                check_block_positions(sq, own.columns.len())?;
+            }
+            self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)))?;
+        }
         let statement = match dropped {
+            // A join's run names its columns, so it binds what it reads
+            true if joined => SelectStatement {
+                order_by: Vec::new(),
+                ..statement
+            },
             true => {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
-                // A join's run names its columns, so it binds what it reads
-                match own.tables.len() > 1 {
-                    true => SelectStatement {
-                        order_by: Vec::new(),
-                        ..statement
-                    },
-                    false => existence(executor, statement, &own.lower, ctx)?,
-                }
+                existence(executor, statement, &own.lower, ctx)?
             }
             false => statement,
         };
-        if own.tables.len() > 1 {
-            let slots = work
-                .outer
-                .values()
-                .chain(&params)
-                .filter(|s| **s != usize::MAX);
-            self.bind_join_statement(&statement, slots.max().map_or(0, |slot| slot + 1))?;
-        }
         let (identity, signature, _) = block_identity(sq, form);
         // One that binds nothing beyond itself keeps its answer across
         // statements while the tables it reads, all known, stay as they were
@@ -4220,95 +4329,6 @@ impl Builder<'_> {
             uncorrelated,
         });
         Ok((id, work.delegated, work.reads_parent))
-    }
-
-    /// Raise what binding `statement`, a block's run over a join, raises, as
-    /// a block over one table does when prepared: opened once per schema over
-    /// no row, its WHERE and an aggregate's HAVING false, no LIMIT or OFFSET,
-    /// `slots` parameters NULL; only a join of tables opens so computing nothing
-    fn bind_join_statement(&self, statement: &SelectStatement, slots: usize) -> Result<()> {
-        let Some(Expression::JoinSource(join)) = statement.table_expr.as_deref() else {
-            return Ok(());
-        };
-        let engine = &self.executor.engine;
-        let (key, schema) = (
-            ExprKey::exact_statement(statement),
-            (engine.instance(), engine.schema_epoch()),
-        );
-        if super::context::statement_bound(key, schema) {
-            return Ok(());
-        }
-        let clauses = statement
-            .columns
-            .iter()
-            .chain(&statement.distinct_on)
-            .chain(&statement.group_by.columns)
-            .chain(statement.having.as_deref())
-            .chain(statement.order_by.iter().map(|o| &o.expression));
-        if !statement.set_operations.is_empty()
-            || statement.with.is_some()
-            || clauses.into_iter().any(mentions_subquery)
-            || !self.tables_only(join)?
-        {
-            return Ok(());
-        }
-        let never = || {
-            Expression::BooleanLiteral(BooleanLiteral {
-                token: Token::new(TokenType::Keyword, "FALSE", Position::default()),
-                value: false,
-            })
-        };
-        // A WHERE subquery could run; the walk has bound the WHERE's names
-        let filter = statement
-            .where_clause
-            .as_deref()
-            .filter(|filter| !mentions_subquery(filter));
-        let having = statement.having.as_deref();
-        let check = SelectStatement {
-            where_clause: conjunction(std::iter::once(never()).chain(filter.cloned()).collect())
-                .map(Box::new),
-            having: aggregates(statement)
-                .then(|| conjunction(std::iter::once(never()).chain(having.cloned()).collect()))
-                .flatten()
-                .map(Box::new),
-            limit: None,
-            offset: None,
-            ..statement.clone()
-        };
-        let mut params: ParamVec = self.ctx.params().iter().cloned().collect();
-        if params.len() < slots {
-            params.resize(slots, Value::null_unknown());
-        }
-        drop(
-            self.executor
-                .execute_select(&check, &self.ctx.with_slot_params(params))?,
-        );
-        super::context::keep_statement_bound(key, schema);
-        Ok(())
-    }
-
-    /// Whether every source the join `join` reads is a table, its ON holding
-    /// no subquery
-    fn tables_only(&self, join: &JoinTableSource) -> Result<bool> {
-        if join.condition.as_deref().is_some_and(mentions_subquery) {
-            return Ok(false);
-        }
-        for side in [&*join.left, &*join.right] {
-            let table = match side {
-                Expression::JoinSource(join) => self.tables_only(join)?,
-                Expression::TableSource(ts) => {
-                    let name = ts.name.value_lower.as_str();
-                    ts.as_of.is_none()
-                        && self.named_source(name)?.is_none()
-                        && self.executor.engine.table_exists(name)?
-                }
-                _ => false,
-            };
-            if !table {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// `expr` of the statement as written, with each subquery in it prepared
@@ -5184,6 +5204,10 @@ impl Builder<'_> {
         }
         for expr in projection.iter().chain(&having).chain(&listed) {
             if let Some(name) = ungrouped(expr, &item_keys) {
+                let name = match scope.column_of(&name) {
+                    Some(at) if scope.tables.len() > 1 => scope.spelled(at),
+                    _ => name,
+                };
                 return Err(ungrouped_column(&name));
             }
         }
@@ -5219,10 +5243,8 @@ impl Builder<'_> {
                 if agg.column == "*" || agg.expression.is_some() {
                     return Ok(None);
                 }
-                agg.column_lower
-                    .strip_prefix(RESOLVED)
-                    .and_then(|name| name.strip_prefix(QUALIFIER_SEP))
-                    .and_then(|name| scope.lower.iter().position(|c| c == name))
+                scope
+                    .column_of(&agg.column_lower)
                     .map(Some)
                     .ok_or_else(|| Error::internal("an aggregate's column outside its block"))
             })
@@ -5349,6 +5371,8 @@ fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<String> {
         Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
             Some(q.name.value.to_string())
         }
+        // A column of a scope read by position
+        Expression::Identifier(id) if id.value.starts_with(RESOLVED) => Some(id.value.to_string()),
         other => {
             let mut found = None;
             let _ = for_each_child(other, &mut |child| {
