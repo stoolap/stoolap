@@ -294,6 +294,15 @@ fn a_quoted_group_by_name_binds_as_the_compiler_binds_it() {
              WHERE id = 1",
             vec!["Some(Boolean(true))"],
         ),
+        (
+            "SELECT 'k' AS c, COUNT(*) AS c FROM one GROUP BY c",
+            vec!["Some(Text(\"k\"))|Some(Integer(3))"],
+        ),
+        (
+            "SELECT EXISTS (SELECT 'k' AS c, COUNT(*) AS c FROM u GROUP BY c) FROM one \
+             WHERE id = 1",
+            vec!["Some(Boolean(true))"],
+        ),
     ] {
         assert_eq!(rows(&db, sql), want, "{sql}");
     }

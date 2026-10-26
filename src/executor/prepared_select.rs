@@ -5235,10 +5235,11 @@ impl Builder<'_> {
         let bound = group_by_expressions(executor, sq, &scope.columns)?;
         let mut items = Vec::with_capacity(bound.len());
         for (expr, written) in bound.into_iter().zip(grouping_items(sq)) {
-            // A name written as the key that no scope holds and only an
-            // aggregate item's alias carries
+            // A name written as the key that binds to no other SELECT alias,
+            // no scope holds and only an aggregate item's alias carries
             if matches!(written, Expression::Identifier(name)
                 if names_aggregate_item(&name.value, &sq.columns))
+                && &expr == written
                 && !matches!(chain.resolve(written), Ok(Some(_)))
             {
                 return Err(aggregate_group_key());
