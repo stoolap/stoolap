@@ -118,9 +118,15 @@ fn left_nested_exists() -> Vec<String> {
     out
 }
 
+/// `sql` as a derived table's statement, which holds no plan, so the
+/// general path answers it
+fn general(sql: &str) -> String {
+    format!("SELECT * FROM ({sql}) AS general")
+}
+
 enum Reference {
-    /// The same statement with the ON's subquery moved to a WHERE over
-    /// derived sides, which the general path answers per joined row
+    /// The same statement with the ON's subquery moved to its WHERE, which
+    /// the general path answers per joined row
     Moved(&'static str),
     Computed(fn() -> Vec<String>),
 }
@@ -138,7 +144,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         path: "hash",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         ),
         limit: None,
     },
@@ -146,7 +152,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
         path: "hash",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
         ),
         limit: None,
     },
@@ -154,7 +160,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
         path: "hash",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
         ),
         limit: None,
     },
@@ -162,7 +168,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
         path: "hash",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
         ),
         limit: None,
     },
@@ -182,7 +188,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w) LIMIT 7",
         path: "limit_hash",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
         ),
         limit: Some(7),
     },
@@ -190,7 +196,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.g < r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         path: "nested_loop",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g < r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         ),
         limit: None,
     },
@@ -204,7 +210,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.k = r.id AND r.w IN (SELECT s.b FROM s WHERE s.a = l.id)",
         path: "batch_index_nested_loop",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.k = r.id WHERE r.w IN (SELECT s.b FROM s WHERE s.a = l.id)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE r.w IN (SELECT s.b FROM s WHERE s.a = l.id)",
         ),
         limit: None,
     },
@@ -212,7 +218,7 @@ const CASES: &[Case] = &[
         sql: "SELECT r.id, l.id FROM r JOIN l ON r.id = l.k AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b > r.w) WHERE l.g = 1",
         path: "batch_index_nested_loop",
         reference: Reference::Moved(
-            "SELECT r.id, l.id FROM (SELECT * FROM r) r JOIN (SELECT * FROM l) l ON r.id = l.k WHERE l.g = 1 AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b > r.w)",
+            "SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.g = 1 AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b > r.w)",
         ),
         limit: None,
     },
@@ -220,7 +226,7 @@ const CASES: &[Case] = &[
         sql: "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k AND r.id > (SELECT MIN(s.b) FROM s WHERE s.a = l.id) LIMIT 30",
         path: "index_nested_loop",
         reference: Reference::Moved(
-            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.k = r.k WHERE r.id > (SELECT MIN(s.b) FROM s WHERE s.a = l.id)",
+            "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.id > (SELECT MIN(s.b) FROM s WHERE s.a = l.id)",
         ),
         limit: Some(30),
     },
@@ -228,7 +234,7 @@ const CASES: &[Case] = &[
         sql: "SELECT COUNT(*), SUM(bl.id) FROM bl JOIN br ON bl.u = br.u AND br.v IN (SELECT s.b FROM s WHERE s.a < 9)",
         path: "parallel_hash",
         reference: Reference::Moved(
-            "SELECT COUNT(*), SUM(bl.id) FROM (SELECT * FROM bl) bl JOIN (SELECT * FROM br) br ON bl.u = br.u WHERE br.v IN (SELECT s.b FROM s WHERE s.a < 9)",
+            "SELECT COUNT(*), SUM(bl.id) FROM bl JOIN br ON bl.u = br.u WHERE br.v IN (SELECT s.b FROM s WHERE s.a < 9)",
         ),
         limit: None,
     },
@@ -288,7 +294,7 @@ fn a_join_on_runs_its_subqueries_as_blocks() {
             let taken = join_paths_taken();
             let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
             let want = match &case.reference {
-                Reference::Moved(sql) => rows(&db, sql),
+                Reference::Moved(sql) => rows(&db, &general(sql)),
                 Reference::Computed(rows) => Ok(rows()),
             };
             if taken != [case.path] {
@@ -333,8 +339,10 @@ fn an_on_block_that_errors_errors_as_the_general_path_does() {
     fill(&db);
     let want = rows(
         &db,
-        "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w \
-         WHERE l.id < (SELECT s.b FROM s WHERE s.a = r.w)",
+        &general(
+            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+             WHERE l.id < (SELECT s.b FROM s WHERE s.a = r.w)",
+        ),
     );
     assert!(
         want.as_ref()
@@ -484,9 +492,7 @@ fn a_join_rewrites_every_condition_form_beside_its_blocks() {
         let sql = shape.replace("{l}", "l").replace("{r}", "r");
         let want = rows(
             &db,
-            &reference
-                .replace("{l}", "(SELECT * FROM l) l")
-                .replace("{r}", "(SELECT * FROM r) r"),
+            &general(&reference.replace("{l}", "l").replace("{r}", "r")),
         );
         if want.is_err() {
             wrong.push(format!("the reference of {sql} fails: {want:?}"));
@@ -617,20 +623,24 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
         ),
         (
             format!("SELECT l.id, r.id FROM l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE {exists}"),
-            "Prepared: no (a side that is not a table read without AS OF)".to_string(),
+            "Prepared: yes".to_string(),
         ),
         (
             "WITH c AS (SELECT * FROM r) SELECT l.id, c.id FROM l JOIN c ON l.g = c.w \
              WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = c.id)"
                 .to_string(),
-            "Prepared: no (a side that is not a table read without AS OF)".to_string(),
+            "Prepared: yes".to_string(),
         ),
         (
             "WITH c AS (SELECT * FROM s) SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
              WHERE EXISTS (SELECT 1 FROM c WHERE c.a = l.id AND c.b = r.id) \
              AND EXISTS (SELECT 1 FROM c WHERE c.a = r.id)"
                 .to_string(),
-            "Prepared: no (a WITH clause)".to_string(),
+            "Prepared: yes".to_string(),
+        ),
+        (
+            format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w JOIN s ON s.id = l.id WHERE {exists}"),
+            "Prepared: no (a side that is itself a join)".to_string(),
         ),
         (
             format!(

@@ -90,6 +90,12 @@ const CASES: &[(&str, &str)] = &[
     ),
 ];
 
+/// `sql` as a derived table's statement, which holds no plan, so the
+/// general path answers it
+fn general(sql: &str) -> String {
+    format!("SELECT * FROM ({sql}) AS general")
+}
+
 /// The rows of `sql` as sorted text, or the error
 fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let result = db.query(sql, ()).map_err(|e| e.to_string())?;
@@ -123,9 +129,7 @@ fn a_join_where_runs_its_subqueries_as_blocks() {
         };
         for &(shape, path) in CASES {
             let sql = shape.replace("{l}", "l").replace("{r}", "r");
-            let reference = shape
-                .replace("{l}", "(SELECT * FROM l) l")
-                .replace("{r}", "(SELECT * FROM r) r");
+            let reference = general(&sql);
             let first = rows(&db, &sql);
             let bridge = bridge_compiles();
             let programs = program_compiles();
@@ -164,14 +168,10 @@ fn an_uncorrelated_block_no_joined_row_reaches_is_not_read() {
     let db = Database::open("memory://join_where_blocks_lazy").unwrap();
     fill(&db);
     let shape = "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w AND l.id < 0 WHERE l.id + r.id > (SELECT s.b FROM s)";
-    let blocks = rows(&db, &shape.replace("{l}", "l").replace("{r}", "r"));
+    let sql = shape.replace("{l}", "l").replace("{r}", "r");
+    let blocks = rows(&db, &sql);
     assert_eq!(blocks, Ok(Vec::new()), "no joined row reads the block");
-    let folded = rows(
-        &db,
-        &shape
-            .replace("{l}", "(SELECT * FROM l) l")
-            .replace("{r}", "(SELECT * FROM r) r"),
-    );
+    let folded = rows(&db, &general(&sql));
     assert!(
         folded
             .as_ref()
@@ -230,14 +230,9 @@ fn a_column_named_with_a_dot_binds_by_position_inside_a_block() {
     }
     let shape = "SELECT l.id, r.id FROM {l} JOIN {r} ON l.id = r.id \
                  WHERE EXISTS (SELECT 1 FROM s WHERE s.v = l.\"x.y\" + r.id)";
-    let want = rows(
-        &db,
-        &shape
-            .replace("{l}", "(SELECT * FROM l) l")
-            .replace("{r}", "(SELECT * FROM r) r"),
-    );
-    assert_eq!(want, Ok(vec!["Integer(1)|Integer(1)".to_string()]));
     let sql = shape.replace("{l}", "l").replace("{r}", "r");
+    let want = rows(&db, &general(&sql));
+    assert_eq!(want, Ok(vec!["Integer(1)|Integer(1)".to_string()]));
     for _ in 0..2 {
         assert_eq!(rows(&db, &sql), want, "{sql}");
     }

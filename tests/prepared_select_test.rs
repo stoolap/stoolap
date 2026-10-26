@@ -1024,6 +1024,7 @@ fn test_classifier_rules() {
         "SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT v FROM u WHERE u.id <> t.b) AS q \
          WHERE q.v = t.id)"
             .to_string(),
+        format!("SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > {sq}"),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1079,8 +1080,11 @@ fn test_classifier_rules() {
             "a named window",
         ),
         (
-            format!("SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > {sq}"),
-            "a side that is not a table read without AS OF",
+            format!(
+                "SELECT t.id FROM t JOIN u ON u.id = t.id JOIN u AS w ON w.id = t.id \
+                 WHERE a > {sq}"
+            ),
+            "a side that is itself a join",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"

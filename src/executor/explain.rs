@@ -599,14 +599,19 @@ impl Executor {
         if !own {
             return Err("a join outside the statement's own SELECT");
         }
-        if self.has_cte(select) {
-            return Err("a WITH clause");
-        }
+        // A join with CTEs keeps its plan as execution keeps it, its CTE
+        // sides named by their bodies
+        let ctx = match select.with.as_ref() {
+            Some(with) if self.join_keeps_plan(select, with) => {
+                self.named_ctes(with).map_err(|_| "a WITH clause")?
+            }
+            Some(_) => return Err("a WITH clause"),
+            None => ExecutionContext::new(),
+        };
         if Self::folds_select_subqueries(select, &get_classification(select)) {
             return Err("a grouped SELECT list whose subqueries are read first");
         }
-        let side = |expr: &Expression| self.base_table_side_schema(expr, CteNames::Listed(&[]));
-        let (left_schema, right_schema) = (side(&join.left), side(&join.right));
+        let sides = self.join_side_schemas(join, &ctx);
         self.join_blocks_family(
             select,
             join,
@@ -615,7 +620,7 @@ impl Executor {
                 get_table_alias_from_expr(&join.left).as_deref(),
                 get_table_alias_from_expr(&join.right).as_deref(),
             ),
-            (left_schema.as_deref(), right_schema.as_deref()),
+            sides.as_ref(),
         )
     }
 
@@ -1053,10 +1058,10 @@ impl Executor {
         // The index join is reported only where execution takes it: never
         // for a shape the reduction plan takes without the grouped operator,
         // and for the grouped operator on the right side only
-        let bounded = match index_use {
-            JoinIndexUse::None => None,
-            JoinIndexUse::Streaming { bounded } => Some(bounded),
-            JoinIndexUse::Grouped => Some(true),
+        let (bounded, rows) = match index_use {
+            JoinIndexUse::None => (None, [false; 2]),
+            JoinIndexUse::Streaming { bounded, rows } => (Some(bounded), rows),
+            JoinIndexUse::Grouped => (Some(true), [false; 2]),
         };
         // Check for INLJ opportunity on right side (default check)
         if let (Some(cond), Some(bounded)) = (join_condition, bounded) {
@@ -1083,17 +1088,20 @@ impl Executor {
             let left_is_table = left_schema.is_some();
             let right_is_table = right_schema.is_some();
             // Check if INLJ is possible (right side has index/PK for join column)
-            let inlj_info = self.check_index_nested_loop_opportunity(
-                CteNames::Listed(ctes),
-                join_right,
-                Some(cond),
-                &join_type_upper,
-                left_alias.as_deref(),
-                right_alias.as_deref(),
-                bounded,
-                small_outer,
-                !left_is_table,
-            );
+            let inlj_info = match rows[1] {
+                true => None,
+                false => self.check_index_nested_loop_opportunity(
+                    CteNames::Listed(ctes),
+                    join_right,
+                    Some(cond),
+                    &join_type_upper,
+                    left_alias.as_deref(),
+                    right_alias.as_deref(),
+                    bounded,
+                    small_outer,
+                    !left_is_table,
+                ),
+            };
 
             // The side execution probes, by the rule it picks it with. The
             // executor swaps a small outer in only from a right side that is
@@ -1120,8 +1128,9 @@ impl Executor {
                     right_filtered,
                     left_filtered,
                     inlj_info,
-                    || {
-                        self.check_index_nested_loop_opportunity(
+                    || match rows[0] {
+                        true => None,
+                        false => self.check_index_nested_loop_opportunity(
                             CteNames::Listed(ctes),
                             join_left,
                             Some(cond),
@@ -1131,7 +1140,7 @@ impl Executor {
                             bounded,
                             small_outer && !right_is_table,
                             !right_is_table,
-                        )
+                        ),
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
