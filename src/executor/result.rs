@@ -21,6 +21,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
+use super::context::CancellationHandle;
 use super::expression::RowFilter;
 use super::projection::Projection;
 
@@ -1794,6 +1795,12 @@ pub struct ScannerResult {
     current_row: Row,
     /// Whether we have a valid current row
     has_current: bool,
+    /// The statement's cancel, checked every 100 rows and at the end
+    cancel: Option<CancellationHandle>,
+    /// Rows left before the next check of `cancel`
+    left: u32,
+    /// `cancel` was set when last checked
+    cancelled: bool,
 }
 
 impl ScannerResult {
@@ -1807,7 +1814,30 @@ impl ScannerResult {
             columns,
             current_row: Row::new(),
             has_current: false,
+            cancel: None,
+            left: 100,
+            cancelled: false,
         }
+    }
+
+    /// Stop the read with a cancel error once `cancel` is cancelled
+    pub(crate) fn with_cancel(mut self, cancel: CancellationHandle) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Whether the read stops for its cancel, which it checks every 100 rows
+    #[inline]
+    fn stops(&mut self) -> bool {
+        let Some(cancel) = &self.cancel else {
+            return false;
+        };
+        self.left -= 1;
+        if self.left == 0 {
+            self.left = 100;
+            self.cancelled = cancel.is_cancelled();
+        }
+        self.cancelled
     }
 }
 
@@ -1817,14 +1847,16 @@ impl QueryResult for ScannerResult {
     }
 
     fn next(&mut self) -> bool {
-        if self.scanner.next() {
+        if self.scanner.next() && !self.stops() {
             self.current_row = self.scanner.take_row();
             self.has_current = true;
-            true
-        } else {
-            self.has_current = false;
-            false
+            return true;
         }
+        if let Some(cancel) = &self.cancel {
+            self.cancelled = cancel.is_cancelled();
+        }
+        self.has_current = false;
+        false
     }
 
     fn scan(&self, dest: &mut [Value]) -> Result<()> {
@@ -1866,6 +1898,9 @@ impl QueryResult for ScannerResult {
     }
 
     fn last_error(&mut self) -> Option<crate::core::Error> {
+        if self.cancelled {
+            return Some(crate::core::Error::QueryCancelled);
+        }
         self.scanner.err().cloned()
     }
 

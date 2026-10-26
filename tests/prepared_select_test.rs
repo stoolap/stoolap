@@ -1009,6 +1009,7 @@ fn test_classifier_rules() {
         format!("SELECT id FROM t WHERE CAST({sq} AS TEXT) LIKE '5%'"),
         format!("SELECT id FROM t WHERE {sq} IS DISTINCT FROM a"),
         format!("SELECT id FROM t WHERE ABS({sq}) > 1 AND NOT (b = 2) AND -a < 0"),
+        format!("SELECT id FROM t WHERE 'x' || CAST({sq} AS TEXT) = 'x5'"),
         "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = 2)".to_string(),
         format!("SELECT id FROM t WHERE a > (SELECT {sq} FROM u WHERE u.id = 1)"),
         "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)".to_string(),
@@ -1128,10 +1129,6 @@ fn test_classifier_rules() {
                  ORDER BY (SELECT v FROM u WHERE u.id = 2)"
             ),
             "an ORDER BY subquery over a set operation",
-        ),
-        (
-            format!("SELECT id FROM t WHERE 'x' || CAST({sq} AS TEXT) = 'x5'"),
-            "an operator outside the family",
         ),
     ];
     for (sql, reason) in &no {
@@ -2981,4 +2978,48 @@ fn test_an_uncorrelated_order_by_key_repeating_a_select_item_runs_once() {
     let before = random_draws();
     assert_eq!(ids(&db, SQL, ()).0, vec![1, 2, 3, 4, 5, 6]);
     assert_eq!(random_draws() - before, 1, "one draw, which the key reads");
+}
+
+#[test]
+fn test_a_read_past_its_timeout_fails() {
+    let _guard = serial();
+    let db = setup("prepared_read_timeout");
+    for sql in [
+        "SELECT id FROM t WHERE a > (SELECT MIN(v) FROM u)",
+        "SELECT id FROM t WHERE a + 0 IN (SELECT v FROM u)",
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        after_prepared_plan_taken(|| std::thread::sleep(std::time::Duration::from_millis(150)));
+        let read = db
+            .query_with_timeout(sql, (), 10)
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+        assert!(read.is_err(), "{sql}: rows read past the timeout");
+    }
+}
+
+#[test]
+fn test_a_read_cancelled_before_its_rows_fails() {
+    let _guard = serial();
+    let db = setup("prepared_read_cancel");
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    for sql in [
+        "SELECT id FROM t WHERE a > (SELECT MIN(v) FROM u)",
+        "SELECT id FROM t WHERE a + 0 IN (SELECT v FROM u)",
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let ctx = stoolap::ExecutionContext::new();
+        let handle = ctx.clone();
+        after_prepared_plan_taken(move || handle.cancel());
+        let read = executor
+            .execute_with_context(sql, &ctx)
+            .and_then(|mut rows| {
+                while rows.next() {}
+                rows.last_error().map_or(Ok(()), Err)
+            });
+        assert!(
+            matches!(read, Err(stoolap::Error::QueryCancelled)),
+            "{sql}: {:?}",
+            read
+        );
+    }
 }
