@@ -1018,6 +1018,7 @@ fn test_classifier_rules() {
         format!("SELECT id FROM t WHERE b = 1 ORDER BY {sq}"),
         format!("SELECT id, {sq} FROM t ORDER BY {sq} DESC, id LIMIT 3 OFFSET $1"),
         format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),
+        format!("SELECT DISTINCT ON (b) id FROM t WHERE a > {sq} ORDER BY b, id"),
         format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u"),
         "SELECT id FROM t WHERE a > (SELECT q.v FROM (SELECT id, v FROM u) AS q WHERE q.id = t.id)"
             .to_string(),
@@ -1066,10 +1067,6 @@ fn test_classifier_rules() {
             "a tuple on the left of IN (subquery)",
         ),
         (
-            format!("SELECT DISTINCT ON (b) id FROM t WHERE a > {sq}"),
-            "a clause outside the family",
-        ),
-        (
             format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
             "LIMIT or OFFSET that is not a literal or a parameter",
         ),
@@ -1089,7 +1086,7 @@ fn test_classifier_rules() {
         (
             "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"
                 .to_string(),
-            "a grouped subquery block with ORDER BY, LIMIT or OFFSET",
+            "a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1 LIMIT 1)"

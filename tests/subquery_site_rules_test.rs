@@ -397,3 +397,41 @@ fn test_table_function_argument() {
         "SELECT * FROM generate_series(1, 3)",
     );
 }
+
+#[test]
+fn test_where_over_a_source_outside_the_family() {
+    let db = setup("site_source_outside_family");
+    db.execute("CREATE VIEW tv AS SELECT id, a, b FROM t", ())
+        .unwrap();
+    let sources = [
+        ("", "(SELECT * FROM t) AS s"),
+        ("", "tv AS s"),
+        ("WITH c AS (SELECT * FROM t) ", "c AS s"),
+    ];
+    // (WHERE with a subquery, the same with its answer written out)
+    let wheres = [
+        ("s.a IN (SELECT x FROM u)", "s.a IN (1, 2, 3)"),
+        ("EXISTS (SELECT 1 FROM u WHERE u.x = 2)", "TRUE"),
+        ("s.b > (SELECT MAX(x) FROM u) * 10", "s.b > 30"),
+        ("s.a = ANY (SELECT x FROM u)", "s.a IN (1, 2, 3)"),
+    ];
+    // Each keeps the statement out of the prepared family
+    let outside = [
+        ("", " LIMIT 5 + 5"),
+        (" AND (s.id, s.a) IN (SELECT id, a FROM t)", ""),
+    ];
+    for (with, from) in sources {
+        for (with_subquery, with_literal) in wheres {
+            for (also, tail) in outside {
+                let query = |filter: &str| {
+                    format!(
+                        "{with}SELECT s.id FROM {from} WHERE {filter}{also} ORDER BY s.id{tail}"
+                    )
+                };
+                let sql = query(with_subquery);
+                let want = rows(&db, &query(with_literal)).unwrap();
+                holds(Right, rows(&db, &sql), &want, &sql);
+            }
+        }
+    }
+}

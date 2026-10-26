@@ -283,7 +283,7 @@ fn a_cut_block_outside_the_family_says_why() {
     for (block, reason) in [
         (
             "SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",
-            "a grouped subquery block with ORDER BY, LIMIT or OFFSET",
+            "a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET",
         ),
         (
             "SELECT x FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",

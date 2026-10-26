@@ -317,6 +317,46 @@ fn a_position_outside_the_list_names_no_column() {
     }
 }
 
+#[test]
+fn a_block_keeps_the_first_row_of_each_key_in_every_form() {
+    let db = Database::open("memory://distinct_on_binding_forms").unwrap();
+    setup(&db);
+    let row = |cells: &[&str]| cells.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    let cases = [
+        (
+            "SELECT p.id, (SELECT DISTINCT ON (c.a) c.b FROM child AS c WHERE c.a = p.id \
+             ORDER BY c.a, c.b) FROM parent AS p ORDER BY p.id",
+            vec![
+                row(&["Some(Integer(1))", "Some(Integer(70))"]),
+                row(&["Some(Integer(2))", "Some(Integer(0))"]),
+            ],
+        ),
+        (
+            "SELECT p.id FROM parent AS p WHERE p.b * 10 IN (SELECT DISTINCT ON (c.a) c.b \
+             FROM child AS c WHERE c.id > p.id - 2 ORDER BY c.a, c.b DESC) ORDER BY p.id",
+            vec![row(&["Some(Integer(1))"])],
+        ),
+        (
+            "SELECT p.id FROM parent AS p WHERE EXISTS (SELECT DISTINCT ON (c.a % 2) c.id \
+             FROM child AS c WHERE c.b >= p.b - 5 ORDER BY c.a % 2, c.id OFFSET 1) ORDER BY p.id",
+            vec![row(&["Some(Integer(1))"])],
+        ),
+    ];
+    for (sql, want) in cases {
+        let explain = collect(db.query(&format!("EXPLAIN {sql}"), ())).unwrap();
+        assert!(
+            explain
+                .iter()
+                .flatten()
+                .any(|line| line.contains("Prepared: yes")),
+            "{sql}: {explain:?}"
+        );
+        for (run, got) in runs(&db, sql) {
+            assert_eq!(got.as_ref(), Ok(&want), "{sql} ({run})");
+        }
+    }
+}
+
 /// The rows, in order when the query fixes it
 fn sorted(mut rows: Vec<Vec<String>>, unordered: bool) -> Vec<Vec<String>> {
     if unordered {
