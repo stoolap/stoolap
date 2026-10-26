@@ -66,10 +66,7 @@ fn values() -> Vec<(Value, &'static str)> {
         (Value::text("50"), "'50'"),
         (Value::text("abc"), "'abc'"),
         (Value::Null(stoolap::core::DataType::Null), "NULL"),
-        (
-            Value::text("2024-01-05 00:00:00"),
-            "'2024-01-05 00:00:00'",
-        ),
+        (Value::text("2024-01-05 00:00:00"), "'2024-01-05 00:00:00'"),
         (Value::Boolean(true), "TRUE"),
     ]
 }
@@ -106,14 +103,20 @@ fn matrix(db: &Database) {
                     &format!("SELECT id, (SELECT 1) FROM w WHERE {column} {op} $1"),
                     vec![value.clone()],
                 );
-                let l = literal(db, &format!("SELECT id FROM w WHERE {column} {op} {spelled}"));
+                let l = literal(
+                    db,
+                    &format!("SELECT id FROM w WHERE {column} {op} {spelled}"),
+                );
                 assert_eq!(p, l, "{column} {op} {spelled}");
                 let p = prepared(
                     db,
                     &format!("SELECT id, (SELECT 1) FROM w WHERE $1 {op} {column}"),
                     vec![value],
                 );
-                let l = literal(db, &format!("SELECT id FROM w WHERE {spelled} {op} {column}"));
+                let l = literal(
+                    db,
+                    &format!("SELECT id FROM w WHERE {spelled} {op} {column}"),
+                );
                 assert_eq!(p, l, "{spelled} {op} {column}");
             }
         }
