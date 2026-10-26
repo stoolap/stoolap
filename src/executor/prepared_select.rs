@@ -3592,28 +3592,27 @@ enum Output {
     Key(Computed),
     /// A key that reads SELECT aliases from the projected row, as its second
     /// row, and the positions of the items it reads
-    AliasKey(SharedProgram, SmallVec<[usize; 2]>),
+    AliasKey(Computed, SmallVec<[usize; 2]>),
     /// A key that is the SELECT item at this position, read from it
     Copy(usize),
 }
 
 /// A computed output's program, the item it reads as before a run binds
-/// it, and whether a run binds it: it loads a parameter or asks a block
+/// it, and its place among the outputs a run binds, when a run binds it
 #[derive(Debug)]
 struct Computed {
     program: SharedProgram,
     item: Item,
-    binds: bool,
+    slot: Option<usize>,
 }
 
 impl Computed {
     fn new(program: SharedProgram) -> Self {
         let item = Item::of(CompactArc::clone(&program));
-        let binds = Self::binds(&program);
         Self {
             program,
             item,
-            binds,
+            slot: None,
         }
     }
 
@@ -3640,9 +3639,9 @@ struct PreparedProjection {
     whole_row: bool,
     /// The row's columns the outputs are, when every output is one
     columns: Option<Vec<usize>>,
-    /// Whether an output's program loads a parameter or asks a block, which
-    /// a run may bind it to
-    binds: bool,
+    /// How many outputs' programs load a parameter or ask a block, which a
+    /// run may bind them to
+    slots: usize,
     /// Whether a key reads SELECT aliases from the projected row
     alias_keys: bool,
 }
@@ -5385,7 +5384,10 @@ impl PreparedProjection {
                 .filter(|(alias, _)| names_any(key, &|name| name == **alias))
                 .map(|(_, position)| usize::from(*position))
                 .collect();
-            outputs.push(Output::AliasKey(compile_with(&alias_ctx, key)?, items));
+            outputs.push(Output::AliasKey(
+                Computed::new(compile_with(&alias_ctx, key)?),
+                items,
+            ));
             extra_names.push(name);
             extra_sources.push(ColumnSource {
                 item: None,
@@ -5404,20 +5406,26 @@ impl PreparedProjection {
                 _ => None,
             })
             .collect();
-        let binds = outputs.iter().any(|output| match output {
-            Output::Program(computed) | Output::Key(computed) | Output::Block(computed) => {
-                computed.binds
+        let mut slots = 0;
+        for output in &mut outputs {
+            if let Output::Program(computed)
+            | Output::Key(computed)
+            | Output::Block(computed)
+            | Output::AliasKey(computed, _) = output
+            {
+                if Computed::binds(&computed.program) {
+                    computed.slot = Some(slots);
+                    slots += 1;
+                }
             }
-            Output::AliasKey(program, _) => Computed::binds(program),
-            Output::Column(_) | Output::Copy(_) => false,
-        });
+        }
         let alias_keys = outputs.iter().any(|o| matches!(o, Output::AliasKey(..)));
         Ok((
             Self {
                 outputs,
                 whole_row,
                 columns: column_outputs,
-                binds,
+                slots,
                 alias_keys,
             },
             extra_names,
@@ -5427,28 +5435,32 @@ impl PreparedProjection {
 
     /// Each row's output, its subqueries answered by the run's blocks
     fn project(&self, mut rows: RowVec, run: &PreparedRunner<'_>) -> Result<RowVec> {
-        let mut projected = RowVec::with_capacity(rows.len());
         if self.whole_row {
-            for (row_id, row) in rows.drain_rows().enumerate() {
-                projected.push((row_id as i64, row));
+            for (row_id, (id, _)) in rows.iter_mut().enumerate() {
+                *id = row_id as i64;
             }
-            return Ok(projected);
+            return Ok(rows);
         }
         // Columns only: each row keeps them in its own storage, as the
         // general path's projection takes them
         if let Some(columns) = &self.columns {
-            for (row_id, row) in rows.drain_rows().enumerate() {
-                projected.push((row_id as i64, row.take_columns(columns)));
+            for (row_id, (id, row)) in rows.iter_mut().enumerate() {
+                *row = std::mem::take(row).take_columns(columns);
+                *id = row_id as i64;
             }
-            return Ok(projected);
+            return Ok(rows);
+        }
+        if rows.is_empty() {
+            return Ok(rows);
         }
         let mut vm = ExprVM::new();
         let mut bound = self.unbound();
-        for (row_id, row) in rows.drain_rows().enumerate() {
-            let out = self.project_row::<false>(&mut vm, &row, run, &[], &mut bound)?;
-            projected.push((row_id as i64, out));
+        // Each row's output takes its place
+        for (row_id, (id, row)) in rows.iter_mut().enumerate() {
+            *row = self.project_row::<false>(&mut vm, row, run, &[], &mut bound)?;
+            *id = row_id as i64;
         }
-        Ok(projected)
+        Ok(rows)
     }
 
     /// Whether a SELECT item is computed, which the sort can leave for later
@@ -5531,7 +5543,7 @@ impl PreparedProjection {
             for (position, output) in self.outputs.iter().enumerate() {
                 if let Output::Program(computed) | Output::Block(computed) = output {
                     if !read.contains(&position) {
-                        let item = Self::output_item(run, &mut bound, position, computed);
+                        let item = Self::output_item(run, &mut bound, computed);
                         out.set(position, item.value(&mut vm, &exec)?)?;
                     }
                 }
@@ -5579,7 +5591,7 @@ impl PreparedProjection {
                     Value::null_unknown()
                 }
                 Output::Program(computed) | Output::Key(computed) | Output::Block(computed) => {
-                    Self::output_item(run, bound, position, computed).value(vm, &exec)?
+                    Self::output_item(run, bound, computed).value(vm, &exec)?
                 }
                 Output::AliasKey(..) => Value::null_unknown(),
                 Output::Copy(item) => values
@@ -5597,50 +5609,49 @@ impl PreparedProjection {
             return Ok(out);
         }
         for (position, output) in self.outputs.iter().enumerate() {
-            if let Output::AliasKey(program, _) = output {
+            if let Output::AliasKey(computed, _) = output {
                 let mut exec =
                     ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
                 exec.row2 = Some(&out);
-                let key = vm.execute(Self::bound_program(run, bound, position, program), &exec)?;
+                let key = vm.execute(Self::bound_program(run, bound, computed), &exec)?;
                 out.set(position, key)?;
             }
         }
         Ok(out)
     }
 
-    /// No output bound yet, for one run; none to bind when no output binds
+    /// No output bound yet, for one run: a slot for each output a run binds
     fn unbound(&self) -> OutputsBound {
-        match self.binds {
-            true => self.outputs.iter().map(|_| None).collect(),
-            false => OutputsBound::new(),
-        }
+        (0..self.slots).map(|_| None).collect()
     }
 
-    /// The item of the computed output at `position`, bound to `run`
+    /// The item of `computed`, bound to `run` when a run binds it
     #[inline]
     fn output_item<'b>(
         run: &PreparedRunner<'_>,
         bound: &'b mut OutputsBound,
-        position: usize,
         computed: &'b Computed,
     ) -> &'b Item {
-        match bound.get_mut(position).filter(|_| computed.binds) {
+        match computed.slot.and_then(|slot| bound.get_mut(slot)) {
             Some(slot) => &BoundOutput::current(slot, run, &computed.program).item,
             None => &computed.item,
         }
     }
 
-    /// The program of the output at `position`, bound to `run`
+    /// The program of `computed`, bound to `run` when a run binds it
     #[inline]
     fn bound_program<'b>(
         run: &PreparedRunner<'_>,
         bound: &'b mut OutputsBound,
-        position: usize,
-        program: &'b SharedProgram,
+        computed: &'b Computed,
     ) -> &'b SharedProgram {
-        match bound.get_mut(position) {
-            Some(slot) => &BoundOutput::current(slot, run, program).bound.program,
-            None => program,
+        match computed.slot.and_then(|slot| bound.get_mut(slot)) {
+            Some(slot) => {
+                &BoundOutput::current(slot, run, &computed.program)
+                    .bound
+                    .program
+            }
+            None => &computed.program,
         }
     }
 }
