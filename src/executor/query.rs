@@ -336,6 +336,44 @@ struct SideRead<'a> {
     run: Option<(StatementRun<'a>, usize)>,
 }
 
+/// A WHERE asked of joined rows: each row asks it as written, and once the
+/// statement's run holds every value it asks, it is bound to them, so a
+/// value no row reaches is never read
+struct JoinedWhere<'r, 'p> {
+    filter: RowFilter,
+    program: SharedProgram,
+    run: Option<&'r super::prepared_select::PreparedRunner<'p>>,
+    ctx: &'r ExecutionContext,
+}
+
+impl<'r, 'p> JoinedWhere<'r, 'p> {
+    fn new(
+        program: SharedProgram,
+        run: Option<&'r super::prepared_select::PreparedRunner<'p>>,
+        ctx: &'r ExecutionContext,
+    ) -> Self {
+        let filter = RowFilter::from_program(CompactArc::clone(&program)).with_context(ctx);
+        // One that asks a correlated block is never bound
+        let run = run.filter(|run| program.has_subqueries() && run.binds_once_read(&program));
+        Self {
+            filter,
+            program,
+            run,
+            ctx,
+        }
+    }
+
+    fn matches(&mut self, row: &Row, blocks: Option<&dyn SubqueryExecutor>) -> Result<bool> {
+        let passed = self.filter.matches_checked_with(row, blocks)?;
+        if let Some(bound) = self.run.and_then(|run| run.bound_known(&self.program)) {
+            self.filter = RowFilter::from_program(CompactArc::clone(&bound)).with_context(self.ctx);
+            self.program = bound;
+            self.run = None;
+        }
+        Ok(passed)
+    }
+}
+
 /// A semantic cache answer and its output columns
 type CachedAnswer = (Box<dyn QueryResult>, CompactArc<Vec<String>>);
 
@@ -5353,19 +5391,6 @@ impl Executor {
         Ok(true)
     }
 
-    /// `program`, a WHERE asked of joined rows, with what `run` already holds
-    /// bound in, its run slots among them; as it is when it asks a block
-    /// whose answer is not read yet
-    fn bound_where(
-        run: Option<&super::prepared_select::PreparedRunner<'_>>,
-        program: SharedProgram,
-    ) -> SharedProgram {
-        match run.and_then(|run| run.bound_known(&program)) {
-            Some(bound) => bound,
-            None => program,
-        }
-    }
-
     /// The program of the WHERE `cross` a join asks at `site` of its joined
     /// rows named `all_columns`, held with the plan when it has one. With
     /// the statement's `blocks`, the WHERE they rewrote; else `cross` as
@@ -6398,21 +6423,19 @@ impl Executor {
 
                     // A cross-table WHERE filter counts toward LIMIT, so it is
                     // applied per joined row rather than after collection
-                    let cross_row_filter = match cross_filter {
-                        Some(ref cross) => Some(
-                            RowFilter::from_program(Self::bound_where(
-                                blocks_run.as_ref(),
-                                self.join_where(
-                                    prepared.as_deref(),
-                                    WhereSite::IndexJoin,
-                                    stmt,
-                                    cross,
-                                    &all_columns,
-                                    blocks.as_deref(),
-                                )?,
-                            ))
-                            .with_context(ctx),
-                        ),
+                    let mut cross_row_filter = match cross_filter {
+                        Some(ref cross) => Some(JoinedWhere::new(
+                            self.join_where(
+                                prepared.as_deref(),
+                                WhereSite::IndexJoin,
+                                stmt,
+                                cross,
+                                &all_columns,
+                                blocks.as_deref(),
+                            )?,
+                            blocks_run.as_ref(),
+                            ctx,
+                        )),
                         None => None,
                     };
                     if let Some(run) = &blocks_run {
@@ -6479,7 +6502,7 @@ impl Executor {
                             Self::collect_join_rows(
                                 &mut op,
                                 join_limit,
-                                cross_row_filter.as_ref(),
+                                cross_row_filter.as_mut(),
                                 where_blocks,
                                 &mut result_rows,
                             )?;
@@ -6595,7 +6618,7 @@ impl Executor {
                         Self::collect_join_rows(
                             &mut op,
                             None,
-                            cross_row_filter.as_ref(),
+                            cross_row_filter.as_mut(),
                             where_blocks,
                             &mut result_rows,
                         )?;
@@ -7334,14 +7357,13 @@ impl Executor {
                     &all_columns,
                     blocks.as_deref(),
                 )?;
-                let program = Self::bound_where(blocks_run.as_ref(), program);
-                let where_filter = RowFilter::from_program(program).with_context(ctx);
+                let mut where_filter = JoinedWhere::new(program, blocks_run.as_ref(), ctx);
                 if let Some(run) = &blocks_run {
                     run.ask_rows(Some(result_rows.len()));
                 }
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
-                    if where_filter.matches_checked_with(&row, where_blocks)? {
+                    if where_filter.matches(&row, where_blocks)? {
                         filtered.push((id, row));
                     }
                 }
@@ -9689,7 +9711,7 @@ impl Executor {
             }
             None => None,
         };
-        let cross = match cross_filter {
+        let mut cross = match cross_filter {
             Some(cross) => {
                 let blocks = run.map(|run| run.blocks);
                 let program = self.join_where(
@@ -9700,8 +9722,7 @@ impl Executor {
                     &all_columns,
                     blocks,
                 )?;
-                let program = Self::bound_where(run.map(|run| run.run), program);
-                Some(RowFilter::from_program(program).with_context(ctx))
+                Some(JoinedWhere::new(program, run.map(|run| run.run), ctx))
             }
             None => None,
         };
@@ -9848,8 +9869,8 @@ impl Executor {
             let mut enough = false;
             while let Some(row_ref) = op.next()? {
                 let row = row_ref.into_owned();
-                if let Some(cross) = &cross {
-                    if !cross.matches_checked_with(&row, cross_blocks)? {
+                if let Some(cross) = cross.as_mut() {
+                    if !cross.matches(&row, cross_blocks)? {
                         continue;
                     }
                 }
@@ -9980,15 +10001,15 @@ impl Executor {
     fn collect_join_rows(
         join_op: &mut dyn Operator,
         limit: Option<u64>,
-        cross: Option<&RowFilter>,
+        mut cross: Option<&mut JoinedWhere<'_, '_>>,
         blocks: Option<&dyn SubqueryExecutor>,
         out: &mut RowVec,
     ) -> Result<()> {
         join_op.open()?;
         while let Some(row_ref) = join_op.next()? {
             let row = row_ref.into_owned();
-            if let Some(filter) = cross {
-                if !filter.matches_checked_with(&row, blocks)? {
+            if let Some(filter) = cross.as_deref_mut() {
+                if !filter.matches(&row, blocks)? {
                     continue;
                 }
             }

@@ -7281,9 +7281,6 @@ pub(crate) struct JoinBlocks {
     /// The uncorrelated member blocks those read, read before the join
     /// reads a row; a value block they read is a run slot
     ahead: Vec<u16>,
-    /// The member blocks a WHERE conjunct tests as a set, read before the
-    /// join reads a row as a scan reads them, a failed read left to the row
-    cross_sets: Vec<usize>,
     /// The scope's names for the left side's columns, then the right side's
     pub(crate) left: Vec<String>,
     pub(crate) right: Vec<String>,
@@ -7421,43 +7418,16 @@ impl JoinBlocks {
             Some(moved) => (on.cloned(), with_moved(cross, moved)),
             None => (on.cloned(), cross.cloned()),
         };
-        let on = on
-            .as_ref()
-            .map(|on| builder.rewrite(&chain, None, on, &mut Rewritten::default()))
-            .transpose()?;
-        // A value a joined column is compared with in the WHERE is a run slot,
-        // as in a WHERE over one table; an uncorrelated value the output reads
-        // is one too, each read once before the join reads a row
-        let mut run_slots = Vec::new();
-        // The members a WHERE conjunct tests as a set are read before the
-        // join reads a row, as a scan's are
-        let mut cross_sets = Vec::new();
-        let cross = match cross.as_ref() {
-            Some(cross) => {
-                let mut parts = Vec::new();
-                conjuncts(cross, &mut parts);
-                let parts = parts
-                    .into_iter()
-                    .map(|part| {
-                        let work = &mut Rewritten::default();
-                        builder.statement_conjunct(&chain, part, work, &mut run_slots)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                for part in &parts {
-                    let set = match part {
-                        Expression::In(in_expr) => match &*in_expr.right {
-                            Expression::ScalarSubquery(mark) => mark.subquery.prepared,
-                            _ => None,
-                        },
-                        Expression::AllAny(all_any) => all_any.subquery.prepared,
-                        _ => None,
-                    };
-                    cross_sets.extend(set.map(usize::from));
-                }
-                conjunction(parts)
-            }
-            None => None,
+        let mut rewrite = |clause: Option<&Expression>| {
+            clause
+                .map(|clause| builder.rewrite(&chain, None, clause, &mut Rewritten::default()))
+                .transpose()
         };
+        let on = rewrite(on.as_ref())?;
+        let cross = rewrite(cross.as_ref())?;
+        // An uncorrelated value the output reads is a run slot, read once
+        // before the join reads a row
+        let mut run_slots = Vec::new();
         let first_output_block = builder.subqueries.len();
         let [select, order_by, distinct_on] = output.map(|exprs| {
             exprs
@@ -7580,7 +7550,6 @@ impl JoinBlocks {
             order_by,
             distinct_on,
             ahead,
-            cross_sets,
             left,
             right,
             all: CompactArc::clone(&scope.columns),
@@ -7739,9 +7708,6 @@ impl Executor {
             runner.base[slot] = value;
         }
         runner.read_ahead(&held.ahead, holes)?;
-        for &id in &held.cross_sets {
-            let _ = runner.read_set(id);
-        }
         Ok(Some(runner))
     }
 
@@ -11662,6 +11628,22 @@ impl PreparedRunner<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Whether every block `program` asks is uncorrelated, so it may be bound
+    /// once the run has read them
+    pub(crate) fn binds_once_read(&self, program: &SharedProgram) -> bool {
+        program.ops().iter().all(|op| match *op {
+            Op::ExecScalarSubquery(index)
+            | Op::ExecExists(index)
+            | Op::ExecInSubquery(index)
+            | Op::ExecQuantified(index, ..) => self
+                .prepared
+                .subqueries
+                .get(usize::from(index))
+                .is_some_and(|sq| sq.uncorrelated),
+            _ => true,
+        })
     }
 
     /// `program` bound to what this run already holds, its run slots and the

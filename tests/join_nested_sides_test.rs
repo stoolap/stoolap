@@ -340,6 +340,8 @@ fn a_subquery_in_a_branch_no_joined_row_takes_is_never_read() {
          WHERE t.id > 0 OR u.x > (SELECT RANDOM() * 100)",
         "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id \
          WHERE CASE WHEN t.id > 0 THEN TRUE ELSE u.x IN (SELECT RANDOM() FROM w) END",
+        "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id \
+         WHERE t.id > 100 AND u.x + r.id IN (SELECT RANDOM() FROM w)",
     ] {
         let before = random_draws();
         let rows = answer(&db, sql).map(|rows| rows.len());
@@ -415,4 +417,52 @@ fn a_joined_side_whose_columns_change_after_preparing_is_refused_or_read_anew() 
         Ok(ids) => assert_eq!(ids, &[1], "read with the old layout"),
         Err(e) => assert!(e.contains("schema changed"), "{e}"),
     }
+}
+
+#[test]
+fn a_where_value_no_joined_row_reaches_is_never_read() {
+    let _guard = serial();
+    let db = Database::open("memory://join_nested_sides_unreached").unwrap();
+    for sql in [
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO u VALUES (1, 7), (2, 8)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "INSERT INTO r VALUES (1), (2)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO m VALUES (1, -9223372036854775808)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        (
+            "SELECT e.id FROM e LEFT JOIN u ON u.id = e.id WHERE u.x > (SELECT ABS(m.x) FROM m)",
+            0,
+        ),
+        (
+            "SELECT e.id FROM e LEFT JOIN u ON u.id = e.id JOIN r ON r.id = e.a \
+             WHERE u.x > (SELECT ABS(m.x) FROM m)",
+            0,
+        ),
+        (
+            "SELECT u.id FROM u JOIN r ON r.id = u.id \
+             WHERE u.id > 5 AND u.x + r.id IN (SELECT ABS(m.x) FROM m)",
+            0,
+        ),
+        (
+            "SELECT u.id FROM u JOIN r ON r.id = u.id JOIN r AS q ON q.id = r.id \
+             WHERE u.id > 5 AND u.x + q.id IN (SELECT ABS(m.x) FROM m)",
+            0,
+        ),
+    ] {
+        let got = answer(&db, sql).map(|found| found.len());
+        if got != Ok(rows) {
+            wrong.push(format!("{sql}: {got:?}, want {rows} rows"));
+        }
+        if prepared_line(&db, sql) != "Prepared: yes" {
+            wrong.push(format!("{sql}: not prepared"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
