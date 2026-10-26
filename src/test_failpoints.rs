@@ -614,8 +614,18 @@ thread_local! {
     static ROW_ORDERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COUNT_IDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COUNT_BOUNDS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WHERE_PUSHDOWNS_CONVERTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_INDEX_IDS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COLD_UPDATE_ROWS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Prepared WHEREs whose scan filter was converted from the AST on this thread
+pub fn where_pushdowns_converted() -> usize {
+    WHERE_PUSHDOWNS_CONVERTED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn where_pushdown_converted() {
+    WHERE_PUSHDOWNS_CONVERTED.with(|c| c.set(c.get() + 1));
 }
 
 /// Row ids the hot store's single-column index lookups returned on this thread

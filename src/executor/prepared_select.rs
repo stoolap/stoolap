@@ -2572,6 +2572,8 @@ struct PreparedWhere {
     narrowed_scanned: Option<WhereProgram>,
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
+    /// `pushdown` prepared, for a run to give its values
+    push: Option<PreparedPush>,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
     /// set's keys name the rows the WHERE may pass
     narrowing: Option<Narrowing>,
@@ -2747,9 +2749,14 @@ impl WhereParts {
         }
     }
 
-    /// The WHERE as `programs`, narrowed by the first set test whose block
-    /// in `blocks` can name its rows
-    fn prepare(self, programs: WherePrograms, blocks: &PreparedBlocks) -> PreparedWhere {
+    /// The WHERE as `programs` over `schema`, narrowed by the first set
+    /// test whose block in `blocks` can name its rows
+    fn prepare(
+        self,
+        programs: WherePrograms,
+        blocks: &PreparedBlocks,
+        schema: &Schema,
+    ) -> PreparedWhere {
         let whole = self.conjuncts == 1;
         let narrowing_test =
             self.set_tests
@@ -2814,16 +2821,19 @@ impl WhereParts {
                     scanned.map(|p| WhereProgram::of(p, WhereRest::NarrowedScanned, blocks)),
                 )
             });
+        let pushed = self.pushed.len();
+        let pushdown = conjunction(self.pushed);
         PreparedWhere {
+            push: pushdown.as_ref().and_then(|p| PreparedPush::of(p, schema)),
             whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
             scanned: programs
                 .scanned
                 .map(|program| WhereProgram::of(program, WhereRest::Scanned, blocks)),
             narrowed: narrowed_program,
             narrowed_scanned,
-            pushed: self.pushed.len(),
+            pushed,
             conjuncts: self.conjuncts,
-            pushdown: conjunction(self.pushed),
+            pushdown,
             narrowing,
             sets,
             narrowing_set,
@@ -3404,6 +3414,41 @@ impl PreparedComparison {
             PreparedValue::Const(value) => value.is_null(),
             PreparedValue::Slot(slot) => params.get(*slot).is_some_and(Value::is_null),
         }
+    }
+}
+
+/// A statement's pushed conjuncts as comparisons, in the AND tree that
+/// `try_pushdown` builds from them, when every one is a comparison
+#[derive(Debug)]
+enum PreparedPush {
+    Comparison(PreparedComparison),
+    And(Box<PreparedPush>, Box<PreparedPush>),
+}
+
+impl PreparedPush {
+    fn of(expr: &Expression, schema: &Schema) -> Option<Self> {
+        match expr {
+            Expression::Infix(infix) if infix.op_type == InfixOperator::And => Some(Self::And(
+                Box::new(Self::of(&infix.left, schema)?),
+                Box::new(Self::of(&infix.right, schema)?),
+            )),
+            _ => PreparedComparison::from_conjunct(expr, schema).map(Self::Comparison),
+        }
+    }
+
+    /// The scan's filter for a run with `params`, as `try_pushdown` builds
+    /// it; None when a value is not read as its column's type
+    fn storage(&self, params: &[Value]) -> Option<Box<dyn StorageExpr>> {
+        Some(match self {
+            Self::Comparison(c) => Box::new(
+                ComparisonExpr::new(c.column.clone(), c.operator, c.value(params)?)
+                    .with_column_index(c.index),
+            ),
+            Self::And(left, right) => Box::new(AndExpr::new(vec![
+                left.storage(params)?,
+                right.storage(params)?,
+            ])),
+        })
     }
 }
 
@@ -5621,7 +5666,7 @@ impl PreparedSelect {
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
         });
-        let where_ = parts.prepare(where_programs, &blocks);
+        let where_ = parts.prepare(where_programs, &blocks, schema);
         Ok(Self {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
@@ -6020,7 +6065,7 @@ impl PreparedGrouped {
         let where_clause = where_parts.as_ref().map(|parts| parts.clause.clone());
         let where_ = where_parts
             .zip(where_program)
-            .map(|(parts, program)| parts.prepare(program, &blocks));
+            .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
         // A group's row holds its GROUP BY items first, each holding the
         // column the grouping reads it from when it reads one. A hole reads
         // an item holding the column it resolved to; between several, the
@@ -6703,7 +6748,7 @@ impl PreparedDml {
         let (blocks, holes) = builder.finish(param_count, run_slots)?;
         let where_ = where_parts
             .zip(where_program)
-            .map(|(parts, program)| parts.prepare(program, &blocks));
+            .map(|(parts, program)| parts.prepare(program, &blocks, schema));
         Ok(Self {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
@@ -6945,7 +6990,7 @@ impl JoinBlocks {
         let side_columns = [sides[0].1.columns.clone(), sides[1].1.columns.clone()];
         for (i, part) in side_parts.into_iter().enumerate() {
             if let Some((parts, program, joined_clause)) = part {
-                side_wheres[i] = Some(parts.prepare(program, &blocks));
+                side_wheres[i] = Some(parts.prepare(program, &blocks, sides[i].1));
                 side_filters[i] = Some(joined_clause);
             }
         }
@@ -9242,16 +9287,25 @@ impl<'a> PreparedRunner<'a> {
             }
             (own, extra) => own.as_ref().or(extra),
         };
-        let (mut storage_expr, residual) = match pushdown {
-            Some(pushdown) if self.prepared.run_slots.is_empty() => {
+        let prepared = match (&where_.push, extra) {
+            (Some(push), None) => push.storage(&self.base),
+            _ => None,
+        };
+        #[cfg(feature = "test-failpoints")]
+        if prepared.is_none() && pushdown.is_some() {
+            crate::test_failpoints::where_pushdown_converted();
+        }
+        let (mut storage_expr, residual) = match (prepared, pushdown) {
+            (Some(expr), _) => (Some(expr), false),
+            (None, Some(pushdown)) if self.prepared.run_slots.is_empty() => {
                 pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
             }
-            Some(pushdown) => {
+            (None, Some(pushdown)) => {
                 let mut run_ctx = ctx.clone();
                 run_ctx.set_params(self.base.clone());
                 pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx))
             }
-            None => (None, true),
+            (None, None) => (None, true),
         };
         // The conjuncts the scan takes whole, of the WHERE's
         let static_whole = where_.pushdown.is_none() || (storage_expr.is_some() && !residual);
