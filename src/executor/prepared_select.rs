@@ -2974,6 +2974,8 @@ struct BlockOrder {
     /// For each of a row's values, the key that is it, which the member
     /// reads; empty for a single item
     values: Vec<Option<usize>>,
+    /// A row's key that names a value again, and the key that computed it
+    repeats: Vec<(usize, usize)>,
     /// The DISTINCT ON keys over the block's row: the first row in order of
     /// each of their values is kept, before the OFFSET
     distinct: Vec<SharedProgram>,
@@ -4509,6 +4511,7 @@ impl Builder<'_> {
         // For each of a row's values, the key that sorts by it, whose value
         // the member reads
         let mut row_keys = vec![None; if values.len() > 1 { values.len() } else { 0 }];
+        let mut repeats = Vec::new();
         if matches!(form, Form::Exists(_)) {
             check_block_positions(sq, scope.columns.len())?;
         }
@@ -4534,8 +4537,18 @@ impl Builder<'_> {
                     _ => None,
                 };
                 if let Some(at) = named {
-                    row_keys[at].get_or_insert(order_keys.len());
-                    order_keys.push((Some(values[at].clone()), ob.ascending, ob.nulls_first));
+                    // A value named again sorts by the value its first key computed
+                    let key = match row_keys[at] {
+                        Some(first) => {
+                            repeats.push((order_keys.len(), first));
+                            None
+                        }
+                        None => {
+                            row_keys[at] = Some(order_keys.len());
+                            Some(values[at].clone())
+                        }
+                    };
+                    order_keys.push((key, ob.ascending, ob.nulls_first));
                     continue;
                 }
             }
@@ -4705,8 +4718,12 @@ impl Builder<'_> {
                     count.as_deref().map(|c| compile_with(&own, c)).transpose()
                 };
                 Some(Box::new(BlockOrder {
-                    item: order_keys.iter().position(|(key, ..)| key.is_none()),
+                    item: match row_keys.is_empty() {
+                        true => order_keys.iter().position(|(key, ..)| key.is_none()),
+                        false => None,
+                    },
                     values: row_keys,
+                    repeats,
                     keys: order_keys
                         .iter()
                         .map(|(key, ascending, nulls)| {
@@ -10662,10 +10679,12 @@ impl PreparedRunner<'_> {
             }
             let mut keys: SmallVec<[Value; 2]> = SmallVec::new();
             for (i, (key, ..)) in order.keys.iter().enumerate() {
-                let value = match (key, order.item) {
-                    (Some(key), _) => vm.execute(key, &exec)?,
-                    (None, Some(first)) if first < i => keys[first].clone(),
-                    (None, _) => {
+                let repeated = order.repeats.iter().find(|(at, _)| *at == i);
+                let value = match (key, order.item, repeated) {
+                    (Some(key), ..) => vm.execute(key, &exec)?,
+                    (None, _, Some(&(_, first))) => keys[first].clone(),
+                    (None, Some(first), None) if first < i => keys[first].clone(),
+                    (None, ..) => {
                         let item =
                             item.ok_or_else(|| Error::internal("a sort key without item"))?;
                         vm.execute(item, &exec)?

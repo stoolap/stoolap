@@ -442,6 +442,10 @@ fn a_row_block_key_that_is_a_value_answers_with_the_value_it_sorted() {
         "SELECT (0.5, 0) < (SELECT RANDOM() AS r, 0 FROM u ORDER BY r LIMIT 1) FROM t",
         "SELECT (0.5, 0) > ANY (SELECT 0 + RANDOM(), 0 FROM u ORDER BY 0 + RANDOM() LIMIT 1) \
          FROM t",
+        "SELECT (0, 1) IN (SELECT ROUND(RANDOM()) AS r, id FROM u ORDER BY r, r, id LIMIT 1) \
+         FROM t",
+        "SELECT (0, 1) IN (SELECT 0 + RANDOM(), id FROM u \
+         ORDER BY 0 + RANDOM(), 0 + RANDOM() DESC, id LIMIT 1) FROM t",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
         let draws = random_draws();
