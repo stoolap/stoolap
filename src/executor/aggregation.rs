@@ -2566,6 +2566,12 @@ impl Executor {
                             expr: aliased_expr.clone(),
                             display_name: id.value.to_string(),
                         });
+                    } else if id.quoted {
+                        // The compiler binds a quoted name: a column, else its text
+                        group_items.push(GroupByItem::Expression {
+                            expr: expr.clone(),
+                            display_name: id.value.to_string(),
+                        });
                     } else {
                         // Regular column reference
                         group_items.push(GroupByItem::Column(id.value.to_string()));

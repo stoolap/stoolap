@@ -211,3 +211,46 @@ fn an_aggregate_alias_leaves_a_column_of_its_name_to_group_by() {
         vec!["Some(Integer(2))", "Some(Integer(3))"]
     );
 }
+
+#[test]
+fn a_quoted_group_by_name_binds_as_the_compiler_binds_it() {
+    let db = open("quoted_group_by_name");
+    for (sql, want) in [
+        (
+            "SELECT COUNT(*) FROM one GROUP BY \"constant\"",
+            vec!["Some(Integer(3))"],
+        ),
+        (
+            "SELECT \"constant\", COUNT(*) FROM one GROUP BY \"constant\"",
+            vec!["Some(Text(\"constant\"))|Some(Integer(3))"],
+        ),
+        (
+            "SELECT COUNT(*) FROM one GROUP BY \"constant\" || ''",
+            vec!["Some(Integer(3))"],
+        ),
+        (
+            "SELECT COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY \"constant\"",
+            vec!["Some(Integer(3))|Some(Integer(6))"],
+        ),
+        (
+            "SELECT id, (SELECT COUNT(*) FROM u GROUP BY \"constant\") FROM one WHERE id = 1",
+            vec!["Some(Integer(1))|Some(Integer(2))"],
+        ),
+        (
+            "SELECT \"a\", COUNT(*) FROM one GROUP BY \"a\" ORDER BY 1",
+            vec![
+                "Some(Integer(10))|Some(Integer(2))",
+                "Some(Integer(20))|Some(Integer(1))",
+            ],
+        ),
+        (
+            "SELECT a, COUNT(*) FROM one GROUP BY \"a\" ORDER BY 1",
+            vec![
+                "Some(Integer(10))|Some(Integer(2))",
+                "Some(Integer(20))|Some(Integer(1))",
+            ],
+        ),
+    ] {
+        assert_eq!(rows(&db, sql), want, "{sql}");
+    }
+}
