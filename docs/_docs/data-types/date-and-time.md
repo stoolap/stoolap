@@ -47,6 +47,9 @@ Based on the implementation, Stoolap recognizes various date and time formats:
 ```
 
 Either form may end with a time zone after the time: `Z`, `+HH`, `+HHMM` or `+HH:MM` (or with `-`), optionally after a space. The value is that instant in UTC, so `'2023-05-15 16:30:45+02:00'`, `'2023-05-15T09:30:45-05'` and `'2023-05-15 14:30:45Z'` are all `2023-05-15 14:30:45` UTC. A zone outside `-23:59` to `+23:59`, or one written as a name such as `UTC`, does not read: the text is no timestamp.
+
+A typed literal, `TIMESTAMP '...'` or `DATE '...'`, whose text does not read as a timestamp is an error, as writing that text into a TIMESTAMP column is.
+
 ### Date Only
 ```
 2023-05-15                    -- Date only (time defaults to 00:00:00)

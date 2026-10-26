@@ -14,7 +14,8 @@
 
 //! A timestamp text may end with a zone after its time, `Z`, `+HH`,
 //! `+HHMM` or `+HH:MM`, in the ISO form and the SQL form alike, and reads as
-//! that instant in UTC wherever a text is read as a timestamp
+//! that instant in UTC wherever a text is read as a timestamp. A TIMESTAMP or
+//! DATE literal whose text does not read as one is an error
 
 use stoolap::{Database, Value};
 
@@ -176,5 +177,28 @@ fn a_zone_out_of_range_reads_as_no_timestamp() {
                 .is_err(),
             "{text} written"
         );
+    }
+}
+
+#[test]
+fn a_typed_literal_that_reads_as_no_timestamp_is_an_error() {
+    let db = Database::open("memory://a_typed_literal_that_reads_as_no_timestamp").unwrap();
+    for sql in [
+        "SELECT TIMESTAMP '2024-01-10 00:00:00 UTC'",
+        "SELECT TIMESTAMP 'not a date'",
+        "SELECT DATE '2024-13-01'",
+        "SELECT TIMESTAMP '2024-01-10 00:00:00+25:00'",
+    ] {
+        let failed = db
+            .query(sql, ())
+            .map_or(true, |mut rows| rows.next().is_some_and(|row| row.is_err()));
+        assert!(failed, "{sql} answered");
+    }
+    for sql in [
+        "SELECT TIMESTAMP '2024-01-10'",
+        "SELECT TIMESTAMP '12:00:00'",
+        "SELECT DATE '2024-01-10'",
+    ] {
+        assert!(db.query(sql, ()).is_ok(), "{sql} failed");
     }
 }

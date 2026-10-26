@@ -1827,6 +1827,15 @@ impl Parser<'_> {
         } else {
             literal.clone()
         };
+        if crate::core::value::typed_literal_is_timestamp(&type_hint)
+            && crate::core::value::parse_timestamp(&value).is_err()
+        {
+            self.add_error(format!(
+                "invalid {} literal '{}' at {}",
+                type_hint, value, self.cur_token.position
+            ));
+            return None;
+        }
 
         Some(Expression::StringLiteral(StringLiteral {
             token: self.cur_token.clone(),

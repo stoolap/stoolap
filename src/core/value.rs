@@ -1368,13 +1368,17 @@ pub const TYPED_LITERAL_KEYWORDS: [&str; 3] = ["TIMESTAMP", "DATE", "TIME"];
 /// The TIMESTAMP a typed literal stands for: a TIMESTAMP, DATETIME or DATE
 /// hint whose text parses. None otherwise, and the literal stays a TEXT
 pub fn typed_literal_timestamp(hint: &str, text: &str) -> Option<Value> {
-    let timestamp = ["TIMESTAMP", "DATETIME", "DATE"]
-        .iter()
-        .any(|name| hint.eq_ignore_ascii_case(name));
-    if !timestamp {
+    if !typed_literal_is_timestamp(hint) {
         return None;
     }
     parse_timestamp(text).ok().map(Value::Timestamp)
+}
+
+/// Whether a literal typed `hint` is a TIMESTAMP, whose text must read as one
+pub fn typed_literal_is_timestamp(hint: &str) -> bool {
+    ["TIMESTAMP", "DATETIME", "DATE"]
+        .iter()
+        .any(|name| hint.eq_ignore_ascii_case(name))
 }
 
 /// A TEXT as `CAST(... AS BOOLEAN)` reads it: `true`, `t`, `yes`, `y` and
