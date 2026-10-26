@@ -2476,6 +2476,14 @@ fn slot_parameter(slot: usize) -> Expression {
     })
 }
 
+/// Whether `stmt` aggregates its rows: it groups, has a HAVING, or a SELECT
+/// item calls an aggregate outside a window
+fn aggregates(stmt: &SelectStatement) -> bool {
+    !stmt.group_by.columns.is_empty()
+        || stmt.having.is_some()
+        || stmt.columns.iter().any(expression_contains_aggregate)
+}
+
 /// The EXISTS block `stmt`, run as a statement, asked only whether it has
 /// a row: one value per row it returns in place of its SELECT items, each
 /// alias or position that read an item reading its expression, no ORDER
@@ -2486,9 +2494,7 @@ fn existence(
     from_names: &[String],
     ctx: &ExecutionContext,
 ) -> Result<SelectStatement> {
-    let grouped = !stmt.group_by.columns.is_empty()
-        || stmt.having.is_some()
-        || stmt.columns.iter().any(expression_contains_aggregate);
+    let grouped = aggregates(&stmt);
     if grouped {
         check_grouped_reads(executor, &stmt, from_names, ctx)?;
     }
@@ -3341,6 +3347,8 @@ struct StatementBlock {
     run: StatementRun,
     form: StatementForm,
     tables: Option<Vec<SmartString>>,
+    /// Whether it computes a window function
+    windowed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4187,6 +4195,7 @@ impl Builder<'_> {
                 compiled: RwLock::new(CompiledExecution::Unknown),
             },
             form,
+            windowed: windowed_block(sq),
         };
         let (holes, hole_exprs, hole_written) = self.compiled_holes(outer, parent, &work)?;
         self.subqueries[id as usize] = Some(PreparedSubquery {
@@ -4215,8 +4224,8 @@ impl Builder<'_> {
 
     /// Raise what binding `statement`, a block's run over a join, raises, as
     /// a block over one table does when prepared: opened once per schema over
-    /// no row, its WHERE false, no LIMIT or OFFSET, `slots` parameters NULL.
-    /// Only a join of tables holding no subquery opens so computing no value
+    /// no row, its WHERE and an aggregate's HAVING false, no LIMIT or OFFSET,
+    /// `slots` parameters NULL; only a join of tables opens so computing nothing
     fn bind_join_statement(&self, statement: &SelectStatement, slots: usize) -> Result<()> {
         let Some(Expression::JoinSource(join)) = statement.table_expr.as_deref() else {
             return Ok(());
@@ -4233,7 +4242,6 @@ impl Builder<'_> {
             .columns
             .iter()
             .chain(&statement.distinct_on)
-            .chain(statement.where_clause.as_deref())
             .chain(&statement.group_by.columns)
             .chain(statement.having.as_deref())
             .chain(statement.order_by.iter().map(|o| &o.expression));
@@ -4244,17 +4252,25 @@ impl Builder<'_> {
         {
             return Ok(());
         }
-        let never = Expression::BooleanLiteral(BooleanLiteral {
-            token: Token::new(TokenType::Keyword, "FALSE", Position::default()),
-            value: false,
-        });
+        let never = || {
+            Expression::BooleanLiteral(BooleanLiteral {
+                token: Token::new(TokenType::Keyword, "FALSE", Position::default()),
+                value: false,
+            })
+        };
+        // A WHERE subquery could run; the walk has bound the WHERE's names
+        let filter = statement
+            .where_clause
+            .as_deref()
+            .filter(|filter| !mentions_subquery(filter));
+        let having = statement.having.as_deref();
         let check = SelectStatement {
-            where_clause: conjunction(
-                std::iter::once(never)
-                    .chain(statement.where_clause.as_deref().cloned())
-                    .collect(),
-            )
-            .map(Box::new),
+            where_clause: conjunction(std::iter::once(never()).chain(filter.cloned()).collect())
+                .map(Box::new),
+            having: aggregates(statement)
+                .then(|| conjunction(std::iter::once(never()).chain(having.cloned()).collect()))
+                .flatten()
+                .map(Box::new),
             limit: None,
             offset: None,
             ..statement.clone()
@@ -4389,6 +4405,7 @@ impl Builder<'_> {
             Expression::Exists(exists) => exists.subquery.prepared,
             _ => None,
         };
+        // A window's block runs when a row asks it, as over one source
         let once = block
             .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
             .is_some_and(|sq| {
@@ -4397,7 +4414,7 @@ impl Builder<'_> {
                     && match &sq.answer {
                         Answer::Value(..) | Answer::Exists(_) => true,
                         Answer::Statement(_, block) => {
-                            !matches!(block.form, StatementForm::Members(..))
+                            !matches!(block.form, StatementForm::Members(..)) && !block.windowed
                         }
                         Answer::Members(..) => false,
                     }

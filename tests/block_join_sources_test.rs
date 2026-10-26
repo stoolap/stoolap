@@ -477,6 +477,7 @@ fn a_block_over_a_join_is_bound_when_prepared_and_run_when_asked() {
         "INSERT INTO one VALUES (1)",
         "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)",
         "INSERT INTO m VALUES (1, -9223372036854775808)",
+        "CREATE TABLE z (id INTEGER PRIMARY KEY)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -508,6 +509,25 @@ fn a_block_over_a_join_is_bound_when_prepared_and_run_when_asked() {
         (
             "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u WHERE u.id = e.id GROUP BY u.id)",
             Err("Compile error: Column 'x' not found".to_string()),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
+             WHERE EXISTS (SELECT 1 FROM z) GROUP BY v.x)",
+            ungrouped.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u WHERE EXISTS (SELECT 1 FROM z) \
+             GROUP BY u.id)",
+            Err("Compile error: Column 'x' not found".to_string()),
+        ),
+        (
+            "SELECT id, (SELECT ABS(COUNT(*) - 9223372036854775807 - 1) FROM u JOIN w \
+             ON w.id = u.id) FROM one",
+            Ok(vec!["1|9223372036854775805".to_string()]),
+        ),
+        (
+            "SELECT id, (SELECT ABS(COUNT(*) - 9223372036854775807 - 1) FROM u) FROM one",
+            Ok(vec!["1|9223372036854775804".to_string()]),
         ),
         (
             "SELECT id FROM e WHERE EXISTS (SELECT v.x FROM u JOIN u AS v ON v.id = u.id \
@@ -564,6 +584,16 @@ fn a_block_over_a_join_is_bound_when_prepared_and_run_when_asked() {
         (
             "SELECT id, CASE WHEN id = 0 THEN (SELECT ABS(m.x) FROM m LIMIT 1) END FROM one",
             overflow.clone(),
+        ),
+        (
+            "SELECT CASE WHEN id = 0 THEN (SELECT ABS(m.x) + ROW_NUMBER() OVER () FROM m \
+             JOIN u ON u.id = m.id LIMIT 1) ELSE 1 END FROM one",
+            Ok(vec!["1".to_string()]),
+        ),
+        (
+            "SELECT CASE WHEN id = 0 THEN (SELECT ABS(m.x) + ROW_NUMBER() OVER () FROM m \
+             LIMIT 1) ELSE 1 END FROM one",
+            Ok(vec!["1".to_string()]),
         ),
         (
             "SELECT id, (SELECT u.x FROM u JOIN w ON w.id = u.id) FROM e",
