@@ -3341,6 +3341,8 @@ struct StatementBlock {
     run: StatementRun,
     form: StatementForm,
     tables: Option<Vec<SmartString>>,
+    /// Set once a run has opened it, which binds what it reads
+    opened: std::sync::OnceLock<()>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4179,6 +4181,7 @@ impl Builder<'_> {
                 compiled: RwLock::new(CompiledExecution::Unknown),
             },
             form,
+            opened: std::sync::OnceLock::new(),
         };
         let (holes, hole_exprs, hole_written) = self.compiled_holes(outer, parent, &work)?;
         self.subqueries[id as usize] = Some(PreparedSubquery {
@@ -4304,7 +4307,13 @@ impl Builder<'_> {
             .is_some_and(|sq| {
                 sq.uncorrelated
                     && sq.parent.is_none()
-                    && matches!(sq.answer, Answer::Value(..) | Answer::Exists(_))
+                    && match &sq.answer {
+                        Answer::Value(..) | Answer::Exists(_) => true,
+                        Answer::Statement(_, block) => {
+                            !matches!(block.form, StatementForm::Members(..))
+                        }
+                        Answer::Members(..) => false,
+                    }
             });
         match (block, once) {
             (Some(_), true) => {
@@ -6781,6 +6790,7 @@ impl Executor {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
+        runner.open_statements(&held.holes)?;
         runner.read_ahead(&held.ahead, &held.holes)?;
         Ok(Some(runner))
     }
@@ -7562,6 +7572,7 @@ impl Executor {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
+        runner.open_statements(holes)?;
         runner.read_ahead(&held.ahead, holes)?;
         Ok(Some(runner))
     }
@@ -7820,6 +7831,7 @@ impl<'a> DmlRunner<'a> {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
+        runner.open_statements(&prepared.holes)?;
         Ok(Self { runner, prepared })
     }
 
@@ -8865,6 +8877,7 @@ impl Executor {
                 runner.base[slot] = value;
             }
         }
+        runner.open_statements(&prepared.holes)?;
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
         let output_columns = CompactArc::clone(&prepared.output_columns);
         // Every value of a VALUES list is evaluated, as the general path does
@@ -9380,6 +9393,9 @@ struct BlockState {
     point_rows: RefCell<RowVec>,
     /// The row ids an index count reads, kept for the next call
     count_ids: RefCell<Option<Box<CountIds>>>,
+    /// An uncorrelated statement block's rows, opened before the statement
+    /// reads its own and taken by the block's first read
+    opened: RefCell<Option<Box<dyn crate::storage::traits::QueryResult>>>,
 }
 
 /// The row ids of one index probe and the scratch it reads them with
@@ -9537,6 +9553,7 @@ impl<'a> PreparedRunner<'a> {
                     feed_vm: RefCell::new(None),
                     point_rows: RefCell::new(RowVec::new()),
                     count_ids: RefCell::new(None),
+                    opened: RefCell::new(None),
                 })
                 .collect(),
             base,
@@ -9545,6 +9562,31 @@ impl<'a> PreparedRunner<'a> {
             tables,
             where_bound: OnceCell::new(),
         }
+    }
+
+    /// Open and read each uncorrelated statement block no run has opened
+    /// yet, so an error binding it is raised whether a row asks it or not;
+    /// an error its rows raise is kept for the row that needs them
+    fn open_statements(&self, holes: &HoleSet) -> Result<()> {
+        let empty = Row::new();
+        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        for (index, sq) in self.prepared.subqueries.iter().enumerate() {
+            let Answer::Statement(_, block) = &sq.answer else {
+                continue;
+            };
+            if !sq.uncorrelated || sq.parent.is_some() || block.opened.get().is_some() {
+                continue;
+            }
+            let rows = self.block_statement(index, block, &caller, holes)?;
+            *self.blocks[index].opened.borrow_mut() = Some(rows);
+            let _ = match block.form {
+                StatementForm::Value => self.scalar_at(index as u16, &caller, holes).map(drop),
+                StatementForm::Exists => self.exists_answer(index, &caller, holes).map(drop),
+                StatementForm::Members(..) => self.read_member_set(index, &caller, holes),
+            };
+            drop(self.blocks[index].opened.borrow_mut().take());
+        }
+        Ok(())
     }
 
     /// Read the members of each uncorrelated block of `ids` now, which keeps
@@ -12140,6 +12182,9 @@ impl PreparedRunner<'_> {
         caller: &ExecuteContext,
         site: &HoleSet,
     ) -> Result<Box<dyn crate::storage::traits::QueryResult>> {
+        if let Some(rows) = self.blocks[index].opened.borrow_mut().take() {
+            return Ok(rows);
+        }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::BlockStatement,
@@ -12148,13 +12193,15 @@ impl PreparedRunner<'_> {
         let ctx = self
             .ctx
             .with_slot_params(self.blocks[index].buffer.borrow().clone());
-        self.executor.execute_select_with_plan(
+        let rows = self.executor.execute_select_with_plan(
             &block.run.statement,
             &ctx,
             Some(&block.run.classification),
             Some(&block.run.compiled),
             None,
-        )
+        )?;
+        let _ = block.opened.set(());
+        Ok(rows)
     }
 
     fn statement_values(&self, run: &StatementRun, width: usize) -> Result<Vec<Value>> {

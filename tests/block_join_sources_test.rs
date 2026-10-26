@@ -467,6 +467,59 @@ fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
 }
 
 #[test]
+fn an_uncorrelated_block_over_a_join_is_bound_with_no_row_asking_it() {
+    let _guard = serial();
+    let db = hot("bound");
+    db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    let ungrouped = Err("Compile error: Column 'u.x' not found".to_string());
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
+             GROUP BY v.x)",
+            ungrouped.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE a IN (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
+             GROUP BY v.x)",
+            ungrouped.clone(),
+        ),
+        (
+            "SELECT id, (SELECT u.x FROM u JOIN u AS v ON v.id = u.id GROUP BY v.x) FROM e",
+            ungrouped.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT v.x FROM u JOIN u AS v ON v.id = u.id \
+             GROUP BY v.x)",
+            Ok(Vec::new()),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
+             WHERE u.id = e.id GROUP BY v.x)",
+            Ok(Vec::new()),
+        ),
+        (
+            "SELECT id, (SELECT u.x FROM u JOIN w ON w.id = u.id) FROM e",
+            Err("scalar subquery returned more than one row".to_string()),
+        ),
+        (
+            "SELECT id, (SELECT u.x FROM u) FROM e",
+            Err("scalar subquery returned more than one row".to_string()),
+        ),
+    ] {
+        // A second run takes the plan the first one made
+        for run in ["first", "second"] {
+            let got = answer(&db, sql);
+            if got != want {
+                wrong.push(format!("{sql} ({run} run): gave {got:?}, want {want:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_star_over_a_join_is_named_only_by_its_run() {
     let _guard = serial();
     let db = hot("star");
