@@ -3757,6 +3757,13 @@ impl Executor {
                 .expressions
                 .iter()
                 .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            // A subquery folded to its members keeps the side it is tested on
+            Expression::InHashSet(set) => {
+                Self::references_outer_columns(&set.column, subquery_tables)
+            }
+            Expression::QuantifiedSet(set) => {
+                Self::references_outer_columns(&set.left, subquery_tables)
+            }
             Expression::Window(window) => window
                 .function
                 .arguments

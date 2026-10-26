@@ -5395,14 +5395,27 @@ impl Executor {
             .condition
             .as_deref()
             .filter(|_| ctx.outer_row().is_some())
-            .and_then(|on| Self::bind_to_parent_row(join_source, on, ctx))
         {
-            Some(condition) => {
-                bound_source = JoinTableSource {
-                    condition: Some(Box::new(condition)),
-                    ..join_source.clone()
+            Some(on) => {
+                // An uncorrelated subquery folds first, as it would below,
+                // so the parent's columns beside it are bound too
+                let folded = match Self::has_subqueries(on) && !Self::has_correlated_subqueries(on)
+                {
+                    true => Some(self.process_where_subqueries(on, ctx)?),
+                    false => None,
                 };
-                &bound_source
+                let bound =
+                    Self::bind_to_parent_row(join_source, folded.as_ref().unwrap_or(on), ctx);
+                match bound.or(folded) {
+                    Some(condition) => {
+                        bound_source = JoinTableSource {
+                            condition: Some(Box::new(condition)),
+                            ..join_source.clone()
+                        };
+                        &bound_source
+                    }
+                    None => join_source,
+                }
             }
             None => join_source,
         };

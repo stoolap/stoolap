@@ -40,6 +40,8 @@ fn create(dsn: &str) -> Database {
         "INSERT INTO u VALUES (1, 1), (2, 1)",
         "CREATE TABLE v (id INTEGER PRIMARY KEY, k INTEGER)",
         "INSERT INTO v VALUES (1, 1), (2, 2), (3, 3)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO w VALUES (1, 1)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -146,6 +148,64 @@ fn an_outer_join_and_a_nested_join_read_the_parent_row_in_their_condition() {
     ] {
         let got = rows(&db, sql);
         if got.as_ref() != Ok(&want) {
+            failed.push(format!("{sql}: {got:?}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+#[test]
+fn the_parent_row_beside_a_folded_subquery_is_bound() {
+    let db = create("memory://the_parent_row_beside_a_folded_subquery_is_bound");
+    let mut failed = Vec::new();
+    for (subquery, want) in [
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id WHERE t.k IN (SELECT k FROM w))",
+            [2, 0, 0],
+        ),
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id WHERE t.k NOT IN (SELECT k FROM w))",
+            [0, 2, 2],
+        ),
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id WHERE t.k = ANY (SELECT k FROM w))",
+            [2, 0, 0],
+        ),
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id WHERE t.k > ALL (SELECT k FROM w))",
+            [0, 2, 2],
+        ),
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id AND v.k = t.k + (SELECT 0))",
+            [1, 1, 0],
+        ),
+        (
+            "(SELECT COUNT(v.id) FROM u LEFT JOIN v ON v.id = u.id AND v.k = t.k + (SELECT 0))",
+            [1, 1, 0],
+        ),
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id AND t.k IN (SELECT k FROM w))",
+            [2, 0, 0],
+        ),
+        (
+            "(SELECT COUNT(*) FROM u JOIN v ON v.id = u.id AND t.k > ALL (SELECT k FROM w))",
+            [0, 2, 2],
+        ),
+    ] {
+        let sql = format!("SELECT id, {subquery} FROM t");
+        let want: Vec<Vec<i64>> = (1..=3).zip(want).map(|(id, n)| vec![id, n]).collect();
+        let got = rows(&db, &sql);
+        if got.as_ref() != Ok(&want) {
+            failed.push(format!("{sql}: {got:?}"));
+        }
+        let sql = format!("SELECT id FROM t WHERE s || 'x' <> 'zx' AND {subquery} = 0");
+        let zero: Vec<Vec<i64>> = want
+            .iter()
+            .filter(|r| r[1] == 0)
+            .map(|r| vec![r[0]])
+            .collect();
+        let got = rows(&db, &sql);
+        if got.as_ref() != Ok(&zero) {
             failed.push(format!("{sql}: {got:?}"));
         }
     }
