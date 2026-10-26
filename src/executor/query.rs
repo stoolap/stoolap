@@ -773,7 +773,7 @@ impl JoinOutput {
 }
 
 /// The columns of the row a statement runs for, which its programs read by name
-fn outer_column_names(ctx: &ExecutionContext) -> Option<Vec<String>> {
+pub(crate) fn outer_column_names(ctx: &ExecutionContext) -> Option<Vec<String>> {
     ctx.outer_row()
         .filter(|outer| !outer.is_empty())
         .map(|outer| outer.keys().map(|k| k.to_string()).collect())
@@ -1551,8 +1551,7 @@ impl Executor {
         let written_items = branch.columns.len();
         let (branch, branch_classification) =
             match Self::with_distinct_on_items(branch, &classification) {
-                Some(mut keyed) => {
-                    Self::bind_outer_items(&mut keyed, written_items, ctx);
+                Some(keyed) => {
                     keyed_stmt = keyed;
                     keyed_classification = get_classification(&keyed_stmt);
                     (&keyed_stmt, &keyed_classification)
