@@ -13556,8 +13556,11 @@ impl Executor {
             return None;
         }
 
-        // Must have GROUP BY
-        if stmt.group_by.columns.is_empty() {
+        // Must have a plain GROUP BY: ROLLUP, CUBE and GROUPING SETS add
+        // groups of many left rows, which a cut left side would count short
+        if stmt.group_by.columns.is_empty()
+            || stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None
+        {
             return None;
         }
 

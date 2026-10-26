@@ -763,3 +763,28 @@ fn test_grouping_sets_group_by_items_the_select_list_does_not_name() {
         assert_eq!(sorted_rows(&db, sql), sorted_rows(&db, same), "{sql}");
     }
 }
+
+#[test]
+fn test_a_join_limit_cuts_no_rolled_up_group() {
+    let db = Database::open("memory://join_limit_rolled_up_group").expect("open");
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for grouping in ["GROUPING SETS ((l.id), ())", "ROLLUP(l.id)", "CUBE(l.id)"] {
+        for join in ["LEFT JOIN", "JOIN"] {
+            let sql = format!(
+                "SELECT l.id, COUNT(*) FROM t l {join} u r ON l.id = r.id \
+                 GROUP BY {grouping} HAVING COUNT(*) > 1 LIMIT 1"
+            );
+            let want = match join {
+                "LEFT JOIN" => vec!["Some(Null(Null))|Some(Integer(5))"],
+                _ => vec![],
+            };
+            assert_eq!(sorted_rows(&db, &sql), want, "{sql}");
+        }
+    }
+}
