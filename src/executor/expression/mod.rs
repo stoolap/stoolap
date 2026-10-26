@@ -58,6 +58,7 @@ pub(crate) use once::{
 };
 pub use ops::{CompareOp, Op, QuantifiedMembers};
 pub use program::Program;
+pub(crate) use vm::concat_values;
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 
 #[cfg(test)]

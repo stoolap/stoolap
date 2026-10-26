@@ -70,6 +70,7 @@ mod index_optimizer;
 mod pk_fast_path;
 mod prepared_join;
 mod prepared_select;
+mod projection;
 pub mod pushdown;
 mod query;
 mod query_classification;
