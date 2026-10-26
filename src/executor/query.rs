@@ -5353,14 +5353,14 @@ impl Executor {
         Ok(true)
     }
 
-    /// `program`, a WHERE asked of joined rows, with the uncorrelated values
-    /// it asks of `run` read once and bound; as it is when a read fails,
-    /// whose error stays with the row that needs it
+    /// `program`, a WHERE asked of joined rows, with what `run` already holds
+    /// bound in, its run slots among them; as it is when it asks a block
+    /// whose answer is not read yet
     fn bound_where(
         run: Option<&super::prepared_select::PreparedRunner<'_>>,
         program: SharedProgram,
     ) -> SharedProgram {
-        match run.and_then(|run| run.bound_reading(&program)) {
+        match run.and_then(|run| run.bound_known(&program)) {
             Some(bound) => bound,
             None => program,
         }
@@ -7334,12 +7334,11 @@ impl Executor {
                     &all_columns,
                     blocks.as_deref(),
                 )?;
+                let program = Self::bound_where(blocks_run.as_ref(), program);
+                let where_filter = RowFilter::from_program(program).with_context(ctx);
                 if let Some(run) = &blocks_run {
                     run.ask_rows(Some(result_rows.len()));
                 }
-                let run = blocks_run.as_ref().filter(|_| !result_rows.is_empty());
-                let where_filter =
-                    RowFilter::from_program(Self::bound_where(run, program)).with_context(ctx);
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
                     if where_filter.matches_checked_with(&row, where_blocks)? {

@@ -67,7 +67,7 @@ use super::result::{
     DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
 };
 use super::utils::{
-    build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
+    bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, get_table_alias_from_expr, infix_to_operator,
     is_aggregate_function, item_name, order_by_names_an_alias, split_qualified,
     strip_table_qualifier, QUALIFIER_SEP,
@@ -7281,6 +7281,9 @@ pub(crate) struct JoinBlocks {
     /// The uncorrelated member blocks those read, read before the join
     /// reads a row; a value block they read is a run slot
     ahead: Vec<u16>,
+    /// The member blocks a WHERE conjunct tests as a set, read before the
+    /// join reads a row as a scan reads them, a failed read left to the row
+    cross_sets: Vec<usize>,
     /// The scope's names for the left side's columns, then the right side's
     pub(crate) left: Vec<String>,
     pub(crate) right: Vec<String>,
@@ -7314,19 +7317,14 @@ impl JoinBlocks {
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
     fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
-        // A joined side's rows are read by position, its tables' columns in turn
-        if self.nested[side].is_some() {
-            let width = [self.left.len(), self.right.len()][side];
-            if columns.len() == width {
-                return Ok(());
-            }
-            return Err(Error::SchemaChanged {
-                table: name.to_string(),
-            });
-        }
         let prepared = &self.side_columns[side];
-        if prepared.len() == columns.len()
-            && prepared.iter().zip(columns).all(|(c, n)| c.name == *n)
+        // A joined side's rows hold its tables' columns in turn, each named
+        // by its table and its own name
+        let fits = |c: &SchemaColumn, n: &String| match self.nested[side] {
+            Some(_) => bare_name(n).eq_ignore_ascii_case(&c.name),
+            None => c.name == *n,
+        };
+        if prepared.len() == columns.len() && prepared.iter().zip(columns).all(|(c, n)| fits(c, n))
         {
             return Ok(());
         }
@@ -7423,16 +7421,43 @@ impl JoinBlocks {
             Some(moved) => (on.cloned(), with_moved(cross, moved)),
             None => (on.cloned(), cross.cloned()),
         };
-        let mut rewrite = |clause: Option<&Expression>| {
-            clause
-                .map(|clause| builder.rewrite(&chain, None, clause, &mut Rewritten::default()))
-                .transpose()
-        };
-        let on = rewrite(on.as_ref())?;
-        let cross = rewrite(cross.as_ref())?;
-        // An uncorrelated value the output reads is a run slot, read once
-        // before the join reads a row
+        let on = on
+            .as_ref()
+            .map(|on| builder.rewrite(&chain, None, on, &mut Rewritten::default()))
+            .transpose()?;
+        // A value a joined column is compared with in the WHERE is a run slot,
+        // as in a WHERE over one table; an uncorrelated value the output reads
+        // is one too, each read once before the join reads a row
         let mut run_slots = Vec::new();
+        // The members a WHERE conjunct tests as a set are read before the
+        // join reads a row, as a scan's are
+        let mut cross_sets = Vec::new();
+        let cross = match cross.as_ref() {
+            Some(cross) => {
+                let mut parts = Vec::new();
+                conjuncts(cross, &mut parts);
+                let parts = parts
+                    .into_iter()
+                    .map(|part| {
+                        let work = &mut Rewritten::default();
+                        builder.statement_conjunct(&chain, part, work, &mut run_slots)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for part in &parts {
+                    let set = match part {
+                        Expression::In(in_expr) => match &*in_expr.right {
+                            Expression::ScalarSubquery(mark) => mark.subquery.prepared,
+                            _ => None,
+                        },
+                        Expression::AllAny(all_any) => all_any.subquery.prepared,
+                        _ => None,
+                    };
+                    cross_sets.extend(set.map(usize::from));
+                }
+                conjunction(parts)
+            }
+            None => None,
+        };
         let first_output_block = builder.subqueries.len();
         let [select, order_by, distinct_on] = output.map(|exprs| {
             exprs
@@ -7494,9 +7519,10 @@ impl JoinBlocks {
             .collect::<Result<Vec<_>>>()?;
         let mut side_filters = [None, None];
         let mut side_wheres = [None, None];
-        let side_columns = sides
-            .each_ref()
-            .map(|side| side.schema().map(|s| s.columns.clone()).unwrap_or_default());
+        let side_columns = sides.each_ref().map(|side| {
+            let columns = side.leaves.iter().flat_map(|(_, schema)| &schema.columns);
+            columns.cloned().collect()
+        });
         for (i, part) in side_parts.into_iter().enumerate() {
             if let (Some((parts, program, joined_clause)), Some(schema)) = (part, sides[i].schema())
             {
@@ -7554,6 +7580,7 @@ impl JoinBlocks {
             order_by,
             distinct_on,
             ahead,
+            cross_sets,
             left,
             right,
             all: CompactArc::clone(&scope.columns),
@@ -7712,6 +7739,9 @@ impl Executor {
             runner.base[slot] = value;
         }
         runner.read_ahead(&held.ahead, holes)?;
+        for &id in &held.cross_sets {
+            let _ = runner.read_set(id);
+        }
         Ok(Some(runner))
     }
 
@@ -11631,6 +11661,22 @@ impl PreparedRunner<'_> {
                 self.members_op(index as usize)
             }
             _ => None,
+        }
+    }
+
+    /// `program` bound to what this run already holds, its run slots and the
+    /// values it has read, reading nothing; None when it asks a block whose
+    /// answer is not read yet, which a row reads when it needs it
+    pub(crate) fn bound_known(&self, program: &SharedProgram) -> Option<SharedProgram> {
+        let unread_set = program.ops().iter().any(|op| match *op {
+            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) => {
+                self.blocks[usize::from(index)].members.get().is_none()
+            }
+            _ => false,
+        });
+        match unread_set {
+            true => None,
+            false => self.bound_program(program),
         }
     }
 

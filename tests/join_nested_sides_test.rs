@@ -127,8 +127,13 @@ const SHAPES: &[&str] = &[
     "SELECT t.id, u.id, s.id FROM {f} WHERE NOT EXISTS (SELECT 1 FROM w WHERE w.y = t.id)",
     "SELECT t.id, u.id, s.id FROM {f} WHERE s.id + t.id > ALL (SELECT y FROM w WHERE w.x = s.id)",
     "SELECT t.id, (SELECT COUNT(*) FROM w WHERE w.x = s.id), u.x FROM {f}",
-    "SELECT t.id, u.id, s.id FROM {f} ORDER BY (SELECT COUNT(*) FROM w WHERE w.x = u.id), t.id",
+    "SELECT t.id AS ti, u.id AS ui, s.id AS si, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS k \
+     FROM {f} ORDER BY (SELECT COUNT(*) FROM w WHERE w.x = u.id), ti, ui, si",
 ];
+
+/// The order an ordered shape's rows are compared in, as its general path
+/// reference sorts them by the columns it selects
+const ORDERED: &str = " ORDER BY k, ti, ui, si";
 
 /// The FROMs of three sources, the side third or second, with its ON
 /// holding a subquery or not
@@ -142,7 +147,8 @@ const FROMS: &[&str] = &[
 const FIRST: &[&str] = &["", "LEFT"];
 const SECOND: &[&str] = &["", "LEFT", "RIGHT", "FULL"];
 
-/// The rows of `sql` as sorted text, or the error
+/// The rows of `sql` as text, sorted unless the statement orders them, or
+/// the error
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -158,7 +164,9 @@ fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
                 .join("|"),
         );
     }
-    out.sort();
+    if !sql.contains(" ORDER BY ") {
+        out.sort();
+    }
     Ok(out)
 }
 
@@ -172,9 +180,13 @@ fn prepared_line(db: &Database, sql: &str) -> String {
 }
 
 /// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it
+/// general path answers it, in the order an ordered shape compares
 fn general(with: &str, sql: &str) -> String {
-    format!("{with}SELECT * FROM ({sql}) AS general")
+    let order = match sql.contains(" ORDER BY ") {
+        true => ORDERED,
+        false => "",
+    };
+    format!("{with}SELECT * FROM ({sql}) AS general{order}")
 }
 
 /// Every statement of `sqls`, `{with}` before it, answers as the general
@@ -311,4 +323,96 @@ fn a_joined_side_named_only_by_its_run_stays_on_the_general_path() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+#[test]
+fn a_subquery_in_a_branch_no_joined_row_takes_is_never_read() {
+    use stoolap::test_failpoints::random_draws;
+    let _guard = serial();
+    let db = hot("branch");
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT t.id FROM t LEFT JOIN u ON u.id = t.a \
+         WHERE CASE WHEN t.id + COALESCE(u.id, 0) > 0 THEN TRUE ELSE (SELECT RANDOM()) > 2 END",
+        "SELECT t.id FROM t LEFT JOIN u ON u.id = t.a JOIN r ON r.id = t.a \
+         WHERE CASE WHEN t.id + COALESCE(u.id, 0) > 0 THEN TRUE ELSE (SELECT RANDOM()) > 2 END",
+        "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id \
+         WHERE t.id > 0 OR u.x > (SELECT RANDOM() * 100)",
+        "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id \
+         WHERE CASE WHEN t.id > 0 THEN TRUE ELSE u.x IN (SELECT RANDOM() FROM w) END",
+    ] {
+        let before = random_draws();
+        let rows = answer(&db, sql).map(|rows| rows.len());
+        let drawn = random_draws() - before;
+        if drawn != 0 || rows.is_err() {
+            wrong.push(format!("{sql}: {rows:?} rows, {drawn} draws, want none"));
+        }
+        if prepared_line(&db, sql) != "Prepared: yes" {
+            wrong.push(format!("{sql}: not prepared"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_joined_side_whose_columns_change_after_preparing_is_refused_or_read_anew() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use stoolap::test_failpoints::{after_join_index_chosen, reset_all};
+    let _guard = serial();
+    let db = Database::open("memory://join_nested_sides_renamed").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 1)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO u VALUES (1, 10, 20)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "INSERT INTO r VALUES (1)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO w VALUES (1, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = t.a \
+               WHERE EXISTS (SELECT 1 FROM w WHERE w.k = u.x) LIMIT 10";
+    assert_eq!(
+        answer(&db, sql),
+        Ok(Vec::new()),
+        "u.x is 10 before the renames"
+    );
+    let (other, reader) = (db.clone(), db.clone());
+    let fired = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&fired);
+    let got = std::thread::spawn(move || {
+        after_join_index_chosen(move || {
+            for rename in [
+                "ALTER TABLE u RENAME COLUMN x TO z",
+                "ALTER TABLE u RENAME COLUMN y TO x",
+                "ALTER TABLE u RENAME COLUMN z TO y",
+            ] {
+                other.execute(rename, ()).unwrap();
+            }
+            seen.store(true, Ordering::SeqCst);
+        });
+        let got = reader
+            .query(sql, ())
+            .map(|rows| {
+                rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string());
+        reset_all();
+        got
+    })
+    .join()
+    .unwrap();
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the renames ran mid-statement"
+    );
+    // u.x is now the 20 that was y: the statement reads that, or refuses
+    match &got {
+        Ok(ids) => assert_eq!(ids, &[1], "read with the old layout"),
+        Err(e) => assert!(e.contains("schema changed"), "{e}"),
+    }
 }
