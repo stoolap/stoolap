@@ -99,6 +99,21 @@ fn a_concatenation_of_parameters_is_joined_once_per_execution() {
 }
 
 #[test]
+fn a_runner_binds_only_the_outputs_a_run_binds() {
+    let db = open("projection_alloc_runner_slots");
+    let wide = allocations(
+        &db,
+        "SELECT id, s, id, s, id, s, id, s, (SELECT 1) FROM t",
+        &[],
+    );
+    let narrow = allocations(&db, "SELECT id, (SELECT 1) FROM t", &[]);
+    assert_eq!(
+        wide, narrow,
+        "nine outputs with one block allocate as two with one"
+    );
+}
+
+#[test]
 fn a_short_concatenation_of_many_parts_allocates_nothing_per_row() {
     let db = open("projection_alloc_parts");
     let parts = allocations(
