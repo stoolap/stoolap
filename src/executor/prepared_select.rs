@@ -6405,6 +6405,9 @@ pub(crate) struct JoinBlocks {
     fitted: [std::sync::OnceLock<CompactArc<Schema>>; 2],
     /// Whether each side is read whole as rows, not scanned as a table
     pub(crate) rows_sides: [bool; 2],
+    /// The conditions on a side read as rows that ask a block of each row,
+    /// asked of the joined row with the WHERE's others there
+    pub(crate) moved: Option<Expression>,
     /// Each SELECT item and ORDER BY key holding a subquery, over the joined row
     pub(crate) select: Vec<Option<Expression>>,
     pub(crate) order_by: Vec<Option<Expression>>,
@@ -6455,15 +6458,16 @@ impl JoinBlocks {
         })
     }
 
-    /// `on`, `cross`, the conditions on one side, `side_filters`, and the
-    /// SELECT items and ORDER BY keys holding a subquery, `output`, over the
-    /// joined row of `sides`, each a name, its columns' schema and whether it
-    /// is read as rows; None when the join's `width` columns do not line up
+    /// `on`, `inner_on` when it is an INNER join's, `cross`, the conditions on
+    /// one side, `side_filters`, and the SELECT items and ORDER BY keys
+    /// holding a subquery, `output`, over the joined row of `sides`, each a
+    /// name, its columns' schema and whether it is read as rows; None when
+    /// the join's `width` columns do not line up
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
-        on: Option<&Expression>,
+        (on, inner_on): (Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 2],
@@ -6487,13 +6491,54 @@ impl JoinBlocks {
             max_param: 0,
             keeps_holes: false,
         };
+        // A side read as rows keeps the conditions its read asks: those
+        // without a block, which the read takes, and those whose blocks bind
+        // before its first row; one that asks a block of each row is asked
+        // of the joined row
+        let mut kept: [Option<Expression>; 2] = [None, None];
+        let mut moved = Vec::new();
+        for (i, filter) in side_filters.into_iter().enumerate() {
+            let Some(filter) = filter else {
+                continue;
+            };
+            if !rows_sides[i] {
+                kept[i] = Some(filter.clone());
+                continue;
+            }
+            let side = ScopeTable::of(sides[i].0.clone(), sides[i].1);
+            let side_scopes = [&side];
+            let side_chain = Chain {
+                scopes: &side_scopes,
+            };
+            let (mut parts, mut binds) = (Vec::new(), Vec::new());
+            conjuncts(filter, &mut parts);
+            for part in parts.into_iter().filter(|part| mentions_subquery(part)) {
+                match builder.binds_before_rows(&side_chain, sides[i].1, part)? {
+                    true => binds.push(part.clone()),
+                    false => moved.push(part.clone()),
+                }
+            }
+            kept[i] = conjunction(binds);
+        }
+        let side_filters = [kept[0].as_ref(), kept[1].as_ref()];
+        // An INNER join's ON asks them of each pair, as its WHERE would, so a
+        // join that stops at its LIMIT still does; another join's WHERE does
+        let moved = conjunction(moved);
+        let with_moved = |clause: Option<&Expression>, moved: &Expression| {
+            conjunction(clause.cloned().into_iter().chain([moved.clone()]).collect())
+        };
+        let (on, cross) = match moved.as_ref() {
+            Some(moved) if inner_on => (with_moved(on, moved), cross.cloned()),
+            Some(moved) => (on.cloned(), with_moved(cross, moved)),
+            None => (on.cloned(), cross.cloned()),
+        };
         let mut rewrite = |clause: Option<&Expression>| {
             clause
                 .map(|clause| builder.rewrite(&chain, None, clause, &mut Rewritten::default()))
                 .transpose()
         };
-        let on = rewrite(on)?;
-        let cross = rewrite(cross)?;
+        let on = rewrite(on.as_ref())?;
+        let cross = rewrite(cross.as_ref())?;
         // An uncorrelated value the output reads is a run slot, read once
         // before the join reads a row
         let mut run_slots = Vec::new();
@@ -6608,6 +6653,7 @@ impl JoinBlocks {
             side_columns,
             fitted: Default::default(),
             rows_sides,
+            moved,
             select,
             order_by,
             ahead,
@@ -6729,7 +6775,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_join_blocks(
         &self,
-        on: Option<&Expression>,
+        on: (Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 2],
@@ -6877,10 +6923,9 @@ impl Executor {
         )))
     }
 
-    /// `result`, side `expr` as the general path read it, side `side` of the
-    /// join `held` prepared, cut to the rows its conditions on that side and
-    /// the `extra` ones pass: as it is read, or read whole first when a
-    /// condition asks a block of each row
+    /// `result`, side `expr` as the general path read it with its conditions
+    /// without a block, side `side` of the join `held` prepared, cut to the
+    /// rows its conditions with a block pass
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn join_source_side_rows(
         &self,
@@ -6889,39 +6934,27 @@ impl Executor {
         side: usize,
         (expr, result): (&Expression, Box<dyn crate::storage::traits::QueryResult>),
         ctx: &ExecutionContext,
-        extra: Option<&Expression>,
     ) -> Result<Box<dyn crate::storage::traits::QueryResult>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
         let alias = get_table_alias_from_expr(expr).unwrap_or_default();
-        let alias = alias.as_str();
         let columns = CompactArc::new(result.columns().to_vec());
-        held.rows_fit(side, alias, &columns)?;
+        held.rows_fit(side, &alias, &columns)?;
         // A side with no condition of its own passes on as the join reads it
         let Some(where_) = &held.side_wheres[side] else {
             return Ok(result);
         };
-        let extra = extra.map(|extra| strip_table_qualifier(extra, alias));
-        let filter = extra
-            .as_ref()
-            .map(|extra| RowFilter::new(extra, &columns).map(|f| f.with_context(ctx)))
-            .transpose()?;
-        // Conditions that ask no block of a row pass on as the join reads it,
-        // as a table side's do
+        // Its conditions bind before its first row, so they pass its rows
+        // as they come, as a table side's scan does
         if let Some(bound) = run.bound_program(&where_.program) {
             let mut own = RowFilter::from_program(bound).with_context(ctx);
             // The values the run computed once sit past the statement's own
             if run.base.len() > ctx.params().len() {
                 own = own.with_params(CompactArc::new(run.base.clone()));
             }
-            let result: Box<dyn crate::storage::traits::QueryResult> =
-                Box::new(FilteredResult::from_filter(result, own));
-            return Ok(match filter {
-                Some(filter) => Box::new(FilteredResult::from_filter(result, filter)),
-                None => result,
-            });
+            return Ok(Box::new(FilteredResult::from_filter(result, own)));
         }
-        // Streamed, as a side's rows are read once and kept only when they pass
+        // A set whose read failed leaves its error with the row that needs it
         let mut result = result;
         let mut id = 0i64;
         let source = std::iter::from_fn(|| {
@@ -6930,16 +6963,16 @@ impl Executor {
                 (id - 1, result.take_row())
             })
         });
-        let mut kept = SideKeep::new(filter.as_ref(), 0, None);
-        let keep = |id: i64, _: u64, row: Row| kept.keep(id, row);
+        let mut rows = RowVec::new();
+        let keep = |id: i64, _: u64, row: Row| {
+            rows.push((id, row));
+            true
+        };
         run.rows_passing(where_, source.into_iter().map(Ok), ctx, None, keep)?;
         if let Some(err) = result.last_error() {
             return Err(err);
         }
-        Ok(Box::new(ExecutorResult::with_arc_columns(
-            columns,
-            kept.rows()?,
-        )))
+        Ok(Box::new(ExecutorResult::with_arc_columns(columns, rows)))
     }
 }
 
@@ -7253,6 +7286,37 @@ fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
     }
 }
 
+/// Whether `expr`, rewritten with its blocks in `blocks`, asks one of them
+/// of each row: any but a member test of an uncorrelated block, whose set a
+/// run reads once
+fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool {
+    let members = |mark: &SelectStatement| {
+        mark.prepared
+            .and_then(|id| blocks.get(usize::from(id))?.as_ref())
+            .is_some_and(|sq| sq.uncorrelated && matches!(sq.answer, Answer::Members(..)))
+    };
+    match expr {
+        Expression::In(in_expr) => match in_expr.right.as_ref() {
+            Expression::ScalarSubquery(mark) => {
+                !members(&mark.subquery) || asks_per_row(&in_expr.left, blocks)
+            }
+            right => asks_per_row(&in_expr.left, blocks) || asks_per_row(right, blocks),
+        },
+        Expression::AllAny(all_any) => {
+            !members(&all_any.subquery) || asks_per_row(&all_any.left, blocks)
+        }
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => true,
+        other => {
+            let mut found = false;
+            let _ = for_each_child(other, &mut |child| {
+                found |= asks_per_row(child, blocks);
+                Ok(())
+            });
+            found
+        }
+    }
+}
+
 fn mentions_subquery(expr: &Expression) -> bool {
     match expr {
         Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => true,
@@ -7323,6 +7387,30 @@ impl Builder<'_> {
             set_tests,
             conjuncts,
         })
+    }
+
+    /// Whether `conjunct`, a condition on the one table of `chain` over
+    /// `schema`, binds to what a run reads before the table's first row: its
+    /// values run slots and its member tests an uncorrelated block's sets.
+    /// Tried as the WHERE prepares it, and given back
+    fn binds_before_rows(
+        &mut self,
+        chain: &Chain<'_>,
+        schema: &Schema,
+        conjunct: &Expression,
+    ) -> Result<bool> {
+        let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
+        let parts = self.statement_where(
+            chain,
+            schema,
+            conjunct,
+            &mut Rewritten::default(),
+            &mut Vec::new(),
+        );
+        let binds = parts.map(|parts| !asks_per_row(&parts.clause, &self.subqueries));
+        self.next_slot = next_slot;
+        self.subqueries.truncate(blocks);
+        binds
     }
 
     /// A top-level conjunct of the statement's WHERE. The value a column

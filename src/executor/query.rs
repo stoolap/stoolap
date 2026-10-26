@@ -5119,6 +5119,16 @@ impl Executor {
             && !Self::has_correlated_select_subqueries(&stmt.columns)
     }
 
+    /// Whether the join's ON is an INNER join's written one, which a WHERE
+    /// condition may join without changing what it answers
+    fn inner_on(join_source: &JoinTableSource, join_type: &str) -> bool {
+        join_source.condition.is_some()
+            && join_source.using_columns.is_empty()
+            && !["LEFT", "RIGHT", "FULL", "NATURAL", "CROSS"]
+                .iter()
+                .any(|kind| join_type.contains(kind))
+    }
+
     /// Whether a join of two sources with a subquery in a clause keeps its
     /// plan, its CTEs bound or inlined, so its blocks may run; a join whose
     /// LIMIT the CTE path cuts into a CTE it does not inline, or with a CTE
@@ -5408,7 +5418,7 @@ impl Executor {
                 .map(|ob| Some(&ob.expression).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
             self.prepare_join_blocks(
-                on,
+                (on, Self::inner_on(join_source, join_type)),
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
                 [&select, &keys],
@@ -5641,6 +5651,42 @@ impl Executor {
             )?,
             false => None,
         };
+        // A side read as rows reads its conditions without a block; the
+        // blocks ask those of its others that bind as it is read, and the
+        // rest of the joined row with the WHERE's conditions on both sides
+        let rows_sides = blocks.as_deref().map_or([false; 2], |held| held.rows_sides);
+        let plain = |filter: &Option<Expression>, rows: bool| match rows {
+            true => filter.as_ref().and_then(|filter| {
+                combine_predicates_with_and(
+                    flatten_and_predicates(filter)
+                        .into_iter()
+                        .filter(|part| !Self::has_subqueries(part))
+                        .collect(),
+                )
+            }),
+            false => None,
+        };
+        let (left_plain, right_plain) = (
+            plain(&left_filter, rows_sides[0]),
+            plain(&right_filter, rows_sides[1]),
+        );
+        // As the blocks prepared them: an INNER join's ON with them, else its
+        // WHERE on the joined row
+        let moved_on;
+        let (on_condition, cross_filter) =
+            match blocks.as_deref().and_then(|held| held.moved.clone()) {
+                Some(moved) if Self::inner_on(join_source, &join_type) => {
+                    moved_on = combine_predicates_with_and(
+                        on_condition.cloned().into_iter().chain([moved]).collect(),
+                    );
+                    (moved_on.as_ref(), cross_filter)
+                }
+                Some(moved) => (
+                    on_condition,
+                    combine_predicates_with_and(cross_filter.into_iter().chain([moved]).collect()),
+                ),
+                None => (on_condition, cross_filter),
+            };
         let blocks_run = match blocks.as_deref() {
             Some(blocks) => Some(self.join_runner(blocks, ctx)?.ok_or_else(|| {
                 Error::internal("a table's columns changed while the statement prepared")
@@ -5652,11 +5698,17 @@ impl Executor {
             _ => None,
         };
         let left_read = SideRead {
-            filter: left_filter.as_ref(),
+            filter: match rows_sides[0] {
+                true => left_plain.as_ref(),
+                false => left_filter.as_ref(),
+            },
             run: statement_run.map(|run| (run, 0)),
         };
         let right_read = SideRead {
-            filter: right_filter.as_ref(),
+            filter: match rows_sides[1] {
+                true => right_plain.as_ref(),
+                false => right_filter.as_ref(),
+            },
             run: statement_run.map(|run| (run, 1)),
         };
         let where_blocks = statement_run.map(|run| run.site(false));
@@ -8715,23 +8767,19 @@ impl Executor {
         offset: usize,
     ) -> Result<OuterFetch> {
         // A side the blocks read as rows is read by the one read below, as the
-        // general path reads it; conditions of its own are asked of its whole
-        // rows after the read
+        // general path reads it, with its conditions without a block; the
+        // ones with a block that it keeps are asked of the rows as they come,
+        // which the read's limit cannot count
         let rows = side
             .run
             .filter(|(run, index)| run.blocks.rows_sides[*index]);
-        let asks = rows.filter(|(run, index)| run.blocks.side_asks(*index));
-        let asked = asks.and(extra);
         let side = match rows {
-            Some(_) => SideRead {
-                filter: None,
-                run: None,
-            },
+            Some(_) => SideRead { run: None, ..side },
             None => side,
         };
-        let (extra, limit, offset) = match asks {
-            Some(_) => (None, None, 0),
-            None => (extra, limit, offset),
+        let (limit, offset) = match rows.filter(|(run, index)| run.blocks.side_asks(*index)) {
+            Some(_) => (None, 0),
+            None => (limit, offset),
         };
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
             let alias = ts.alias.as_ref().unwrap_or(&ts.name).value.as_str();
@@ -8767,7 +8815,7 @@ impl Executor {
         if let Some((run, index)) = rows {
             let (result, columns, bounded, _) = fetched;
             let result =
-                self.join_source_side_rows(run.blocks, run.run, index, (expr, result), ctx, asked)?;
+                self.join_source_side_rows(run.blocks, run.run, index, (expr, result), ctx)?;
             return Ok((result, columns, bounded, None));
         }
         if let Some((run, index)) = side.run {

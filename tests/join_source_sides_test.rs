@@ -297,6 +297,11 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
              WHERE t.b > (SELECT MIN(x) FROM w) LIMIT 15",
             "SELECT s.id, t.id FROM {s} JOIN t ON t.id = s.x \
              WHERE s.id IN (SELECT x FROM w) LIMIT 1",
+            "SELECT s.id FROM {s} JOIN t ON t.a = s.id \
+             WHERE s.id > 0 OR s.id = (SELECT MIN(x) FROM w) LIMIT 1",
+            "SELECT s.id FROM {s} JOIN t ON t.a = s.id \
+             WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) LIMIT 1",
+            "SELECT s.id, (SELECT 1) FROM {s} JOIN t ON t.a = s.id WHERE s.id = 3 LIMIT 1",
         ] {
             let sql = format!("{with}{}", shape.replace("{s}", side));
             let reference = format!("{with}{}", general(&shape.replace("{s}", side)));
@@ -317,6 +322,14 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
          JOIN t ON t.a = s.id LIMIT 1",
         "SELECT s.id, t.id FROM generate_series(1, 100000) AS s (id) JOIN t ON t.a = s.id \
          WHERE s.id IN (SELECT x FROM w) LIMIT 1",
+        "SELECT s.id, (SELECT 1) FROM generate_series(1, 1000000) AS s (id) \
+         JOIN t ON t.a = s.id WHERE s.id = 1 LIMIT 1",
+        "SELECT s.id, (SELECT 1) FROM generate_series(1, 1000000) AS s (id) \
+         JOIN t ON t.a = s.id WHERE s.id BETWEEN 2 AND 4 LIMIT 1",
+        "SELECT s.id FROM generate_series(1, 100000) AS s (id) JOIN t ON t.a = s.id \
+         WHERE s.id > 0 OR s.id = (SELECT MIN(x) FROM w) LIMIT 1",
+        "SELECT s.id FROM generate_series(1, 100000) AS s (id) JOIN t ON t.a = s.id \
+         WHERE s.id < 10 AND EXISTS (SELECT 1 FROM w WHERE w.x = s.id) LIMIT 1",
     ] {
         let (got, want) = (generated(series), generated(&general(series)));
         if got.0 != want.0 || got.1 > want.1 {
