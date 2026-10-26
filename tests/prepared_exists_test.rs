@@ -341,6 +341,76 @@ fn test_the_rule_probes_for_few_outer_rows_or_a_small_limit_on_an_index() {
 }
 
 #[test]
+fn test_a_row_its_keys_named_is_not_asked_the_exists_again() {
+    let _guard = serial();
+    let db = setup("named_rows");
+    let exists = "EXISTS (SELECT 1 FROM u WHERE u.k = t.k)";
+    for (sql, expected) in [
+        (
+            format!("SELECT id FROM t WHERE s <> 'z' AND {exists} ORDER BY id"),
+            vec![1, 2, 4],
+        ),
+        (
+            format!("SELECT id FROM t WHERE LENGTH(s) = 1 AND {exists} ORDER BY id"),
+            vec![1, 2, 4],
+        ),
+        (
+            format!("SELECT id FROM t WHERE {exists} AND id > 1 ORDER BY id"),
+            vec![2, 4],
+        ),
+    ] {
+        let narrowed = prepared_rows_narrowed();
+        let (_, _, lookups) = prepared_exists_counts();
+        assert_eq!(ids(&db, &sql), expected, "{sql}");
+        assert!(
+            prepared_rows_narrowed() > narrowed,
+            "{sql} read no row by the keys"
+        );
+        assert_eq!(
+            prepared_exists_counts().2,
+            lookups,
+            "{sql} asked a named row the EXISTS"
+        );
+    }
+    // A key that raised an error leaves each named row to the whole WHERE
+    let raising = "SELECT id FROM t WHERE s <> 'z' AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k \
+         AND u.d * 9223372036854775807 > 0) ORDER BY id";
+    assert!(fails(&db, raising), "{raising}");
+}
+
+#[test]
+fn test_every_where_program_reads_a_value_as_the_column_it_is_compared_with() {
+    let _guard = serial();
+    let db = Database::open("memory://residual_read_as").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN)",
+        "INSERT INTO t VALUES (1, NULL), (2, TRUE)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT)",
+        "INSERT INTO u VALUES (1, 'bad'), (2, 'true')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let test = "b IS NOT DISTINCT FROM (SELECT s FROM u WHERE u.id = t.id)";
+    let plain = format!("SELECT id FROM t WHERE {test} ORDER BY id");
+    let expected = ids(&db, &plain);
+    assert_eq!(expected, vec![1, 2], "{plain}");
+    for sql in [
+        format!("SELECT id FROM t WHERE id > 0 AND {test} ORDER BY id"),
+        format!(
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND {test} \
+             ORDER BY id"
+        ),
+        format!(
+            "SELECT id FROM t WHERE id > 0 AND EXISTS (SELECT 1 FROM u WHERE u.id = t.id) \
+             AND {test} ORDER BY id"
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+        assert_eq!(ids(&db, &sql), expected, "{sql}");
+    }
+}
+
+#[test]
 fn test_a_keyed_outcome_uses_at_most_one_word() {
     let bytes = std::mem::size_of::<stoolap::executor::context::ExistsOutcome>();
     assert!(

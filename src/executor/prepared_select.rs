@@ -2263,6 +2263,14 @@ fn conjunction(parts: Vec<Expression>) -> Option<Expression> {
     })
 }
 
+/// The condition every row passes
+fn true_literal() -> Expression {
+    Expression::BooleanLiteral(BooleanLiteral {
+        token: Token::new(TokenType::Keyword, "TRUE", Position::default()),
+        value: true,
+    })
+}
+
 fn slot_parameter(slot: usize) -> Expression {
     let name = format!("${}", slot + 1);
     Expression::Parameter(Parameter {
@@ -2570,7 +2578,16 @@ struct PreparedBlocks {
 /// takes, and the rows a set test's keys may narrow it to
 #[derive(Debug)]
 struct PreparedWhere {
-    program: SharedProgram,
+    whole: WhereProgram,
+    /// What a row the scan read is still asked when the scan took
+    /// `pushdown` whole: the conjuncts outside it
+    scanned: Option<WhereProgram>,
+    /// What a row the narrowing named is still asked when the narrowing's
+    /// keys raised no error: the WHERE without the narrowing's conjunct
+    narrowed: Option<WhereProgram>,
+    /// `narrowed` without the conjuncts `pushdown` holds, for a named row
+    /// the scan's filter passed when it took `pushdown` whole
+    narrowed_scanned: Option<WhereProgram>,
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
@@ -2584,10 +2601,65 @@ struct PreparedWhere {
     /// How many conjuncts `pushdown` holds, of the WHERE's `conjuncts`
     pushed: usize,
     conjuncts: usize,
-    /// Whether the program asks an uncorrelated block, and whether it loads
-    /// a parameter or asks one, which a run may bind it to
-    asks_blocks: bool,
+}
+
+/// A program over the statement's row, with whether a run binds it: it
+/// loads a parameter or asks an uncorrelated block, and binding can
+/// shrink it
+#[derive(Debug)]
+struct WhereProgram {
+    program: SharedProgram,
     binds: bool,
+    /// Which of the WHERE's programs it is, the run's bound copy's place
+    rest: WhereRest,
+}
+
+impl WhereProgram {
+    fn of(program: SharedProgram, rest: WhereRest, blocks: &PreparedBlocks) -> Self {
+        let asks_blocks = program.ops().iter().any(|op| match *op {
+            Op::ExecScalarSubquery(id)
+            | Op::ExecExists(id)
+            | Op::ExecInSubquery(id)
+            | Op::ExecQuantified(id, ..) => blocks
+                .subqueries
+                .get(id as usize)
+                .is_some_and(|sq| sq.uncorrelated),
+            _ => false,
+        });
+        let loads = asks_blocks
+            || program
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::LoadParam(_)));
+        let binds = loads && (asks_blocks || !program.bind_never_shrinks());
+        Self {
+            program,
+            binds,
+            rest,
+        }
+    }
+}
+
+/// Which of a prepared WHERE's programs a row is asked
+#[derive(Debug, Clone, Copy)]
+enum WhereRest {
+    Whole,
+    Scanned,
+    Narrowed,
+    NarrowedScanned,
+}
+
+impl PreparedWhere {
+    /// The program `rest` names, the whole WHERE when there is none
+    fn rest(&self, rest: WhereRest) -> &WhereProgram {
+        let program = match rest {
+            WhereRest::Whole => None,
+            WhereRest::Scanned => self.scanned.as_ref(),
+            WhereRest::Narrowed => self.narrowed.as_ref(),
+            WhereRest::NarrowedScanned => self.narrowed_scanned.as_ref(),
+        };
+        program.unwrap_or(&self.whole)
+    }
 }
 
 /// `column [NOT] IN (block)` or `column op ANY|ALL (block)` at the top of
@@ -2600,8 +2672,9 @@ struct SetSlot {
 }
 
 /// The filter a scan of a prepared WHERE takes, whether it is the whole
-/// WHERE, and whether it takes the extra conditions whole
-type WhereScan = (Option<Box<dyn StorageExpr>>, bool, bool);
+/// WHERE, whether it takes the extra conditions whole, and which program
+/// a row it reads is still asked
+type WhereScan = (Option<Box<dyn StorageExpr>>, bool, bool, WhereRest);
 
 /// What a set slot's members make of its conjunct for one run
 enum SetScan {
@@ -2636,42 +2709,99 @@ enum Passing {
 struct WhereParts {
     clause: Expression,
     pushed: Vec<Expression>,
-    /// Each top-level EXISTS or IN test: its block, whether negated, and
-    /// the statement column an IN tests
-    set_tests: Vec<(u16, bool, Option<usize>)>,
+    /// The clause without the pushed conjuncts, when some are pushed and
+    /// some are not
+    scanned: Option<Expression>,
+    /// For each set test, the clause without it, and without the pushed
+    /// conjuncts too when some are pushed
+    narrowed: Vec<(Expression, Option<Expression>)>,
+    /// Each top-level EXISTS or IN test: its block, whether negated, the
+    /// statement column an IN tests, and its conjunct's position
+    set_tests: Vec<(u16, bool, Option<usize>, usize)>,
     conjuncts: usize,
 }
 
+/// A WHERE's programs: the whole one, the one without the pushed
+/// conjuncts when some are pushed and some are not, and for each set test
+/// the one without the test, and without the pushed conjuncts too when
+/// some are pushed
+struct WherePrograms {
+    whole: SharedProgram,
+    scanned: Option<SharedProgram>,
+    narrowed: Vec<(SharedProgram, Option<SharedProgram>)>,
+}
+
 impl WhereParts {
-    /// The WHERE as `program`, narrowed by the first set test whose block
+    /// The WHERE's programs, each compiled by `compile`
+    fn programs(
+        &self,
+        compile: impl Fn(&Expression) -> Result<SharedProgram>,
+    ) -> Result<WherePrograms> {
+        let optional = |clause: &Option<Expression>| clause.as_ref().map(&compile).transpose();
+        let narrowed = self
+            .narrowed
+            .iter()
+            .map(|(clause, scanned)| Ok((compile(clause)?, optional(scanned)?)))
+            .collect::<Result<_>>()?;
+        Ok(WherePrograms {
+            whole: compile(&self.clause)?,
+            scanned: optional(&self.scanned)?,
+            narrowed,
+        })
+    }
+
+    /// Each value a clause of the WHERE compares with a column of `schema`,
+    /// read as the scan reads it, by node address
+    fn read_as(&self, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
+        let narrowed = self
+            .narrowed
+            .iter()
+            .flat_map(|(clause, scanned)| std::iter::once(clause).chain(scanned));
+        for clause in std::iter::once(&self.clause)
+            .chain(&self.scanned)
+            .chain(narrowed)
+        {
+            compare_as_scan(clause, schema, out);
+        }
+    }
+
+    /// The WHERE as `programs`, narrowed by the first set test whose block
     /// in `blocks` can name its rows
-    fn prepare(self, program: SharedProgram, blocks: &PreparedBlocks) -> PreparedWhere {
+    fn prepare(self, programs: WherePrograms, blocks: &PreparedBlocks) -> PreparedWhere {
         let whole = self.conjuncts == 1;
-        let narrowing = self.set_tests.iter().find_map(|&(id, negated, column)| {
-            let sq = &blocks.subqueries[id as usize];
-            let (column, members) = match (&sq.answer, column) {
-                (
-                    Answer::Exists(Kept {
-                        keyed: Some(plan), ..
-                    }),
-                    None,
-                ) if plan.keys.len() == 1 => (plan.keys[0].2, false),
-                (Answer::Members(_, members), Some(column))
-                    if sq.uncorrelated && members.test == MemberTest::In =>
-                {
-                    (column, true)
-                }
-                _ => return None,
-            };
-            Some(Narrowing {
-                id,
-                column,
-                whole,
-                negated,
-                members,
-            })
-        });
-        let slot = |&(id, negated, column): &(u16, bool, Option<usize>)| {
+        let narrowing_test =
+            self.set_tests
+                .iter()
+                .enumerate()
+                .find_map(|(at, &(id, negated, column, _))| {
+                    let sq = &blocks.subqueries[id as usize];
+                    let (column, members) = match (&sq.answer, column) {
+                        (
+                            Answer::Exists(Kept {
+                                keyed: Some(plan), ..
+                            }),
+                            None,
+                        ) if plan.keys.len() == 1 => (plan.keys[0].2, false),
+                        (Answer::Members(_, members), Some(column))
+                            if sq.uncorrelated && members.test == MemberTest::In =>
+                        {
+                            (column, true)
+                        }
+                        _ => return None,
+                    };
+                    Some((
+                        at,
+                        Narrowing {
+                            id,
+                            column,
+                            whole,
+                            negated,
+                            members,
+                        },
+                    ))
+                });
+        let narrowing = narrowing_test.map(|(_, narrowing)| narrowing);
+        let slot = |&(id, negated, column, _): &(u16, bool, Option<usize>, usize)| {
             let sq = &blocks.subqueries[id as usize];
             let column = column.filter(|_| sq.uncorrelated)?;
             matches!(sq.answer, Answer::Members(..)).then_some(SetSlot {
@@ -2694,25 +2824,21 @@ impl WhereParts {
             .iter()
             .filter(|test| narrowed(test.0))
             .find_map(slot);
-        let asks_blocks = program.ops().iter().any(|op| match *op {
-            Op::ExecScalarSubquery(id)
-            | Op::ExecExists(id)
-            | Op::ExecInSubquery(id)
-            | Op::ExecQuantified(id, ..) => blocks
-                .subqueries
-                .get(id as usize)
-                .is_some_and(|sq| sq.uncorrelated),
-            _ => false,
-        });
-        let binds = asks_blocks
-            || program
-                .ops()
-                .iter()
-                .any(|op| matches!(op, Op::LoadParam(_)));
+        let (narrowed_program, narrowed_scanned) = narrowing_test
+            .and_then(|(at, _)| programs.narrowed.get(at).cloned())
+            .map_or((None, None), |(program, scanned)| {
+                (
+                    Some(WhereProgram::of(program, WhereRest::Narrowed, blocks)),
+                    scanned.map(|p| WhereProgram::of(p, WhereRest::NarrowedScanned, blocks)),
+                )
+            });
         PreparedWhere {
-            program,
-            asks_blocks,
-            binds,
+            whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
+            scanned: programs
+                .scanned
+                .map(|program| WhereProgram::of(program, WhereRest::Scanned, blocks)),
+            narrowed: narrowed_program,
+            narrowed_scanned,
             pushed: self.pushed.len(),
             conjuncts: self.conjuncts,
             pushdown: conjunction(self.pushed),
@@ -5382,11 +5508,10 @@ impl PreparedSelect {
             }
             // No conjunct: the scan reads every row with no filter, and takes it whole
             None => WhereParts {
-                clause: Expression::BooleanLiteral(BooleanLiteral {
-                    token: Token::new(TokenType::Keyword, "TRUE", Position::default()),
-                    value: true,
-                }),
+                clause: true_literal(),
                 pushed: Vec::new(),
+                scanned: None,
+                narrowed: Vec::new(),
                 set_tests: Vec::new(),
                 conjuncts: 0,
             },
@@ -5434,12 +5559,12 @@ impl PreparedSelect {
             .collect::<Result<Vec<_>>>()?;
         let output_blocks = first_output_block..builder.subqueries.len();
         let mut read_as = FxHashMap::default();
-        compare_as_scan(&parts.clause, schema, &mut read_as);
+        parts.read_as(schema, &mut read_as);
         let own = CompileContext::new(&scope.columns, registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Expression| compile_with(&own, expr);
-        let where_program = compile(&parts.clause)?;
+        let where_programs = parts.programs(compile)?;
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile(value).map(|p| (*slot, p)))
@@ -5496,7 +5621,7 @@ impl PreparedSelect {
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
         });
-        let where_ = parts.prepare(where_program, &blocks);
+        let where_ = parts.prepare(where_programs, &blocks);
         Ok(Self {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
@@ -5882,14 +6007,14 @@ impl PreparedGrouped {
             .collect::<Result<Vec<_>>>()?;
         let mut read_as = FxHashMap::default();
         if let Some(parts) = &where_parts {
-            compare_as_scan(&parts.clause, &schema, &mut read_as);
+            parts.read_as(&schema, &mut read_as);
         }
         let own = CompileContext::new(&scope.columns, &executor.function_registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let where_program = where_parts
             .as_ref()
-            .map(|parts| compile_with(&own, &parts.clause))
+            .map(|parts| parts.programs(|expr| compile_with(&own, expr)))
             .transpose()?;
         let (blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
         let where_clause = where_parts.as_ref().map(|parts| parts.clause.clone());
@@ -6508,14 +6633,14 @@ impl PreparedDml {
         }
         let mut read_as = FxHashMap::default();
         if let Some(parts) = &where_parts {
-            compare_as_scan(&parts.clause, schema, &mut read_as);
+            parts.read_as(schema, &mut read_as);
         }
         let own = CompileContext::new(&scope.columns, &executor.function_registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let where_program = where_parts
             .as_ref()
-            .map(|parts| compile_with(&own, &parts.clause))
+            .map(|parts| parts.programs(|expr| compile_with(&own, expr)))
             .transpose()?;
         let sets = sets
             .iter()
@@ -6793,11 +6918,11 @@ impl JoinBlocks {
                 &mut run_slots,
             )?;
             let mut read_as = FxHashMap::default();
-            compare_as_scan(&parts.clause, schema, &mut read_as);
+            parts.read_as(schema, &mut read_as);
             let own = CompileContext::new(&side.columns, registry)
                 .with_prepared_subqueries()
                 .with_read_as(&read_as);
-            let program = compile_with(&own, &parts.clause)?;
+            let program = parts.programs(|expr| compile_with(&own, expr))?;
             let offset = if i == 0 { 0 } else { left_width };
             let joined_clause = in_joined(&parts.clause, &side, &scope, offset)?;
             side_parts[i] = Some((parts, program, joined_clause));
@@ -7055,7 +7180,7 @@ impl Executor {
         Ok(
             match run.where_scan(where_, None, where_.narrowing_set, table, ctx)? {
                 None => Some(Some(Box::new(ConstBoolExpr::new(false)))),
-                Some((filter, true, _)) => Some(filter),
+                Some((filter, true, ..)) => Some(filter),
                 Some(_) => None,
             },
         )
@@ -7160,7 +7285,7 @@ impl Executor {
         };
         // Its conditions bind before its first row, so they pass its rows
         // as they come, as a table side's scan does
-        if let Some(bound) = run.bound_reading(&where_.program) {
+        if let Some(bound) = run.bound_reading(&where_.whole.program) {
             let mut own = RowFilter::from_program(bound).with_context(ctx);
             // The values the run computed once sit past the statement's own
             if run.base.len() > ctx.params().len() {
@@ -7310,7 +7435,7 @@ impl<'a> DmlRunner<'a> {
     /// statement without one
     pub(crate) fn matches(&self, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<bool> {
         match &self.prepared.where_ {
-            Some(where_) => self.runner.passes(vm, where_, exec),
+            Some(where_) => self.runner.passes(vm, &where_.whole, exec),
             None => Ok(true),
         }
     }
@@ -7566,9 +7691,11 @@ impl Builder<'_> {
         let mut rewritten = Vec::with_capacity(parts.len());
         let mut pushed = Vec::new();
         let mut set_tests = Vec::new();
-        for part in parts {
+        for (at, part) in parts.into_iter().enumerate() {
             let part = self.statement_conjunct(chain, part, work, run_slots)?;
-            if !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema) {
+            let scanned =
+                !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema);
+            if scanned {
                 pushed.push(part.clone());
             }
             let set_test = match &part {
@@ -7592,16 +7719,40 @@ impl Builder<'_> {
                 _ => None,
             };
             if let Some((mark, negated, column)) = set_test {
-                set_tests.extend(mark.prepared.map(|id| (id, negated, column)));
+                set_tests.extend(mark.prepared.map(|id| (id, negated, column, at)));
             }
-            rewritten.push(part);
+            rewritten.push((part, scanned));
         }
         let conjuncts = rewritten.len();
-        let clause = conjunction(rewritten)
+        let clause = conjunction(rewritten.iter().map(|(part, _)| part.clone()).collect())
             .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
+        // The conjuncts the `kept` test keeps; TRUE for none
+        let rest = |kept: &dyn Fn(usize, bool) -> bool| {
+            let parts = rewritten
+                .iter()
+                .enumerate()
+                .filter(|&(i, &(_, pushed))| kept(i, pushed))
+                .map(|(_, (part, _))| part.clone())
+                .collect();
+            conjunction(parts).unwrap_or_else(true_literal)
+        };
+        let scanned = match pushed.len() {
+            0 => None,
+            n if n == conjuncts => None,
+            _ => Some(rest(&|_, pushed| !pushed)),
+        };
+        let narrowed = set_tests
+            .iter()
+            .map(|&(.., at)| {
+                let scanned = (!pushed.is_empty()).then(|| rest(&|i, pushed| i != at && !pushed));
+                (rest(&|i, _| i != at), scanned)
+            })
+            .collect();
         Ok(WhereParts {
             clause,
             pushed,
+            scanned,
+            narrowed,
             set_tests,
             conjuncts,
         })
@@ -8727,9 +8878,9 @@ pub(crate) struct PreparedRunner<'a> {
     tables: BlockTables,
     /// Each subquery's state for this run, by its id
     blocks: Vec<BlockState>,
-    /// The WHERE bound to the run, once a row asks it; boxed, as a larger
-    /// runner costs a point query its move
-    where_bound: OnceCell<Box<RefCell<Bound>>>,
+    /// The WHERE's programs bound to the run, each once a row asks it, by
+    /// [`WhereRest`]; boxed, as a larger runner costs a point query its move
+    where_bound: OnceCell<Box<[OnceCell<RefCell<Bound>>; 4]>>,
 }
 
 /// A statement program bound to its run's parameters and run slots and to
@@ -8972,40 +9123,34 @@ impl<'a> PreparedRunner<'a> {
         vm.execute_bool_checked(condition, &exec)
     }
 
-    /// Whether `row` passes `where_`, see [`Self::passes`]. Out of line: a
+    /// Whether `row` passes `program`, see [`Self::passes`]. Out of line: a
     /// scan loop that builds the context costs a point query its codegen
     #[inline(never)]
-    fn row_passes(&self, vm: &mut ExprVM, where_: &PreparedWhere, row: &Row) -> Result<bool> {
+    fn row_passes(&self, vm: &mut ExprVM, program: &WhereProgram, row: &Row) -> Result<bool> {
         let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
             .with_subquery_executor(self);
-        self.passes(vm, where_, &exec)
+        self.passes(vm, program, &exec)
     }
 
-    /// Whether the row of `exec` passes `where_`, its program bound to what
-    /// the run knows once a row asks it, unless binding cannot shrink it
+    /// Whether the row of `exec` passes `program`, one of a WHERE's, bound
+    /// to what the run knows once a row asks it, unless binding cannot
+    /// shrink it
     fn passes(
         &self,
         vm: &mut ExprVM,
-        where_: &PreparedWhere,
+        program: &WhereProgram,
         exec: &ExecuteContext,
     ) -> Result<bool> {
-        let bound = match self.where_bound.get() {
-            Some(bound) => Some(bound),
-            None if where_.binds
-                && (where_.asks_blocks || !where_.program.bind_never_shrinks()) =>
-            {
-                Some(
-                    self.where_bound
-                        .get_or_init(|| Box::new(RefCell::new(self.bind(&where_.program)))),
-                )
-            }
-            None => None,
-        };
-        match bound.and_then(|bound| bound.try_borrow_mut().ok()) {
-            Some(mut bound) if CompactArc::ptr_eq(&bound.source, &where_.program) => {
+        if !program.binds {
+            return vm.execute_bool_checked(&program.program, exec);
+        }
+        let cell = &self.where_bound.get_or_init(Box::default)[program.rest as usize];
+        let bound = cell.get_or_init(|| RefCell::new(self.bind(&program.program)));
+        match bound.try_borrow_mut() {
+            Ok(mut bound) if CompactArc::ptr_eq(&bound.source, &program.program) => {
                 vm.execute_bool_checked(self.current(&mut bound), exec)
             }
-            _ => vm.execute_bool_checked(&where_.program, exec),
+            _ => vm.execute_bool_checked(&program.program, exec),
         }
     }
 
@@ -9087,7 +9232,12 @@ impl<'a> PreparedRunner<'a> {
         }
         // The scan took the whole WHERE: its rows need no second look
         let scanned_whole = static_whole && taken == where_.conjuncts;
-        Ok(Some((storage_expr, scanned_whole, extra_whole)))
+        // The scan took the pushed conjuncts: its rows need the others only
+        let rest = match where_.pushdown.is_some() && static_whole {
+            true => WhereRest::Scanned,
+            false => WhereRest::Whole,
+        };
+        Ok(Some((storage_expr, scanned_whole, extra_whole, rest)))
     }
 
     /// `storage_expr` with the filters the set conjuncts of `slots` make
@@ -9225,7 +9375,7 @@ impl<'a> PreparedRunner<'a> {
         if where_.narrowing.is_some() || where_.narrowing_set.is_some() {
             return Ok(None);
         }
-        let Some((storage_expr, scanned_whole, _)) =
+        let Some((storage_expr, scanned_whole, ..)) =
             self.where_scan(where_, None, None, table, ctx)?
         else {
             return Ok(Some(RowVec::new()));
@@ -9270,7 +9420,7 @@ impl<'a> PreparedRunner<'a> {
         stream: bool,
         mut keep: impl FnMut(i64, u64, Row) -> bool,
     ) -> Result<Passing> {
-        let Some((mut storage_expr, mut scanned_whole, mut extra_whole)) =
+        let Some((mut storage_expr, mut scanned_whole, mut extra_whole, mut rest)) =
             self.where_scan(where_, extra, None, table, ctx)?
         else {
             return Ok(Passing::Pruned);
@@ -9286,12 +9436,20 @@ impl<'a> PreparedRunner<'a> {
         // or the scan, which takes the narrowing's own set when it declined
         let (mut listed, mut scanner, judged, passed) =
             match self.narrowed_rows(where_.narrowing, table, target)? {
-                Some((candidates, passed)) => {
+                Some((candidates, settled)) => {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_rows_narrowed_by_keys(
                         where_.narrowing.is_some_and(|n| n.negated),
                     );
-                    (Some(candidates.into_iter()), None, true, passed)
+                    // A named row needs no second look at the narrowing,
+                    // nor at the pushed conjuncts the scan's filter took
+                    rest = match (settled, rest) {
+                        (true, WhereRest::Scanned) => WhereRest::NarrowedScanned,
+                        (true, _) => WhereRest::Narrowed,
+                        (false, _) => WhereRest::Whole,
+                    };
+                    let whole = where_.narrowing.is_some_and(|n| n.whole);
+                    (Some(candidates.into_iter()), None, true, settled && whole)
                 }
                 None => {
                     if let Some(slot) = where_.narrowing_set {
@@ -9299,7 +9457,7 @@ impl<'a> PreparedRunner<'a> {
                         else {
                             return Ok(Passing::Pruned);
                         };
-                        (storage_expr, scanned_whole, extra_whole) = scan;
+                        (storage_expr, scanned_whole, extra_whole, rest) = scan;
                     }
                     match target.filter(|_| scanned_whole) {
                         Some(target) => {
@@ -9319,7 +9477,8 @@ impl<'a> PreparedRunner<'a> {
                                 return Ok(Passing::Scan(scan));
                             }
                             if stream && extra_whole {
-                                if let Some(bound) = self.bound_program(&where_.program) {
+                                if let Some(bound) = self.bound_program(&where_.rest(rest).program)
+                                {
                                     return Ok(Passing::Filtered(scan, bound));
                                 }
                             }
@@ -9328,6 +9487,7 @@ impl<'a> PreparedRunner<'a> {
                     }
                 }
             };
+        let chosen = where_.rest(rest);
         loop {
             let (id, row) = match (&mut listed, &mut scanner) {
                 (Some(listed), _) => match listed.next() {
@@ -9354,7 +9514,8 @@ impl<'a> PreparedRunner<'a> {
                 Some(Err(_)) => false,
                 Some(Ok(true)) | None => true,
             };
-            if ((passed && taken) || self.row_passes(&mut vm, where_, &row)?)
+            let asked = if taken { chosen } else { &where_.whole };
+            if ((passed && taken) || self.row_passes(&mut vm, asked, &row)?)
                 && !keep(id, scanned, row)
             {
                 break;
@@ -9401,7 +9562,7 @@ impl<'a> PreparedRunner<'a> {
                     .copied()
                     .chain(where_.narrowing_set)
                     .collect();
-                self.with_bound_sets(&where_.program, &slots)
+                self.with_bound_sets(&where_.whole.program, &slots)
             });
             if self.matches(&mut vm, self.current(bound), row.row())?
                 && !keep(id, scanned, row.into_row())
@@ -9415,8 +9576,8 @@ impl<'a> PreparedRunner<'a> {
 
     /// The statement's rows its narrowing EXISTS may pass, read by the keys
     /// of the block's keyed set when the run takes it, and whether each
-    /// passes the WHERE without asking it: the EXISTS is the whole WHERE and
-    /// no key holds an error; None to scan
+    /// passes the narrowing's conjunct without asking it: no key holds an
+    /// error; None to scan
     fn narrowed_rows(
         &self,
         narrowing: Option<Narrowing>,
@@ -9488,7 +9649,7 @@ impl<'a> PreparedRunner<'a> {
             let members = set.outcomes.keys().filter_map(|key| key.first());
             Executor::rows_of_members(table, column, members, target.is_some(), enough)?
         };
-        Ok(rows.map(|rows| (rows, passed)))
+        Ok(rows.map(|rows| (rows, !set.failed)))
     }
 
     /// What fills the block's slots: the calling site's holes for one of
@@ -11047,7 +11208,7 @@ impl PreparedRunner<'_> {
 
     /// The statement's rows an uncorrelated `column IN (b)` or `column NOT
     /// IN (b)` in its top-level AND may pass, read by the block's members,
-    /// and whether each passes without the WHERE. The members are read
+    /// and whether each passes that conjunct. The members are read
     /// before the scan, as a block compared with a column there is; a
     /// member's error leaves the rows to the scan, which raises it
     fn rows_by_members(
@@ -11099,7 +11260,7 @@ impl PreparedRunner<'_> {
             }
             let rows =
                 Executor::rows_without_members(table, name, values, target.filter(|_| whole))?;
-            return Ok(rows.map(|rows| (rows, whole)));
+            return Ok(rows.map(|rows| (rows, true)));
         }
         let rows = Executor::rows_of_members(
             table,
@@ -11108,7 +11269,7 @@ impl PreparedRunner<'_> {
             target.is_some(),
             target.filter(|_| whole),
         )?;
-        Ok(rows.map(|rows| (rows, whole)))
+        Ok(rows.map(|rows| (rows, true)))
     }
 
     /// A keyed IN block's answer to `value` for the buffer filled: no
