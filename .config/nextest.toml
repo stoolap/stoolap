@@ -9,6 +9,7 @@ not (
   test(=storage::mvcc::version_store::tests::test_unique_constraint_performance_bulk_update)
   | test(=storage::index::multi_column::tests::test_prefix_build_and_batch_removal_scale)
   | test(=test_fk_cascade_delete_performance_with_auto_index)
+  | test(=executor::expression::program::tests::binding_a_list_ten_times_longer_takes_about_ten_times_longer)
   | binary(=concurrency_history_test)
   | binary(=volume_concurrency_test)
 )

@@ -163,7 +163,11 @@ impl Program {
                 op => op.clone(),
             })
             .collect();
-        Self::new_unoptimized(ops)
+        Self {
+            binding: self.binding.clone(),
+            bound_from: self.bound_from.clone(),
+            ..Self::new_unoptimized(ops)
+        }
     }
 
     /// This program with each parameter it loads taken from `params`, as the
@@ -240,10 +244,16 @@ impl Program {
         // the first position it stands for
         let mut emitted: SmallVec<[(bool, usize); 16]> = SmallVec::new();
         let mut position_map: SmallVec<[usize; 16]> = SmallVec::new();
+        // Both in position order, as the walk below goes
+        let (mut next_fold, mut next_replaced) = (folded.iter().peekable(), replaced_at.iter());
+        let mut replaced_here = next_replaced.next();
         let mut at = 0;
         while at < source.len() {
             let here = ops.len();
-            let (op, next, known_now) = match folded.iter().find(|(start, ..)| *start == at) {
+            while replaced_here.is_some_and(|&position| position < at) {
+                replaced_here = next_replaced.next();
+            }
+            let (op, next, known_now) = match next_fold.next_if(|(start, ..)| *start == at) {
                 Some((start, end, value)) => {
                     position_map.extend((*start..*end).map(|_| here));
                     (Op::LoadConst(value.clone()), *end, true)
@@ -251,13 +261,14 @@ impl Program {
                 None => {
                     position_map.push(here);
                     let op = std::mem::replace(&mut source[at], Op::Return);
-                    (op, at + 1, replaced_at.contains(&at))
+                    (op, at + 1, replaced_here == Some(&at))
                 }
             };
             let after = source.get(next).map(|op| (next, op));
             if let Some((first, takes_next, taken)) =
                 Self::taken_by(&op, at, after, &ops, &emitted, &targets)
             {
+                let first_position = emitted[first].1;
                 ops.truncate(first);
                 emitted.truncate(first);
                 for position in position_map.iter_mut().rev() {
@@ -267,8 +278,9 @@ impl Program {
                     *position = first;
                 }
                 ops.push(taken);
-                // Built from a value known only now, as a value it is one too
-                emitted.push((true, at));
+                // Built from a value known only now, as a value it is one too,
+                // standing where the first op it took stood
+                emitted.push((true, first_position));
                 if takes_next {
                     position_map.push(first);
                     at = next + 1;
@@ -337,18 +349,38 @@ impl Program {
         replaced: &[usize],
     ) -> SmallVec<[(usize, usize, Value); 2]> {
         let marked = self.binding.as_deref().map_or(&[][..], |b| &b.folds[..]);
+        // `replaced` is in position order
+        let holds_replaced = |start: usize, end: usize| {
+            replaced
+                .get(replaced.partition_point(|&at| at < start))
+                .is_some_and(|&at| at < end)
+        };
         let mut folds: SmallVec<[(usize, usize); 4]> = marked
             .iter()
             .map(|&(start, end)| (usize::from(start), usize::from(end)))
-            .filter(|(start, end)| replaced.iter().any(|at| (*start..*end).contains(at)))
+            .filter(|&(start, end)| holds_replaced(start, end))
             .collect();
-        folds.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
         let mut folded: SmallVec<[(usize, usize, Value); 2]> = SmallVec::new();
+        if folds.is_empty() {
+            return folded;
+        }
+        folds.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+        // Each jump, as where it lands and where it stands, by where it lands
+        let mut jumps: SmallVec<[(usize, usize); 8]> = source
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(at, op)| jump_target(op).map(|target| (usize::from(*target), at)))
+            .collect();
+        jumps.sort_unstable();
         for (start, end) in folds {
-            if folded.iter().any(|(s, e, _)| start >= *s && end <= *e) {
+            // Marked ranges nest, so only the last one folded can hold this one
+            if folded
+                .last()
+                .is_some_and(|(s, e, _)| start >= *s && end <= *e)
+            {
                 continue;
             }
-            let Some(range) = Self::fold_range(source, start, end) else {
+            let Some(range) = Self::fold_range(source, &jumps, start, end) else {
                 continue;
             };
             if let Some(value) = super::compiler::fold_ops(range) {
@@ -361,20 +393,23 @@ impl Program {
     /// The ops of `source[start..end]` as a program of their own, their
     /// jumps moved with them; None when a jump crosses the range's edge
     /// other than into its start or out to its end
-    fn fold_range(source: &mut [Op], start: usize, end: usize) -> Option<Vec<Op>> {
-        let (before, rest) = source.split_at_mut(start);
-        let (inside, after) = rest.split_at_mut(end - start);
-        let entered = before
-            .iter_mut()
-            .chain(after.iter_mut())
-            .filter_map(jump_target)
-            .any(|target| (start + 1..end).contains(&usize::from(*target)));
+    fn fold_range(
+        source: &[Op],
+        jumps: &[(usize, usize)],
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<Op>> {
+        let landing_inside = &jumps[jumps.partition_point(|&(target, _)| target <= start)..];
+        let entered = landing_inside
+            .iter()
+            .take_while(|&&(target, _)| target < end)
+            .any(|&(_, from)| !(start..end).contains(&from));
         if entered {
             return None;
         }
         // Room for the Return the fold ends it with
-        let mut range = Vec::with_capacity(inside.len() + 1);
-        range.extend_from_slice(inside);
+        let mut range = Vec::with_capacity(end - start + 1);
+        range.extend_from_slice(&source[start..end]);
         for target in range.iter_mut().filter_map(jump_target) {
             let at = usize::from(*target);
             if !(start..=end).contains(&at) {
@@ -1399,6 +1434,52 @@ mod tests {
         assert!(
             !listing.contains("InList"),
             "the list binds to a set test: {listing}"
+        );
+    }
+
+    #[test]
+    fn a_worker_copy_of_a_bound_program_binds_new_values() {
+        let program = CompactArc::new(Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadParam(0),
+            Op::Eq,
+            Op::Return,
+        ]));
+        let bound = Program::bound(program, &[Value::Integer(1)]);
+        let copy = CompactArc::new(bound.worker_copy());
+        let rebound = Program::bound(copy, &[Value::Integer(2)]);
+        let listing = format!("{:?}", rebound.ops());
+        assert!(
+            listing.contains("Integer(2)") && !listing.contains("Integer(1)"),
+            "the copy binds $1 = 2: {listing}"
+        );
+    }
+
+    /// The time binding `column IN ($1, ..., $items)` takes, the least of three
+    fn binding_time(items: u32) -> std::time::Duration {
+        let mut ops = vec![Op::LoadColumn(0)];
+        ops.extend((0..items).map(Op::LoadParam));
+        ops.extend([Op::InList(items), Op::Return]);
+        let program = Program::new(ops);
+        let params: Vec<Value> = (0..i64::from(items)).map(Value::Integer).collect();
+        (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                assert!(program.bind(&params).is_some(), "the list binds");
+                started.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn binding_a_list_ten_times_longer_takes_about_ten_times_longer() {
+        let short = binding_time(4_000);
+        let long = binding_time(40_000);
+        // Linear work is about 10 times; work per pair of items is 100
+        assert!(
+            long < short * 30,
+            "{long:?} binding 40000 items, {short:?} binding 4000"
         );
     }
 }

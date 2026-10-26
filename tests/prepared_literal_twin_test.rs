@@ -28,6 +28,9 @@ use stoolap::Database;
 #[cfg(feature = "test-failpoints")]
 const PER_ROW: usize = 3;
 
+/// Held by each test: the programs one records are those of every thread
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn open(name: &str) -> Database {
     let db = Database::open(&format!("memory://{name}")).unwrap();
     for sql in [
@@ -139,6 +142,7 @@ fn other_values(params: &[Value]) -> Vec<Value> {
 
 #[test]
 fn a_bound_statement_answers_as_its_literal_twin() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = open("prepared_literal_twin_answers");
     let mut wrong = Vec::new();
     for (sql, params, twin) in &shapes() {
@@ -163,6 +167,11 @@ fn shapes() -> Vec<(&'static str, Vec<Value>, &'static str)> {
             "SELECT id + (COALESCE($1, 2) + 3) FROM t",
             vec![int(1)],
             "SELECT id + (COALESCE(1, 2) + 3) FROM t",
+        ),
+        (
+            "SELECT id FROM t WHERE b IN (COALESCE(a, 1), $1) AND id = (SELECT MAX(id) FROM t)",
+            vec![int(2)],
+            "SELECT id FROM t WHERE b IN (COALESCE(a, 1), 2) AND id = (SELECT MAX(id) FROM t)",
         ),
         (
             "SELECT id FROM t WHERE (a IN ($1, $2)) IS TRUE",
@@ -427,6 +436,7 @@ fn shapes() -> Vec<(&'static str, Vec<Value>, &'static str)> {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_bound_statement_runs_its_literal_twins_programs() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = open("prepared_literal_twin");
     let mut wrong = Vec::new();
     for (sql, params, twin) in &shapes() {
