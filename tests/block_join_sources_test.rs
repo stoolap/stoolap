@@ -284,6 +284,138 @@ fn an_uncorrelated_block_over_a_join_runs_once_per_run() {
 }
 
 #[test]
+fn a_kept_answer_of_a_block_over_a_join_follows_its_parameters() {
+    let _guard = serial();
+    let db = hot("params");
+    let read = |sql: &str, bound: i64| -> Vec<String> {
+        let rows = db.query(sql, (bound,)).unwrap();
+        rows.map(|row| row.unwrap().get::<i64>(0).unwrap().to_string())
+            .collect()
+    };
+    let mut wrong = Vec::new();
+    for (sql, first, then) in [
+        (
+            "SELECT id FROM t WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id \
+             WHERE w.y <= $1) ORDER BY id",
+            vec!["1", "4"],
+            vec!["1", "2", "4", "5"],
+        ),
+        (
+            "SELECT id FROM t WHERE b > (SELECT MAX(w.y) FROM u JOIN w ON w.id = u.id \
+             WHERE w.y <= $1) ORDER BY id",
+            vec!["2", "3", "4"],
+            vec!["4"],
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
+             WHERE w.y > $1)",
+            vec!["5"],
+            vec!["0"],
+        ),
+        (
+            "SELECT id FROM t WHERE a IN (SELECT q.x FROM (SELECT u.x FROM u JOIN w \
+             ON w.id = u.id WHERE w.y <= $1) AS q) ORDER BY id",
+            vec!["1", "4"],
+            vec!["1", "2", "4", "5"],
+        ),
+    ] {
+        for (bound, want) in [(10, &first), (30, &then)] {
+            let got = read(sql, bound);
+            if got != *want {
+                wrong.push(format!(
+                    "{sql} with $1 = {bound}: gave {got:?}, want {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_in_over_a_join_narrows_the_statement_as_one_over_a_table_does() {
+    use stoolap::test_failpoints::{
+        prepared_rows_narrowed, prepared_strategy_runs, PreparedStrategy,
+    };
+    let _guard = serial();
+    let db = hot("narrows");
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT id FROM t WHERE id IN (SELECT u.id FROM u JOIN w ON w.id = u.id) ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM t WHERE id NOT IN (SELECT u.id FROM u JOIN w ON w.id = u.id) \
+             ORDER BY id",
+            vec!["4", "5"],
+        ),
+        (
+            "SELECT id FROM t WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id) ORDER BY id",
+            vec!["1", "2", "4", "5"],
+        ),
+    ] {
+        let before = prepared_rows_narrowed();
+        let got = answer(&db, sql);
+        if got != Ok(want.iter().map(|s| s.to_string()).collect()) {
+            wrong.push(format!("{sql}: gave {got:?}, want {want:?}"));
+        }
+        if prepared_rows_narrowed() == before {
+            wrong.push(format!("{sql}: read t whole, not by the members' keys"));
+        }
+    }
+    let scanned = "SELECT id FROM t WHERE a NOT IN (SELECT u.x FROM u JOIN w ON w.id = u.id) \
+                   ORDER BY id";
+    let before = prepared_strategy_runs(PreparedStrategy::ScanTakesMembers);
+    let got = answer(&db, scanned);
+    if got != Ok(vec!["3".into()]) {
+        wrong.push(format!("{scanned}: gave {got:?}"));
+    }
+    if prepared_strategy_runs(PreparedStrategy::ScanTakesMembers) == before {
+        wrong.push(format!("{scanned}: the scan did not take the members"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
+    let _guard = serial();
+    let db = hot("dropped");
+    let refused = |position: &str| Err(format!("invalid argument: {}", position));
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT * FROM u JOIN w USING (id) ORDER BY 3)",
+            Ok(vec!["5".to_string()]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT * FROM u JOIN w USING (id) ORDER BY 4)",
+            refused("ORDER BY position 4 is not in the select list"),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.* FROM u JOIN w ON w.id = u.id \
+             ORDER BY 3)",
+            refused("ORDER BY position 3 is not in the select list"),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT v.x FROM u JOIN u AS v ON v.id = u.id \
+             GROUP BY v.x)",
+            Ok(vec!["5".to_string()]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
+             GROUP BY v.x)",
+            Err("Compile error: Column 'u.x' not found".to_string()),
+        ),
+    ] {
+        let got = answer(&db, sql);
+        if got != want {
+            wrong.push(format!("{sql}: gave {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_star_over_a_join_is_named_only_by_its_run() {
     let _guard = serial();
     let db = hot("star");

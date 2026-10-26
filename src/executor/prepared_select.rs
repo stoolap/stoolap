@@ -68,7 +68,7 @@ use super::result::{
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, get_table_alias_from_expr, infix_to_operator,
-    is_aggregate_function, item_name, order_by_names_an_alias, split_qualified,
+    is_aggregate_function, item_name, order_by_names_an_alias, qualified, split_qualified,
     strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
@@ -684,9 +684,17 @@ impl<'a> Family<'a> {
         }
         self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
+        let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
+        // Only its run knows how wide a star over a join merging columns is
+        if sq.table_expr.as_deref().is_some_and(merges_columns)
+            && sq.columns.iter().any(star)
+            && crate::parser::scope::order_position_outside(sq, Some(0)).is_some()
+        {
+            return Err("an EXISTS ordered by position in a star over a NATURAL or USING join");
+        }
         let mut found = false;
         for column in &sq.columns {
-            if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
+            if !star(column) {
                 self.expression(unaliased(column), scopes, list_site(sq), &mut found)?;
             }
         }
@@ -697,6 +705,19 @@ impl<'a> Family<'a> {
             }
             None => Ok(()),
         }
+    }
+}
+
+/// Whether `from` holds a NATURAL or USING join, whose run merges columns
+fn merges_columns(from: &Expression) -> bool {
+    match from {
+        Expression::JoinSource(join) => {
+            join.join_type.to_uppercase().contains("NATURAL")
+                || !join.using_columns.is_empty()
+                || merges_columns(&join.left)
+                || merges_columns(&join.right)
+        }
+        _ => false,
     }
 }
 
@@ -1139,6 +1160,28 @@ impl ScopeTable {
             lower: joined(&left.lower, &right.lower),
             types: left.types.into_iter().chain(right.types).collect(),
         }
+    }
+
+    /// The names a run of its FROM gives its columns: each qualified by its
+    /// table when there are more tables than one
+    fn source_names(&self) -> std::borrow::Cow<'_, [String]> {
+        if self.tables.len() < 2 {
+            return std::borrow::Cow::Borrowed(self.lower.as_slice());
+        }
+        let mut names = Vec::with_capacity(self.lower.len());
+        for (i, (table, start)) in self.tables.iter().enumerate() {
+            let end = self
+                .tables
+                .get(i + 1)
+                .map_or(self.lower.len(), |(_, at)| *at);
+            let table = table.to_lowercase();
+            names.extend(
+                self.lower[*start..end]
+                    .iter()
+                    .map(|name| qualified(&table, name)),
+            );
+        }
+        std::borrow::Cow::Owned(names)
     }
 
     /// The scope of a block without FROM: no columns, and no name a
@@ -2939,9 +2982,7 @@ impl WhereParts {
                             }),
                             None,
                         ) if plan.keys.len() == 1 => (plan.keys[0].2, false),
-                        (Answer::Members(_, members), Some(column))
-                            if sq.uncorrelated && members.test == MemberTest::In =>
-                        {
+                        (_, Some(column)) if sq.member_set_test() == Some(MemberTest::In) => {
                             (column, true)
                         }
                         _ => return None,
@@ -2961,7 +3002,7 @@ impl WhereParts {
         let slot = |&(id, negated, column, _): &(u16, bool, Option<usize>, usize)| {
             let sq = &blocks.subqueries[id as usize];
             let column = column.filter(|_| sq.uncorrelated)?;
-            matches!(sq.answer, Answer::Members(..)).then_some(SetSlot {
+            sq.member_set_test().is_some().then_some(SetSlot {
                 id,
                 column,
                 negated,
@@ -3144,6 +3185,22 @@ impl PartialEq for HeldRow<'_> {
 impl Eq for HeldRow<'_> {}
 
 impl PreparedSubquery {
+    /// The test an uncorrelated block's members answer, read once per run
+    /// as a set: of a block over one source, or of one run as a statement
+    fn member_set_test(&self) -> Option<MemberTest> {
+        if !self.uncorrelated {
+            return None;
+        }
+        match &self.answer {
+            Answer::Members(_, members) => Some(members.test),
+            Answer::Statement(_, block) => match block.form {
+                StatementForm::Members(_, test) => Some(test),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether the block may read `table`: its own table, or one its view's
     /// query reads, any when they are not known. A CTE's rows are read before
     /// the statement writes; a VALUES list or table function reads none
@@ -4052,6 +4109,9 @@ impl Builder<'_> {
             false => Check::Off,
         };
         let mut max_param = 0;
+        // The parameters it reads key its kept answer; one not positional
+        // leaves it every parameter
+        let mut params = SmallVec::<[usize; 2]>::new();
         let (statement, _, own) = StatementWalk {
             executor,
             ctx,
@@ -4059,11 +4119,17 @@ impl Builder<'_> {
                 Reach::Outer(expr, depth, index) => {
                     Ok(Some(self.outer_slot(&chain, depth, index, expr, &mut work)))
                 }
-                Reach::Param(Expression::Parameter(p)) => {
+                Reach::Param(Expression::Parameter(p)) if p.index > 0 => {
                     max_param = max_param.max(p.index);
+                    if !params.contains(&(p.index - 1)) {
+                        params.push(p.index - 1);
+                    }
                     Ok(None)
                 }
-                Reach::Param(_) => Ok(None),
+                Reach::Param(_) => {
+                    params.push(usize::MAX);
+                    Ok(None)
+                }
             },
         }
         .statement(sq, outer, 0, check)?;
@@ -4071,7 +4137,7 @@ impl Builder<'_> {
         let statement = match dropped {
             true => {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
-                existence(executor, statement, &own.lower, ctx)?
+                existence(executor, statement, &own.source_names(), ctx)?
             }
             false => statement,
         };
@@ -4116,7 +4182,7 @@ impl Builder<'_> {
             candidates: None,
             filter: None,
             rest: Vec::new(),
-            reads: work.outer.values().copied().collect(),
+            reads: work.outer.values().copied().chain(params).collect(),
             answer: Answer::Statement(kept, Box::new(block)),
             grouping: None,
             order: None,
@@ -5920,7 +5986,7 @@ impl PreparedSelect {
         let ahead = output_blocks
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
-                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+                sq.parent.is_none() && sq.member_set_test().is_some()
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
@@ -6425,7 +6491,7 @@ impl PreparedGrouped {
         let ahead = (where_blocks..blocks_read)
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
-                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+                sq.parent.is_none() && sq.member_set_test().is_some()
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
@@ -7269,7 +7335,7 @@ impl JoinBlocks {
         let ahead = output_blocks
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
-                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+                sq.parent.is_none() && sq.member_set_test().is_some()
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
@@ -7966,9 +8032,8 @@ fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool 
         mark.prepared
             .and_then(|id| blocks.get(usize::from(id))?.as_ref())
     };
-    let members = |mark: &SelectStatement| {
-        block(mark).is_some_and(|sq| sq.uncorrelated && matches!(sq.answer, Answer::Members(..)))
-    };
+    let members =
+        |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.member_set_test().is_some());
     let once = |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.uncorrelated);
     match expr {
         Expression::In(in_expr) => match in_expr.right.as_ref() {
@@ -9679,19 +9744,10 @@ impl<'a> PreparedRunner<'a> {
         ctx: &ExecutionContext,
     ) -> Result<SetScan> {
         let index = slot.id as usize;
-        let Answer::Members(kept, members) = &self.prepared.subqueries[index].answer else {
-            return Ok(SetScan::Program);
-        };
         // An error reading the members, or one a member raised, belongs to
         // the row that needs the answer: the program asks the block then
         let empty = Row::new();
-        let read = self.read_members(
-            index,
-            kept,
-            members,
-            &ExecuteContext::new(&empty),
-            self.holes,
-        );
+        let read = self.read_member_set(index, &ExecuteContext::new(&empty), self.holes);
         if read.is_err() {
             return Ok(SetScan::Program);
         }
@@ -11130,31 +11186,13 @@ impl PreparedRunner<'_> {
             .subqueries
             .get(index)
             .ok_or_else(|| Error::internal("unknown prepared subquery"))?;
-        if let Answer::Statement(kept, block) = &sq.answer {
+        if let Answer::Statement(_, block) = &sq.answer {
             let StatementForm::Members(read_as, test) = block.form else {
                 return Err(Error::internal("a block run for its members that has none"));
             };
             // One that binds nothing beyond itself reads its members once
             if sq.uncorrelated {
-                if self.blocks[index].members.get().is_none() {
-                    let answer = self.read_once(index, || {
-                        self.kept(kept, || {
-                            let mut rows = self.block_statement(index, block, caller, site)?;
-                            let mut values = Vec::new();
-                            while rows.next() {
-                                Member::of_row(rows.take_row(), tested.len(), read_as)
-                                    .push_into(&mut values);
-                            }
-                            if let Some(e) = rows.last_error() {
-                                return Err(e);
-                            }
-                            let set = member_set(test, tested.len(), values, true);
-                            let members = KeptMembers { set, failed: None };
-                            Ok(BlockAnswer::Members(CompactArc::new(members)))
-                        })
-                    })?;
-                    let _ = self.blocks[index].members.set(answer);
-                }
+                self.read_member_set(index, caller, site)?;
                 let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
                     return Err(Error::internal("a value block's members not kept"));
                 };
@@ -11263,6 +11301,43 @@ impl PreparedRunner<'_> {
         })
     }
 
+    /// The members uncorrelated block `index` holds, read once per run on
+    /// first need whether it is a value block or a statement
+    fn read_member_set(&self, index: usize, caller: &ExecuteContext, site: &HoleSet) -> Result<()> {
+        let sq = &self.prepared.subqueries[index];
+        let (kept, block, read_as, test) = match &sq.answer {
+            Answer::Members(kept, members) => {
+                return self.read_members(index, kept, members, caller, site)
+            }
+            Answer::Statement(kept, block) if sq.uncorrelated => match block.form {
+                StatementForm::Members(read_as, test) => (kept, block, read_as, test),
+                _ => return Err(Error::internal("a block run for its members that has none")),
+            },
+            _ => return Err(Error::internal("a block run for its members that has none")),
+        };
+        if self.blocks[index].members.get().is_some() {
+            return Ok(());
+        }
+        let width = block.run.statement.columns.len();
+        let answer = self.read_once(index, || {
+            self.kept(kept, || {
+                let mut rows = self.block_statement(index, block, caller, site)?;
+                let mut values = Vec::new();
+                while rows.next() {
+                    Member::of_row(rows.take_row(), width, read_as).push_into(&mut values);
+                }
+                if let Some(e) = rows.last_error() {
+                    return Err(e);
+                }
+                let set = member_set(test, width, values, true);
+                let members = KeptMembers { set, failed: None };
+                Ok(BlockAnswer::Members(CompactArc::new(members)))
+            })
+        })?;
+        let _ = self.blocks[index].members.set(answer);
+        Ok(())
+    }
+
     /// An uncorrelated value block's members, read once per run on first
     /// need, or taken from a run before whose stamp still holds
     fn read_members(
@@ -11352,22 +11427,10 @@ impl PreparedRunner<'_> {
     /// when a test over them binds; None when the read fails or a candidate
     /// failed, whose error stays with the row that needs it
     fn read_set(&self, index: usize) -> Option<()> {
-        let sq = self.prepared.subqueries.get(index)?;
-        let Answer::Members(kept, members) = &sq.answer else {
-            return None;
-        };
-        if !sq.uncorrelated {
-            return None;
-        }
+        self.prepared.subqueries.get(index)?.member_set_test()?;
         let empty = Row::new();
-        self.read_members(
-            index,
-            kept,
-            members,
-            &ExecuteContext::new(&empty),
-            self.holes,
-        )
-        .ok()?;
+        self.read_member_set(index, &ExecuteContext::new(&empty), self.holes)
+            .ok()?;
         self.members_op(index).map(drop)
     }
 
@@ -11833,19 +11896,12 @@ impl PreparedRunner<'_> {
         negated: bool,
         target: Option<usize>,
     ) -> Result<Option<(RowVec, bool)>> {
-        let sq = &self.prepared.subqueries[index];
-        let Answer::Members(kept, members) = &sq.answer else {
+        if self.prepared.subqueries[index].member_set_test().is_none() {
             return Ok(None);
-        };
+        }
         // An error reading the members belongs to the row that needs them
         let empty = Row::new();
-        let read = self.read_members(
-            index,
-            kept,
-            members,
-            &ExecuteContext::new(&empty),
-            self.holes,
-        );
+        let read = self.read_member_set(index, &ExecuteContext::new(&empty), self.holes);
         if read.is_err() {
             return Ok(None);
         }
