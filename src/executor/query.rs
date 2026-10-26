@@ -2643,11 +2643,7 @@ impl Executor {
                 None => processed_where,
             };
             let where_result = super::expression::evaluate_once(&processed_where, Some(ctx))?;
-            passes = match where_result {
-                Value::Boolean(b) => b,
-                Value::Null(_) => false, // NULL in WHERE is treated as false
-                _ => true,
-            };
+            passes = ExprVM::passes(&where_result);
         }
 
         // Aggregates and windows read the row the WHERE passed, as in

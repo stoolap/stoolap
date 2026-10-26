@@ -278,3 +278,67 @@ fn an_aggregate_without_from_over_sealed_blocks_answers_one_row() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     aggregate_rule(&db);
 }
+
+#[test]
+fn a_where_without_from_keeps_its_row_by_the_rule_of_every_where() {
+    let db = open("where_rule");
+    db.execute("CREATE TABLE one (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO one VALUES (1)", ()).unwrap();
+    let count = |sql: &str, params: Vec<Value>| {
+        db.query(sql, params)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .count()
+    };
+    for (literal, param) in [
+        ("TRUE", Value::Boolean(true)),
+        ("FALSE", Value::Boolean(false)),
+        ("NULL", Value::Null(stoolap::core::DataType::Null)),
+        ("2", Value::Integer(2)),
+        ("0", Value::Integer(0)),
+        ("0.5", Value::Float(0.5)),
+        ("'abc'", Value::text("abc")),
+    ] {
+        let table = count(&format!("SELECT 1 FROM one WHERE {literal}"), vec![]);
+        for sql in [
+            format!("SELECT 1 WHERE {literal}"),
+            format!("SELECT (SELECT 1) WHERE {literal}"),
+        ] {
+            assert_eq!(count(&sql, vec![]), table, "{sql}");
+        }
+        for sql in [
+            "SELECT 1 WHERE $1",
+            "SELECT (SELECT 1) WHERE $1",
+            "SELECT 1 FROM one WHERE $1",
+        ] {
+            assert_eq!(
+                count(sql, vec![param.clone()]),
+                table,
+                "{sql} with {literal}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_uncorrelated_output_block_without_from_raises_its_error_as_over_a_table() {
+    let db = open("read_once");
+    db.execute("CREATE TABLE one (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO one VALUES (1)", ()).unwrap();
+    let error = |sql: &str, params: Vec<Value>| db.query(sql, params).err().map(|e| e.to_string());
+    for (filter, params) in [
+        ("TRUE", vec![]),
+        ("FALSE", vec![]),
+        ("NULL", vec![]),
+        ("$1 > 1", vec![Value::Integer(0)]),
+    ] {
+        let table = error(
+            &format!("SELECT (SELECT x FROM u) FROM one WHERE {filter}"),
+            params.clone(),
+        );
+        assert!(table.is_some(), "the table form raises with WHERE {filter}");
+        let fromless = error(&format!("SELECT (SELECT x FROM u) WHERE {filter}"), params);
+        assert_eq!(fromless, table, "WHERE {filter}");
+    }
+}
