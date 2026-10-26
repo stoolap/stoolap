@@ -184,6 +184,12 @@ fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// `sql` as a derived table's statement, which holds no plan, so the
+/// general path answers it
+fn general_path(sql: &str) -> String {
+    format!("SELECT * FROM ({sql}) AS general")
+}
+
 /// Whether every row of `part` is in `whole`, as often as it is there
 fn contained(part: &[String], whole: &[String]) -> bool {
     let mut left = whole.to_vec();
@@ -227,12 +233,9 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
                 cases += 1;
                 let sql = shape.sql.replace("{f}", form);
                 let plain = sql.replace("{l}", "l").replace("{r}", "r");
-                let general = sql
-                    .replace("{l}", "(SELECT * FROM l) l")
-                    .replace("{r}", "(SELECT * FROM r) r");
-                let general = match general.rfind(" LIMIT ") {
-                    Some(at) if shape.limit.is_some() => general[..at].to_string(),
-                    _ => general,
+                let general = match plain.rfind(" LIMIT ") {
+                    Some(at) if shape.limit.is_some() => general_path(&plain[..at]),
+                    _ => general_path(&plain),
                 };
                 let first = rows(&db, &plain);
                 let compiles = (bridge_compiles(), program_compiles());
@@ -299,8 +302,8 @@ fn a_condition_on_the_right_side_reads_the_right_side() {
         (
             "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
              WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)",
-            "SELECT r.id, l.id FROM r JOIN (SELECT * FROM l) l ON r.w = l.g \
-             WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)",
+            "SELECT * FROM (SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
+             WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)) AS general",
         ),
     ] {
         let want = rows(&db, same_as);
@@ -375,11 +378,8 @@ fn the_index_joins_answer_with_a_side_subquery_beside_their_own_rules() {
         ),
     ] {
         let plain = sql.replace("{l}", "l").replace("{r}", "r");
-        let general = sql
-            .replace("{l}", "(SELECT * FROM l) l")
-            .replace("{r}", "(SELECT * FROM r) r");
-        let general = &general[..general.rfind(" LIMIT ").unwrap()];
-        let want = rows(&db, general).unwrap();
+        let general = general_path(&plain[..plain.rfind(" LIMIT ").unwrap()]);
+        let want = rows(&db, &general).unwrap();
         reset_join_paths();
         let got = rows(&db, &plain).unwrap();
         assert_eq!(join_paths_taken(), [path], "{plain}");
@@ -418,10 +418,7 @@ fn an_index_join_fetches_its_inner_rows_through_their_conditions() {
     ] {
         let sql = format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.k = r.k WHERE {condition}");
         let plain = sql.replace("{l}", "l").replace("{r}", "r");
-        let general = sql
-            .replace("{l}", "(SELECT * FROM l) l")
-            .replace("{r}", "(SELECT * FROM r) r");
-        let want = rows(&db, &general);
+        let want = rows(&db, &general_path(&plain));
         reset_join_paths();
         let before = inner_fetch_filters();
         let got = rows(&db, &plain);
@@ -469,10 +466,7 @@ fn a_side_whose_rows_need_the_where_streams_it_bound_to_its_sets() {
         let sql =
             format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON r.id = l.k WHERE {condition}");
         let plain = sql.replace("{l}", "l").replace("{r}", "r");
-        let general = sql
-            .replace("{l}", "(SELECT * FROM l) l")
-            .replace("{r}", "(SELECT * FROM r) r");
-        let want = rows(&db, &general);
+        let want = rows(&db, &general_path(&plain));
         let before = bound_side_reads();
         let got = rows(&db, &plain);
         assert_eq!(

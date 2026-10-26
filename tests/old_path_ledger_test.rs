@@ -312,7 +312,50 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "WITH c AS (SELECT id, x FROM u) SELECT t.id FROM t JOIN c ON c.id = t.a \
          WHERE t.b > (SELECT MAX(x) FROM u)",
         "SELECT t.id FROM t JOIN u ON u.id = t.a WHERE t.b > 3",
-        Old("plan-less and source-side joins"),
+        Prepared,
+    ),
+    (
+        "join_with_a_cte_side_its_limit_cuts",
+        "WITH c (a, n) AS (SELECT a, COUNT(*) FROM t GROUP BY a) \
+         SELECT c.a, (SELECT MAX(x) FROM u) FROM c LEFT JOIN u ON u.id = c.a ORDER BY c.a LIMIT 2",
+        "WITH c (a, n) AS (SELECT a, COUNT(*) FROM t GROUP BY a) \
+         SELECT c.a, 3 FROM c LEFT JOIN u ON u.id = c.a ORDER BY c.a LIMIT 2",
+        Old("a CTE's LIMIT cut on the CTE path"),
+    ),
+    (
+        "join_with_a_view_side",
+        "SELECT t.id FROM t JOIN vt ON vt.id = t.a WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN vt ON vt.id = t.a WHERE t.b > 3",
+        Prepared,
+    ),
+    (
+        "join_with_a_derived_side",
+        "SELECT t.id FROM t JOIN (SELECT id, x FROM u) AS d ON d.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN (SELECT id, x FROM u) AS d ON d.id = t.a WHERE t.b > 3",
+        Prepared,
+    ),
+    (
+        "join_with_a_values_side",
+        "SELECT t.id FROM t JOIN (VALUES (1, 1), (2, 2)) AS v (id, x) ON v.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN (VALUES (1, 1), (2, 2)) AS v (id, x) ON v.id = t.a \
+         WHERE t.b > 3",
+        Prepared,
+    ),
+    (
+        "join_with_a_table_function_side",
+        "SELECT t.id FROM t JOIN generate_series(1, 2) AS g (n) ON g.n = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN generate_series(1, 2) AS g (n) ON g.n = t.a WHERE t.b > 3",
+        Prepared,
+    ),
+    (
+        "join_of_three_tables",
+        "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN u AS w ON w.id = u.id \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN u AS w ON w.id = u.id WHERE t.b > 3",
+        Old("joins of more than two sources"),
     ),
     (
         "block_over_a_derived_table",

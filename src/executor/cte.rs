@@ -1539,7 +1539,7 @@ impl Executor {
     ///    either side of an INNER JOIN, whose result must then fill the LIMIT
     /// 2. Main query has LIMIT
     /// 3. ORDER BY (if present) references only CTE columns
-    fn compute_cte_limit_hints(
+    pub(crate) fn compute_cte_limit_hints(
         &self,
         stmt: &SelectStatement,
         with_clause: &WithClause,

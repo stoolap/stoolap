@@ -20,7 +20,8 @@ use std::sync::{Arc, RwLock};
 
 use smallvec::SmallVec;
 
-use crate::core::Result;
+use crate::common::CompactArc;
+use crate::core::{Result, Schema};
 
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
@@ -156,6 +157,10 @@ impl<K, T: ?Sized> Shelf<K, T> {
     }
 }
 
+/// Each side's columns as a join's blocks read them, and whether the side
+/// is read as rows
+pub(crate) type JoinSides = [(CompactArc<Schema>, bool); 2];
+
 /// The programs one join statement compiled, valid for one schema epoch
 #[derive(Debug)]
 pub struct PreparedJoin {
@@ -169,6 +174,9 @@ pub struct PreparedJoin {
     /// Whether the ON's and the WHERE's subqueries run as the statement's
     /// blocks; decided on first need
     blocks_where: std::sync::OnceLock<bool>,
+    /// Each side's columns as the blocks read them, and whether it is read
+    /// as rows; None when a side's are not known before it is read
+    sides: std::sync::OnceLock<Option<JoinSides>>,
     join_blocks: RwLock<Option<Arc<JoinBlocks>>>,
     /// Whether a grouped statement's subqueries run as its grouped blocks;
     /// decided on first need
@@ -186,6 +194,7 @@ impl PreparedJoin {
             outputs: Shelf::new(),
             wheres: Shelf::new(),
             blocks_where: std::sync::OnceLock::new(),
+            sides: std::sync::OnceLock::new(),
             join_blocks: RwLock::new(None),
             grouped: std::sync::OnceLock::new(),
             grouped_blocks: Shelf::new(),
@@ -196,6 +205,11 @@ impl PreparedJoin {
     /// `decide` finds once
     pub fn blocks_where(&self, decide: impl FnOnce() -> bool) -> bool {
         *self.blocks_where.get_or_init(decide)
+    }
+
+    /// Each side's columns as the blocks read them, as `name` finds once
+    pub(crate) fn sides(&self, name: impl FnOnce() -> Option<JoinSides>) -> Option<&JoinSides> {
+        self.sides.get_or_init(name).as_ref()
     }
 
     /// Whether the grouped statement's subqueries run as its grouped blocks,

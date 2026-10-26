@@ -145,10 +145,10 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The statement with both sides read as derived tables, out of the blocks
+/// `sql` as a derived table's statement, which holds no plan, so the
+/// general path answers it
 fn general(sql: &str) -> String {
-    sql.replace(" FROM l ", " FROM (SELECT * FROM l) l ")
-        .replace(" JOIN r ", " JOIN (SELECT * FROM r) r ")
+    format!("SELECT * FROM ({sql}) AS general")
 }
 
 #[test]
