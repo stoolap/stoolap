@@ -27,6 +27,7 @@ use super::expression::{
 use super::utils::for_each_qualified_star_column;
 
 /// One output item, as its compiled program reads
+#[derive(Debug)]
 pub(crate) enum Item {
     /// The input column at this index
     Column(usize),
@@ -43,7 +44,7 @@ pub(crate) enum Item {
 impl Item {
     /// The item `program` computes: a column, a constant, a parameter or a
     /// concatenation of them when that is all it does
-    fn of(program: SharedProgram) -> Self {
+    pub(crate) fn of(program: SharedProgram) -> Self {
         match program.ops() {
             [Op::LoadColumn(index), Op::Return] => Item::Column(usize::from(*index)),
             [Op::LoadConst(value), Op::Return] => Item::Constant(value.clone()),
@@ -54,6 +55,22 @@ impl Item {
                 None => Item::Program(program),
             },
         }
+    }
+
+    /// The item's value for `exec`'s row
+    #[inline(always)]
+    pub(crate) fn value(&self, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<Value> {
+        Ok(match self {
+            Item::Column(index) => exec
+                .row
+                .get(*index)
+                .cloned()
+                .unwrap_or_else(Value::null_unknown),
+            Item::Constant(value) => value.clone(),
+            Item::Param(slot) => exec.param_ref(*slot)?.clone(),
+            Item::Concat(concat) => concat.value(exec)?,
+            Item::Program(program) => vm.execute_cow(program, exec)?,
+        })
     }
 }
 
@@ -216,18 +233,7 @@ impl Projection {
         out: &mut Row,
     ) -> Result<()> {
         for item in &self.items {
-            let value = match item {
-                Item::Column(index) => exec
-                    .row
-                    .get(*index)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-                Item::Constant(value) => value.clone(),
-                Item::Param(slot) => exec.param_ref(*slot)?.clone(),
-                Item::Concat(concat) => concat.value(exec)?,
-                Item::Program(program) => vm.execute_cow(program, exec)?,
-            };
-            out.push_inline(value);
+            out.push_inline(item.value(vm, exec)?);
         }
         Ok(())
     }

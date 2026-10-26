@@ -54,6 +54,7 @@ use super::expression::{
     QuantifiedMembers, RowFilter, SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
+use super::projection::Item;
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
@@ -3355,16 +3356,51 @@ impl BoundPushdown {
 #[derive(Debug)]
 enum Output {
     Column(usize),
-    Program(SharedProgram),
+    Program(Computed),
     /// A SELECT item holding subqueries, which the blocks answer
-    Block(SharedProgram),
+    Block(Computed),
     /// An ORDER BY or DISTINCT ON key, NULL where it fails, as on the general path
-    Key(SharedProgram),
+    Key(Computed),
     /// A key that reads SELECT aliases from the projected row, as its second
     /// row, and the positions of the items it reads
     AliasKey(SharedProgram, SmallVec<[usize; 2]>),
     /// A key that is the SELECT item at this position, read from it
     Copy(usize),
+}
+
+/// A computed output's program, the item it reads as before a run binds
+/// it, and whether a run binds it: it loads a parameter or asks a block
+#[derive(Debug)]
+struct Computed {
+    program: SharedProgram,
+    item: Item,
+    binds: bool,
+}
+
+impl Computed {
+    fn new(program: SharedProgram) -> Self {
+        let item = Item::of(CompactArc::clone(&program));
+        let binds = Self::binds(&program);
+        Self {
+            program,
+            item,
+            binds,
+        }
+    }
+
+    /// Whether a run binds `program`: it loads a parameter or asks a block
+    fn binds(program: &SharedProgram) -> bool {
+        program.ops().iter().any(|op| {
+            matches!(
+                op,
+                Op::LoadParam(_)
+                    | Op::ExecScalarSubquery(_)
+                    | Op::ExecExists(_)
+                    | Op::ExecInSubquery(_)
+                    | Op::ExecQuantified(..)
+            )
+        })
+    }
 }
 
 /// The SELECT list, then the columns and expressions ORDER BY appends for the sort
@@ -4950,8 +4986,8 @@ impl PreparedProjection {
         {
             outputs.push(match (star.or(*index), rewritten) {
                 (Some(index), _) => Output::Column(index),
-                (None, Some(_)) => Output::Block(compile(expr, *rewritten)?),
-                (None, None) => Output::Program(compile(expr, None)?),
+                (None, Some(_)) => Output::Block(Computed::new(compile(expr, *rewritten)?)),
+                (None, None) => Output::Program(Computed::new(compile(expr, None)?)),
             });
         }
         outputs.extend(plan.extra_order_indices.iter().map(|&i| Output::Column(i)));
@@ -4987,7 +5023,7 @@ impl PreparedProjection {
                 .flatten();
             outputs.push(match item {
                 Some(position) => Output::Copy(position),
-                None => Output::Key(compile(expr, rewritten)?),
+                None => Output::Key(Computed::new(compile(expr, rewritten)?)),
             });
         }
         // A key reading a SELECT alias reads the value the projection gave
@@ -5038,19 +5074,10 @@ impl PreparedProjection {
                 .enumerate()
                 .all(|(i, output)| matches!(output, Output::Column(c) if *c == i));
         let binds = outputs.iter().any(|output| match output {
-            Output::Program(program)
-            | Output::Key(program)
-            | Output::Block(program)
-            | Output::AliasKey(program, _) => program.ops().iter().any(|op| {
-                matches!(
-                    op,
-                    Op::LoadParam(_)
-                        | Op::ExecScalarSubquery(_)
-                        | Op::ExecExists(_)
-                        | Op::ExecInSubquery(_)
-                        | Op::ExecQuantified(..)
-                )
-            }),
+            Output::Program(computed) | Output::Key(computed) | Output::Block(computed) => {
+                computed.binds
+            }
+            Output::AliasKey(program, _) => Computed::binds(program),
             Output::Column(_) | Output::Copy(_) => false,
         });
         Ok((
@@ -5160,10 +5187,10 @@ impl PreparedProjection {
             let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
                 .with_subquery_executor(run);
             for (position, output) in self.outputs.iter().enumerate() {
-                if let Output::Program(program) | Output::Block(program) = output {
+                if let Output::Program(computed) | Output::Block(computed) = output {
                     if !read.contains(&position) {
-                        let program = Self::bound_output(run, &mut bound, position, program);
-                        out.set(position, vm.execute(program, &exec)?)?;
+                        let item = Self::output_item(run, &mut bound, position, computed);
+                        out.set(position, item.value(&mut vm, &exec)?)?;
                     }
                 }
             }
@@ -5209,8 +5236,8 @@ impl PreparedProjection {
                 Output::Program(_) | Output::Block(_) if FIRST && !read.contains(&position) => {
                     Value::null_unknown()
                 }
-                Output::Program(program) | Output::Key(program) | Output::Block(program) => {
-                    vm.execute(Self::bound_output(run, bound, position, program), &exec)?
+                Output::Program(computed) | Output::Key(computed) | Output::Block(computed) => {
+                    Self::output_item(run, bound, position, computed).value(vm, &exec)?
                 }
                 Output::AliasKey(..) => Value::null_unknown(),
                 Output::Copy(item) => values
@@ -5229,7 +5256,7 @@ impl PreparedProjection {
                 let mut exec =
                     ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
                 exec.row2 = Some(&out);
-                let key = vm.execute(Self::bound_output(run, bound, position, program), &exec)?;
+                let key = vm.execute(Self::bound_program(run, bound, position, program), &exec)?;
                 out.set(position, key)?;
             }
         }
@@ -5244,23 +5271,64 @@ impl PreparedProjection {
         }
     }
 
+    /// The item of the computed output at `position`, bound to `run`
+    #[inline]
+    fn output_item<'b>(
+        run: &PreparedRunner<'_>,
+        bound: &'b mut OutputsBound,
+        position: usize,
+        computed: &'b Computed,
+    ) -> &'b Item {
+        match bound.get_mut(position).filter(|_| computed.binds) {
+            Some(slot) => &BoundOutput::current(slot, run, &computed.program).item,
+            None => &computed.item,
+        }
+    }
+
     /// The program of the output at `position`, bound to `run`
     #[inline]
-    fn bound_output<'b>(
+    fn bound_program<'b>(
         run: &PreparedRunner<'_>,
         bound: &'b mut OutputsBound,
         position: usize,
         program: &'b SharedProgram,
     ) -> &'b SharedProgram {
         match bound.get_mut(position) {
-            Some(bound) => run.current(bound.get_or_insert_with(|| run.bind(program))),
+            Some(slot) => &BoundOutput::current(slot, run, program).bound.program,
             None => program,
         }
     }
 }
 
+/// An output's program bound to one run, and the item the bound program reads
+struct BoundOutput {
+    bound: Bound,
+    item: Item,
+}
+
+impl BoundOutput {
+    /// `slot`'s output bound to `run`, bound first from `program` when no row
+    /// computed it yet and again when a block it asks was read since
+    #[inline]
+    fn current<'s>(
+        slot: &'s mut Option<Self>,
+        run: &PreparedRunner<'_>,
+        program: &SharedProgram,
+    ) -> &'s Self {
+        let output = slot.get_or_insert_with(|| {
+            let bound = run.bind(program);
+            let item = Item::of(CompactArc::clone(&bound.program));
+            Self { bound, item }
+        });
+        if run.rebound(&mut output.bound) {
+            output.item = Item::of(CompactArc::clone(&output.bound.program));
+        }
+        output
+    }
+}
+
 /// Each output's program bound to one run, once a row computes it
-type OutputsBound = SmallVec<[Option<Bound>; 4]>;
+type OutputsBound = SmallVec<[Option<BoundOutput>; 4]>;
 
 impl PreparedSelect {
     /// Prepare `stmt` over its table, named `scope_name` and holding
@@ -10676,10 +10744,18 @@ impl PreparedRunner<'_> {
     /// `bound`'s program, bound again when a block it asks was read since
     #[inline]
     pub(crate) fn current<'b>(&self, bound: &'b mut Bound) -> &'b SharedProgram {
-        if bound.pending.iter().any(|op| self.knows(op)) {
+        self.rebound(bound);
+        &bound.program
+    }
+
+    /// Whether `bound` was bound again, a block it asks having been read since
+    #[inline]
+    fn rebound(&self, bound: &mut Bound) -> bool {
+        let read = bound.pending.iter().any(|op| self.knows(op));
+        if read {
             *bound = self.bind(&bound.source);
         }
-        &bound.program
+        read
     }
 
     /// `read` of block `index`'s set or uncorrelated value, or the error a
