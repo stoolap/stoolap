@@ -811,9 +811,13 @@ pub struct RowMembers {
 }
 
 impl RowMembers {
-    /// `values` holds the members' values in turn, `width` of them each
-    pub fn new(test: RowTest, width: usize, values: Vec<Value>) -> Self {
+    /// `values` holds the members' values in turn, `width` of them each; a
+    /// row compared with the one member is compared with NULLs for none
+    pub fn new(test: RowTest, width: usize, mut values: Vec<Value>) -> Self {
         debug_assert!(width > 1 && values.len().is_multiple_of(width));
+        if matches!(test, RowTest::One(_)) && values.is_empty() {
+            values.resize(width, Value::null_unknown());
+        }
         Self {
             test,
             width,
@@ -831,10 +835,9 @@ impl RowMembers {
                 row,
                 self.values.chunks_exact(self.width),
             )),
-            RowTest::One(comparison) => match self.values.len() / self.width {
-                0 => Ok(comparison.answer(row, &vec![Value::null_unknown(); self.width])),
-                1 => Ok(comparison.answer(row, &self.values)),
-                _ => Err(more_than_one_row()),
+            RowTest::One(comparison) => match self.values.len() == self.width {
+                true => Ok(comparison.answer(row, &self.values)),
+                false => Err(more_than_one_row()),
             },
         }
     }
