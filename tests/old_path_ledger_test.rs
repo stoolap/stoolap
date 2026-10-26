@@ -188,7 +188,37 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "fromless",
         "SELECT (SELECT MAX(x) FROM u)",
         "SELECT 3",
-        Old("a statement without FROM"),
+        Prepared,
+    ),
+    (
+        "fromless_where_exists",
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM u WHERE x = 2)",
+        "SELECT 1",
+        Prepared,
+    ),
+    (
+        "fromless_distinct_ordered",
+        "SELECT DISTINCT (SELECT MAX(x) FROM u) ORDER BY 1 LIMIT 1",
+        "SELECT DISTINCT 3 ORDER BY 1 LIMIT 1",
+        Prepared,
+    ),
+    (
+        "fromless_aggregate",
+        "SELECT COUNT(*), (SELECT MAX(x) FROM u)",
+        "SELECT COUNT(*), 3",
+        Prepared,
+    ),
+    (
+        "fromless_having",
+        "SELECT COUNT(*) HAVING (SELECT MAX(x) FROM u) > 2",
+        "SELECT COUNT(*) HAVING 3 > 2",
+        Prepared,
+    ),
+    (
+        "fromless_window",
+        "SELECT ROW_NUMBER() OVER (), (SELECT MAX(x) FROM u)",
+        "SELECT ROW_NUMBER() OVER (), 3",
+        Prepared,
     ),
     (
         "fromless_block_reading_the_row",
