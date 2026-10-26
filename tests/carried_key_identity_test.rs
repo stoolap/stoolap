@@ -120,13 +120,7 @@ fn an_output_spelled_like_a_key_does_not_answer_for_it() {
                     let sql = query(&spelled(key));
                     let got = rows(&db, &sql);
                     cases += 1;
-                    // #664: a computed DISTINCT ON or window key over a derived
-                    // source with a WHERE subquery fails whatever the item is called
-                    let known = (head.starts_with("DISTINCT ON") || key.contains("OVER"))
-                        && !filter.is_empty()
-                        && from != "child AS c"
-                        && !from.contains("JOIN");
-                    if (want.is_err() && !known) || got != want {
+                    if want.is_err() || got != want {
                         wrong.push(format!("{sql}\n  got {got:?}\n  want {want:?}"));
                     }
                 }

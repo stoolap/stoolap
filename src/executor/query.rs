@@ -99,6 +99,15 @@ impl OutputLayout {
         }
     }
 
+    /// How many columns the first `items` SELECT items show, before those
+    /// appended for the sort keys, a hidden key item among them
+    fn shown(&self, items: usize) -> usize {
+        self.sources
+            .iter()
+            .take_while(|source| source.item.is_some_and(|item| item < items))
+            .count()
+    }
+
     /// The output column of SELECT item `item`, its first under a star
     fn item_position(&self, item: usize) -> Option<usize> {
         self.sources.iter().position(|s| s.item == Some(item))
@@ -157,7 +166,18 @@ fn reads_input(from: Option<&Expression>, qid: &QualifiedIdentifier) -> bool {
     from.is_some_and(|from| crate::parser::scope::from_shows(from, &qid.qualifier.value_lower))
 }
 
-/// Each input column `stmt`'s ORDER BY reads by its binding, with the
+/// `stmt`'s sort keys: its ORDER BY keys, then its DISTINCT ON keys, which
+/// are bound, carried and read as ORDER BY keys are. A set operation's
+/// branch carries no DISTINCT ON key: one reads its first branch's items
+fn sort_keys(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
+    let carried = stmt.set_operations.is_empty();
+    stmt.order_by
+        .iter()
+        .map(|ob| &ob.expression)
+        .chain(stmt.distinct_on.iter().filter(move |_| carried))
+}
+
+/// Each input column `stmt`'s sort keys read by their binding, with the
 /// reference that names it: a plain name bound to its input column, and
 /// every name inside an expression; false when an expression reads more
 /// than its names say, as a subquery does
@@ -166,12 +186,11 @@ fn visit_order_by_inputs<'e>(
     visit: &mut dyn FnMut(&'e Expression, OrderKey<'e>),
 ) -> bool {
     let mut read_all = true;
-    for ob in &stmt.order_by {
-        match bind_order_key(&ob.expression, stmt) {
-            key @ OrderKey::Input(..) => visit(&ob.expression, key),
+    for expr in sort_keys(stmt) {
+        match bind_order_key(expr, stmt) {
+            key @ OrderKey::Input(..) => visit(expr, key),
             OrderKey::Expression => {
-                read_all &=
-                    visit_expression_inputs(&ob.expression, stmt.table_expr.as_deref(), visit)
+                read_all &= visit_expression_inputs(expr, stmt.table_expr.as_deref(), visit)
             }
             OrderKey::Ordinal(_) | OrderKey::Item(_) => {}
         }
@@ -196,7 +215,7 @@ fn visit_expression_inputs<'e>(
     })
 }
 
-/// The input columns `stmt`'s ORDER BY reads, as indexes into `columns`;
+/// The input columns `stmt`'s sort keys read, as indexes into `columns`;
 /// every one of them when its names do not say all it reads
 pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec<usize> {
     let mut inputs = Vec::new();
@@ -1498,7 +1517,8 @@ impl Executor {
         let written_items = branch.columns.len();
         let (branch, branch_classification) =
             match Self::with_distinct_on_items(branch, &classification) {
-                Some(keyed) => {
+                Some(mut keyed) => {
+                    Self::bind_outer_items(&mut keyed, written_items, ctx);
                     keyed_stmt = keyed;
                     keyed_classification = get_classification(&keyed_stmt);
                     (&keyed_stmt, &keyed_classification)
@@ -1547,11 +1567,15 @@ impl Executor {
         let prepared_visible = prepared_visible.or(visible);
 
         // Count expected SELECT columns (before any extra ORDER BY columns).
-        // Beside a star the count is unknown, but the only columns past
-        // the visible ones are then the window functions ORDER BY had
-        // computed for it, so those are counted off the end
+        // Beside a star the count is unknown: the layout says which columns
+        // a SELECT item gives; without one, the only columns past the
+        // visible ones are the window functions ORDER BY had computed for
+        // it, so those are counted off the end
         let expected_columns =
             match prepared_visible.unwrap_or_else(|| self.count_select_columns(stmt)) {
+                0 if stmt.set_operations.is_empty() && layout.is_some() => {
+                    layout.as_deref().map_or(0, |l| l.shown(written_items))
+                }
                 0 if hidden_windows + hidden_keys > 0 => {
                     let hidden = hidden_windows + hidden_keys;
                     if hidden > 0 {
@@ -1916,7 +1940,7 @@ impl Executor {
 
                 // Apply DISTINCT ON if active
                 if has_distinct_on {
-                    result = Self::distinct_on_result(stmt, result, item_layout, expected_columns)?;
+                    result = self.distinct_on_result(stmt, result, item_layout, ctx)?;
 
                     // Remove extra columns after DISTINCT ON dedup
                     if needs_extra_col_removal {
@@ -2014,7 +2038,7 @@ impl Executor {
         // columns not in SELECT (they may be among the extra ORDER BY columns or
         // the full source columns).
         if !stmt.distinct_on.is_empty() {
-            result = Self::distinct_on_result(stmt, result, item_layout, expected_columns)?;
+            result = self.distinct_on_result(stmt, result, item_layout, ctx)?;
         }
 
         // Remove extra ORDER BY columns that were added for sorting
@@ -2031,48 +2055,97 @@ impl Executor {
         Ok(result)
     }
 
-    /// `result` deduplicated on `stmt`'s DISTINCT ON keys, each read from the
-    /// column `resolve_distinct_on_indices` binds it to
+    /// `result` deduplicated on `stmt`'s DISTINCT ON keys, each bound and
+    /// read as an ORDER BY key is: from the column holding it, else computed
+    /// for each row as the sort computes one
     fn distinct_on_result(
+        &self,
         stmt: &SelectStatement,
-        result: Box<dyn QueryResult>,
+        mut result: Box<dyn QueryResult>,
         layout: Option<&OutputLayout>,
-        visible: usize,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let columns = result.columns().to_vec();
-        let visible = if visible == 0 { columns.len() } else { visible };
-        // An item's column by the layout; without one, counted from the front,
-        // or from the end of the visible columns for one after every star
-        let item_column = |key: &Expression| {
-            let item = Self::item_computing(stmt, key)?;
-            if let Some(layout) = layout {
-                return layout.item_position(item);
-            }
-            let first_star = stmt.columns.iter().position(is_star_item);
-            let last_star = stmt.columns.iter().rposition(is_star_item);
-            match (first_star, last_star) {
-                (Some(first), Some(last)) if first < item && item < last => None,
-                (_, Some(last)) if last < item => visible.checked_sub(stmt.columns.len() - item),
-                _ => Some(item),
-            }
-        };
-        let indices = Self::resolve_distinct_on_indices(
-            &stmt.distinct_on,
+        let columns = CompactArc::new(result.columns().to_vec());
+        let set_operation = !stmt.set_operations.is_empty();
+        // A set operation's rows keep where its first branch put its items,
+        // which the layout says; only without one do output names stand
+        let (mut mapped, mut slots) = self.key_columns(
+            stmt,
+            stmt.distinct_on.iter(),
             &columns,
-            Some(&stmt.columns),
-            &item_column,
+            layout,
+            set_operation && layout.is_none(),
         );
-        let indices = stmt
-            .distinct_on
-            .iter()
-            .zip(indices)
-            .map(|(key, index)| {
-                index.ok_or_else(|| {
-                    Error::invalid_argument(format!("DISTINCT ON key {key} names no column"))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Box::new(DistinctOnResult::new(result, indices)))
+        // A position names one of the columns the SELECT list shows
+        let shown = layout.map_or(columns.len(), |l| l.shown(stmt.columns.len()));
+        for (column, key) in mapped.iter_mut().zip(&stmt.distinct_on) {
+            if let Expression::IntegerLiteral(lit) = key {
+                *column = column.filter(|&c| lit.value >= 1 && c < shown);
+            }
+        }
+        if let Some(indices) = mapped.iter().copied().collect::<Option<Vec<_>>>() {
+            return Ok(Box::new(DistinctOnResult::new(result, indices)));
+        }
+        if let Some(layout) = layout {
+            visit_order_by_inputs(stmt, &mut |column, key| {
+                if let Some(position) = layout.position(&key) {
+                    slots.entry(ExprKey::of(column)).or_insert(position);
+                }
+            });
+        }
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+        evaluator.init_columns(&columns);
+        evaluator.add_aggregate_aliases(&slots);
+        // Each key no column holds is computed into a column appended to the
+        // row, which the dedup reads and the projection below drops
+        let width = columns.len();
+        let mut programs: Vec<SharedProgram> = Vec::new();
+        let mut indices = Vec::with_capacity(mapped.len());
+        for (key, column) in stmt.distinct_on.iter().zip(mapped) {
+            if let Some(column) = column {
+                indices.push(column);
+                continue;
+            }
+            // A set operation's branch carries no key column for its rows
+            if set_operation || matches!(bind_order_key(key, stmt), OrderKey::Ordinal(_)) {
+                return Err(Error::invalid_argument(format!(
+                    "DISTINCT ON key {key} names no column"
+                )));
+            }
+            let key = match Self::has_subqueries(key) && !Self::has_correlated_subqueries(key) {
+                true => std::borrow::Cow::Owned(self.process_where_subqueries(key, ctx)?),
+                false => std::borrow::Cow::Borrowed(key),
+            };
+            indices.push(width + programs.len());
+            programs.push(evaluator.compile_cached(&key)?);
+        }
+        let mut rows = RowVec::new();
+        let mut row_id = 0i64;
+        while result.next() {
+            let mut row = result.take_row();
+            for program in &programs {
+                let value = evaluator.evaluate_program(program, &row)?;
+                row.push(value);
+            }
+            rows.push((row_id, row));
+            row_id += 1;
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
+        let mut keyed_columns = columns.to_vec();
+        keyed_columns.extend(
+            stmt.distinct_on
+                .iter()
+                .zip(&indices)
+                .filter(|&(_, &index)| index >= width)
+                .map(|(key, _)| ExprKey::of(key).hidden_column_name()),
+        );
+        let keyed = Box::new(ExecutorResult::new(keyed_columns, rows));
+        Ok(Box::new(ProjectedResult::new(
+            Box::new(DistinctOnResult::new(keyed, indices)),
+            width,
+        )))
     }
 
     /// The SELECT item computing `key`, aliased or not
@@ -2149,134 +2222,6 @@ impl Executor {
             columns,
             ..stmt.clone()
         })
-    }
-
-    /// Resolve DISTINCT ON expressions to column indices in the result set,
-    /// None for a key no column holds; a key carried as a hidden column is
-    /// found by its identity.
-    /// Also checks original SELECT expressions to handle aliased columns
-    /// (e.g., `SELECT DISTINCT ON (customer) customer AS c` — matches `customer`
-    /// against the original identifier behind the `c` alias).
-    fn resolve_distinct_on_indices(
-        distinct_on: &[Expression],
-        result_columns: &[String],
-        select_exprs: Option<&[Expression]>,
-        item_column: &dyn Fn(&Expression) -> Option<usize>,
-    ) -> Vec<Option<usize>> {
-        distinct_on
-            .iter()
-            .map(|expr| {
-                let hidden = || {
-                    let key = ExprKey::of(expr);
-                    result_columns
-                        .iter()
-                        .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
-                };
-                let bound = match expr {
-                    Expression::Identifier(id) => {
-                        // First: direct match against result column names
-                        let direct = result_columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&id.value_lower));
-                        if direct.is_some() {
-                            return direct;
-                        }
-                        // Second: check if any SELECT expression is an alias over this identifier
-                        if let Some(sel_exprs) = select_exprs {
-                            for (i, sel) in sel_exprs.iter().enumerate() {
-                                if let Expression::Aliased(aliased) = sel {
-                                    match &*aliased.expression {
-                                        Expression::Identifier(sel_id)
-                                            if sel_id.value_lower == id.value_lower =>
-                                        {
-                                            return Some(i);
-                                        }
-                                        Expression::QualifiedIdentifier(qid)
-                                            if qid.name.value_lower == id.value_lower =>
-                                        {
-                                            return Some(i);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    }
-                    Expression::QualifiedIdentifier(qi) => {
-                        // Match table.column — try full qualified name first
-                        let full = format!("{}.{}", qi.qualifier.value, qi.name.value);
-                        let qualified_match = result_columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&full));
-                        if qualified_match.is_some() {
-                            return qualified_match;
-                        }
-                        // Second: check SELECT expressions for the source column behind
-                        // aliases or projections (e.g., c.name AS customer, or bare c.name
-                        // projected as "name")
-                        if let Some(sel_exprs) = select_exprs {
-                            for (i, sel) in sel_exprs.iter().enumerate() {
-                                match sel {
-                                    Expression::QualifiedIdentifier(sel_qi)
-                                        if sel_qi.qualifier.value_lower
-                                            == qi.qualifier.value_lower
-                                            && sel_qi.name.value_lower == qi.name.value_lower =>
-                                    {
-                                        return Some(i);
-                                    }
-                                    Expression::Aliased(aliased) => {
-                                        if let Expression::QualifiedIdentifier(sel_qi) =
-                                            &*aliased.expression
-                                        {
-                                            if sel_qi.qualifier.value_lower
-                                                == qi.qualifier.value_lower
-                                                && sel_qi.name.value_lower == qi.name.value_lower
-                                            {
-                                                return Some(i);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        // Last resort: unqualified only if unambiguous (exactly one match)
-                        let unqualified_matches: Vec<usize> = result_columns
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, c)| c.eq_ignore_ascii_case(&qi.name.value))
-                            .map(|(i, _)| i)
-                            .collect();
-                        if unqualified_matches.len() == 1 {
-                            Some(unqualified_matches[0])
-                        } else {
-                            None
-                        }
-                    }
-                    Expression::IntegerLiteral(lit) => {
-                        // 1-based positional reference
-                        let pos = lit.value as usize;
-                        if pos >= 1 && pos <= result_columns.len() {
-                            Some(pos - 1)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => {
-                        // The SELECT column computing the same expression, else the
-                        // hidden column carried for it, as ORDER BY reads them
-                        let key = ExprKey::of(expr);
-                        item_column(expr).or_else(|| {
-                            result_columns
-                                .iter()
-                                .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
-                        })
-                    }
-                };
-                bound.or_else(hidden)
-            })
-            .collect()
     }
 
     /// Count the number of columns in the SELECT clause
@@ -2730,11 +2675,11 @@ impl Executor {
         // For t.*, check if all ORDER BY columns are covered by the qualified star
         let has_qualified_star = stmt.columns.iter().any(|c| {
             if let Expression::QualifiedStar(qs) = c {
-                // Check if ORDER BY columns match this qualifier
-                stmt.order_by.iter().all(|ob| {
-                    if let Expression::QualifiedIdentifier(qid) = &ob.expression {
+                // Check if the sort keys match this qualifier
+                sort_keys(stmt).all(|key| {
+                    if let Expression::QualifiedIdentifier(qid) = key {
                         qid.qualifier.value_lower == qs.qualifier.to_lowercase()
-                    } else if let Expression::Identifier(_) = &ob.expression {
+                    } else if let Expression::Identifier(_) = key {
                         // Simple identifier might be covered by qualified star
                         true
                     } else {
@@ -2778,19 +2723,15 @@ impl Executor {
             }
         }
 
-        // A correlated subquery in ORDER BY reads the parent row, all of
+        // A correlated subquery in a sort key reads the parent row, all of
         // it, so every column is carried until the sort has run
-        if stmt
-            .order_by
-            .iter()
-            .any(|ob| Self::has_correlated_subqueries(&ob.expression))
-        {
+        if sort_keys(stmt).any(Self::has_correlated_subqueries) {
             return true;
         }
 
-        // Check if any ORDER BY column is not in SELECT
-        for ob in &stmt.order_by {
-            match &ob.expression {
+        // Check if any ORDER BY or DISTINCT ON key is not in SELECT
+        for key in sort_keys(stmt) {
+            match key {
                 Expression::Identifier(id)
                     if !select_columns.contains(id.value_lower.as_str())
                         && all_columns
@@ -2845,38 +2786,6 @@ impl Executor {
                     }
                 }
                 _ => {}
-            }
-        }
-
-        // Check if any DISTINCT ON column is not in SELECT
-        for expr in &stmt.distinct_on {
-            match expr {
-                Expression::Identifier(id) => {
-                    if !select_columns.contains(id.value_lower.as_str())
-                        && all_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str()))
-                    {
-                        return true;
-                    }
-                }
-                Expression::QualifiedIdentifier(qi) => {
-                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
-                    // For qualified identifiers, only match the fully qualified name
-                    // to avoid ambiguity when both tables have the same column name
-                    if !select_columns.contains(full_name.as_str())
-                        && all_columns.iter().any(|c| {
-                            c.eq_ignore_ascii_case(&full_name)
-                                || c.eq_ignore_ascii_case(qi.name.value_lower.as_str())
-                        })
-                    {
-                        return true;
-                    }
-                }
-                _ => {
-                    // Computed expression (e.g., amount + 0) — always needs extra column
-                    return true;
-                }
             }
         }
 
@@ -7490,7 +7399,8 @@ impl Executor {
                     .map(|a| a.value_lower.as_str());
                 self.filter_rows_by_correlated_where(where_clause, rows, &columns, alias, ctx)?
             } else {
-                let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
+                let where_clause = self.answered_where(where_clause, ctx)?;
+                let where_filter = RowFilter::new(&where_clause, &columns)?.with_context(ctx);
 
                 let mut filtered = RowVec::with_capacity(rows.len());
                 for (id, row) in rows {
@@ -7738,7 +7648,8 @@ impl Executor {
                 )?;
                 result = Box::new(ExecutorResult::new(view_columns.clone(), rows));
             } else {
-                let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
+                let where_clause = self.answered_where(where_clause, ctx)?;
+                let filter = RowFilter::new(&where_clause, &view_columns)?.with_context(ctx);
                 result = Box::new(FilteredResult::from_filter(result, filter));
             }
         }
@@ -11116,24 +11027,35 @@ impl Executor {
                 .map(CompactArc::new)
                 .map_err(|e| Error::internal(format!("Compile error: {}", e)))
         };
-        let sources: Vec<Result<ItemSource>> = select_exprs
-            .iter()
-            .map(|expr| match select_column(expr, &col_index_map_lower) {
-                Some(idx) => idx.map(ItemSource::Column),
-                None => compile(unaliased_item(expr)).map(ItemSource::Program),
-            })
-            .chain(
-                extra_order_indices
-                    .iter()
-                    .map(|&idx| Ok(ItemSource::Column(idx))),
-            )
-            .chain(
-                computed_order_by
-                    .iter()
-                    .chain(&computed_distinct_on)
-                    .map(|expr| compile(expr).map(ItemSource::Program)),
-            )
-            .collect();
+        let mut sources: Vec<Result<ItemSource>> = Vec::with_capacity(select_exprs.len());
+        for expr in select_exprs {
+            match expr {
+                Expression::Star(_) => {
+                    sources.extend((0..all_columns.len()).map(|i| Ok(ItemSource::Column(i))))
+                }
+                Expression::QualifiedStar(star) => for_each_qualified_star_column(
+                    all_columns,
+                    &star.qualifier,
+                    table_alias,
+                    |i, _| sources.push(Ok(ItemSource::Column(i))),
+                ),
+                _ => sources.push(match select_column(expr, &col_index_map_lower) {
+                    Some(idx) => idx.map(ItemSource::Column),
+                    None => compile(unaliased_item(expr)).map(ItemSource::Program),
+                }),
+            }
+        }
+        sources.extend(
+            extra_order_indices
+                .iter()
+                .map(|&idx| Ok(ItemSource::Column(idx))),
+        );
+        sources.extend(
+            computed_order_by
+                .iter()
+                .chain(&computed_distinct_on)
+                .map(|expr| compile(expr).map(ItemSource::Program)),
+        );
         (OrderedProjection::Items(sources), extra_names, layout)
     }
 
@@ -11479,13 +11401,18 @@ impl Executor {
             })
             .collect();
 
-        // Find ORDER BY columns not in SELECT
+        // Find ORDER BY and DISTINCT ON columns not in SELECT
         let mut extra_order_indices: Vec<usize> = Vec::new();
-        // An ORDER BY expression is read from a column of its own, so the
-        // sort has something to read once the projection has run
+        // A key expression is read from a column of its own, so the sort
+        // and DISTINCT ON have something to read once the projection has run
         let mut computed_order_by: Vec<&Expression> = Vec::new();
-        for ob in order_by {
-            match &ob.expression {
+        let mut computed_distinct_on: Vec<&Expression> = Vec::new();
+        let keys = order_by
+            .iter()
+            .map(|ob| (&ob.expression, false))
+            .chain(distinct_on.iter().map(|expr| (expr, true)));
+        for (expr, distinct) in keys {
+            match expr {
                 Expression::Identifier(id)
                     if !select_column_names
                         .iter()
@@ -11534,9 +11461,15 @@ impl Executor {
                     if !select_exprs
                         .iter()
                         .any(|item| ExprKey::of(unaliased_item(item)) == key)
-                        && !computed_order_by.iter().any(|e| ExprKey::of(e) == key)
+                        && !computed_order_by
+                            .iter()
+                            .chain(&computed_distinct_on)
+                            .any(|e| ExprKey::of(e) == key)
                     {
-                        computed_order_by.push(other);
+                        match distinct {
+                            true => computed_distinct_on.push(other),
+                            false => computed_order_by.push(other),
+                        }
                     }
                 }
                 // An expression the sort evaluates carries the input columns
@@ -11556,56 +11489,18 @@ impl Executor {
             }
         }
 
-        // A correlated subquery in ORDER BY reads the parent row, so every
+        // A correlated subquery in a sort key reads the parent row, so every
         // column rides along until the sort has run
         if !computes_subqueries
             && order_by
                 .iter()
-                .any(|ob| Self::has_correlated_subqueries(&ob.expression))
+                .map(|ob| &ob.expression)
+                .chain(distinct_on)
+                .any(Self::has_correlated_subqueries)
         {
             for idx in 0..all_columns.len() {
                 if !extra_order_indices.contains(&idx) {
                     extra_order_indices.push(idx);
-                }
-            }
-        }
-
-        // Find DISTINCT ON columns not in SELECT and not already in extra ORDER BY columns
-        // Also collect computed DISTINCT ON expressions that need evaluation
-        let mut computed_distinct_on: Vec<&Expression> = Vec::new();
-        for expr in distinct_on {
-            match expr {
-                Expression::Identifier(id) => {
-                    if !select_column_names
-                        .iter()
-                        .any(|s| s == id.value_lower.as_str())
-                    {
-                        if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
-                            if !extra_order_indices.contains(&idx) {
-                                extra_order_indices.push(idx);
-                            }
-                        }
-                    }
-                }
-                Expression::QualifiedIdentifier(qi) => {
-                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
-                    // For qualified identifiers, only match against the full qualified name
-                    // in SELECT to avoid ambiguity (e.g., c.name vs p.name)
-                    if !select_column_names.contains(&full_name) {
-                        // Prefer fully qualified lookup to avoid binding to wrong column
-                        let idx_opt = col_index_map_lower
-                            .get(full_name.as_str())
-                            .or_else(|| col_index_map_lower.get(qi.name.value_lower.as_str()));
-                        if let Some(&idx) = idx_opt {
-                            if !extra_order_indices.contains(&idx) {
-                                extra_order_indices.push(idx);
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // Computed expression — needs evaluation and appending
-                    computed_distinct_on.push(expr);
                 }
             }
         }
@@ -11930,6 +11825,19 @@ impl Executor {
         layout: Option<&OutputLayout>,
         set_operation: bool,
     ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
+        let keys = stmt.order_by.iter().map(|ob| &ob.expression);
+        self.key_columns(stmt, keys, columns, layout, set_operation)
+    }
+
+    /// `order_by_columns` for any of `stmt`'s sort keys
+    fn key_columns<'k>(
+        &self,
+        stmt: &SelectStatement,
+        keys: impl Iterator<Item = &'k Expression>,
+        columns: &[String],
+        layout: Option<&OutputLayout>,
+        set_operation: bool,
+    ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
         // Each column by the identity of what computed it: the SELECT
         // list in order (unless a star moves the positions), then the
         // aggregates carried only for this sort
@@ -11988,22 +11896,19 @@ impl Executor {
         // Each ORDER BY item by its binding: an ordinal by position, a
         // plain name by the column the layout says holds what it reads,
         // a name the input lacks or anything else by a column computing it
-        let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
-            let key = bind_order_key(&ob.expression, stmt);
+        let try_map_to_column = |expr: &Expression| -> Option<usize> {
+            let key = bind_order_key(expr, stmt);
             match (&key, layout) {
                 (OrderKey::Ordinal(position), _) => Some(*position),
-                (OrderKey::Expression, _) => find_column_for(&ob.expression),
-                (_, Some(layout)) => layout
-                    .position(&key)
-                    .or_else(|| find_column_for(&ob.expression)),
+                (OrderKey::Expression, _) => find_column_for(expr),
+                (_, Some(layout)) => layout.position(&key).or_else(|| find_column_for(expr)),
                 // A set operation's rows carry only output names
                 (OrderKey::Item(_) | OrderKey::Input(..), None) => {
                     debug_assert!(
                         set_operation,
-                        "rows reached ORDER BY {} without a layout",
-                        ob.expression
+                        "rows reached ORDER BY {expr} without a layout"
                     );
-                    let name = match &ob.expression {
+                    let name = match expr {
                         Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
                         Expression::Identifier(id) => &id.value_lower,
                         _ => return None,
@@ -12012,7 +11917,7 @@ impl Executor {
                 }
             }
         };
-        let mapped = stmt.order_by.iter().map(try_map_to_column).collect();
+        let mapped = keys.map(try_map_to_column).collect();
         (mapped, aggregate_slots)
     }
 
