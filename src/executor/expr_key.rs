@@ -254,14 +254,14 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             write_identifier(&qid.qualifier, hasher);
             write_identifier(&qid.name, hasher);
         }
-        // A GROUP BY keeps a qualified column as its dotted name
+        // A GROUP BY keeps a qualified column as its qualified column text
         Expression::QualifiedIdentifier(qid) => {
             hasher.tag(b'I');
             for c in qid
                 .qualifier
                 .value_lower
                 .chars()
-                .chain(std::iter::once('.'))
+                .chain(std::iter::once(super::utils::QUALIFIER_SEP))
                 .chain(qid.name.value_lower.chars())
                 .flat_map(char::to_lowercase)
             {
@@ -655,9 +655,12 @@ mod tests {
 
     #[test]
     fn test_a_column_key_is_the_identifier_key() {
+        use crate::executor::utils::qualified;
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
-        assert_eq!(ExprKey::column("T.v"), select_key("t.V"));
-        assert_eq!(ExprKey::column("a.Σ"), select_key("a.\"Σ\""));
+        assert_eq!(ExprKey::column(&qualified("T", "v")), select_key("t.V"));
+        assert_eq!(ExprKey::column(&qualified("a", "Σ")), select_key("a.\"Σ\""));
+        // A dotted name is one name, never a qualified column
+        assert_ne!(ExprKey::column("t.v"), select_key("t.v"));
         // A name as the resolver lowers it, a final sigma to its own letter
         assert_ne!(select_key("\"ΟΣ\""), select_key("\"οσ\""));
         assert_ne!(
@@ -680,14 +683,12 @@ mod tests {
                 other => panic!("not a SELECT: {other:?}"),
             }
         };
-        for (a, b) in [
-            ("\"a.b\"", "a.b"),
-            ("\"UPPER\"", "\"upper\""),
-            ("\"v\"", "v"),
-        ] {
+        for (a, b) in [("\"UPPER\"", "\"upper\""), ("\"v\"", "v")] {
             assert_eq!(select_key(a), select_key(b), "{a} and {b} name one column");
             assert_ne!(exact(a), exact(b), "{a} and {b} may read two values");
         }
+        // A quoted dotted name and a qualified column are two columns
+        assert_ne!(select_key("\"a.b\""), select_key("a.b"));
         for (a, b) in [("t.V + 1", "T.v + 1"), ("UPPER(v)", "upper(V)")] {
             assert_eq!(exact(a), exact(b), "{a} and {b} are one expression");
         }

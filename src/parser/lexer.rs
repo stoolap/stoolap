@@ -511,6 +511,12 @@ impl<'a> Lexer<'a> {
             self.last_error =
                 Some("NULL byte (0x00) is not allowed in quoted identifiers".to_string());
         }
+        // It separates a qualifier from a name inside the engine
+        if result.contains(crate::executor::utils::QUALIFIER_SEP) {
+            self.last_error = Some(
+                "the control character U+001F is not allowed in quoted identifiers".to_string(),
+            );
+        }
 
         result
     }

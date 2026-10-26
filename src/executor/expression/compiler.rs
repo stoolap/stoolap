@@ -41,7 +41,8 @@ use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
 use crate::executor::pushdown::read_as_column;
 use crate::executor::utils::{
-    derived_aggregate_column_name, extract_literal_value, string_literal_value, string_to_datatype,
+    derived_aggregate_column_name, extract_literal_value, qualified, split_qualified,
+    string_literal_value, string_to_datatype,
 };
 use crate::executor::volatility::expression_volatility;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
@@ -198,9 +199,8 @@ impl<'a> CompileContext<'a> {
             col_map.insert(lower.clone(), i as u16);
 
             // Handle qualified names (table.column)
-            if let Some(dot_idx) = col.rfind('.') {
-                let table = col[..dot_idx].to_lowercase();
-                let column = col[dot_idx + 1..].to_lowercase();
+            if let Some((table, column)) = split_qualified(&lower) {
+                let (table, column) = (table.to_string(), column.to_string());
                 qualified_map
                     .entry(table)
                     .or_default()
@@ -241,9 +241,8 @@ impl<'a> CompileContext<'a> {
             col_map.insert(lower.clone(), i as u16);
 
             // Handle qualified names (table.column)
-            if let Some(dot_idx) = col.rfind('.') {
-                let table = col[..dot_idx].to_lowercase();
-                let column = col[dot_idx + 1..].to_lowercase();
+            if let Some((table, column)) = split_qualified(&lower) {
+                let (table, column) = (table.to_string(), column.to_string());
 
                 // Track this table as belonging to row2
                 self.row2_tables.insert(table.clone());
@@ -353,7 +352,7 @@ impl<'a> CompileContext<'a> {
         // This distinguishes between `t.id` (outer reference) and `t2.id` (current row).
         // Only if the qualified name is in outer context should we skip the fallback.
         if let Some(ref outer_cols) = self.outer_columns {
-            let qualified_name = format!("{}.{}", table_lower, column_lower);
+            let qualified_name = qualified(&table_lower, &column_lower);
             if outer_cols.contains_key(qualified_name.as_str()) {
                 // Qualified name exists in outer context - don't fall back
                 return None;
@@ -369,12 +368,9 @@ impl<'a> CompileContext<'a> {
     pub(crate) fn reference(&self, expr: &Expression) -> Option<Reference> {
         let found = |source: Option<ColumnSource>| source.map(Reference::Column);
         Some(match expr {
-            Expression::Identifier(id) => match id.value_lower.rfind('.') {
-                Some(dot) => {
-                    let column = &id.value_lower[dot + 1..];
-                    found(self.resolve_qualified(&id.value_lower[..dot], column))
-                        .or_else(|| self.resolve_outer_column(column).map(Reference::Outer))
-                }
+            Expression::Identifier(id) => match split_qualified(&id.value_lower) {
+                Some((table, column)) => found(self.resolve_qualified(table, column))
+                    .or_else(|| self.resolve_outer_column(column).map(Reference::Outer)),
                 None => found(self.resolve_column(&id.value_lower)).or_else(|| {
                     self.resolve_outer_column(&id.value_lower)
                         .map(Reference::Outer)
@@ -390,7 +386,7 @@ impl<'a> CompileContext<'a> {
                 // hold an inner row's column of the same name
                 found(self.resolve_qualified(table, column))
                     .or_else(|| {
-                        self.resolve_outer_column(&format!("{table}.{column}"))
+                        self.resolve_outer_column(&qualified(table, column))
                             .or_else(|| self.resolve_outer_column(column))
                             .map(Reference::Outer)
                     })

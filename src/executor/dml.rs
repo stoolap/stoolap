@@ -38,7 +38,7 @@ use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::query_cache::{CompiledConflictInsert, CompiledExecution, CompiledInsert};
 use super::result::{ExecResult, ExecutorResult};
-use super::utils::dummy_token_clone;
+use super::utils::{dummy_token_clone, qualified};
 use super::Executor;
 use std::sync::RwLock;
 
@@ -2716,7 +2716,7 @@ impl Executor {
                         .iter()
                         .map(|col_lower| {
                             let qualified =
-                                CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                                CompactArc::from(qualified(table_name, col_lower).as_str());
                             (CompactArc::from(col_lower.as_str()), qualified)
                         })
                         .collect()
@@ -2801,8 +2801,7 @@ impl Executor {
             let col_name_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = column_names_lower
                 .iter()
                 .map(|col_lower| {
-                    let qualified =
-                        CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                    let qualified = CompactArc::from(qualified(table_name, col_lower).as_str());
                     (CompactArc::from(col_lower.as_str()), qualified)
                 })
                 .collect();
@@ -3052,8 +3051,7 @@ impl Executor {
                     .column_names_lower_arc()
                     .iter()
                     .map(|col_lower| {
-                        let qualified =
-                            CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                        let qualified = CompactArc::from(qualified(table_name, col_lower).as_str());
                         (CompactArc::from(col_lower.as_str()), qualified)
                     })
                     .collect()
@@ -3545,7 +3543,7 @@ impl Executor {
             // OPTIMIZATION: Only build when needed (memory filter or RETURNING)
             let column_names_with_prefix: Vec<String> = column_names_owned
                 .iter()
-                .map(|c| format!("{}.{}", effective_name, c))
+                .map(|c| qualified(effective_name, c))
                 .collect();
 
             // Create evaluator for WHERE filtering
@@ -3646,11 +3644,9 @@ impl Executor {
                 .iter()
                 .map(|col_lower| {
                     let effective_qualified =
-                        CompactArc::from(format!("{}.{}", effective_name, col_lower).as_str());
+                        CompactArc::from(qualified(effective_name, col_lower).as_str());
                     let table_qualified = if effective_name != table_name {
-                        Some(CompactArc::from(
-                            format!("{}.{}", table_name, col_lower).as_str(),
-                        ))
+                        Some(CompactArc::from(qualified(table_name, col_lower).as_str()))
                     } else {
                         None
                     };
@@ -3994,7 +3990,7 @@ impl Executor {
         // Build EXCLUDED column name list for the second row source.
         let excluded_columns: Vec<String> = column_names
             .iter()
-            .map(|c| format!("excluded.{}", c))
+            .map(|c| qualified("excluded", c))
             .collect();
 
         // Compile each update expression with EXCLUDED as the second row source.

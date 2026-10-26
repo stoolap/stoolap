@@ -454,10 +454,12 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
             "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT t.grp) DESC",
             "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a DESC",
         ),
+        // A dotted name is one name, which no column has: its text
         (
             "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a \
              ORDER BY (SELECT \"t.grp\" + 0 * t.a), t.a DESC",
-            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a \
+             ORDER BY (SELECT 't.grp' + 0 * t.a), t.a DESC",
         ),
     ] {
         assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");

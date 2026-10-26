@@ -1312,8 +1312,9 @@ mod tests {
         .into_iter()
         .map(|(k, w)| Row::from_values(vec![k, Value::integer(w)]))
         .collect();
-        let left_cols = vec!["a.k".to_string(), "a.v".to_string()];
-        let right_cols = vec!["b.k".to_string(), "b.w".to_string()];
+        use crate::executor::utils::qualified;
+        let left_cols = vec![qualified("a", "k"), qualified("a", "v")];
+        let right_cols = vec![qualified("b", "k"), qualified("b", "w")];
         let ctx = ExecutionContext::new();
         let executor = JoinExecutor::new();
         let mut cases = 0;
