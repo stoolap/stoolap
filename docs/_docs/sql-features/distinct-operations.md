@@ -177,6 +177,8 @@ ORDER BY region, category, sale_date;
 
 A key may be a column, a SELECT alias or position, or any expression, including one the SELECT list does not compute. A key that is not a SELECT alias or position is computed for each row as a SELECT item would be: in a query with GROUP BY, aggregates or window functions it may read the GROUP BY items and aggregates, and under ROLLUP, CUBE or GROUPING SETS a rolled-up item reads NULL, whether or not the SELECT list shows them. In the first SELECT of a UNION, INTERSECT or EXCEPT, a key is a column, a SELECT alias or position, or an expression the SELECT list computes. A name that no column or SELECT item answers is an error.
 
+A key reads its names as an ORDER BY key does: a bare name that is a SELECT alias over anything but that column reads the alias, any other name reads the column of the FROM, and a name inside an expression reads the FROM's column first and a SELECT alias only when the FROM has none. A qualified name the FROM does not show is the enclosing query's column, one value for the whole subquery. This holds over a table, a view, a derived table, a CTE or a join, beside `*` or `t.*`, with or without a WHERE subquery, and in a prepared statement.
+
 ```sql
 -- First region per parity of its total, grouped
 SELECT DISTINCT ON (SUM(amount) % 2) region, SUM(amount)

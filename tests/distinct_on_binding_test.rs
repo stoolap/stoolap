@@ -1,0 +1,274 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A DISTINCT ON key is bound as an ORDER BY key is: it answers as the same
+//! query whose key is written out, over every source, select list, pipeline,
+//! nesting and prepared run
+
+use std::collections::BTreeMap;
+use stoolap::Database;
+
+fn setup(db: &Database) {
+    for sql in [
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, b INTEGER)",
+        "INSERT INTO parent VALUES (1, 5), (2, 7)",
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO child VALUES (1, 1, 100), (2, 2, 0), (3, 3, 50), (4, 1, 70)",
+        "CREATE TABLE side (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO side VALUES (1, 1), (2, 2), (3, 3)",
+        "CREATE VIEW cv AS SELECT id, a, b FROM child",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+}
+
+type Rows = Result<Vec<Vec<String>>, String>;
+
+fn collect(rows: stoolap::Result<stoolap::Rows>) -> Rows {
+    let mut out = Vec::new();
+    for row in rows.map_err(|e| e.to_string())? {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push(
+            (0..row.len())
+                .map(|i| format!("{:?}", row.get_value(i)))
+                .collect(),
+        );
+    }
+    Ok(out)
+}
+
+/// The answer run directly, and run twice as a prepared statement
+fn runs(db: &Database, sql: &str) -> [(&'static str, Rows); 3] {
+    let prepared = db.prepare(sql).map_err(|e| e.to_string());
+    let run = || match &prepared {
+        Ok(stmt) => collect(stmt.query(())),
+        Err(e) => Err(e.clone()),
+    };
+    [
+        ("direct", collect(db.query(sql, ()))),
+        ("prepared", run()),
+        ("prepared again", run()),
+    ]
+}
+
+/// (name, WITH clause, FROM)
+const SOURCES: [(&str, &str, &str); 5] = [
+    ("table", "", "child AS c"),
+    ("derived", "", "(SELECT * FROM child) AS c"),
+    ("view", "", "cv AS c"),
+    ("cte", "WITH w AS (SELECT * FROM child) ", "w AS c"),
+    ("join", "", "child AS c JOIN side AS s ON s.k = c.a"),
+];
+
+/// The general pipeline, and the blocks' one a WHERE subquery takes
+const FILTERS: [(&str, &str); 2] = [
+    ("general", ""),
+    ("blocks", " WHERE c.id > (SELECT MIN(id) FROM child) - 1"),
+];
+
+/// (name, items, DISTINCT ON key, the key written out over the input)
+const SHAPES: [(&str, &str, &str, &str); 17] = [
+    ("column", "c.b", "c.a", "c.a"),
+    ("bare column", "c.b", "a", "c.a"),
+    ("computed", "c.b", "c.a % 2", "c.a % 2"),
+    ("computed twice read", "c.b", "c.a + c.id * 0", "c.a"),
+    ("selected computed", "c.a % 2, c.b", "c.a % 2", "c.a % 2"),
+    ("aliased computed", "c.a % 2 AS m", "c.a % 2", "c.a % 2"),
+    ("alias", "c.a % 2 AS q, c.b", "q", "c.a % 2"),
+    (
+        "alias in expression",
+        "c.a % 2 AS q, c.b",
+        "q + 0",
+        "c.a % 2",
+    ),
+    (
+        "alias over a column name",
+        "c.a % 2 AS a, c.b",
+        "a",
+        "c.a % 2",
+    ),
+    ("ordinal", "c.a % 2, c.b", "1", "c.a % 2"),
+    ("star", "*", "c.a % 2", "c.a % 2"),
+    ("item then star", "c.b, *", "c.a % 2", "c.a % 2"),
+    ("qualified star", "c.*", "c.a % 2", "c.a % 2"),
+    (
+        "star then computed",
+        "*, c.a % 2 AS m",
+        "c.a % 2",
+        "c.a % 2",
+    ),
+    ("enclosing", "c.b", "p.b + c.a % 2", "c.a % 2"),
+    // A windowed statement computes its key as a hidden item
+    (
+        "windowed computed",
+        "ROW_NUMBER() OVER () * 0 + c.b",
+        "c.a % 2",
+        "c.a % 2",
+    ),
+    (
+        "windowed enclosing",
+        "ROW_NUMBER() OVER () * 0 + c.b",
+        "p.b + c.a % 2",
+        "c.a % 2",
+    ),
+];
+
+/// Where the query stands: alone, as a derived table, or as scalar subqueries
+const NESTINGS: [&str; 3] = ["top", "derived", "scalar"];
+
+fn query(head: &str, items: &str, from: &str, filter: &str, order: &str, tail: &str) -> String {
+    format!("SELECT DISTINCT ON ({head}) {items} FROM {from}{filter} ORDER BY {order}, c.id{tail}")
+}
+
+#[test]
+fn a_distinct_on_key_answers_as_its_written_out_key() {
+    let db = Database::open("memory://distinct_on_binding").unwrap();
+    setup(&db);
+    let mut wrong: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut cases = 0;
+    for (source, with, from) in SOURCES {
+        // The written out key over the table itself, or the join itself
+        let base_from = if from.contains("JOIN") {
+            from
+        } else {
+            "child AS c"
+        };
+        for (name, items, key, written) in SHAPES {
+            let enclosing = key.contains("p.");
+            // A star written out as its columns
+            let star = if from.contains("JOIN") {
+                "c.id, c.a, c.b, s.id, s.k"
+            } else {
+                "c.id, c.a, c.b"
+            };
+            let base_items = items
+                .split(", ")
+                .map(|item| match item {
+                    "*" => star,
+                    "c.*" => "c.id, c.a, c.b",
+                    other => other,
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let base =
+                collect(db.query(&query(written, &base_items, base_from, "", written, ""), ()))
+                    .unwrap_or_else(|e| panic!("{name} base: {e}"));
+            for (pipeline, filter) in FILTERS {
+                for nesting in NESTINGS {
+                    let single = !items.contains(", ") && !matches!(items, "*" | "c.*");
+                    let (sql, want) = match nesting {
+                        "top" if !enclosing => (
+                            format!("{with}{}", query(key, items, from, filter, written, "")),
+                            sorted(base.clone(), false),
+                        ),
+                        "derived" if !enclosing => (
+                            format!(
+                                "{with}SELECT * FROM ({}) AS d",
+                                query(key, items, from, filter, written, "")
+                            ),
+                            sorted(base.clone(), true),
+                        ),
+                        "scalar" if single => {
+                            let one = |offset: usize| {
+                                format!(
+                                    "({})",
+                                    query(
+                                        key,
+                                        items,
+                                        from,
+                                        filter,
+                                        written,
+                                        &format!(" LIMIT 1 OFFSET {offset}")
+                                    )
+                                )
+                            };
+                            let row: Vec<String> = (0..3)
+                                .map(|i| {
+                                    base.get(i)
+                                        .map_or("Some(Null(Null))".into(), |r| r[0].clone())
+                                })
+                                .collect();
+                            (
+                                format!(
+                                    "{with}SELECT {}, {}, {} FROM parent AS p ORDER BY p.id",
+                                    one(0),
+                                    one(1),
+                                    one(2)
+                                ),
+                                vec![row.clone(), row],
+                            )
+                        }
+                        _ => continue,
+                    };
+                    for (run, got) in runs(&db, &sql) {
+                        cases += 1;
+                        let got = got.map(|rows| sorted(rows, nesting == "derived"));
+                        if got.as_ref() != Ok(&want) {
+                            wrong
+                                .entry(format!("{name:<24} {nesting:<7} {pipeline}"))
+                                .or_default()
+                                .push(format!("{source} {run}: {got:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let total: usize = wrong.values().map(Vec::len).sum();
+    let table: Vec<String> = wrong
+        .iter()
+        .map(|(shape, runs)| {
+            format!(
+                "{:>2}  {shape}\n      {}",
+                runs.len(),
+                runs.join("\n      ")
+            )
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{total} of {cases} wrong:\n{}",
+        table.join("\n")
+    );
+}
+
+#[test]
+fn a_position_outside_the_list_names_no_column() {
+    let db = Database::open("memory://distinct_on_binding_position").unwrap();
+    setup(&db);
+    for (_, with, from) in SOURCES {
+        for (_, filter) in FILTERS {
+            for position in ["0", "3"] {
+                let sql = format!(
+                    "{with}{}",
+                    query(position, "c.a % 2, c.b", from, filter, "c.a % 2", "")
+                );
+                for (run, got) in runs(&db, &sql) {
+                    assert!(
+                        got.as_ref().is_err_and(|e| e.contains("names no column")),
+                        "{sql} ({run}) answered {got:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The rows, in order when the query fixes it
+fn sorted(mut rows: Vec<Vec<String>>, unordered: bool) -> Vec<Vec<String>> {
+    if unordered {
+        rows.sort();
+    }
+    rows
+}

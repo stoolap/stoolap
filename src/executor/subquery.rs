@@ -131,6 +131,22 @@ struct IndexNestedLoopInfo {
 }
 
 impl Executor {
+    /// A WHERE over rows a source already gave, its subqueries that read no
+    /// row answered first, so a row filter can compile it; one that reads
+    /// the row is left for the per-row path
+    pub(crate) fn answered_where<'w>(
+        &self,
+        where_clause: &'w Expression,
+        ctx: &ExecutionContext,
+    ) -> Result<std::borrow::Cow<'w, Expression>> {
+        if Self::has_subqueries(where_clause) && !Self::has_correlated_subqueries(where_clause) {
+            return self
+                .process_where_subqueries(where_clause, ctx)
+                .map(std::borrow::Cow::Owned);
+        }
+        Ok(std::borrow::Cow::Borrowed(where_clause))
+    }
+
     /// Process subqueries in WHERE clause, replacing EXISTS with boolean literals
     ///
     /// This function walks the expression tree and executes any EXISTS subqueries,
@@ -3452,11 +3468,14 @@ impl Executor {
             }
         }
 
-        // So does an ORDER BY, which decides what a LIMIT keeps
+        // So does an ORDER BY, which decides what a LIMIT keeps, and a
+        // DISTINCT ON, which decides which rows stay
         if subquery
             .order_by
             .iter()
-            .any(|o| Self::references_outer_columns(&o.expression, &subquery_tables))
+            .map(|o| &o.expression)
+            .chain(&subquery.distinct_on)
+            .any(|e| Self::references_outer_columns(e, &subquery_tables))
         {
             return true;
         }
@@ -3535,6 +3554,31 @@ impl Executor {
             having: having.map(Box::new),
             ..subquery.clone()
         })
+    }
+
+    /// `stmt`'s items from `first` on, the hidden items a DISTINCT ON key
+    /// runs as, bound to the parent row as `bind_outer_references` binds
+    /// what a subquery selects; the keys keep their names, which find them
+    pub(crate) fn bind_outer_items(
+        stmt: &mut SelectStatement,
+        first: usize,
+        ctx: &ExecutionContext,
+    ) {
+        let Some(outer_row) = ctx.outer_row() else {
+            return;
+        };
+        let tables = Self::collect_subquery_table_columns(stmt);
+        let tables: Vec<&str> = tables.iter().map(|table| table.as_str()).collect();
+        let scope = super::utils::InnerScope {
+            tables: &tables,
+            schema: None,
+        };
+        let mut bound: Vec<Expression> = stmt.columns[first..]
+            .iter()
+            .map(|item| super::utils::substitute_outer_references_in_scope(item, outer_row, &scope))
+            .collect();
+        stmt.columns.truncate(first);
+        stmt.columns.append(&mut bound);
     }
 
     /// Collect table/alias names from a subquery's FROM clause

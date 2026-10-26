@@ -622,16 +622,9 @@ impl Executor {
 
         // Apply WHERE clause filter
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            // Process subqueries in WHERE clause (e.g., IN subqueries on CTEs)
-            // Use cached classification to avoid AST traversal; a correlated
-            // one is evaluated per row below
-            let processed_where = if classification.where_has_subqueries
-                && !Self::has_correlated_subqueries(where_clause)
-            {
-                self.process_where_subqueries(where_clause, ctx)?
-            } else {
-                (**where_clause).clone()
-            };
+            // Process subqueries in WHERE clause (e.g., IN subqueries on CTEs);
+            // a correlated one is evaluated per row below
+            let processed_where = self.answered_where(where_clause, ctx)?.into_owned();
             // A parent row's column named through its own table is bound
             // first, or the bare name it would fall back to could be the
             // CTE's own

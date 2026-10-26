@@ -249,7 +249,7 @@ fn test_grouped_items_mixing_correlated_and_uncorrelated() {
 fn test_distinct_on_expression() {
     site(
         "site_distinct_on",
-        Fails("step 4"),
+        Right,
         "SELECT DISTINCT ON (a + (SELECT COUNT(*) FROM u)) a FROM t ORDER BY a + (SELECT COUNT(*) FROM u), id",
         "SELECT DISTINCT ON (a + 3) a FROM t ORDER BY a + 3, id",
     );
