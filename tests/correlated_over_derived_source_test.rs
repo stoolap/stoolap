@@ -222,8 +222,15 @@ fn test_a_view_source_binds_two_parent_columns() {
     assert_eq!(
         ids(
             &db,
-            "SELECT id FROM x WHERE EXISTS (SELECT 1 FROM vy v JOIN y ON y.id = v.id WHERE v.a = x.a AND y.b = x.b) ORDER BY id"
+            "SELECT id FROM x WHERE EXISTS (SELECT 1 FROM vy v JOIN y ON y.a = v.a AND y.b = v.b WHERE v.a = x.a AND y.b = x.b) ORDER BY id"
         ),
         [2]
+    );
+    // vy has no id, over a join as over the view alone
+    let unknown = "SELECT id FROM x WHERE EXISTS (SELECT 1 FROM vy v JOIN y ON y.id = v.id WHERE v.a = x.a AND y.b = x.b)";
+    assert_eq!(
+        db.query(unknown, ()).err().map(|e| e.to_string()),
+        Some("column 'v.id' not found".to_string()),
+        "{unknown}"
     );
 }

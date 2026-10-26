@@ -177,11 +177,43 @@ impl<'a> Family<'a> {
                 }
             }
             Some(Expression::SubquerySource(derived)) => self.derived(&derived.subquery),
+            Some(Expression::JoinSource(join)) => self.join_from(join),
             some => {
                 self.blocks.borrow_mut().push(Self::one_table(some)?);
                 Ok(())
             }
         }
+    }
+
+    /// A join in the FROM of a block or of a derived table in one, which
+    /// the block runs as a statement of its own: each side a source a
+    /// derived table reads, each subquery in it a derived table of its own
+    fn join_from(&self, join: &'a JoinTableSource) -> std::result::Result<(), OutOfFamily> {
+        let mut nested = Vec::new();
+        for side in [&*join.left, &*join.right] {
+            match side {
+                Expression::JoinSource(join) => self.join_from(join)?,
+                Expression::SubquerySource(derived) => self.derived(&derived.subquery)?,
+                Expression::ValuesSource(values) => values
+                    .rows
+                    .iter()
+                    .flatten()
+                    .for_each(|e| nested_statements(e, &mut nested)),
+                Expression::FunctionTableSource(function) => function
+                    .arguments
+                    .iter()
+                    .for_each(|e| nested_statements(e, &mut nested)),
+                side => match Self::one_table(Some(side)) {
+                    Ok(ts) => self.blocks.borrow_mut().push(ts),
+                    Err("FROM reads AS OF") => return Err("a join side read AS OF"),
+                    Err(_) => return Err("a join side the family does not read"),
+                },
+            }
+        }
+        if let Some(on) = join.condition.as_deref() {
+            nested_statements(on, &mut nested);
+        }
+        nested.into_iter().try_for_each(|s| self.derived(s))
     }
 
     /// A derived table in a block's FROM, which runs as a statement of its
@@ -216,10 +248,21 @@ impl<'a> Family<'a> {
                     .for_each(|e| nested_statements(e, &mut nested));
             }
             Some(Expression::SubquerySource(derived)) => self.derived(&derived.subquery)?,
+            Some(Expression::JoinSource(join)) => {
+                // A star over a join is named only by its run
+                if stmt
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c, Expression::Star(_)))
+                {
+                    return Err("a derived table selecting * over a join");
+                }
+                self.join_from(join)?
+            }
             some => match Self::one_table(some) {
                 Ok(ts) => self.blocks.borrow_mut().push(ts),
                 Err("FROM reads AS OF") => return Err("a derived table read AS OF"),
-                Err(_) => return Err("a derived table over a join"),
+                Err(_) => return Err("a derived table over a source the family does not read"),
             },
         }
         for branch in &stmt.set_operations {
@@ -641,9 +684,17 @@ impl<'a> Family<'a> {
         }
         self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
+        let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
+        // Only its run knows how wide a star over a join merging columns is
+        if sq.table_expr.as_deref().is_some_and(merges_columns)
+            && sq.columns.iter().any(star)
+            && crate::parser::scope::order_position_outside(sq, Some(0)).is_some()
+        {
+            return Err("an EXISTS ordered by position in a star over a NATURAL or USING join");
+        }
         let mut found = false;
         for column in &sq.columns {
-            if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
+            if !star(column) {
                 self.expression(unaliased(column), scopes, list_site(sq), &mut found)?;
             }
         }
@@ -654,6 +705,19 @@ impl<'a> Family<'a> {
             }
             None => Ok(()),
         }
+    }
+}
+
+/// Whether `from` holds a NATURAL or USING join, whose run merges columns
+fn merges_columns(from: &Expression) -> bool {
+    match from {
+        Expression::JoinSource(join) => {
+            join.join_type.to_uppercase().contains("NATURAL")
+                || !join.using_columns.is_empty()
+                || merges_columns(&join.left)
+                || merges_columns(&join.right)
+        }
+        _ => false,
     }
 }
 
@@ -1076,6 +1140,72 @@ impl ScopeTable {
         }
     }
 
+    /// The scope of a join of `left` and `right`: their tables side by side,
+    /// the right's columns after the left's
+    fn beside(left: Self, right: Self) -> Self {
+        let offset = left.columns.len();
+        let mut tables = left.tables;
+        tables.extend(
+            right
+                .tables
+                .into_iter()
+                .map(|(name, at)| (name, at + offset)),
+        );
+        let joined = |left: &[String], right: &[String]| {
+            CompactArc::new(left.iter().chain(right).cloned().collect::<Vec<_>>())
+        };
+        Self {
+            tables,
+            columns: joined(&left.columns, &right.columns),
+            lower: joined(&left.lower, &right.lower),
+            types: left.types.into_iter().chain(right.types).collect(),
+        }
+    }
+
+    /// This scope read by position, as `joined`'s is: a name two of its
+    /// tables share binds the one its qualifier names, never the first
+    fn by_position(&self) -> Self {
+        let width = self.lower.len();
+        Self {
+            tables: self.tables.clone(),
+            columns: CompactArc::new((0..width).map(|i| format!("{RESOLVED}#{i}")).collect()),
+            lower: CompactArc::clone(&self.lower),
+            types: self.types.clone(),
+        }
+    }
+
+    /// The column a program name `name` of this scope reads: a position
+    /// name, or a resolved own name
+    fn column_of(&self, name: &str) -> Option<usize> {
+        let name = name.strip_prefix(RESOLVED)?;
+        match name.strip_prefix('#') {
+            Some(at) => at.parse().ok().filter(|at| *at < self.lower.len()),
+            None => {
+                let name = name.strip_prefix(QUALIFIER_SEP)?;
+                self.lower.iter().position(|c| c == name)
+            }
+        }
+    }
+
+    /// Whether more than one of its tables has a column named `name`
+    fn shared(&self, name: &str) -> bool {
+        let mut tables = self.tables.iter().enumerate().filter(|(at, _)| {
+            let (_, range) = self.table(self.tables[*at].1);
+            self.lower[range].iter().any(|c| c == name)
+        });
+        tables.next().is_some() && tables.next().is_some()
+    }
+
+    /// Column `at` as a reference spells it: qualified by its table when
+    /// the scope has more than one
+    fn spelled(&self, at: usize) -> String {
+        let table = self.tables.iter().rev().find(|(_, start)| *start <= at);
+        match table {
+            Some((table, _)) if self.tables.len() > 1 => format!("{table}.{}", self.lower[at]),
+            _ => self.lower[at].clone(),
+        }
+    }
+
     /// The scope of a block without FROM: no columns, and no name a
     /// qualifier could find, so every name reads an enclosing scope
     fn unnamed() -> Self {
@@ -1287,8 +1417,8 @@ struct StatementWalk<'w> {
 
 impl StatementWalk<'_> {
     /// `stmt` over the scopes `enclosing`, nearest first, the first `inside`
-    /// of them inside the block, with the names its rows have and the
-    /// names its FROM gives it
+    /// of them inside the block, with the names its rows have, as
+    /// `output_names` gives them, and the scope its FROM gives it
     #[allow(clippy::type_complexity)]
     fn statement(
         &mut self,
@@ -1296,7 +1426,7 @@ impl StatementWalk<'_> {
         enclosing: &[&ScopeTable],
         inside: usize,
         check: Check,
-    ) -> Result<(SelectStatement, Vec<String>, Vec<String>)> {
+    ) -> Result<(SelectStatement, Option<Vec<String>>, ScopeTable)> {
         let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
         scopes.push(&own);
@@ -1331,7 +1461,7 @@ impl StatementWalk<'_> {
         // Its ORDER BY positions count the columns it shows, whether or not
         // it ever runs
         if let Some(position) =
-            crate::parser::scope::order_position_outside(stmt, Some(names.len()))
+            crate::parser::scope::order_position_outside(stmt, names.as_ref().map(Vec::len))
         {
             return Err(Error::invalid_argument(
                 crate::parser::scope::order_position_message(position.value),
@@ -1388,7 +1518,12 @@ impl StatementWalk<'_> {
                     Ok(WindowDefinition {
                         partition_by: all(self, &def.partition_by)?,
                         order_by: order(self, &def.order_by, &level)?,
-                        ..def.clone()
+                        frame: def
+                            .frame
+                            .as_ref()
+                            .map(|frame| self.frame(frame, &level))
+                            .transpose()?,
+                        name: def.name.clone(),
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -1408,7 +1543,7 @@ impl StatementWalk<'_> {
                 .collect::<Result<_>>()?,
             ..stmt.clone()
         };
-        Ok((walked, names, own.lower.to_vec()))
+        Ok((walked, names, own))
     }
 
     /// A FROM walked over the scopes it sees, `enclosing` and not its
@@ -1498,12 +1633,45 @@ impl StatementWalk<'_> {
                 let (subquery, names, _) =
                     self.statement(&derived.subquery, enclosing, inside, check)?;
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
-                let scope = untyped(&name.unwrap_or_default(), &names);
+                let scope = untyped(&name.unwrap_or_default(), &named(names)?);
                 let walked = SubqueryTableSource {
                     subquery: Box::new(subquery),
                     ..(**derived).clone()
                 };
                 return Ok((Some(Expression::SubquerySource(Box::new(walked))), scope));
+            }
+            // Each side sees what the join does, not its sibling; the ON
+            // sees both, as the statement's other clauses do
+            Expression::JoinSource(join) => {
+                let (left, left_scope) = self.from(Some(&join.left), enclosing, inside, check)?;
+                let (right, right_scope) =
+                    self.from(Some(&join.right), enclosing, inside, check)?;
+                let (Some(left), Some(right)) = (left, right) else {
+                    return Err(Error::internal("a join side without a source"));
+                };
+                let scope = ScopeTable::beside(left_scope, right_scope);
+                let condition = match join.condition.as_deref() {
+                    Some(on) => {
+                        let mut scopes = Vec::with_capacity(enclosing.len() + 1);
+                        scopes.push(&scope);
+                        scopes.extend_from_slice(enclosing);
+                        let level = Level {
+                            scopes,
+                            inside: inside + 1,
+                            aliases: Vec::new(),
+                            check: check == Check::All,
+                        };
+                        Some(Box::new(self.expr(on, &level)?))
+                    }
+                    None => None,
+                };
+                let walked = JoinTableSource {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    condition,
+                    ..(**join).clone()
+                };
+                return Ok((Some(Expression::JoinSource(Box::new(walked))), scope));
             }
             _ => {
                 return Err(Error::internal(
@@ -1624,6 +1792,26 @@ impl StatementWalk<'_> {
             _ => walked,
         })
     }
+
+    /// The frame of a named window, its offsets walked
+    fn frame(&mut self, frame: &WindowFrame, level: &Level<'_>) -> Result<WindowFrame> {
+        let mut bound = |bound: &WindowFrameBound| -> Result<WindowFrameBound> {
+            Ok(match bound {
+                WindowFrameBound::Preceding(offset) => {
+                    WindowFrameBound::Preceding(Box::new(self.expr(offset, level)?))
+                }
+                WindowFrameBound::Following(offset) => {
+                    WindowFrameBound::Following(Box::new(self.expr(offset, level)?))
+                }
+                other => other.clone(),
+            })
+        };
+        Ok(WindowFrame {
+            unit: frame.unit,
+            start: bound(&frame.start)?,
+            end: frame.end.as_ref().map(&mut bound).transpose()?,
+        })
+    }
 }
 
 /// `stands`, when it is a parameter, spelled `name`; a parameter is read by
@@ -1639,11 +1827,13 @@ fn spelled_as(stands: Expression, name: String) -> Expression {
 }
 
 /// The names `stmt`'s rows have over its FROM's scope `own`: a star's
-/// columns, every other item by `item_name`
-fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Vec<String>> {
+/// columns, every other item by `item_name`; None for a star over a join,
+/// whose names only its run gives
+fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Vec<String>>> {
     let mut names = Vec::with_capacity(stmt.columns.len());
     for item in &stmt.columns {
         match item {
+            Expression::Star(_) if own.tables.len() > 1 => return Ok(None),
             Expression::Star(_) => names.extend(own.columns.iter().cloned()),
             Expression::QualifiedStar(star) => {
                 let qualifier = star.qualifier.to_lowercase();
@@ -1658,7 +1848,13 @@ fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Vec<String>>
             _ => names.push(item_name(item)),
         }
     }
-    Ok(names)
+    Ok(Some(names))
+}
+
+/// The names a walked statement's rows have, or the error of a star over
+/// a join, which a source named before its run cannot carry
+fn named(names: Option<Vec<String>>) -> Result<Vec<String>> {
+    names.ok_or_else(|| Error::internal("a star over a join, named only by its run"))
 }
 
 /// The names of `view`'s columns, recorded when it was created; a view
@@ -2833,9 +3029,7 @@ impl WhereParts {
                             }),
                             None,
                         ) if plan.keys.len() == 1 => (plan.keys[0].2, false),
-                        (Answer::Members(_, members), Some(column))
-                            if sq.uncorrelated && members.test == MemberTest::In =>
-                        {
+                        (_, Some(column)) if sq.member_set_test() == Some(MemberTest::In) => {
                             (column, true)
                         }
                         _ => return None,
@@ -2855,7 +3049,7 @@ impl WhereParts {
         let slot = |&(id, negated, column, _): &(u16, bool, Option<usize>, usize)| {
             let sq = &blocks.subqueries[id as usize];
             let column = column.filter(|_| sq.uncorrelated)?;
-            matches!(sq.answer, Answer::Members(..)).then_some(SetSlot {
+            sq.member_set_test().is_some().then_some(SetSlot {
                 id,
                 column,
                 negated,
@@ -3038,6 +3232,31 @@ impl PartialEq for HeldRow<'_> {
 impl Eq for HeldRow<'_> {}
 
 impl PreparedSubquery {
+    /// The test an uncorrelated block's members answer, read once per run
+    /// as a set: of a block over one source, or of one run as a statement
+    fn member_set_test(&self) -> Option<MemberTest> {
+        if !self.uncorrelated {
+            return None;
+        }
+        match &self.answer {
+            Answer::Members(_, members) => Some(members.test),
+            Answer::Statement(_, block) => match block.form {
+                StatementForm::Members(_, test) => Some(test),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// How many values a member of the block holds: one, or a row's
+    fn member_width(&self) -> usize {
+        match &self.answer {
+            Answer::Members(_, members) => members.width(),
+            Answer::Statement(_, block) => block.run.statement.columns.len(),
+            _ => 1,
+        }
+    }
+
     /// Whether the block may read `table`: its own table, or one its view's
     /// query reads, any when they are not known. A CTE's rows are read before
     /// the statement writes; a VALUES list or table function reads none
@@ -3175,6 +3394,8 @@ struct StatementBlock {
     run: StatementRun,
     form: StatementForm,
     tables: Option<Vec<SmartString>>,
+    /// Whether it computes a window function
+    windowed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3888,29 +4109,22 @@ impl Builder<'_> {
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
-        Ok((reads, names))
+        Ok((reads, named(names)?))
     }
 
     /// Bind the ORDER BY the EXISTS block `sq` runs without, as a block binds
-    /// a key that chooses no row, over its derived table's `columns`
+    /// a key that chooses no row, over the scope `own` its FROM gives it
     fn bind_dropped_order(
         &mut self,
         sq: &SelectStatement,
-        columns: &[String],
+        own: &ScopeTable,
         outer: &[&ScopeTable],
         id: u16,
         work: &Rewritten,
     ) -> Result<()> {
-        let name = match sq.table_expr.as_deref() {
-            Some(Expression::SubquerySource(derived)) => derived.alias.as_ref(),
-            _ => None,
-        };
-        check_block_positions(sq, columns.len())?;
-        let name = name.map(|a| a.value_lower.clone()).unwrap_or_default();
-        let schema = untyped_schema(&name, columns);
-        let own = ScopeTable::of(name, &schema);
+        check_block_positions(sq, own.columns.len())?;
         let mut scopes = Vec::with_capacity(outer.len() + 1);
-        scopes.push(&own);
+        scopes.push(own);
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
         let registry = &self.executor.function_registry;
@@ -3923,9 +4137,88 @@ impl Builder<'_> {
         Ok(())
     }
 
-    /// The block `sq`, whose derived table reads an enclosing scope or which
-    /// computes a window function, run as one statement for each call: each
-    /// name it binds beyond itself reads a slot its parent fills
+    /// Bind the block `sq` over a join as a block over one table is bound
+    /// when prepared, computing nothing: its clauses over its FROM's scope
+    /// `own` read by position, its grouping checked as `grouping` checks it.
+    /// A window function, or a bare name two of its tables have, binds when
+    /// the block runs, which binds that name as the prepared side cannot know
+    fn bind_join_block(
+        &mut self,
+        sq: &SelectStatement,
+        own: &ScopeTable,
+        outer: &[&ScopeTable],
+        id: u16,
+        work: &Rewritten,
+        exists: bool,
+    ) -> Result<()> {
+        let clauses = sq
+            .columns
+            .iter()
+            .chain(sq.where_clause.as_deref())
+            .chain(&sq.group_by.columns)
+            .chain(sq.having.as_deref())
+            .chain(sq.order_by.iter().map(|ob| &ob.expression))
+            .chain(&sq.distinct_on);
+        if clauses
+            .into_iter()
+            .any(|e| names_any(e, &|name| own.shared(name)))
+        {
+            return Ok(());
+        }
+        let scope = own.by_position();
+        let mut scopes = Vec::with_capacity(outer.len() + 1);
+        scopes.push(&scope);
+        scopes.extend_from_slice(outer);
+        let chain = Chain { scopes: &scopes };
+        let registry = &self.executor.function_registry;
+        let compile = CompileContext::new(&scope.columns, registry).with_prepared_subqueries();
+        let windowed = windowed_block(sq);
+        let grouped = grouped_block(sq) && !windowed;
+        let items: Vec<&Expression> = sq
+            .columns
+            .iter()
+            .filter(|c| !matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            .map(unaliased)
+            .collect();
+        let named = |expr: &Expression| with_aliases(expr, &sq.columns, &scope.lower).into_owned();
+        let mut bound: Vec<Expression> =
+            sq.where_clause.as_deref().map(named).into_iter().collect();
+        if !windowed {
+            bound.extend(sq.order_by.iter().map(|ob| named(&ob.expression)));
+            bound.extend(sq.distinct_on.iter().map(named));
+        }
+        if !grouped && !windowed {
+            bound.extend(items.iter().map(|item| (*item).clone()));
+        }
+        for expr in &bound {
+            let expr = self.trial_rewrite(&chain, id, expr, &work.outer)?;
+            compile_with(&compile, &expr)?;
+        }
+        if grouped {
+            let values = match exists {
+                true => Vec::new(),
+                false => items
+                    .iter()
+                    .map(|item| self.trial_rewrite(&chain, id, item, &work.outer))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
+            let mut trial = Rewritten {
+                outer: work.outer.clone(),
+                ..Rewritten::default()
+            };
+            let grouping = self.grouping(&chain, id, sq, &values, exists, &mut trial);
+            self.next_slot = next_slot;
+            self.subqueries.truncate(blocks);
+            grouping?;
+        }
+        Ok(())
+    }
+
+    /// The block `sq`, whose FROM is a join or a derived table reading an
+    /// enclosing scope, or which computes a window function, run as one
+    /// statement: each name it binds beyond itself reads a slot its parent
+    /// fills, as any block's does, and one that binds none answers once per run
     fn statement_block(
         &mut self,
         sq: &SelectStatement,
@@ -3947,41 +4240,63 @@ impl Builder<'_> {
         // rows its items choose, by a window or a DISTINCT ON, runs as written
         let dropped =
             matches!(form, Form::Exists(_)) && !windowed_block(sq) && sq.distinct_on.is_empty();
-        let check = match dropped {
-            true => Check::Order,
-            false => Check::Off,
-        };
         let mut max_param = 0;
-        let (statement, _, from_names) = StatementWalk {
+        // The parameters it reads key its kept answer; one not positional
+        // leaves it every parameter
+        let mut params = SmallVec::<[usize; 2]>::new();
+        let (statement, _, own) = StatementWalk {
             executor,
             ctx,
             on: &mut |reach| match reach {
                 Reach::Outer(expr, depth, index) => {
                     Ok(Some(self.outer_slot(&chain, depth, index, expr, &mut work)))
                 }
-                Reach::Param(Expression::Parameter(p)) => {
+                Reach::Param(Expression::Parameter(p)) if p.index > 0 => {
                     max_param = max_param.max(p.index);
+                    if !params.contains(&(p.index - 1)) {
+                        params.push(p.index - 1);
+                    }
                     Ok(None)
                 }
-                Reach::Param(_) => Ok(None),
+                Reach::Param(_) => {
+                    params.push(usize::MAX);
+                    Ok(None)
+                }
             },
         }
-        .statement(sq, outer, 0, check)?;
+        .statement(sq, outer, 0, Check::All)?;
         self.max_param = self.max_param.max(max_param);
+        let joined = own.tables.len() > 1;
+        if joined {
+            if dropped {
+                check_block_positions(sq, own.columns.len())?;
+            }
+            self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)))?;
+        }
         let statement = match dropped {
+            // A join's run names its columns, so it binds what it reads
+            true if joined => SelectStatement {
+                order_by: Vec::new(),
+                ..statement
+            },
             true => {
-                self.bind_dropped_order(sq, &from_names, outer, id, &work)?;
-                existence(executor, statement, &from_names, ctx)?
+                self.bind_dropped_order(sq, &own, outer, id, &work)?;
+                existence(executor, statement, &own.lower, ctx)?
             }
             false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
+        // One that binds nothing beyond itself keeps its answer across
+        // statements while the tables it reads, all known, stay as they were
+        let uncorrelated = !work.reads_parent && work.delegated.is_empty();
+        let tables = executor.read_tables(&statement);
+        let kept_tables = tables.clone().filter(|_| uncorrelated);
         let kept = Kept {
             identity_key: ExprKey::exact(&identity),
             identity: Arc::new(identity),
             scopes: scope_signature(signature, outer),
-            tables: Vec::new(),
-            reads_source: true,
+            reads_source: kept_tables.is_none(),
+            tables: kept_tables.unwrap_or_default(),
             params: None,
             keyed: None,
         };
@@ -3991,13 +4306,14 @@ impl Builder<'_> {
             Form::Members { read_as, test, .. } => StatementForm::Members(read_as, test),
         };
         let block = StatementBlock {
-            tables: executor.read_tables(&statement),
+            tables,
             run: StatementRun {
                 statement,
                 classification: std::sync::OnceLock::new(),
                 compiled: RwLock::new(CompiledExecution::Unknown),
             },
             form,
+            windowed: windowed_block(sq),
         };
         let (holes, hole_exprs, hole_written) = self.compiled_holes(outer, parent, &work)?;
         self.subqueries[id as usize] = Some(PreparedSubquery {
@@ -4011,7 +4327,7 @@ impl Builder<'_> {
             candidates: None,
             filter: None,
             rest: Vec::new(),
-            reads: work.outer.values().copied().collect(),
+            reads: work.outer.values().copied().chain(params).collect(),
             answer: Answer::Statement(kept, Box::new(block)),
             grouping: None,
             order: None,
@@ -4019,7 +4335,7 @@ impl Builder<'_> {
             holes,
             hole_exprs,
             hole_written,
-            uncorrelated: false,
+            uncorrelated,
         });
         Ok((id, work.delegated, work.reads_parent))
     }
@@ -4118,12 +4434,19 @@ impl Builder<'_> {
             Expression::Exists(exists) => exists.subquery.prepared,
             _ => None,
         };
+        // A window's block runs when a row asks it, as over one source
         let once = block
             .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
             .is_some_and(|sq| {
                 sq.uncorrelated
                     && sq.parent.is_none()
-                    && matches!(sq.answer, Answer::Value(..) | Answer::Exists(_))
+                    && match &sq.answer {
+                        Answer::Value(..) | Answer::Exists(_) => true,
+                        Answer::Statement(_, block) => {
+                            !matches!(block.form, StatementForm::Members(..)) && !block.windowed
+                        }
+                        Answer::Members(..) => false,
+                    }
             });
         match (block, once) {
             (Some(_), true) => {
@@ -4453,6 +4776,11 @@ impl Builder<'_> {
                     BlockSource::Function(function.clone(), range, counts),
                     Executor::tvf_columns(function)?,
                 )
+            }
+            // A join runs with the block as one statement: for each call when
+            // it reads an enclosing scope, else once per run
+            Some(Expression::JoinSource(_)) => {
+                return self.statement_block(sq, outer, parent, form);
             }
             // A derived table that reads an enclosing scope runs with the block
             // as one statement for each call; one that reads none, once per
@@ -4885,6 +5213,10 @@ impl Builder<'_> {
         }
         for expr in projection.iter().chain(&having).chain(&listed) {
             if let Some(name) = ungrouped(expr, &item_keys) {
+                let name = match scope.column_of(&name) {
+                    Some(at) if scope.tables.len() > 1 => scope.spelled(at),
+                    _ => name,
+                };
                 return Err(ungrouped_column(&name));
             }
         }
@@ -4920,10 +5252,8 @@ impl Builder<'_> {
                 if agg.column == "*" || agg.expression.is_some() {
                     return Ok(None);
                 }
-                agg.column_lower
-                    .strip_prefix(RESOLVED)
-                    .and_then(|name| name.strip_prefix(QUALIFIER_SEP))
-                    .and_then(|name| scope.lower.iter().position(|c| c == name))
+                scope
+                    .column_of(&agg.column_lower)
                     .map(Some)
                     .ok_or_else(|| Error::internal("an aggregate's column outside its block"))
             })
@@ -5050,6 +5380,8 @@ fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<String> {
         Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
             Some(q.name.value.to_string())
         }
+        // A column of a scope read by position
+        Expression::Identifier(id) if id.value.starts_with(RESOLVED) => Some(id.value.to_string()),
         other => {
             let mut found = None;
             let _ = for_each_child(other, &mut |child| {
@@ -5810,7 +6142,7 @@ impl PreparedSelect {
         let ahead = output_blocks
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
-                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+                sq.parent.is_none() && sq.member_set_test().is_some()
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
@@ -6315,7 +6647,7 @@ impl PreparedGrouped {
         let ahead = (where_blocks..blocks_read)
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
-                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+                sq.parent.is_none() && sq.member_set_test().is_some()
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
@@ -7159,7 +7491,7 @@ impl JoinBlocks {
         let ahead = output_blocks
             .filter(|&id| {
                 let sq = &blocks.subqueries[id];
-                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+                sq.parent.is_none() && sq.member_set_test().is_some()
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
@@ -7323,7 +7655,7 @@ impl Executor {
                         ctx: &ctx,
                         on: &mut on,
                     };
-                    walk.statement(query, &[], 0, Check::Off)?.1
+                    named(walk.statement(query, &[], 0, Check::Off)?.1)?
                 }
             };
             registry.store(&cte.name.value, columns, RowVec::new());
@@ -7856,9 +8188,8 @@ fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool 
         mark.prepared
             .and_then(|id| blocks.get(usize::from(id))?.as_ref())
     };
-    let members = |mark: &SelectStatement| {
-        block(mark).is_some_and(|sq| sq.uncorrelated && matches!(sq.answer, Answer::Members(..)))
-    };
+    let members =
+        |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.member_set_test().is_some());
     let once = |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.uncorrelated);
     match expr {
         Expression::In(in_expr) => match in_expr.right.as_ref() {
@@ -9368,10 +9699,7 @@ impl<'a> PreparedRunner<'a> {
         let empty = Row::new();
         let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
         for &id in ids {
-            let width = match &self.prepared.subqueries[usize::from(id)].answer {
-                Answer::Members(_, members) => members.width(),
-                _ => 1,
-            };
+            let width = self.prepared.subqueries[usize::from(id)].member_width();
             let nulls: SmallVec<[Value; 2]> = smallvec::smallvec![Value::null_unknown(); width];
             self.members_answer(usize::from(id), &nulls, &caller, holes)?;
         }
@@ -9569,19 +9897,10 @@ impl<'a> PreparedRunner<'a> {
         ctx: &ExecutionContext,
     ) -> Result<SetScan> {
         let index = slot.id as usize;
-        let Answer::Members(kept, members) = &self.prepared.subqueries[index].answer else {
-            return Ok(SetScan::Program);
-        };
         // An error reading the members, or one a member raised, belongs to
         // the row that needs the answer: the program asks the block then
         let empty = Row::new();
-        let read = self.read_members(
-            index,
-            kept,
-            members,
-            &ExecuteContext::new(&empty),
-            self.holes,
-        );
+        let read = self.read_member_set(index, &ExecuteContext::new(&empty), self.holes);
         if read.is_err() {
             return Ok(SetScan::Program);
         }
@@ -10495,19 +10814,31 @@ impl PreparedRunner<'_> {
         self.ctx.check_cancelled()?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_scalar_next();
-        if let Answer::Statement(_, block) = &sq.answer {
-            let mut rows = self.block_statement(index, block, caller, site)?;
-            let mut value = None;
-            while rows.next() {
-                if value.is_some() {
-                    return Err(more_than_one_row());
+        if let Answer::Statement(kept, block) = &sq.answer {
+            let read = || {
+                let mut rows = self.block_statement(index, block, caller, site)?;
+                let mut value = None;
+                while rows.next() {
+                    if value.is_some() {
+                        return Err(more_than_one_row());
+                    }
+                    value = Some(first_value(rows.take_row()));
                 }
-                value = Some(first_value(rows.take_row()));
+                if let Some(e) = rows.last_error() {
+                    return Err(e);
+                }
+                Ok(value.unwrap_or_else(Value::null_unknown))
+            };
+            if !sq.uncorrelated {
+                return read();
             }
-            if let Some(e) = rows.last_error() {
-                return Err(e);
-            }
-            return Ok(value.unwrap_or_else(Value::null_unknown));
+            let answer =
+                self.read_once(index, || self.kept(kept, || read().map(BlockAnswer::Value)))?;
+            let BlockAnswer::Value(value) = answer else {
+                return Err(Error::internal("a set kept for a scalar value"));
+            };
+            *self.blocks[index].value.borrow_mut() = Some(value.clone());
+            return Ok(value);
         }
         let Answer::Value(projection, kept) = &sq.answer else {
             return Err(Error::internal("an EXISTS block run for a value"));
@@ -10810,13 +11141,28 @@ impl PreparedRunner<'_> {
             .subqueries
             .get(index)
             .ok_or_else(|| Error::internal("unknown prepared subquery"))?;
-        if let Answer::Statement(_, block) = &sq.answer {
-            let mut rows = self.block_statement(index, block, caller, site)?;
-            let exists = rows.next();
-            return match rows.last_error() {
-                Some(e) => Err(e),
-                None => Ok(exists),
+        if let Answer::Statement(kept, block) = &sq.answer {
+            let read = || {
+                let mut rows = self.block_statement(index, block, caller, site)?;
+                let exists = rows.next();
+                match rows.last_error() {
+                    Some(e) => Err(e),
+                    None => Ok(exists),
+                }
             };
+            if !sq.uncorrelated {
+                return read();
+            }
+            if let Some(Value::Boolean(exists)) = self.blocks[index].value.borrow().as_ref() {
+                return Ok(*exists);
+            }
+            let answer =
+                self.read_once(index, || self.kept(kept, || read().map(BlockAnswer::Once)))?;
+            let BlockAnswer::Once(exists) = answer else {
+                return Err(Error::internal("a set kept for an EXISTS value"));
+            };
+            *self.blocks[index].value.borrow_mut() = Some(Value::Boolean(exists));
+            return Ok(exists);
         }
         let Answer::Exists(existence) = &sq.answer else {
             return Err(Error::internal("a scalar block run for EXISTS"));
@@ -10997,6 +11343,14 @@ impl PreparedRunner<'_> {
             let StatementForm::Members(read_as, test) = block.form else {
                 return Err(Error::internal("a block run for its members that has none"));
             };
+            // One that binds nothing beyond itself reads its members once
+            if sq.uncorrelated {
+                self.read_member_set(index, caller, site)?;
+                let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
+                    return Err(Error::internal("a value block's members not kept"));
+                };
+                return set.answer_values(tested);
+            }
             let mut rows = self.block_statement(index, block, caller, site)?;
             let mut fold = MemberFold::new(test);
             while rows.next() {
@@ -11100,6 +11454,43 @@ impl PreparedRunner<'_> {
         })
     }
 
+    /// The members uncorrelated block `index` holds, read once per run on
+    /// first need whether it is a value block or a statement
+    fn read_member_set(&self, index: usize, caller: &ExecuteContext, site: &HoleSet) -> Result<()> {
+        let sq = &self.prepared.subqueries[index];
+        let (kept, block, read_as, test) = match &sq.answer {
+            Answer::Members(kept, members) => {
+                return self.read_members(index, kept, members, caller, site)
+            }
+            Answer::Statement(kept, block) if sq.uncorrelated => match block.form {
+                StatementForm::Members(read_as, test) => (kept, block, read_as, test),
+                _ => return Err(Error::internal("a block run for its members that has none")),
+            },
+            _ => return Err(Error::internal("a block run for its members that has none")),
+        };
+        if self.blocks[index].members.get().is_some() {
+            return Ok(());
+        }
+        let width = sq.member_width();
+        let answer = self.read_once(index, || {
+            self.kept(kept, || {
+                let mut rows = self.block_statement(index, block, caller, site)?;
+                let mut values = Vec::new();
+                while rows.next() {
+                    Member::of_row(rows.take_row(), width, read_as).push_into(&mut values);
+                }
+                if let Some(e) = rows.last_error() {
+                    return Err(e);
+                }
+                let set = member_set(test, width, values, true);
+                let members = KeptMembers { set, failed: None };
+                Ok(BlockAnswer::Members(CompactArc::new(members)))
+            })
+        })?;
+        let _ = self.blocks[index].members.set(answer);
+        Ok(())
+    }
+
     /// An uncorrelated value block's members, read once per run on first
     /// need, or taken from a run before whose stamp still holds
     fn read_members(
@@ -11189,22 +11580,10 @@ impl PreparedRunner<'_> {
     /// when a test over them binds; None when the read fails or a candidate
     /// failed, whose error stays with the row that needs it
     fn read_set(&self, index: usize) -> Option<()> {
-        let sq = self.prepared.subqueries.get(index)?;
-        let Answer::Members(kept, members) = &sq.answer else {
-            return None;
-        };
-        if !sq.uncorrelated {
-            return None;
-        }
+        self.prepared.subqueries.get(index)?.member_set_test()?;
         let empty = Row::new();
-        self.read_members(
-            index,
-            kept,
-            members,
-            &ExecuteContext::new(&empty),
-            self.holes,
-        )
-        .ok()?;
+        self.read_member_set(index, &ExecuteContext::new(&empty), self.holes)
+            .ok()?;
         self.members_op(index).map(drop)
     }
 
@@ -11670,19 +12049,12 @@ impl PreparedRunner<'_> {
         negated: bool,
         target: Option<usize>,
     ) -> Result<Option<(RowVec, bool)>> {
-        let sq = &self.prepared.subqueries[index];
-        let Answer::Members(kept, members) = &sq.answer else {
+        if self.prepared.subqueries[index].member_set_test().is_none() {
             return Ok(None);
-        };
+        }
         // An error reading the members belongs to the row that needs them
         let empty = Row::new();
-        let read = self.read_members(
-            index,
-            kept,
-            members,
-            &ExecuteContext::new(&empty),
-            self.holes,
-        );
+        let read = self.read_member_set(index, &ExecuteContext::new(&empty), self.holes);
         if read.is_err() {
             return Ok(None);
         }

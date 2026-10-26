@@ -342,28 +342,38 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
 }
 
 #[test]
-fn a_cte_not_named_before_it_runs_keeps_the_cte_path_as_explain_says() {
+fn a_cte_over_a_join_keeps_its_plan_unless_its_names_wait_for_its_run() {
     let _guard = serial();
     let db = hot("cte_over_join");
-    let with = "WITH c AS (SELECT u.id FROM u JOIN w ON w.id = u.id) ";
-    let join = "SELECT a.id FROM c a JOIN c b ON a.id = b.id \
-                WHERE EXISTS (SELECT 1 FROM t WHERE t.id = a.id)";
-    let sql = &format!("{with}{join}");
-    let (got, ran) = run(&db, sql);
-    assert_eq!(
-        got,
-        answer(&db, &format!("{with}{}", general(join))),
-        "{sql}"
-    );
-    assert_eq!(
-        prepared_line(&db, sql),
-        "Prepared: no (a WITH clause)",
-        "{sql}"
-    );
-    assert!(
-        !ran.is_empty(),
-        "{sql}: the CTE path runs the join without its plan"
-    );
+    for (with, join, line) in [
+        (
+            "WITH c AS (SELECT u.id FROM u JOIN w ON w.id = u.id) ",
+            "SELECT a.id FROM c a JOIN c b ON a.id = b.id \
+             WHERE EXISTS (SELECT 1 FROM t WHERE t.id = a.id)",
+            "Prepared: yes",
+        ),
+        (
+            "WITH c AS (SELECT * FROM u JOIN w ON w.id = u.id) ",
+            "SELECT t2.id FROM t AS t2 JOIN c ON TRUE \
+             WHERE EXISTS (SELECT 1 FROM t WHERE t.id = t2.id)",
+            "Prepared: no (a side read with AS OF or not named before it is read)",
+        ),
+    ] {
+        let sql = &format!("{with}{join}");
+        let (got, ran) = run(&db, sql);
+        assert_eq!(
+            got,
+            answer(&db, &format!("{with}{}", general(join))),
+            "{sql}"
+        );
+        assert_eq!(prepared_line(&db, sql), line, "{sql}");
+        let evaluator = |path: &&GeneralPath| !matches!(path, GeneralPath::ProjectionEvaluator);
+        assert_eq!(
+            ran.iter().any(|path| evaluator(&path)),
+            line != "Prepared: yes",
+            "{sql}: the CTE path runs the join without its plan: {ran:?}"
+        );
+    }
 }
 
 mod drops_before_the_join {
