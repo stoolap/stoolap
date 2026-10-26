@@ -30,7 +30,7 @@ use crate::parser::ast::*;
 use crate::parser::token::TokenType;
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::version_store::LayoutToken;
-use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Table};
+use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, QueryResult, Table};
 
 use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
@@ -453,10 +453,9 @@ impl Executor {
         }
 
         // Fall back to full subquery execution
-        let subquery_ctx = ctx.with_incremented_query_depth();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::exists_subquery_ran();
-        let mut result = self.execute_select(subquery, &subquery_ctx)?;
+        let mut result = self.execute_for_outer_row(subquery, ctx)?;
 
         // Check if there's at least one row
         if result.next() {
@@ -1942,21 +1941,9 @@ impl Executor {
             }
         }
 
-        // A correlated subquery reads the parent row in what it selects and
-        // in its HAVING, not only in its WHERE. The paths above read the
-        // statement as written, and one of them keys a cache on its address
-        let bound;
-        let subquery = match Self::bind_outer_references(subquery, ctx) {
-            Some(rewritten) => {
-                bound = rewritten;
-                &bound
-            }
-            None => subquery,
-        };
-
-        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
-        let subquery_ctx = ctx.with_incremented_query_depth();
-        let mut result = self.execute_select(subquery, &subquery_ctx)?;
+        // The paths above read the statement as written, and one of them
+        // keys a cache on its address
+        let mut result = self.execute_for_outer_row(subquery, ctx)?;
 
         // Get the first row
         if !result.next() {
@@ -2036,11 +2023,9 @@ impl Executor {
             }
         }
 
-        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
-        let subquery_ctx = ctx.with_incremented_query_depth();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::in_subquery_ran();
-        let mut result = self.execute_select(subquery, &subquery_ctx)?;
+        let mut result = self.execute_for_outer_row(subquery, ctx)?;
 
         // Collect all values from the first column - use take_row() to avoid cloning
         let mut values = Vec::new();
@@ -2073,9 +2058,7 @@ impl Executor {
         crate::test_failpoints::general_path_reached(
             crate::test_failpoints::GeneralPath::InSubquery,
         );
-        // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
-        let subquery_ctx = ctx.with_incremented_query_depth();
-        let mut result = self.execute_select(subquery, &subquery_ctx)?;
+        let mut result = self.execute_for_outer_row(subquery, ctx)?;
 
         // Collect all values from all columns - use take_row() to avoid cloning
         let mut rows = Vec::new();
@@ -3489,7 +3472,7 @@ impl Executor {
 
     /// Whether a derived table in a FROM, or a join condition there, reads a
     /// column that neither the query nor the derived table defines
-    fn from_reads_outer_columns(from: &Expression, subquery_tables: &[String]) -> bool {
+    fn from_reads_outer_columns<S: AsRef<str>>(from: &Expression, subquery_tables: &[S]) -> bool {
         match from {
             Expression::SubquerySource(source) => {
                 Self::nested_reads_outer_columns(&source.subquery, subquery_tables)
@@ -3531,12 +3514,19 @@ impl Executor {
             .columns
             .iter()
             .chain(subquery.having.as_deref())
-            .any(|expr| Self::references_outer_columns(expr, &[]))
+            .any(|expr| Self::references_outer_columns::<&str>(expr, &[]))
         {
             return None;
         }
         let tables = Self::collect_subquery_table_columns(subquery);
-        let tables: Vec<&str> = tables.iter().map(|table| table.as_str()).collect();
+        if !subquery
+            .columns
+            .iter()
+            .chain(subquery.having.as_deref())
+            .any(|expr| Self::references_outer_columns(expr, &tables))
+        {
+            return None;
+        }
         let scope = super::utils::InnerScope {
             tables: &tables,
             schema: None,
@@ -3567,23 +3557,38 @@ impl Executor {
         let Some(outer_row) = ctx.outer_row() else {
             return;
         };
-        let tables = Self::collect_subquery_table_columns(stmt);
-        let tables: Vec<&str> = tables.iter().map(|table| table.as_str()).collect();
-        let scope = super::utils::InnerScope {
-            tables: &tables,
-            schema: None,
+        let mut bound: Vec<Expression> = {
+            let tables = Self::collect_subquery_table_columns(stmt);
+            let scope = super::utils::InnerScope {
+                tables: &tables,
+                schema: None,
+            };
+            stmt.columns[first..]
+                .iter()
+                .map(|item| {
+                    super::utils::substitute_outer_references_in_scope(item, outer_row, &scope)
+                })
+                .collect()
         };
-        let mut bound: Vec<Expression> = stmt.columns[first..]
-            .iter()
-            .map(|item| super::utils::substitute_outer_references_in_scope(item, outer_row, &scope))
-            .collect();
         stmt.columns.truncate(first);
         stmt.columns.append(&mut bound);
     }
 
+    /// Run a subquery written in the query as the parent row reads it, one
+    /// query level deeper so it does not start a new timeout guard
+    fn execute_for_outer_row(
+        &self,
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        let bound = Self::bind_outer_references(subquery, ctx);
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        self.execute_select(bound.as_ref().unwrap_or(subquery), &subquery_ctx)
+    }
+
     /// Collect table/alias names from a subquery's FROM clause
-    fn collect_subquery_table_columns(subquery: &SelectStatement) -> Vec<String> {
-        let mut tables = Vec::new();
+    fn collect_subquery_table_columns(subquery: &SelectStatement) -> smallvec::SmallVec<[&str; 4]> {
+        let mut tables = smallvec::SmallVec::new();
 
         if let Some(ref table_expr) = subquery.table_expr {
             Self::collect_table_names_from_source(table_expr, &mut tables);
@@ -3593,16 +3598,19 @@ impl Executor {
     }
 
     /// Recursively collect table names from a table source expression
-    fn collect_table_names_from_source(source: &Expression, tables: &mut Vec<String>) {
+    fn collect_table_names_from_source<'a>(
+        source: &'a Expression,
+        tables: &mut smallvec::SmallVec<[&'a str; 4]>,
+    ) {
         match source {
             Expression::TableSource(ts) => {
                 // When a table has an alias, SQL semantics require using the alias,
                 // not the original table name. So for `FROM t t2`, only `t2` is valid.
                 // If there's no alias, use the table name.
                 if let Some(ref alias) = ts.alias {
-                    tables.push(alias.value_lower.to_string());
+                    tables.push(alias.value_lower.as_str());
                 } else {
-                    tables.push(ts.name.value_lower.to_string());
+                    tables.push(ts.name.value_lower.as_str());
                 }
             }
             Expression::JoinSource(js) => {
@@ -3612,14 +3620,14 @@ impl Executor {
             Expression::SubquerySource(ss) => {
                 // Subquery source has an optional alias
                 if let Some(ref alias) = ss.alias {
-                    tables.push(alias.value_lower.to_string());
+                    tables.push(alias.value_lower.as_str());
                 }
             }
             Expression::FunctionTableSource(fs) => {
                 if let Some(ref alias) = fs.alias {
-                    tables.push(alias.value_lower.to_string());
+                    tables.push(alias.value_lower.as_str());
                 } else {
-                    tables.push(fs.function.value_lower.to_string());
+                    tables.push(fs.function.value_lower.as_str());
                 }
             }
             _ => {}
@@ -3635,7 +3643,7 @@ impl Executor {
     ///
     /// For qualified identifiers (e.g., c.id), we check if the qualifier (table/alias)
     /// is NOT defined in the subquery's FROM clause - if so, it must be an outer reference.
-    fn references_outer_columns(expr: &Expression, subquery_tables: &[String]) -> bool {
+    fn references_outer_columns<S: AsRef<str>>(expr: &Expression, subquery_tables: &[S]) -> bool {
         match expr {
             Expression::Identifier(_id) => {
                 // Simple identifiers are ambiguous - they resolve to inner scope first per SQL semantics.
@@ -3652,7 +3660,7 @@ impl Executor {
                 // This is the key check: if "c" is not in ["orders", "o"], then c.id is outer
                 !subquery_tables
                     .iter()
-                    .any(|t| t.eq_ignore_ascii_case(table_name))
+                    .any(|t| t.as_ref().eq_ignore_ascii_case(table_name))
             }
             Expression::Infix(infix) => {
                 Self::references_outer_columns(&infix.left, subquery_tables)
@@ -3753,8 +3761,12 @@ impl Executor {
 
     /// Whether a subquery nested inside another reads a column that neither
     /// of them defines
-    fn nested_reads_outer_columns(nested: &SelectStatement, subquery_tables: &[String]) -> bool {
-        let mut tables = subquery_tables.to_vec();
+    fn nested_reads_outer_columns<S: AsRef<str>>(
+        nested: &SelectStatement,
+        subquery_tables: &[S],
+    ) -> bool {
+        let mut tables: smallvec::SmallVec<[&str; 4]> =
+            subquery_tables.iter().map(AsRef::as_ref).collect();
         if let Some(from) = &nested.table_expr {
             Self::collect_table_names_from_source(from, &mut tables);
         }
@@ -5117,11 +5129,11 @@ impl Executor {
 
     /// Get outer table names from a table expression (for semi-join optimization).
     pub fn collect_outer_table_names(table_expr: &Option<Box<Expression>>) -> Vec<String> {
-        let mut tables = Vec::new();
+        let mut tables = smallvec::SmallVec::new();
         if let Some(ref expr) = table_expr {
             Self::collect_table_names_from_source(expr.as_ref(), &mut tables);
         }
-        tables
+        tables.into_iter().map(str::to_string).collect()
     }
 }
 

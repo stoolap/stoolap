@@ -124,3 +124,34 @@ fn a_subquery_reading_the_outer_row_in_its_having_is_correlated() {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+#[test]
+fn every_subquery_form_reads_the_outer_row_in_its_having() {
+    let _serial = serial();
+    let db = create("memory://every_subquery_form_reads_the_outer_row_in_its_having");
+    let groups = "FROM u GROUP BY u.g HAVING COUNT(*) > t.k";
+    let mut failed = Vec::new();
+    for (predicate, want) in [
+        (format!("EXISTS (SELECT 1 {groups})"), vec![1]),
+        (format!("NOT EXISTS (SELECT 1 {groups})"), vec![2, 3]),
+        (format!("1 IN (SELECT u.g {groups})"), vec![1]),
+        (format!("1 NOT IN (SELECT u.g {groups})"), vec![2, 3]),
+        (format!("(1, 1) IN (SELECT u.g, u.g {groups})"), vec![1]),
+        (format!("1 = ANY (SELECT u.g {groups})"), vec![1]),
+        (format!("0 = ALL (SELECT u.g {groups})"), vec![2, 3]),
+        (format!("(SELECT u.g {groups}) = 1"), vec![1]),
+        (
+            "EXISTS (SELECT t.k + COUNT(*) FROM u HAVING t.k + COUNT(*) = 4)".to_string(),
+            vec![2],
+        ),
+    ] {
+        for filter in ["", "s || 'x' <> 'zx' AND ", "id IN (1, 2, 3) AND "] {
+            let sql = format!("SELECT id FROM t WHERE {filter}{predicate}");
+            let got = ids(&db, &sql);
+            if got.as_ref() != Ok(&want) {
+                failed.push(format!("{sql}: {got:?}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
