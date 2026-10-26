@@ -26,7 +26,7 @@ use crate::common::CompactArc;
 
 use crate::core::interval::IntervalUnit;
 use crate::core::pattern::Pattern;
-use crate::core::predicate::{sql_compare, sql_eq, PredicateSet};
+use crate::core::predicate::{sql_compare, sql_eq, sql_rows_distinct, PredicateSet};
 use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
 
@@ -753,35 +753,106 @@ fn settle_rows<'v>(
     (!unknown).then_some(all)
 }
 
-/// A row block's members, `width` values each, as `op` ANY or ALL tests
-/// them; IN is `=` ANY
+/// How two rows compare: by an operator, or IS [NOT] DISTINCT FROM
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowComparison {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Distinct,
+    NotDistinct,
+}
+
+impl RowComparison {
+    pub fn answer(self, a: &[Value], b: &[Value]) -> Option<bool> {
+        let op = match self {
+            RowComparison::Eq => CompareOp::Eq,
+            RowComparison::Ne => CompareOp::Ne,
+            RowComparison::Lt => CompareOp::Lt,
+            RowComparison::Le => CompareOp::Le,
+            RowComparison::Gt => CompareOp::Gt,
+            RowComparison::Ge => CompareOp::Ge,
+            RowComparison::Distinct => return Some(sql_rows_distinct(a, b)),
+            RowComparison::NotDistinct => return Some(!sql_rows_distinct(a, b)),
+        };
+        op.compare_rows(a, b)
+    }
+
+    /// The comparison with its sides swapped
+    pub fn flipped(self) -> Self {
+        match self {
+            RowComparison::Lt => RowComparison::Gt,
+            RowComparison::Le => RowComparison::Ge,
+            RowComparison::Gt => RowComparison::Lt,
+            RowComparison::Ge => RowComparison::Le,
+            other => other,
+        }
+    }
+}
+
+/// What a row block's members answer for a row
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowTest {
+    /// `row op ANY (members)`, or `op ALL` when true; IN is `=` ANY
+    Quantified(CompareOp, bool),
+    /// `row` compared with the one member, every value NULL for none
+    One(RowComparison),
+}
+
+/// A row block's members, `width` values each, as `test` asks them
 #[derive(Debug, Clone)]
 pub struct RowMembers {
-    op: CompareOp,
-    all: bool,
+    test: RowTest,
     width: usize,
     values: Vec<Value>,
 }
 
 impl RowMembers {
     /// `values` holds the members' values in turn, `width` of them each
-    pub fn new(op: CompareOp, all: bool, width: usize, values: Vec<Value>) -> Self {
+    pub fn new(test: RowTest, width: usize, values: Vec<Value>) -> Self {
         debug_assert!(width > 1 && values.len().is_multiple_of(width));
         Self {
-            op,
-            all,
+            test,
             width,
             values,
         }
     }
 
-    pub fn answer(&self, row: &[Value]) -> Option<bool> {
-        quantified_rows(self.op, self.all, row, self.values.chunks_exact(self.width))
+    /// The answer for `row`; more than one member for a row compared with
+    /// one is an error
+    pub fn answer(&self, row: &[Value]) -> crate::core::Result<Option<bool>> {
+        match self.test {
+            RowTest::Quantified(op, all) => Ok(quantified_rows(
+                op,
+                all,
+                row,
+                self.values.chunks_exact(self.width),
+            )),
+            RowTest::One(comparison) => match self.values.len() / self.width {
+                0 => Ok(comparison.answer(row, &vec![Value::null_unknown(); self.width])),
+                1 => Ok(comparison.answer(row, &self.values)),
+                _ => Err(more_than_one_row()),
+            },
+        }
     }
 
-    /// The answer one member settles: TRUE for ANY, FALSE for ALL
-    pub fn decides(&self) -> bool {
-        !self.all
+    /// The answer one member settles: TRUE for ANY, FALSE for ALL; none
+    /// for a row compared with the one member
+    pub fn decides(&self) -> Option<bool> {
+        match self.test {
+            RowTest::Quantified(_, all) => Some(!all),
+            RowTest::One(_) => None,
+        }
+    }
+}
+
+/// A subquery read for one row's value or values gave more
+pub(crate) fn more_than_one_row() -> crate::core::Error {
+    crate::core::Error::Internal {
+        message: "scalar subquery returned more than one row".to_string(),
     }
 }
 

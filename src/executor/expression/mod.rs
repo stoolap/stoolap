@@ -56,7 +56,8 @@ pub use evaluator_bridge::{
 pub(crate) use once::{
     compile_once, evaluate_once, execute_context, execute_once, try_eval_constant_expr_with_context,
 };
-pub use ops::{CompareOp, Op, QuantifiedMembers, RowMembers};
+pub(crate) use ops::more_than_one_row;
+pub use ops::{CompareOp, Op, QuantifiedMembers, RowComparison, RowMembers, RowTest};
 pub use program::Program;
 pub(crate) use vm::concat_values;
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};

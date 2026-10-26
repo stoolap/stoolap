@@ -586,9 +586,14 @@ impl KeptMembers {
     /// `row` tested against a row block's members as [`Self::answer`] tests
     /// a value
     pub(crate) fn answer_row(&self, row: &[Value]) -> crate::core::Result<Option<bool>> {
-        match &self.set {
-            MemberSet::Rows(members) => self.settle(members.answer(row), members.decides()),
-            _ => Err(one_value_against_rows()),
+        let MemberSet::Rows(members) = &self.set else {
+            return Err(one_value_against_rows());
+        };
+        match (members.decides(), &self.failed) {
+            (Some(decides), _) => self.settle(members.answer(row)?, decides),
+            // A row compared with the one member has no member that decides
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => members.answer(row),
         }
     }
 

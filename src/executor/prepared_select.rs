@@ -52,8 +52,9 @@ use super::context::{
 };
 use super::expr_key::ExprKey;
 use super::expression::{
-    CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, Op,
-    QuantifiedMembers, RowFilter, RowMembers, SharedProgram, SubqueryExecutor,
+    more_than_one_row, CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler,
+    ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter, RowMembers, RowTest, SharedProgram,
+    SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::projection::{Item, Projection};
@@ -307,6 +308,14 @@ impl<'a> Family<'a> {
             Expression::Infix(infix) => {
                 if infix.op_type == InfixOperator::Other {
                     return Err("an operator outside the family");
+                }
+                if let Some((row, sq, _)) = row_subquery(infix) {
+                    if !subqueries {
+                        return Err("a subquery outside WHERE and the subquery blocks");
+                    }
+                    self.expression(row, scopes, site.operand(), found)?;
+                    *found = true;
+                    return self.block(&sq.subquery, scopes + 1, width(row));
                 }
                 walk(&infix.left)?;
                 walk(&infix.right)
@@ -703,6 +712,53 @@ fn list_site(sq: &SelectStatement) -> Site {
     } else {
         Site::Subqueries
     }
+}
+
+/// `(a, b) op (SELECT x, y ..)`, either way round: the row, the block, and
+/// the comparison with the row on its left
+fn row_subquery(infix: &InfixExpression) -> Option<(&Expression, &ScalarSubquery, RowComparison)> {
+    let comparison = match infix.op_type {
+        InfixOperator::Equal => RowComparison::Eq,
+        InfixOperator::NotEqual => RowComparison::Ne,
+        InfixOperator::LessThan => RowComparison::Lt,
+        InfixOperator::LessEqual => RowComparison::Le,
+        InfixOperator::GreaterThan => RowComparison::Gt,
+        InfixOperator::GreaterEqual => RowComparison::Ge,
+        InfixOperator::IsDistinctFrom => RowComparison::Distinct,
+        InfixOperator::IsNotDistinctFrom => RowComparison::NotDistinct,
+        _ => return None,
+    };
+    match (&*infix.left, &*infix.right) {
+        (row, Expression::ScalarSubquery(sq)) if width(row) > 1 => Some((row, sq, comparison)),
+        (Expression::ScalarSubquery(sq), row) if width(row) > 1 => {
+            Some((row, sq, comparison.flipped()))
+        }
+        _ => None,
+    }
+}
+
+/// `infix` with its row and its block replaced, each on its side
+fn row_against(
+    infix: &InfixExpression,
+    row: Expression,
+    block: &ScalarSubquery,
+    mark: Box<SelectStatement>,
+) -> Expression {
+    let block = Expression::ScalarSubquery(ScalarSubquery {
+        token: block.token.clone(),
+        subquery: mark,
+    });
+    let (left, right) = match &*infix.right {
+        Expression::ScalarSubquery(_) => (row, block),
+        _ => (block, row),
+    };
+    Expression::Infix(InfixExpression {
+        token: infix.token.clone(),
+        left: Box::new(left),
+        operator: infix.operator.clone(),
+        op_type: infix.op_type,
+        right: Box::new(right),
+    })
 }
 
 /// The values `expr` holds: a row's, `(a, b)`, else one
@@ -3264,6 +3320,8 @@ enum MemberTest {
     In,
     /// The operator, and whether it is ALL
     Quantified(CompareOp, bool),
+    /// A row compared with the block's one row, `(a, b) = (SELECT x, y ..)`
+    One(RowComparison),
 }
 
 impl MemberTest {
@@ -3935,6 +3993,20 @@ impl Builder<'_> {
             {
                 Ok(expr.clone())
             }
+            Expression::Infix(infix) => match row_subquery(infix) {
+                Some((row, nested, comparison)) if nested.subquery.prepared.is_none() => {
+                    let form = Form::Members {
+                        block: &nested.subquery,
+                        read_as: None,
+                        test: MemberTest::One(comparison),
+                    };
+                    let row = self.rewrite_blocks(chain, row)?;
+                    let mark = self.nested(chain, None, &nested.subquery, form, &mut work)?;
+                    Ok(row_against(infix, row, nested, mark))
+                }
+                Some(_) => Ok(expr.clone()),
+                None => rebuild(expr, &mut |child| self.rewrite_blocks(chain, child)),
+            },
             Expression::ScalarSubquery(_) | Expression::Exists(_) => {
                 self.rewrite(chain, None, expr, &mut work)
             }
@@ -4112,6 +4184,19 @@ impl Builder<'_> {
                     subquery: mark,
                 }))
             }
+            Expression::Infix(infix) => match row_subquery(infix) {
+                Some((row, nested, comparison)) => {
+                    let form = Form::Members {
+                        block: &nested.subquery,
+                        read_as: None,
+                        test: MemberTest::One(comparison),
+                    };
+                    let row = self.rewrite(chain, id, row, work)?;
+                    let mark = self.nested(chain, id, &nested.subquery, form, work)?;
+                    Ok(row_against(infix, row, nested, mark))
+                }
+                None => rebuild(expr, &mut |child| self.rewrite(chain, id, child, work)),
+            },
             other => rebuild(other, &mut |child| self.rewrite(chain, id, child, work)),
         }
     }
@@ -10183,7 +10268,7 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         row: &[Value],
         caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, row, caller, self.holes)
+        self.row_members_answer(subquery_index as usize, row, caller, self.holes)
     }
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
@@ -10256,7 +10341,7 @@ impl SubqueryExecutor for SiteRunner<'_> {
         caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
         self.runner
-            .members_answer(subquery_index as usize, row, caller, self.holes)
+            .row_members_answer(subquery_index as usize, row, caller, self.holes)
     }
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
@@ -10691,22 +10776,20 @@ fn first_value(row: Row) -> Value {
     }
 }
 
-fn more_than_one_row() -> Error {
-    Error::Internal {
-        message: "scalar subquery returned more than one row".to_string(),
-    }
-}
-
 /// `values` as `test` asks them, NULL members included; an uncorrelated
 /// block's IN set `shared`, a key's kept in place. A row block's members
 /// are `width` values each
 fn member_set(test: MemberTest, width: usize, values: Vec<Value>, shared: bool) -> MemberSet {
+    let (op, all) = match test {
+        MemberTest::One(comparison) => {
+            return MemberSet::Rows(RowMembers::new(RowTest::One(comparison), width, values));
+        }
+        MemberTest::In => (CompareOp::Eq, false),
+        MemberTest::Quantified(op, all) => (op, all),
+    };
     if width > 1 {
-        let (op, all) = match test {
-            MemberTest::In => (CompareOp::Eq, false),
-            MemberTest::Quantified(op, all) => (op, all),
-        };
-        return MemberSet::Rows(RowMembers::new(op, all, width, values));
+        let test = RowTest::Quantified(op, all);
+        return MemberSet::Rows(RowMembers::new(test, width, values));
     }
     match test {
         MemberTest::In => {
@@ -10716,7 +10799,7 @@ fn member_set(test: MemberTest, width: usize, values: Vec<Value>, shared: bool) 
                 false => MemberSet::In(set),
             }
         }
-        MemberTest::Quantified(op, all) => {
+        _ => {
             let has_null = values.iter().any(Value::is_null);
             let members: Vec<Value> = values.into_iter().filter(|v| !v.is_null()).collect();
             MemberSet::Quantified(QuantifiedMembers::new(
@@ -10730,6 +10813,54 @@ fn member_set(test: MemberTest, width: usize, values: Vec<Value>, shared: bool) 
 }
 
 impl PreparedRunner<'_> {
+    /// A row block's answer to `row` for the row it runs for. A row compared
+    /// with the block's one row reads every row the block gives first; an
+    /// uncorrelated block keeps them for the run
+    fn row_members_answer(
+        &self,
+        index: usize,
+        row: &[Value],
+        caller: &ExecuteContext,
+        site: &HoleSet,
+    ) -> Result<Option<bool>> {
+        let sq = &self.prepared.subqueries[index];
+        let one = match &sq.answer {
+            Answer::Members(_, members) => matches!(members.test, MemberTest::One(_)),
+            Answer::Statement(_, block) => {
+                matches!(block.form, StatementForm::Members(_, MemberTest::One(_)))
+            }
+            _ => false,
+        };
+        if !one || sq.uncorrelated {
+            return self.members_answer(index, row, caller, site);
+        }
+        let set = match &sq.answer {
+            Answer::Statement(_, block) => {
+                let StatementForm::Members(read_as, test) = block.form else {
+                    return Err(Error::internal("a block run for its members that has none"));
+                };
+                let mut rows = self.block_statement(index, block, caller, site)?;
+                let mut values = Vec::new();
+                while rows.next() {
+                    Member::of_row(rows.take_row(), row.len(), read_as).push_into(&mut values);
+                }
+                if let Some(e) = rows.last_error() {
+                    return Err(e);
+                }
+                KeptMembers {
+                    set: member_set(test, row.len(), values, false),
+                    failed: None,
+                }
+            }
+            Answer::Members(_, members) => {
+                self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
+                self.collect_members(index, members, None)?
+            }
+            _ => return Err(Error::internal("a block run for its members that has none")),
+        };
+        set.answer_row(row)
+    }
+
     /// A value block's answer to `tested`, a value or a row of the block's
     /// width, for the row it runs for
     fn members_answer(
@@ -11558,8 +11689,12 @@ struct MemberFold {
 
 impl MemberFold {
     fn new(test: MemberTest) -> Self {
+        debug_assert!(
+            !matches!(test, MemberTest::One(_)),
+            "a row compared with a block's one row reads all its rows first"
+        );
         let (op, decides) = match test {
-            MemberTest::In => (CompareOp::Eq, true),
+            MemberTest::In | MemberTest::One(_) => (CompareOp::Eq, true),
             MemberTest::Quantified(op, all) => (op, !all),
         };
         Self {

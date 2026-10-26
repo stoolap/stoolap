@@ -1349,6 +1349,15 @@ impl<'a> ExprCompiler<'a> {
                 )))
             }
         };
+        // A block a row is compared with holds the comparison, and its one row
+        if let (Expression::ScalarSubquery(sq), _, None, Some(row))
+        | (_, Expression::ScalarSubquery(sq), Some(row), None) =
+            (&*infix.left, &*infix.right, left, right)
+        {
+            let id = self.subquery_id(&sq.subquery, "row subquery")?;
+            self.compile_row_members(id, row.iter(), builder)?;
+            return Ok(true);
+        }
         let (left, right) = match (left, right) {
             (Some(left), Some(right)) if left.len() == right.len() => (left, right),
             (left, right) => {

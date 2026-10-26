@@ -38,6 +38,8 @@ A row `IN` a list of rows is true when a row of the list equals it, else NULL wh
 
 A row tested against a subquery that selects as many values, `(a, b) IN (SELECT x, y FROM u)` or `(a, b) < ANY (SELECT x, y FROM u)`, compares the row with each row the subquery gives by the same rule. `IN` and `op ANY` are true when one comparison is true, else NULL when one is NULL, else false; `op ALL` is false when one comparison is false, else NULL when one is NULL, else true. Over no rows `IN` and `ANY` are false and `ALL` is true.
 
+A row compared with a subquery that selects as many values, `(a, b) = (SELECT x, y FROM u WHERE u.id = t.id)`, either way round, compares it with the one row the subquery gives, by the same rule. A subquery that gives no row gives a row of NULLs, and one that gives more than one row is an error.
+
 A row is compared only with a row of as many values: `(1, 2) = (1, 2, 3)` and `(1, 2) = 1` are errors, and so is a row anywhere a single value is read, such as `SELECT (1, 2)` or `(1, 2) IS NULL`.
 
 ## Logical Operators
