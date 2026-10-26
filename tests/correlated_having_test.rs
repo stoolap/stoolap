@@ -155,3 +155,42 @@ fn every_subquery_form_reads_the_outer_row_in_its_having() {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+#[test]
+fn a_values_alias_names_the_subquery_own_rows() {
+    let _serial = serial();
+    let db = create("memory://a_values_alias_names_the_subquery_own_rows");
+    let mut failed = Vec::new();
+    for predicate in [
+        "(1, 1) IN (SELECT t.id, t.id FROM (VALUES (1)) AS t(id))",
+        "1 IN (SELECT t.id FROM (VALUES (1)) AS t(id))",
+        "(SELECT t.id FROM (VALUES (1)) AS t(id)) = 1",
+        "(SELECT v.id FROM (VALUES (1)) AS v(id)) = 1",
+    ] {
+        for filter in ["", "s || 'x' <> 'zx' AND ", "id IN (1, 2, 3) AND "] {
+            let sql = format!("SELECT id FROM t WHERE {filter}{predicate}");
+            let got = ids(&db, &sql);
+            if got != Ok(vec![1, 2, 3]) {
+                failed.push(format!("{sql}: {got:?}"));
+            }
+        }
+    }
+    // Twins that differ only in the alias, the inner one first
+    let outer = "SELECT o.id FROM t AS o WHERE s || 'x' <> 'zx' AND";
+    for (sql, want) in [
+        (
+            format!("{outer} (SELECT o.id FROM (VALUES (1)) AS o(id)) = 1"),
+            vec![1, 2, 3],
+        ),
+        (
+            format!("{outer} (SELECT o.id FROM (VALUES (1)) AS w(id)) = 2"),
+            vec![2],
+        ),
+    ] {
+        let got = ids(&db, &sql);
+        if got.as_ref() != Ok(&want) {
+            failed.push(format!("{sql}: {got:?}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}

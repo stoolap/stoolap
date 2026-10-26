@@ -3623,6 +3623,11 @@ impl Executor {
                     tables.push(alias.value_lower.as_str());
                 }
             }
+            Expression::ValuesSource(vs) => {
+                if let Some(ref alias) = vs.alias {
+                    tables.push(alias.value_lower.as_str());
+                }
+            }
             Expression::FunctionTableSource(fs) => {
                 if let Some(ref alias) = fs.alias {
                     tables.push(alias.value_lower.as_str());
