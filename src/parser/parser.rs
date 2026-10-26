@@ -154,7 +154,7 @@ pub struct Parser<'a> {
     /// entries; off for text the engine wrote itself
     scoped: bool,
     /// Whether the current statement wrote what the scope check can refuse:
-    /// a qualifier, or a SELECT DISTINCT and its ORDER BY
+    /// a qualifier, a SELECT DISTINCT and its ORDER BY, or an ORDER BY position
     pub(crate) scope_checked: bool,
 }
 

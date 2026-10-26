@@ -705,9 +705,20 @@ impl Executor {
     /// groups, a row count keeps only some of the rows, and a bare aggregate
     /// returns its one row whether or not anything matched. Grouping on its
     /// own is not among them, since a group is there exactly where a row is.
+    /// Nor can they check an ORDER BY position beside a star, which only the
+    /// expanded list's width tells valid.
     fn exists_subquery_is_more_than_its_where(subquery: &SelectStatement) -> bool {
+        let star = subquery
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+        let position = subquery
+            .order_by
+            .iter()
+            .any(|ob| matches!(ob.expression, Expression::IntegerLiteral(_)));
         // ROLLUP, CUBE and grouping sets add total rows that need no row
-        if subquery.having.is_some()
+        if (star && position)
+            || subquery.having.is_some()
             || subquery.limit.is_some()
             || subquery.offset.is_some()
             || !subquery.set_operations.is_empty()

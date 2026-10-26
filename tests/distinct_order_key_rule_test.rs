@@ -82,8 +82,6 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
                 "(SELECT MAX(x) FROM u WHERE (u.k = t.a))",
             ),
             ("t.a", "t.b LIMIT 2", "t.b"),
-            // A position past the list
-            ("t.a", "2", "2"),
             // A call that may answer anew for each merged row
             ("t.a", "RANDOM()", "RANDOM()"),
             ("t.a", "t.a + RANDOM()", "(t.a + RANDOM())"),

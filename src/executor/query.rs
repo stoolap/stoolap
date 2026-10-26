@@ -1586,6 +1586,21 @@ impl Executor {
                 }
                 counted => counted,
             };
+        // Beside a star only the rows know the width an ORDER BY position
+        // counts in: the columns before those appended for the sort
+        if stmt.columns.iter().any(is_star_item) {
+            let width = match (&deferred_projection, expected_columns) {
+                (Some((_, names)), _) => names.len(),
+                (None, 0) => columns.len(),
+                (None, shown) => shown,
+            };
+            if let Some(position) = crate::parser::scope::order_position_outside(stmt, Some(width))
+            {
+                return Err(Error::invalid_argument(
+                    crate::parser::scope::order_position_message(position.value),
+                ));
+            }
+        }
 
         // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.

@@ -531,7 +531,8 @@ impl<'a> Family<'a> {
         let mut found = false;
         for ob in &sq.order_by {
             let key = &ob.expression;
-            if matches!(key, Expression::IntegerLiteral(_)) {
+            // An EXISTS block checks its positions where it is bound
+            if matches!(key, Expression::IntegerLiteral(_)) && !exists {
                 return Err("an ORDER BY position in a subquery block");
             }
             if !chooses && mentions_subquery(key) {
@@ -1229,6 +1230,15 @@ impl StatementWalk<'_> {
             ..level.clone()
         };
         let names = output_names(stmt, &own)?;
+        // Its ORDER BY positions count the columns it shows, whether or not
+        // it ever runs
+        if let Some(position) =
+            crate::parser::scope::order_position_outside(stmt, Some(names.len()))
+        {
+            return Err(Error::invalid_argument(
+                crate::parser::scope::order_position_message(position.value),
+            ));
+        }
         let all = |walk: &mut Self, exprs: &[Expression]| {
             exprs
                 .iter()
@@ -2336,6 +2346,26 @@ fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
 
 fn compile_error(error: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", error))
+}
+
+/// That each ORDER BY position of the block `sq`, whose FROM gives `columns`
+/// columns, names a column its list shows: a star shows them all, as a
+/// block's FROM is one source
+fn check_block_positions(sq: &SelectStatement, columns: usize) -> Result<()> {
+    let width = sq
+        .columns
+        .iter()
+        .map(|item| match item {
+            Expression::Star(_) | Expression::QualifiedStar(_) => columns,
+            _ => 1,
+        })
+        .sum();
+    match crate::parser::scope::order_position_outside(sq, Some(width)) {
+        Some(position) => Err(Error::invalid_argument(
+            crate::parser::scope::order_position_message(position.value),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// A block's WHERE with its SELECT aliases read as their expressions, as
@@ -3555,6 +3585,7 @@ impl Builder<'_> {
             Some(Expression::SubquerySource(derived)) => derived.alias.as_ref(),
             _ => None,
         };
+        check_block_positions(sq, columns.len())?;
         let name = name.map(|a| a.value_lower.clone()).unwrap_or_default();
         let schema = untyped_schema(&name, columns);
         let own = ScopeTable::of(name, &schema);
@@ -4160,6 +4191,9 @@ impl Builder<'_> {
             .first()
             .filter(|_| !matches!(form, Form::Exists(_)));
         let (mut order_keys, mut bound_only) = (Vec::new(), Vec::new());
+        if matches!(form, Form::Exists(_)) {
+            check_block_positions(sq, scope.columns.len())?;
+        }
         for ob in &sq.order_by {
             // A bare alias sorts by the item's value
             let alias = item.is_some() && order_by_names_an_alias(&ob.expression, sq);
