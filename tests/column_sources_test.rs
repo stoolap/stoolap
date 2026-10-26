@@ -337,29 +337,63 @@ fn a_quoted_name_no_column_has_is_its_text_over_every_source() {
         db.execute(sql, ()).unwrap();
     }
     let mut wrong = Vec::new();
-    for (with, from) in [
-        ("", "q"),
-        ("", "qv"),
-        ("", "(SELECT 5 AS \"a.b\") AS d"),
-        ("WITH c(\"a.b\") AS (SELECT 5) ", "c"),
-        ("WITH c AS (SELECT 5 AS \"a.b\") ", "c"),
-        ("", "(VALUES (5)) AS v(\"a.b\")"),
+    // (WITH clause, FROM, the name the FROM entry shows)
+    for (with, from, entry) in [
+        ("", "q", "q"),
+        ("", "qv", "qv"),
+        ("", "(SELECT 5 AS \"a.b\") AS d", "d"),
+        ("WITH c(\"a.b\") AS (SELECT 5) ", "c", "c"),
+        ("WITH c AS (SELECT 5 AS \"a.b\") ", "c", "c"),
+        ("", "(VALUES (5)) AS v(\"a.b\")", "v"),
     ] {
         for (item, want) in [
-            ("\"b\"", "[Some(Text(\"b\"))]"),
-            ("\"b\" AS x", "[Some(Text(\"b\"))]"),
-            ("\"a.b\"", "[Some(Integer(5))]"),
-            ("\"a.b\" AS x", "[Some(Integer(5))]"),
+            ("\"b\"".to_string(), Some("[Some(Text(\"b\"))]")),
+            ("\"b\" AS x".to_string(), Some("[Some(Text(\"b\"))]")),
+            ("\"a.b\"".to_string(), Some("[Some(Integer(5))]")),
+            ("\"a.b\" AS x".to_string(), Some("[Some(Integer(5))]")),
+            (format!("{entry}.\"a.b\""), Some("[Some(Integer(5))]")),
+            (format!("{entry}.\"a.b\" AS x"), Some("[Some(Integer(5))]")),
+            // A qualified name is a column or nothing: it never reads as text
+            (format!("{entry}.b"), None),
+            (format!("{entry}.b AS x"), None),
         ] {
             let sql = format!("{with}SELECT {item} FROM {from}");
             for (run, got) in runs(&db, &sql) {
-                if got.as_ref().map(|rows| rows.get(1).map(String::as_str)) != Ok(Some(want)) {
-                    wrong.push(format!("{sql} ({run}): {got:?}, want {want}"));
+                let right = match want {
+                    Some(want) => {
+                        got.as_ref().map(|rows| rows.get(1).map(String::as_str)) == Ok(Some(want))
+                    }
+                    None => got.as_ref().is_err_and(|e| e.contains("not found")),
+                };
+                if !right {
+                    wrong.push(format!("{sql} ({run}): {got:?}, want {want:?}"));
                 }
             }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_name_is_escaped_once_however_deep_its_value_sits() {
+    let db = Database::open("memory://column_sources_escape_once").unwrap();
+    let names = |sql: &str| db.query(sql, ()).unwrap().columns().to_vec();
+    // One item, one name, whatever stands beside it
+    assert_eq!(
+        names("SELECT MAX('\u{FFFD}')")[0],
+        names("SELECT MAX('\u{FFFD}'), 1")[0]
+    );
+    // The name grows with the text it spells, not with its depth
+    let mut item = "'\u{FFFD}'".to_string();
+    for _ in 0..20 {
+        item = format!("LOWER({item})");
+    }
+    let name = names(&format!("SELECT {item}"))[0].clone();
+    assert!(
+        name.len() < 2 * item.len(),
+        "{} bytes for {item}",
+        name.len()
+    );
 }
 
 #[test]

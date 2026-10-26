@@ -1996,7 +1996,12 @@ fn holds_text_literal(expr: &Expression) -> bool {
 
 /// A function call as a result column names it: `COUNT(DISTINCT g)`
 pub fn function_call_to_string(func: &crate::parser::ast::FunctionCall) -> String {
-    let args: Vec<String> = func.arguments.iter().map(expression_to_string).collect();
+    name_text(written_call(func))
+}
+
+/// `function_call_to_string` before `name_text`, as `written_text` nests it
+fn written_call(func: &crate::parser::ast::FunctionCall) -> String {
+    let args: Vec<String> = func.arguments.iter().map(written_text).collect();
     let distinct = if func.is_distinct { "DISTINCT " } else { "" };
     format!("{}({}{})", func.function, distinct, args.join(", "))
 }
@@ -2073,7 +2078,7 @@ fn written_text(expr: &Expression) -> String {
         Expression::FloatLiteral(lit) => lit.value.to_string(),
         Expression::StringLiteral(lit) => lit.to_string(),
         Expression::BooleanLiteral(lit) => lit.value.to_string(),
-        Expression::FunctionCall(func) => function_call_to_string(func),
+        Expression::FunctionCall(func) => written_call(func),
         // An operand bound less tightly than its operator keeps its
         // parentheses, or (a + b) * 2 and a + b * 2 would read the same; a
         // right operand of the same precedence keeps them too unless it is
@@ -2081,7 +2086,7 @@ fn written_text(expr: &Expression) -> String {
         Expression::Infix(infix) => {
             let precedence = infix_precedence(&infix.op_type);
             let side = |operand: &Expression, on_the_right: bool| -> String {
-                let text = expression_to_string(operand);
+                let text = written_text(operand);
                 match operand {
                     Expression::Infix(inner) => {
                         let inner_precedence = infix_precedence(&inner.op_type);
@@ -2114,7 +2119,7 @@ fn written_text(expr: &Expression) -> String {
             )
         }
         Expression::Prefix(prefix) => {
-            let operand = expression_to_string(&prefix.right);
+            let operand = written_text(&prefix.right);
             let operand = match prefix.right.as_ref() {
                 Expression::Infix(_) => format!("({operand})"),
                 _ => operand,
@@ -2126,21 +2131,13 @@ fn written_text(expr: &Expression) -> String {
             }
         }
         Expression::Cast(cast) => {
-            format!(
-                "CAST({} AS {})",
-                expression_to_string(&cast.expr),
-                cast.type_name
-            )
+            format!("CAST({} AS {})", written_text(&cast.expr), cast.type_name)
         }
         // The call as an aggregate names it, then OVER as the query wrote it
         Expression::Window(window) => {
             let mut parts: Vec<String> = Vec::new();
             if !window.partition_by.is_empty() {
-                let keys: Vec<String> = window
-                    .partition_by
-                    .iter()
-                    .map(expression_to_string)
-                    .collect();
+                let keys: Vec<String> = window.partition_by.iter().map(written_text).collect();
                 parts.push(format!("PARTITION BY {}", keys.join(", ")));
             }
             if !window.order_by.is_empty() {
@@ -2157,11 +2154,7 @@ fn written_text(expr: &Expression) -> String {
                     format!("({})", name.chain(parts).collect::<Vec<_>>().join(" "))
                 }
             };
-            format!(
-                "{} OVER {}",
-                function_call_to_string(&window.function),
-                over
-            )
+            format!("{} OVER {}", written_call(&window.function), over)
         }
         _ => format!("{}", expr),
     }
@@ -2169,7 +2162,7 @@ fn written_text(expr: &Expression) -> String {
 
 /// An ORDER BY key as written: ASC is the default and is left out
 fn order_key_to_string(key: &crate::parser::ast::OrderByExpression) -> String {
-    let mut text = expression_to_string(&key.expression);
+    let mut text = written_text(&key.expression);
     if !key.ascending {
         text.push_str(" DESC");
     }

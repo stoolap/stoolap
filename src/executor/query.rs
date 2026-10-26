@@ -8125,13 +8125,15 @@ impl Executor {
         let extended_columns = column_names_arc.to_vec();
 
         // OPTIMIZATION: Check if we need an evaluator for complex expressions
-        // A name no column has is read as the compiler reads it
-        let unbound = |id: &Identifier| !col_index_map.contains_key(id.value_lower.as_str());
-        let needs_evaluator = stmt.columns.iter().any(|c| match c {
-            Expression::Identifier(id) => unbound(id),
-            Expression::Star(_) | Expression::QualifiedStar(_) => false,
-            Expression::QualifiedIdentifier(_) => false,
-            _ => true,
+        let needs_evaluator = stmt.columns.iter().any(|c| {
+            matches!(c, Expression::Aliased(_))
+                || !matches!(
+                    c,
+                    Expression::Star(_)
+                        | Expression::QualifiedStar(_)
+                        | Expression::Identifier(_)
+                        | Expression::QualifiedIdentifier(_)
+                )
         });
 
         let mut proj_eval = if needs_evaluator {
@@ -8159,6 +8161,35 @@ impl Executor {
                 qualified_col_indices.push(None);
             }
         }
+        // A name no column has is compiled once, read as the compiler reads
+        // it: the enclosing row's column, a quoted name's text, or an error
+        let outer_columns = outer_column_names(ctx);
+        let mut unbound_ctx = CompileContext::new(&extended_columns, &self.function_registry);
+        if let Some(outer) = &outer_columns {
+            unbound_ctx = unbound_ctx.with_outer_columns(outer);
+        }
+        let unbound: Vec<Option<SharedProgram>> = stmt
+            .columns
+            .iter()
+            .zip(&qualified_col_indices)
+            .map(|(col_expr, qualified_idx)| {
+                let bound = match col_expr {
+                    Expression::Identifier(id) => {
+                        col_index_map.contains_key(id.value_lower.as_str())
+                    }
+                    Expression::QualifiedIdentifier(_) => qualified_idx.is_some(),
+                    _ => return Ok(None),
+                };
+                if bound {
+                    return Ok(None);
+                }
+                ExprCompiler::new(&unbound_ctx)
+                    .compile(col_expr)
+                    .map(|program| Some(CompactArc::new(program)))
+                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+            })
+            .collect::<Result<_>>()?;
+        let mut unbound_vm = ExprVM::new();
 
         // Materialize and project
         // OPTIMIZATION: Pre-compute output size to avoid reallocation per row
@@ -8186,6 +8217,15 @@ impl Executor {
             let mut new_values = Vec::with_capacity(output_cols);
 
             for (col_idx, col_expr) in stmt.columns.iter().enumerate() {
+                if let Some(program) = &unbound[col_idx] {
+                    let mut exec =
+                        ExecuteContext::with_common_params(row, ctx.params(), ctx.transaction_id());
+                    if let Some(outer) = ctx.outer_row() {
+                        exec = exec.with_outer_row(outer);
+                    }
+                    new_values.push(unbound_vm.execute(program, &exec)?);
+                    continue;
+                }
                 match col_expr {
                     Expression::Star(_) => {
                         // Extend with all values from the row
@@ -8207,11 +8247,7 @@ impl Executor {
                                 new_values.push(Value::null_unknown());
                             }
                         } else {
-                            let eval = proj_eval.as_mut().ok_or_else(|| {
-                                Error::internal("an unbound name without an evaluator")
-                            })?;
-                            eval.set_row_array(row);
-                            new_values.push(eval.evaluate(col_expr)?);
+                            new_values.push(Value::null_unknown());
                         }
                     }
                     Expression::QualifiedIdentifier(_) => {
