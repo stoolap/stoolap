@@ -1169,8 +1169,8 @@ impl SegmentedTable {
     /// returns the fence once neither a seal nor any publication moved the
     /// volumes since; each round walks only the volumes the snapshot gained,
     /// and three that do not stand are a write conflict. With `ids` the rows
-    /// are the ones named, and the ids no cold volume holds come back for
-    /// the hot store
+    /// are the ones named that `where_expr` passes, and the ids no cold
+    /// volume holds come back for the hot store
     fn prepare_cold_updates<'m>(
         &self,
         mgr: &'m super::manifest::SegmentManager,
@@ -1195,6 +1195,7 @@ impl SegmentedTable {
             drop(guard);
         }
         let comparisons = where_expr
+            .filter(|_| ids.is_none())
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
@@ -1205,7 +1206,9 @@ impl SegmentedTable {
                 self.revalidate_prepared(snap, &mut prep)?;
             }
             match ids {
-                Some(ids) => self.prepare_cold_rows_by_id(snap, ids, setter, &mut prep)?,
+                Some(ids) => {
+                    self.prepare_cold_rows_by_id(snap, ids, where_expr, setter, &mut prep)?
+                }
                 None => self.prepare_cold_rows_where(
                     snap,
                     where_expr,
@@ -1347,14 +1350,17 @@ impl SegmentedTable {
         Ok(())
     }
 
-    /// One round over the rows named that no round set yet
+    /// One round over the rows named that no round set yet and `where_expr`
+    /// passes
     fn prepare_cold_rows_by_id(
         &self,
         snap: &super::manifest::StatementSnapshot,
         ids: &[i64],
+        where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
         let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
         for &row_id in ids {
             // A row an earlier round ran the setter on is never set again; a
@@ -1383,6 +1389,11 @@ impl SegmentedTable {
                 .map(|(reader, mapping)| (reader, &*mapping))
                 .expect("reader just set");
             let row = reader.row(idx, mapping)?;
+            if let Some(expr) = where_expr {
+                if !passes(expr, fallible, &row)? {
+                    continue;
+                }
+            }
             self.prepare_cold_row(snap, seg_id, row_id, row, setter, prep)?;
         }
         Ok(())
@@ -1432,6 +1443,8 @@ impl SegmentedTable {
                     continue;
                 }
                 let row = reader.row(i, &mapping)?;
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::cold_update_row_walked();
                 if let Some(expr) = where_expr {
                     if !passes(expr, fallible, &row)? {
                         continue;
@@ -3914,10 +3927,18 @@ impl Table for SegmentedTable {
             return self.update_admitted_by_row_ids(&[pk], setter);
         }
         let txn_id = self.txn_id();
+        // A key ANDed with other conditions names the one cold row they judge
+        let named = where_expr
+            .and_then(|e| crate::storage::mvcc::table::pk_conjunct_id(e, self.hot.schema()));
         // The cold rows the statement changes are read, filtered, set and
         // checked outside the fence; under it they are claimed, then the hot
         // rows are set, skipping every row the cold half ran the setter on
-        let prepared = self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
+        let prepared = self.prepare_cold_updates(
+            &self.segment_mgr,
+            named.as_ref().map(std::slice::from_ref),
+            where_expr,
+            setter,
+        )?;
         let mut plan = PlannedUpdate {
             cold: prepared.changes,
             ..PlannedUpdate::default()

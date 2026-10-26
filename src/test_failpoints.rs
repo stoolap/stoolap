@@ -614,6 +614,26 @@ thread_local! {
     static ROW_ORDERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COUNT_IDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COUNT_BOUNDS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOT_INDEX_IDS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COLD_UPDATE_ROWS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Row ids the hot store's single-column index lookups returned on this thread
+pub fn hot_index_ids_read() -> usize {
+    HOT_INDEX_IDS_READ.with(std::cell::Cell::get)
+}
+
+pub(crate) fn hot_index_ids_add(n: usize) {
+    HOT_INDEX_IDS_READ.with(|c| c.set(c.get() + n));
+}
+
+/// Cold rows an UPDATE's filter walk read on this thread
+pub fn cold_update_rows_walked() -> usize {
+    COLD_UPDATE_ROWS_WALKED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn cold_update_row_walked() {
+    COLD_UPDATE_ROWS_WALKED.with(|c| c.set(c.get() + 1));
 }
 
 /// Segment bounds compared on this thread to find a segment's id range
