@@ -1,0 +1,352 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A subquery block whose FROM is a join, or reads a derived table over
+//! one, runs as a statement of the prepared blocks and answers as written
+
+#![cfg(feature = "test-failpoints")]
+
+use std::sync::{Mutex, MutexGuard};
+
+use stoolap::test_failpoints::{general_path_hits, GeneralPath};
+use stoolap::Database;
+
+// The counters are process-wide
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+const MECHANISMS: [GeneralPath; 15] = [
+    GeneralPath::CorrelatedScan,
+    GeneralPath::CorrelatedWhere,
+    GeneralPath::OuterBinding,
+    GeneralPath::OuterSubstitution,
+    GeneralPath::PushdownConstant,
+    GeneralPath::ProjectionEvaluator,
+    GeneralPath::OrderByEvaluator,
+    GeneralPath::AntiJoin,
+    GeneralPath::ExistsSemiJoin,
+    GeneralPath::ExistsSubquery,
+    GeneralPath::InSubquery,
+    GeneralPath::ScalarSubquery,
+    GeneralPath::SelectFold,
+    GeneralPath::CorrelatedExpression,
+    GeneralPath::LiftedSubqueries,
+];
+
+/// u joins w on id for ids 1 to 3; u 4 has no w, w 5 no u
+const SETUP: &[&str] = &[
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+    "INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 0, 30), (4, 1, 40), (5, 3, NULL)",
+    "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+    "INSERT INTO u VALUES (1, 1), (2, 2), (3, 3), (4, NULL)",
+    "CREATE TABLE w (id INTEGER PRIMARY KEY, y INTEGER)",
+    "INSERT INTO w VALUES (1, 10), (2, 20), (3, 30), (5, 50)",
+];
+
+fn hot(name: &str) -> Database {
+    let db = Database::open(&format!("memory://block_join_sources_{name}")).unwrap();
+    for sql in SETUP {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+fn sealed(dir: &tempfile::TempDir, name: &str) -> Database {
+    let path = dir.path().join(name);
+    let db = Database::open(&format!("file://{}?checkpoint_interval=0", path.display())).unwrap();
+    for sql in SETUP {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db
+}
+
+/// The rows of `sql` in order, each its values joined by `|`, or the error
+fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
+    let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push(
+            (0..row.len())
+                .map(|i| match row.get::<Option<String>>(i) {
+                    Ok(value) => value.unwrap_or_else(|| "NULL".into()),
+                    Err(e) => format!("<{e}>"),
+                })
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+    }
+    Ok(out)
+}
+
+fn prepared_line(db: &Database, sql: &str) -> String {
+    db.query(&format!("EXPLAIN {sql}"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.trim_start().starts_with("Prepared:"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Each statement and its rows in order
+const SHAPES: &[(&str, &[&str])] = &[
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id WHERE u.x = t.a) \
+         ORDER BY id",
+        &["1", "2", "4", "5"],
+    ),
+    (
+        "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
+         WHERE u.x = t.a) ORDER BY id",
+        &["3"],
+    ),
+    (
+        "SELECT id FROM t WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id WHERE w.y > 10) \
+         ORDER BY id",
+        &["2", "5"],
+    ),
+    (
+        "SELECT id, (SELECT MAX(w.y) FROM u JOIN w ON w.id = u.id WHERE u.x = t.a) FROM t \
+         ORDER BY id",
+        &["1|10", "2|20", "3|NULL", "4|10", "5|30"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id AND w.y = t.b) \
+         ORDER BY id",
+        &["1", "2", "3"],
+    ),
+    (
+        "SELECT id FROM t WHERE b > (SELECT MAX(w.y) FROM u LEFT JOIN w ON w.id = u.id) \
+         ORDER BY id",
+        &["4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
+         JOIN u AS v ON v.id = w.id WHERE v.x = t.a) ORDER BY id",
+        &["1", "2", "4", "5"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w USING (id) WHERE id = t.a) \
+         ORDER BY id",
+        &["1", "2", "4", "5"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u NATURAL JOIN w WHERE x = t.a) \
+         ORDER BY id",
+        &["1", "2", "4", "5"],
+    ),
+    (
+        "SELECT id FROM t WHERE b >= ALL (SELECT w.y FROM u JOIN w ON w.id = u.id \
+         WHERE u.x <= t.a) ORDER BY id",
+        &["1", "2", "3", "4"],
+    ),
+    (
+        "SELECT id, (SELECT COUNT(*) FROM u JOIN w ON w.id = u.id) FROM t ORDER BY id",
+        &["1|3", "2|3", "3|3", "4|3", "5|3"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.x, w.y FROM u JOIN w \
+         ON w.id = u.id) AS q WHERE q.x = t.a) ORDER BY id",
+        &["1", "2", "4", "5"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT id, y FROM u JOIN w USING (id)) \
+         AS q WHERE q.id = t.a AND q.y > 10) ORDER BY id",
+        &["2", "5"],
+    ),
+];
+
+#[test]
+fn a_block_over_a_join_runs_prepared_and_answers_as_written() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for (context, db) in [("hot", hot("matrix")), ("sealed", sealed(&dir, "matrix"))] {
+        for &(sql, want) in SHAPES {
+            let before: Vec<usize> = MECHANISMS.iter().map(|p| general_path_hits(*p)).collect();
+            let got = answer(&db, sql);
+            let ran: Vec<_> = MECHANISMS
+                .iter()
+                .zip(before)
+                .filter(|(path, before)| general_path_hits(**path) > *before)
+                .map(|(path, _)| *path)
+                .collect();
+            let want: Vec<String> = want.iter().map(|row| row.to_string()).collect();
+            if got != Ok(want.clone()) {
+                wrong.push(format!("{context}: {sql}: gave {got:?}, want {want:?}"));
+            }
+            if !ran.is_empty() {
+                wrong.push(format!("{context}: {sql}: ran {ran:?}"));
+            }
+            let line = prepared_line(&db, sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("{context}: {sql}: EXPLAIN {line}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_write_reads_a_block_over_a_join() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for (write, read, want) in [
+        (
+            "UPDATE t SET b = 0 WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
+             WHERE u.x = t.a)",
+            "SELECT id FROM t WHERE b = 0 ORDER BY id",
+            &["1", "2", "4", "5"][..],
+        ),
+        (
+            "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u JOIN w USING (id) WHERE id = t.a)",
+            "SELECT id FROM t ORDER BY id",
+            &["1", "2", "4", "5"][..],
+        ),
+    ] {
+        let db = hot(&format!("write_{}", wrong.len() + write.len()));
+        let before: Vec<usize> = MECHANISMS.iter().map(|p| general_path_hits(*p)).collect();
+        if let Err(e) = db.execute(write, ()) {
+            wrong.push(format!("{write}: {e}"));
+            continue;
+        }
+        let ran: Vec<_> = MECHANISMS
+            .iter()
+            .zip(before)
+            .filter(|(path, before)| general_path_hits(**path) > *before)
+            .map(|(path, _)| *path)
+            .collect();
+        let want: Vec<String> = want.iter().map(|row| row.to_string()).collect();
+        let got = answer(&db, read);
+        if got != Ok(want.clone()) {
+            wrong.push(format!("{write}: left {got:?}, want {want:?}"));
+        }
+        if !ran.is_empty() {
+            wrong.push(format!("{write}: ran {ran:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_uncorrelated_block_over_a_join_runs_once_per_run() {
+    use stoolap::test_failpoints::random_draws;
+    let _guard = serial();
+    let db = hot("once");
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        (
+            "SELECT id FROM t WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id \
+             WHERE RANDOM() >= 0) ORDER BY id",
+            4,
+        ),
+        (
+            "SELECT id, (SELECT COUNT(*) FROM u JOIN w ON w.id = u.id WHERE RANDOM() >= 0) FROM t \
+             ORDER BY id",
+            5,
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
+             WHERE RANDOM() < 0) ORDER BY id",
+            0,
+        ),
+    ] {
+        let before = random_draws();
+        let got = answer(&db, sql).map(|found| found.len());
+        let draws = random_draws() - before;
+        if got != Ok(rows) || draws != 3 {
+            wrong.push(format!(
+                "{sql}: {got:?} rows and {draws} draws, want {rows} rows and the 3 of one run"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_star_over_a_join_is_named_only_by_its_run() {
+    let _guard = serial();
+    let db = hot("star");
+    let thrice = |ids: &[&str]| -> Vec<String> {
+        ids.iter()
+            .flat_map(|id| std::iter::repeat_n(id.to_string(), 3))
+            .collect()
+    };
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT t.id FROM t JOIN (SELECT * FROM u JOIN w ON w.id = u.id) AS q ON TRUE \
+             WHERE EXISTS (SELECT 1 FROM w WHERE w.id = t.id) ORDER BY t.id",
+            thrice(&["1", "2", "3", "5"]),
+        ),
+        (
+            "WITH c AS (SELECT * FROM u JOIN w ON w.id = u.id) SELECT t.id FROM t JOIN c ON TRUE \
+             WHERE EXISTS (SELECT 1 FROM w WHERE w.id = t.id) ORDER BY t.id",
+            thrice(&["1", "2", "3", "5"]),
+        ),
+        (
+            "WITH c AS (SELECT * FROM u JOIN w ON w.id = u.id) SELECT t.id FROM t JOIN c ON TRUE \
+             WHERE EXISTS (SELECT 1 FROM c AS d WHERE t.id = 1) ORDER BY t.id",
+            thrice(&["1"]),
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN w ON w.id = u.id) \
+             AS q WHERE t.a > 1) ORDER BY id",
+            vec!["2".to_string(), "5".to_string()],
+        ),
+    ] {
+        let got = answer(&db, sql);
+        if got != Ok(want.clone()) {
+            wrong.push(format!("{sql}: gave {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_kept_answer_of_a_block_over_a_join_follows_its_tables() {
+    let _guard = serial();
+    let db = hot("kept");
+    let in_sql = "SELECT id FROM t WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id \
+                  WHERE w.y > 10) ORDER BY id";
+    let max_sql = "SELECT id FROM t WHERE b > (SELECT MAX(w.y) FROM u JOIN w ON w.id = u.id) \
+                   ORDER BY id";
+    let exists_sql = "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w \
+                      ON w.id = u.id WHERE w.y > 40)";
+    let read = |sql: &str| answer(&db, sql).unwrap();
+    assert_eq!(read(in_sql), ["2", "5"]);
+    assert_eq!(read(max_sql), ["4"]);
+    assert_eq!(read(exists_sql), ["0"]);
+    // u 4 meets a w row now, with x NULL; w 1 rises above every b
+    db.execute("INSERT INTO w VALUES (4, 45)", ()).unwrap();
+    db.execute("UPDATE u SET x = 1 WHERE id = 4", ()).unwrap();
+    assert_eq!(read(in_sql), ["1", "2", "4", "5"], "{in_sql}");
+    assert_eq!(read(max_sql), Vec::<String>::new(), "{max_sql}");
+    assert_eq!(read(exists_sql), ["5"], "{exists_sql}");
+    // A transaction reads its own writes, and the answers after it reads none
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("DELETE FROM w WHERE id = 4", ()).unwrap();
+    assert_eq!(read(exists_sql), ["0"], "{exists_sql} in the transaction");
+    db.execute("ROLLBACK", ()).unwrap();
+    assert_eq!(read(exists_sql), ["5"], "{exists_sql} after the rollback");
+}

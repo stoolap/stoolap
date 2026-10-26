@@ -374,7 +374,14 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.x FROM u JOIN u AS w ON w.id = u.id) \
          AS q WHERE q.x = t.a)",
         "SELECT id FROM t WHERE a IN (1, 2, 3)",
-        Old("plan-less and source-side joins"),
+        Prepared,
+    ),
+    (
+        "block_over_a_join",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN u AS w ON w.id = u.id \
+         WHERE u.x = t.a)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
     ),
 ];
 

@@ -1027,6 +1027,11 @@ fn test_classifier_rules() {
          WHERE q.v = t.id)"
             .to_string(),
         format!("SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > {sq}"),
+        "SELECT id FROM t WHERE a > (SELECT v FROM u JOIN t AS x ON x.id = u.id WHERE u.id = t.id)"
+            .to_string(),
+        "SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT u.v FROM u JOIN uv \
+         ON uv.id = u.id) AS q WHERE q.v = t.id)"
+            .to_string(),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1103,18 +1108,14 @@ fn test_classifier_rules() {
             "a subquery block without exactly one SELECT expression",
         ),
         (
-            "SELECT id FROM t WHERE a > (SELECT v FROM u JOIN t AS x ON x.id = u.id WHERE u.id = t.id)"
-                .to_string(),
-            "FROM is not one table",
-        ),
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.v FROM u JOIN uv ON uv.id = u.id) \
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
              AS q WHERE q.v = t.a)"
                 .to_string(),
-            "a derived table over a join",
+            "a derived table selecting * over a join",
         ),
         (
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u LIMIT t.a) AS q)".to_string(),
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u LIMIT t.a) AS q)"
+                .to_string(),
             "a derived table's LIMIT or OFFSET naming a column",
         ),
         (
