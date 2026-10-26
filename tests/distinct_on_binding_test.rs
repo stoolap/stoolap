@@ -427,7 +427,14 @@ fn a_block_answers_as_its_statement_run_alone_for_each_enclosing_row() {
     let params = [2i64, 3, 2];
     let mut wrong = Vec::new();
     let mut cases = 0;
-    for (source, with, from) in SOURCES.iter().filter(|(_, _, from)| !from.contains("JOIN")) {
+    // A derived table reading the enclosing row runs the block as a statement
+    let enclosing = (
+        "derived enclosing",
+        "",
+        "(SELECT * FROM child WHERE child.id <= p.b - 3) AS c",
+    );
+    let sources = SOURCES.iter().filter(|(_, _, from)| !from.contains("JOIN"));
+    for &(source, with, from) in sources.chain([&enclosing]) {
         for (name, key, item, order) in BLOCK_KEYS {
             let block = |tail: &str| {
                 format!("SELECT DISTINCT ON ({key}) {item} FROM {from} ORDER BY {order}{tail}")

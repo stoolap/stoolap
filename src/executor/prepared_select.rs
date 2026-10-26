@@ -3675,9 +3675,10 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
-        // An EXISTS runs without its ORDER BY, which is still bound; a
-        // windowed one runs as written, its window values choosing its rows
-        let dropped = matches!(form, Form::Exists(_)) && !windowed_block(sq);
+        // An EXISTS runs without its ORDER BY, which is still bound; one whose
+        // rows its items choose, by a window or a DISTINCT ON, runs as written
+        let dropped =
+            matches!(form, Form::Exists(_)) && !windowed_block(sq) && sq.distinct_on.is_empty();
         let check = match dropped {
             true => Check::Order,
             false => Check::Off,
