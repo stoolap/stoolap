@@ -3535,6 +3535,8 @@ struct PreparedProjection {
     outputs: Vec<Output>,
     /// The outputs are the row's columns in order: each row is its own projection
     whole_row: bool,
+    /// The row's columns the outputs are, when every output is one
+    columns: Option<Vec<usize>>,
     /// Whether an output's program loads a parameter or asks a block, which
     /// a run may bind it to
     binds: bool,
@@ -5201,6 +5203,13 @@ impl PreparedProjection {
                 .iter()
                 .enumerate()
                 .all(|(i, output)| matches!(output, Output::Column(c) if *c == i));
+        let column_outputs = outputs
+            .iter()
+            .map(|output| match output {
+                Output::Column(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
         let binds = outputs.iter().any(|output| match output {
             Output::Program(computed) | Output::Key(computed) | Output::Block(computed) => {
                 computed.binds
@@ -5213,6 +5222,7 @@ impl PreparedProjection {
             Self {
                 outputs,
                 whole_row,
+                columns: column_outputs,
                 binds,
                 alias_keys,
             },
@@ -5227,6 +5237,14 @@ impl PreparedProjection {
         if self.whole_row {
             for (row_id, row) in rows.drain_rows().enumerate() {
                 projected.push((row_id as i64, row));
+            }
+            return Ok(projected);
+        }
+        // Columns only: each row keeps them in its own storage, as the
+        // general path's projection takes them
+        if let Some(columns) = &self.columns {
+            for (row_id, row) in rows.drain_rows().enumerate() {
+                projected.push((row_id as i64, row.take_columns(columns)));
             }
             return Ok(projected);
         }
