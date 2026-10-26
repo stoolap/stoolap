@@ -260,6 +260,22 @@ pub(crate) fn ungrouped_column(name: &str) -> crate::core::Error {
     ))
 }
 
+/// The error of a GROUP BY key that is or holds an aggregate call, however
+/// the key is written: as the call, by position or by its item's alias
+pub(crate) fn aggregate_group_key() -> crate::core::Error {
+    crate::core::Error::invalid_argument("an aggregate function cannot be a GROUP BY key")
+}
+
+/// Whether `name` is the alias of a SELECT item of `select` holding an
+/// aggregate call
+pub(crate) fn names_aggregate_item(name: &str, select: &[Expression]) -> bool {
+    select.iter().any(|item| {
+        matches!(item, Expression::Aliased(aliased)
+            if aliased.alias.value.eq_ignore_ascii_case(name)
+                && expression_contains_aggregate(&aliased.expression))
+    })
+}
+
 /// Whether `name`, a GROUP BY column the input does not hold, is a column of
 /// the outer row `ctx` runs for
 fn names_outer_column(name: &str, ctx: &ExecutionContext) -> bool {
@@ -885,12 +901,13 @@ struct RowFeed<'a> {
 
 impl<'a> RowFeed<'a> {
     /// The feed of `aggregations` grouped by `group_items` over `columns`,
-    /// for this execution of `ctx`'s statement: its subqueries run as the
-    /// statement's `blocks`, each set they read tested in place, and what
-    /// reads a parameter folds it
+    /// for this execution of `ctx`'s statement, whose SELECT list is
+    /// `select`: its subqueries run as the statement's `blocks`, each set
+    /// they read tested in place, and what reads a parameter folds it
     fn new(
         aggregations: &'a [SqlAggregateFunction],
         group_items: &[GroupByItem],
+        select: &[Expression],
         columns: &[String],
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
@@ -922,6 +939,10 @@ impl<'a> RowFeed<'a> {
                             Some(idx) => KeyItem::Column(idx),
                             // The outer row's column is one value for every row
                             None if names_outer_column(name, ctx) => KeyItem::Null,
+                            // A name only an aggregate item's alias carries
+                            None if names_aggregate_item(name, select) => {
+                                return Err(aggregate_group_key())
+                            }
                             None => {
                                 return Err(ungrouped_column(&match split_qualified(name) {
                                     Some((table, column)) => format!("{table}.{column}"),
@@ -1250,6 +1271,7 @@ impl Executor {
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
+                &stmt.columns,
                 &base_rows,
                 base_columns,
                 &col_index_map,
@@ -2107,6 +2129,7 @@ impl Executor {
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
+                &stmt.columns,
                 base_rows,
                 base_columns,
                 &col_index_map,
@@ -2530,6 +2553,9 @@ impl Executor {
             .collect();
 
         for expr in grouping_items(stmt) {
+            if expression_contains_aggregate(expr) {
+                return Err(aggregate_group_key());
+            }
             match expr {
                 Expression::Identifier(id) => {
                     // Check if this identifier is an alias defined in SELECT
@@ -2556,6 +2582,9 @@ impl Executor {
                     if pos > 0 && pos <= stmt.columns.len() {
                         // Convert position to the actual SELECT column expression
                         let select_col = &stmt.columns[pos - 1];
+                        if expression_contains_aggregate(select_col) {
+                            return Err(aggregate_group_key());
+                        }
                         match select_col {
                             Expression::Identifier(id) => {
                                 // Simple column reference - use the column name
@@ -2671,7 +2700,7 @@ impl Executor {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
         let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
-        RowFeed::new(aggregations, &[], columns, col_index_map, ctx, blocks)?.run_rows(
+        RowFeed::new(aggregations, &[], &[], columns, col_index_map, ctx, blocks)?.run_rows(
             &mut groups,
             rows,
             ctx,
@@ -2688,6 +2717,7 @@ impl Executor {
         &self,
         aggregations: &[SqlAggregateFunction],
         group_by_items: &[GroupByItem],
+        select: &[Expression],
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
@@ -2703,6 +2733,7 @@ impl Executor {
         RowFeed::new(
             aggregations,
             group_by_items,
+            select,
             columns,
             col_index_map,
             ctx,
@@ -2756,6 +2787,7 @@ impl Executor {
         let feed = RowFeed::new(
             aggregations,
             group_by_items,
+            &stmt.columns,
             columns,
             col_index_map,
             ctx,
@@ -3532,7 +3564,15 @@ impl Executor {
 
         // Otherwise the one group of the grouped path, fed by a scan
         let mut groups = GroupedAggregates::global(self.call_templates(&aggregations)?);
-        let feed = RowFeed::new(&aggregations, &[], &schema_lower, &col_index_map, ctx, None)?;
+        let feed = RowFeed::new(
+            &aggregations,
+            &[],
+            &[],
+            &schema_lower,
+            &col_index_map,
+            ctx,
+            None,
+        )?;
         let mut state = FeedState::default();
         let reads = RowReads::of(ctx, None);
         let mut scanner = table.scan(&[], None)?;
@@ -3683,6 +3723,7 @@ impl Executor {
         let feed = RowFeed::new(
             &aggregations,
             &group_items,
+            &stmt.columns,
             &source_columns,
             &col_index_map,
             ctx,

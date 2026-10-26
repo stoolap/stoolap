@@ -160,3 +160,54 @@ fn a_group_by_name_that_binds_groups_as_before() {
         assert_eq!(rows(&db, sql), want, "{sql}");
     }
 }
+
+#[test]
+fn an_aggregate_group_by_key_is_one_error_however_it_is_written() {
+    let db = open("aggregate_group_by_key");
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT COUNT(*) FROM one GROUP BY 1",
+        "SELECT COUNT(*) AS c FROM one GROUP BY c",
+        "SELECT COUNT(*) FROM one GROUP BY COUNT(*)",
+        "SELECT a, SUM(id) + 1 FROM one GROUP BY 2",
+        "SELECT a, SUM(id) + 1 AS s FROM one GROUP BY s",
+        "SELECT a FROM one GROUP BY a + SUM(id)",
+        "SELECT a, COUNT(*) FROM one GROUP BY a, 2",
+        "SELECT a, COUNT(*) AS c FROM one GROUP BY a, c HAVING COUNT(*) > 0",
+        "SELECT a, COUNT(*) FROM one GROUP BY ROLLUP(2)",
+        "SELECT a, COUNT(*) FROM one GROUP BY GROUPING SETS ((a), (2))",
+        "SELECT a, COUNT(*) FROM one JOIN u ON u.id = one.id GROUP BY 2",
+        "SELECT COUNT(*) AS c FROM v GROUP BY c",
+        "SELECT COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY 1",
+        "SELECT COUNT(*) AS c, (SELECT MAX(x) FROM u) FROM one GROUP BY c",
+        "SELECT COUNT(*) GROUP BY 1",
+        "SELECT COUNT(*) GROUP BY 1 HAVING TRUE",
+        "SELECT COUNT(*) AS c GROUP BY c",
+        "SELECT COUNT(*) GROUP BY COUNT(*)",
+        "SELECT id, (SELECT COUNT(*) AS c FROM u GROUP BY c) FROM one",
+    ] {
+        match error(&db, sql) {
+            Some(e) if e.contains("an aggregate function cannot be a GROUP BY key") => {}
+            other => wrong.push(format!("{sql}: {other:?}")),
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn an_aggregate_alias_leaves_a_column_of_its_name_to_group_by() {
+    let db = open("aggregate_alias_leaves_the_column");
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) AS a FROM one GROUP BY a ORDER BY 1"),
+        vec!["Some(Integer(1))", "Some(Integer(2))"]
+    );
+    assert_eq!(
+        rows(&db, "SELECT MAX(id) AS a FROM one GROUP BY a ORDER BY 1"),
+        vec!["Some(Integer(2))", "Some(Integer(3))"]
+    );
+}

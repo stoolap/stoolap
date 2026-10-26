@@ -43,8 +43,9 @@ use crate::storage::traits::{
 };
 
 use super::aggregation::{
-    aggregate_slot_keys, check_grouped_reads, grouping_items, ungrouped_column, AggregatePath,
-    CallInputs, GroupByItem, Modifiers, SqlAggregateFunction, COUNT_STAR,
+    aggregate_group_key, aggregate_slot_keys, check_grouped_reads, grouping_items,
+    names_aggregate_item, ungrouped_column, AggregatePath, CallInputs, GroupByItem, Modifiers,
+    SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -5234,7 +5235,17 @@ impl Builder<'_> {
         let bound = group_by_expressions(executor, sq, &scope.columns)?;
         let mut items = Vec::with_capacity(bound.len());
         for expr in bound {
-            items.push(self.rewrite(chain, Some(id), &expr, work)?);
+            // A name no scope holds that only an aggregate item's alias carries
+            let rewritten = match self.rewrite(chain, Some(id), &expr, work) {
+                Err(Error::ColumnNotFound(_))
+                    if matches!(&expr, Expression::Identifier(name)
+                        if names_aggregate_item(&name.value, &sq.columns)) =>
+                {
+                    return Err(aggregate_group_key());
+                }
+                rewritten => rewritten?,
+            };
+            items.push(rewritten);
         }
         let having = match sq.having.as_deref() {
             Some(having) => {
