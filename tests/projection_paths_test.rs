@@ -96,6 +96,8 @@ fn every_item_answers_alike_on_every_projecting_path() {
             ("sorted", format!("SELECT {list} FROM t WHERE a = 1 OR a = 2 ORDER BY id")),
             ("sorted with limit", format!("SELECT {list} FROM t WHERE a = 1 OR a = 2 ORDER BY id LIMIT 100")),
             ("runner", format!("SELECT {list} FROM t WHERE (a = 1 OR a = 2) AND 1 = (SELECT 1) ORDER BY id")),
+            ("runner streamed", format!("SELECT {list} FROM t WHERE (a = 1 OR a = 2) AND 1 = (SELECT 1)")),
+            ("runner with limit", format!("SELECT {list} FROM t WHERE (a = 1 OR a = 2) AND 1 = (SELECT 1) LIMIT 100")),
             ("view", format!("SELECT {} FROM v AS t WHERE a = 1 OR a = 2 ORDER BY id", list)),
             ("cte", format!("WITH t AS (SELECT * FROM t) SELECT {list} FROM t WHERE a = 1 OR a = 2 ORDER BY id")),
         ];
@@ -152,4 +154,24 @@ fn a_qualified_column_and_a_dotted_name_are_two_columns_on_every_path() {
         "reference {reference:?}\n{}",
         wrong.join("\n")
     );
+}
+
+#[test]
+fn a_runner_limit_projects_the_rows_its_read_answers() {
+    let db = open();
+    // The block is in the list only, so the scan answers the WHERE and the
+    // LIMIT itself
+    for (runner, general) in [
+        (
+            "SELECT id, (SELECT 1) FROM t WHERE a = 1 LIMIT 2",
+            "SELECT id, 1 FROM t WHERE a = 1 LIMIT 2",
+        ),
+        (
+            "SELECT id, (SELECT 1) FROM t WHERE a = 1 LIMIT 2 OFFSET 1",
+            "SELECT id, 1 FROM t WHERE a = 1 LIMIT 2 OFFSET 1",
+        ),
+    ] {
+        let rows = |sql: &str| answer(&db, sql, &[]).map(|(_, rows)| rows);
+        assert_eq!(rows(runner), rows(general), "{runner}");
+    }
 }
