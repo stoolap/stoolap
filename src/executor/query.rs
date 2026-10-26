@@ -10174,6 +10174,7 @@ impl Executor {
                     ctx.params(),
                     |action| match action {
                         ExprAction::Compiled(program) => Some(program),
+                        ExprAction::Concat(concat) => concat.source(),
                         _ => None,
                     },
                     ExprAction::of_program,

@@ -72,8 +72,10 @@ fn concat_text<'v>(parts: impl Iterator<Item = &'v Value> + Clone) -> Value {
 #[inline]
 pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) -> Value {
     let mut total_len = 0usize;
+    let mut count = 0usize;
     let mut all_text = true;
     for part in parts.clone() {
+        count += 1;
         match part {
             Value::Null(_) => return Value::Null(DataType::Text),
             Value::Text(text) => total_len += text.len(),
@@ -86,7 +88,7 @@ pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) 
     if all_text {
         // A text that fits inline is built in place, any other at its
         // exact length
-        if total_len <= 15 {
+        if total_len <= 15 && count <= 8 {
             let texts: SmallVec<[&str; 8]> = parts
                 .filter_map(|part| match part {
                     Value::Text(text) => Some(text.as_str()),
@@ -94,6 +96,19 @@ pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) 
                 })
                 .collect();
             return Value::Text(SmartString::concat_many(&texts));
+        }
+        if total_len <= 15 {
+            let mut buf = [0u8; 15];
+            let mut pos = 0;
+            for part in parts.clone() {
+                if let Value::Text(text) = part {
+                    buf[pos..pos + text.len()].copy_from_slice(text.as_bytes());
+                    pos += text.len();
+                }
+            }
+            if let Ok(text) = std::str::from_utf8(&buf[..pos]) {
+                return Value::Text(SmartString::new(text));
+            }
         }
         let mut s = String::with_capacity(total_len);
         for part in parts {

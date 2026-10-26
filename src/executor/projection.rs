@@ -16,13 +16,14 @@
 //! input is copied, one whose value is known before the first row is a
 //! constant, and every other item is the compiler's program, run per row.
 
+use crate::common::CompactArc;
 use crate::core::{Result, Row, Value, NULL_VALUE};
 use crate::parser::ast::Expression;
 
+use super::expression::SharedProgram;
 use super::expression::{
     bind_params, compile_expression, concat_values, ExecuteContext, ExprVM, Op,
 };
-use super::expression::{Program, SharedProgram};
 use super::utils::for_each_qualified_star_column;
 
 /// One output item, as its compiled program reads
@@ -70,12 +71,14 @@ enum Part {
 #[derive(Debug, Clone)]
 pub(crate) struct Concat {
     parts: Box<[Part]>,
-    reads_params: bool,
+    /// The program, when a part is a parameter: binding it to an
+    /// execution's values may fold it whole
+    source: Option<SharedProgram>,
 }
 
 impl Concat {
     /// `program` as a concatenation, when that is all it does
-    pub(crate) fn of(program: &Program) -> Option<Self> {
+    pub(crate) fn of(program: &SharedProgram) -> Option<Self> {
         let (Op::Return, rest) = program.ops().split_last()? else {
             return None;
         };
@@ -98,18 +101,23 @@ impl Concat {
                 _ => None,
             })
             .collect::<Option<_>>()?;
-        let reads_params = parts.iter().any(|part| matches!(part, Part::Param(_)));
-        Some(Self {
-            parts,
-            reads_params,
-        })
+        let source = parts
+            .iter()
+            .any(|part| matches!(part, Part::Param(_)))
+            .then(|| CompactArc::clone(program));
+        Some(Self { parts, source })
+    }
+
+    /// The program to bind to an execution's parameters, when a part is one
+    pub(crate) fn source(&self) -> Option<&SharedProgram> {
+        self.source.as_ref()
     }
 
     /// The parts of `exec`'s row and parameters joined; a missing parameter
     /// is the error the VM's load of it raises
     #[inline]
     pub(crate) fn value(&self, exec: &ExecuteContext) -> Result<Value> {
-        if !self.reads_params {
+        if self.source.is_none() {
             let row = exec.row;
             return Ok(concat_values(self.parts.iter().map(|part| match part {
                 Part::Column(index) => row.get(*index).unwrap_or(&NULL_VALUE),
@@ -172,9 +180,15 @@ impl Projection {
             return;
         }
         for item in &mut self.items {
-            if let Item::Program(program) = item {
-                *item = Item::of(bind_params(program.clone(), params));
-            }
+            let program = match item {
+                Item::Program(program) => program,
+                Item::Concat(concat) => match concat.source() {
+                    Some(source) => source,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            *item = Item::of(bind_params(program.clone(), params));
         }
     }
 

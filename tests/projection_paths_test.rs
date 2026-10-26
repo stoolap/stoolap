@@ -111,3 +111,45 @@ fn every_item_answers_alike_on_every_projecting_path() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_qualified_column_and_a_dotted_name_are_two_columns_on_every_path() {
+    let db = Database::open("memory://projection_paths_dotted").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \"t.a\" INTEGER)",
+        "INSERT INTO t VALUES (1, 7, 99), (2, 8, 98)",
+        "CREATE VIEW v AS SELECT * FROM t",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let reference = answer(&db, "SELECT id, a, \"t.a\" FROM t", &[]);
+    let list = "id, t.a, \"t.a\"";
+    let mut wrong = Vec::new();
+    for (path, sql) in [
+        ("streamed", format!("SELECT {list} FROM t")),
+        ("sorted", format!("SELECT {list} FROM t ORDER BY id")),
+        (
+            "sorted with limit",
+            format!("SELECT {list} FROM t ORDER BY id LIMIT 10"),
+        ),
+        (
+            "runner",
+            format!("SELECT {list} FROM t WHERE 1 = (SELECT 1)"),
+        ),
+        ("view", format!("SELECT {list} FROM v AS t")),
+        (
+            "cte",
+            format!("WITH t AS (SELECT * FROM t) SELECT {list} FROM t"),
+        ),
+    ] {
+        let got = answer(&db, &sql, &[]);
+        if got != reference {
+            wrong.push(format!("{path}: {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "reference {reference:?}\n{}",
+        wrong.join("\n")
+    );
+}
