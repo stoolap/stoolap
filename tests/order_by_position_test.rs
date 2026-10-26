@@ -21,6 +21,7 @@ use stoolap::Database;
 
 fn setup(db: &Database) {
     for sql in [
+        "CREATE TABLE nobody (id INTEGER PRIMARY KEY)",
         "CREATE TABLE parent (id INTEGER PRIMARY KEY, b INTEGER)",
         "INSERT INTO parent VALUES (1, 5), (2, 7), (9, 1)",
         "CREATE TABLE child (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
@@ -103,13 +104,16 @@ const SHAPES: [(&str, &str, &str, &str); 11] = [
 ];
 
 /// Where the query stands: alone, as a derived table, inside EXISTS, or
-/// inside an EXISTS or NOT EXISTS that reads the enclosing row
-const NESTINGS: [&str; 5] = [
+/// inside an EXISTS or NOT EXISTS that reads the enclosing row, of a table
+/// with rows or of an empty one
+const NESTINGS: [&str; 7] = [
     "top",
     "derived",
     "exists",
     "correlated exists",
     "correlated not exists",
+    "empty correlated exists",
+    "empty correlated not exists",
 ];
 
 #[test]
@@ -180,17 +184,22 @@ fn an_order_by_position_names_a_shown_column() {
                     }
                     for (keys, written_keys) in keys {
                         for nesting in NESTINGS {
-                            let correlated = nesting.starts_with("correlated");
+                            let correlated = nesting.contains("correlated");
+                            // An empty enclosing table runs the subquery for no row
+                            let outer = match nesting.starts_with("empty") {
+                                true => "nobody",
+                                false => "parent",
+                            };
                             let wrap = |q: String| match nesting {
                                 "top" => format!("{with}{q}"),
                                 "derived" => format!("{with}SELECT * FROM ({q}) AS d"),
                                 "exists" => format!("{with}SELECT EXISTS ({q})"),
-                                "correlated exists" => format!(
-                                    "{with}SELECT p.id FROM parent AS p WHERE EXISTS ({q}) \
+                                nesting if nesting.ends_with("not exists") => format!(
+                                    "{with}SELECT p.id FROM {outer} AS p WHERE NOT EXISTS ({q}) \
                                      ORDER BY p.id"
                                 ),
                                 _ => format!(
-                                    "{with}SELECT p.id FROM parent AS p WHERE NOT EXISTS ({q}) \
+                                    "{with}SELECT p.id FROM {outer} AS p WHERE EXISTS ({q}) \
                                      ORDER BY p.id"
                                 ),
                             };
@@ -205,9 +214,13 @@ fn an_order_by_position_names_a_shown_column() {
                                 }
                                 None => Err(()),
                             };
+                            // #676: a join keeps the subquery out of the
+                            // blocks, so with no enclosing row it never runs
+                            let unchecked = outer == "nobody" && from.contains("JOIN");
                             for (run, got) in runs(&db, &sql) {
                                 cases += 1;
                                 let right = match (&want, &got) {
+                                    (Err(()), Ok(rows)) if unchecked => rows.is_empty(),
                                     (Ok(want), Ok(got)) if nesting == "derived" => {
                                         let (mut w, mut g) = (want.clone(), got.clone());
                                         w.sort();
@@ -296,6 +309,40 @@ fn a_star_of_one_column_counts_one_position_in_every_subquery() {
                     if !got.as_ref().is_err_and(|e| e.contains("ORDER BY position")) {
                         wrong.push(format!("{} ({run}): {got:?}", sql(p)));
                     }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_valid_position_leaves_a_correlated_exists_plan_as_it_is() {
+    let db = Database::open("memory://order_by_position_plan").unwrap();
+    setup(&db);
+    // The plan without the line that prints the subquery as written
+    let plan = |sql: &str| -> Vec<String> {
+        collect(db.query(&format!("EXPLAIN {sql}"), ()))
+            .unwrap_or_else(|e| panic!("EXPLAIN {sql}: {e}"))
+            .into_iter()
+            .flatten()
+            .filter(|line| !line.contains("EXISTS"))
+            .collect()
+    };
+    let mut wrong = Vec::new();
+    for (_, with, from) in SOURCES {
+        for items in ["*", "c.*"] {
+            let sql = |order: &str| {
+                format!(
+                    "{with}SELECT p.id FROM parent AS p WHERE EXISTS \
+                     (SELECT {items} FROM {from} WHERE c.id = p.id{order})"
+                )
+            };
+            let want = plan(&sql(""));
+            for order in [" ORDER BY 1", " ORDER BY 2 DESC, 1"] {
+                let got = plan(&sql(order));
+                if got != want {
+                    wrong.push(format!("{}\n  {got:?}\n  want {want:?}", sql(order)));
                 }
             }
         }
