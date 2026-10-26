@@ -18,12 +18,11 @@
 
 use crate::common::CompactArc;
 use crate::core::{Result, Row, RowVec, Value};
-use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
-use super::utils::for_each_qualified_star_column;
+use super::projection::Projection;
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -557,116 +556,50 @@ impl QueryResult for FilteredResult {
     }
 }
 
-/// Pre-compiled projection that can be either a Star expansion or a compiled expression.
-enum CompiledProjection {
-    /// Expand all columns from source (SELECT *)
-    Star,
-    /// Expand the columns a qualifier names (SELECT t.*), found once
-    QualifiedStar(Vec<usize>),
-    /// A pre-compiled expression program
-    Compiled(super::expression::SharedProgram),
-}
-
-/// Expression-based mapped result with pre-compiled projections
-///
-/// This struct pre-compiles all expressions during construction, providing
-/// efficient per-row evaluation through the Expression VM.
-pub struct ExprMappedResult {
-    /// Underlying result
+/// A streaming SELECT list over another result, see [`Projection`]
+pub struct ProjectionResult {
     inner: Box<dyn QueryResult>,
-    /// Pre-compiled projections (one per output column)
-    projections: Vec<CompiledProjection>,
-    /// VM instance for expression execution (reused)
+    projection: Projection,
     vm: super::expression::ExprVM,
-    /// Current mapped row
+    /// The output row, its storage kept across rows while no caller takes it
     current_row: Row,
-    /// Output column names
     output_columns: Vec<String>,
-    /// The statement's parameters and transaction, for the projections
+    /// The statement's parameters and transaction, for the programs
     params: Option<crate::common::CompactArc<crate::ParamVec>>,
     transaction_id: Option<u64>,
-    /// Pending error from a projection, reported by `last_error`
+    /// Pending error from a program, reported by `last_error`
     pending_error: Option<crate::core::Error>,
 }
 
-// SAFETY: ExprMappedResult is Send because all fields are Send:
-// - Box<dyn QueryResult> is Send (trait bound)
-// - CompiledProjection is Send (SharedProgram uses Arc)
-// - ExprVM is Send
-// - Row, Vec<String> are Send
-unsafe impl Send for ExprMappedResult {}
-
-impl ExprMappedResult {
-    /// Create a new expression-mapped result
-    ///
-    /// # Arguments
-    /// * `inner` - The source result to project
-    /// * `expressions` - The projection expressions
-    /// * `output_columns` - Names for the output columns
-    /// * `table_alias` - The name a qualified star may give the source
-    ///
-    /// Returns an error if any expression cannot be compiled.
-    pub fn new(
+impl ProjectionResult {
+    /// `projection` of `inner`'s rows, its output named `output_columns`
+    pub(crate) fn new(
         inner: Box<dyn QueryResult>,
-        expressions: Vec<Expression>,
+        projection: Projection,
         output_columns: Vec<String>,
-        table_alias: Option<&str>,
-    ) -> Result<Self> {
-        use super::expression::compile_expression;
-
-        let source_columns = inner.columns().to_vec();
-
-        // Pre-compile all expressions
-        let mut projections = Vec::with_capacity(expressions.len());
-        for expr in &expressions {
-            let projection = match expr {
-                Expression::Star(_) => CompiledProjection::Star,
-                Expression::QualifiedStar(qs) => {
-                    let mut taken = Vec::new();
-                    for_each_qualified_star_column(
-                        &source_columns,
-                        &qs.qualifier,
-                        table_alias,
-                        |idx, _| taken.push(idx),
-                    );
-                    CompiledProjection::QualifiedStar(taken)
-                }
-                _ => {
-                    let program = compile_expression(expr, &source_columns)?;
-                    CompiledProjection::Compiled(program)
-                }
-            };
-            projections.push(projection);
-        }
-
-        // Pre-allocate buffer with capacity for reuse
-        let capacity = projections.len();
-        Ok(Self {
+    ) -> Self {
+        Self {
+            current_row: Row::with_capacity(projection.width()),
             inner,
-            projections,
+            projection,
             vm: super::expression::ExprVM::new(),
-            current_row: Row::with_capacity(capacity),
             output_columns,
             params: None,
             transaction_id: None,
             pending_error: None,
-        })
+        }
     }
 
-    /// The projections see `ctx`'s parameters and transaction
-    pub fn with_context(mut self, ctx: &super::context::ExecutionContext) -> Self {
+    /// The programs bound to `ctx`'s parameters and run in its transaction
+    pub(crate) fn with_context(mut self, ctx: &super::context::ExecutionContext) -> Self {
+        self.projection.bind(ctx.params());
         self.params = (!ctx.params().is_empty()).then(|| ctx.params_arc().clone());
-        for projection in &mut self.projections {
-            if let CompiledProjection::Compiled(program) = projection {
-                *program = super::expression::bind_params(program.clone(), ctx.params());
-            }
-        }
         self.transaction_id = ctx.transaction_id();
         self
     }
 }
 
-impl QueryResult for ExprMappedResult {
+impl QueryResult for ProjectionResult {
     fn columns(&self) -> &[String] {
         &self.output_columns
     }
@@ -676,42 +609,19 @@ impl QueryResult for ExprMappedResult {
 
         if self.inner.next() {
             let source_row = self.inner.row();
-
-            // OPTIMIZATION: Lazy capacity reservation - only allocate when Row was taken
-            // This avoids allocation in take_row() when caller drops the Row
-            self.current_row.reserve_inline(self.projections.len());
-            // Reuse buffer with inline storage - clear_inline preserves capacity
+            // Storage comes back only after a caller took the last row
+            self.current_row.reserve_inline(self.projection.width());
             self.current_row.clear_inline();
-            for projection in &self.projections {
-                match projection {
-                    CompiledProjection::Star => {
-                        // Expand all columns from source
-                        for value in source_row.iter() {
-                            self.current_row.push_inline(value.clone());
-                        }
-                    }
-                    CompiledProjection::QualifiedStar(taken) => {
-                        for &idx in taken {
-                            if let Some(value) = source_row.get(idx) {
-                                self.current_row.push_inline(value.clone());
-                            }
-                        }
-                    }
-                    CompiledProjection::Compiled(program) => {
-                        let mut ctx = ExecuteContext::new(source_row)
-                            .with_transaction_id(self.transaction_id);
-                        if let Some(params) = &self.params {
-                            ctx = ctx.with_params(params);
-                        }
-                        match self.vm.execute_cow(program, &ctx) {
-                            Ok(value) => self.current_row.push_inline(value),
-                            Err(e) => {
-                                self.pending_error = Some(e);
-                                return false;
-                            }
-                        }
-                    }
-                }
+            let mut exec = ExecuteContext::new(source_row).with_transaction_id(self.transaction_id);
+            if let Some(params) = &self.params {
+                exec = exec.with_params(params);
+            }
+            if let Err(e) = self
+                .projection
+                .project_into(&mut self.vm, &exec, &mut self.current_row)
+            {
+                self.pending_error = Some(e);
+                return false;
             }
             true
         } else {
@@ -1976,112 +1886,6 @@ impl QueryResult for ScannerResult {
     }
 }
 
-/// Streaming projection result that projects columns row-by-row
-///
-/// This allows streaming projection without materializing all rows into a Vec.
-/// Uses simple column index-based projection for performance.
-pub struct StreamingProjectionResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
-    /// Column indices to project (from source to output)
-    column_indices: Vec<usize>,
-    /// Output column names
-    output_columns: Vec<String>,
-    /// Current projected row
-    current_row: Row,
-}
-
-impl StreamingProjectionResult {
-    /// Create a new streaming projection result
-    ///
-    /// # Arguments
-    /// * `inner` - The source result
-    /// * `column_indices` - Indices of columns to keep from the source
-    /// * `output_columns` - Names for the output columns
-    pub fn new(
-        inner: Box<dyn QueryResult>,
-        column_indices: Vec<usize>,
-        output_columns: Vec<String>,
-    ) -> Self {
-        // Pre-allocate Inline storage - no Arc overhead for intermediate results
-        let capacity = column_indices.len();
-        Self {
-            inner,
-            column_indices,
-            output_columns,
-            current_row: Row::with_capacity(capacity),
-        }
-    }
-}
-
-impl QueryResult for StreamingProjectionResult {
-    fn columns(&self) -> &[String] {
-        &self.output_columns
-    }
-
-    fn next(&mut self) -> bool {
-        if self.inner.next() {
-            // OPTIMIZATION: Use Inline storage - no Arc overhead for intermediate results
-            self.current_row.reserve_inline(self.column_indices.len());
-            self.current_row.clear_inline();
-            let source_row = self.inner.row();
-            for &idx in &self.column_indices {
-                self.current_row.push_inline(
-                    source_row
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or(Value::null_unknown()),
-                );
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if dest.len() != self.current_row.len() {
-            return Err(crate::core::Error::internal(format!(
-                "scan destination has {} values but row has {} columns",
-                dest.len(),
-                self.current_row.len()
-            )));
-        }
-        for (i, value) in self.current_row.iter().enumerate() {
-            dest[i] = value.clone();
-        }
-        Ok(())
-    }
-
-    fn row(&self) -> &Row {
-        &self.current_row
-    }
-
-    fn take_row(&mut self) -> Row {
-        std::mem::take(&mut self.current_row)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.inner.close()
-    }
-
-    fn rows_affected(&self) -> i64 {
-        0
-    }
-
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
-    fn last_error(&mut self) -> Option<crate::core::Error> {
-        self.inner.last_error()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
-    }
-}
-
 /// Columnar result that stores data column-major and materializes rows lazily.
 ///
 /// This is optimized for window functions and other operations that naturally
@@ -2337,7 +2141,9 @@ mod tests {
 
         // Filter for value > 15 using Expression
         use crate::executor::utils::dummy_token;
-        use crate::parser::ast::{Identifier, InfixExpression, InfixOperator, IntegerLiteral};
+        use crate::parser::ast::{
+            Expression, Identifier, InfixExpression, InfixOperator, IntegerLiteral,
+        };
         use crate::parser::token::TokenType;
 
         let filter_expr = Expression::Infix(InfixExpression {

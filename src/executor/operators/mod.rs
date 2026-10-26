@@ -41,7 +41,7 @@
 //!
 //! For filtering and projection, use the Result Wrapper pattern:
 //! - `FilteredResult` with `RowFilter` for WHERE clauses
-//! - `StreamingProjectionResult` for column projection
+//! - `ProjectionResult` for the SELECT list
 //!
 //! See `executor/result.rs` and `expression/evaluator_bridge.rs` for the
 //! recommended execution model.

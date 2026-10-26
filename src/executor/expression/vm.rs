@@ -61,6 +61,76 @@ fn regexp_match(value: &Value, regex: &regex::Regex) -> Value {
     truth(value.text_form().map(|text| regex.is_match(&text)))
 }
 
+/// [`concat_values`] out of line: inlined, it costs the VM's op loop registers
+#[inline(never)]
+fn concat_text<'v>(parts: impl Iterator<Item = &'v Value> + Clone) -> Value {
+    concat_values(parts)
+}
+
+/// `parts` joined by `||` in order: NULL of type TEXT when one is NULL,
+/// else each part's text, a part of another type written as it displays
+#[inline]
+pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) -> Value {
+    let mut total_len = 0usize;
+    let mut count = 0usize;
+    let mut all_text = true;
+    for part in parts.clone() {
+        count += 1;
+        match part {
+            Value::Null(_) => return Value::Null(DataType::Text),
+            Value::Text(text) => total_len += text.len(),
+            _ => {
+                all_text = false;
+                total_len += 32;
+            }
+        }
+    }
+    if all_text {
+        // A text that fits inline is built in place, any other at its
+        // exact length
+        if total_len <= 15 && count <= 8 {
+            let texts: SmallVec<[&str; 8]> = parts
+                .filter_map(|part| match part {
+                    Value::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            return Value::Text(SmartString::concat_many(&texts));
+        }
+        if total_len <= 15 {
+            let mut buf = [0u8; 15];
+            let mut pos = 0;
+            for part in parts.clone() {
+                if let Value::Text(text) = part {
+                    buf[pos..pos + text.len()].copy_from_slice(text.as_bytes());
+                    pos += text.len();
+                }
+            }
+            if let Ok(text) = std::str::from_utf8(&buf[..pos]) {
+                return Value::Text(SmartString::new(text));
+            }
+        }
+        let mut s = String::with_capacity(total_len);
+        for part in parts {
+            if let Value::Text(text) = part {
+                s.push_str(text);
+            }
+        }
+        return Value::Text(SmartString::from_string(s));
+    }
+    let mut s = String::with_capacity(total_len);
+    for part in parts {
+        match part {
+            Value::Text(text) => s.push_str(text),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(s, "{}", part);
+            }
+        }
+    }
+    Value::Text(SmartString::from_string_shared(s))
+}
+
 /// `value BETWEEN low AND high`: `value >= low AND value <= high`, where a
 /// false half decides even when the other is UNKNOWN
 #[cold]
@@ -960,118 +1030,15 @@ impl ExprVM {
                 Op::Concat => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if a.is_null() || b.is_null() {
-                        Value::Null(DataType::Text)
-                    } else {
-                        // Fast path: both are Text
-                        match (&a, &b) {
-                            (Value::Text(a_str), Value::Text(b_str)) => {
-                                // Use optimized concat - handles inline and heap efficiently
-                                Value::Text(SmartString::concat(a_str, b_str))
-                            }
-                            (Value::Text(a_str), _) => {
-                                // a is Text, b needs conversion - use Arc to avoid shrink_to_fit
-                                use std::fmt::Write;
-                                let mut s = String::with_capacity(a_str.len() + 32);
-                                s.push_str(a_str);
-                                let _ = write!(s, "{}", b);
-                                Value::Text(SmartString::from_string_shared(s))
-                            }
-                            (_, Value::Text(b_str)) => {
-                                // a needs conversion, b is Text - use Arc to avoid shrink_to_fit
-                                use std::fmt::Write;
-                                let mut s = String::with_capacity(32 + b_str.len());
-                                let _ = write!(s, "{}", a);
-                                s.push_str(b_str);
-                                Value::Text(SmartString::from_string_shared(s))
-                            }
-                            _ => {
-                                // Both need conversion - use Arc to avoid shrink_to_fit
-                                use std::fmt::Write;
-                                let mut s = String::with_capacity(64);
-                                let _ = write!(s, "{}{}", a, b);
-                                Value::Text(SmartString::from_string_shared(s))
-                            }
-                        }
-                    };
-                    self.stack.push(result);
+                    self.stack.push(concat_text([&a, &b].into_iter()));
                     pc += 1;
                 }
 
                 Op::ConcatN(n) => {
-                    let n = *n as usize;
-                    let start = self.stack.len().saturating_sub(n);
-
-                    // Single pass: check for NULL and calculate total length
-                    let mut total_len = 0usize;
-                    let mut has_null = false;
-                    let mut all_text = true;
-
-                    for v in &self.stack[start..] {
-                        match v {
-                            Value::Null(_) => {
-                                has_null = true;
-                                break;
-                            }
-                            Value::Text(s) => total_len += s.len(),
-                            _ => {
-                                all_text = false;
-                                total_len += 32;
-                            }
-                        }
-                    }
-
-                    if has_null {
-                        self.stack.truncate(start);
-                        self.stack.push(Value::Null(DataType::Text));
-                        pc += 1;
-                        continue;
-                    }
-
-                    // Build result - optimize for inline vs heap
-                    let result = if all_text && total_len <= 15 {
-                        // Fast path: build directly into inline SmartString (no heap allocation)
-                        let mut data = [0u8; 15];
-                        let mut pos = 0;
-                        for v in self.stack.drain(start..) {
-                            if let Value::Text(text) = v {
-                                let bytes = text.as_bytes();
-                                data[pos..pos + bytes.len()].copy_from_slice(bytes);
-                                pos += bytes.len();
-                            }
-                        }
-                        // SAFETY: SmartString only stores valid UTF-8, build_inline returns Some for len <= 15
-                        unsafe {
-                            SmartString::build_inline(total_len, |buf| {
-                                buf.copy_from_slice(&data[..total_len]);
-                            })
-                            .unwrap_unchecked()
-                        }
-                    } else if all_text {
-                        // Heap path: exact capacity, into_boxed_str is O(1) when len == capacity
-                        let mut s = String::with_capacity(total_len);
-                        for v in self.stack.drain(start..) {
-                            if let Value::Text(text) = v {
-                                s.push_str(&text);
-                            }
-                        }
-                        // len == capacity, so into_boxed_str is O(1)
-                        SmartString::from_string(s)
-                    } else {
-                        // Mixed types: capacity is estimate, use Arc to avoid shrink_to_fit
-                        let mut s = String::with_capacity(total_len);
-                        for v in self.stack.drain(start..) {
-                            match v {
-                                Value::Text(text) => s.push_str(&text),
-                                _ => {
-                                    use std::fmt::Write;
-                                    let _ = write!(s, "{}", v);
-                                }
-                            }
-                        }
-                        SmartString::from_string_shared(s)
-                    };
-                    self.stack.push(Value::Text(result));
+                    let start = self.stack.len().saturating_sub(*n as usize);
+                    let result = concat_text(self.stack[start..].iter());
+                    self.stack.truncate(start);
+                    self.stack.push(result);
                     pc += 1;
                 }
 
@@ -2389,119 +2356,16 @@ impl ExprVM {
                 Op::Concat => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = if a.is_null() || b.is_null() {
-                        Value::Null(DataType::Text)
-                    } else {
-                        // Fast path: both are Text
-                        match (&*a, &*b) {
-                            (Value::Text(a_str), Value::Text(b_str)) => {
-                                // Use optimized concat - handles inline and heap efficiently
-                                Value::Text(SmartString::concat(a_str, b_str))
-                            }
-                            (Value::Text(a_str), _) => {
-                                // Use Arc to avoid shrink_to_fit
-                                use std::fmt::Write;
-                                let mut s = String::with_capacity(a_str.len() + 32);
-                                s.push_str(a_str);
-                                let _ = write!(s, "{}", *b);
-                                Value::Text(SmartString::from_string_shared(s))
-                            }
-                            (_, Value::Text(b_str)) => {
-                                // Use Arc to avoid shrink_to_fit
-                                use std::fmt::Write;
-                                let mut s = String::with_capacity(32 + b_str.len());
-                                let _ = write!(s, "{}", *a);
-                                s.push_str(b_str);
-                                Value::Text(SmartString::from_string_shared(s))
-                            }
-                            _ => {
-                                // Use Arc to avoid shrink_to_fit
-                                use std::fmt::Write;
-                                let mut s = String::with_capacity(64);
-                                let _ = write!(s, "{}{}", *a, *b);
-                                Value::Text(SmartString::from_string_shared(s))
-                            }
-                        }
-                    };
-                    stack.push(Cow::Owned(result));
+                    stack.push(Cow::Owned(concat_text([&*a, &*b].into_iter())));
                     pc += 1;
                 }
 
                 // Multi-value string concatenation (optimized for chained ||)
                 Op::ConcatN(n) => {
-                    let n = *n as usize;
-                    let start = stack.len().saturating_sub(n);
-
-                    // Single pass: check for NULL and calculate total length
-                    let mut total_len = 0usize;
-                    let mut has_null = false;
-                    let mut all_text = true;
-
-                    for v in &stack[start..] {
-                        match &**v {
-                            Value::Null(_) => {
-                                has_null = true;
-                                break;
-                            }
-                            Value::Text(s) => total_len += s.len(),
-                            _ => {
-                                all_text = false;
-                                total_len += 32;
-                            }
-                        }
-                    }
-
-                    if has_null {
-                        stack.truncate(start);
-                        stack.push(Cow::Owned(Value::Null(DataType::Text)));
-                        pc += 1;
-                        continue;
-                    }
-
-                    // Build result - optimize for inline vs heap
-                    let result = if all_text && total_len <= 15 {
-                        // Fast path: build directly into inline SmartString (no heap allocation)
-                        let mut data = [0u8; 15];
-                        let mut pos = 0;
-                        for v in stack.drain(start..) {
-                            if let Value::Text(text) = &*v {
-                                let bytes = text.as_bytes();
-                                data[pos..pos + bytes.len()].copy_from_slice(bytes);
-                                pos += bytes.len();
-                            }
-                        }
-                        // SAFETY: SmartString only stores valid UTF-8, build_inline returns Some for len <= 15
-                        unsafe {
-                            SmartString::build_inline(total_len, |buf| {
-                                buf.copy_from_slice(&data[..total_len]);
-                            })
-                            .unwrap_unchecked()
-                        }
-                    } else if all_text {
-                        // Heap path: exact capacity, into_boxed_str is O(1) when len == capacity
-                        let mut s = String::with_capacity(total_len);
-                        for v in stack.drain(start..) {
-                            if let Value::Text(text) = &*v {
-                                s.push_str(text);
-                            }
-                        }
-                        // len == capacity, so into_boxed_str is O(1)
-                        SmartString::from_string(s)
-                    } else {
-                        // Mixed types: capacity is estimate, use Arc to avoid shrink_to_fit
-                        let mut s = String::with_capacity(total_len);
-                        for v in stack.drain(start..) {
-                            match &*v {
-                                Value::Text(text) => s.push_str(text),
-                                other => {
-                                    use std::fmt::Write;
-                                    let _ = write!(s, "{}", other);
-                                }
-                            }
-                        }
-                        SmartString::from_string_shared(s)
-                    };
-                    stack.push(Cow::Owned(Value::Text(result)));
+                    let start = stack.len().saturating_sub(*n as usize);
+                    let result = concat_text(stack[start..].iter().map(|v| &**v));
+                    stack.truncate(start);
+                    stack.push(Cow::Owned(result));
                     pc += 1;
                 }
 

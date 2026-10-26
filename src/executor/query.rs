@@ -369,13 +369,14 @@ use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::prepared_join::{BuiltPrograms, JoinProgramKey, JoinSides, PreparedJoin, WhereSite};
 use super::prepared_select::{names_any_within, JoinBlocks, OutOfFamily};
+use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
-    AliasedResult, DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult,
-    FilteredResult, LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, RadixOrderSpec,
-    ScannerResult, StreamingProjectionResult, TopN, TopNResult,
+    AliasedResult, DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, FilteredResult,
+    LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, ProjectionResult,
+    RadixOrderSpec, ScannerResult, TopN, TopNResult,
 };
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
@@ -695,9 +696,20 @@ enum ExprAction {
         branches: smallvec::SmallVec<[CaseBranch; 4]>,
         else_result: Option<ArgSource>,
     },
-    /// Inline string concatenation (||) - bypasses VM
-    Concat(smallvec::SmallVec<[ArgSource; 6]>),
+    /// Columns, constants and parameters joined by `||`
+    Concat(Concat),
     Compiled(SharedProgram),
+}
+
+impl ExprAction {
+    /// The action running `program`: a concatenation runs without the VM,
+    /// see [`Concat`]
+    fn of_program(program: SharedProgram) -> Self {
+        match Concat::of(&program) {
+            Some(concat) => ExprAction::Concat(concat),
+            None => ExprAction::Compiled(program),
+        }
+    }
 }
 
 /// How a SELECT list without correlated subqueries projects its input rows
@@ -2035,9 +2047,9 @@ impl Executor {
                         None => OrderLimitPath::TopN.taken(),
                     }
                     if let Some((col_indices, output_names)) = deferred_projection {
-                        result = Box::new(StreamingProjectionResult::new(
+                        result = Box::new(ProjectionResult::new(
                             result,
-                            col_indices,
+                            Projection::columns(col_indices),
                             output_names,
                         ));
                     } else if columns.len() > expected_columns && expected_columns > 0 {
@@ -3972,11 +3984,8 @@ impl Executor {
             && !has_correlated_where_subqueries
             && !skip_streaming_for_memory_filter_with_limit
         {
-            // Check if we have simple column projection (no complex expressions)
-            let simple_projection = self.get_simple_projection_indices(&stmt.columns, &all_columns);
-
-            if let Some((column_indices, output_columns)) = simple_projection {
-                // All columns are simple references - we can stream!
+            // A SELECT list without a block streams; its blocks need processing first
+            if !classification.select_has_scalar_subqueries {
                 let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
                 // A table that reads by need materializes only the columns
                 // the statement names
@@ -3992,7 +4001,6 @@ impl Executor {
                     None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
                 };
 
-                // Wrap scanner in ScannerResult
                 let mut result: Box<dyn QueryResult> =
                     Box::new(ScannerResult::new(scanner, all_columns.clone()));
 
@@ -4016,90 +4024,28 @@ impl Executor {
                     }
                 }
 
-                // Apply projection if needed (not SELECT *)
-                // OPTIMIZATION: Check if projection is identity without allocating a Vec
-                let is_identity_projection = column_indices.len() == all_columns.len()
-                    && column_indices.iter().enumerate().all(|(i, &idx)| idx == i);
-                // Check if column names differ (aliases)
-                let names_differ = output_columns.len() != all_columns.len()
-                    || output_columns
-                        .iter()
-                        .zip(all_columns.iter())
-                        .any(|(out, all)| out != all);
-                // Need StreamingProjectionResult if either:
-                // 1. Non-identity projection (different columns or reordered)
-                // 2. Column names differ (aliases like "SELECT id AS a")
-                if !column_indices.is_empty() && (!is_identity_projection || names_differ) {
-                    let output_columns = CompactArc::new(output_columns);
-                    result = Box::new(StreamingProjectionResult::new(
-                        result,
-                        column_indices,
-                        (*output_columns).clone(),
-                    ));
-                    // LIMIT/OFFSET NOT applied yet - streaming path
-                    let shape = shape_of(&output_columns);
-                    return Ok((result, output_columns, false, shape));
-                } else {
-                    // SELECT * - no projection needed
-                    // LIMIT/OFFSET NOT applied yet - streaming path
-                    let shape = shape_of(&output_columns);
-                    return Ok((result, CompactArc::new(output_columns), false, shape));
+                // A lone star is the scan's own rows, under the schema's names
+                if matches!(stmt.columns.as_slice(), [Expression::Star(_)]) {
+                    let shape = shape_of(&all_columns);
+                    return Ok((result, all_columns, false, shape));
                 }
-            } else if !classification.select_has_scalar_subqueries {
-                // STREAMING WITH EXPRESSIONS: Use ExprMappedResult for complex projections
-                // This avoids batch allocation when SELECT contains expressions like CASE
-                // NOTE: Only use this path when SELECT doesn't have subqueries (which need special processing)
-                let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-                let needed = (table.narrows_scans()
-                    && !has_outer_context
-                    && !classification.has_window_functions
-                    && !classification.where_has_subqueries)
-                    .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
-                    .flatten();
-                let scanner = match needed {
-                    Some(mask) => {
-                        table.scan_needed(&column_idx_vec, &mask, storage_expr.as_deref())?
-                    }
-                    None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
-                };
-
-                let mut result: Box<dyn QueryResult> =
-                    Box::new(ScannerResult::new(scanner, all_columns.clone()));
-
-                // If we need memory filtering
-                if needs_memory_filter {
-                    if let Some(where_expr) = where_to_use {
-                        let has_scalar_subqueries = classification.where_has_subqueries
-                            && !classification.where_has_correlated_subqueries;
-
-                        let filter = if has_scalar_subqueries {
-                            let processed = self.process_where_subqueries(where_expr, ctx)?;
-                            RowFilter::new(&processed, &all_columns)?.with_context(ctx)
-                        } else {
-                            RowFilter::new(where_expr, &all_columns)?.with_context(ctx)
-                        };
-                        result = Box::new(FilteredResult::from_filter(result, filter));
-                    }
-                }
-
-                // Use ExprMappedResult for expression-based projection with buffer reuse
-                let output_columns = self.get_output_column_names(
+                let projection =
+                    Projection::compile(&stmt.columns, &all_columns, table_alias.as_deref())?;
+                let output_columns = CompactArc::new(self.get_output_column_names(
                     &stmt.columns,
                     &all_columns,
                     table_alias.as_deref(),
-                );
-                let output_columns = CompactArc::new(output_columns);
-
-                result = Box::new(
-                    ExprMappedResult::new(
-                        result,
-                        stmt.columns.clone(),
-                        (*output_columns).clone(),
-                        table_alias.as_deref(),
-                    )?
-                    .with_context(ctx),
-                );
-
+                ));
+                // The scan's own rows, under their own names, need no projection
+                if !(projection.is_columns_in_order(all_columns.len())
+                    && *output_columns == all_columns[..])
+                {
+                    result = Box::new(
+                        ProjectionResult::new(result, projection, (*output_columns).clone())
+                            .with_context(ctx),
+                    );
+                }
+                // LIMIT/OFFSET NOT applied yet - streaming path
                 let shape = shape_of(&output_columns);
                 return Ok((result, output_columns, false, shape));
             }
@@ -7964,8 +7910,8 @@ impl Executor {
         }
 
         // Determine if we have any complex expressions (not just column references)
-        // If all expressions are simple column references, use fast StreamingProjectionResult
-        // Otherwise, use ExprMappedResult with pre-compiled expression evaluation
+        // Column references are checked against the view here; any other item
+        // compiles into the projection
         let mut has_complex_expressions = false;
         let mut column_indices = Vec::with_capacity(stmt.columns.len());
         let mut output_columns = Vec::with_capacity(stmt.columns.len());
@@ -8025,7 +7971,7 @@ impl Executor {
                             return Err(Error::ColumnNotFound(id.value.to_string()));
                         }
                     } else {
-                        // Complex expression in alias - need ExprMappedResult
+                        // Complex expression in alias - compiled into the projection
                         has_complex_expressions = true;
                     }
                 }
@@ -8039,8 +7985,6 @@ impl Executor {
         }
 
         // Apply projection based on complexity
-        // OPTIMIZATION: ExprMappedResult owns the Evaluator and reuses it for each row,
-        // avoiding 7 HashMap allocations per row that the closure-based approach had.
         let result: Box<dyn QueryResult> = if has_complex_expressions {
             // Rebuild output columns to handle Star expansion
             let mut final_output_columns = Vec::with_capacity(stmt.columns.len());
@@ -8070,20 +8014,15 @@ impl Executor {
                 }
             }
 
+            let projection = Projection::compile(&stmt.columns, result.columns(), view_alias)?;
             Box::new(
-                ExprMappedResult::new(
-                    result,
-                    stmt.columns.clone(),
-                    final_output_columns.clone(),
-                    view_alias,
-                )?
-                .with_context(ctx),
+                ProjectionResult::new(result, projection, final_output_columns.clone())
+                    .with_context(ctx),
             )
         } else {
-            // Simple column references only: use fast StreamingProjectionResult
-            Box::new(StreamingProjectionResult::new(
+            Box::new(ProjectionResult::new(
                 result,
-                column_indices,
+                Projection::columns(column_indices),
                 output_columns.clone(),
             ))
         };
@@ -10235,9 +10174,10 @@ impl Executor {
                     ctx.params(),
                     |action| match action {
                         ExprAction::Compiled(program) => Some(program),
+                        ExprAction::Concat(concat) => concat.source(),
                         _ => None,
                     },
-                    ExprAction::Compiled,
+                    ExprAction::of_program,
                 );
                 return Self::run_projection_actions(
                     bound.as_deref().unwrap_or(actions),
@@ -10589,47 +10529,6 @@ impl Executor {
             })
         }
 
-        // Helper to flatten nested || concatenations into a list
-        fn flatten_concat(
-            expr: &Expression,
-            col_index_map_lower: &StringMap<usize>,
-            parts: &mut smallvec::SmallVec<[ArgSource; 6]>,
-        ) -> bool {
-            match expr {
-                Expression::Infix(infix) if infix.operator == "||" => {
-                    // Recursively flatten left and right
-                    flatten_concat(&infix.left, col_index_map_lower, parts)
-                        && flatten_concat(&infix.right, col_index_map_lower, parts)
-                }
-                _ => {
-                    // Try to convert to ArgSource
-                    if let Some(arg) = expr_to_arg_source(expr, col_index_map_lower) {
-                        parts.push(arg);
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-        }
-
-        // Helper to try building inline Concat action (bypasses VM)
-        fn try_build_concat_action(
-            expr: &Expression,
-            col_index_map_lower: &StringMap<usize>,
-        ) -> Option<ExprAction> {
-            // Only handle || operator
-            if let Expression::Infix(infix) = expr {
-                if infix.operator == "||" {
-                    let mut parts: smallvec::SmallVec<[ArgSource; 6]> = smallvec::SmallVec::new();
-                    if flatten_concat(expr, col_index_map_lower, &mut parts) && parts.len() >= 2 {
-                        return Some(ExprAction::Concat(parts));
-                    }
-                }
-            }
-            None
-        }
-
         // Analyze and pre-compile all expressions ONCE before the row loop
         let mut actions: Vec<ExprAction> = Vec::with_capacity(select_exprs.len());
 
@@ -10713,17 +10612,6 @@ impl Executor {
                                 ExprAction::Compiled(program)
                             }
                         }
-                        Expression::Infix(_) => {
-                            // Try inline concat optimization for ||
-                            if let Some(action) =
-                                try_build_concat_action(&aliased.expression, col_index_map_lower)
-                            {
-                                action
-                            } else {
-                                let program = compile_expression(&aliased.expression, all_columns)?;
-                                ExprAction::Compiled(program)
-                            }
-                        }
                         _ => {
                             // Compile the inner expression (not the Aliased wrapper)
                             let program = compile_expression(&aliased.expression, all_columns)?;
@@ -10749,27 +10637,24 @@ impl Executor {
                         ExprAction::Compiled(program)
                     }
                 }
-                Expression::Infix(_) => {
-                    // Try inline concat optimization for ||
-                    if let Some(action) = try_build_concat_action(expr, col_index_map_lower) {
-                        action
-                    } else {
-                        let program = compile_expression(expr, all_columns)?;
-                        ExprAction::Compiled(program)
-                    }
-                }
                 _ => {
                     // Complex expression - compile it
                     let program = compile_expression(expr, all_columns)?;
                     ExprAction::Compiled(program)
                 }
             };
+            let action = match action {
+                ExprAction::Compiled(program) => ExprAction::of_program(program),
+                action => action,
+            };
             actions.push(action);
         }
         Ok(actions)
     }
 
-    /// The rows `actions` project, run directly on the VM
+    /// The rows `actions` project, run directly on the VM. Out of line: its
+    /// row loop keeps its own registers in any caller
+    #[inline(never)]
     fn run_projection_actions(
         actions: &[ExprAction],
         rows: RowVec,
@@ -10927,65 +10812,7 @@ impl Executor {
                                 }
                             }
                         }
-                        ExprAction::Concat(parts) => {
-                            // First pass: calculate exact length for text-only (common case)
-                            // and check for nulls/non-text values
-                            let mut total_len = 0usize;
-                            let mut any_null = false;
-                            let mut all_text = true;
-                            for part in parts.iter() {
-                                let val: Option<&Value> = match part {
-                                    ArgSource::Column(idx) => row.get(*idx),
-                                    ArgSource::Const(v) => Some(v),
-                                };
-                                match val {
-                                    Some(Value::Text(s)) => total_len += s.len(),
-                                    Some(Value::Null(_)) | None => {
-                                        any_null = true;
-                                        break;
-                                    }
-                                    // A later part may still be NULL
-                                    Some(_) => all_text = false,
-                                }
-                            }
-
-                            if any_null {
-                                values.push(Value::null_unknown());
-                            } else if all_text {
-                                // Fast path: all text, exact capacity, no shrink_to_fit realloc
-                                let mut result = String::with_capacity(total_len);
-                                for part in parts.iter() {
-                                    let val: Option<&Value> = match part {
-                                        ArgSource::Column(idx) => row.get(*idx),
-                                        ArgSource::Const(v) => Some(v),
-                                    };
-                                    if let Some(Value::Text(s)) = val {
-                                        result.push_str(s.as_str());
-                                    }
-                                }
-                                // len == capacity, so into_boxed_str is O(1)
-                                values.push(Value::Text(result.into()));
-                            } else {
-                                // Slow path: mixed types, written as Op::Concat writes
-                                // them; use Arc to avoid shrink_to_fit
-                                let mut result = String::with_capacity(64);
-                                for part in parts.iter() {
-                                    let val: Option<&Value> = match part {
-                                        ArgSource::Column(idx) => row.get(*idx),
-                                        ArgSource::Const(v) => Some(v),
-                                    };
-                                    match val {
-                                        Some(Value::Text(s)) => result.push_str(s.as_str()),
-                                        Some(v) => {
-                                            use std::fmt::Write;
-                                            let _ = write!(result, "{}", v);
-                                        }
-                                        None => {}
-                                    }
-                                }
-                                values.push(Value::Text(SmartString::from_string_shared(result)));
-                            }
-                        }
+                        ExprAction::Concat(concat) => values.push(concat.value(&vm_ctx)?),
                         ExprAction::Compiled(program) => {
                             let value = vm.execute_cow(program, &vm_ctx)?;
                             values.push(value);
@@ -12019,38 +11846,6 @@ impl Executor {
         }
 
         names
-    }
-
-    /// Get simple column projection indices (returns None if any expression is complex)
-    ///
-    /// Returns (column_indices, output_names) for simple SELECT with only column references.
-    /// Returns None if there are computed expressions that require Evaluator.
-    fn get_simple_projection_indices(
-        &self,
-        select_exprs: &[Expression],
-        all_columns: &[String],
-    ) -> Option<(Vec<usize>, Vec<String>)> {
-        // SELECT * is a simple case; t.* needs the alias this path lacks
-        if select_exprs.len() == 1 && matches!(&select_exprs[0], Expression::Star(_)) {
-            return Some(((0..all_columns.len()).collect(), all_columns.to_vec()));
-        }
-
-        let col_index_map = build_column_index_map(all_columns);
-
-        let mut indices = Vec::with_capacity(select_exprs.len());
-        let mut names = Vec::with_capacity(select_exprs.len());
-
-        for expr in select_exprs {
-            let column = match unaliased_item(expr) {
-                Expression::Identifier(id) => id.value_lower.as_str(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
-                _ => return None, // Complex expression
-            };
-            indices.push(*col_index_map.get(column)?);
-            names.push(item_name(expr));
-        }
-
-        Some((indices, names))
     }
 
     /// Each ORDER BY item's column among `columns`, the rows `layout` laid
