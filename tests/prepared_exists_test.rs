@@ -158,26 +158,16 @@ fn test_exists_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id FROM t WHERE EXISTS (SELECT COUNT(*) FROM u WHERE u.k = t.k)",
         "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.k = t.k) FROM t WHERE EXISTS (SELECT 1 FROM u)",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k ORDER BY 1)",
+        "SELECT id FROM t WHERE EXISTS (SELECT (u.k, u.id) IN (SELECT k, id FROM w) AS x FROM u WHERE x)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
-    for (sql, reason) in [
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)",
-            "a subquery block with a clause outside the family",
-        ),
-        // The WHERE reads the alias, so the SELECT list's forms count
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT (u.k, u.id) IN (SELECT k, id FROM w) AS x FROM u WHERE x)",
-            "a tuple on the left of IN (subquery)",
-        ),
-    ] {
-        assert_eq!(
-            prepared_line(&db, sql),
-            format!("Prepared: no ({reason})"),
-            "{sql}"
-        );
-    }
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
+    assert_eq!(
+        prepared_line(&db, sql),
+        "Prepared: no (a subquery block with a clause outside the family)",
+        "{sql}"
+    );
 }
 
 #[test]

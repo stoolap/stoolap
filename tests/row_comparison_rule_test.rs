@@ -302,3 +302,153 @@ fn test_a_row_is_compared_with_a_row_of_its_width_only() {
         assert!(failed, "{sql} answered");
     }
 }
+
+/// The rows a set test's block gives, over 1, 2 and NULL
+const MEMBERS: [Pair; 3] = [[Some(1), Some(2)], [Some(2), None], [None, Some(1)]];
+
+/// `a op ALL (members)` when `all`, else `a op ANY (members)`, by the rule:
+/// a member that settles it wins, else UNKNOWN when one's comparison is
+fn expected_quantified(op: &str, all: bool, a: Pair, members: &[Pair]) -> Option<bool> {
+    let mut unknown = false;
+    for member in members {
+        match expected(op, a, *member) {
+            Some(answer) if answer != all => return Some(answer),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(all)
+}
+
+/// The members whose value at `at` equals `value`, as `=` keeps them
+fn members_where(at: usize, value: Option<i64>, equal: bool) -> Vec<Pair> {
+    MEMBERS
+        .iter()
+        .filter(|m| match (m[at], value) {
+            (Some(x), Some(y)) => (x == y) == equal,
+            _ => false,
+        })
+        .copied()
+        .collect()
+}
+
+fn check_set_tests(db: &Database) {
+    db.execute(
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x1 INTEGER, x2 INTEGER)",
+        (),
+    )
+    .unwrap();
+    for (id, member) in MEMBERS.iter().enumerate() {
+        db.execute(
+            "INSERT INTO m VALUES ($1, $2, $3)",
+            vec![
+                Value::Integer(id as i64),
+                value(member[0]),
+                value(member[1]),
+            ],
+        )
+        .unwrap();
+    }
+    let mut cases: Vec<(String, Rule)> = Vec::new();
+    for op in ["=", "<>", "<", "<=", ">", ">="] {
+        for all in [false, true] {
+            let quantifier = if all { "ALL" } else { "ANY" };
+            cases.push((
+                format!("(a1, a2) {op} {quantifier} (SELECT x1, x2 FROM m)"),
+                Box::new(move |a, _| expected_quantified(op, all, a, &MEMBERS)),
+            ));
+        }
+    }
+    cases.push((
+        "(a1, a2) IN (SELECT x1, x2 FROM m)".to_string(),
+        Box::new(|a, _| expected_quantified("=", false, a, &MEMBERS)),
+    ));
+    cases.push((
+        "(a1, a2) NOT IN (SELECT x1, x2 FROM m)".to_string(),
+        Box::new(|a, _| expected_quantified("=", false, a, &MEMBERS).map(|found| !found)),
+    ));
+    cases.push((
+        "(a1, a2) IN (SELECT x1, x2 FROM m WHERE m.x1 = r.b1)".to_string(),
+        Box::new(|a, b| expected_quantified("=", false, a, &members_where(0, b[0], true))),
+    ));
+    cases.push((
+        "(a1, a2) < ALL (SELECT x1, x2 FROM m WHERE m.x2 <> r.b2)".to_string(),
+        Box::new(|a, b| expected_quantified("<", true, a, &members_where(1, b[1], false))),
+    ));
+    cases.push((
+        "(a1, a2) IN (SELECT x1, MAX(x2) FROM m GROUP BY x1)".to_string(),
+        Box::new(|a, _| expected_quantified("=", false, a, &MEMBERS)),
+    ));
+    cases.push((
+        "(a1, a2) >= ANY (SELECT x1, x2 FROM m ORDER BY x2 LIMIT 1)".to_string(),
+        Box::new(|a, _| expected_quantified(">=", false, a, &[[None, Some(1)]])),
+    ));
+    cases.push((
+        "(a1, a2) IN (SELECT x1, x2 FROM m WHERE id < 0)".to_string(),
+        Box::new(|_, _| Some(false)),
+    ));
+    cases.push((
+        "(a1, a2) > ALL (SELECT x1, x2 FROM m WHERE id < 0)".to_string(),
+        Box::new(|_, _| Some(true)),
+    ));
+    let rows = combinations();
+    let mut wrong = Vec::new();
+    for (test, rule) in cases {
+        let want: Vec<(i64, Option<bool>)> =
+            rows.iter().map(|(id, a, b)| (*id, rule(*a, *b))).collect();
+        let holding = |truth: Option<bool>| -> Vec<i64> {
+            want.iter()
+                .filter(|(_, t)| *t == truth)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let select = format!("SELECT id, {test} FROM r");
+        let plan: Vec<String> = db
+            .query(&format!("EXPLAIN {select}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        if !plan.iter().any(|line| line.trim() == "Prepared: yes") {
+            wrong.push(format!("{select} is not prepared: {plan:?}"));
+        }
+        let got = per_row(db, &select);
+        if got != want {
+            wrong.push(format!("{select}: {got:?}"));
+        }
+        for (sql, truth) in [
+            (format!("SELECT id FROM r WHERE {test}"), Some(true)),
+            (format!("SELECT id FROM r WHERE NOT ({test})"), Some(false)),
+        ] {
+            let got = ids(db, &sql);
+            if got != holding(truth) {
+                wrong.push(format!("{sql}: {got:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_a_row_is_tested_against_a_subquery_by_the_rule() {
+    let db = Database::open("memory://a_row_is_tested_against_a_subquery_by_the_rule").unwrap();
+    load(&db);
+    check_set_tests(&db);
+}
+
+#[test]
+fn test_a_sealed_row_is_tested_against_a_subquery_by_the_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    load(&db);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    check_set_tests(&db);
+}

@@ -259,7 +259,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "tuple_in",
         "SELECT id FROM t WHERE (id, a) IN (SELECT id, x FROM u)",
         "SELECT id FROM t WHERE id IN (1, 2)",
-        Old("a tuple on the left of IN"),
+        Prepared,
     ),
     (
         "distinct_where",

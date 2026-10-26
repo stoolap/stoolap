@@ -505,6 +505,11 @@ pub enum Op {
     /// Stack: [value] -> [bool or NULL]
     ExecQuantified(u16, CompareOp, bool), // Subquery index, comparison operator, ALL
 
+    /// A row of N values tested against a row block's members, by the IN,
+    /// ANY or ALL test the block answers: TRUE, FALSE or UNKNOWN
+    /// Stack: [a1, .., aN] -> [bool or NULL]
+    ExecRowMembers(u16, u16), // Subquery index, N
+
     // =========================================================================
     // AGGREGATE REFERENCES (post-aggregation)
     // =========================================================================
@@ -676,40 +681,108 @@ impl CompareOp {
     /// unequal pair's, UNKNOWN when that pair's equality is
     pub fn compare_rows(&self, a: &[Value], b: &[Value]) -> Option<bool> {
         debug_assert_eq!(a.len(), b.len());
-        let mut equal = Some(true);
+        match self {
+            CompareOp::Eq => return rows_equal(a, b),
+            CompareOp::Ne => return rows_equal(a, b).map(|eq| !eq),
+            _ => {}
+        }
         for (x, y) in a.iter().zip(b) {
             match QuantifiedMembers::compares(CompareOp::Eq, x, y) {
                 Some(true) => {}
-                Some(false) if matches!(self, CompareOp::Eq | CompareOp::Ne) => {
-                    equal = Some(false);
-                    break;
-                }
                 Some(false) => return self.compare(x, y),
-                None if matches!(self, CompareOp::Eq | CompareOp::Ne) => equal = None,
                 None => return None,
             }
         }
-        match self {
-            CompareOp::Eq => equal,
-            CompareOp::Ne => equal.map(|eq| !eq),
-            CompareOp::Le | CompareOp::Ge => Some(true),
-            CompareOp::Lt | CompareOp::Gt => Some(false),
+        Some(matches!(self, CompareOp::Le | CompareOp::Ge))
+    }
+}
+
+/// `=` over two rows: false when a pair is unequal, else UNKNOWN when a
+/// pair's equality is, else true
+#[inline]
+fn rows_equal(a: &[Value], b: &[Value]) -> Option<bool> {
+    let mut equal = Some(true);
+    for (x, y) in a.iter().zip(b) {
+        match QuantifiedMembers::compares(CompareOp::Eq, x, y) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => equal = None,
         }
     }
+    equal
 }
 
 /// `row IN (list)`: true when a row of the list equals `row`, else UNKNOWN
 /// when one's equality is, else false
 pub fn row_in<'v>(row: &[Value], list: impl IntoIterator<Item = &'v [Value]>) -> Option<bool> {
-    let mut found = Some(false);
-    for member in list {
-        match CompareOp::Eq.compare_rows(row, member) {
-            Some(true) => return Some(true),
-            Some(false) => {}
-            None => found = None,
+    quantified_rows(CompareOp::Eq, false, row, list)
+}
+
+/// `row op ALL (members)` when `all`, else `row op ANY (members)`: a member
+/// that settles it wins (TRUE for ANY, FALSE for ALL), else UNKNOWN when
+/// one's comparison is; over no members ANY is FALSE and ALL TRUE
+pub fn quantified_rows<'v>(
+    op: CompareOp,
+    all: bool,
+    row: &[Value],
+    members: impl IntoIterator<Item = &'v [Value]>,
+) -> Option<bool> {
+    // The operator chosen once, so a member costs its comparison alone
+    match op {
+        CompareOp::Eq => settle_rows(all, members, |member| rows_equal(row, member)),
+        CompareOp::Ne => settle_rows(all, members, |member| rows_equal(row, member).map(|eq| !eq)),
+        _ => settle_rows(all, members, |member| op.compare_rows(row, member)),
+    }
+}
+
+/// [`quantified_rows`] over the members' answers
+#[inline(always)]
+fn settle_rows<'v>(
+    all: bool,
+    members: impl IntoIterator<Item = &'v [Value]>,
+    compare: impl Fn(&[Value]) -> Option<bool>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for member in members {
+        match compare(member) {
+            Some(answer) if answer != all => return Some(answer),
+            Some(_) => {}
+            None => unknown = true,
         }
     }
-    found
+    (!unknown).then_some(all)
+}
+
+/// A row block's members, `width` values each, as `op` ANY or ALL tests
+/// them; IN is `=` ANY
+#[derive(Debug, Clone)]
+pub struct RowMembers {
+    op: CompareOp,
+    all: bool,
+    width: usize,
+    values: Vec<Value>,
+}
+
+impl RowMembers {
+    /// `values` holds the members' values in turn, `width` of them each
+    pub fn new(op: CompareOp, all: bool, width: usize, values: Vec<Value>) -> Self {
+        debug_assert!(width > 1 && values.len().is_multiple_of(width));
+        Self {
+            op,
+            all,
+            width,
+            values,
+        }
+    }
+
+    pub fn answer(&self, row: &[Value]) -> Option<bool> {
+        quantified_rows(self.op, self.all, row, self.values.chunks_exact(self.width))
+    }
+
+    /// The answer one member settles: TRUE for ANY, FALSE for ALL
+    pub fn decides(&self) -> bool {
+        !self.all
+    }
 }
 
 // Make Op Debug-printable (without showing full function pointers)
@@ -869,6 +942,7 @@ impl std::fmt::Debug for Op {
             Op::ExecScalarSubquery(idx) => write!(f, "ExecScalarSubquery({})", idx),
             Op::ExecExists(idx) => write!(f, "ExecExists({})", idx),
             Op::ExecInSubquery(idx) => write!(f, "ExecInSubquery({})", idx),
+            Op::ExecRowMembers(idx, width) => write!(f, "ExecRowMembers({}, {})", idx, width),
             Op::ExecQuantified(idx, op, all) => {
                 write!(f, "ExecQuantified({}, {:?}, {})", idx, op, all)
             }

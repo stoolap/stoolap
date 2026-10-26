@@ -782,6 +782,9 @@ impl<'a> ExprCompiler<'a> {
                             all_any.operator
                         ))
                     })?;
+                if let Some(row) = row_values(&all_any.left) {
+                    return self.compile_row_members(id, row.iter(), builder);
+                }
                 self.compile_expr(&all_any.left, builder)?;
                 let all = matches!(all_any.all_any_type, AllAnyType::All);
                 builder.emit(Op::ExecQuantified(id, compare_op, all));
@@ -1367,6 +1370,23 @@ impl<'a> ExprCompiler<'a> {
         Ok(true)
     }
 
+    /// Compile `row` tested against the members of block `id`
+    fn compile_row_members<'e>(
+        &self,
+        id: u16,
+        row: impl ExactSizeIterator<Item = &'e Expression>,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
+        let width = u16::try_from(row.len()).map_err(|_| {
+            CompileError::UnsupportedExpression(format!("a row of {} values", row.len()))
+        })?;
+        for value in row {
+            self.compile_expr(value, builder)?;
+        }
+        builder.emit(Op::ExecRowMembers(id, width));
+        Ok(())
+    }
+
     /// Compile an IN expression
     fn compile_in(
         &self,
@@ -1518,6 +1538,14 @@ impl<'a> ExprCompiler<'a> {
         let items: &[Expression] = match &*in_expr.right {
             Expression::List(list) => &list.elements,
             Expression::ExpressionList(list) => &list.expressions,
+            Expression::ScalarSubquery(sq) => {
+                let id = self.subquery_id(&sq.subquery, "IN (subquery)")?;
+                self.compile_row_members(id, left_columns.iter().copied(), builder)?;
+                if in_expr.not {
+                    builder.emit(Op::Not);
+                }
+                return Ok(());
+            }
             _ => {
                 return Err(CompileError::UnsupportedExpression(
                     "Dynamic multi-column IN not yet supported in VM".to_string(),

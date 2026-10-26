@@ -290,6 +290,16 @@ pub trait SubqueryExecutor {
         ctx: &ExecuteContext,
     ) -> Result<Option<bool>>;
 
+    /// `row` tested against a row block's members by the test it answers
+    fn execute_row_members(
+        &self,
+        _subquery_index: u16,
+        _row: &[Value],
+        _ctx: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        Err(no_subquery_executor())
+    }
+
     /// An uncorrelated block's members once this run has read them, which
     /// the VM tests in place of calling the block
     fn kept_members(&self, _subquery_index: u16) -> Option<&KeptMembers> {
@@ -1783,6 +1793,11 @@ impl ExprVM {
                     pc += 1;
                 }
 
+                Op::ExecRowMembers(idx, width) => {
+                    self.row_members(*idx, *width, ctx)?;
+                    pc += 1;
+                }
+
                 // =============================================================
                 // SPECIAL
                 // =============================================================
@@ -2899,6 +2914,22 @@ impl ExprVM {
             Value::Null(_) => None,
             _ => Some(true),
         }
+    }
+
+    /// The top `width` values tested against block `index`'s members,
+    /// replaced by the answer
+    #[inline(never)]
+    fn row_members(&mut self, index: u16, width: u16, ctx: &ExecuteContext) -> Result<()> {
+        let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+        let start = self.stack.len().saturating_sub(width as usize);
+        let row = &self.stack[start..];
+        let answer = match executor.kept_members(index) {
+            Some(kept) => kept.answer_row(row)?,
+            None => executor.execute_row_members(index, row, ctx)?,
+        };
+        self.stack.truncate(start);
+        self.stack.push(truth(answer));
+        Ok(())
     }
 
     #[inline]
