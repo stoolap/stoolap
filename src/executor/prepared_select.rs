@@ -8543,8 +8543,9 @@ struct BlockState {
     /// A value block's members: an uncorrelated block's, or a keyed IN
     /// block's grouped by key, set once per run
     members: std::cell::OnceCell<BlockAnswer>,
-    /// The error a read of the members or of the keyed set raised in this
-    /// run, which every row that needs them raises without reading again
+    /// The error a read of an uncorrelated block's value, of the members or
+    /// of the keyed set raised in this run, which every row that needs them
+    /// raises without reading again
     read_error: RefCell<Option<Error>>,
     /// The slots whose value raised an error for this call, its parent's
     /// included: an EXISTS or value block raises one only on a candidate
@@ -9831,9 +9832,11 @@ impl PreparedRunner<'_> {
             self.answer_call(index, call, || BlockAnswer::Value(value.clone()));
             return Ok(value);
         }
-        let answer = self.kept(kept, || {
-            self.scalar_value(index, sq, projection, caller, site)
-                .map(BlockAnswer::Value)
+        let answer = self.read_once(index, || {
+            self.kept(kept, || {
+                self.scalar_value(index, sq, projection, caller, site)
+                    .map(BlockAnswer::Value)
+            })
         })?;
         let BlockAnswer::Value(value) = answer else {
             return Err(Error::internal("a set kept for a scalar value"));
@@ -10150,7 +10153,9 @@ impl PreparedRunner<'_> {
                         self.probe(index)
                     }
                 };
-                match self.kept(existence, || once().map(BlockAnswer::Once))? {
+                match self.read_once(index, || {
+                    self.kept(existence, || once().map(BlockAnswer::Once))
+                })? {
                     BlockAnswer::Once(exists) => exists,
                     _ => return Err(Error::internal("a set kept for an EXISTS value")),
                 }
@@ -10530,8 +10535,9 @@ impl PreparedRunner<'_> {
         &bound.program
     }
 
-    /// `read` of block `index`'s set, or the error a read of it raised
-    /// before in this run, which every row that needs the set raises
+    /// `read` of block `index`'s set or uncorrelated value, or the error a
+    /// read of it raised before in this run, which every row that needs it
+    /// raises
     fn read_once<T>(&self, index: usize, read: impl FnOnce() -> Result<T>) -> Result<T> {
         if let Some(e) = self.blocks[index].read_error.borrow().as_ref() {
             return Err(e.clone());

@@ -458,3 +458,86 @@ mod drops_before_the_join {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
+
+mod a_failed_read {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use stoolap::core::{Error, Result, Value};
+    use stoolap::functions::registry::global_registry;
+    use stoolap::functions::{
+        FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    };
+    use stoolap::Database;
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Fails on its first call of a run, then returns its argument
+    #[derive(Default)]
+    struct FailOnce;
+
+    impl ScalarFunction for FailOnce {
+        fn name(&self) -> &str {
+            "FAIL_ONCE"
+        }
+        fn info(&self) -> FunctionInfo {
+            FunctionInfo::new(
+                "FAIL_ONCE",
+                FunctionType::Scalar,
+                "test failure",
+                FunctionSignature::new(
+                    FunctionDataType::Integer,
+                    vec![FunctionDataType::Any],
+                    1,
+                    1,
+                ),
+            )
+        }
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            match CALLS.fetch_add(1, Ordering::Relaxed) {
+                0 => Err(Error::invalid_argument("FAIL_ONCE failed")),
+                _ => Ok(args[0].clone()),
+            }
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(FailOnce)
+        }
+    }
+
+    #[test]
+    fn an_uncorrelated_block_s_failed_read_is_raised_by_the_row_that_needs_it() {
+        let _guard = super::serial();
+        global_registry().register_scalar::<FailOnce>();
+        let db = Database::open("memory://join_source_sides_failed_read").unwrap();
+        stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
+            .function_registry()
+            .register_scalar::<FailOnce>();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "INSERT INTO t VALUES (1)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+            "INSERT INTO u VALUES (1)",
+            "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)",
+            "INSERT INTO w VALUES (1, 1)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let run = |sql: &str| {
+            CALLS.store(0, Ordering::Relaxed);
+            (super::answer(&db, sql), CALLS.load(Ordering::Relaxed))
+        };
+        let needed = "SELECT s.id FROM (SELECT id FROM u) AS s JOIN t ON t.id = s.id \
+                      WHERE s.id = 0 OR s.id = (SELECT FAIL_ONCE(x) FROM w)";
+        let (got, calls) = run(needed);
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("FAIL_ONCE failed")),
+            "{needed}: the row that needs the block raises its error: {got:?}"
+        );
+        assert_eq!(calls, 1, "{needed}: the block is read once");
+        let unneeded = "SELECT s.id FROM (SELECT id FROM u) AS s JOIN t ON t.id = s.id \
+                        WHERE s.id = 1 OR s.id = (SELECT FAIL_ONCE(x) FROM w)";
+        assert_eq!(
+            run(unneeded).0,
+            Ok(vec!["1".to_string()]),
+            "{unneeded}: no row needs the block"
+        );
+    }
+}
