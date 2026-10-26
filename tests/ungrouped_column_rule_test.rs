@@ -59,7 +59,7 @@ const REFUSED: &[&str] = &[
     "SELECT \"v\", COUNT(*) FROM u GROUP BY k",
     "SELECT \"v\" || 'x', COUNT(*) FROM u GROUP BY k",
     "SELECT s LIKE 'a' ESCAPE \"w\", COUNT(*) FROM e GROUP BY s",
-    "SELECT \"b\", COUNT(*) FROM q",
+    "SELECT \"a.b\", COUNT(*) FROM q",
     "SELECT k, COUNT(*) FROM u GROUP BY k HAVING \"v\" > 1",
     "SELECT k, COUNT(*) FROM u GROUP BY k ORDER BY \"v\"",
     "SELECT v AS w, COUNT(*) FROM u GROUP BY k",
@@ -106,7 +106,7 @@ const ANSWERED: &[(&str, &[&str])] = &[
         &["w|2"],
     ),
     (
-        "SELECT \"b\", COUNT(*) FROM q GROUP BY \"a.b\"",
+        "SELECT \"a.b\", COUNT(*) FROM q GROUP BY \"a.b\"",
         &["5|1", "6|1"],
     ),
     (

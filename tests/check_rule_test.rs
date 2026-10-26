@@ -187,19 +187,17 @@ fn rename_follows_the_column_a_check_binds_to() {
 }
 
 #[test]
-fn rename_refuses_a_name_that_would_rebind_a_check() {
+fn rename_to_a_dotted_name_leaves_a_check_on_its_column() {
     let db = Database::open("memory://check_rename_rebind").unwrap();
     db.execute(
         "CREATE TABLE c (id INTEGER PRIMARY KEY, b INTEGER, z INTEGER, CHECK (c.b > 0))",
         (),
     )
     .unwrap();
-    let sql = "ALTER TABLE c RENAME COLUMN z TO \"c.b\"";
-    assert!(
-        db.execute(sql, ()).is_err(),
-        "{sql} moved CHECK (c.b > 0) onto z"
-    );
+    db.execute("ALTER TABLE c RENAME COLUMN z TO \"c.b\"", ())
+        .unwrap();
     refused(&db, &["INSERT INTO c VALUES (1, -1, 1)"]);
+    db.execute("INSERT INTO c VALUES (2, 1, -5)", ()).unwrap();
 }
 
 #[test]

@@ -434,7 +434,8 @@ fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<Sh
 ///
 /// # Arguments
 /// * `expr` - The expression to compile
-/// * `columns` - Column names for the schema
+/// * `columns` - Column names for the schema; a qualified column is named
+///   by [`crate::executor::utils::qualified`], never by a dotted text
 ///
 /// # Returns
 /// * `CompactArc<Program>` that can be executed with `RowFilter` or `ExprVM`
@@ -513,7 +514,8 @@ impl RowFilter {
     ///
     /// # Arguments
     /// * `expr` - The boolean expression to use as filter
-    /// * `columns` - Column names matching the row schema
+    /// * `columns` - Column names matching the row schema, a qualified one
+    ///   named by [`crate::executor::utils::qualified`]
     pub fn new(expr: &Expression, columns: &[String]) -> Result<Self> {
         Ok(Self::from_program(compile_expression(expr, columns)?))
     }
@@ -693,8 +695,9 @@ impl JoinFilter {
     ///
     /// # Arguments
     /// * `expr` - The join condition expression
-    /// * `left_columns` - Column names for the left table
-    /// * `right_columns` - Column names for the right table
+    /// * `left_columns` - Column names for the left table, a qualified one
+    ///   named by [`crate::executor::utils::qualified`]
+    /// * `right_columns` - Column names for the right table, the same way
     pub fn new(
         expr: &Expression,
         left_columns: &[String],

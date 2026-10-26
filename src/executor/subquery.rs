@@ -50,7 +50,10 @@ use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::query_cache::check_compiled_token;
-use super::utils::{crossing_key_pair, dummy_token, dummy_token_clone, value_to_expression};
+use super::utils::{
+    bare_name, crossing_key_pair, dummy_token, dummy_token_clone, name_text, qualified,
+    split_qualified, value_to_expression,
+};
 use super::volatility::{expression_volatility_in, statement_volatility_in};
 use super::Executor;
 use crate::core::predicate::{kind, KeySide, PredicateSet};
@@ -513,9 +516,10 @@ impl Executor {
                     inner_column: i.inner_column.clone(),
                     inner_table: i.inner_table.clone(),
                     outer_column_lower: i.outer_column.to_lowercase(),
-                    outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
-                        format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
-                    }),
+                    outer_qualified_lower: i
+                        .outer_table
+                        .as_ref()
+                        .map(|tbl| qualified(&tbl.to_lowercase(), &i.outer_column.to_lowercase())),
                     additional_predicate: i.additional_predicate.clone(),
                 });
                 // cache_exists_correlation returns the Arc-wrapped version
@@ -894,9 +898,10 @@ impl Executor {
                     inner_column: i.inner_column.clone(),
                     inner_table: i.inner_table.clone(),
                     outer_column_lower: i.outer_column.to_lowercase(),
-                    outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
-                        format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
-                    }),
+                    outer_qualified_lower: i
+                        .outer_table
+                        .as_ref()
+                        .map(|tbl| qualified(&tbl.to_lowercase(), &i.outer_column.to_lowercase())),
                     additional_predicate: i.additional_predicate.clone(),
                 });
                 // cache_exists_correlation returns the Arc-wrapped version
@@ -1074,7 +1079,7 @@ impl Executor {
         let outer_qualified_lower = correlation
             .outer_table
             .as_ref()
-            .map(|tbl| format!("{}.{}", tbl.to_lowercase(), outer_column_lower));
+            .map(|tbl| qualified(&tbl.to_lowercase(), &outer_column_lower));
 
         let is_count = Self::is_count_expression(&subquery.columns[0]);
 
@@ -3004,21 +3009,20 @@ impl Executor {
         lifted: &mut Vec<(Expression, String)>,
         base_columns: &[String],
     ) -> String {
-        let text = expr.to_string();
+        let text = name_text(expr.to_string());
         // An anonymous parameter prints as a bare marker, so one text can
         // stand for two bindings and only a distinct text may be shared
         if !text.contains('?') {
-            if let Some((_, name)) = lifted.iter().find(|(e, _)| e.to_string() == text) {
+            if let Some((_, name)) = lifted
+                .iter()
+                .find(|(e, _)| name_text(e.to_string()) == text)
+            {
                 return name.clone();
             }
         }
         let mut name = text;
-        // A qualifier holds no dot, the name after it may
         while base_columns.iter().any(|column| {
-            column.eq_ignore_ascii_case(&name)
-                || column
-                    .split_once('.')
-                    .is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(&name))
+            column.eq_ignore_ascii_case(&name) || bare_name(column).eq_ignore_ascii_case(&name)
         }) || lifted
             .iter()
             .any(|(_, taken)| taken.eq_ignore_ascii_case(&name))
@@ -3399,11 +3403,10 @@ impl Executor {
             .iter()
             .map(|name| {
                 let lower = name.to_lowercase();
-                let other = match lower.rfind('.') {
-                    Some(dot) => Some(CompactArc::from(&lower[dot + 1..])),
-                    None => qualifier.map(|q| {
-                        CompactArc::from(format!("{}.{}", q.to_lowercase(), lower).as_str())
-                    }),
+                let other = match split_qualified(&lower) {
+                    Some((_, bare)) => Some(CompactArc::from(bare)),
+                    None => qualifier
+                        .map(|q| CompactArc::from(qualified(&q.to_lowercase(), &lower).as_str())),
                 };
                 (CompactArc::from(lower.as_str()), other)
             })
@@ -4630,14 +4633,9 @@ impl Executor {
 
         let outer_key_idx = {
             let search_col = info.outer_column.to_lowercase();
-            let search_suffix = format!(".{}", search_col); // Pre-compute once outside loop
             outer_columns_lower
                 .iter()
-                .position(|c| {
-                    c == &search_col
-                        || c.ends_with(&search_suffix)
-                        || c.split('.').next_back() == Some(search_col.as_str())
-                })
+                .position(|c| c == &search_col || bare_name(c) == search_col.as_str())
                 .ok_or_else(|| {
                     Error::internal(format!(
                         "Anti-join outer key column '{}' not found in columns: {:?}",

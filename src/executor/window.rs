@@ -561,7 +561,7 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name,
+    get_table_alias_from_expr, item_name, qualified, split_qualified,
 };
 use super::volatility::expression_volatility;
 use super::Executor;
@@ -1960,10 +1960,11 @@ impl Executor {
                     } else {
                         // Column not found directly - try to match against qualified columns (e.g., "name" matches "e.name")
                         // This handles JOIN cases where columns have table prefixes
-                        let suffix = format!(".{}", id.value_lower);
                         let mut found = false;
                         for (col_name, &idx) in &col_index_map {
-                            if col_name.ends_with(&suffix) {
+                            if split_qualified(col_name)
+                                .is_some_and(|(_, name)| name == id.value_lower.as_str())
+                            {
                                 items.push(SelectItem {
                                     output_name: id.value.to_string(),
                                     source: SelectItemSource::BaseColumn(idx),
@@ -1984,8 +1985,7 @@ impl Executor {
                 Expression::QualifiedIdentifier(qid) => {
                     // Qualified column reference (table.column)
                     // Try full qualified name first (e.g., "c.name" for JOINs)
-                    let full_name =
-                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     if let Some(&idx) = col_index_map.get(&full_name) {
                         items.push(SelectItem {
                             output_name: item_name(col_expr),
@@ -2459,7 +2459,7 @@ impl Executor {
             .filter_map(|e| match e {
                 Expression::Identifier(id) => Some(id.value.to_string()),
                 Expression::QualifiedIdentifier(qid) => {
-                    Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
+                    Some(qualified(&qid.qualifier.value, &qid.name.value))
                 }
                 _ => None,
             })
@@ -2671,8 +2671,8 @@ impl Executor {
                 .map(|part_col| {
                     let lower = part_col.to_lowercase();
                     col_index_map.get(&lower).copied().or_else(|| {
-                        if let Some(dot_pos) = lower.rfind('.') {
-                            col_index_map.get(&lower[dot_pos + 1..]).copied()
+                        if let Some((_, name)) = split_qualified(&lower) {
+                            col_index_map.get(name).copied()
                         } else {
                             None
                         }
@@ -3469,8 +3469,7 @@ impl Executor {
             Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
             Expression::QualifiedIdentifier(qid) => {
                 // Try fully qualified name first (e.g., "s.qty")
-                let qualified =
-                    format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase();
+                let qualified = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                 col_index_map
                     .get(&qualified)
                     // Then try unqualified (e.g., "qty") for CTE/subquery cases
@@ -3561,7 +3560,7 @@ impl Executor {
                     }
                     Expression::QualifiedIdentifier(qid) => {
                         let qualified =
-                            format!("{}.{}", qid.qualifier.value, qid.name.value).to_lowercase();
+                            qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                         col_index_map
                             .get(&qualified)
                             .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))

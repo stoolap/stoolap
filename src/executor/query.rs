@@ -247,10 +247,9 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
         })
         .or_else(|| columns.iter().position(|c| eq_folded(c, name)))
         .or_else(|| {
-            columns.iter().position(|c| {
-                c.rsplit_once('.')
-                    .is_some_and(|(_, last)| eq_folded(last, name))
-            })
+            columns
+                .iter()
+                .position(|c| split_qualified(c).is_some_and(|(_, last)| eq_folded(last, name)))
         })
 }
 
@@ -381,14 +380,14 @@ use super::result::{
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, build_column_index_map, collect_table_qualifiers,
+    add_table_qualifier, bare_name, build_column_index_map, collect_table_qualifiers,
     collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name, named_as_written,
-    order_by_names_an_alias, star_takes_every_column, string_literal_value, strip_table_qualifier,
-    substitute_filter_column, visit_column_refs,
+    order_by_names_an_alias, qualified, shown_name, split_qualified, star_takes_every_column,
+    string_literal_value, strip_table_qualifier, substitute_filter_column, visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
@@ -433,11 +432,11 @@ impl ColumnKeyMapping {
             .enumerate()
             .map(|(i, col_name)| {
                 let col_lower: CompactArc<str> = CompactArc::from(col_name.to_lowercase().as_str());
+                let unqualified_part = split_qualified(col_name)
+                    .map(|(_, name)| CompactArc::from(name.to_lowercase().as_str()));
                 let qualified_name = table_alias
-                    .map(|alias| CompactArc::from(format!("{}.{}", alias, col_lower).as_str()));
-                let unqualified_part = col_name.rfind('.').map(|dot_idx| {
-                    CompactArc::from(col_name[dot_idx + 1..].to_lowercase().as_str())
-                });
+                    .filter(|_| unqualified_part.is_none())
+                    .map(|alias| CompactArc::from(qualified(alias, &col_lower).as_str()));
                 ColumnKeyMapping {
                     index: i,
                     col_lower,
@@ -624,9 +623,15 @@ pub(crate) fn split_join_where(
 
 /// The input column a SELECT item names, its alias set aside: a bare name,
 /// or a qualified one by its full name and then its bare one; the error for
-/// a name no column has; None for any other expression
+/// a name no column has; None for any other expression, a quoted name no
+/// column has among them
 fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<Result<usize>> {
     match unaliased_item(expr) {
+        Expression::Identifier(id)
+            if id.quoted && !col_index_map.contains_key(id.value_lower.as_str()) =>
+        {
+            None
+        }
         Expression::Identifier(id) => Some(
             col_index_map
                 .get(id.value_lower.as_str())
@@ -635,7 +640,7 @@ fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<
         ),
         Expression::QualifiedIdentifier(qid) => {
             // The full name first: two tables in a join may share a column name
-            let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+            let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
             Some(
                 col_index_map
                     .get(&full_name)
@@ -793,8 +798,7 @@ fn lower_index_map(
     for (i, lower) in columns_lower.iter().enumerate() {
         col_index_map_lower.insert(lower.clone(), i);
         // Also add unqualified column names for qualified columns
-        if let Some(dot_idx) = lower.rfind('.') {
-            let column_part = &lower[dot_idx + 1..];
+        if let Some((_, column_part)) = split_qualified(lower) {
             col_index_map_lower
                 .entry(column_part.to_string())
                 .or_insert(i);
@@ -1294,6 +1298,31 @@ impl Executor {
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
         counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
+        let result = self.select_with_plan(stmt, ctx, plan_classification, compiled, counts)?;
+        // A column read through a FROM entry shows as `entry.name`
+        if !result
+            .columns()
+            .iter()
+            .any(|c| split_qualified(c).is_some())
+        {
+            return Ok(result);
+        }
+        let shown = result
+            .columns()
+            .iter()
+            .map(|c| shown_name(c).into_owned())
+            .collect();
+        Ok(Box::new(AliasedResult::renamed(result, shown)))
+    }
+
+    fn select_with_plan(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        counts: Option<&super::query_cache::CountsSlot>,
+    ) -> Result<Box<dyn QueryResult>> {
         // Start timeout guard ONLY at the top level (query_depth == 0).
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
@@ -1743,9 +1772,9 @@ impl Executor {
                     let mut name_at = |name: &str, position: usize| {
                         outer_names.push((CompactArc::from(name), position));
                         if let Some(alias) = &order_table_alias {
-                            if !name.contains('.') {
+                            if split_qualified(name).is_none() {
                                 outer_names.push((
-                                    CompactArc::from(format!("{}.{}", alias, name).as_str()),
+                                    CompactArc::from(qualified(alias, name).as_str()),
                                     position,
                                 ));
                             }
@@ -1763,7 +1792,7 @@ impl Executor {
                             };
                             let name = name.to_lowercase();
                             name_at(&name, position);
-                            if let Some((_, bare)) = name.rsplit_once('.') {
+                            if let Some((_, bare)) = split_qualified(&name) {
                                 name_at(bare, position);
                             }
                         }
@@ -2355,7 +2384,7 @@ impl Executor {
 
         let qualified_columns: Vec<String> = column_names
             .iter()
-            .map(|col| format!("{}.{}", table_alias, col))
+            .map(|col| qualified(&table_alias, col))
             .collect();
 
         if let Some(filter_expr) = filter {
@@ -2721,17 +2750,13 @@ impl Executor {
         for expr in &stmt.columns {
             match expr {
                 Expression::QualifiedIdentifier(qi) => {
-                    select_columns.insert(format!(
-                        "{}.{}",
-                        qi.qualifier.value_lower, qi.name.value_lower
-                    ));
+                    select_columns
+                        .insert(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
                 }
                 Expression::Aliased(a) => {
                     if let Expression::QualifiedIdentifier(qi) = &*a.expression {
-                        select_columns.insert(format!(
-                            "{}.{}",
-                            qi.qualifier.value_lower, qi.name.value_lower
-                        ));
+                        select_columns
+                            .insert(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
                     }
                 }
                 _ => {}
@@ -2758,7 +2783,7 @@ impl Executor {
                 Expression::QualifiedIdentifier(qi)
                     if reads_input(stmt.table_expr.as_deref(), qi) =>
                 {
-                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                    let full_name = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
                     if !select_columns.contains(full_name.as_str())
                         && all_columns.iter().any(|c| {
                             c.eq_ignore_ascii_case(&full_name)
@@ -5126,7 +5151,7 @@ impl Executor {
         let mut columns = Vec::new();
         for (alias, schema) in [(left_alias, schemas.0), (right_alias, schemas.1)] {
             if let (Some(alias), Some(schema)) = (alias, schema) {
-                columns.extend(schema.columns.iter().map(|c| format!("{alias}.{}", c.name)));
+                columns.extend(schema.columns.iter().map(|c| qualified(alias, &c.name)));
             }
         }
         let opened = |part: Option<Expression>| {
@@ -5270,7 +5295,7 @@ impl Executor {
                     schema
                         .columns
                         .iter()
-                        .map(move |c| format!("{alias}.{}", c.name))
+                        .map(move |c| qualified(alias, &c.name))
                 })
                 .collect();
             // The equalities of a NATURAL join or a USING list stand for its ON
@@ -5803,7 +5828,7 @@ impl Executor {
                 // numbers: a comparison reads a constant against each by its own type
                 let same_family = || {
                     let column_type = |expr: &Expression, column: &str| {
-                        let name = column.rsplit('.').next().unwrap_or(column);
+                        let name = bare_name(column);
                         self.base_table_side_schema(expr, CteNames::Context(ctx))
                             .and_then(|schema| schema.get_column_type(name))
                     };
@@ -5891,7 +5916,7 @@ impl Executor {
                                     } else {
                                         &join_source.right
                                     };
-                                    let name = inner_col.rsplit('.').next().unwrap_or(&inner_col);
+                                    let name = bare_name(&inner_col);
                                     self.base_table_side_schema(inner_expr, CteNames::Context(ctx))
                                         .and_then(|schema| schema.get_column_type(name))
                                 })
@@ -5998,17 +6023,10 @@ impl Executor {
                     .position(|c| c == &outer_col_lower)
                     .or_else(|| {
                         // Try unqualified match
-                        let outer_unqualified = outer_col_lower
-                            .rfind('.')
-                            .map(|p| &outer_col_lower[p + 1..])
-                            .unwrap_or(&outer_col_lower);
-                        outer_cols_lower.iter().position(|c_lower| {
-                            let c_unqualified = c_lower
-                                .rfind('.')
-                                .map(|p| &c_lower[p + 1..])
-                                .unwrap_or(c_lower);
-                            c_unqualified == outer_unqualified
-                        })
+                        let outer_unqualified = bare_name(&outer_col_lower);
+                        outer_cols_lower
+                            .iter()
+                            .position(|c_lower| bare_name(c_lower) == outer_unqualified)
                     });
 
                 if let Some(outer_idx) = outer_key_idx {
@@ -6062,7 +6080,7 @@ impl Executor {
                     let inner_cols: Vec<String> = inner_schema
                         .columns
                         .iter()
-                        .map(|col| format!("{}.{}", inner_alias, col.name))
+                        .map(|col| qualified(inner_alias, &col.name))
                         .collect();
 
                     // Joined rows read the sides in the statement's order
@@ -6085,11 +6103,9 @@ impl Executor {
                     // filter is built per pass since the operator owns it
                     // The inner key column, checked on each fetched row in
                     // place of the equality the residual filter leaves out
-                    let inner_key_idx = inner_cols.iter().position(|c| {
-                        c.rsplit('.')
-                            .next()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&inner_col))
-                    });
+                    let inner_key_idx = inner_cols
+                        .iter()
+                        .position(|c| bare_name(c).eq_ignore_ascii_case(&inner_col));
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::join_inner_opened();
                     // The program is held with the plan, by the key equality
@@ -6773,10 +6789,7 @@ impl Executor {
                     // One key no schema types: the pass that builds its hash table
                     // tells what the build column holds
                     let typed = |idx: usize| {
-                        let name = build_cols[idx]
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or(&build_cols[idx]);
+                        let name = bare_name(&build_cols[idx]);
                         build_schema
                             .as_ref()
                             .and_then(|s| s.get_column_type(name))
@@ -6811,7 +6824,7 @@ impl Executor {
                             continue;
                         }
                         let probe_column = &probe_cols[probe_idx];
-                        let name = probe_column.rsplit('.').next().unwrap_or(probe_column);
+                        let name = bare_name(probe_column);
                         let crosses = probe_schema
                             .as_ref()
                             .and_then(|s| s.get_column_type(name))
@@ -7086,7 +7099,7 @@ impl Executor {
                 let joined_qualifiers: Vec<String> = {
                     let mut qualifiers: Vec<String> = all_columns
                         .iter()
-                        .filter_map(|c| c.split_once('.').map(|(q, _)| q.to_lowercase()))
+                        .filter_map(|c| split_qualified(c).map(|(q, _)| q.to_lowercase()))
                         .collect();
                     qualifiers.sort_unstable();
                     qualifiers.dedup();
@@ -7867,6 +7880,10 @@ impl Executor {
                         .position(|c| c.eq_ignore_ascii_case(name_lower))
                     {
                         column_indices.push(idx);
+                    } else if id.quoted {
+                        // A quoted name no column has is its text, which
+                        // the compiled projection reads as such
+                        has_complex_expressions = true;
                     } else {
                         return Err(Error::ColumnNotFound(id.value.to_string()));
                     }
@@ -7881,6 +7898,8 @@ impl Executor {
                             .position(|c| c.eq_ignore_ascii_case(name_lower))
                         {
                             column_indices.push(idx);
+                        } else if id.quoted {
+                            has_complex_expressions = true;
                         } else {
                             return Err(Error::ColumnNotFound(id.value.to_string()));
                         }
@@ -8049,12 +8068,7 @@ impl Executor {
         if !table_alias.is_empty() {
             let alias_lower = table_alias.to_lowercase();
             for (i, name) in column_names.iter().enumerate() {
-                let name_lower = name.to_lowercase();
-                let mut qualified = String::with_capacity(alias_lower.len() + 1 + name_lower.len());
-                qualified.push_str(&alias_lower);
-                qualified.push('.');
-                qualified.push_str(&name_lower);
-                col_index_map.insert(qualified, i);
+                col_index_map.insert(qualified(&alias_lower, &name.to_lowercase()), i);
             }
         }
 
@@ -8063,7 +8077,7 @@ impl Executor {
             // Pre-compute qualified column names once
             let qualified_cols: Vec<String> = column_names
                 .iter()
-                .map(|c| format!("{}.{}", table_alias, c))
+                .map(|c| qualified(&table_alias, c))
                 .collect();
 
             // Create filters for simple and qualified column names
@@ -8182,12 +8196,7 @@ impl Executor {
         for col_expr in &stmt.columns {
             if let Expression::QualifiedIdentifier(qi) = col_expr {
                 // Build qualified key once
-                let mut key = String::with_capacity(
-                    qi.qualifier.value_lower.len() + 1 + qi.name.value_lower.len(),
-                );
-                key.push_str(&qi.qualifier.value_lower);
-                key.push('.');
-                key.push_str(&qi.name.value_lower);
+                let key = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
                 qualified_col_indices.push(
                     col_index_map
                         .get(&key)
@@ -8198,6 +8207,35 @@ impl Executor {
                 qualified_col_indices.push(None);
             }
         }
+        // A name no column has is compiled once, read as the compiler reads
+        // it: the enclosing row's column, a quoted name's text, or an error
+        let outer_columns = outer_column_names(ctx);
+        let mut unbound_ctx = CompileContext::new(&extended_columns, &self.function_registry);
+        if let Some(outer) = &outer_columns {
+            unbound_ctx = unbound_ctx.with_outer_columns(outer);
+        }
+        let unbound: Vec<Option<SharedProgram>> = stmt
+            .columns
+            .iter()
+            .zip(&qualified_col_indices)
+            .map(|(col_expr, qualified_idx)| {
+                let bound = match col_expr {
+                    Expression::Identifier(id) => {
+                        col_index_map.contains_key(id.value_lower.as_str())
+                    }
+                    Expression::QualifiedIdentifier(_) => qualified_idx.is_some(),
+                    _ => return Ok(None),
+                };
+                if bound {
+                    return Ok(None);
+                }
+                ExprCompiler::new(&unbound_ctx)
+                    .compile(col_expr)
+                    .map(|program| Some(CompactArc::new(program)))
+                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+            })
+            .collect::<Result<_>>()?;
+        let mut unbound_vm = ExprVM::new();
 
         // Materialize and project
         // OPTIMIZATION: Pre-compute output size to avoid reallocation per row
@@ -8225,6 +8263,15 @@ impl Executor {
             let mut new_values = Vec::with_capacity(output_cols);
 
             for (col_idx, col_expr) in stmt.columns.iter().enumerate() {
+                if let Some(program) = &unbound[col_idx] {
+                    let mut exec =
+                        ExecuteContext::with_common_params(row, ctx.params(), ctx.transaction_id());
+                    if let Some(outer) = ctx.outer_row() {
+                        exec = exec.with_outer_row(outer);
+                    }
+                    new_values.push(unbound_vm.execute(program, &exec)?);
+                    continue;
+                }
                 match col_expr {
                     Expression::Star(_) => {
                         // Extend with all values from the row
@@ -8373,7 +8420,7 @@ impl Executor {
                         .unwrap_or_else(|| ts.name.value.clone());
                     let qualified_columns: Vec<String> = columns
                         .iter()
-                        .map(|col| format!("{}.{}", table_alias, col))
+                        .map(|col| qualified(&table_alias, col))
                         .collect();
 
                     // Apply filter to CTE data if present, or convert to RowVec
@@ -8420,7 +8467,7 @@ impl Executor {
                         .unwrap_or_else(|| ts.name.value.clone());
                     let qualified_columns: Vec<String> = columns
                         .iter()
-                        .map(|col| format!("{}.{}", table_alias, col))
+                        .map(|col| qualified(&table_alias, col))
                         .collect();
                     // The filter pushed to this side applies to the view's
                     // rows the way it does to a CTE's
@@ -8477,7 +8524,7 @@ impl Executor {
 
                 let qualified_columns: Vec<String> = columns
                     .iter()
-                    .map(|col| format!("{}.{}", table_alias, col))
+                    .map(|col| qualified(&table_alias, col))
                     .collect();
 
                 Ok((result, qualified_columns))
@@ -8520,7 +8567,7 @@ impl Executor {
                 let qualified_columns: Vec<String> = if let Some(alias) = &ss.alias {
                     columns
                         .iter()
-                        .map(|col| format!("{}.{}", alias.value, col))
+                        .map(|col| qualified(&alias.value, col))
                         .collect()
                 } else {
                     columns.clone()
@@ -8607,7 +8654,7 @@ impl Executor {
                 let columns = result
                     .columns()
                     .iter()
-                    .map(|c| format!("{alias}.{c}"))
+                    .map(|c| qualified(alias, c))
                     .collect();
                 return Ok((result, columns, limit.is_some(), Some(token)));
             }
@@ -8773,7 +8820,7 @@ impl Executor {
 
             let qualified_columns: Vec<String> = columns
                 .iter()
-                .map(|col| format!("{}.{}", table_alias, col))
+                .map(|col| qualified(&table_alias, col))
                 .collect();
 
             return Ok((result, qualified_columns, true, token));
@@ -9302,7 +9349,7 @@ impl Executor {
         if !outer_bounded {
             outer_limit = None;
         }
-        let unqualified = |name: &str| name.rfind('.').map_or(name, |p| &name[p + 1..]).to_string();
+        let unqualified = |name: &str| bare_name(name).to_string();
         let outer_key_lower = outer_key_col.to_lowercase();
         let outer_key_unqualified = unqualified(&outer_key_lower);
         let Some(outer_key_idx) = outer_cols
@@ -9336,15 +9383,13 @@ impl Executor {
             .schema()
             .columns
             .iter()
-            .map(|col| format!("{}.{}", inner_alias, col.name))
+            .map(|col| qualified(inner_alias, &col.name))
             .collect();
         // The inner key column, checked on each fetched row: the ids name the
         // rows the index held for the key, not the rows' keys now
-        let inner_key_idx = inner_cols.iter().position(|c| {
-            c.rsplit('.')
-                .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case(&inner_key_col))
-        });
+        let inner_key_idx = inner_cols
+            .iter()
+            .position(|c| bare_name(c).eq_ignore_ascii_case(&inner_key_col));
         let all_columns: Vec<String> = outer_cols
             .iter()
             .chain(inner_cols.iter())
@@ -9872,11 +9917,7 @@ impl Executor {
                 .or_else(|| {
                     // Try unqualified match for qualified column names
                     columns.iter().position(|c| {
-                        if let Some(dot_idx) = c.rfind('.') {
-                            c[dot_idx + 1..].eq_ignore_ascii_case(name)
-                        } else {
-                            false
-                        }
+                        split_qualified(c).is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(name))
                     })
                 })
         };
@@ -9913,8 +9954,7 @@ impl Executor {
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     // Try full qualified name first (table.column)
-                    let full_name =
-                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     if let Some(idx) = find_column_index(&full_name, all_columns) {
                         simple_column_indices.push(idx);
                     } else if let Some(idx) = find_column_index(&qid.name.value_lower, all_columns)
@@ -9938,7 +9978,7 @@ impl Executor {
                         }
                         Expression::QualifiedIdentifier(qid) => {
                             let full_name =
-                                format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                                qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                             if let Some(idx) = find_column_index(&full_name, all_columns) {
                                 simple_column_indices.push(idx);
                             } else if let Some(idx) =
@@ -10230,7 +10270,7 @@ impl Executor {
                     Expression::QualifiedIdentifier(qid) => {
                         // Try full name first, then just column name
                         let full_name =
-                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                            qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                         if let Some(&idx) = col_index_map_lower.get(&full_name) {
                             args.push(ArgSource::Column(idx));
                         } else if let Some(&idx) =
@@ -10270,7 +10310,7 @@ impl Executor {
                     col_index_map_lower.get(id.value_lower.as_str()).copied()
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     col_index_map_lower
                         .get(&full)
                         .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
@@ -10291,7 +10331,7 @@ impl Executor {
                     Some(ArgSource::Column(idx))
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     let idx = col_index_map_lower
                         .get(&full)
                         .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))?;
@@ -10470,8 +10510,7 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    let full_name =
-                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     if let Some(&idx) = col_index_map_lower.get(&full_name) {
                         ExprAction::SimpleColumn(idx)
                     } else if let Some(&idx) =
@@ -10496,7 +10535,7 @@ impl Executor {
                         }
                         Expression::QualifiedIdentifier(qid) => {
                             let full_name =
-                                format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                                qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                             if let Some(&idx) = col_index_map_lower.get(&full_name) {
                                 ExprAction::SimpleColumn(idx)
                             } else if let Some(&idx) =
@@ -10906,8 +10945,7 @@ impl Executor {
         // first name no source column has, qualified or bare
         let taken = |name: &str, columns: &[String]| {
             columns.iter().any(|column| {
-                let bare = column.rsplit('.').next().unwrap_or(column);
-                column.eq_ignore_ascii_case(name) || bare.eq_ignore_ascii_case(name)
+                column.eq_ignore_ascii_case(name) || bare_name(column).eq_ignore_ascii_case(name)
             })
         };
         let mut next = 0usize;
@@ -11434,17 +11472,11 @@ impl Executor {
                 // Also add fully qualified name for disambiguation
                 match expr {
                     Expression::QualifiedIdentifier(qi) => {
-                        names.push(format!(
-                            "{}.{}",
-                            qi.qualifier.value_lower, qi.name.value_lower
-                        ));
+                        names.push(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
                     }
                     Expression::Aliased(a) => {
                         if let Expression::QualifiedIdentifier(qi) = &*a.expression {
-                            names.push(format!(
-                                "{}.{}",
-                                qi.qualifier.value_lower, qi.name.value_lower
-                            ));
+                            names.push(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
                         }
                     }
                     _ => {}
@@ -11486,7 +11518,7 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qi) if reads_input(from, qi) => {
-                    let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                    let full_name = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
                     // Only match against full qualified name in SELECT to avoid ambiguity
                     if !select_column_names.contains(&full_name) {
                         // Prefer fully qualified lookup
@@ -11576,7 +11608,7 @@ impl Executor {
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     // Prefer full qualified name to handle same-named columns across tables
-                    let full = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     select_column_indices.push(
                         col_index_map_lower
                             .get(full.as_str())
@@ -11590,8 +11622,7 @@ impl Executor {
                             .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        let full =
-                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                        let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                         select_column_indices.push(
                             col_index_map_lower
                                 .get(full.as_str())
@@ -11759,7 +11790,7 @@ impl Executor {
         for name in appended {
             let input = match ExprKey::from_hidden_column_name(name) {
                 Some(_) => None,
-                None => match folded(name).rsplit_once('.') {
+                None => match split_qualified(&folded(name)) {
                     Some((qualifier, bare)) => {
                         input_column_index(all_columns, Some(qualifier), bare)
                     }
@@ -13201,8 +13232,7 @@ impl Executor {
                     // the part after the dot.
                     if base_cols.iter().any(|c| {
                         c.eq_ignore_ascii_case(&alias_name)
-                            || c.rsplit_once('.')
-                                .is_some_and(|(_, base)| base.eq_ignore_ascii_case(&alias_name))
+                            || bare_name(c).eq_ignore_ascii_case(&alias_name)
                     }) {
                         continue;
                     }
@@ -13442,17 +13472,13 @@ impl Executor {
         // Verify left key references the left table
         let left_key_lower = left_key_col.to_lowercase();
         let left_alias_lower = left_alias.to_lowercase();
-        let left_alias_len = left_alias_lower.len();
-        // Inline prefix check: "alias." without format! allocation
-        let left_matches = left_key_lower.len() > left_alias_len
-            && left_key_lower.starts_with(&left_alias_lower)
-            && left_key_lower.as_bytes()[left_alias_len] == b'.';
+        let qualified_by_left =
+            |key: &str| split_qualified(key).is_some_and(|(q, _)| q == left_alias_lower);
+        let left_matches = qualified_by_left(&left_key_lower);
         if !left_matches {
             // Maybe it's right.col = left.col (swapped)
             let right_key_lower = right_key_col.to_lowercase();
-            let right_matches = right_key_lower.len() > left_alias_len
-                && right_key_lower.starts_with(&left_alias_lower)
-                && right_key_lower.as_bytes()[left_alias_len] == b'.';
+            let right_matches = qualified_by_left(&right_key_lower);
             if !right_matches {
                 return None;
             }
@@ -13516,7 +13542,7 @@ impl Executor {
     fn extract_qualified_column_name(&self, expr: &Expression) -> Option<String> {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
-                Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
+                Some(qualified(&qid.qualifier.value, &qid.name.value))
             }
             Expression::Identifier(id) => Some(id.value.to_string()),
             _ => None,
@@ -13797,28 +13823,22 @@ impl Executor {
         // Check if left_col is from right table and right_col is from left table (swapped)
         // Pre-compute lowercase alias to avoid repeated format! allocations
         let right_alias_lower = right_table_alias.to_lowercase();
-        let right_alias_len = right_alias_lower.len();
-        // Inline prefix check helper
-        let starts_with_alias = |col: &str, alias: &str, alias_len: usize| -> bool {
-            col.len() > alias_len && col.starts_with(alias) && col.as_bytes()[alias_len] == b'.'
+        // Whether a column is the one `alias` qualifies
+        let starts_with_alias = |col: &str, alias: &str| -> bool {
+            split_qualified(col).is_some_and(|(qualifier, _)| qualifier == alias)
         };
-        let (inner_col, outer_col) =
-            if starts_with_alias(&left_col_lower, &right_alias_lower, right_alias_len) {
-                // left_col is actually from right (inner) table
-                (left_col.clone(), right_col.clone())
-            } else if starts_with_alias(&right_col_lower, &right_alias_lower, right_alias_len) {
-                // right_col is from right (inner) table - normal case
-                (right_col.clone(), left_col.clone())
-            } else {
-                // Can't determine which column is from which table
-                return None;
-            };
+        let (inner_col, outer_col) = if starts_with_alias(&left_col_lower, &right_alias_lower) {
+            // left_col is actually from right (inner) table
+            (left_col.clone(), right_col.clone())
+        } else if starts_with_alias(&right_col_lower, &right_alias_lower) {
+            // right_col is from right (inner) table - normal case
+            (right_col.clone(), left_col.clone())
+        } else {
+            // Can't determine which column is from which table
+            return None;
+        };
         // An equality between two columns of the inner table joins nothing
-        if starts_with_alias(
-            &outer_col.to_lowercase(),
-            &right_alias_lower,
-            right_alias_len,
-        ) {
+        if starts_with_alias(&outer_col.to_lowercase(), &right_alias_lower) {
             return None;
         }
 
@@ -13826,19 +13846,14 @@ impl Executor {
         if let Some(left_a) = left_alias {
             let outer_col_lower = outer_col.to_lowercase();
             let left_alias_lower = left_a.to_lowercase();
-            let left_alias_len = left_alias_lower.len();
-            if !starts_with_alias(&outer_col_lower, &left_alias_lower, left_alias_len) {
+            if !starts_with_alias(&outer_col_lower, &left_alias_lower) {
                 // Outer column doesn't reference left table
                 return None;
             }
         }
 
         // Extract unqualified column name for the inner (right) table
-        let inner_col_unqualified = if let Some(dot_pos) = inner_col.rfind('.') {
-            inner_col[dot_pos + 1..].to_string()
-        } else {
-            inner_col.clone()
-        };
+        let inner_col_unqualified = bare_name(&inner_col).to_string();
 
         // Try to get the table and check for index or PK
         let txn = self.begin_transaction().ok()?;
@@ -13882,7 +13897,7 @@ impl Executor {
         // or a hot one large enough for the largest small outer
         // A narrowing key must be the outer side's; an inner column's name is unsure
         let outer_is_sure = left_alias.is_some()
-            || outer_col.contains('.')
+            || split_qualified(&outer_col).is_some()
             || !schema
                 .columns
                 .iter()
@@ -14024,9 +14039,7 @@ impl Executor {
         }
 
         // Parse the column name to handle qualified names like "o.user_id"
-        let col_expr = if let Some(dot_pos) = column_name.find('.') {
-            let qualifier = &column_name[..dot_pos];
-            let name = &column_name[dot_pos + 1..];
+        let col_expr = if let Some((qualifier, name)) = split_qualified(column_name) {
             Expression::QualifiedIdentifier(QualifiedIdentifier {
                 qualifier: Identifier::new(
                     Token::new(TokenType::Identifier, qualifier, Position::default()),
@@ -14116,20 +14129,12 @@ impl Executor {
             }
             // Match qualified to qualified: "t.col" matches "t.col"
             // Match qualified to unqualified: "t.col" -> check if "col" matches
-            if let Some(dot_pos) = col_lower.rfind('.') {
-                let unqualified = &col_lower[dot_pos + 1..];
-                if c_lower.contains('.') {
-                    // Both qualified
-                    c_lower == col_lower
-                } else {
-                    // col_name is qualified, c is unqualified
-                    c_lower == unqualified
-                }
-            } else if let Some(c_dot) = c_lower.rfind('.') {
-                // col_name is unqualified, c is qualified
-                c_lower[c_dot + 1..] == *col_lower
-            } else {
-                false
+            match (split_qualified(&col_lower), split_qualified(&c_lower)) {
+                // Both qualified, which the exact match above compared
+                (Some(_), Some(_)) => false,
+                (Some((_, unqualified)), None) => c_lower == unqualified,
+                (None, Some((_, bare))) => bare == col_lower,
+                (None, None) => false,
             }
         })
     }

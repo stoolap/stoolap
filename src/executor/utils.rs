@@ -225,9 +225,9 @@ fn substitute_outer_references_inner(
             if scope.is_some_and(|s| s.owns_qualifier(&qid.qualifier.value_lower)) {
                 return None;
             }
-            // Try qualified name: "alias.column"
+            // Try the qualified name first
             // Use .as_str() for lookups since map now uses CompactArc<str> keys
-            let qualified_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+            let qualified_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
             if let Some(value) = outer_row.get(qualified_name.as_str()) {
                 return Some(value_to_expression(value));
             }
@@ -688,16 +688,14 @@ pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     let mut base_count: StringMap<u8> = StringMap::default();
     for c in columns {
         let lower = c.to_lowercase();
-        if let Some(dot_pos) = lower.rfind('.') {
-            let base = &lower[dot_pos + 1..];
+        if let Some((_, base)) = split_qualified(&lower) {
             let entry = base_count.entry(base.to_string()).or_insert(0);
             *entry = entry.saturating_add(1);
         }
     }
     for (i, c) in columns.iter().enumerate() {
         let lower = c.to_lowercase();
-        if let Some(dot_pos) = lower.rfind('.') {
-            let base = &lower[dot_pos + 1..];
+        if let Some((_, base)) = split_qualified(&lower) {
             if base_count.get(base).copied().unwrap_or(0) == 1 && !map.contains_key(base) {
                 map.insert(base.to_string(), i);
             }
@@ -1089,11 +1087,7 @@ pub fn infix_to_operator(op: InfixOperator) -> Option<Operator> {
 /// The result is always lowercase for case-insensitive comparisons.
 #[inline]
 pub fn extract_base_column_name(col_name: &str) -> String {
-    if let Some(dot_idx) = col_name.rfind('.') {
-        col_name[dot_idx + 1..].to_lowercase()
-    } else {
-        col_name.to_lowercase()
-    }
+    bare_name(col_name).to_lowercase()
 }
 
 // ============================================================================
@@ -1857,7 +1851,7 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
     let (qualifier, col_name) = col_info;
 
     // Pre-compute qualified name if qualifier exists (avoid format! in loop)
-    let qualified = qualifier.as_ref().map(|q| format!("{}.{}", q, col_name));
+    let qualified = qualifier.as_ref().map(|q| qualified(q, col_name));
 
     // First pass: try exact or qualified match
     for (idx, column) in columns.iter().enumerate() {
@@ -1879,11 +1873,8 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
     // Second pass: ONLY if no qualifier was provided, try suffix match
     // This allows matching "id" against "t1.id" when the column ref is just "id"
     if qualifier.is_none() {
-        // Pre-compute suffix pattern once (avoid format! in loop)
-        let suffix_pattern = format!(".{}", col_name);
         for (idx, column) in columns.iter().enumerate() {
-            let col_lower = column.to_lowercase();
-            if col_lower.ends_with(&suffix_pattern) {
+            if split_qualified(column).is_some_and(|(_, name)| name.to_lowercase() == *col_name) {
                 return Some(idx);
             }
         }
@@ -2005,7 +1996,12 @@ fn holds_text_literal(expr: &Expression) -> bool {
 
 /// A function call as a result column names it: `COUNT(DISTINCT g)`
 pub fn function_call_to_string(func: &crate::parser::ast::FunctionCall) -> String {
-    let args: Vec<String> = func.arguments.iter().map(expression_to_string).collect();
+    name_text(written_call(func))
+}
+
+/// `function_call_to_string` before `name_text`, as `written_text` nests it
+fn written_call(func: &crate::parser::ast::FunctionCall) -> String {
+    let args: Vec<String> = func.arguments.iter().map(written_text).collect();
     let distinct = if func.is_distinct { "DISTINCT " } else { "" };
     format!("{}({}{})", func.function, distinct, args.join(", "))
 }
@@ -2051,6 +2047,29 @@ pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
 /// Convert expression to string representation.
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {
+    name_text(written_text(expr))
+}
+
+/// `text` as a column name: no qualifier separator, which a text value may
+/// hold, and still apart from every other text. U+FFFD escapes, so the
+/// separator shows as U+FFFD then `1`, and U+FFFD itself shows twice
+pub(crate) fn name_text(text: String) -> String {
+    const ESCAPE: char = '\u{FFFD}';
+    if !text.contains([QUALIFIER_SEP, ESCAPE]) {
+        return text;
+    }
+    let mut name = String::with_capacity(text.len() + 4);
+    for c in text.chars() {
+        match c {
+            QUALIFIER_SEP => name.extend([ESCAPE, '1']),
+            ESCAPE => name.extend([ESCAPE, ESCAPE]),
+            c => name.push(c),
+        }
+    }
+    name
+}
+
+fn written_text(expr: &Expression) -> String {
     match expr {
         // A name as the statement's own text spells it, quoted where it must be
         Expression::Identifier(id) => id.to_string(),
@@ -2059,7 +2078,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
         Expression::FloatLiteral(lit) => lit.value.to_string(),
         Expression::StringLiteral(lit) => lit.to_string(),
         Expression::BooleanLiteral(lit) => lit.value.to_string(),
-        Expression::FunctionCall(func) => function_call_to_string(func),
+        Expression::FunctionCall(func) => written_call(func),
         // An operand bound less tightly than its operator keeps its
         // parentheses, or (a + b) * 2 and a + b * 2 would read the same; a
         // right operand of the same precedence keeps them too unless it is
@@ -2067,7 +2086,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
         Expression::Infix(infix) => {
             let precedence = infix_precedence(&infix.op_type);
             let side = |operand: &Expression, on_the_right: bool| -> String {
-                let text = expression_to_string(operand);
+                let text = written_text(operand);
                 match operand {
                     Expression::Infix(inner) => {
                         let inner_precedence = infix_precedence(&inner.op_type);
@@ -2100,7 +2119,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
             )
         }
         Expression::Prefix(prefix) => {
-            let operand = expression_to_string(&prefix.right);
+            let operand = written_text(&prefix.right);
             let operand = match prefix.right.as_ref() {
                 Expression::Infix(_) => format!("({operand})"),
                 _ => operand,
@@ -2112,21 +2131,13 @@ pub fn expression_to_string(expr: &Expression) -> String {
             }
         }
         Expression::Cast(cast) => {
-            format!(
-                "CAST({} AS {})",
-                expression_to_string(&cast.expr),
-                cast.type_name
-            )
+            format!("CAST({} AS {})", written_text(&cast.expr), cast.type_name)
         }
         // The call as an aggregate names it, then OVER as the query wrote it
         Expression::Window(window) => {
             let mut parts: Vec<String> = Vec::new();
             if !window.partition_by.is_empty() {
-                let keys: Vec<String> = window
-                    .partition_by
-                    .iter()
-                    .map(expression_to_string)
-                    .collect();
+                let keys: Vec<String> = window.partition_by.iter().map(written_text).collect();
                 parts.push(format!("PARTITION BY {}", keys.join(", ")));
             }
             if !window.order_by.is_empty() {
@@ -2143,11 +2154,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
                     format!("({})", name.chain(parts).collect::<Vec<_>>().join(" "))
                 }
             };
-            format!(
-                "{} OVER {}",
-                function_call_to_string(&window.function),
-                over
-            )
+            format!("{} OVER {}", written_call(&window.function), over)
         }
         _ => format!("{}", expr),
     }
@@ -2155,7 +2162,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
 
 /// An ORDER BY key as written: ASC is the default and is left out
 fn order_key_to_string(key: &crate::parser::ast::OrderByExpression) -> String {
-    let mut text = expression_to_string(&key.expression);
+    let mut text = written_text(&key.expression);
     if !key.ascending {
         text.push_str(" DESC");
     }
@@ -2252,9 +2259,7 @@ pub fn crossing_key_pair(
 /// The kinds a key column holds: by the schema of a side that reads a base
 /// table, else by its rows
 pub fn column_kinds(rows: &[Row], columns: &[String], schema: Option<&Schema>, idx: usize) -> u8 {
-    let name = columns
-        .get(idx)
-        .map(|column| column.rsplit('.').next().unwrap_or(column));
+    let name = columns.get(idx).map(|column| bare_name(column));
     match schema
         .zip(name)
         .and_then(|(schema, name)| schema.get_column_type(name))
@@ -2357,7 +2362,7 @@ fn find_join_side_index(
     other_columns: &[String],
 ) -> Option<usize> {
     if let (Some(qualifier), col_name) = col_info {
-        let qualified = format!("{}.{}", qualifier, col_name);
+        let qualified = qualified(qualifier, col_name);
         if other_columns
             .iter()
             .any(|column| column.to_lowercase() == qualified)
@@ -2599,9 +2604,7 @@ pub fn substitute_filter_column(
 /// Create a column identifier expression from a column name.
 /// Handles qualified names (table.column) and unqualified names (column).
 fn create_column_identifier(col_name: &str) -> Expression {
-    if let Some(dot_idx) = col_name.find('.') {
-        let qualifier = &col_name[..dot_idx];
-        let name = &col_name[dot_idx + 1..];
+    if let Some((qualifier, name)) = split_qualified(col_name) {
         Expression::QualifiedIdentifier(QualifiedIdentifier {
             qualifier: Identifier::new(
                 dummy_token(qualifier, TokenType::Identifier),
@@ -2665,8 +2668,8 @@ pub fn compute_join_projection(
         // "t.val" answers to "val" when no other column has that base name
         let mut found = None;
         for (i, c) in columns_all().enumerate() {
-            if let Some(dot) = c.rfind('.') {
-                if eq_folded(&c[dot + 1..], name) {
+            if let Some((_, bare)) = split_qualified(c) {
+                if eq_folded(bare, name) {
                     if found.is_some() {
                         return None;
                     }
@@ -2735,6 +2738,43 @@ pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item =
     }
 }
 
+/// What separates a column's qualifier from its own name in the column
+/// text the executor binds by. No identifier holds it, so a dot inside a
+/// quoted qualifier or name never splits them otherwise. A caller handing
+/// column names to `compile_expression`, `RowFilter` or `JoinFilter` names a
+/// qualified column with `qualified`
+pub const QUALIFIER_SEP: char = '\u{1F}';
+
+/// The column text of `name` read through the FROM entry `qualifier`
+pub fn qualified(qualifier: &str, name: &str) -> String {
+    let mut column = String::with_capacity(qualifier.len() + 1 + name.len());
+    column.push_str(qualifier);
+    column.push(QUALIFIER_SEP);
+    column.push_str(name);
+    column
+}
+
+/// A column text's qualifier and own name; None for a column no FROM
+/// entry qualifies, whatever dots its name holds
+#[inline]
+pub fn split_qualified(column: &str) -> Option<(&str, &str)> {
+    column.split_once(QUALIFIER_SEP)
+}
+
+/// A column's own name, without the qualifier its text may carry
+#[inline]
+pub fn bare_name(column: &str) -> &str {
+    split_qualified(column).map_or(column, |(_, name)| name)
+}
+
+/// The name a column text shows: its qualifier and name joined by a dot
+pub fn shown_name(column: &str) -> std::borrow::Cow<'_, str> {
+    match column.contains(QUALIFIER_SEP) {
+        true => std::borrow::Cow::Owned(column.replace(QUALIFIER_SEP, ".")),
+        false => std::borrow::Cow::Borrowed(column),
+    }
+}
+
 /// Case-insensitive comparison of a column name against an already
 /// lowercased name, lowercasing the column as `str::to_lowercase` does,
 /// final sigma included
@@ -2747,25 +2787,10 @@ pub(crate) fn eq_folded(column: &str, lower: &str) -> bool {
     }
 }
 
-/// The same for `qualifier.name`, compared as one string so that a dot
-/// inside a quoted qualifier or name is not taken for the separator.
+/// The same for a column `qualifier` qualifies, named `name`
 #[inline]
 pub(crate) fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
-    if column.is_ascii() {
-        let q = qualifier.len();
-        qualifier.is_ascii()
-            && name.is_ascii()
-            && column.len() == q + 1 + name.len()
-            && column.as_bytes()[q] == b'.'
-            && column[..q].eq_ignore_ascii_case(qualifier)
-            && column[q + 1..].eq_ignore_ascii_case(name)
-    } else {
-        let expected = qualifier
-            .chars()
-            .chain(std::iter::once('.'))
-            .chain(name.chars());
-        with_lowercase(column, |column| column.eq(expected))
-    }
+    split_qualified(column).is_some_and(|(q, n)| eq_folded(q, qualifier) && eq_folded(n, name))
 }
 
 /// Each column a qualified star over `qualifier` takes from `columns`, as
@@ -2813,21 +2838,10 @@ pub(crate) fn star_takes_every_column(
     }
 }
 
-/// Where the bare name of `column` starts when the part before one of its
-/// dots names `qualifier`
+/// Where the bare name of `column` starts when its qualifier is `qualifier`
 fn qualified_name_start(column: &str, qualifier: &str) -> Option<usize> {
-    if column.is_ascii() && qualifier.is_ascii() {
-        let q = qualifier.len();
-        return (column.len() > q
-            && column.as_bytes()[q] == b'.'
-            && column[..q].eq_ignore_ascii_case(qualifier))
-        .then_some(q + 1);
-    }
-    column
-        .match_indices('.')
-        .map(|(dot, _)| dot)
-        .find(|&dot| eq_names(&column[..dot], qualifier))
-        .map(|dot| dot + 1)
+    let (q, _) = split_qualified(column)?;
+    eq_names(q, qualifier).then_some(q.len() + QUALIFIER_SEP.len_utf8())
 }
 
 /// Whether two names are one ignoring case, each lowercased on its own as
@@ -2869,8 +2883,8 @@ mod tests {
     /// a name the later one wins, as the column index map always did.
     #[test]
     fn test_join_projection_folds_unicode_and_prefers_the_later_duplicate() {
-        let outer = vec!["u.ÄNAME".to_string(), "u.x".to_string()];
-        let inner = vec!["o.x".to_string(), "x".to_string()];
+        let outer = vec![super::qualified("u", "ÄNAME"), super::qualified("u", "x")];
+        let inner = vec![super::qualified("o", "x"), "x".to_string()];
 
         let proj = compute_join_projection(&[qualified("u", "äname")], &outer, &inner)
             .expect("Unicode-folded name must resolve");
@@ -2883,8 +2897,8 @@ mod tests {
         // `s.x` is not a full name; the bare fallback finds the exact `x`
         let proj = compute_join_projection(&[qualified("s", "x")], &outer, &inner).unwrap();
         assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
-        // without an exact `x`, two columns ending in `.x` are ambiguous
-        let two = vec!["u.x".to_string(), "o.x".to_string()];
+        // without an exact `x`, two columns qualifying `x` are ambiguous
+        let two = vec![super::qualified("u", "x"), super::qualified("o", "x")];
         assert!(compute_join_projection(&[ident("x")], &two, &[]).is_none());
 
         // duplicate full names: the later one wins
@@ -2894,15 +2908,15 @@ mod tests {
     }
 
     /// A quoted alias may contain a dot; `"a.b".x` must match the column
-    /// `a.b.x` as a whole and not fall back to a bare `x` elsewhere.
+    /// `x` of `a.b` and not fall back to a bare `x` elsewhere.
     #[test]
     fn test_join_projection_keeps_dots_inside_a_qualifier() {
         let outer = vec!["x".to_string()];
-        let inner = vec!["a.b.id".to_string(), "a.b.x".to_string()];
+        let inner = vec![super::qualified("a.b", "id"), super::qualified("a.b", "x")];
         let proj = compute_join_projection(&[qualified("a.b", "x")], &outer, &inner).unwrap();
         assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
 
-        let unicode = vec!["Ä.b.x".to_string()];
+        let unicode = vec![super::qualified("Ä.b", "x")];
         let proj = compute_join_projection(&[qualified("ä.b", "x")], &unicode, &[]).unwrap();
         assert!(matches!(proj.columns[0], ColumnSource::Outer(0)));
     }
@@ -2924,14 +2938,14 @@ mod tests {
         };
         let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
         for (key, value) in [
-            ("c.id", 3),
-            ("id", 3),
-            ("c.pid", 7),
-            ("pid", 7),
-            ("c.name", 9),
-            ("name", 9),
+            (super::qualified("c", "id"), 3),
+            ("id".to_string(), 3),
+            (super::qualified("c", "pid"), 7),
+            ("pid".to_string(), 7),
+            (super::qualified("c", "name"), 9),
+            ("name".to_string(), 9),
         ] {
-            outer.insert(CompactArc::from(key), Value::Integer(value));
+            outer.insert(CompactArc::from(key.as_str()), Value::Integer(value));
         }
 
         let is_literal = |expr: &Expression, expected: i64| matches!(expr, Expression::IntegerLiteral(l) if l.value == expected);
@@ -2963,8 +2977,14 @@ mod tests {
         ));
 
         // with an alias, the table name is not inner: it may be an outer alias
-        outer.insert(CompactArc::from("parent.id"), Value::Integer(5));
-        outer.insert(CompactArc::from("parent.pid"), Value::Integer(7));
+        outer.insert(
+            CompactArc::from(super::qualified("parent", "id").as_str()),
+            Value::Integer(5),
+        );
+        outer.insert(
+            CompactArc::from(super::qualified("parent", "pid").as_str()),
+            Value::Integer(7),
+        );
         assert!(is_literal(
             &substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &scope),
             5
@@ -3435,14 +3455,23 @@ mod tests {
 
     #[test]
     fn test_extract_base_column_name_qualified() {
-        assert_eq!(extract_base_column_name("table.column"), "column");
-        assert_eq!(extract_base_column_name("TABLE.COLUMN"), "column");
+        assert_eq!(
+            extract_base_column_name(&super::qualified("table", "column")),
+            "column"
+        );
+        assert_eq!(
+            extract_base_column_name(&super::qualified("TABLE", "COLUMN")),
+            "column"
+        );
     }
 
     #[test]
-    fn test_extract_base_column_name_multiple_dots() {
-        // Uses rfind so finds last dot
-        assert_eq!(extract_base_column_name("a.b.c"), "c");
+    fn test_extract_base_column_name_keeps_the_dots_of_a_name() {
+        assert_eq!(extract_base_column_name("a.b.c"), "a.b.c");
+        assert_eq!(
+            extract_base_column_name(&super::qualified("a.b", "c.d")),
+            "c.d"
+        );
     }
 
     // ============================================================================
@@ -3464,7 +3493,7 @@ mod tests {
 
     #[test]
     fn test_find_column_index_qualified_match() {
-        let columns = vec!["t.id".to_string(), "t.name".to_string()];
+        let columns = vec![super::qualified("t", "id"), super::qualified("t", "name")];
         assert_eq!(
             find_column_index(&(Some("t".to_string()), "id".to_string()), &columns),
             Some(0)
@@ -3473,7 +3502,7 @@ mod tests {
 
     #[test]
     fn test_find_column_index_suffix_match() {
-        let columns = vec!["t1.id".to_string(), "t1.name".to_string()];
+        let columns = vec![super::qualified("t1", "id"), super::qualified("t1", "name")];
         // Without qualifier, can match suffix
         assert_eq!(
             find_column_index(&(None, "id".to_string()), &columns),
@@ -3637,7 +3666,7 @@ mod tests {
 
     #[test]
     fn test_create_column_identifier_qualified() {
-        let expr = create_column_identifier("t.col");
+        let expr = create_column_identifier(&super::qualified("t", "col"));
         match expr {
             Expression::QualifiedIdentifier(qid) => {
                 assert_eq!(qid.qualifier.value, "t");

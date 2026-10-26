@@ -43,7 +43,10 @@ use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::{build_column_index_map, eq_folded, item_name, item_spelled_name};
+use super::utils::{
+    bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
+    split_qualified,
+};
 use super::window::WindowOutput;
 use super::Executor;
 
@@ -300,12 +303,11 @@ fn ungrouped_read(
             (GroupByItem::Column(c), Expression::Identifier(id)) => {
                 c.eq_ignore_ascii_case(&id.value)
             }
-            (GroupByItem::Column(c), Expression::QualifiedIdentifier(q)) => {
-                c.split_once('.').is_some_and(|(table, name)| {
+            (GroupByItem::Column(c), Expression::QualifiedIdentifier(q)) => split_qualified(c)
+                .is_some_and(|(table, name)| {
                     table.eq_ignore_ascii_case(&q.qualifier.value)
                         && name.eq_ignore_ascii_case(&q.name.value)
-                })
-            }
+                }),
             _ => false,
         })
     };
@@ -403,11 +405,7 @@ pub(crate) fn aggregate_slot_keys(
     // The alias comes lowercased; the column keeps its written spelling
     let names_a_group_column = |alias_lower: &str| {
         group_items.iter().any(|item| match item {
-            GroupByItem::Column(name) => eq_folded(
-                name.rsplit_once('.')
-                    .map_or(name.as_str(), |(_, bare)| bare),
-                alias_lower,
-            ),
+            GroupByItem::Column(name) => eq_folded(bare_name(name), alias_lower),
             GroupByItem::Expression { .. } => false,
         })
     };
@@ -1555,7 +1553,7 @@ impl Executor {
                     Expression::Identifier(id) => name.to_lowercase() == id.value_lower.as_str(),
                     Expression::QualifiedIdentifier(qid) => {
                         name.to_lowercase()
-                            == format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
+                            == qualified(&qid.qualifier.value_lower, &qid.name.value_lower)
                     }
                     Expression::Aliased(a) => {
                         slot_of(&a.expression) == Some(i)
@@ -1622,7 +1620,7 @@ impl Executor {
                     // e.g., u.username -> username
                     // Try qualified name first, then fall back to unqualified column name
                     let qualified_lower =
-                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+                        qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
                     let unqualified_lower: String = qid.name.value_lower.to_string();
                     if agg_col_index_map.contains_key(&qualified_lower) {
                         column_sources.push(ColumnSource::AggColumn(qualified_lower));
@@ -1806,7 +1804,7 @@ impl Executor {
                             let col_lower: CompactArc<str> =
                                 CompactArc::from(col_name.to_lowercase().as_str());
                             let qualified = table_alias.as_ref().map(|alias| {
-                                CompactArc::from(format!("{}.{}", alias, col_lower).as_str())
+                                CompactArc::from(qualified(alias, &col_lower).as_str())
                             });
                             (col_lower, qualified)
                         })
@@ -2467,7 +2465,7 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => {
                 // Use full qualified name (e.g., "p.price" instead of just "price")
                 // This is needed for JOIN queries where columns are qualified with table aliases
-                let qualified_name = format!("{}.{}", qid.qualifier.value, qid.name.value);
+                let qualified_name = qualified(&qid.qualifier.value, &qid.name.value);
                 (qualified_name, false, None)
             }
             // For expressions like val * 2, a + b, etc. - store the expression
@@ -2531,7 +2529,7 @@ impl Executor {
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     // Use full qualified name (e.g., "c.name" instead of just "name")
-                    let qualified_name = format!("{}.{}", qid.qualifier.value, qid.name.value);
+                    let qualified_name = qualified(&qid.qualifier.value, &qid.name.value);
                     group_items.push(GroupByItem::Column(qualified_name));
                 }
                 Expression::IntegerLiteral(lit) => {
@@ -2917,9 +2915,8 @@ impl Executor {
             return Some(idx);
         }
 
-        // If it's a qualified name (contains a dot), try the unqualified part
-        if let Some(dot_pos) = column_lower.rfind('.') {
-            let unqualified = &column_lower[dot_pos + 1..];
+        // If it's a qualified name, try the unqualified part
+        if let Some((_, unqualified)) = split_qualified(column_lower) {
             if let Some(&idx) = col_index_map.get(unqualified) {
                 return Some(idx);
             }
@@ -2960,9 +2957,9 @@ impl Executor {
                 .iter()
                 .map(|c| {
                     let bare = c.to_lowercase();
-                    let qualified = outer_table.filter(|_| !bare.contains('.')).map(|t| {
-                        CompactArc::from(format!("{}.{}", t.to_lowercase(), bare).as_str())
-                    });
+                    let qualified = outer_table
+                        .filter(|_| split_qualified(&bare).is_none())
+                        .map(|t| CompactArc::from(qualified(&t.to_lowercase(), &bare).as_str()));
                     (CompactArc::from(bare.as_str()), qualified)
                 })
                 .collect();

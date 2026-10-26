@@ -62,7 +62,7 @@ use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult}
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function, item_name,
-    order_by_names_an_alias, strip_table_qualifier,
+    order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -1037,7 +1037,7 @@ impl ScopeTable {
         let own = |leaf: &JoinLeaf, offset: usize, at: usize| -> Option<&str> {
             let name = spelled[at]
                 .strip_prefix(leaf.name.as_str())?
-                .strip_prefix('.')?;
+                .strip_prefix(QUALIFIER_SEP)?;
             match &leaf.columns {
                 Some(names) => names.get(offset).filter(|n| n.to_lowercase() == name)?,
                 None => &spelled[at],
@@ -1594,7 +1594,7 @@ impl Chain<'_> {
         if !id.quoted && matches!(id.value_lower.as_str(), "true" | "false") {
             return Ok(None);
         }
-        // A name is a column's whole name before its dot is a qualifier's
+        // A name is a column's whole name, dots and all, before a qualifier's
         for (depth, scope) in self.scopes.iter().enumerate() {
             if let Some(index) = scope.lower.iter().position(|c| *c == id.value_lower) {
                 let (_, range) = scope.table(index);
@@ -1602,12 +1602,8 @@ impl Chain<'_> {
                 return Ok(Some((depth, index)));
             }
         }
-        if let Some(dot) = id.value_lower.rfind('.') {
-            let resolved = self.qualified(
-                &id.value_lower[..dot],
-                &id.value_lower[dot + 1..],
-                &id.value,
-            );
+        if let Some((qualifier, name)) = split_qualified(&id.value_lower) {
+            let resolved = self.qualified(qualifier, name, &id.value);
             return match resolved {
                 Err(_) if id.quoted => Ok(None),
                 other => other.map(Some),
@@ -4475,7 +4471,7 @@ impl Builder<'_> {
                 }
                 agg.column_lower
                     .strip_prefix(RESOLVED)
-                    .and_then(|name| name.strip_prefix('.'))
+                    .and_then(|name| name.strip_prefix(QUALIFIER_SEP))
                     .and_then(|name| scope.lower.iter().position(|c| c == name))
                     .map(Some)
                     .ok_or_else(|| Error::internal("an aggregate's column outside its block"))
@@ -7054,10 +7050,7 @@ fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
     match expr {
         Expression::Identifier(id) => {
             matches(&id.value_lower)
-                || id
-                    .value_lower
-                    .rsplit_once('.')
-                    .is_some_and(|(_, column)| matches(column))
+                || split_qualified(&id.value_lower).is_some_and(|(_, column)| matches(column))
         }
         Expression::QualifiedIdentifier(qid) => matches(&qid.name.value_lower),
         Expression::Aliased(aliased) => names_anywhere(&aliased.expression, matches),

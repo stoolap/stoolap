@@ -229,7 +229,7 @@ impl Executor {
         let pk_lower = &schema.columns[pk_idx].name_lower;
 
         // Handle qualified names like "users.id"
-        let matches_pk = col_lower == *pk_lower || col_lower.ends_with(&format!(".{}", pk_lower));
+        let matches_pk = super::utils::bare_name(&col_lower) == pk_lower.as_str();
 
         if !matches_pk {
             return None;
@@ -277,7 +277,7 @@ impl Executor {
         let col_name = match col_expr {
             Expression::Identifier(id) => id.value.to_string(),
             Expression::QualifiedIdentifier(q) => {
-                format!("{}.{}", q.qualifier.value, q.name.value)
+                super::utils::qualified(&q.qualifier.value, &q.name.value)
             }
             _ => return None,
         };
