@@ -228,11 +228,17 @@ SELECT * FROM products
 WHERE price > (SELECT MAX(price) FROM products WHERE category = 'Electronics');
 ```
 
-#### Subqueries without FROM
+#### Queries without FROM
 
-A subquery without FROM reads one row that has no columns. Its WHERE, GROUP BY, HAVING and aggregates apply to that row as they would to a table holding it, and a bare name in it refers to the enclosing query:
+A statement or a subquery without FROM reads one row that has no columns. Its WHERE, GROUP BY, HAVING and aggregates apply to that row as they would to a table holding it, and a bare name in a subquery refers to the enclosing query:
 
 ```sql
+-- 0: the WHERE keeps the row out, and an aggregate without GROUP BY answers one row
+SELECT COUNT(*) WHERE (SELECT MAX(price) FROM products) > 1000000;
+
+-- no row
+SELECT 1 WHERE (SELECT MAX(price) FROM products) > 1000000;
+
 -- 2, for each row of t
 SELECT * FROM t WHERE a = (SELECT 2);
 

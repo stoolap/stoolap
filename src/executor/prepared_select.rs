@@ -131,13 +131,14 @@ impl<'a> Family<'a> {
 
     /// The statement's FROM: one table, view or CTE, a derived table, a
     /// VALUES list or a table function; the statement of a view, a CTE or a
-    /// derived table runs as any statement does
+    /// derived table runs as any statement does; or none, which reads one
+    /// row without columns
     fn statement_from(
         &self,
         table_expr: Option<&'a Expression>,
     ) -> std::result::Result<(), OutOfFamily> {
         match table_expr {
-            Some(Expression::SubquerySource(_)) => Ok(()),
+            None | Some(Expression::SubquerySource(_)) => Ok(()),
             Some(Expression::ValuesSource(values)) => {
                 match values.rows.iter().flatten().any(Executor::has_subqueries) {
                     true => Err("a VALUES row holding a subquery"),
@@ -8799,7 +8800,8 @@ impl Executor {
     /// What `stmt` reads its rows from, and the name its scope bears: None
     /// for a base table, left closed; else a CTE's rows, a VALUES list, or a
     /// view's, a derived table's or a table function's rows, read once under
-    /// the statement's snapshot, before a plan is taken. A table function
+    /// the statement's snapshot, before a plan is taken, or without FROM the
+    /// one row without columns. A table function
     /// generates at most `first` rows when the caller needs no more
     fn read_source<'s>(
         &self,
@@ -8852,6 +8854,11 @@ impl Executor {
                     .as_ref()
                     .map_or(&function.function.value_lower, |alias| &alias.value_lower);
                 (Some(StatementSource::Rows(columns, rows)), Some(scope))
+            }
+            None => {
+                let mut row = RowVec::with_capacity(1);
+                row.push((0, Row::new()));
+                (Some(StatementSource::Rows(Vec::new(), row)), None)
             }
             _ => return Err(Error::internal("a prepared statement without one table")),
         })

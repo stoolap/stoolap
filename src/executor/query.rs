@@ -1438,11 +1438,9 @@ impl Executor {
             None => get_classification(stmt),
         };
 
-        // A statement of the prepared family runs on that path and no other;
-        // one without FROM never is
+        // A statement of the prepared family runs on that path and no other
         let in_family = (classification.where_has_subqueries
             || classification.output_has_subqueries)
-            && stmt.table_expr.is_some()
             && (self.holds_prepared_select(compiled, ctx)
                 || self.prepared_family(stmt, Some(ctx)).is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
@@ -2634,7 +2632,8 @@ impl Executor {
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
-        // Check WHERE clause first - if it evaluates to false, return empty result
+        // The one row without columns, unless the WHERE keeps it out
+        let mut passes = true;
         if let Some(where_clause) = &stmt.where_clause {
             // Pre-process subqueries in WHERE clause (EXISTS, IN, ALL/ANY, scalar subqueries)
             let processed_where = self.process_where_subqueries(where_clause, ctx)?;
@@ -2644,27 +2643,29 @@ impl Executor {
                 None => processed_where,
             };
             let where_result = super::expression::evaluate_once(&processed_where, Some(ctx))?;
-            let passes = match where_result {
+            passes = match where_result {
                 Value::Boolean(b) => b,
                 Value::Null(_) => false, // NULL in WHERE is treated as false
                 _ => true,
             };
-            if !passes {
-                // WHERE clause is false, return empty result
-                // Still need to determine column names for the schema
-                let columns = CompactArc::new(stmt.columns.iter().map(item_name).collect());
-                let result =
-                    ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
-                let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
-                return Ok((Box::new(result), columns, false, shape));
-            }
         }
 
-        // Aggregates and windows read one empty row, as in SELECT SUM(3+5)
+        // Aggregates and windows read the row the WHERE passed, as in
+        // SELECT SUM(3+5); over none, an aggregate still answers one row
         if classification.has_aggregation || classification.has_window_functions {
-            let mut dummy_rows = RowVec::new();
-            dummy_rows.push((0, Row::from_values(vec![])));
-            return self.grouped_select(stmt, ctx, classification, dummy_rows, &[], None);
+            let mut rows = RowVec::new();
+            if passes {
+                rows.push((0, Row::from_values(vec![])));
+            }
+            return self.grouped_select(stmt, ctx, classification, rows, &[], None);
+        }
+        if !passes {
+            // Still need to determine column names for the schema
+            let columns = CompactArc::new(stmt.columns.iter().map(item_name).collect());
+            let result =
+                ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
+            let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
+            return Ok((Box::new(result), columns, false, shape));
         }
 
         // Process scalar subqueries in SELECT columns first (single-pass)
