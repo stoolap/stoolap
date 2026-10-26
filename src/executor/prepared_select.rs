@@ -1533,13 +1533,16 @@ impl StatementWalk<'_> {
                 })
                 .collect::<Result<Vec<_>>>()
         };
-        let modifier = match &stmt.group_by.modifier {
-            GroupByModifier::GroupingSets(sets) => GroupByModifier::GroupingSets(
+        let group_by = match &stmt.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => GroupByClause::grouping_sets(
                 sets.iter()
                     .map(|set| all(self, set))
                     .collect::<Result<_>>()?,
             ),
-            other => other.clone(),
+            modifier => GroupByClause {
+                columns: all(self, &stmt.group_by.columns)?,
+                modifier: modifier.clone(),
+            },
         };
         let walked = SelectStatement {
             distinct_on: all(self, &stmt.distinct_on)?,
@@ -1550,10 +1553,7 @@ impl StatementWalk<'_> {
                 .collect::<Result<_>>()?,
             table_expr: table_expr.map(Box::new),
             where_clause: one(self, &stmt.where_clause)?,
-            group_by: GroupByClause {
-                columns: all(self, &stmt.group_by.columns)?,
-                modifier,
-            },
+            group_by,
             having: one(self, &stmt.having)?,
             window_defs: stmt
                 .window_defs
@@ -6516,19 +6516,21 @@ impl PreparedGrouped {
                 .or_insert_with(|| rewritten.clone())
                 .clone())
         };
-        let group_by = stmt
-            .group_by
-            .columns
-            .iter()
-            .map(&mut group_item)
-            .collect::<Result<Vec<_>>>()?;
-        let modifier = match &stmt.group_by.modifier {
-            GroupByModifier::GroupingSets(sets) => GroupByModifier::GroupingSets(
+        let group_by = match &stmt.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => GroupByClause::grouping_sets(
                 sets.iter()
                     .map(|set| set.iter().map(&mut group_item).collect())
                     .collect::<Result<_>>()?,
             ),
-            other => other.clone(),
+            modifier => GroupByClause {
+                columns: stmt
+                    .group_by
+                    .columns
+                    .iter()
+                    .map(&mut group_item)
+                    .collect::<Result<_>>()?,
+                modifier: modifier.clone(),
+            },
         };
         // An item the GROUP BY names is read for each input row, as rewritten
         // above, and so is every item of rows that do not group; any other
@@ -6700,10 +6702,7 @@ impl PreparedGrouped {
         let stmt = SelectStatement {
             columns,
             having,
-            group_by: GroupByClause {
-                columns: group_by,
-                modifier,
-            },
+            group_by,
             where_clause: where_clause
                 .map(Box::new)
                 .or_else(|| stmt.where_clause.clone()),

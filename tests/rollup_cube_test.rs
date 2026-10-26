@@ -703,3 +703,63 @@ fn test_grouping_sets_three_columns() {
     assert!(has_region_product, "Should have region-product rows");
     assert!(has_all_three, "Should have all-three-columns rows");
 }
+
+/// The rows of `sql`, sorted
+fn sorted_rows(db: &Database, sql: &str) -> Vec<String> {
+    let mut out: Vec<String> = db
+        .query(sql, ())
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .map(|row| {
+            let row = row.unwrap();
+            (0..row.len())
+                .map(|i| format!("{:?}", row.get_value(i)))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn test_grouping_sets_group_by_items_the_select_list_does_not_name() {
+    let db = Database::open("memory://grouping_sets_unnamed_items").expect("open");
+    setup_sales_table(&db);
+    db.execute("CREATE VIEW v AS SELECT * FROM sales", ())
+        .unwrap();
+    for (sql, same) in [
+        (
+            "SELECT SUM(amount) FROM sales GROUP BY GROUPING SETS ((region))",
+            "SELECT SUM(amount) FROM sales GROUP BY region",
+        ),
+        (
+            "SELECT COUNT(*) FROM sales GROUP BY GROUPING SETS ((region), ())",
+            "SELECT COUNT(*) FROM sales GROUP BY ROLLUP(region)",
+        ),
+        (
+            "SELECT COUNT(*) FROM sales GROUP BY GROUPING SETS ((region), (product))",
+            "SELECT COUNT(*) FROM sales GROUP BY region \
+             UNION ALL SELECT COUNT(*) FROM sales GROUP BY product",
+        ),
+        (
+            "SELECT SUM(amount) FROM sales GROUP BY GROUPING SETS ((region)) \
+             HAVING COUNT(*) > 1",
+            "SELECT SUM(amount) FROM sales GROUP BY region HAVING COUNT(*) > 1",
+        ),
+        (
+            "SELECT COUNT(*), (SELECT MAX(amount) FROM sales) FROM sales \
+             GROUP BY GROUPING SETS ((region))",
+            "SELECT COUNT(*), (SELECT MAX(amount) FROM sales) FROM sales GROUP BY region",
+        ),
+        (
+            "SELECT SUM(amount) FROM (SELECT * FROM sales) s GROUP BY GROUPING SETS ((region))",
+            "SELECT SUM(amount) FROM (SELECT * FROM sales) s GROUP BY region",
+        ),
+        (
+            "SELECT SUM(amount) FROM v GROUP BY GROUPING SETS ((product))",
+            "SELECT SUM(amount) FROM v GROUP BY product",
+        ),
+    ] {
+        assert_eq!(sorted_rows(&db, sql), sorted_rows(&db, same), "{sql}");
+    }
+}
