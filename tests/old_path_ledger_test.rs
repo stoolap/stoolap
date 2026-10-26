@@ -385,7 +385,22 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN u AS w ON w.id = u.id \
          WHERE t.b > (SELECT MAX(x) FROM u)",
         "SELECT t.id FROM t JOIN u ON u.id = t.a JOIN u AS w ON w.id = u.id WHERE t.b > 3",
-        Old("joins of more than two sources"),
+        Prepared,
+    ),
+    (
+        "join_with_a_joined_using_side",
+        "SELECT t.id FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.a WHERE t.b > 3",
+        Old("a joined side whose run merges or names its columns: #576"),
+    ),
+    (
+        "join_with_a_joined_values_side",
+        "SELECT t.id FROM t JOIN (VALUES (1), (2)) AS v (n) ON v.n = t.a JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT t.id FROM t JOIN (VALUES (1), (2)) AS v (n) ON v.n = t.a JOIN u ON u.id = t.a \
+         WHERE t.b > 3",
+        Old("a joined side whose run merges or names its columns: #576"),
     ),
     (
         "block_over_a_derived_table",

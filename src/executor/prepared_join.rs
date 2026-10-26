@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 
 use smallvec::SmallVec;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Schema};
 
 use super::expression::SharedProgram;
@@ -157,9 +157,37 @@ impl<K, T: ?Sized> Shelf<K, T> {
     }
 }
 
-/// Each side's columns as a join's blocks read them, and whether the side
-/// is read as rows
-pub(crate) type JoinSides = [(CompactArc<Schema>, bool); 2];
+/// One side of a join as its blocks read it: each table it joins, by the
+/// name that qualifies it as written, with its columns, one unless the side
+/// is itself a join; and whether the side is read as rows
+#[derive(Debug, Clone)]
+pub(crate) struct JoinSide {
+    pub(crate) leaves: SmallVec<[(SmartString, CompactArc<Schema>); 1]>,
+    pub(crate) rows: bool,
+}
+
+impl JoinSide {
+    /// The side's columns when it is one table, not a join
+    pub(crate) fn schema(&self) -> Option<&Schema> {
+        match self.leaves.as_slice() {
+            [(_, schema)] => Some(schema),
+            _ => None,
+        }
+    }
+
+    /// Each column as a reference spells it: its table's name and its own
+    pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.leaves.iter().flat_map(|(name, schema)| {
+            schema
+                .columns
+                .iter()
+                .map(move |c| (name.as_str(), c.name.as_str()))
+        })
+    }
+}
+
+/// Each side's columns as a join's blocks read them
+pub(crate) type JoinSides = [JoinSide; 2];
 
 /// The programs one join statement compiled, valid for one schema epoch
 #[derive(Debug)]

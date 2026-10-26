@@ -1084,10 +1084,10 @@ fn test_classifier_rules() {
         ),
         (
             format!(
-                "SELECT t.id FROM t JOIN u ON u.id = t.id JOIN u AS w ON w.id = t.id \
+                "SELECT t.id FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id \
                  WHERE a > {sq}"
             ),
-            "a side that is itself a join",
+            "a joined side that is a NATURAL or USING join",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"

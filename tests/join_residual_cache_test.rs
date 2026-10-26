@@ -443,3 +443,39 @@ fn a_held_join_analysis_copies_no_condition_per_run() {
         "a join with one residual condition costs {one} allocations per run, with four {four}"
     );
 }
+
+#[test]
+fn a_joined_where_it_cannot_bind_costs_no_allocation_per_joined_row() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let open = |rows: i64| {
+        let db = Database::open(&format!("memory://join_residual_unbound_where_{rows}")).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)".to_string(),
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, b INTEGER)".to_string(),
+            "CREATE TABLE v (id INTEGER PRIMARY KEY, z INTEGER)".to_string(),
+            "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)".to_string(),
+            format!("INSERT INTO t SELECT g.value, g.value % 7 FROM generate_series(1, {rows}) g"),
+            format!("INSERT INTO u SELECT g.value, g.value % 5 FROM generate_series(1, {rows}) g"),
+            "INSERT INTO v VALUES (1, 0), (2, 3)".to_string(),
+            "INSERT INTO w VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)".to_string(),
+        ] {
+            db.execute(&sql, ()).unwrap();
+        }
+        db
+    };
+    let (small, large) = (open(50), open(200));
+    let cost = |value: &str| {
+        let sql = format!(
+            "SELECT t.id FROM t JOIN u ON u.id = t.id \
+             WHERE t.a + u.b > {value} AND (t.a, u.b) IN (SELECT x, y FROM w)"
+        );
+        allocations_per_run(&large, &sql) - allocations_per_run(&small, &sql)
+    };
+    let literal = cost("0");
+    let scalar = cost("(SELECT MIN(z) FROM v)");
+    assert_eq!(
+        literal, scalar,
+        "150 more joined rows cost {literal} more allocations per run with a literal, \
+         {scalar} with a scalar subquery beside a row IN"
+    );
+}
