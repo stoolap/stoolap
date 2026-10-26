@@ -302,6 +302,7 @@ impl<'a> Family<'a> {
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
             | Expression::Parameter(_) => Ok(()),
             Expression::Infix(infix) => {
                 if infix.op_type == InfixOperator::Other {
