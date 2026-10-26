@@ -365,3 +365,96 @@ fn a_cte_not_named_before_it_runs_keeps_the_cte_path_as_explain_says() {
         "{sql}: the CTE path runs the join without its plan"
     );
 }
+
+mod drops_before_the_join {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use stoolap::core::{Result, Value};
+    use stoolap::functions::registry::global_registry;
+    use stoolap::functions::{
+        FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    };
+    use stoolap::Database;
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Returns its argument and counts its calls
+    #[derive(Default)]
+    struct SideCalls;
+
+    impl ScalarFunction for SideCalls {
+        fn name(&self) -> &str {
+            "SIDE_CALLS"
+        }
+        fn info(&self) -> FunctionInfo {
+            FunctionInfo::new(
+                "SIDE_CALLS",
+                FunctionType::Scalar,
+                "test counter",
+                FunctionSignature::new(
+                    FunctionDataType::Integer,
+                    vec![FunctionDataType::Any],
+                    1,
+                    1,
+                ),
+            )
+        }
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(args[0].clone())
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(SideCalls)
+        }
+    }
+
+    #[test]
+    fn a_side_s_condition_on_values_read_once_drops_its_rows_before_the_join() {
+        let _guard = super::serial();
+        global_registry().register_scalar::<SideCalls>();
+        let db = Database::open("memory://join_source_sides_drops_first").unwrap();
+        stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
+            .function_registry()
+            .register_scalar::<SideCalls>();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO t SELECT g.value, 1 FROM generate_series(1, 100) g",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO u SELECT g.value, 1 FROM generate_series(1, 500) g",
+            "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)",
+            "INSERT INTO w VALUES (1, 1), (2, 2)",
+            "CREATE VIEW uk AS SELECT id, k FROM u",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let run = |sql: &str| {
+            let before = CALLS.load(Ordering::Relaxed);
+            let rows = super::answer(&db, sql).map(|rows| rows.len());
+            (rows, CALLS.load(Ordering::Relaxed) - before)
+        };
+        let mut wrong = Vec::new();
+        for (with, side) in [
+            ("", "(SELECT id, k FROM u) AS s"),
+            ("", "uk AS s"),
+            ("WITH s (id, k) AS (SELECT id, k FROM u) ", "s"),
+        ] {
+            for condition in [
+                "SIDE_CALLS(s.id) = 1 OR s.id = (SELECT MIN(x) FROM w)",
+                "SIDE_CALLS(s.id) = (SELECT MAX(x) FROM w) OR EXISTS (SELECT 1 FROM w WHERE x > 5)",
+            ] {
+                let shape =
+                    format!("SELECT s.id, t.id FROM {side} JOIN t ON t.k = s.k WHERE {condition}");
+                let (got, want) = (
+                    run(&format!("{with}{shape}")),
+                    run(&format!("{with}{}", super::general(&shape))),
+                );
+                if got.0 != want.0 || got.1 > want.1 {
+                    wrong.push(format!(
+                        "{with}{shape}: {:?} rows and {} calls, the general path {:?} and {}",
+                        got.0, got.1, want.0, want.1
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}

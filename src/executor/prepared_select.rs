@@ -6946,7 +6946,7 @@ impl Executor {
         };
         // Its conditions bind before its first row, so they pass its rows
         // as they come, as a table side's scan does
-        if let Some(bound) = run.bound_program(&where_.program) {
+        if let Some(bound) = run.bound_reading(&where_.program) {
             let mut own = RowFilter::from_program(bound).with_context(ctx);
             // The values the run computed once sit past the statement's own
             if run.base.len() > ctx.params().len() {
@@ -7287,14 +7287,17 @@ fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
 }
 
 /// Whether `expr`, rewritten with its blocks in `blocks`, asks one of them
-/// of each row: any but a member test of an uncorrelated block, whose set a
+/// of each row: any but an uncorrelated block's value or members, which a
 /// run reads once
 fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool {
-    let members = |mark: &SelectStatement| {
+    let block = |mark: &SelectStatement| {
         mark.prepared
             .and_then(|id| blocks.get(usize::from(id))?.as_ref())
-            .is_some_and(|sq| sq.uncorrelated && matches!(sq.answer, Answer::Members(..)))
     };
+    let members = |mark: &SelectStatement| {
+        block(mark).is_some_and(|sq| sq.uncorrelated && matches!(sq.answer, Answer::Members(..)))
+    };
+    let once = |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.uncorrelated);
     match expr {
         Expression::In(in_expr) => match in_expr.right.as_ref() {
             Expression::ScalarSubquery(mark) => {
@@ -7305,7 +7308,8 @@ fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool 
         Expression::AllAny(all_any) => {
             !members(&all_any.subquery) || asks_per_row(&all_any.left, blocks)
         }
-        Expression::ScalarSubquery(_) | Expression::Exists(_) => true,
+        Expression::ScalarSubquery(mark) => !once(&mark.subquery),
+        Expression::Exists(mark) => !once(&mark.subquery),
         other => {
             let mut found = false;
             let _ = for_each_child(other, &mut |child| {
@@ -7391,8 +7395,8 @@ impl Builder<'_> {
 
     /// Whether `conjunct`, a condition on the one table of `chain` over
     /// `schema`, binds to what a run reads before the table's first row: its
-    /// values run slots and its member tests an uncorrelated block's sets.
-    /// Tried as the WHERE prepares it, and given back
+    /// blocks uncorrelated, read once for their values or sets. Tried as the
+    /// WHERE prepares it, and given back
     fn binds_before_rows(
         &mut self,
         chain: &Chain<'_>,
@@ -10357,6 +10361,24 @@ impl PreparedRunner<'_> {
         }
         let bound = self.bound_now(program, program.ops().iter().any(|op| self.asks_block(op)));
         (!bound.has_subqueries()).then_some(bound)
+    }
+
+    /// `program` bound as [`Self::bound_program`] binds it, once the values
+    /// of the uncorrelated blocks it asks are read: a side read once asks
+    /// them alike of each of its rows. None when a read fails, whose error
+    /// stays with the row that needs it
+    pub(crate) fn bound_reading(&self, program: &SharedProgram) -> Option<SharedProgram> {
+        let empty = Row::new();
+        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        for op in program.ops().iter().filter(|op| self.asks_block(op)) {
+            let read = match *op {
+                Op::ExecScalarSubquery(index) => self.execute_scalar(index, &caller).map(drop),
+                Op::ExecExists(index) => self.execute_exists(index, &caller).map(drop),
+                _ => Ok(()),
+            };
+            read.ok()?;
+        }
+        self.bound_program(program)
     }
 
     /// `program` with the member tests of `slots` bound to the sets this run
