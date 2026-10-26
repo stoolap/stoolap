@@ -78,7 +78,7 @@ const FILTERS: [(&str, &str); 2] = [
 ];
 
 /// (name, items, DISTINCT ON key, the key written out over the input)
-const SHAPES: [(&str, &str, &str, &str); 20] = [
+const SHAPES: [(&str, &str, &str, &str); 22] = [
     ("column", "c.b", "c.a", "c.a"),
     ("bare column", "c.b", "a", "c.a"),
     ("computed", "c.b", "c.a % 2", "c.a % 2"),
@@ -109,7 +109,19 @@ const SHAPES: [(&str, &str, &str, &str); 20] = [
         "c.a % 2",
     ),
     ("enclosing", "c.b", "p.b + c.a % 2", "c.a % 2"),
+    (
+        "subquery",
+        "c.b",
+        "c.a % 2 + (SELECT MIN(id) FROM side) * 0",
+        "c.a % 2",
+    ),
     // A windowed statement computes its key as a hidden item
+    (
+        "windowed subquery",
+        "ROW_NUMBER() OVER () * 0 + c.b",
+        "c.a % 2 + (SELECT MIN(id) FROM side) * 0",
+        "c.a % 2",
+    ),
     (
         "windowed computed",
         "ROW_NUMBER() OVER () * 0 + c.b",
@@ -354,6 +366,29 @@ fn a_block_keeps_the_first_row_of_each_key_in_every_form() {
         for (run, got) in runs(&db, sql) {
             assert_eq!(got.as_ref(), Ok(&want), "{sql} ({run})");
         }
+    }
+}
+
+#[test]
+fn a_join_runs_a_distinct_on_subquery_as_its_block() {
+    let db = Database::open("memory://distinct_on_binding_join").unwrap();
+    setup(&db);
+    let sql = "SELECT DISTINCT ON (c.a % 2 + (SELECT MIN(id) FROM side) * 0) c.b \
+               FROM child AS c JOIN side AS s ON s.k = c.a ORDER BY c.a % 2, c.id";
+    let explain = collect(db.query(&format!("EXPLAIN {sql}"), ())).unwrap();
+    assert!(
+        explain
+            .iter()
+            .flatten()
+            .any(|line| line.contains("Prepared: yes")),
+        "{explain:?}"
+    );
+    let want = vec![
+        vec!["Some(Integer(0))".to_string()],
+        vec!["Some(Integer(100))".to_string()],
+    ];
+    for (run, got) in runs(&db, sql) {
+        assert_eq!(got.as_ref(), Ok(&want), "{run}");
     }
 }
 

@@ -6516,9 +6516,11 @@ pub(crate) struct JoinBlocks {
     /// The conditions on a side read as rows that ask a block of each row,
     /// asked of the joined row with the WHERE's others there
     pub(crate) moved: Option<Expression>,
-    /// Each SELECT item and ORDER BY key holding a subquery, over the joined row
+    /// Each SELECT item, ORDER BY key and DISTINCT ON key holding a
+    /// subquery, over the joined row
     pub(crate) select: Vec<Option<Expression>>,
     pub(crate) order_by: Vec<Option<Expression>>,
+    pub(crate) distinct_on: Vec<Option<Expression>>,
     /// The uncorrelated member blocks those read, read before the join
     /// reads a row; a value block they read is a run slot
     ahead: Vec<u16>,
@@ -6567,10 +6569,10 @@ impl JoinBlocks {
     }
 
     /// `on`, `inner_on` when it is an INNER join's, `cross`, the conditions on
-    /// one side, `side_filters`, and the SELECT items and ORDER BY keys
-    /// holding a subquery, `output`, over the joined row of `sides`, each a
-    /// name, its columns' schema and whether it is read as rows; None when
-    /// the join's `width` columns do not line up
+    /// one side, `side_filters`, and the SELECT items, ORDER BY keys and
+    /// DISTINCT ON keys holding a subquery, `output`, over the joined row of
+    /// `sides`, each a name, its columns' schema and whether it is read as
+    /// rows; None when the join's `width` columns do not line up
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
@@ -6578,7 +6580,7 @@ impl JoinBlocks {
         (on, inner_on): (Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
-        output: [&[Option<&Expression>]; 2],
+        output: [&[Option<&Expression>]; 3],
         sides: [(SmartString, &Schema, bool); 2],
         width: usize,
         param_count: usize,
@@ -6651,7 +6653,7 @@ impl JoinBlocks {
         // before the join reads a row
         let mut run_slots = Vec::new();
         let first_output_block = builder.subqueries.len();
-        let [select, order_by] = output.map(|exprs| {
+        let [select, order_by, distinct_on] = output.map(|exprs| {
             exprs
                 .iter()
                 .map(|expr| {
@@ -6664,7 +6666,7 @@ impl JoinBlocks {
                 })
                 .collect::<Result<Vec<_>>>()
         });
-        let (select, order_by) = (select?, order_by?);
+        let (select, order_by, distinct_on) = (select?, order_by?, distinct_on?);
         let output_blocks = first_output_block..builder.subqueries.len();
         // Each side's conditions as its own scan reads them, a value a column
         // is compared with a run slot; the joined row reads the same blocks
@@ -6764,6 +6766,7 @@ impl JoinBlocks {
             moved,
             select,
             order_by,
+            distinct_on,
             ahead,
             left,
             right,
@@ -6886,7 +6889,7 @@ impl Executor {
         on: (Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
-        output: [&[Option<&Expression>]; 2],
+        output: [&[Option<&Expression>]; 3],
         sides: [(SmartString, &Schema, bool); 2],
         width: usize,
         ctx: &ExecutionContext,

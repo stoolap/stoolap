@@ -2141,9 +2141,7 @@ impl Executor {
                 }
             });
         }
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        evaluator.init_columns(&columns);
-        evaluator.add_aggregate_aliases(&slots);
+        let outer = outer_column_names(ctx);
         // Each key no column holds is computed into a column appended to the
         // row, which the dedup reads and the projection below drops
         let width = columns.len();
@@ -2160,19 +2158,30 @@ impl Executor {
                     "DISTINCT ON key {key} names no column"
                 )));
             }
+            // A subquery that reads nothing of the row is run once here, as
+            // an ORDER BY key's is
             let key = match Self::has_subqueries(key) && !Self::has_correlated_subqueries(key) {
                 true => std::borrow::Cow::Owned(self.process_where_subqueries(key, ctx)?),
                 false => std::borrow::Cow::Borrowed(key),
             };
             indices.push(width + programs.len());
-            programs.push(evaluator.compile_cached(&key)?);
+            programs.push(super::aggregation::compile_over_slots(
+                &key,
+                &columns,
+                &self.function_registry,
+                Some(&slots),
+                outer.as_deref(),
+                false,
+                Some(ctx.params()),
+            )?);
         }
+        let mut vm = ExprVM::new();
         let mut rows = RowVec::new();
         let mut row_id = 0i64;
         while result.next() {
             let mut row = result.take_row();
             for program in &programs {
-                let value = evaluator.evaluate_program(program, &row)?;
+                let value = vm.execute(program, &super::aggregation::slot_context(&row, ctx))?;
                 row.push(value);
             }
             rows.push((row_id, row));
@@ -5242,9 +5251,9 @@ impl Executor {
         classification.has_aggregation && !classification.has_window_functions
     }
 
-    /// Whether the SELECT list or the ORDER BY of a join holds subqueries,
-    /// all of the forms the prepared blocks run over the joined rows, or
-    /// why the blocks cannot run them
+    /// Whether the SELECT list, the ORDER BY or the DISTINCT ON of a join
+    /// holds subqueries, all of the forms the prepared blocks run over the
+    /// joined rows, or why the blocks cannot run them
     fn join_output_family(
         &self,
         stmt: &SelectStatement,
@@ -5260,7 +5269,11 @@ impl Executor {
             .iter()
             .filter(|c| !matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
             .map(unaliased_item);
-        let keys = stmt.order_by.iter().map(|ob| &ob.expression);
+        let keys = stmt
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .chain(&stmt.distinct_on);
         let mut found = false;
         for expr in items.chain(keys) {
             if Self::has_subqueries(expr) {
@@ -5294,6 +5307,11 @@ impl Executor {
                 && names_any_within(&ob.expression, &|name| aliases.contains(&name))
         }) {
             return Err("an ORDER BY subquery that names a SELECT alias");
+        }
+        if stmt.distinct_on.iter().any(|key| {
+            Self::has_subqueries(key) && names_any_within(key, &|name| aliases.contains(&name))
+        }) {
+            return Err("a DISTINCT ON subquery that names a SELECT alias");
         }
         Ok(true)
     }
@@ -5404,7 +5422,7 @@ impl Executor {
                     right_side.1,
                 ),
             ];
-            // The SELECT items and ORDER BY keys whose subqueries the blocks run
+            // The SELECT items and sort keys whose subqueries the blocks run
             let output = !Self::grouped_join_output(stmt);
             let select: Vec<Option<&Expression>> = stmt
                 .columns
@@ -5416,11 +5434,16 @@ impl Executor {
                 .iter()
                 .map(|ob| Some(&ob.expression).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
+            let distinct: Vec<Option<&Expression>> = stmt
+                .distinct_on
+                .iter()
+                .map(|key| Some(key).filter(|e| output && Self::has_subqueries(e)))
+                .collect();
             self.prepare_join_blocks(
                 (on, Self::inner_on(join_source, join_type)),
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
-                [&select, &keys],
+                [&select, &keys, &distinct],
                 sides,
                 columns.len(),
                 ctx,
@@ -5527,12 +5550,9 @@ impl Executor {
         let plan = compiled
             .filter(|_| ctx.outer_row().is_none())
             .and_then(|slot| self.prepared_join(slot));
-        let output_subqueries = stmt.columns.iter().any(Self::has_subqueries)
-            || stmt
-                .order_by
-                .iter()
-                .any(|ob| Self::has_subqueries(&ob.expression));
-        let asks_blocks = classification.where_has_subqueries || on_subqueries || output_subqueries;
+        let asks_blocks = classification.where_has_subqueries
+            || on_subqueries
+            || classification.output_has_subqueries;
         let block_sides = plan.as_ref().filter(|_| asks_blocks).and_then(|plan| {
             plan.sides(|| self.join_side_schemas(join_source, ctx))
                 .cloned()
@@ -11320,6 +11340,7 @@ impl Executor {
                 .select
                 .iter()
                 .chain(&blocks.order_by)
+                .chain(&blocks.distinct_on)
                 .any(Option::is_some)
         };
         if let Some(blocks) = blocks.filter(runs_output) {
@@ -11404,7 +11425,11 @@ impl Executor {
             }
         }
         let mut columns = self.get_output_column_names(&stmt.columns, all_columns, None);
-        let keys_hold_subqueries = blocks.order_by.iter().any(Option::is_some);
+        let keys_hold_subqueries = blocks
+            .order_by
+            .iter()
+            .chain(&blocks.distinct_on)
+            .any(Option::is_some);
         if sorted || !(keys_hold_subqueries || self.order_by_needs_extra_columns(stmt, all_columns))
         {
             return Ok(JoinOutput {
@@ -11436,8 +11461,10 @@ impl Executor {
             let rewritten = at.and_then(|at| blocks.order_by[at].as_ref());
             sources.push(compile(rewritten, key));
         }
-        for expr in &plan.computed_distinct_on {
-            sources.push(compile(None, expr));
+        for key in &plan.computed_distinct_on {
+            let at = stmt.distinct_on.iter().position(|k| std::ptr::eq(k, *key));
+            let rewritten = at.and_then(|at| blocks.distinct_on[at].as_ref());
+            sources.push(compile(rewritten, key));
         }
         let mut layout =
             Self::shared_select_layout(&stmt.columns, CompactArc::new(all_columns.to_vec()), None);
