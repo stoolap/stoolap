@@ -3412,6 +3412,8 @@ struct PreparedProjection {
     /// Whether an output's program loads a parameter or asks a block, which
     /// a run may bind it to
     binds: bool,
+    /// Whether a key reads SELECT aliases from the projected row
+    alias_keys: bool,
 }
 
 /// What preparing one statement builds up
@@ -5080,11 +5082,13 @@ impl PreparedProjection {
             Output::AliasKey(program, _) => Computed::binds(program),
             Output::Column(_) | Output::Copy(_) => false,
         });
+        let alias_keys = outputs.iter().any(|o| matches!(o, Output::AliasKey(..)));
         Ok((
             Self {
                 outputs,
                 whole_row,
                 binds,
+                alias_keys,
             },
             extra_names,
             extra_sources,
@@ -5251,6 +5255,9 @@ impl PreparedProjection {
             values.push(Value::null_unknown());
         }
         let mut out = Row::from_values(values);
+        if !self.alias_keys {
+            return Ok(out);
+        }
         for (position, output) in self.outputs.iter().enumerate() {
             if let Output::AliasKey(program, _) = output {
                 let mut exec =
@@ -5315,15 +5322,27 @@ impl BoundOutput {
         run: &PreparedRunner<'_>,
         program: &SharedProgram,
     ) -> &'s Self {
-        let output = slot.get_or_insert_with(|| {
-            let bound = run.bind(program);
-            let item = Item::of(CompactArc::clone(&bound.program));
-            Self { bound, item }
-        });
+        // A binding that waits for no block stays as it is for the run
+        if !slot.as_ref().is_some_and(|o| o.bound.pending.is_empty()) {
+            Self::refresh(slot, run, program);
+        }
+        slot.get_or_insert_with(|| Self::bind(run, program))
+    }
+
+    /// [`Self::current`] binding `slot`'s output for the first time or again
+    #[inline(never)]
+    fn refresh(slot: &mut Option<Self>, run: &PreparedRunner<'_>, program: &SharedProgram) {
+        let output = slot.get_or_insert_with(|| Self::bind(run, program));
         if run.rebound(&mut output.bound) {
             output.item = Item::of(CompactArc::clone(&output.bound.program));
         }
-        output
+    }
+
+    /// `program` bound to all `run` knows now, and the item it reads
+    fn bind(run: &PreparedRunner<'_>, program: &SharedProgram) -> Self {
+        let bound = run.bind(program);
+        let item = Item::of(CompactArc::clone(&bound.program));
+        Self { bound, item }
     }
 }
 
