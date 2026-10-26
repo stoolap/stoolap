@@ -956,9 +956,12 @@ impl<'a> RowFeed<'a> {
                             Some(idx) => KeyItem::Column(idx),
                             // The outer row's column is one value for every row
                             None if names_outer_column(name, ctx) => KeyItem::Null,
-                            // A name only an aggregate item's alias carries
-                            None if stmt
-                                .is_some_and(|s| names_aggregate_item(name, &s.columns)) =>
+                            // A name written as the key that only an aggregate
+                            // item's alias carries
+                            None if stmt.is_some_and(|s| {
+                                matches!(grouping_items(s).get(at), Some(Expression::Identifier(_)))
+                                    && names_aggregate_item(name, &s.columns)
+                            }) =>
                             {
                                 return Err(aggregate_group_key())
                             }

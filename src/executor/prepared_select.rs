@@ -5234,11 +5234,12 @@ impl Builder<'_> {
         let scope = chain.scopes[0];
         let bound = group_by_expressions(executor, sq, &scope.columns)?;
         let mut items = Vec::with_capacity(bound.len());
-        for expr in bound {
-            // A name no scope holds that only an aggregate item's alias carries
-            if matches!(&expr, Expression::Identifier(name)
+        for (expr, written) in bound.into_iter().zip(grouping_items(sq)) {
+            // A name written as the key that no scope holds and only an
+            // aggregate item's alias carries
+            if matches!(written, Expression::Identifier(name)
                 if names_aggregate_item(&name.value, &sq.columns))
-                && !matches!(chain.resolve(&expr), Ok(Some(_)))
+                && !matches!(chain.resolve(written), Ok(Some(_)))
             {
                 return Err(aggregate_group_key());
             }

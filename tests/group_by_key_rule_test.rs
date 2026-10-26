@@ -281,6 +281,19 @@ fn a_quoted_group_by_name_binds_as_the_compiler_binds_it() {
             "SELECT \"constant\", COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY 1",
             vec!["Some(Text(\"constant\"))|Some(Integer(3))|Some(Integer(6))"],
         ),
+        (
+            "SELECT \"c\" AS k, COUNT(*) AS c FROM one GROUP BY 1",
+            vec!["Some(Text(\"c\"))|Some(Integer(3))"],
+        ),
+        (
+            "SELECT \"c\" AS k, COUNT(*) AS c FROM one GROUP BY k",
+            vec!["Some(Text(\"c\"))|Some(Integer(3))"],
+        ),
+        (
+            "SELECT EXISTS (SELECT \"c\" AS k, COUNT(*) AS c FROM u GROUP BY k) FROM one \
+             WHERE id = 1",
+            vec!["Some(Boolean(true))"],
+        ),
     ] {
         assert_eq!(rows(&db, sql), want, "{sql}");
     }
