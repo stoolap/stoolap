@@ -3675,10 +3675,12 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
-        // An EXISTS runs without its ORDER BY, which is still bound
-        let check = match form {
-            Form::Exists(_) => Check::Order,
-            _ => Check::Off,
+        // An EXISTS runs without its ORDER BY, which is still bound; a
+        // windowed one runs as written, its window values choosing its rows
+        let dropped = matches!(form, Form::Exists(_)) && !windowed_block(sq);
+        let check = match dropped {
+            true => Check::Order,
+            false => Check::Off,
         };
         let mut max_param = 0;
         let (statement, _, from_names) = StatementWalk {
@@ -3697,12 +3699,12 @@ impl Builder<'_> {
         }
         .statement(sq, outer, 0, check)?;
         self.max_param = self.max_param.max(max_param);
-        let statement = match form {
-            Form::Exists(_) => {
+        let statement = match dropped {
+            true => {
                 self.bind_dropped_order(sq, &from_names, outer, id, &work)?;
                 existence(executor, statement, &from_names, ctx)?
             }
-            _ => statement,
+            false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
         let kept = Kept {
@@ -4288,7 +4290,19 @@ impl Builder<'_> {
         }
         let mut distinct_keys = Vec::new();
         for key in &sq.distinct_on {
-            let key = with_aliases(key, &sq.columns, &scope.columns);
+            // A bare alias reads its item, as an ORDER BY key does
+            let item = match key {
+                Expression::Identifier(id) if order_by_names_an_alias(key, sq) => {
+                    sq.columns.iter().find_map(|item| match item {
+                        Expression::Aliased(a) if a.alias.value_lower == id.value_lower => {
+                            Some(std::borrow::Cow::Borrowed(&*a.expression))
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            let key = item.unwrap_or_else(|| with_aliases(key, &sq.columns, &scope.columns));
             match cut {
                 true => distinct_keys.push(self.rewrite(&chain, Some(id), &key, &mut work)?),
                 false => bound_only.push(self.trial_rewrite(&chain, id, &key, &work.outer)?),
@@ -4362,6 +4376,7 @@ impl Builder<'_> {
             .chain(&candidates)
             .chain(&filter)
             .chain(order_keys.iter().filter_map(|(key, ..)| key.as_ref()))
+            .chain(&distinct_keys)
             .chain(counts)
         {
             slots_read(expr, &mut reads);
