@@ -32,10 +32,9 @@ use crate::common::{CompactArc, SmartString};
 /// Timestamp formats supported for parsing
 /// Order matters - more specific formats first
 const TIMESTAMP_FORMATS: &[&str] = &[
-    "%Y-%m-%dT%H:%M:%S%.f%:z", // RFC3339 with fractional seconds
-    "%Y-%m-%dT%H:%M:%S%:z",    // RFC3339
-    "%Y-%m-%dT%H:%M:%S%.fZ",   // RFC3339 UTC with fractional seconds
-    "%Y-%m-%dT%H:%M:%SZ",      // RFC3339 UTC
+    // A zone of Z, +HH, +HHMM or +HH:MM after the time, fractional seconds or not
+    "%Y-%m-%dT%H:%M:%S%.f%#z", // ISO with a zone
+    "%Y-%m-%d %H:%M:%S%.f%#z", // SQL-style with a zone
     "%Y-%m-%dT%H:%M:%S%.f",    // ISO with fractional seconds, no timezone
     "%Y-%m-%dT%H:%M:%S",       // ISO without timezone
     "%Y-%m-%d %H:%M:%S%.f",    // SQL-style with fractional seconds
@@ -1500,11 +1499,12 @@ fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
     TS_FORMAT_PARSES.with(|count| count.set(count.get() + 1));
     if four_digit_year(s) {
         for format in TIMESTAMP_FORMATS {
-            if let Ok(dt) = DateTime::parse_from_str(s, format) {
-                return Ok(dt.with_timezone(&Utc));
-            }
-            // Try parsing as naive datetime and assume UTC
-            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, format) {
+            // A zone the format reads is never dropped: a time without one is UTC
+            if format.ends_with('z') {
+                if let Ok(dt) = DateTime::parse_from_str(s, format) {
+                    return Ok(dt.with_timezone(&Utc));
+                }
+            } else if let Ok(ndt) = NaiveDateTime::parse_from_str(s, format) {
                 return Ok(Utc.from_utc_datetime(&ndt));
             }
         }
@@ -2120,6 +2120,35 @@ mod tests {
             "24-03-04 05:06:07",
         ] {
             assert_eq!(at(text), None, "{text:?} writes no four digit year");
+        }
+    }
+
+    #[test]
+    fn a_zone_after_the_time_reads_in_either_form() {
+        let at = |text: &str| parse_timestamp(text).ok().map(|ts| ts.to_rfc3339());
+        for (text, want) in [
+            ("2024-01-10 00:00:00+00:00", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10 03:00:00+03:00", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10 03:00:00+0300", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-09 19:00:00-05", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10 00:00:00Z", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10 00:00:00 +00:00", "2024-01-10T00:00:00+00:00"),
+            (
+                "2024-01-10 00:00:00.25-05:30",
+                "2024-01-10T05:30:00.250+00:00",
+            ),
+            ("2024-01-10T00:00:00-05", "2024-01-10T05:00:00+00:00"),
+            ("2024-01-10T00:00:00.5Z", "2024-01-10T00:00:00.500+00:00"),
+            ("2024-01-10T00:00:00+00:00", "2024-01-10T00:00:00+00:00"),
+        ] {
+            assert_eq!(at(text).as_deref(), Some(want), "{text:?}");
+        }
+        for text in [
+            "2024-01-10 00:00:00 UTC",
+            "2024-01-10 00:00:00+5",
+            "2024-01-10 00:00:00+25:00",
+        ] {
+            assert_eq!(at(text), None, "{text:?}");
         }
     }
 
