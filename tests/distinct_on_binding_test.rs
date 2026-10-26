@@ -78,7 +78,7 @@ const FILTERS: [(&str, &str); 2] = [
 ];
 
 /// (name, items, DISTINCT ON key, the key written out over the input)
-const SHAPES: [(&str, &str, &str, &str); 20] = [
+const SHAPES: [(&str, &str, &str, &str); 22] = [
     ("column", "c.b", "c.a", "c.a"),
     ("bare column", "c.b", "a", "c.a"),
     ("computed", "c.b", "c.a % 2", "c.a % 2"),
@@ -109,7 +109,19 @@ const SHAPES: [(&str, &str, &str, &str); 20] = [
         "c.a % 2",
     ),
     ("enclosing", "c.b", "p.b + c.a % 2", "c.a % 2"),
+    (
+        "subquery",
+        "c.b",
+        "c.a % 2 + (SELECT MIN(id) FROM side) * 0",
+        "c.a % 2",
+    ),
     // A windowed statement computes its key as a hidden item
+    (
+        "windowed subquery",
+        "ROW_NUMBER() OVER () * 0 + c.b",
+        "c.a % 2 + (SELECT MIN(id) FROM side) * 0",
+        "c.a % 2",
+    ),
     (
         "windowed computed",
         "ROW_NUMBER() OVER () * 0 + c.b",
@@ -315,6 +327,212 @@ fn a_position_outside_the_list_names_no_column() {
             }
         }
     }
+}
+
+#[test]
+fn a_block_keeps_the_first_row_of_each_key_in_every_form() {
+    let db = Database::open("memory://distinct_on_binding_forms").unwrap();
+    setup(&db);
+    let row = |cells: &[&str]| cells.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    let cases = [
+        (
+            "SELECT p.id, (SELECT DISTINCT ON (c.a) c.b FROM child AS c WHERE c.a = p.id \
+             ORDER BY c.a, c.b) FROM parent AS p ORDER BY p.id",
+            vec![
+                row(&["Some(Integer(1))", "Some(Integer(70))"]),
+                row(&["Some(Integer(2))", "Some(Integer(0))"]),
+            ],
+        ),
+        (
+            "SELECT p.id FROM parent AS p WHERE p.b * 10 IN (SELECT DISTINCT ON (c.a) c.b \
+             FROM child AS c WHERE c.id > p.id - 2 ORDER BY c.a, c.b DESC) ORDER BY p.id",
+            vec![row(&["Some(Integer(1))"])],
+        ),
+        (
+            "SELECT p.id FROM parent AS p WHERE EXISTS (SELECT DISTINCT ON (c.a % 2) c.id \
+             FROM child AS c WHERE c.b >= p.b - 5 ORDER BY c.a % 2, c.id OFFSET 1) ORDER BY p.id",
+            vec![row(&["Some(Integer(1))"])],
+        ),
+    ];
+    for (sql, want) in cases {
+        let explain = collect(db.query(&format!("EXPLAIN {sql}"), ())).unwrap();
+        assert!(
+            explain
+                .iter()
+                .flatten()
+                .any(|line| line.contains("Prepared: yes")),
+            "{sql}: {explain:?}"
+        );
+        for (run, got) in runs(&db, sql) {
+            assert_eq!(got.as_ref(), Ok(&want), "{sql} ({run})");
+        }
+    }
+}
+
+#[test]
+fn a_join_runs_a_distinct_on_subquery_as_its_block() {
+    let db = Database::open("memory://distinct_on_binding_join").unwrap();
+    setup(&db);
+    let sql = "SELECT DISTINCT ON (c.a % 2 + (SELECT MIN(id) FROM side) * 0) c.b \
+               FROM child AS c JOIN side AS s ON s.k = c.a ORDER BY c.a % 2, c.id";
+    let explain = collect(db.query(&format!("EXPLAIN {sql}"), ())).unwrap();
+    assert!(
+        explain
+            .iter()
+            .flatten()
+            .any(|line| line.contains("Prepared: yes")),
+        "{explain:?}"
+    );
+    let want = vec![
+        vec!["Some(Integer(0))".to_string()],
+        vec!["Some(Integer(100))".to_string()],
+    ];
+    for (run, got) in runs(&db, sql) {
+        assert_eq!(got.as_ref(), Ok(&want), "{run}");
+    }
+}
+
+/// (name, DISTINCT ON key, the block's item, its ORDER BY)
+const BLOCK_KEYS: [(&str, &str, &str, &str); 8] = [
+    ("column", "c.a", "c.b", "c.a, c.b DESC"),
+    ("parameter only in the key", "c.a % $1", "c.b", "c.b"),
+    ("alias over a column name", "a", "c.a % 2 AS a", "c.id DESC"),
+    ("alias", "q", "c.a % 2 AS q", "c.id DESC"),
+    ("enclosing", "c.a % 2 + p.b * 0", "c.b", "c.id DESC"),
+    (
+        "windowed",
+        "c.a % 2",
+        "ROW_NUMBER() OVER (ORDER BY c.id) * 1000 + c.b",
+        "c.id DESC",
+    ),
+    (
+        "windowed position",
+        "1",
+        "ROW_NUMBER() OVER (ORDER BY c.id) % 2",
+        "c.id",
+    ),
+    (
+        "windowed enclosing",
+        "c.a % 2 + p.b * 0",
+        "ROW_NUMBER() OVER (ORDER BY c.id) * 1000 + c.b",
+        "c.id DESC",
+    ),
+];
+
+#[test]
+fn a_block_answers_as_its_statement_run_alone_for_each_enclosing_row() {
+    let db = Database::open("memory://distinct_on_binding_block_matrix").unwrap();
+    setup(&db);
+    let parents = [(1, 5), (2, 7)];
+    let params = [2i64, 3, 2];
+    let mut wrong = Vec::new();
+    let mut cases = 0;
+    // A derived table reading the enclosing row runs the block as a statement
+    let enclosing = (
+        "derived enclosing",
+        "",
+        "(SELECT * FROM child WHERE child.id <= p.b - 3) AS c",
+    );
+    let sources = SOURCES.iter().filter(|(_, _, from)| !from.contains("JOIN"));
+    for &(source, with, from) in sources.chain([&enclosing]) {
+        for (name, key, item, order) in BLOCK_KEYS {
+            let block = |tail: &str| {
+                format!("SELECT DISTINCT ON ({key}) {item} FROM {from} ORDER BY {order}{tail}")
+            };
+            let param = key.contains("$1");
+            // The block alone, for one enclosing row and parameter
+            let alone = |b: i64, tail: &str, p: i64| -> Vec<String> {
+                let sql = format!("{with}{}", block(tail).replace("p.b", &b.to_string()));
+                let rows = match param {
+                    true => collect(db.query(&sql, (p,))),
+                    false => collect(db.query(&sql, ())),
+                };
+                let rows = rows.unwrap_or_else(|e| panic!("{sql}: {e}"));
+                rows.into_iter().map(|row| row[0].clone()).collect()
+            };
+            let every = format!("{with}SELECT {item} FROM {from}")
+                .replace(" AS a", "")
+                .replace(" AS q", "");
+            let values: Vec<String> = collect(db.query(&every.replace("p.b", "5"), ()))
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row[0]
+                        .trim_start_matches("Some(Integer(")
+                        .trim_end_matches("))")
+                        .to_string()
+                })
+                .collect();
+            let scalars: Vec<String> = (0..3)
+                .map(|n| format!("({})", block(&format!(" LIMIT 1 OFFSET {n}"))))
+                .collect();
+            let members: Vec<String> = values
+                .iter()
+                .map(|v| format!("{v} IN ({})", block("")))
+                .collect();
+            let exists: Vec<String> = (0..4)
+                .map(|n| format!("EXISTS ({})", block(&format!(" OFFSET {n}"))))
+                .collect();
+            for (form, items) in [("scalar", &scalars), ("IN", &members), ("EXISTS", &exists)] {
+                let sql = format!(
+                    "{with}SELECT p.id, {} FROM parent AS p ORDER BY p.id",
+                    items.join(", ")
+                );
+                let want = |p: i64| -> Vec<Vec<String>> {
+                    parents
+                        .iter()
+                        .map(|&(id, b)| {
+                            let rows = alone(b, "", p);
+                            let mut row = vec![format!("{:?}", Some(stoolap::Value::Integer(id)))];
+                            match form {
+                                "scalar" => row.extend((0..3).map(|n| {
+                                    rows.get(n).cloned().unwrap_or("Some(Null(Null))".into())
+                                })),
+                                "IN" => row.extend(values.iter().map(|v| {
+                                    let member = rows.contains(&format!("Some(Integer({v}))"));
+                                    format!("Some(Boolean({member}))")
+                                })),
+                                _ => row.extend(
+                                    (0..4).map(|n| format!("Some(Boolean({}))", rows.len() > n)),
+                                ),
+                            }
+                            row
+                        })
+                        .collect()
+                };
+                let mut check = |run: &str, p: i64, got: Rows| {
+                    cases += 1;
+                    if got.as_ref() != Ok(&want(p)) {
+                        wrong.push(format!("{source} {name} {form} {run} $1={p}: {got:?}"));
+                    }
+                };
+                match param {
+                    true => {
+                        let stmt = db.prepare(&sql).map_err(|e| e.to_string());
+                        for p in params {
+                            check("direct", p, collect(db.query(&sql, (p,))));
+                            let got = match &stmt {
+                                Ok(stmt) => collect(stmt.query((p,))),
+                                Err(e) => Err(e.clone()),
+                            };
+                            check("prepared", p, got);
+                        }
+                    }
+                    false => {
+                        for (run, got) in runs(&db, &sql) {
+                            check(run, 0, got);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {cases} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 /// The rows, in order when the query fixes it

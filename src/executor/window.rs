@@ -96,10 +96,12 @@ impl<'a> RowPrograms<'a> {
         ctx: &'a ExecutionContext,
         blocks: Option<&'a dyn SubqueryExecutor>,
     ) -> Result<Self> {
+        // A statement run for an enclosing row reads that row's columns by name
+        let outer = super::query::outer_column_names(ctx);
         let programs = exprs
             .into_iter()
-            .map(|expr| match (blocks, slots) {
-                (None, None) => compile_expression(expr, columns)
+            .map(|expr| match (blocks, slots, &outer) {
+                (None, None, None) => compile_expression(expr, columns)
                     .map(|program| bind_params(program, ctx.params())),
                 _ => {
                     let program = compile_over_slots(
@@ -107,7 +109,7 @@ impl<'a> RowPrograms<'a> {
                         columns,
                         global_registry(),
                         slots,
-                        None,
+                        outer.as_deref(),
                         blocks.is_some(),
                         Some(slot_params(ctx, blocks)),
                     )?;

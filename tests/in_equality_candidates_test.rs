@@ -535,10 +535,11 @@ mod probed {
             .unwrap();
         db.execute("BEGIN", ()).unwrap();
         let (before, asked) = (in_subquery_runs(), in_member_probes());
-        // DISTINCT ON keeps it on the general path, which asks the list's candidates
+        // An inner ORDER BY position keeps it on the general path, which asks
+        // the list's candidates
         let (found, reads) = read(
             &db,
-            "SELECT DISTINCT ON (id) id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s)",
+            "SELECT id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s ORDER BY 1)",
         );
         let (runs, asked) = (in_subquery_runs() - before, in_member_probes() - asked);
         db.execute("COMMIT", ()).unwrap();

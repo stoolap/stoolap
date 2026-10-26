@@ -125,7 +125,7 @@ pub struct QueryClassification {
     pub select_has_correlated_subqueries: bool,
     /// Whether the SELECT list, HAVING or GROUP BY holds a subquery of any form
     pub grouped_has_subqueries: bool,
-    /// Whether the SELECT list or ORDER BY holds a subquery of any form
+    /// Whether the SELECT list, ORDER BY or DISTINCT ON holds a subquery of any form
     pub output_has_subqueries: bool,
 
     // === ORDER BY analysis ===
@@ -236,6 +236,7 @@ impl QueryClassification {
             .columns
             .iter()
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on)
             .any(super::Executor::has_subqueries);
 
         // ORDER BY correlated subquery analysis

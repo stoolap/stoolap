@@ -684,14 +684,10 @@ impl Executor {
         let on_subqueries = join
             .and_then(|join| join.condition.as_deref())
             .is_some_and(Self::has_subqueries);
-        let output_subqueries = select.columns.iter().any(Self::has_subqueries)
-            || select
-                .order_by
-                .iter()
-                .any(|ob| Self::has_subqueries(&ob.expression));
-        let grouped_output = Self::grouped_family_reach(select, &get_classification(select));
+        let classification = get_classification(select);
+        let grouped_output = Self::grouped_family_reach(select, &classification);
         if on_subqueries
-            || output_subqueries
+            || classification.output_has_subqueries
             || grouped_output
             || select
                 .where_clause

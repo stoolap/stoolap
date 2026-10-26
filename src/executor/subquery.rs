@@ -3560,34 +3560,6 @@ impl Executor {
         })
     }
 
-    /// `stmt`'s items from `first` on, the hidden items a DISTINCT ON key
-    /// runs as, bound to the parent row as `bind_outer_references` binds
-    /// what a subquery selects; the keys keep their names, which find them
-    pub(crate) fn bind_outer_items(
-        stmt: &mut SelectStatement,
-        first: usize,
-        ctx: &ExecutionContext,
-    ) {
-        let Some(outer_row) = ctx.outer_row() else {
-            return;
-        };
-        let mut bound: Vec<Expression> = {
-            let tables = Self::collect_subquery_table_columns(stmt);
-            let scope = super::utils::InnerScope {
-                tables: &tables,
-                schema: None,
-            };
-            stmt.columns[first..]
-                .iter()
-                .map(|item| {
-                    super::utils::substitute_outer_references_in_scope(item, outer_row, &scope)
-                })
-                .collect()
-        };
-        stmt.columns.truncate(first);
-        stmt.columns.append(&mut bound);
-    }
-
     /// Run a subquery written in the query as the parent row reads it, one
     /// query level deeper so it does not start a new timeout guard
     fn execute_for_outer_row(

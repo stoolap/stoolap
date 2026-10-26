@@ -475,8 +475,6 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
-        self.order(sq, scopes, false)?;
-        self.block_from(sq.table_expr.as_deref())?;
         let [column] = sq.columns.as_slice() else {
             return Err("a subquery block without exactly one SELECT expression");
         };
@@ -484,6 +482,11 @@ impl<'a> Family<'a> {
         if matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
             return Err("a subquery block selecting *");
         }
+        if windowed_block(sq) {
+            return self.derived(sq);
+        }
+        self.order(sq, scopes, false)?;
+        self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
         self.expression(column, scopes, list_site(sq), &mut found)?;
         self.grouping(sq, scopes)?;
@@ -495,8 +498,8 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// A block's ORDER BY, LIMIT and OFFSET: its counts literals or
-    /// parameters, its keys values over its row and the enclosing ones; a
+    /// A block's DISTINCT ON, ORDER BY, LIMIT and OFFSET: its counts literals
+    /// or parameters, its keys values over its row and the enclosing ones; a
     /// block that groups holds none of them
     fn order(
         &self,
@@ -504,11 +507,15 @@ impl<'a> Family<'a> {
         scopes: usize,
         exists: bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        if sq.order_by.is_empty() && sq.limit.is_none() && sq.offset.is_none() {
+        if sq.order_by.is_empty()
+            && sq.distinct_on.is_empty()
+            && sq.limit.is_none()
+            && sq.offset.is_none()
+        {
             return Ok(());
         }
         if grouped_block(sq) {
-            return Err("a grouped subquery block with ORDER BY, LIMIT or OFFSET");
+            return Err("a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET");
         }
         let counts = [sq.limit.as_deref(), sq.offset.as_deref()];
         if counts.into_iter().flatten().any(|count| {
@@ -520,7 +527,8 @@ impl<'a> Family<'a> {
             return Err("a subquery block's LIMIT or OFFSET that is not a literal or a parameter");
         }
         // Keys that choose no row are bound but never computed
-        let chooses = !exists && (sq.limit.is_some() || sq.offset.is_some());
+        let chooses =
+            !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
         let volatile_alias = match sq.columns.as_slice() {
             [Expression::Aliased(item)]
                 if volatile(&item.expression, &self.executor.function_registry) =>
@@ -542,6 +550,20 @@ impl<'a> Family<'a> {
             if let Some(alias) = volatile_alias.filter(|_| !order_by_names_an_alias(key, sq)) {
                 if names_any(key, &|name| name == alias.as_str()) {
                     return Err("an ORDER BY expression reading a volatile SELECT alias");
+                }
+            }
+            self.expression(key, scopes, Site::Values, &mut found)?;
+        }
+        for key in &sq.distinct_on {
+            if matches!(key, Expression::IntegerLiteral(_)) {
+                return Err("a DISTINCT ON position in a subquery block");
+            }
+            if mentions_subquery(key) {
+                return Err("a subquery block's DISTINCT ON key holding a subquery");
+            }
+            if let Some(alias) = volatile_alias {
+                if names_any(key, &|name| name == alias.as_str()) {
+                    return Err("a DISTINCT ON key reading a volatile SELECT alias");
                 }
             }
             self.expression(key, scopes, Site::Values, &mut found)?;
@@ -616,6 +638,9 @@ impl<'a> Family<'a> {
         if !block_clauses(sq) {
             return Err("a subquery block with a clause outside the family");
         }
+        if windowed_block(sq) {
+            return self.derived(sq);
+        }
         self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
@@ -675,6 +700,15 @@ fn grouped_block(sq: &SelectStatement) -> bool {
         || sq.columns.iter().any(expression_contains_aggregate)
 }
 
+/// A block whose SELECT list or ORDER BY computes a window function, which
+/// runs as one statement for each call
+fn windowed_block(sq: &SelectStatement) -> bool {
+    sq.columns
+        .iter()
+        .chain(sq.order_by.iter().map(|ob| &ob.expression))
+        .any(QueryClassification::expression_has_window_function)
+}
+
 /// What a block's SELECT list may hold
 fn list_site(sq: &SelectStatement) -> Site {
     if grouped_block(sq) {
@@ -694,11 +728,10 @@ fn is_tuple(expr: &Expression) -> bool {
 }
 
 /// A statement of the family's clauses: its WITH runs before it, as its own
-/// statements, and its DISTINCT and set operation over the rows it gives, as
-/// the general path runs them; no DISTINCT ON, grouping, HAVING or WINDOW
+/// statements, and its DISTINCT, DISTINCT ON and set operation over the rows
+/// it gives, as the general path runs them; no grouping, HAVING or WINDOW
 fn plain_statement(stmt: &SelectStatement) -> bool {
-    stmt.distinct_on.is_empty()
-        && matches!(stmt.group_by.modifier, GroupByModifier::None)
+    matches!(stmt.group_by.modifier, GroupByModifier::None)
         && stmt.window_defs.is_empty()
         && stmt.group_by.columns.is_empty()
         && stmt.having.is_none()
@@ -709,11 +742,11 @@ fn block_clauses(stmt: &SelectStatement) -> bool {
     stmt.with.is_none() && statement_clauses(stmt)
 }
 
-/// No set operation, DISTINCT, grouping set or WINDOW
+/// No set operation, DISTINCT, grouping set or WINDOW; a DISTINCT ON is not
+/// a DISTINCT
 fn statement_clauses(stmt: &SelectStatement) -> bool {
     stmt.set_operations.is_empty()
-        && !stmt.distinct
-        && stmt.distinct_on.is_empty()
+        && (!stmt.distinct || !stmt.distinct_on.is_empty())
         && matches!(stmt.group_by.modifier, GroupByModifier::None)
         && stmt.window_defs.is_empty()
 }
@@ -764,13 +797,23 @@ impl Executor {
             {
                 return Err("an ORDER BY subquery over a set operation");
             }
+            // Its DISTINCT ON reads the first branch's items over every row
+            if !stmt.distinct_on.is_empty() {
+                return Err("a DISTINCT ON over a set operation");
+            }
         } else {
-            for ob in &stmt.order_by {
-                family.expression(&ob.expression, 1, Site::Subqueries, &mut found)?;
+            // A DISTINCT ON key is computed for each row as an ORDER BY key is
+            for key in stmt
+                .order_by
+                .iter()
+                .map(|ob| &ob.expression)
+                .chain(&stmt.distinct_on)
+            {
+                family.expression(key, 1, Site::Subqueries, &mut found)?;
             }
         }
         if !found {
-            return Err("no WHERE, SELECT list or ORDER BY subquery");
+            return Err("no WHERE, SELECT list, ORDER BY or DISTINCT ON subquery");
         }
         let aliases: SmallVec<[&str; 4]> = stmt
             .columns
@@ -780,11 +823,18 @@ impl Executor {
                 _ => None,
             })
             .collect();
-        if stmt.order_by.iter().any(|ob| {
-            mentions_subquery(&ob.expression)
-                && names_any_within(&ob.expression, &|name| aliases.contains(&name))
-        }) {
+        let names_an_alias = |key: &Expression| {
+            mentions_subquery(key) && names_any_within(key, &|name| aliases.contains(&name))
+        };
+        if stmt
+            .order_by
+            .iter()
+            .any(|ob| names_an_alias(&ob.expression))
+        {
             return Err("an ORDER BY subquery that names a SELECT alias");
+        }
+        if stmt.distinct_on.iter().any(names_an_alias) {
+            return Err("a DISTINCT ON subquery that names a SELECT alias");
         }
         counts_fit(stmt, ctx)?;
         family.statement_from(stmt.table_expr.as_deref())?;
@@ -829,11 +879,13 @@ impl Executor {
             return Err("a DISTINCT ON subquery in a set operation's branch");
         }
         let grouped = grouped_block(stmt);
-        // A grouped statement's DISTINCT ON key runs as an item, its windows too
+        // A grouped statement's DISTINCT ON key runs as an item, its windows
+        // too, and an ORDER BY window as a hidden item the window path adds
         let windowed = stmt
             .columns
             .iter()
             .chain(stmt.distinct_on.iter().filter(|_| grouped))
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .any(QueryClassification::expression_has_window_function);
         if !grouped && !windowed {
             return Err("a statement that neither groups nor has window functions");
@@ -2748,6 +2800,9 @@ struct BlockOrder {
     keys: Vec<(Option<SharedProgram>, bool, Option<bool>)>,
     /// The first key that is the SELECT item, which the answer reads
     item: Option<usize>,
+    /// The DISTINCT ON keys over the block's row: the first row in order of
+    /// each of their values is kept, before the OFFSET
+    distinct: Vec<SharedProgram>,
     limit: Option<SharedProgram>,
     offset: Option<SharedProgram>,
 }
@@ -3600,9 +3655,9 @@ impl Builder<'_> {
         Ok(())
     }
 
-    /// The block `sq`, whose derived table reads an enclosing scope, run as
-    /// one statement for each call: each name it binds beyond itself reads
-    /// a slot its parent fills, as any block's does
+    /// The block `sq`, whose derived table reads an enclosing scope or which
+    /// computes a window function, run as one statement for each call: each
+    /// name it binds beyond itself reads a slot its parent fills
     fn statement_block(
         &mut self,
         sq: &SelectStatement,
@@ -3620,10 +3675,13 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
-        // An EXISTS runs without its ORDER BY, which is still bound
-        let check = match form {
-            Form::Exists(_) => Check::Order,
-            _ => Check::Off,
+        // An EXISTS runs without its ORDER BY, which is still bound; one whose
+        // rows its items choose, by a window or a DISTINCT ON, runs as written
+        let dropped =
+            matches!(form, Form::Exists(_)) && !windowed_block(sq) && sq.distinct_on.is_empty();
+        let check = match dropped {
+            true => Check::Order,
+            false => Check::Off,
         };
         let mut max_param = 0;
         let (statement, _, from_names) = StatementWalk {
@@ -3642,12 +3700,12 @@ impl Builder<'_> {
         }
         .statement(sq, outer, 0, check)?;
         self.max_param = self.max_param.max(max_param);
-        let statement = match form {
-            Form::Exists(_) => {
+        let statement = match dropped {
+            true => {
                 self.bind_dropped_order(sq, &from_names, outer, id, &work)?;
                 existence(executor, statement, &from_names, ctx)?
             }
-            _ => statement,
+            false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
         let kept = Kept {
@@ -4035,6 +4093,9 @@ impl Builder<'_> {
         parent: Option<u16>,
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
+        if windowed_block(sq) {
+            return self.statement_block(sq, outer, parent, form);
+        }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities
         let picks = grouped_block(sq) || !matches!(form, Form::Scalar);
         let executor = self.executor;
@@ -4081,11 +4142,16 @@ impl Builder<'_> {
                     .unwrap_or(&function.function)
                     .value_lower;
                 let range = function_range(sq.where_clause.as_deref(), name);
-                // Without a WHERE or an ORDER BY the first rows are the answer
+                // Without a WHERE, an ORDER BY or a DISTINCT ON the first rows
+                // are the answer
                 let counts = sq
                     .limit
                     .clone()
-                    .filter(|_| sq.where_clause.is_none() && sq.order_by.is_empty())
+                    .filter(|_| {
+                        sq.where_clause.is_none()
+                            && sq.order_by.is_empty()
+                            && sq.distinct_on.is_empty()
+                    })
                     .map(|limit| (limit, sq.offset.clone()));
                 over_source(
                     name.clone(),
@@ -4181,8 +4247,10 @@ impl Builder<'_> {
         // A LIMIT or OFFSET chooses the rows the block answers from, by its
         // ORDER BY, whose keys read the block's row and enclosing values as
         // its WHERE does; an EXISTS needs the count alone
-        let cut = sq.limit.is_some() || sq.offset.is_some();
-        let chooses = cut && !matches!(form, Form::Exists(_));
+        let exists = matches!(form, Form::Exists(_));
+        let cut =
+            sq.limit.is_some() || sq.offset.is_some() || (!sq.distinct_on.is_empty() && !exists);
+        let chooses = cut && !exists;
         let item = sq
             .columns
             .first()
@@ -4219,6 +4287,26 @@ impl Builder<'_> {
                     bound_only.push(self.trial_rewrite(&chain, id, &key, &work.outer)?);
                 }
                 (None, false) => {}
+            }
+        }
+        let mut distinct_keys = Vec::new();
+        for key in &sq.distinct_on {
+            // A bare alias reads its item, as an ORDER BY key does
+            let item = match key {
+                Expression::Identifier(id) if order_by_names_an_alias(key, sq) => {
+                    sq.columns.iter().find_map(|item| match item {
+                        Expression::Aliased(a) if a.alias.value_lower == id.value_lower => {
+                            Some(std::borrow::Cow::Borrowed(&*a.expression))
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            let key = item.unwrap_or_else(|| with_aliases(key, &sq.columns, &scope.columns));
+            match cut {
+                true => distinct_keys.push(self.rewrite(&chain, Some(id), &key, &mut work)?),
+                false => bound_only.push(self.trial_rewrite(&chain, id, &key, &work.outer)?),
             }
         }
         for count in sq.limit.iter().chain(&sq.offset) {
@@ -4289,6 +4377,7 @@ impl Builder<'_> {
             .chain(&candidates)
             .chain(&filter)
             .chain(order_keys.iter().filter_map(|(key, ..)| key.as_ref()))
+            .chain(&distinct_keys)
             .chain(counts)
         {
             slots_read(expr, &mut reads);
@@ -4328,6 +4417,10 @@ impl Builder<'_> {
                             let key = key.as_ref().map(|key| compile_with(&own, key));
                             key.transpose().map(|p| (p, *ascending, *nulls))
                         })
+                        .collect::<Result<Vec<_>>>()?,
+                    distinct: distinct_keys
+                        .iter()
+                        .map(|key| compile_with(&own, key))
                         .collect::<Result<Vec<_>>>()?,
                     limit: count(&sq.limit)?,
                     offset: count(&sq.offset)?,
@@ -4758,15 +4851,16 @@ fn check_names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str]) -> Result
 }
 
 impl PreparedProjection {
-    /// The SELECT list over `chain`'s one table and what ORDER BY appends,
-    /// with the names and the sources of the appended columns. `rewritten`
-    /// holds each SELECT item and ORDER BY key holding subqueries as the
-    /// blocks rewrote it, which compiles in its place
+    /// The SELECT list over `chain`'s one table and what ORDER BY and
+    /// DISTINCT ON append, with the names and the sources of the appended
+    /// columns. `rewritten` holds each SELECT item, ORDER BY key and DISTINCT
+    /// ON key holding subqueries as the blocks rewrote it, which compiles in
+    /// its place
     fn prepare(
         executor: &Executor,
         stmt: &SelectStatement,
         chain: &Chain<'_>,
-        rewritten: [&[Option<Expression>]; 2],
+        rewritten: [&[Option<Expression>]; 3],
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
         let scope = chain.scopes[0];
         let columns: &[String] = &scope.columns;
@@ -4810,8 +4904,14 @@ impl PreparedProjection {
         // the same name comes first, so only the aliases this map keeps
         let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
         let inner_aliases: Vec<&str> = alias_map.keys().map(String::as_str).collect();
-        for ob in &stmt.order_by {
-            match &ob.expression {
+        let sort_keys = || {
+            stmt.order_by
+                .iter()
+                .map(|ob| &ob.expression)
+                .chain(&stmt.distinct_on)
+        };
+        for key in sort_keys() {
+            match key {
                 Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str()) => {}
                 key => check_names(chain, key, &inner_aliases)?,
             }
@@ -4820,7 +4920,7 @@ impl PreparedProjection {
         let plan = executor.order_by_projection(
             &select_exprs,
             &stmt.order_by,
-            &[],
+            &stmt.distinct_on,
             stmt.table_expr.as_deref(),
             columns,
             true,
@@ -4855,12 +4955,25 @@ impl PreparedProjection {
             });
         }
         outputs.extend(plan.extra_order_indices.iter().map(|&i| Output::Column(i)));
-        for expr in &plan.computed_order_by {
-            let at = stmt
+        // Each key as the blocks rewrote it, found by the node it is
+        let rewritten_key = |expr: &Expression| {
+            let order_at = stmt
                 .order_by
                 .iter()
-                .position(|ob| std::ptr::eq(&ob.expression, *expr));
-            let rewritten = at.and_then(|at| rewritten[1][at].as_ref());
+                .position(|ob| std::ptr::eq(&ob.expression, expr));
+            let distinct_at = stmt.distinct_on.iter().position(|k| std::ptr::eq(k, expr));
+            match (order_at, distinct_at) {
+                (Some(at), _) => rewritten[1][at].as_ref(),
+                (None, Some(at)) => rewritten[2][at].as_ref(),
+                (None, None) => None,
+            }
+        };
+        for expr in plan
+            .computed_order_by
+            .iter()
+            .chain(&plan.computed_distinct_on)
+        {
+            let rewritten = rewritten_key(expr);
             // A key holding subqueries that is a SELECT item reads its value,
             // so the subqueries run once per row
             let key = ExprKey::of(expr);
@@ -4894,10 +5007,7 @@ impl PreparedProjection {
                 }
             }
         }
-        let keys: Vec<&Expression> = stmt
-            .order_by
-            .iter()
-            .map(|ob| &ob.expression)
+        let keys: Vec<&Expression> = sort_keys()
             .filter(|key| !is_leaf(key) && names_any(key, &|name| positions.contains_key(name)))
             .collect();
         let mut bindings = FxHashMap::default();
@@ -5227,6 +5337,14 @@ impl PreparedSelect {
                 false => output(&ob.expression),
             })
             .collect::<Result<Vec<_>>>()?;
+        let distinct_on = stmt
+            .distinct_on
+            .iter()
+            .map(|key| match repeats(key) {
+                true => Ok(None),
+                false => output(key),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let output_blocks = first_output_block..builder.subqueries.len();
         let mut read_as = FxHashMap::default();
         compare_as_scan(&parts.clause, schema, &mut read_as);
@@ -5239,12 +5357,17 @@ impl PreparedSelect {
             .iter()
             .map(|(slot, value)| compile(value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let (projection, extra_names, extra_sources) =
-            PreparedProjection::prepare(executor, stmt, &chain, [&select, &order_by])?;
+        let (projection, extra_names, extra_sources) = PreparedProjection::prepare(
+            executor,
+            stmt,
+            &chain,
+            [&select, &order_by, &distinct_on],
+        )?;
         for column in stmt
             .columns
             .iter()
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on)
         {
             builder.note_params(unaliased(column));
         }
@@ -5279,8 +5402,9 @@ impl PreparedSelect {
             executor.get_output_column_names(&select, &scope.columns, Some(scope_name));
         let visible = output_columns.len();
         output_columns.extend(extra_names);
-        // The layout an ORDER BY binds its names by, built with the plan
-        let layout = (!stmt.order_by.is_empty()).then(|| {
+        // The layout an ORDER BY or DISTINCT ON binds its names by, built
+        // with the plan
+        let layout = (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty()).then(|| {
             let mut layout = Executor::select_layout(&select, &scope.columns, Some(scope_name));
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
@@ -6408,9 +6532,11 @@ pub(crate) struct JoinBlocks {
     /// The conditions on a side read as rows that ask a block of each row,
     /// asked of the joined row with the WHERE's others there
     pub(crate) moved: Option<Expression>,
-    /// Each SELECT item and ORDER BY key holding a subquery, over the joined row
+    /// Each SELECT item, ORDER BY key and DISTINCT ON key holding a
+    /// subquery, over the joined row
     pub(crate) select: Vec<Option<Expression>>,
     pub(crate) order_by: Vec<Option<Expression>>,
+    pub(crate) distinct_on: Vec<Option<Expression>>,
     /// The uncorrelated member blocks those read, read before the join
     /// reads a row; a value block they read is a run slot
     ahead: Vec<u16>,
@@ -6459,10 +6585,10 @@ impl JoinBlocks {
     }
 
     /// `on`, `inner_on` when it is an INNER join's, `cross`, the conditions on
-    /// one side, `side_filters`, and the SELECT items and ORDER BY keys
-    /// holding a subquery, `output`, over the joined row of `sides`, each a
-    /// name, its columns' schema and whether it is read as rows; None when
-    /// the join's `width` columns do not line up
+    /// one side, `side_filters`, and the SELECT items, ORDER BY keys and
+    /// DISTINCT ON keys holding a subquery, `output`, over the joined row of
+    /// `sides`, each a name, its columns' schema and whether it is read as
+    /// rows; None when the join's `width` columns do not line up
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
@@ -6470,7 +6596,7 @@ impl JoinBlocks {
         (on, inner_on): (Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
-        output: [&[Option<&Expression>]; 2],
+        output: [&[Option<&Expression>]; 3],
         sides: [(SmartString, &Schema, bool); 2],
         width: usize,
         param_count: usize,
@@ -6543,7 +6669,7 @@ impl JoinBlocks {
         // before the join reads a row
         let mut run_slots = Vec::new();
         let first_output_block = builder.subqueries.len();
-        let [select, order_by] = output.map(|exprs| {
+        let [select, order_by, distinct_on] = output.map(|exprs| {
             exprs
                 .iter()
                 .map(|expr| {
@@ -6556,7 +6682,7 @@ impl JoinBlocks {
                 })
                 .collect::<Result<Vec<_>>>()
         });
-        let (select, order_by) = (select?, order_by?);
+        let (select, order_by, distinct_on) = (select?, order_by?, distinct_on?);
         let output_blocks = first_output_block..builder.subqueries.len();
         // Each side's conditions as its own scan reads them, a value a column
         // is compared with a run slot; the joined row reads the same blocks
@@ -6656,6 +6782,7 @@ impl JoinBlocks {
             moved,
             select,
             order_by,
+            distinct_on,
             ahead,
             left,
             right,
@@ -6778,7 +6905,7 @@ impl Executor {
         on: (Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
-        output: [&[Option<&Expression>]; 2],
+        output: [&[Option<&Expression>]; 3],
         sides: [(SmartString, &Schema, bool); 2],
         width: usize,
         ctx: &ExecutionContext,
@@ -8133,7 +8260,9 @@ impl Executor {
                 SetOperationType::Union | SetOperationType::Intersect | SetOperationType::Except
             )
         });
+        // A DISTINCT ON keeps its first row per key once the rows are sorted
         let distinct = ((stmt.distinct || dedups_branch)
+            && stmt.distinct_on.is_empty()
             && !stmt
                 .columns
                 .iter()
@@ -9981,8 +10110,9 @@ impl PreparedRunner<'_> {
 
     /// The rows block `index` answers from for the buffer filled, with
     /// their key values: those its WHERE passes in its ORDER BY, a tie in
-    /// the order read, past its OFFSET and up to its LIMIT, or the first of
-    /// them for an `exists`. A candidate's error is the block's
+    /// the order read, the first of each DISTINCT ON key, past its OFFSET
+    /// and up to its LIMIT, or the first of them for an `exists`. A
+    /// candidate's error is the block's
     fn cut_rows(
         &self,
         index: usize,
@@ -10023,7 +10153,7 @@ impl PreparedRunner<'_> {
             self.scan(index, None)?
         };
         let decided = pushed && sq.pushed_whole;
-        let mut kept = Vec::new();
+        let (mut kept, mut all) = (Vec::new(), Vec::new());
         // The worst row held on top, which a better one replaces
         let mut held = std::collections::BinaryHeap::new();
         let (mut passed, mut scanned) = (0usize, 0u64);
@@ -10047,7 +10177,7 @@ impl PreparedRunner<'_> {
             }
             passed += 1;
             // Without keys the rows come in the order read: OFFSET's are passed
-            if order.keys.is_empty() {
+            if order.keys.is_empty() && order.distinct.is_empty() {
                 if passed > offset {
                     kept.push((SmallVec::new(), row.clone()));
                 }
@@ -10068,6 +10198,15 @@ impl PreparedRunner<'_> {
                     }
                 };
                 keys.push(value);
+            }
+            // A DISTINCT ON keeps the first row of a key in the whole order
+            if !order.distinct.is_empty() {
+                let mut seen = Row::with_capacity(order.distinct.len());
+                for key in &order.distinct {
+                    seen.push(vm.execute(key, &exec)?);
+                }
+                all.push((keys, seen, row.clone()));
+                continue;
             }
             if held.len() < keep {
                 let row = row.clone();
@@ -10091,6 +10230,14 @@ impl PreparedRunner<'_> {
         }
         if let Some(err) = scanner.err() {
             return Err(err.clone());
+        }
+        if !order.distinct.is_empty() {
+            // A stable sort: a tie stays in the order read
+            all.sort_by(|a, b| order.compare(&a.0, &b.0));
+            let mut first = super::result::DistinctRows::new(order.distinct.len());
+            let rows = all.into_iter().filter(|(_, seen, _)| first.is_new(seen));
+            let rows = rows.skip(offset).take(keep - offset);
+            return Ok(rows.map(|(keys, _, row)| (keys, row)).collect());
         }
         if order.keys.is_empty() {
             return Ok(kept);
