@@ -121,6 +121,10 @@ const SHAPES: &[(&str, &[&str])] = &[
         &["1", "2"],
     ),
     (
+        "SELECT id, (a, b) IN (SELECT u.x, w.y FROM u JOIN w ON w.id = u.id) FROM t ORDER BY id",
+        &["1|true", "2|true", "3|false", "4|false", "5|NULL"],
+    ),
+    (
         "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
          WHERE u.x = t.a) ORDER BY id",
         &["3"],

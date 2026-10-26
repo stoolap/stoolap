@@ -3248,6 +3248,15 @@ impl PreparedSubquery {
         }
     }
 
+    /// How many values a member of the block holds: one, or a row's
+    fn member_width(&self) -> usize {
+        match &self.answer {
+            Answer::Members(_, members) => members.width(),
+            Answer::Statement(_, block) => block.run.statement.columns.len(),
+            _ => 1,
+        }
+    }
+
     /// Whether the block may read `table`: its own table, or one its view's
     /// query reads, any when they are not known. A CTE's rows are read before
     /// the statement writes; a VALUES list or table function reads none
@@ -9690,10 +9699,7 @@ impl<'a> PreparedRunner<'a> {
         let empty = Row::new();
         let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
         for &id in ids {
-            let width = match &self.prepared.subqueries[usize::from(id)].answer {
-                Answer::Members(_, members) => members.width(),
-                _ => 1,
-            };
+            let width = self.prepared.subqueries[usize::from(id)].member_width();
             let nulls: SmallVec<[Value; 2]> = smallvec::smallvec![Value::null_unknown(); width];
             self.members_answer(usize::from(id), &nulls, &caller, holes)?;
         }
@@ -11465,7 +11471,7 @@ impl PreparedRunner<'_> {
         if self.blocks[index].members.get().is_some() {
             return Ok(());
         }
-        let width = block.run.statement.columns.len();
+        let width = sq.member_width();
         let answer = self.read_once(index, || {
             self.kept(kept, || {
                 let mut rows = self.block_statement(index, block, caller, site)?;
