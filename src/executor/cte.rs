@@ -215,17 +215,28 @@ impl Executor {
             return self.execute_select(&inlined_stmt, ctx);
         }
 
-        // LAZY CTE OPTIMIZATION:
-        // For a single-use CTE joined with LIMIT, push LIMIT into CTE
-        // This enables streaming GROUP BY early termination
+        self.run_over_cut_ctes(stmt, with_clause, ctx, |cte_registry| {
+            self.execute_main_query_with_ctes(stmt, ctx, cte_registry)
+        })
+    }
+
+    /// `main` run over the CTEs of `with_clause`, a single-use CTE joined
+    /// under a LIMIT read only as far as the LIMIT needs, so a streaming
+    /// GROUP BY stops early
+    pub(crate) fn run_over_cut_ctes(
+        &self,
+        stmt: &SelectStatement,
+        with_clause: &WithClause,
+        ctx: &ExecutionContext,
+        mut main: impl FnMut(&mut CteRegistry) -> Result<Box<dyn QueryResult>>,
+    ) -> Result<Box<dyn QueryResult>> {
         let mut cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
 
         loop {
             let mut cte_registry =
                 self.materialize_ctes(with_clause, ctx, Some(&cte_limit_hints))?;
 
-            // Execute the main query with CTE registry
-            let result = self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)?;
+            let result = main(&mut cte_registry)?;
 
             // A CTE cut under an INNER join may match fewer rows than the LIMIT
             // asks; then its cut grows until the rows fill it or nothing is cut

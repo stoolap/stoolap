@@ -219,8 +219,8 @@ fn a_join_whose_limit_is_cut_into_a_cte_it_keeps_runs_as_explain_says() {
         ),
         (
             "WITH c (a, n) AS (SELECT a, COUNT(*) FROM t GROUP BY a) ",
-            "Prepared: no (a WITH clause)",
-            true,
+            "Prepared: yes",
+            false,
         ),
     ] {
         let sql = format!("{with}{shape}");

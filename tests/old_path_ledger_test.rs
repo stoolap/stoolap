@@ -347,10 +347,17 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
     (
         "join_with_a_cte_side_its_limit_cuts",
         "WITH c (a, n) AS (SELECT a, COUNT(*) FROM t GROUP BY a) \
-         SELECT c.a, (SELECT MAX(x) FROM u) FROM c LEFT JOIN u ON u.id = c.a ORDER BY c.a LIMIT 2",
+         SELECT c.a, u.x FROM c LEFT JOIN u ON u.id = c.a AND u.x < (SELECT MAX(x) FROM u) \
+         ORDER BY c.a LIMIT 2",
         "WITH c (a, n) AS (SELECT a, COUNT(*) FROM t GROUP BY a) \
-         SELECT c.a, 3 FROM c LEFT JOIN u ON u.id = c.a ORDER BY c.a LIMIT 2",
-        Old("a CTE's LIMIT cut on the CTE path"),
+         SELECT c.a, u.x FROM c LEFT JOIN u ON u.id = c.a AND u.x < 3 ORDER BY c.a LIMIT 2",
+        Prepared,
+    ),
+    (
+        "join_with_a_subquery_in_its_select_list",
+        "SELECT t.id, (SELECT MAX(x) FROM u) FROM t JOIN u v ON v.id = t.a",
+        "SELECT t.id, 3 FROM t JOIN u v ON v.id = t.a",
+        Old("a join's SELECT list projected by the general evaluator: step 7b"),
     ),
     (
         "join_with_a_view_side",
