@@ -1009,6 +1009,7 @@ fn test_classifier_rules() {
         format!("SELECT id FROM t WHERE CAST({sq} AS TEXT) LIKE '5%'"),
         format!("SELECT id FROM t WHERE {sq} IS DISTINCT FROM a"),
         format!("SELECT id FROM t WHERE ABS({sq}) > 1 AND NOT (b = 2) AND -a < 0"),
+        format!("SELECT id FROM t WHERE 'x' || CAST({sq} AS TEXT) = 'x5'"),
         "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = 2)".to_string(),
         format!("SELECT id FROM t WHERE a > (SELECT {sq} FROM u WHERE u.id = 1)"),
         "SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)".to_string(),
@@ -1128,10 +1129,6 @@ fn test_classifier_rules() {
                  ORDER BY (SELECT v FROM u WHERE u.id = 2)"
             ),
             "an ORDER BY subquery over a set operation",
-        ),
-        (
-            format!("SELECT id FROM t WHERE 'x' || CAST({sq} AS TEXT) = 'x5'"),
-            "an operator outside the family",
         ),
     ];
     for (sql, reason) in &no {

@@ -302,10 +302,10 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
-        "operator_outside_the_family",
+        "concatenation_beside_a_subquery",
         "SELECT id FROM t WHERE id > (SELECT MAX(x) FROM u) AND a || '' = '1'",
         "SELECT id FROM t WHERE id > 3 AND a || '' = '1'",
-        Old("operators outside the family"),
+        Prepared,
     ),
     (
         "join_with_a_cte_side",
@@ -401,10 +401,10 @@ const WRITES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
-        "delete_with_an_operator_outside_the_family",
+        "delete_with_concatenation_beside_a_subquery",
         "DELETE FROM t WHERE id > (SELECT MAX(x) FROM u) AND a || '' = '1'",
         "DELETE FROM t WHERE id > 3 AND a || '' = '1'",
-        Old("DML refusals"),
+        Prepared,
     ),
 ];
 

@@ -304,35 +304,18 @@ impl<'a> Family<'a> {
             | Expression::NullLiteral(_)
             | Expression::Parameter(_) => Ok(()),
             Expression::Infix(infix) => {
-                use InfixOperator as I;
-                match infix.op_type {
-                    I::Equal
-                    | I::NotEqual
-                    | I::LessThan
-                    | I::LessEqual
-                    | I::GreaterThan
-                    | I::GreaterEqual
-                    | I::And
-                    | I::Or
-                    | I::Add
-                    | I::Subtract
-                    | I::Multiply
-                    | I::Divide
-                    | I::Modulo
-                    | I::Like
-                    | I::NotLike
-                    | I::IsDistinctFrom
-                    | I::IsNotDistinctFrom => {}
-                    I::Is | I::IsNot if matches!(*infix.right, Expression::NullLiteral(_)) => {}
-                    _ => return Err("an operator outside the family"),
+                if infix.op_type == InfixOperator::Other {
+                    return Err("an operator outside the family");
                 }
                 walk(&infix.left)?;
                 walk(&infix.right)
             }
-            Expression::Prefix(prefix) => match prefix.op_type {
-                PrefixOperator::Negate | PrefixOperator::Not => walk(&prefix.right),
-                _ => Err("a prefix operator outside the family"),
-            },
+            Expression::Prefix(prefix) => {
+                if prefix.op_type == PrefixOperator::Other {
+                    return Err("a prefix operator outside the family");
+                }
+                walk(&prefix.right)
+            }
             Expression::Between(between) => {
                 walk(&between.expr)?;
                 walk(&between.lower)?;
@@ -359,11 +342,6 @@ impl<'a> Family<'a> {
                 list.iter().try_for_each(walk)
             }
             Expression::Like(like) => {
-                if !like.operator.eq_ignore_ascii_case("LIKE")
-                    && !like.operator.eq_ignore_ascii_case("NOT LIKE")
-                {
-                    return Err("a pattern operator outside the family");
-                }
                 walk(&like.left)?;
                 walk(&like.pattern)?;
                 like.escape.as_deref().map_or(Ok(()), walk)
