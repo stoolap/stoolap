@@ -354,6 +354,10 @@ pub enum Op {
         negated: bool,
     },
 
+    /// A row of N values IN a list of K rows of N values read per row
+    /// Stack: [a1, .., aN, r1_1, .., r1_N, .., rK_N] -> [bool]
+    InRows(u16, u32),
+
     // =========================================================================
     // BOOLEAN CHECKS
     // =========================================================================
@@ -694,6 +698,20 @@ impl CompareOp {
     }
 }
 
+/// `row IN (list)`: true when a row of the list equals `row`, else UNKNOWN
+/// when one's equality is, else false
+pub fn row_in<'v>(row: &[Value], list: impl IntoIterator<Item = &'v [Value]>) -> Option<bool> {
+    let mut found = Some(false);
+    for member in list {
+        match CompareOp::Eq.compare_rows(row, member) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => found = None,
+        }
+    }
+    found
+}
+
 // Make Op Debug-printable (without showing full function pointers)
 impl std::fmt::Debug for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -815,6 +833,7 @@ impl std::fmt::Debug for Op {
                     negated
                 )
             }
+            Op::InRows(width, count) => write!(f, "InRows({}, {})", width, count),
             Op::CompareRows(op, width) => write!(f, "CompareRows({:?}, {})", op, width),
             Op::RowsDistinct(negated, width) => {
                 write!(f, "RowsDistinct(negated={}, {})", negated, width)

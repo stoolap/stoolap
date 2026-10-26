@@ -34,6 +34,8 @@ SELECT (1, NULL) < (1, 3);       -- NULL
 SELECT (1, NULL) IS NOT DISTINCT FROM (1, NULL);  -- true
 ```
 
+A row `IN` a list of rows is true when a row of the list equals it, else NULL when the equality with one is NULL, else false; `NOT IN` is its negation. The rows of the list may hold any expression, such as `(a, b) IN ((1, 2), (b, a))`.
+
 A row is compared only with a row of as many values: `(1, 2) = (1, 2, 3)` and `(1, 2) = 1` are errors, and so is a row anywhere a single value is read, such as `SELECT (1, 2)` or `(1, 2) IS NULL`.
 
 ## Logical Operators

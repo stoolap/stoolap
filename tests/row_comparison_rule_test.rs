@@ -141,15 +141,58 @@ fn ids(db: &Database, sql: &str) -> Vec<i64> {
     out
 }
 
+/// `a IN (list)` by the rule: OR over the rows' equalities
+fn expected_in(a: Pair, list: &[Pair]) -> Option<bool> {
+    list.iter()
+        .map(|b| expected("=", a, *b))
+        .try_fold(Some(false), |found, eq| match (found, eq) {
+            (_, Some(true)) => Err(()),
+            (Some(false), Some(false)) => Ok(Some(false)),
+            _ => Ok(None),
+        })
+        .unwrap_or(Some(true))
+}
+
+/// A test's truth for a table row's two pairs
+type Rule = Box<dyn Fn(Pair, Pair) -> Option<bool>>;
+
+/// The tests a row's cells answer, the same with parameters for the cells,
+/// and their truth by the rule
+fn cases() -> Vec<(String, String, Rule)> {
+    let mut cases: Vec<(String, String, Rule)> = OPERATORS
+        .iter()
+        .map(|op| {
+            (
+                format!("(a1, a2) {op} (b1, b2)"),
+                format!("($1, $2) {op} ($3, $4)"),
+                Box::new(move |a, b| expected(op, a, b)) as Rule,
+            )
+        })
+        .collect();
+    cases.push((
+        "(a1, a2) IN ((b1, b2), (b2, b1))".to_string(),
+        "($1, $2) IN (($3, $4), ($4, $3))".to_string(),
+        Box::new(|a, b| expected_in(a, &[b, [b[1], b[0]]])),
+    ));
+    cases.push((
+        "(a1, a2) NOT IN ((b1, b2), (b2, b1))".to_string(),
+        "($1, $2) NOT IN (($3, $4), ($4, $3))".to_string(),
+        Box::new(|a, b| expected_in(a, &[b, [b[1], b[0]]]).map(|found| !found)),
+    ));
+    cases.push((
+        "(a1, a2) IN ((1, 2), (2, NULL))".to_string(),
+        "($1, $2) IN ((1, 2), (2, NULL))".to_string(),
+        Box::new(|a, _| expected_in(a, &[[Some(1), Some(2)], [Some(2), None]])),
+    ));
+    cases
+}
+
 fn check_every_context(db: &Database) {
     let rows = combinations();
     let mut wrong = Vec::new();
-    for op in OPERATORS {
-        let test = format!("(a1, a2) {op} (b1, b2)");
-        let want: Vec<(i64, Option<bool>)> = rows
-            .iter()
-            .map(|(id, a, b)| (*id, expected(op, *a, *b)))
-            .collect();
+    for (test, with_parameters, rule) in cases() {
+        let want: Vec<(i64, Option<bool>)> =
+            rows.iter().map(|(id, a, b)| (*id, rule(*a, *b))).collect();
         let holding = |truth: Option<bool>| -> Vec<i64> {
             want.iter()
                 .filter(|(_, t)| *t == truth)
@@ -179,17 +222,15 @@ fn check_every_context(db: &Database) {
                 wrong.push(format!("{sql}: {got:?}"));
             }
         }
-        let prepared = db
-            .prepare(&format!("SELECT ($1, $2) {op} ($3, $4)"))
-            .unwrap();
+        let prepared = db.prepare(&format!("SELECT {with_parameters}")).unwrap();
         for (_, a, b) in &rows {
             let params = vec![value(a[0]), value(a[1]), value(b[0]), value(b[1])];
             for _ in 0..2 {
                 let mut result = prepared.query(params.clone()).unwrap();
                 let row = result.next().unwrap().unwrap();
                 let got = truth(row.get_value(0));
-                if got != expected(op, *a, *b) {
-                    wrong.push(format!("({a:?}) {op} ({b:?}) as parameters: {got:?}"));
+                if got != rule(*a, *b) {
+                    wrong.push(format!("{with_parameters} with {a:?}, {b:?}: {got:?}"));
                 }
             }
         }
@@ -251,6 +292,9 @@ fn test_a_row_is_compared_with_a_row_of_its_width_only() {
         "SELECT (1, 2)",
         "SELECT (1, 2) + 1",
         "SELECT (1, 2) IS NULL",
+        "SELECT (1, 2) IN ((1, 2, 3))",
+        "SELECT (1, 2) IN ((1, 2), 3)",
+        "SELECT (1, 2) IN (1, 2)",
     ] {
         let failed = db
             .query(sql, ())

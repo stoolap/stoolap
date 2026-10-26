@@ -1515,42 +1515,57 @@ impl<'a> ExprCompiler<'a> {
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
         let tuple_size = left_columns.len();
+        let items: &[Expression] = match &*in_expr.right {
+            Expression::List(list) => &list.elements,
+            Expression::ExpressionList(list) => &list.expressions,
+            _ => {
+                return Err(CompileError::UnsupportedExpression(
+                    "Dynamic multi-column IN not yet supported in VM".to_string(),
+                ))
+            }
+        };
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            match row_values(item) {
+                Some(row) if row.len() == tuple_size => rows.push(row),
+                row => {
+                    return Err(CompileError::TypeError(format!(
+                        "a row of {} values compared with {} values",
+                        tuple_size,
+                        row.map_or(1, <[Expression]>::len)
+                    )))
+                }
+            }
+        }
 
         // Extract tuples from right side
-        let mut tuple_values: Vec<Vec<Value>> = Vec::new();
-        let mut all_constant = true;
-
-        match &*in_expr.right {
-            Expression::List(list) => {
-                for item in &list.elements {
-                    if let Some(tuple) = self.extract_tuple_values(item, tuple_size) {
-                        tuple_values.push(tuple);
-                    } else {
-                        all_constant = false;
-                        break;
-                    }
-                }
+        let tuple_values: Option<Vec<Vec<Value>>> = rows
+            .iter()
+            .map(|row| row.iter().map(try_eval_constant).collect())
+            .collect();
+        let Some(tuple_values) = tuple_values.filter(|values| !values.is_empty()) else {
+            let width = u16::try_from(tuple_size).map_err(|_| {
+                CompileError::UnsupportedExpression(format!("a row of {} values", tuple_size))
+            })?;
+            let count = u32::try_from(rows.len()).map_err(|_| {
+                CompileError::UnsupportedExpression(format!(
+                    "IN list holds {} items, more than an expression can hold",
+                    rows.len()
+                ))
+            })?;
+            for value in left_columns
+                .iter()
+                .copied()
+                .chain(rows.iter().copied().flatten())
+            {
+                self.compile_expr(value, builder)?;
             }
-            Expression::ExpressionList(list) => {
-                for item in &list.expressions {
-                    if let Some(tuple) = self.extract_tuple_values(item, tuple_size) {
-                        tuple_values.push(tuple);
-                    } else {
-                        all_constant = false;
-                        break;
-                    }
-                }
+            builder.emit(Op::InRows(width, count));
+            if in_expr.not {
+                builder.emit(Op::Not);
             }
-            _ => {
-                all_constant = false;
-            }
-        }
-
-        if !all_constant || tuple_values.is_empty() {
-            return Err(CompileError::UnsupportedExpression(
-                "Dynamic multi-column IN not yet supported in VM".to_string(),
-            ));
-        }
+            return Ok(());
+        };
 
         // Compile each column expression to push onto stack
         for col in left_columns {
@@ -1565,26 +1580,6 @@ impl<'a> ExprCompiler<'a> {
         });
 
         Ok(())
-    }
-
-    /// Extract tuple values from an expression (e.g., (1, 2) -> [1, 2])
-    fn extract_tuple_values(&self, expr: &Expression, expected_size: usize) -> Option<Vec<Value>> {
-        let elements: Vec<&Expression> = match expr {
-            Expression::List(list) => list.elements.iter().collect(),
-            Expression::ExpressionList(list) => list.expressions.iter().collect(),
-            _ => return None,
-        };
-
-        if elements.len() != expected_size {
-            return None;
-        }
-
-        let mut values = Vec::with_capacity(expected_size);
-        for element in elements {
-            values.push(try_eval_constant(element)?);
-        }
-
-        Some(values)
     }
 
     /// Compile a LIKE expression

@@ -609,6 +609,11 @@ impl Program {
                 Op::InTupleSet { tuple_size, .. } => 1 - (*tuple_size as i32),
                 // Two rows: pop 2N, push 1
                 Op::CompareRows(_, width) | Op::RowsDistinct(_, width) => 1 - 2 * i32::from(*width),
+                // A row and its list: pop N (K + 1), push 1
+                Op::InRows(width, count) => {
+                    let values = u64::from(*width) * (u64::from(*count) + 1);
+                    1 - i32::try_from(values).unwrap_or(i32::MAX)
+                }
 
                 // Pop only (-1)
                 Op::Pop => -1,
