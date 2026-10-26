@@ -2040,8 +2040,17 @@ pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
 }
 
 /// Convert expression to string representation.
-/// Used for expression alias matching and display purposes.
+/// Used for expression alias matching and display purposes. A name never
+/// holds the qualifier separator, which a text value may: it shows as U+FFFD
 pub fn expression_to_string(expr: &Expression) -> String {
+    let text = written_text(expr);
+    match text.contains(QUALIFIER_SEP) {
+        true => text.replace(QUALIFIER_SEP, "\u{FFFD}"),
+        false => text,
+    }
+}
+
+fn written_text(expr: &Expression) -> String {
     match expr {
         // A name as the statement's own text spells it, quoted where it must be
         Expression::Identifier(id) => id.to_string(),
@@ -2724,11 +2733,13 @@ pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item =
 
 /// What separates a column's qualifier from its own name in the column
 /// text the executor binds by. No identifier holds it, so a dot inside a
-/// quoted qualifier or name never splits them otherwise
-pub(crate) const QUALIFIER_SEP: char = '\u{1F}';
+/// quoted qualifier or name never splits them otherwise. A caller handing
+/// column names to `compile_expression`, `RowFilter` or `JoinFilter` names a
+/// qualified column with `qualified`
+pub const QUALIFIER_SEP: char = '\u{1F}';
 
 /// The column text of `name` read through the FROM entry `qualifier`
-pub(crate) fn qualified(qualifier: &str, name: &str) -> String {
+pub fn qualified(qualifier: &str, name: &str) -> String {
     let mut column = String::with_capacity(qualifier.len() + 1 + name.len());
     column.push_str(qualifier);
     column.push(QUALIFIER_SEP);
@@ -2739,18 +2750,18 @@ pub(crate) fn qualified(qualifier: &str, name: &str) -> String {
 /// A column text's qualifier and own name; None for a column no FROM
 /// entry qualifies, whatever dots its name holds
 #[inline]
-pub(crate) fn split_qualified(column: &str) -> Option<(&str, &str)> {
+pub fn split_qualified(column: &str) -> Option<(&str, &str)> {
     column.split_once(QUALIFIER_SEP)
 }
 
 /// A column's own name, without the qualifier its text may carry
 #[inline]
-pub(crate) fn bare_name(column: &str) -> &str {
+pub fn bare_name(column: &str) -> &str {
     split_qualified(column).map_or(column, |(_, name)| name)
 }
 
 /// The name a column text shows: its qualifier and name joined by a dot
-pub(crate) fn shown_name(column: &str) -> std::borrow::Cow<'_, str> {
+pub fn shown_name(column: &str) -> std::borrow::Cow<'_, str> {
     match column.contains(QUALIFIER_SEP) {
         true => std::borrow::Cow::Owned(column.replace(QUALIFIER_SEP, ".")),
         false => std::borrow::Cow::Borrowed(column),

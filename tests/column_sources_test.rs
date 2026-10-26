@@ -325,3 +325,73 @@ fn a_quoted_name_cannot_hold_the_qualifier_separator() {
         );
     }
 }
+
+#[test]
+fn a_quoted_name_no_column_has_is_its_text_over_every_source() {
+    let db = Database::open("memory://column_sources_fallback").unwrap();
+    for sql in [
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, \"a.b\" INTEGER)",
+        "INSERT INTO q VALUES (1, 5)",
+        "CREATE VIEW qv AS SELECT \"a.b\" FROM q",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (with, from) in [
+        ("", "q"),
+        ("", "qv"),
+        ("", "(SELECT 5 AS \"a.b\") AS d"),
+        ("WITH c(\"a.b\") AS (SELECT 5) ", "c"),
+        ("WITH c AS (SELECT 5 AS \"a.b\") ", "c"),
+    ] {
+        for (item, want) in [
+            ("\"b\"", "[Some(Text(\"b\"))]"),
+            ("\"b\" AS x", "[Some(Text(\"b\"))]"),
+            ("\"a.b\"", "[Some(Integer(5))]"),
+            ("\"a.b\" AS x", "[Some(Integer(5))]"),
+        ] {
+            let sql = format!("{with}SELECT {item} FROM {from}");
+            for (run, got) in runs(&db, &sql) {
+                if got.as_ref().map(|rows| rows.get(1).map(String::as_str)) != Ok(Some(want)) {
+                    wrong.push(format!("{sql} ({run}): {got:?}, want {want}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_separator_inside_a_value_names_no_qualified_column() {
+    let db = Database::open("memory://column_sources_value_separator").unwrap();
+    setup(&db);
+    let inner = "(SELECT 'a\u{1F}b', 'a.b') AS d";
+    let names = |sql: &str| db.query(sql, ()).map(|rows| rows.columns().to_vec());
+    let shown = names(&format!("SELECT * FROM {inner}")).unwrap();
+    assert_ne!(shown[0], shown[1], "two items, two names: {shown:?}");
+    let sql = format!("SELECT d.\"'a.b'\" FROM {inner}");
+    let got = collect(db.query(&sql, ()));
+    assert_eq!(
+        got.as_ref().map(|rows| rows.get(1).cloned()),
+        Ok(Some("[Some(Text(\"a.b\"))]".to_string())),
+        "{sql}"
+    );
+    db.execute(&format!("CREATE TABLE copied AS SELECT * FROM {inner}"), ())
+        .unwrap();
+}
+
+#[test]
+fn a_caller_of_the_compiler_names_a_qualified_column_with_qualified() {
+    use stoolap::executor::expression::compile_expression;
+    use stoolap::executor::utils::qualified;
+    use stoolap::parser::ast::Statement;
+    let item = |sql: &str| match &stoolap::parser::parse_sql(sql).unwrap()[0] {
+        Statement::Select(select) => select.columns[0].clone(),
+        _ => unreachable!(),
+    };
+    let reference = item("SELECT t.id FROM t");
+    assert!(compile_expression(&reference, &[qualified("t", "id")]).is_ok());
+    // A dotted text is one name, which `t.id` is not
+    assert!(compile_expression(&reference, &["t.id".to_string()]).is_err());
+    assert!(compile_expression(&item("SELECT \"t.id\" FROM t"), &["t.id".to_string()]).is_ok());
+}

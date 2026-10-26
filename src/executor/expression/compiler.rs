@@ -189,7 +189,8 @@ pub struct CompileContext<'a> {
 }
 
 impl<'a> CompileContext<'a> {
-    /// Create a new compilation context
+    /// Create a new compilation context over `columns`, a qualified one
+    /// named by [`crate::executor::utils::qualified`]
     pub fn new(columns: &[String], functions: &'a FunctionRegistry) -> Self {
         let mut col_map = StringMap::new();
         let mut qualified_map: StringMap<StringMap<ColumnSource>> = StringMap::new();

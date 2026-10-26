@@ -869,7 +869,7 @@ impl Executor {
         enum CompiledColumn {
             Star,
             Columns(Vec<usize>),
-            Identifier(Option<usize>),
+            Identifier(usize),
             Compiled(SharedProgram),
         }
 
@@ -887,10 +887,12 @@ impl Executor {
                     );
                     Ok(CompiledColumn::Columns(taken))
                 }
-                Expression::Identifier(id) => {
-                    let idx = col_index_map.get(id.value_lower.as_str()).copied();
-                    Ok(CompiledColumn::Identifier(idx))
-                }
+                // A name no column has reads as the compiler says: the enclosing
+                // row's column, a quoted name's text, or an error
+                Expression::Identifier(id) => match col_index_map.get(id.value_lower.as_str()) {
+                    Some(&idx) => Ok(CompiledColumn::Identifier(idx)),
+                    None => compile_expression(col_expr, cte_columns).map(CompiledColumn::Compiled),
+                },
                 Expression::Aliased(aliased) => {
                     let program = compile_expression(&aliased.expression, cte_columns)?;
                     Ok(CompiledColumn::Compiled(program))
@@ -926,11 +928,8 @@ impl Executor {
                             }),
                         );
                     }
-                    CompiledColumn::Identifier(Some(idx)) => {
+                    CompiledColumn::Identifier(idx) => {
                         values.push(row.get(*idx).cloned().unwrap_or_else(Value::null_unknown));
-                    }
-                    CompiledColumn::Identifier(None) => {
-                        values.push(Value::null_unknown());
                     }
                     CompiledColumn::Compiled(program) => {
                         values.push(vm.execute_cow(program, &exec_ctx)?);
