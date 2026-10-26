@@ -3609,7 +3609,7 @@ impl Executor {
     }
 
     /// Recursively collect table names from a table source expression
-    fn collect_table_names_from_source<'a>(
+    pub(super) fn collect_table_names_from_source<'a>(
         source: &'a Expression,
         tables: &mut smallvec::SmallVec<[&'a str; 4]>,
     ) {
@@ -3659,7 +3659,10 @@ impl Executor {
     ///
     /// For qualified identifiers (e.g., c.id), we check if the qualifier (table/alias)
     /// is NOT defined in the subquery's FROM clause - if so, it must be an outer reference.
-    fn references_outer_columns<S: AsRef<str>>(expr: &Expression, subquery_tables: &[S]) -> bool {
+    pub(super) fn references_outer_columns<S: AsRef<str>>(
+        expr: &Expression,
+        subquery_tables: &[S],
+    ) -> bool {
         match expr {
             Expression::Identifier(_id) => {
                 // Simple identifiers are ambiguous - they resolve to inner scope first per SQL semantics.

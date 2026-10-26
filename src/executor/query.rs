@@ -5341,6 +5341,39 @@ impl Executor {
         })
     }
 
+    /// `predicate` of `join` with the parent row's values in place of the
+    /// columns it names outside the joined tables; None with no parent row
+    /// or no such column. A conjunct holding a subquery is left for the
+    /// per-row path, which binds it
+    fn bind_to_parent_row(
+        join: &JoinTableSource,
+        predicate: &Expression,
+        ctx: &ExecutionContext,
+    ) -> Option<Expression> {
+        let outer = ctx.outer_row()?;
+        let mut tables = smallvec::SmallVec::new();
+        Self::collect_table_names_from_source(&join.left, &mut tables);
+        Self::collect_table_names_from_source(&join.right, &mut tables);
+        if !Self::references_outer_columns(predicate, &tables) {
+            return None;
+        }
+        let scope = super::utils::InnerScope {
+            tables: &tables,
+            schema: None,
+        };
+        let bound = flatten_and_predicates(predicate)
+            .into_iter()
+            .map(|pred| {
+                if Self::has_subqueries(&pred) {
+                    pred
+                } else {
+                    super::utils::substitute_outer_references_in_scope(&pred, outer, &scope)
+                }
+            })
+            .collect();
+        combine_predicates_with_and(bound)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_join_source_capped(
         &self,
@@ -5353,6 +5386,26 @@ impl Executor {
         reduction: &std::cell::Cell<Option<ReductionPass>>,
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
+
+        // A parent row's column named through the parent's table is bound in
+        // the ON and the WHERE before either is read, or the bare name it
+        // falls back to would read a joined column of that name
+        let bound_source;
+        let join_source = match join_source
+            .condition
+            .as_deref()
+            .filter(|_| ctx.outer_row().is_some())
+            .and_then(|on| Self::bind_to_parent_row(join_source, on, ctx))
+        {
+            Some(condition) => {
+                bound_source = JoinTableSource {
+                    condition: Some(Box::new(condition)),
+                    ..join_source.clone()
+                };
+                &bound_source
+            }
+            None => join_source,
+        };
 
         // Get table aliases for filter pushdown
         let left_alias = get_table_alias_from_expr(&join_source.left);
@@ -5456,33 +5509,13 @@ impl Executor {
             Some(where_clause) => Some((**where_clause).clone()),
             None => None,
         };
-        // A parent row's column named through the parent's table is bound
-        // before the predicates are split, or the side a predicate is
-        // pushed to would read the bare name it falls back to as its own.
-        // A predicate holding a subquery is left for the per-row path
-        let where_for_join = match (where_for_join, ctx.outer_row()) {
-            (Some(where_clause), Some(outer)) => {
-                let mut inner = Vec::new();
-                super::utils::collect_table_aliases(&join_source.left, &mut inner);
-                super::utils::collect_table_aliases(&join_source.right, &mut inner);
-                let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
-                let scope = super::utils::InnerScope {
-                    tables: &inner,
-                    schema: None,
-                };
-                let bound: Vec<Expression> = flatten_and_predicates(&where_clause)
-                    .into_iter()
-                    .map(|pred| {
-                        if Self::has_subqueries(&pred) {
-                            pred
-                        } else {
-                            super::utils::substitute_outer_references_in_scope(&pred, outer, &scope)
-                        }
-                    })
-                    .collect();
-                combine_predicates_with_and(bound)
-            }
-            (where_clause, _) => where_clause,
+        // Bound before the predicates are split, or the side a predicate is
+        // pushed to would read the bare name it falls back to as its own
+        let where_for_join = match where_for_join {
+            Some(where_clause) if ctx.outer_row().is_some() => Some(
+                Self::bind_to_parent_row(join_source, &where_clause, ctx).unwrap_or(where_clause),
+            ),
+            where_for_join => where_for_join,
         };
         let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
             Some(where_clause) => split_join_where(
