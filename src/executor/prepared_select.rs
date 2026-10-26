@@ -68,7 +68,7 @@ use super::result::{
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, get_table_alias_from_expr, infix_to_operator,
-    is_aggregate_function, item_name, order_by_names_an_alias, qualified, split_qualified,
+    is_aggregate_function, item_name, order_by_names_an_alias, split_qualified,
     strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
@@ -1162,28 +1162,6 @@ impl ScopeTable {
         }
     }
 
-    /// The names a run of its FROM gives its columns: each qualified by its
-    /// table when there are more tables than one
-    fn source_names(&self) -> std::borrow::Cow<'_, [String]> {
-        if self.tables.len() < 2 {
-            return std::borrow::Cow::Borrowed(self.lower.as_slice());
-        }
-        let mut names = Vec::with_capacity(self.lower.len());
-        for (i, (table, start)) in self.tables.iter().enumerate() {
-            let end = self
-                .tables
-                .get(i + 1)
-                .map_or(self.lower.len(), |(_, at)| *at);
-            let table = table.to_lowercase();
-            names.extend(
-                self.lower[*start..end]
-                    .iter()
-                    .map(|name| qualified(&table, name)),
-            );
-        }
-        std::borrow::Cow::Owned(names)
-    }
-
     /// The scope of a block without FROM: no columns, and no name a
     /// qualifier could find, so every name reads an enclosing scope
     fn unnamed() -> Self {
@@ -1496,7 +1474,12 @@ impl StatementWalk<'_> {
                     Ok(WindowDefinition {
                         partition_by: all(self, &def.partition_by)?,
                         order_by: order(self, &def.order_by, &level)?,
-                        ..def.clone()
+                        frame: def
+                            .frame
+                            .as_ref()
+                            .map(|frame| self.frame(frame, &level))
+                            .transpose()?,
+                        name: def.name.clone(),
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -1763,6 +1746,26 @@ impl StatementWalk<'_> {
                 spelled_as(walked, item_name(item))
             }
             _ => walked,
+        })
+    }
+
+    /// The frame of a named window, its offsets walked
+    fn frame(&mut self, frame: &WindowFrame, level: &Level<'_>) -> Result<WindowFrame> {
+        let mut bound = |bound: &WindowFrameBound| -> Result<WindowFrameBound> {
+            Ok(match bound {
+                WindowFrameBound::Preceding(offset) => {
+                    WindowFrameBound::Preceding(Box::new(self.expr(offset, level)?))
+                }
+                WindowFrameBound::Following(offset) => {
+                    WindowFrameBound::Following(Box::new(self.expr(offset, level)?))
+                }
+                other => other.clone(),
+            })
+        };
+        Ok(WindowFrame {
+            unit: frame.unit,
+            start: bound(&frame.start)?,
+            end: frame.end.as_ref().map(&mut bound).transpose()?,
         })
     }
 }
@@ -4137,7 +4140,14 @@ impl Builder<'_> {
         let statement = match dropped {
             true => {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
-                existence(executor, statement, &own.source_names(), ctx)?
+                // A join's run names its columns, so it binds what it reads
+                match own.tables.len() > 1 {
+                    true => SelectStatement {
+                        order_by: Vec::new(),
+                        ..statement
+                    },
+                    false => existence(executor, statement, &own.lower, ctx)?,
+                }
             }
             false => statement,
         };

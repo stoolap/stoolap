@@ -293,33 +293,47 @@ fn a_kept_answer_of_a_block_over_a_join_follows_its_parameters() {
             .collect()
     };
     let mut wrong = Vec::new();
-    for (sql, first, then) in [
+    for (sql, (low, first), (high, then)) in [
         (
             "SELECT id FROM t WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id \
              WHERE w.y <= $1) ORDER BY id",
-            vec!["1", "4"],
-            vec!["1", "2", "4", "5"],
+            (10, vec!["1", "4"]),
+            (30, vec!["1", "2", "4", "5"]),
         ),
         (
             "SELECT id FROM t WHERE b > (SELECT MAX(w.y) FROM u JOIN w ON w.id = u.id \
              WHERE w.y <= $1) ORDER BY id",
-            vec!["2", "3", "4"],
-            vec!["4"],
+            (10, vec!["2", "3", "4"]),
+            (30, vec!["4"]),
         ),
         (
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id \
              WHERE w.y > $1)",
-            vec!["5"],
-            vec!["0"],
+            (10, vec!["5"]),
+            (30, vec!["0"]),
         ),
         (
             "SELECT id FROM t WHERE a IN (SELECT q.x FROM (SELECT u.x FROM u JOIN w \
              ON w.id = u.id WHERE w.y <= $1) AS q) ORDER BY id",
-            vec!["1", "4"],
-            vec!["1", "2", "4", "5"],
+            (10, vec!["1", "4"]),
+            (30, vec!["1", "2", "4", "5"]),
+        ),
+        (
+            "SELECT id FROM t WHERE b IN (SELECT q.s FROM u JOIN (SELECT w.id, SUM(w.y) \
+             OVER win AS s FROM w WINDOW win AS (ORDER BY w.id ROWS BETWEEN $1 PRECEDING \
+             AND CURRENT ROW)) AS q ON q.id = u.id) ORDER BY id",
+            (0, vec!["1", "2", "3"]),
+            (1, vec!["1", "3"]),
+        ),
+        (
+            "SELECT t.id FROM t JOIN w AS z ON z.id = t.id AND t.b IN (SELECT q.s FROM u \
+             JOIN (SELECT w.id, SUM(w.y) OVER win AS s FROM w WINDOW win AS (ORDER BY w.id \
+             ROWS BETWEEN $1 PRECEDING AND CURRENT ROW)) AS q ON q.id = u.id) ORDER BY t.id",
+            (0, vec!["1", "2", "3"]),
+            (1, vec!["1", "3"]),
         ),
     ] {
-        for (bound, want) in [(10, &first), (30, &then)] {
+        for (bound, want) in [(low, &first), (high, &then)] {
             let got = read(sql, bound);
             if got != *want {
                 wrong.push(format!(
@@ -327,6 +341,13 @@ fn a_kept_answer_of_a_block_over_a_join_follows_its_parameters() {
                 ));
             }
         }
+    }
+    let outer = "SELECT id FROM t WHERE b IN (SELECT q.s FROM u JOIN (SELECT w.id, SUM(w.y) \
+                 OVER win AS s FROM w WINDOW win AS (ORDER BY w.id ROWS BETWEEN t.a PRECEDING \
+                 AND CURRENT ROW)) AS q ON q.id = u.id) ORDER BY id";
+    let got = answer(&db, outer);
+    if got != Ok(vec!["1".to_string(), "3".to_string()]) {
+        wrong.push(format!("{outer}: gave {got:?}, want [1, 3]"));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
@@ -405,6 +426,36 @@ fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
              GROUP BY v.x)",
             Err("Compile error: Column 'u.x' not found".to_string()),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT v.x FROM u CROSS JOIN (VALUES (1)) \
+             AS v(x) GROUP BY x)",
+            Ok(vec!["5".to_string()]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x FROM u CROSS JOIN (VALUES (1)) \
+             AS v(x) GROUP BY x)",
+            Err("Compile error: Column 'u.x' not found".to_string()),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT g.value FROM u CROSS JOIN \
+             generate_series(1, 2) AS g GROUP BY value)",
+            Ok(vec!["5".to_string()]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT q.x FROM u CROSS JOIN \
+             (SELECT 1 AS x) AS q GROUP BY x)",
+            Err("Compile error: Column 'q.x' not found".to_string()),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x AS y FROM u CROSS JOIN \
+             (VALUES (5)) AS v(y) WHERE y = 1)",
+            Ok(vec!["0".to_string()]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x AS z FROM u CROSS JOIN \
+             (VALUES (5)) AS v(y) WHERE z = 1)",
+            Ok(vec!["5".to_string()]),
         ),
     ] {
         let got = answer(&db, sql);
