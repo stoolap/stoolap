@@ -630,6 +630,15 @@ fn a_block_over_a_join_is_bound_when_prepared_and_run_when_asked() {
             "SELECT id, (SELECT u.x FROM u) FROM e",
             Err("scalar subquery returned more than one row".to_string()),
         ),
+        // Over a join an EXISTS's statement computes its SELECT list; the docs say so
+        (
+            "SELECT id FROM one WHERE EXISTS (SELECT ABS(m.x) FROM m JOIN u ON u.id = m.id)",
+            overflow.clone(),
+        ),
+        (
+            "SELECT id FROM one WHERE EXISTS (SELECT ABS(m.x) FROM m)",
+            Ok(vec!["1".to_string()]),
+        ),
     ] {
         // A second run takes the plan the first one made
         for run in ["first", "second"] {
