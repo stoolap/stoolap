@@ -258,6 +258,7 @@ fn the_cached_rest_of_the_on_clause_follows_an_index_dropped_under_a_nested_join
 fn a_plan_run_with_an_outer_row_keeps_no_program() {
     use stoolap::common::CompactArc;
     use stoolap::core::Value;
+    use stoolap::executor::utils::qualified;
     use stoolap::executor::{context::ExecutionContext, Executor};
     use stoolap::parser::ast::{Expression, ParamSlots, Statement};
 
@@ -293,10 +294,10 @@ fn a_plan_run_with_an_outer_row_keeps_no_program() {
     // splits it, so a program kept from one execution would carry it
     let read = |value: i64| {
         let ctx = ExecutionContext::new().with_outer_row(
-            [("parent.v".into(), Value::Integer(value))]
+            [(qualified("parent", "v").into(), Value::Integer(value))]
                 .into_iter()
                 .collect(),
-            CompactArc::new(vec!["parent.v".to_string()]),
+            CompactArc::new(vec![qualified("parent", "v")]),
         );
         let mut rows = executor.execute_with_cached_plan(&plan, &ctx).unwrap();
         let mut ids = Vec::new();
