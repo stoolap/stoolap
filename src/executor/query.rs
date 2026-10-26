@@ -367,7 +367,9 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
-use super::prepared_join::{BuiltPrograms, JoinProgramKey, JoinSides, PreparedJoin, WhereSite};
+use super::prepared_join::{
+    BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
+};
 use super::prepared_select::{names_any_within, JoinBlocks, OutOfFamily};
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -5080,21 +5082,24 @@ impl Executor {
                 .any(|kind| join_type.contains(kind))
     }
 
-    /// Whether a join of two sources with a subquery in a clause keeps its
-    /// plan, its CTEs bound or inlined, so its blocks may run; a join whose
-    /// LIMIT the CTE path cuts into a CTE it does not inline, or with a CTE
-    /// not named before it runs, stays there
+    /// Whether a join with a subquery in a clause keeps its plan, its CTEs
+    /// bound or inlined, so its blocks may run; a join whose LIMIT the CTE
+    /// path cuts into a CTE it does not inline, with a CTE not named before
+    /// it runs, or with a joined side that merges columns, stays there
     pub(crate) fn join_keeps_plan(&self, stmt: &SelectStatement, with: &WithClause) -> bool {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return false;
         };
-        let source = |side: &Expression| !matches!(side, Expression::JoinSource(_));
+        let source = |side: &Expression| match side {
+            Expression::JoinSource(join) => Self::joined_side_reason(join).is_none(),
+            _ => true,
+        };
         let classification = get_classification(stmt);
         source(&join.left)
             && source(&join.right)
             && (classification.where_has_subqueries
                 || classification.output_has_subqueries
-                || join.condition.as_deref().is_some_and(Self::has_subqueries))
+                || Self::ons_hold_subqueries(join))
             && (self.compute_cte_limit_hints(stmt, with).is_empty()
                 || self.try_inline_ctes(stmt, with).is_some())
             && self.named_ctes(with).is_ok()
@@ -5102,32 +5107,91 @@ impl Executor {
 
     /// Each side's columns as the join's blocks read them, a base table's
     /// schema or the names a FROM gives any other source, and whether it is
-    /// read as rows; None when a side is a join, a table read with AS OF or
-    /// a source not named without reading it
+    /// read as rows; a side that is a join, read as rows, has its tables'
+    /// columns side by side. None when a table is read with AS OF, a source
+    /// is not named without reading it, or a joined side merges columns
     pub(crate) fn join_side_schemas(
         &self,
         join_source: &JoinTableSource,
         ctx: &ExecutionContext,
     ) -> Option<JoinSides> {
-        let side = |expr: &Expression| match expr {
+        Some([
+            self.join_side(&join_source.left, ctx)?,
+            self.join_side(&join_source.right, ctx)?,
+        ])
+    }
+
+    fn join_side(&self, expr: &Expression, ctx: &ExecutionContext) -> Option<JoinSide> {
+        match expr {
             Expression::TableSource(ts) if ts.as_of.is_some() => None,
             Expression::TableSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
             | Expression::FunctionTableSource(_) => {
-                match self.base_table_side_schema(expr, CteNames::Context(ctx)) {
-                    Some(schema) => Some((schema, false)),
-                    None => self.join_side_schema(expr, ctx).ok().map(|s| (s, true)),
+                let name = SmartString::from(get_table_alias_from_expr(expr).unwrap_or_default());
+                let (schema, rows) = match self.base_table_side_schema(expr, CteNames::Context(ctx))
+                {
+                    Some(schema) => (schema, false),
+                    None => (self.join_side_schema(expr, ctx).ok()?, true),
+                };
+                Some(JoinSide {
+                    leaves: smallvec::smallvec![(name, schema)],
+                    rows,
+                })
+            }
+            // Its rows lay out each table's columns in turn, unless a NATURAL
+            // or USING join merges them; a VALUES list's are named bare, so
+            // the join's ON could bind them to another table's of that name
+            Expression::JoinSource(join) if Self::joined_side_reason(join).is_none() => {
+                let mut leaves = smallvec::SmallVec::new();
+                for side in [&join.left, &join.right] {
+                    let side = self.join_side(side, ctx)?;
+                    if side.leaves.iter().any(|(name, _)| name.is_empty()) {
+                        return None;
+                    }
+                    leaves.extend(side.leaves);
                 }
+                Some(JoinSide { leaves, rows: true })
             }
             _ => None,
-        };
-        Some([side(&join_source.left)?, side(&join_source.right)?])
+        }
     }
 
-    /// Whether a join of two sources, `sides` as `join_side_schemas` finds
-    /// them, holds subqueries in its ON or its WHERE, all of the forms the
-    /// prepared blocks run, or why not
+    /// Whether `join` is a NATURAL or USING join, whose rows merge columns
+    fn merges_columns(join: &JoinTableSource) -> bool {
+        join.join_type.to_uppercase().contains("NATURAL") || !join.using_columns.is_empty()
+    }
+
+    /// Why `join`, a side of a join, cannot be read as its tables' columns
+    /// in turn, or of a join it holds; None when it can
+    fn joined_side_reason(join: &JoinTableSource) -> Option<OutOfFamily> {
+        if Self::merges_columns(join) {
+            return Some("a joined side that is a NATURAL or USING join");
+        }
+        [&*join.left, &*join.right]
+            .into_iter()
+            .find_map(|side| match side {
+                Expression::JoinSource(join) => Self::joined_side_reason(join),
+                Expression::ValuesSource(_) => Some("a joined side holding a VALUES list"),
+                _ => None,
+            })
+    }
+
+    /// Whether the ON of `join`, or of a join it holds as a side, holds a
+    /// subquery
+    fn ons_hold_subqueries(join: &JoinTableSource) -> bool {
+        let nested = |side: &Expression| match side {
+            Expression::JoinSource(join) => Self::ons_hold_subqueries(join),
+            _ => false,
+        };
+        join.condition.as_deref().is_some_and(Self::has_subqueries)
+            || nested(&join.left)
+            || nested(&join.right)
+    }
+
+    /// Whether a join, `sides` as `join_side_schemas` finds them, holds
+    /// subqueries in its ONs, a joined side's included, or its WHERE, all of
+    /// the forms the prepared blocks run, or why not
     pub(crate) fn join_blocks_family(
         &self,
         stmt: &SelectStatement,
@@ -5136,22 +5200,33 @@ impl Executor {
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         sides: Option<&JoinSides>,
     ) -> std::result::Result<(), OutOfFamily> {
-        let Some([(left, _), (right, _)]) = sides else {
-            let join = |side: &Expression| matches!(side, Expression::JoinSource(_));
-            return Err(match join(&join_source.left) || join(&join_source.right) {
-                true => "a side that is itself a join",
-                false => "a side read with AS OF or not named before it is read",
-            });
+        let Some(sides @ [left, right]) = sides else {
+            let joined = |side: &Expression| match side {
+                Expression::JoinSource(join) => Self::joined_side_reason(join),
+                _ => None,
+            };
+            return Err(joined(&join_source.left)
+                .or_else(|| joined(&join_source.right))
+                .unwrap_or("a side read with AS OF or not named before it is read"));
         };
-        // The blocks qualify each side's columns by its name
-        if left_alias.is_none() || right_alias.is_none() {
+        // The blocks qualify each side's columns by its name, a joined
+        // side's by its tables'
+        let named = |alias: Option<&str>, side: &JoinSide| alias.is_some() || side.leaves.len() > 1;
+        if !named(left_alias, left) || !named(right_alias, right) {
             return Err("a side without a name");
         }
-        let schemas = (Some(&**left), Some(&**right));
+        let schemas = (left.schema(), right.schema());
         let on = join_source.condition.as_deref();
-        let on_subqueries = on.is_some_and(Self::has_subqueries);
+        let mut on_subqueries = on.is_some_and(Self::has_subqueries);
         if let Some(on) = on.filter(|_| on_subqueries) {
             self.join_where_family(on)?;
+        }
+        // A joined side runs as a join of its own, its ON's subqueries as
+        // its blocks
+        for side in [&*join_source.left, &*join_source.right] {
+            if let Expression::JoinSource(join) = side {
+                on_subqueries |= self.joined_side_family(join)?;
+            }
         }
         let output_subqueries = self.join_output_family(stmt, join_source, join_type)?;
         let Some(where_clause) = stmt.where_clause.as_deref() else {
@@ -5164,12 +5239,11 @@ impl Executor {
             split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
         // Each part as its site reads it, the SELECT aliases it names opened
         // over the joined columns the sides lay out
-        let mut columns = Vec::new();
-        for (alias, schema) in [(left_alias, schemas.0), (right_alias, schemas.1)] {
-            if let (Some(alias), Some(schema)) = (alias, schema) {
-                columns.extend(schema.columns.iter().map(|c| qualified(alias, &c.name)));
-            }
-        }
+        let columns: Vec<String> = sides
+            .iter()
+            .flat_map(|side| side.columns())
+            .map(|(table, name)| qualified(table, name))
+            .collect();
         let opened = |part: Option<Expression>| {
             part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
         };
@@ -5185,6 +5259,26 @@ impl Executor {
             true => Ok(()),
             false => Err("no ON, WHERE, SELECT list or ORDER BY holds a subquery"),
         }
+    }
+
+    /// Whether the ON of `join`, a joined side, or of a join it holds holds
+    /// subqueries, all of the forms the prepared blocks run, or why not
+    fn joined_side_family(&self, join: &JoinTableSource) -> std::result::Result<bool, OutOfFamily> {
+        let mut found = false;
+        if let Some(on) = join
+            .condition
+            .as_deref()
+            .filter(|on| Self::has_subqueries(on))
+        {
+            self.join_where_family(on)?;
+            found = true;
+        }
+        for side in [&*join.left, &*join.right] {
+            if let Expression::JoinSource(join) = side {
+                found |= self.joined_side_family(join)?;
+            }
+        }
+        Ok(found)
     }
 
     /// Whether a join's output groups its rows, so the grouped blocks or the
@@ -5259,6 +5353,19 @@ impl Executor {
         Ok(true)
     }
 
+    /// `program`, a WHERE asked of joined rows, with the uncorrelated values
+    /// it asks of `run` read once and bound; as it is when a read fails,
+    /// whose error stays with the row that needs it
+    fn bound_where(
+        run: Option<&super::prepared_select::PreparedRunner<'_>>,
+        program: SharedProgram,
+    ) -> SharedProgram {
+        match run.and_then(|run| run.bound_reading(&program)) {
+            Some(bound) => bound,
+            None => program,
+        }
+    }
+
     /// The program of the WHERE `cross` a join asks at `site` of its joined
     /// rows named `all_columns`, held with the plan when it has one. With
     /// the statement's `blocks`, the WHERE they rewrote; else `cross` as
@@ -5301,45 +5408,36 @@ impl Executor {
         sides: Option<&JoinSides>,
         ctx: &ExecutionContext,
     ) -> Result<Option<std::sync::Arc<JoinBlocks>>> {
-        let (Some(prepared), Some(left_alias), Some(right_alias), Some([left_side, right_side])) =
-            (prepared, left_alias, right_alias, sides)
-        else {
+        let (Some(prepared), Some(sides)) = (prepared, sides) else {
             return Ok(None);
         };
-        let (left_schema, right_schema) = (&*left_side.0, &*right_side.0);
+        let [left_side, right_side] = sides;
         prepared.join_blocks(|| {
+            // Each column by its table and its own name, which may hold a dot
+            let spelled: [Vec<(&str, &str)>; 2] = [
+                left_side.columns().collect(),
+                right_side.columns().collect(),
+            ];
             // The WHERE's SELECT aliases open over the columns the sides lay
             // out, as the decision to run blocks read them
-            let columns: Vec<String> = [(left_alias, left_schema), (right_alias, right_schema)]
+            let columns: Vec<String> = spelled
                 .iter()
-                .flat_map(|(alias, schema)| {
-                    schema
-                        .columns
-                        .iter()
-                        .map(move |c| qualified(alias, &c.name))
-                })
+                .flatten()
+                .map(|(table, name)| qualified(table, name))
                 .collect();
             // The equalities of a NATURAL join or a USING list stand for its ON
-            let (left, right) = columns.split_at(left_schema.columns.len());
-            // Each column by its side and its own name, which may hold a dot
+            let (left, right) = columns.split_at(spelled[0].len());
             let natural =
                 natural_join_condition(join_type, join_source, left, right, |right, i| {
-                    let (alias, schema) = match right {
-                        true => (right_alias, right_schema),
-                        false => (left_alias, left_schema),
-                    };
+                    let (table, name) = spelled[usize::from(right)][i];
                     Expression::QualifiedIdentifier(QualifiedIdentifier {
                         qualifier: Identifier::new(
-                            Token::new(TokenType::Identifier, alias, Position::default()),
-                            alias,
+                            Token::new(TokenType::Identifier, table, Position::default()),
+                            table,
                         ),
                         name: Identifier::new(
-                            Token::new(
-                                TokenType::Identifier,
-                                schema.columns[i].name.as_str(),
-                                Position::default(),
-                            ),
-                            schema.columns[i].name.as_str(),
+                            Token::new(TokenType::Identifier, name, Position::default()),
+                            name,
                         ),
                     })
                 })
@@ -5351,20 +5449,12 @@ impl Executor {
             // A side's conditions come without their qualifier; it is put
             // back, as the index join puts it back on its inner side's
             let [left_filter, right_filter] = side_filters;
-            let left_filter = left_filter.map(|f| add_table_qualifier(f, left_alias));
-            let right_filter = right_filter.map(|f| add_table_qualifier(f, right_alias));
-            let sides = [
-                (
-                    SmartString::from(left_alias.to_lowercase().as_str()),
-                    left_schema,
-                    left_side.1,
-                ),
-                (
-                    SmartString::from(right_alias.to_lowercase().as_str()),
-                    right_schema,
-                    right_side.1,
-                ),
-            ];
+            let left_filter = left_filter
+                .zip(left_alias)
+                .map(|(f, alias)| add_table_qualifier(f, alias));
+            let right_filter = right_filter
+                .zip(right_alias)
+                .map(|(f, alias)| add_table_qualifier(f, alias));
             // The SELECT items and sort keys whose subqueries the blocks run
             let output = !Self::grouped_join_output(stmt);
             let select: Vec<Option<&Expression>> = stmt
@@ -5494,7 +5584,7 @@ impl Executor {
             .filter(|_| ctx.outer_row().is_none())
             .and_then(|slot| self.prepared_join(slot));
         let asks_blocks = classification.where_has_subqueries
-            || on_subqueries
+            || Self::ons_hold_subqueries(join_source)
             || classification.output_has_subqueries;
         let block_sides = plan.as_ref().filter(|_| asks_blocks).and_then(|plan| {
             plan.sides(|| self.join_side_schemas(join_source, ctx))
@@ -5586,7 +5676,7 @@ impl Executor {
         };
         // The blocks split the WHERE over the columns they read each side with
         let split_schemas = match block_sides.as_ref().filter(|_| blocks_where) {
-            Some([(left, _), (right, _)]) => (Some(&**left), Some(&**right)),
+            Some([left, right]) => (left.schema(), right.schema()),
             None => (left_schema.as_deref(), right_schema.as_deref()),
         };
         let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
@@ -6310,14 +6400,17 @@ impl Executor {
                     // applied per joined row rather than after collection
                     let cross_row_filter = match cross_filter {
                         Some(ref cross) => Some(
-                            RowFilter::from_program(self.join_where(
-                                prepared.as_deref(),
-                                WhereSite::IndexJoin,
-                                stmt,
-                                cross,
-                                &all_columns,
-                                blocks.as_deref(),
-                            )?)
+                            RowFilter::from_program(Self::bound_where(
+                                blocks_run.as_ref(),
+                                self.join_where(
+                                    prepared.as_deref(),
+                                    WhereSite::IndexJoin,
+                                    stmt,
+                                    cross,
+                                    &all_columns,
+                                    blocks.as_deref(),
+                                )?,
+                            ))
                             .with_context(ctx),
                         ),
                         None => None,
@@ -7241,10 +7334,12 @@ impl Executor {
                     &all_columns,
                     blocks.as_deref(),
                 )?;
-                let where_filter = RowFilter::from_program(program).with_context(ctx);
                 if let Some(run) = &blocks_run {
                     run.ask_rows(Some(result_rows.len()));
                 }
+                let run = blocks_run.as_ref().filter(|_| !result_rows.is_empty());
+                let where_filter =
+                    RowFilter::from_program(Self::bound_where(run, program)).with_context(ctx);
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
                     if where_filter.matches_checked_with(&row, where_blocks)? {
@@ -8474,6 +8569,40 @@ impl Executor {
         ))
     }
 
+    /// The rows of `join`, a side that is itself a join, each table's columns
+    /// in turn: a SELECT * of it, held in `compiled` when it has a plan
+    fn joined_side_rows(
+        &self,
+        join: &JoinTableSource,
+        ctx: &ExecutionContext,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        let select_all = SelectStatement {
+            param_count: 0,
+            token: dummy_token("SELECT", TokenType::Keyword),
+            distinct: false,
+            distinct_on: vec![],
+            columns: vec![Expression::Star(StarExpression {
+                token: dummy_token("*", TokenType::Punctuator),
+            })],
+            with: None,
+            table_expr: Some(Box::new(Expression::JoinSource(Box::new(join.clone())))),
+            where_clause: None,
+            group_by: GroupByClause::default(),
+            having: None,
+            window_defs: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            set_operations: vec![],
+            prepared: None,
+        };
+        let classification = get_classification(&select_all);
+        let (result, columns, _, _) =
+            self.execute_join_source(join, &select_all, ctx, &classification, compiled)?;
+        Ok((result, columns.to_vec()))
+    }
+
     /// Execute a table expression with optional filter pushdown
     /// This is used by JOIN to push WHERE predicates to individual table scans
     pub(crate) fn execute_table_expression_with_filter(
@@ -8605,33 +8734,7 @@ impl Executor {
 
                 Ok((result, qualified_columns))
             }
-            Expression::JoinSource(js) => {
-                let select_all = SelectStatement {
-                    param_count: 0,
-                    token: dummy_token("SELECT", TokenType::Keyword),
-                    distinct: false,
-                    distinct_on: vec![],
-                    columns: vec![Expression::Star(StarExpression {
-                        token: dummy_token("*", TokenType::Punctuator),
-                    })],
-                    with: None,
-                    table_expr: Some(Box::new(Expression::JoinSource(js.clone()))),
-                    where_clause: None,
-                    group_by: GroupByClause::default(),
-                    having: None,
-                    window_defs: vec![],
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    set_operations: vec![],
-                    prepared: None,
-                };
-                // Get classification for the synthetic SELECT statement
-                let classification = get_classification(&select_all);
-                let (result, columns, _, _) =
-                    self.execute_join_source(js, &select_all, ctx, &classification, None)?;
-                Ok((result, columns.to_vec()))
-            }
+            Expression::JoinSource(js) => self.joined_side_rows(js, ctx, None),
             Expression::SubquerySource(ss) => {
                 // Execute subquery with incremented depth to avoid creating new TimeoutGuard
                 let subquery_ctx = ctx.with_incremented_query_depth();
@@ -8764,9 +8867,22 @@ impl Executor {
         }
         let mut read = None;
         let read_out = side.run.is_some().then_some(&mut read);
-        let fetched = self.execute_table_expression_with_filter_limit(
-            expr, ctx, filter, limit, offset, read_out,
-        )?;
+        // A joined side runs as a join of its own, under the plan it holds
+        let nested = match (rows, expr) {
+            (Some((run, index)), Expression::JoinSource(join)) => {
+                Some((join, run.blocks.nested[index].as_ref()))
+            }
+            _ => None,
+        };
+        let fetched = match nested {
+            Some((join, compiled)) => {
+                let (result, columns) = self.joined_side_rows(join, ctx, compiled)?;
+                (result, columns, false, None)
+            }
+            None => self.execute_table_expression_with_filter_limit(
+                expr, ctx, filter, limit, offset, read_out,
+            )?,
+        };
         if let Some((run, index)) = rows {
             let (result, columns, bounded, _) = fetched;
             let result =
@@ -9585,6 +9701,7 @@ impl Executor {
                     &all_columns,
                     blocks,
                 )?;
+                let program = Self::bound_where(run.map(|run| run.run), program);
                 Some(RowFilter::from_program(program).with_context(ctx))
             }
             None => None,

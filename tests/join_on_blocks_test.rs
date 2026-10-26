@@ -632,7 +632,7 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
         ),
         (
             format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w JOIN s ON s.id = l.id WHERE {exists}"),
-            "Prepared: no (a side that is itself a join)".to_string(),
+            "Prepared: yes".to_string(),
         ),
         (
             format!(

@@ -57,6 +57,7 @@ use super::expression::{
     SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
+use super::prepared_join::{JoinSide, JoinSides};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
@@ -1163,8 +1164,9 @@ impl ScopeTable {
         }
     }
 
-    /// This scope read by position, as `joined`'s is: a name two of its
-    /// tables share binds the one its qualifier names, never the first
+    /// This scope read by position, each column under a name no column can
+    /// have: a name two of its tables share binds the one its qualifier
+    /// names, never the first, and no name a table chose binds it elsewhere
     fn by_position(&self) -> Self {
         let width = self.lower.len();
         Self {
@@ -1216,35 +1218,6 @@ impl ScopeTable {
             lower: CompactArc::new(Vec::new()),
             types: Vec::new(),
         }
-    }
-
-    /// The joined row of `sides`, each a name and its table's schema, as a
-    /// join of `width` columns lays it out; None when they do not line up.
-    /// Its programs read each column by position, under a name no column
-    /// can have, so no name a table chose can bind it elsewhere
-    fn joined(sides: [(SmartString, &Schema); 2], width: usize) -> Option<Self> {
-        if sides
-            .iter()
-            .map(|(_, schema)| schema.columns.len())
-            .sum::<usize>()
-            != width
-        {
-            return None;
-        }
-        let mut tables = SmallVec::new();
-        let mut lower = Vec::with_capacity(width);
-        let mut types = Vec::with_capacity(width);
-        for (name, schema) in sides {
-            tables.push((name, lower.len()));
-            lower.extend(schema.columns.iter().map(|c| c.name.to_lowercase()));
-            types.extend(schema.columns.iter().map(|c| c.data_type));
-        }
-        Some(Self {
-            tables,
-            columns: CompactArc::new((0..width).map(|i| format!("{RESOLVED}#{i}")).collect()),
-            lower: CompactArc::new(lower),
-            types,
-        })
     }
 
     /// The joined row a join path lays out as `columns` from its `leaves`,
@@ -7093,24 +7066,21 @@ impl PreparedDml {
             rewritten_values.push(programs);
         }
         // ON CONFLICT reads the row met and the excluded row, joined
-        let joined = conflict
-            .map(|sites| {
-                let width = sites.schema.columns.len();
-                let excluded = SmartString::from("excluded");
-                // `excluded` names the excluded row, also when the target bears
-                // that name; the target then has a name no qualifier can spell
-                let target = if *sites.table == excluded {
-                    SmartString::from(format!("{RESOLVED}{excluded}"))
-                } else {
-                    sites.table.clone()
-                };
-                ScopeTable::joined(
-                    [(target, sites.schema), (excluded, sites.schema)],
-                    2 * width,
-                )
-                .ok_or_else(|| Error::internal("an ON CONFLICT row that does not line up"))
-            })
-            .transpose()?;
+        let joined = conflict.map(|sites| {
+            let excluded = SmartString::from("excluded");
+            // `excluded` names the excluded row, also when the target bears
+            // that name; the target then has a name no qualifier can spell
+            let target = if *sites.table == excluded {
+                SmartString::from(format!("{RESOLVED}{excluded}"))
+            } else {
+                sites.table.clone()
+            };
+            ScopeTable::beside(
+                ScopeTable::of(target, sites.schema),
+                ScopeTable::of(excluded, sites.schema),
+            )
+            .by_position()
+        });
         let mut conflict_parts = None;
         if let (Some(sites), Some(joined)) = (conflict, &joined) {
             let scopes = [joined];
@@ -7297,6 +7267,9 @@ pub(crate) struct JoinBlocks {
     fitted: [std::sync::OnceLock<CompactArc<Schema>>; 2],
     /// Whether each side is read whole as rows, not scanned as a table
     pub(crate) rows_sides: [bool; 2],
+    /// The plan of a side that is itself a join, which runs its ON's
+    /// subqueries as its own blocks; None for a side that is one source
+    pub(crate) nested: [Option<RwLock<CompiledExecution>>; 2],
     /// The conditions on a side read as rows that ask a block of each row,
     /// asked of the joined row with the WHERE's others there
     pub(crate) moved: Option<Expression>,
@@ -7341,6 +7314,16 @@ impl JoinBlocks {
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
     fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
+        // A joined side's rows are read by position, its tables' columns in turn
+        if self.nested[side].is_some() {
+            let width = [self.left.len(), self.right.len()][side];
+            if columns.len() == width {
+                return Ok(());
+            }
+            return Err(Error::SchemaChanged {
+                table: name.to_string(),
+            });
+        }
         let prepared = &self.side_columns[side];
         if prepared.len() == columns.len()
             && prepared.iter().zip(columns).all(|(c, n)| c.name == *n)
@@ -7365,16 +7348,25 @@ impl JoinBlocks {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
-        sides: [(SmartString, &Schema, bool); 2],
+        sides: &JoinSides,
         width: usize,
         param_count: usize,
     ) -> Result<Option<Self>> {
-        let rows_sides = [sides[0].2, sides[1].2];
-        let sides = sides.map(|(name, schema, _)| (name, schema));
-        let left_width = sides[0].1.columns.len();
-        let Some(scope) = ScopeTable::joined(sides.clone(), width) else {
+        let rows_sides = [sides[0].rows, sides[1].rows];
+        let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
+            ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
+        };
+        // Each side's tables side by side, read by position in the joined row
+        let side_scope = |side: &JoinSide| side.leaves.iter().map(table).reduce(ScopeTable::beside);
+        let (Some(left_scope), Some(right_scope)) = (side_scope(&sides[0]), side_scope(&sides[1]))
+        else {
             return Ok(None);
         };
+        let left_width = left_scope.columns.len();
+        let scope = ScopeTable::beside(left_scope, right_scope).by_position();
+        if scope.columns.len() != width {
+            return Ok(None);
+        }
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -7399,7 +7391,12 @@ impl JoinBlocks {
                 kept[i] = Some(filter.clone());
                 continue;
             }
-            let side = ScopeTable::of(sides[i].0.clone(), sides[i].1);
+            // Only a side of one source is given conditions of its own
+            let Some(schema) = sides[i].schema() else {
+                moved.push(filter.clone());
+                continue;
+            };
+            let side = table(&sides[i].leaves[0]);
             let side_scopes = [&side];
             let side_chain = Chain {
                 scopes: &side_scopes,
@@ -7407,7 +7404,7 @@ impl JoinBlocks {
             let (mut parts, mut binds) = (Vec::new(), Vec::new());
             conjuncts(filter, &mut parts);
             for part in parts.into_iter().filter(|part| mentions_subquery(part)) {
-                match builder.binds_before_rows(&side_chain, sides[i].1, part)? {
+                match builder.binds_before_rows(&side_chain, schema, part)? {
                     true => binds.push(part.clone()),
                     false => moved.push(part.clone()),
                 }
@@ -7457,11 +7454,10 @@ impl JoinBlocks {
         let registry = &executor.function_registry;
         let mut side_parts = [None, None];
         for (i, filter) in side_filters.into_iter().enumerate() {
-            let Some(filter) = filter else {
+            let (Some(filter), Some(schema)) = (filter, sides[i].schema()) else {
                 continue;
             };
-            let (name, schema) = (&sides[i].0, sides[i].1);
-            let side = ScopeTable::of(name.clone(), schema);
+            let side = table(&sides[i].leaves[0]);
             let side_scopes = [&side];
             let side_chain = Chain {
                 scopes: &side_scopes,
@@ -7498,10 +7494,13 @@ impl JoinBlocks {
             .collect::<Result<Vec<_>>>()?;
         let mut side_filters = [None, None];
         let mut side_wheres = [None, None];
-        let side_columns = [sides[0].1.columns.clone(), sides[1].1.columns.clone()];
+        let side_columns = sides
+            .each_ref()
+            .map(|side| side.schema().map(|s| s.columns.clone()).unwrap_or_default());
         for (i, part) in side_parts.into_iter().enumerate() {
-            if let Some((parts, program, joined_clause)) = part {
-                side_wheres[i] = Some(parts.prepare(program, &blocks, sides[i].1));
+            if let (Some((parts, program, joined_clause)), Some(schema)) = (part, sides[i].schema())
+            {
+                side_wheres[i] = Some(parts.prepare(program, &blocks, schema));
                 side_filters[i] = Some(joined_clause);
             }
         }
@@ -7547,6 +7546,9 @@ impl JoinBlocks {
             side_columns,
             fitted: Default::default(),
             rows_sides,
+            nested: sides.each_ref().map(|side| {
+                (side.leaves.len() > 1).then(|| RwLock::new(CompiledExecution::Unknown))
+            }),
             moved,
             select,
             order_by,
@@ -7674,7 +7676,7 @@ impl Executor {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
-        sides: [(SmartString, &Schema, bool); 2],
+        sides: &JoinSides,
         width: usize,
         ctx: &ExecutionContext,
     ) -> Result<Option<JoinBlocks>> {
