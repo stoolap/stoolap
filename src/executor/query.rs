@@ -1430,9 +1430,9 @@ impl Executor {
         // subquery for the aggregation entry, which runs with the CTEs bound
         // A statement of the prepared or grouped family keeps its plan: its
         // CTEs inline as the CTE path inlines them, or are read from the
-        // context, materialized under the snapshot its subqueries read
-        let ctes_ctx;
-        let ctx = if self.has_cte(stmt) {
+        // context, materialized under the snapshot its subqueries read and
+        // cut as the CTE path cuts them
+        if self.has_cte(stmt) {
             let grouped = || {
                 Self::grouped_family_reach(stmt, &get_classification(stmt))
                     && self.grouped_family(stmt, Some(ctx)).is_ok()
@@ -1457,12 +1457,38 @@ impl Executor {
                 None => self.with_counts_snapshot(ctx)?,
             };
             let ctx = snapshot.as_ref().unwrap_or(ctx);
-            ctes_ctx = ctx.with_cte_data(self.materialize_ctes(with, ctx, None)?.data());
-            &ctes_ctx
-        } else {
-            ctx
-        };
+            return self.run_over_cut_ctes(stmt, with, ctx, |ctes| {
+                let ctx = ctx.with_cte_data(ctes.data());
+                self.select_rows_with_plan(
+                    stmt,
+                    &ctx,
+                    reads_blocks,
+                    plan_classification,
+                    compiled,
+                    counts,
+                )
+            });
+        }
+        self.select_rows_with_plan(
+            stmt,
+            ctx,
+            reads_blocks,
+            plan_classification,
+            compiled,
+            counts,
+        )
+    }
 
+    /// `select_with_plan` past its CTEs, which `ctx` holds
+    fn select_rows_with_plan(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        reads_blocks: bool,
+        plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        counts: Option<&super::query_cache::CountsSlot>,
+    ) -> Result<Box<dyn QueryResult>> {
         // The subquery is read once, before any path reads a row, with the
         // CTEs of the statement bound
         let counts_ctx;
@@ -5124,9 +5150,8 @@ impl Executor {
     }
 
     /// Whether a join with a subquery in a clause keeps its plan, its CTEs
-    /// bound or inlined, so its blocks may run; a join whose LIMIT the CTE
-    /// path cuts into a CTE it does not inline, with a CTE not named before
-    /// it runs, or with a joined side that merges columns, stays there
+    /// bound or inlined, so its blocks may run; a join with a CTE not named
+    /// before it runs, or with a joined side that merges columns, stays there
     pub(crate) fn join_keeps_plan(&self, stmt: &SelectStatement, with: &WithClause) -> bool {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return false;
@@ -5141,8 +5166,6 @@ impl Executor {
             && (classification.where_has_subqueries
                 || classification.output_has_subqueries
                 || Self::ons_hold_subqueries(join))
-            && (self.compute_cte_limit_hints(stmt, with).is_empty()
-                || self.try_inline_ctes(stmt, with).is_some())
             && self.named_ctes(with).is_ok()
     }
 
