@@ -5236,16 +5236,13 @@ impl Builder<'_> {
         let mut items = Vec::with_capacity(bound.len());
         for expr in bound {
             // A name no scope holds that only an aggregate item's alias carries
-            let rewritten = match self.rewrite(chain, Some(id), &expr, work) {
-                Err(Error::ColumnNotFound(_))
-                    if matches!(&expr, Expression::Identifier(name)
-                        if names_aggregate_item(&name.value, &sq.columns)) =>
-                {
-                    return Err(aggregate_group_key());
-                }
-                rewritten => rewritten?,
-            };
-            items.push(rewritten);
+            if matches!(&expr, Expression::Identifier(name)
+                if names_aggregate_item(&name.value, &sq.columns))
+                && !matches!(chain.resolve(&expr), Ok(Some(_)))
+            {
+                return Err(aggregate_group_key());
+            }
+            items.push(self.rewrite(chain, Some(id), &expr, work)?);
         }
         let having = match sq.having.as_deref() {
             Some(having) => {

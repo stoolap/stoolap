@@ -194,6 +194,9 @@ fn an_aggregate_group_by_key_is_one_error_however_it_is_written() {
         "SELECT COUNT(*) FROM one GROUP BY CAST(SUM(id) AS TEXT) LIKE '1%'",
         "SELECT COUNT(*) FROM one GROUP BY 'x' LIKE CAST(MIN(id) AS TEXT)",
         "SELECT COUNT(*) FROM one GROUP BY (a, SUM(id)) = (1, 2)",
+        "SELECT COUNT(*) AS c FROM one GROUP BY \"c\"",
+        "SELECT COUNT(*) AS c, (SELECT MAX(x) FROM u) FROM one GROUP BY \"c\"",
+        "SELECT id, (SELECT COUNT(*) AS c FROM u GROUP BY \"c\") FROM one",
     ] {
         match error(&db, sql) {
             Some(e) if e.contains("an aggregate function cannot be a GROUP BY key") => {}
@@ -258,6 +261,25 @@ fn a_quoted_group_by_name_binds_as_the_compiler_binds_it() {
                 "Some(Integer(10))|Some(Integer(2))",
                 "Some(Integer(20))|Some(Integer(1))",
             ],
+        ),
+        (
+            "SELECT one.a, COUNT(*) FROM one GROUP BY \"a\" HAVING one.a > 0 ORDER BY one.a",
+            vec![
+                "Some(Integer(10))|Some(Integer(2))",
+                "Some(Integer(20))|Some(Integer(1))",
+            ],
+        ),
+        (
+            "SELECT \"constant\", COUNT(*) FROM one GROUP BY 1",
+            vec!["Some(Text(\"constant\"))|Some(Integer(3))"],
+        ),
+        (
+            "SELECT \"constant\" AS k, COUNT(*) FROM one GROUP BY 1",
+            vec!["Some(Text(\"constant\"))|Some(Integer(3))"],
+        ),
+        (
+            "SELECT \"constant\", COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY 1",
+            vec!["Some(Text(\"constant\"))|Some(Integer(3))|Some(Integer(6))"],
         ),
     ] {
         assert_eq!(rows(&db, sql), want, "{sql}");

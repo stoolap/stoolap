@@ -276,6 +276,22 @@ pub(crate) fn names_aggregate_item(name: &str, select: &[Expression]) -> bool {
     })
 }
 
+/// The quoted name `stmt` writes as its GROUP BY key at `at`, itself or as
+/// the SELECT item a position names
+fn written_quoted(stmt: &SelectStatement, at: usize) -> Option<&Expression> {
+    let key = match grouping_items(stmt).get(at) {
+        Some(Expression::IntegerLiteral(position)) => usize::try_from(position.value)
+            .ok()
+            .and_then(|position| stmt.columns.get(position.checked_sub(1)?))
+            .map(|item| match item {
+                Expression::Aliased(aliased) => &*aliased.expression,
+                item => item,
+            }),
+        key => key.copied(),
+    };
+    key.filter(|key| matches!(key, Expression::Identifier(id) if id.quoted))
+}
+
 /// Whether `name`, a GROUP BY column the input does not hold, is a column of
 /// the outer row `ctx` runs for
 fn names_outer_column(name: &str, ctx: &ExecutionContext) -> bool {
@@ -900,14 +916,14 @@ struct RowFeed<'a> {
 }
 
 impl<'a> RowFeed<'a> {
-    /// The feed of `aggregations` grouped by `group_items` over `columns`,
-    /// for this execution of `ctx`'s statement, whose SELECT list is
-    /// `select`: its subqueries run as the statement's `blocks`, each set
-    /// they read tested in place, and what reads a parameter folds it
+    /// The feed of `aggregations` grouped by `group_items`, the keys `stmt`
+    /// writes, over `columns`, for this execution of `ctx`'s statement: its
+    /// subqueries run as the statement's `blocks`, each set they read tested
+    /// in place, and what reads a parameter folds it
     fn new(
         aggregations: &'a [SqlAggregateFunction],
         group_items: &[GroupByItem],
-        select: &[Expression],
+        stmt: Option<&SelectStatement>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
@@ -932,7 +948,8 @@ impl<'a> RowFeed<'a> {
         };
         let items = group_items
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(at, item)| {
                 Ok(match item {
                     GroupByItem::Column(name) => {
                         match Executor::lookup_column_index(&name.to_lowercase(), col_index_map) {
@@ -940,15 +957,22 @@ impl<'a> RowFeed<'a> {
                             // The outer row's column is one value for every row
                             None if names_outer_column(name, ctx) => KeyItem::Null,
                             // A name only an aggregate item's alias carries
-                            None if names_aggregate_item(name, select) => {
+                            None if stmt
+                                .is_some_and(|s| names_aggregate_item(name, &s.columns)) =>
+                            {
                                 return Err(aggregate_group_key())
                             }
-                            None => {
-                                return Err(ungrouped_column(&match split_qualified(name) {
-                                    Some((table, column)) => format!("{table}.{column}"),
-                                    None => name.clone(),
-                                }))
-                            }
+                            None => match stmt.and_then(|s| written_quoted(s, at)) {
+                                // A quoted name no column carries is its text,
+                                // as the compiler reads it
+                                Some(quoted) => KeyItem::Program(compile(quoted)?),
+                                None => {
+                                    return Err(ungrouped_column(&match split_qualified(name) {
+                                        Some((table, column)) => format!("{table}.{column}"),
+                                        None => name.clone(),
+                                    }))
+                                }
+                            },
                         }
                     }
                     GroupByItem::Expression { expr, .. } => KeyItem::Program(compile(expr)?),
@@ -1271,7 +1295,7 @@ impl Executor {
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
-                &stmt.columns,
+                stmt,
                 &base_rows,
                 base_columns,
                 &col_index_map,
@@ -2129,7 +2153,7 @@ impl Executor {
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
-                &stmt.columns,
+                stmt,
                 base_rows,
                 base_columns,
                 &col_index_map,
@@ -2566,12 +2590,6 @@ impl Executor {
                             expr: aliased_expr.clone(),
                             display_name: id.value.to_string(),
                         });
-                    } else if id.quoted {
-                        // The compiler binds a quoted name: a column, else its text
-                        group_items.push(GroupByItem::Expression {
-                            expr: expr.clone(),
-                            display_name: id.value.to_string(),
-                        });
                     } else {
                         // Regular column reference
                         group_items.push(GroupByItem::Column(id.value.to_string()));
@@ -2706,7 +2724,7 @@ impl Executor {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
         let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
-        RowFeed::new(aggregations, &[], &[], columns, col_index_map, ctx, blocks)?.run_rows(
+        RowFeed::new(aggregations, &[], None, columns, col_index_map, ctx, blocks)?.run_rows(
             &mut groups,
             rows,
             ctx,
@@ -2723,7 +2741,7 @@ impl Executor {
         &self,
         aggregations: &[SqlAggregateFunction],
         group_by_items: &[GroupByItem],
-        select: &[Expression],
+        stmt: &SelectStatement,
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
@@ -2739,7 +2757,7 @@ impl Executor {
         RowFeed::new(
             aggregations,
             group_by_items,
-            select,
+            Some(stmt),
             columns,
             col_index_map,
             ctx,
@@ -2793,7 +2811,7 @@ impl Executor {
         let feed = RowFeed::new(
             aggregations,
             group_by_items,
-            &stmt.columns,
+            Some(stmt),
             columns,
             col_index_map,
             ctx,
@@ -3573,7 +3591,7 @@ impl Executor {
         let feed = RowFeed::new(
             &aggregations,
             &[],
-            &[],
+            None,
             &schema_lower,
             &col_index_map,
             ctx,
@@ -3729,7 +3747,7 @@ impl Executor {
         let feed = RowFeed::new(
             &aggregations,
             &group_items,
-            &stmt.columns,
+            Some(stmt),
             &source_columns,
             &col_index_map,
             ctx,
