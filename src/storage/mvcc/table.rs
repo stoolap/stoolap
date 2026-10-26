@@ -255,6 +255,18 @@ pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i
     }
 }
 
+/// The primary key value when `expr` is `pk = <integer>` or an AND with
+/// such a conjunct: a row's id is its key, so it names at most one row,
+/// which the rest of `expr` still judges
+pub(crate) fn pk_conjunct_id(expr: &dyn Expression, schema: &Schema) -> Option<i64> {
+    match expr.get_and_operands() {
+        Some(operands) => operands
+            .iter()
+            .find_map(|operand| pk_conjunct_id(operand.as_ref(), schema)),
+        None => pk_equality_id(expr, schema),
+    }
+}
+
 /// `row` as a row of `schema` after ALTER TABLE ADD or DROP COLUMN: the
 /// default value, or NULL, for a column it lacks; one past the schema's
 /// last column dropped
@@ -779,7 +791,12 @@ impl MVCCTable {
             }
 
             if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                return self.query_index_with_operator(&*index, operator, value, history);
+                let row_ids = self.query_index_with_operator(&*index, operator, value, history);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::hot_index_ids_add(
+                    row_ids.as_ref().map_or(0, |ids| ids.len()),
+                );
+                return row_ids;
             }
         }
 
@@ -870,6 +887,15 @@ impl MVCCTable {
                 }
                 return Some(result);
             }
+        }
+
+        if let Some(id) = expr
+            .get_and_operands()
+            .and_then(|_| pk_conjunct_id(expr, &self.cached_schema))
+        {
+            let mut row_ids = RowIdVec::new();
+            row_ids.push(id);
+            return Some(row_ids);
         }
 
         // OPTIMIZATION: Detect BETWEEN/range pattern (col >= X AND col <= Y) for single range scan
@@ -5367,6 +5393,31 @@ impl Table for MVCCTable {
                         pk_value: format!("{}", value),
                     };
                 }
+            }
+
+            // An AND with a key equality reads that one row, as index_lookup does
+            if let (Some(id), Some(index)) = (
+                pk_conjunct_id(expr, schema),
+                self.version_store.get_index_by_column(&pk_col.name),
+            ) {
+                let key = Value::Integer(id);
+                let residual: Vec<String> = expr
+                    .collect_comparisons()
+                    .iter()
+                    .filter(|(col, op, val)| {
+                        !(col.eq_ignore_ascii_case(&pk_col.name)
+                            && *op == Operator::Eq
+                            && **val == key)
+                    })
+                    .map(|(col, op, val)| format!("{} {} {}", col, operator_to_string(*op), val))
+                    .collect();
+                return ScanPlan::IndexScan {
+                    table: table_name,
+                    index_name: index.name().to_string(),
+                    column: pk_col.name.clone(),
+                    condition: format!("= {}", id),
+                    filter: (!residual.is_empty()).then(|| residual.join(" AND ")),
+                };
             }
         }
 
