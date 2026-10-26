@@ -349,3 +349,48 @@ fn a_valid_position_leaves_a_correlated_exists_plan_as_it_is() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_position_in_a_derived_table_of_a_subquery_names_a_shown_column() {
+    let db = Database::open("memory://order_by_position_derived_block").unwrap();
+    setup(&db);
+    // `{p}` is the position, `{c}` the correlation
+    let derived = [
+        "(SELECT * FROM child ORDER BY {p}) AS d",
+        "(SELECT c.* FROM child AS c ORDER BY {p}) AS d",
+        "(SELECT * FROM (SELECT * FROM child ORDER BY {p}) AS e) AS d",
+    ];
+    let mut wrong = Vec::new();
+    for outer in ["parent", "nobody"] {
+        for from in derived {
+            for correlation in [" WHERE d.id = p.id", ""] {
+                for form in [
+                    "SELECT p.id FROM {o} AS p WHERE EXISTS (SELECT * FROM {d}{c})",
+                    "SELECT p.id FROM {o} AS p WHERE NOT EXISTS (SELECT * FROM {d}{c})",
+                    "SELECT p.id, (SELECT d.a FROM {d}{c} LIMIT 1) FROM {o} AS p",
+                    "SELECT p.id FROM {o} AS p WHERE p.id IN (SELECT d.id FROM {d}{c})",
+                ] {
+                    let sql = |p: &str| {
+                        form.replace("{d}", from)
+                            .replace("{c}", correlation)
+                            .replace("{o}", outer)
+                            .replace("{p}", p)
+                    };
+                    for (run, got) in runs(&db, &sql("3 DESC")) {
+                        if let Err(e) = got {
+                            wrong.push(format!("{} ({run}) refused: {e}", sql("3 DESC")));
+                        }
+                    }
+                    for p in ["4", "1, 4", "0"] {
+                        for (run, got) in runs(&db, &sql(p)) {
+                            if !got.as_ref().is_err_and(|e| e.contains("ORDER BY position")) {
+                                wrong.push(format!("{} ({run}): {got:?}", sql(p)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

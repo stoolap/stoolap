@@ -1230,6 +1230,15 @@ impl StatementWalk<'_> {
             ..level.clone()
         };
         let names = output_names(stmt, &own)?;
+        // Its ORDER BY positions count the columns it shows, whether or not
+        // it ever runs
+        if let Some(position) =
+            crate::parser::scope::order_position_outside(stmt, Some(names.len()))
+        {
+            return Err(Error::invalid_argument(
+                crate::parser::scope::order_position_message(position.value),
+            ));
+        }
         let all = |walk: &mut Self, exprs: &[Expression]| {
             exprs
                 .iter()
