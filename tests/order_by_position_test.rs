@@ -21,6 +21,8 @@ use stoolap::Database;
 
 fn setup(db: &Database) {
     for sql in [
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, b INTEGER)",
+        "INSERT INTO parent VALUES (1, 5), (2, 7), (9, 1)",
         "CREATE TABLE child (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
         "INSERT INTO child VALUES (1, 1, 100), (2, 2, 0), (3, 3, 50), (4, 1, 70)",
         "CREATE TABLE side (id INTEGER PRIMARY KEY, k INTEGER)",
@@ -75,8 +77,10 @@ const FILTERS: [(&str, &str); 2] = [
 
 /// (name, the items, the columns they show written out, what follows
 /// WHERE before ORDER BY); `{star}` is the source's columns
-const SHAPES: [(&str, &str, &str, &str); 10] = [
+const SHAPES: [(&str, &str, &str, &str); 11] = [
     ("columns", "c.a, c.b", "c.a, c.b", ""),
+    // No qualifier anywhere, as a statement the scope check may skip
+    ("bare columns", "a, b", "a, b", ""),
     ("alias", "c.a AS x, c.b", "c.a, c.b", ""),
     ("computed", "c.a % 2, c.b", "c.a % 2, c.b", ""),
     ("star", "*", "{star}", ""),
@@ -98,8 +102,15 @@ const SHAPES: [(&str, &str, &str, &str); 10] = [
     ),
 ];
 
-/// Where the query stands: alone, as a derived table, or inside EXISTS
-const NESTINGS: [&str; 3] = ["top", "derived", "exists"];
+/// Where the query stands: alone, as a derived table, inside EXISTS, or
+/// inside an EXISTS or NOT EXISTS that reads the enclosing row
+const NESTINGS: [&str; 5] = [
+    "top",
+    "derived",
+    "exists",
+    "correlated exists",
+    "correlated not exists",
+];
 
 #[test]
 fn an_order_by_position_names_a_shown_column() {
@@ -125,7 +136,12 @@ fn an_order_by_position_names_a_shown_column() {
             let written: Vec<&str> = written.split(", ").collect();
             for (pipeline, filter) in FILTERS {
                 for limit in ["", " LIMIT 3"] {
-                    let query = |keys: &str| {
+                    let query = |keys: &str, correlated: bool| {
+                        let filter = match (correlated, filter) {
+                            (false, filter) => filter.to_string(),
+                            (true, "") => " WHERE c.id = p.id".to_string(),
+                            (true, filter) => format!("{filter} AND c.id = p.id"),
+                        };
                         format!("SELECT {items} FROM {from}{filter}{tail} ORDER BY {keys}{limit}")
                     };
                     // Every position, the last one first and descending
@@ -164,15 +180,24 @@ fn an_order_by_position_names_a_shown_column() {
                     }
                     for (keys, written_keys) in keys {
                         for nesting in NESTINGS {
+                            let correlated = nesting.starts_with("correlated");
                             let wrap = |q: String| match nesting {
                                 "top" => format!("{with}{q}"),
                                 "derived" => format!("{with}SELECT * FROM ({q}) AS d"),
-                                _ => format!("{with}SELECT EXISTS ({q})"),
+                                "exists" => format!("{with}SELECT EXISTS ({q})"),
+                                "correlated exists" => format!(
+                                    "{with}SELECT p.id FROM parent AS p WHERE EXISTS ({q}) \
+                                     ORDER BY p.id"
+                                ),
+                                _ => format!(
+                                    "{with}SELECT p.id FROM parent AS p WHERE NOT EXISTS ({q}) \
+                                     ORDER BY p.id"
+                                ),
                             };
-                            let sql = wrap(query(&keys));
+                            let sql = wrap(query(&keys, correlated));
                             let want = match &written_keys {
                                 Some(written_keys) => {
-                                    let base = wrap(query(written_keys));
+                                    let base = wrap(query(written_keys, correlated));
                                     match collect(db.query(&base, ())) {
                                         Ok(rows) => Ok(rows),
                                         Err(e) => panic!("{base}: {e}"),
@@ -231,4 +256,49 @@ fn an_order_by_position_names_a_shown_column() {
         "{total} of {cases} wrong:\n{}",
         table.join("\n")
     );
+}
+
+#[test]
+fn a_star_of_one_column_counts_one_position_in_every_subquery() {
+    let db = Database::open("memory://order_by_position_one_column").unwrap();
+    setup(&db);
+    for sql in [
+        "CREATE TABLE solo (id INTEGER PRIMARY KEY)",
+        "INSERT INTO solo VALUES (1), (2), (9)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for inner in [
+        "SELECT * FROM solo AS o ORDER BY {p}",
+        "SELECT * FROM solo AS o WHERE o.id = p.id ORDER BY {p}",
+        "SELECT o.* FROM solo AS o WHERE o.id >= p.id ORDER BY {p} LIMIT 1",
+    ] {
+        for outer in [
+            "SELECT p.id FROM parent AS p WHERE p.id IN ({q}) ORDER BY p.id",
+            "SELECT p.id FROM parent AS p WHERE p.id NOT IN ({q}) ORDER BY p.id",
+            "SELECT p.id FROM parent AS p WHERE p.id = ANY ({q}) ORDER BY p.id",
+            "SELECT p.id, ({q} LIMIT 1) FROM parent AS p ORDER BY p.id",
+            "SELECT p.id FROM parent AS p WHERE EXISTS ({q}) ORDER BY p.id",
+        ] {
+            // A scalar subquery holds one LIMIT
+            if outer.contains("LIMIT 1)") && inner.contains("LIMIT") {
+                continue;
+            }
+            let sql = |p: &str| outer.replace("{q}", &inner.replace("{p}", p));
+            for (run, got) in runs(&db, &sql("1")) {
+                if let Err(e) = got {
+                    wrong.push(format!("{} ({run}) refused: {e}", sql("1")));
+                }
+            }
+            for p in ["0", "2"] {
+                for (run, got) in runs(&db, &sql(p)) {
+                    if !got.as_ref().is_err_and(|e| e.contains("ORDER BY position")) {
+                        wrong.push(format!("{} ({run}): {got:?}", sql(p)));
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

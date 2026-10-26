@@ -2142,6 +2142,10 @@ impl Parser<'_> {
     /// Parse an ORDER BY expression
     pub fn parse_order_by_expression(&mut self) -> Option<OrderByExpression> {
         let expression = self.parse_expression(Precedence::Lowest)?;
+        // A position must name a column of the SELECT list
+        if matches!(expression, Expression::IntegerLiteral(_)) {
+            self.scope_checked = true;
+        }
 
         let mut ascending = true;
         if self.peek_token_is_keyword(Keyword::Asc) {
