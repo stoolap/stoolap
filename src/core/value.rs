@@ -1504,17 +1504,16 @@ fn zone_written(s: &str) -> bool {
     if b.last() == Some(&b'Z') {
         return true;
     }
-    // The zone's sign comes after the date's dashes and the time
+    // The date and the time before it are chrono's to read
     let Some(sign) = b.iter().rposition(|&c| c == b'+' || c == b'-') else {
         return false;
     };
     let digits = |part: &[u8]| part.iter().all(u8::is_ascii_digit);
-    sign >= 19
-        && match &b[sign + 1..] {
-            zone @ ([_, _] | [_, _, _, _]) => digits(zone),
-            [h1, h2, b':', m1, m2] => digits(&[*h1, *h2, *m1, *m2]),
-            _ => false,
-        }
+    match &b[sign + 1..] {
+        zone @ ([_, _] | [_, _, _, _]) => digits(zone),
+        [h1, h2, b':', m1, m2] => digits(&[*h1, *h2, *m1, *m2]),
+        _ => false,
+    }
 }
 
 /// `parse_timestamp` through chrono's parser, one format after another
@@ -2167,6 +2166,9 @@ mod tests {
             ("2024-01-10T00:00:00-05", "2024-01-10T05:00:00+00:00"),
             ("2024-01-10T00:00:00.5Z", "2024-01-10T00:00:00.500+00:00"),
             ("2024-01-10T00:00:00+00:00", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10T3:00:00+03:00", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10 3:00:00+03", "2024-01-10T00:00:00+00:00"),
+            ("2024-01-10T3:00:00Z", "2024-01-10T03:00:00+00:00"),
         ] {
             assert_eq!(at(text).as_deref(), Some(want), "{text:?}");
         }
