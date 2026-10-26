@@ -467,13 +467,24 @@ fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
 }
 
 #[test]
-fn an_uncorrelated_block_over_a_join_is_bound_with_no_row_asking_it() {
+fn a_block_over_a_join_is_bound_when_prepared_and_run_when_asked() {
+    use stoolap::test_failpoints::{prepared_strategy_runs, PreparedStrategy};
     let _guard = serial();
     let db = hot("bound");
-    db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, a INTEGER)", ())
-        .unwrap();
+    for sql in [
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO m VALUES (1, -9223372036854775808)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
     let ungrouped = Err("Compile error: Column 'u.x' not found".to_string());
+    let overflow = Err("type error: Integer overflow in ABS: -9223372036854775808".to_string());
+    let none = Ok(Vec::new());
     let mut wrong = Vec::new();
+    // Each shape over a join answers as its twin over one table does
     for (sql, want) in [
         (
             "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
@@ -490,14 +501,69 @@ fn an_uncorrelated_block_over_a_join_is_bound_with_no_row_asking_it() {
             ungrouped.clone(),
         ),
         (
-            "SELECT id FROM e WHERE EXISTS (SELECT v.x FROM u JOIN u AS v ON v.id = u.id \
-             GROUP BY v.x)",
-            Ok(Vec::new()),
-        ),
-        (
             "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u JOIN u AS v ON v.id = u.id \
              WHERE u.id = e.id GROUP BY v.x)",
-            Ok(Vec::new()),
+            ungrouped.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT u.x FROM u WHERE u.id = e.id GROUP BY u.id)",
+            Err("Compile error: Column 'x' not found".to_string()),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT v.x FROM u JOIN u AS v ON v.id = u.id \
+             GROUP BY v.x)",
+            none.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT 1 FROM m JOIN u ON u.id = m.id \
+             WHERE ABS(m.x) > 0)",
+            none.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE EXISTS (SELECT 1 FROM m WHERE ABS(m.x) > 0)",
+            none.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE a IN (SELECT ABS(m.x) FROM m JOIN u ON u.id = m.id)",
+            none.clone(),
+        ),
+        (
+            "SELECT id FROM e WHERE a IN (SELECT ABS(m.x) FROM m)",
+            none.clone(),
+        ),
+        (
+            "SELECT id FROM one WHERE CASE WHEN id = 0 THEN (SELECT ABS(m.x) FROM m \
+             JOIN u ON u.id = m.id LIMIT 1) > 0 ELSE TRUE END",
+            Ok(vec!["1".to_string()]),
+        ),
+        (
+            "SELECT id FROM one WHERE CASE WHEN id = 0 THEN (SELECT ABS(m.x) FROM m \
+             LIMIT 1) > 0 ELSE TRUE END",
+            Ok(vec!["1".to_string()]),
+        ),
+        (
+            "SELECT id FROM one WHERE CASE WHEN id = 0 THEN EXISTS (SELECT 1 FROM m \
+             JOIN u ON u.id = m.id WHERE ABS(m.x) > 0) ELSE TRUE END",
+            Ok(vec!["1".to_string()]),
+        ),
+        (
+            "SELECT id FROM one WHERE CASE WHEN id = 0 THEN 1 IN (SELECT ABS(m.x) FROM m \
+             JOIN u ON u.id = m.id) ELSE TRUE END",
+            Ok(vec!["1".to_string()]),
+        ),
+        (
+            "SELECT id FROM one WHERE CASE WHEN id = 0 THEN (SELECT ABS(m.x) + \
+             ROW_NUMBER() OVER () FROM m LIMIT 1) > 0 ELSE TRUE END",
+            Ok(vec!["1".to_string()]),
+        ),
+        (
+            "SELECT id, CASE WHEN id = 0 THEN (SELECT ABS(m.x) FROM m JOIN u \
+             ON u.id = m.id LIMIT 1) END FROM one",
+            overflow.clone(),
+        ),
+        (
+            "SELECT id, CASE WHEN id = 0 THEN (SELECT ABS(m.x) FROM m LIMIT 1) END FROM one",
+            overflow.clone(),
         ),
         (
             "SELECT id, (SELECT u.x FROM u JOIN w ON w.id = u.id) FROM e",
@@ -515,6 +581,39 @@ fn an_uncorrelated_block_over_a_join_is_bound_with_no_row_asking_it() {
                 wrong.push(format!("{sql} ({run} run): gave {got:?}, want {want:?}"));
             }
         }
+    }
+    // A LIMIT is checked by the run that reads the block, whatever ran before
+    for sql in [
+        "SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u JOIN w ON w.id = u.id LIMIT $1)",
+        "SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u LIMIT $1)",
+        "SELECT id FROM e WHERE a IN (SELECT u.x FROM u JOIN w ON w.id = u.id LIMIT $1)",
+        "SELECT id FROM e WHERE a IN (SELECT u.x FROM u LIMIT $1)",
+    ] {
+        for bound in [-1i64, 1, -1] {
+            let got = db
+                .query(sql, (bound,))
+                .map(|rows| rows.count())
+                .map_err(|e| e.to_string());
+            if got != Ok(0) {
+                wrong.push(format!(
+                    "{sql} with $1 = {bound}: gave {got:?}, want no row"
+                ));
+            }
+        }
+    }
+    // A plan that finds the block's answer kept by another runs no join for it
+    let block = "a IN (SELECT u.x FROM u JOIN w ON w.id = u.id WHERE w.y > 10)";
+    answer(&db, &format!("SELECT id FROM t WHERE id >= 1 AND {block}")).unwrap();
+    let before = prepared_strategy_runs(PreparedStrategy::BlockStatement);
+    let got = answer(
+        &db,
+        &format!("SELECT id FROM t WHERE id >= 2 AND {block} ORDER BY id"),
+    );
+    if got != Ok(vec!["2".to_string(), "5".to_string()]) {
+        wrong.push(format!("the second plan gave {got:?}"));
+    }
+    if prepared_strategy_runs(PreparedStrategy::BlockStatement) != before {
+        wrong.push("the second plan ran the block's join again".to_string());
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

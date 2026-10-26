@@ -3341,8 +3341,6 @@ struct StatementBlock {
     run: StatementRun,
     form: StatementForm,
     tables: Option<Vec<SmartString>>,
-    /// Set once a run has opened it, which binds what it reads
-    opened: std::sync::OnceLock<()>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4153,6 +4151,14 @@ impl Builder<'_> {
             }
             false => statement,
         };
+        if own.tables.len() > 1 {
+            let slots = work
+                .outer
+                .values()
+                .chain(&params)
+                .filter(|s| **s != usize::MAX);
+            self.bind_join_statement(&statement, slots.max().map_or(0, |slot| slot + 1))?;
+        }
         let (identity, signature, _) = block_identity(sq, form);
         // One that binds nothing beyond itself keeps its answer across
         // statements while the tables it reads, all known, stay as they were
@@ -4181,7 +4187,6 @@ impl Builder<'_> {
                 compiled: RwLock::new(CompiledExecution::Unknown),
             },
             form,
-            opened: std::sync::OnceLock::new(),
         };
         let (holes, hole_exprs, hole_written) = self.compiled_holes(outer, parent, &work)?;
         self.subqueries[id as usize] = Some(PreparedSubquery {
@@ -4206,6 +4211,88 @@ impl Builder<'_> {
             uncorrelated,
         });
         Ok((id, work.delegated, work.reads_parent))
+    }
+
+    /// Raise what binding `statement`, a block's run over a join, raises, as
+    /// a block over one table does when prepared: opened once per schema over
+    /// no row, its WHERE false, no LIMIT or OFFSET, `slots` parameters NULL.
+    /// Only a join of tables holding no subquery opens so computing no value
+    fn bind_join_statement(&self, statement: &SelectStatement, slots: usize) -> Result<()> {
+        let Some(Expression::JoinSource(join)) = statement.table_expr.as_deref() else {
+            return Ok(());
+        };
+        let engine = &self.executor.engine;
+        let (key, schema) = (
+            ExprKey::exact_statement(statement),
+            (engine.instance(), engine.schema_epoch()),
+        );
+        if super::context::statement_bound(key, schema) {
+            return Ok(());
+        }
+        let clauses = statement
+            .columns
+            .iter()
+            .chain(&statement.distinct_on)
+            .chain(statement.where_clause.as_deref())
+            .chain(&statement.group_by.columns)
+            .chain(statement.having.as_deref())
+            .chain(statement.order_by.iter().map(|o| &o.expression));
+        if !statement.set_operations.is_empty()
+            || statement.with.is_some()
+            || clauses.into_iter().any(mentions_subquery)
+            || !self.tables_only(join)?
+        {
+            return Ok(());
+        }
+        let never = Expression::BooleanLiteral(BooleanLiteral {
+            token: Token::new(TokenType::Keyword, "FALSE", Position::default()),
+            value: false,
+        });
+        let check = SelectStatement {
+            where_clause: conjunction(
+                std::iter::once(never)
+                    .chain(statement.where_clause.as_deref().cloned())
+                    .collect(),
+            )
+            .map(Box::new),
+            limit: None,
+            offset: None,
+            ..statement.clone()
+        };
+        let mut params: ParamVec = self.ctx.params().iter().cloned().collect();
+        if params.len() < slots {
+            params.resize(slots, Value::null_unknown());
+        }
+        drop(
+            self.executor
+                .execute_select(&check, &self.ctx.with_slot_params(params))?,
+        );
+        super::context::keep_statement_bound(key, schema);
+        Ok(())
+    }
+
+    /// Whether every source the join `join` reads is a table, its ON holding
+    /// no subquery
+    fn tables_only(&self, join: &JoinTableSource) -> Result<bool> {
+        if join.condition.as_deref().is_some_and(mentions_subquery) {
+            return Ok(false);
+        }
+        for side in [&*join.left, &*join.right] {
+            let table = match side {
+                Expression::JoinSource(join) => self.tables_only(join)?,
+                Expression::TableSource(ts) => {
+                    let name = ts.name.value_lower.as_str();
+                    ts.as_of.is_none()
+                        && self.named_source(name)?.is_none()
+                        && self.executor.engine.table_exists(name)?
+                }
+                _ => false,
+            };
+            if !table {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// `expr` of the statement as written, with each subquery in it prepared
@@ -6790,7 +6877,6 @@ impl Executor {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
-        runner.open_statements(&held.holes)?;
         runner.read_ahead(&held.ahead, &held.holes)?;
         Ok(Some(runner))
     }
@@ -7572,7 +7658,6 @@ impl Executor {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
-        runner.open_statements(holes)?;
         runner.read_ahead(&held.ahead, holes)?;
         Ok(Some(runner))
     }
@@ -7831,7 +7916,6 @@ impl<'a> DmlRunner<'a> {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
-        runner.open_statements(&prepared.holes)?;
         Ok(Self { runner, prepared })
     }
 
@@ -8877,7 +8961,6 @@ impl Executor {
                 runner.base[slot] = value;
             }
         }
-        runner.open_statements(&prepared.holes)?;
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
         let output_columns = CompactArc::clone(&prepared.output_columns);
         // Every value of a VALUES list is evaluated, as the general path does
@@ -9393,9 +9476,6 @@ struct BlockState {
     point_rows: RefCell<RowVec>,
     /// The row ids an index count reads, kept for the next call
     count_ids: RefCell<Option<Box<CountIds>>>,
-    /// An uncorrelated statement block's rows, opened before the statement
-    /// reads its own and taken by the block's first read
-    opened: RefCell<Option<Box<dyn crate::storage::traits::QueryResult>>>,
 }
 
 /// The row ids of one index probe and the scratch it reads them with
@@ -9553,7 +9633,6 @@ impl<'a> PreparedRunner<'a> {
                     feed_vm: RefCell::new(None),
                     point_rows: RefCell::new(RowVec::new()),
                     count_ids: RefCell::new(None),
-                    opened: RefCell::new(None),
                 })
                 .collect(),
             base,
@@ -9562,31 +9641,6 @@ impl<'a> PreparedRunner<'a> {
             tables,
             where_bound: OnceCell::new(),
         }
-    }
-
-    /// Open and read each uncorrelated statement block no run has opened
-    /// yet, so an error binding it is raised whether a row asks it or not;
-    /// an error its rows raise is kept for the row that needs them
-    fn open_statements(&self, holes: &HoleSet) -> Result<()> {
-        let empty = Row::new();
-        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
-        for (index, sq) in self.prepared.subqueries.iter().enumerate() {
-            let Answer::Statement(_, block) = &sq.answer else {
-                continue;
-            };
-            if !sq.uncorrelated || sq.parent.is_some() || block.opened.get().is_some() {
-                continue;
-            }
-            let rows = self.block_statement(index, block, &caller, holes)?;
-            *self.blocks[index].opened.borrow_mut() = Some(rows);
-            let _ = match block.form {
-                StatementForm::Value => self.scalar_at(index as u16, &caller, holes).map(drop),
-                StatementForm::Exists => self.exists_answer(index, &caller, holes).map(drop),
-                StatementForm::Members(..) => self.read_member_set(index, &caller, holes),
-            };
-            drop(self.blocks[index].opened.borrow_mut().take());
-        }
-        Ok(())
     }
 
     /// Read the members of each uncorrelated block of `ids` now, which keeps
@@ -12182,9 +12236,6 @@ impl PreparedRunner<'_> {
         caller: &ExecuteContext,
         site: &HoleSet,
     ) -> Result<Box<dyn crate::storage::traits::QueryResult>> {
-        if let Some(rows) = self.blocks[index].opened.borrow_mut().take() {
-            return Ok(rows);
-        }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::BlockStatement,
@@ -12193,15 +12244,13 @@ impl PreparedRunner<'_> {
         let ctx = self
             .ctx
             .with_slot_params(self.blocks[index].buffer.borrow().clone());
-        let rows = self.executor.execute_select_with_plan(
+        self.executor.execute_select_with_plan(
             &block.run.statement,
             &ctx,
             Some(&block.run.classification),
             Some(&block.run.compiled),
             None,
-        )?;
-        let _ = block.opened.set(());
-        Ok(rows)
+        )
     }
 
     fn statement_values(&self, run: &StatementRun, width: usize) -> Result<Vec<Value>> {

@@ -741,6 +741,24 @@ pub(crate) fn cache_block_answer(
     BLOCK_ANSWER_CACHE.with(|cache| cache.borrow_mut().put(key, (kept, stamp, answer)));
 }
 
+thread_local! {
+    static BOUND_STATEMENTS: RefCell<LruCache<super::expr_key::ExprKey, (u64, u64)>> =
+        RefCell::new(LruCache::new(
+            NonZeroUsize::new(SEMI_JOIN_CACHE_SIZE).unwrap_or(NonZeroUsize::MIN),
+        ));
+}
+
+/// Whether the statement keyed `key` was bound under `schema`, an engine
+/// instance and its schema epoch
+pub(crate) fn statement_bound(key: super::expr_key::ExprKey, schema: (u64, u64)) -> bool {
+    BOUND_STATEMENTS.with(|bound| bound.borrow_mut().get(&key) == Some(&schema))
+}
+
+/// Keep that the statement keyed `key` was bound under `schema`
+pub(crate) fn keep_statement_bound(key: super::expr_key::ExprKey, schema: (u64, u64)) {
+    BOUND_STATEMENTS.with(|bound| bound.borrow_mut().put(key, schema));
+}
+
 // Cache for EXISTS predicate filters to avoid re-compilation per row.
 // The key is the predicate expression string (after alias stripping).
 // The value is the compiled RowFilter.
