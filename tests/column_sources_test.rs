@@ -343,6 +343,7 @@ fn a_quoted_name_no_column_has_is_its_text_over_every_source() {
         ("", "(SELECT 5 AS \"a.b\") AS d"),
         ("WITH c(\"a.b\") AS (SELECT 5) ", "c"),
         ("WITH c AS (SELECT 5 AS \"a.b\") ", "c"),
+        ("", "(VALUES (5)) AS v(\"a.b\")"),
     ] {
         for (item, want) in [
             ("\"b\"", "[Some(Text(\"b\"))]"),
@@ -365,19 +366,54 @@ fn a_quoted_name_no_column_has_is_its_text_over_every_source() {
 fn a_separator_inside_a_value_names_no_qualified_column() {
     let db = Database::open("memory://column_sources_value_separator").unwrap();
     setup(&db);
-    let inner = "(SELECT 'a\u{1F}b', 'a.b') AS d";
     let names = |sql: &str| db.query(sql, ()).map(|rows| rows.columns().to_vec());
-    let shown = names(&format!("SELECT * FROM {inner}")).unwrap();
-    assert_ne!(shown[0], shown[1], "two items, two names: {shown:?}");
-    let sql = format!("SELECT d.\"'a.b'\" FROM {inner}");
-    let got = collect(db.query(&sql, ()));
-    assert_eq!(
-        got.as_ref().map(|rows| rows.get(1).cloned()),
-        Ok(Some("[Some(Text(\"a.b\"))]".to_string())),
-        "{sql}"
-    );
-    db.execute(&format!("CREATE TABLE copied AS SELECT * FROM {inner}"), ())
+    // Two values whose texts differ give two names, whatever they spell
+    for (i, other) in ["a.b", "a\u{FFFD}b", "a\u{FFFD}\u{FFFD}b"]
+        .iter()
+        .enumerate()
+    {
+        let inner = format!("(SELECT 'a\u{1F}b', '{other}') AS d");
+        let shown = names(&format!("SELECT * FROM {inner}")).unwrap();
+        assert_ne!(shown[0], shown[1], "{inner}: {shown:?}");
+        assert!(
+            !shown.iter().any(|name| name.contains('\u{1F}')),
+            "{inner}: {shown:?}"
+        );
+        let sql = format!("SELECT d.\"{}\" FROM {inner}", shown[1]);
+        let got = collect(db.query(&sql, ()));
+        assert_eq!(
+            got.as_ref().map(|rows| rows.get(1).cloned()),
+            Ok(Some(format!("[Some(Text({other:?}))]"))),
+            "{sql}"
+        );
+        db.execute(
+            &format!("CREATE TABLE copied{i} AS SELECT * FROM {inner}"),
+            (),
+        )
         .unwrap();
+    }
+    // Subqueries beside a window, and inside the aggregates of a ROLLUP,
+    // which the general path lifts into columns named after their text
+    for (sql, want) in [
+        (
+            "SELECT (SELECT 'a\u{1F}b'), (SELECT 'a.b'), ROW_NUMBER() OVER () FROM child AS c \
+             WHERE c.id = 1",
+            "[Some(Text(\"a\\u{1f}b\")), Some(Text(\"a.b\")), Some(Integer(1))]",
+        ),
+        (
+            "SELECT MAX((SELECT 'a\u{1F}b' FROM child AS x WHERE x.id = c.id)) \
+             || MAX((SELECT 'a.b' FROM child AS y WHERE y.id = c.id)) \
+             FROM child AS c WHERE c.id = 1 GROUP BY ROLLUP(c.a) ORDER BY 1",
+            "[Some(Text(\"a\\u{1f}ba.b\"))]",
+        ),
+    ] {
+        let got = collect(db.query(sql, ()));
+        assert_eq!(
+            got.as_ref().map(|rows| rows.get(1).cloned()),
+            Ok(Some(want.to_string())),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

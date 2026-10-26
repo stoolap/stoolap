@@ -2040,14 +2040,28 @@ pub fn item_spelled_name(expr: &Expression) -> Option<&str> {
 }
 
 /// Convert expression to string representation.
-/// Used for expression alias matching and display purposes. A name never
-/// holds the qualifier separator, which a text value may: it shows as U+FFFD
+/// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {
-    let text = written_text(expr);
-    match text.contains(QUALIFIER_SEP) {
-        true => text.replace(QUALIFIER_SEP, "\u{FFFD}"),
-        false => text,
+    name_text(written_text(expr))
+}
+
+/// `text` as a column name: no qualifier separator, which a text value may
+/// hold, and still apart from every other text. U+FFFD escapes, so the
+/// separator shows as U+FFFD then `1`, and U+FFFD itself shows twice
+pub(crate) fn name_text(text: String) -> String {
+    const ESCAPE: char = '\u{FFFD}';
+    if !text.contains([QUALIFIER_SEP, ESCAPE]) {
+        return text;
     }
+    let mut name = String::with_capacity(text.len() + 4);
+    for c in text.chars() {
+        match c {
+            QUALIFIER_SEP => name.extend([ESCAPE, '1']),
+            ESCAPE => name.extend([ESCAPE, ESCAPE]),
+            c => name.push(c),
+        }
+    }
+    name
 }
 
 fn written_text(expr: &Expression) -> String {

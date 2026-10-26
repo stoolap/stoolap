@@ -51,8 +51,8 @@ use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::query_cache::check_compiled_token;
 use super::utils::{
-    bare_name, crossing_key_pair, dummy_token, dummy_token_clone, qualified, split_qualified,
-    value_to_expression,
+    bare_name, crossing_key_pair, dummy_token, dummy_token_clone, name_text, qualified,
+    split_qualified, value_to_expression,
 };
 use super::volatility::{expression_volatility_in, statement_volatility_in};
 use super::Executor;
@@ -3009,11 +3009,14 @@ impl Executor {
         lifted: &mut Vec<(Expression, String)>,
         base_columns: &[String],
     ) -> String {
-        let text = expr.to_string();
+        let text = name_text(expr.to_string());
         // An anonymous parameter prints as a bare marker, so one text can
         // stand for two bindings and only a distinct text may be shared
         if !text.contains('?') {
-            if let Some((_, name)) = lifted.iter().find(|(e, _)| e.to_string() == text) {
+            if let Some((_, name)) = lifted
+                .iter()
+                .find(|(e, _)| name_text(e.to_string()) == text)
+            {
                 return name.clone();
             }
         }

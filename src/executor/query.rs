@@ -8125,15 +8125,13 @@ impl Executor {
         let extended_columns = column_names_arc.to_vec();
 
         // OPTIMIZATION: Check if we need an evaluator for complex expressions
-        let needs_evaluator = stmt.columns.iter().any(|c| {
-            matches!(c, Expression::Aliased(_))
-                || !matches!(
-                    c,
-                    Expression::Star(_)
-                        | Expression::QualifiedStar(_)
-                        | Expression::Identifier(_)
-                        | Expression::QualifiedIdentifier(_)
-                )
+        // A name no column has is read as the compiler reads it
+        let unbound = |id: &Identifier| !col_index_map.contains_key(id.value_lower.as_str());
+        let needs_evaluator = stmt.columns.iter().any(|c| match c {
+            Expression::Identifier(id) => unbound(id),
+            Expression::Star(_) | Expression::QualifiedStar(_) => false,
+            Expression::QualifiedIdentifier(_) => false,
+            _ => true,
         });
 
         let mut proj_eval = if needs_evaluator {
@@ -8209,7 +8207,11 @@ impl Executor {
                                 new_values.push(Value::null_unknown());
                             }
                         } else {
-                            new_values.push(Value::null_unknown());
+                            let eval = proj_eval.as_mut().ok_or_else(|| {
+                                Error::internal("an unbound name without an evaluator")
+                            })?;
+                            eval.set_row_array(row);
+                            new_values.push(eval.evaluate(col_expr)?);
                         }
                     }
                     Expression::QualifiedIdentifier(_) => {
