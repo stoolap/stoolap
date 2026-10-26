@@ -126,6 +126,18 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
     for order in &select.order_by {
         check_expr(&order.expression, ordered)?;
     }
+    // Beside a star the list's width is known only once the star is expanded
+    let star = select
+        .columns
+        .iter()
+        .any(|item| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_)));
+    if let Some(position) = order_position_outside(select, (!star).then_some(select.columns.len()))
+    {
+        return Err(ScopeError {
+            message: order_position_message(position.value),
+            position: position.token.position,
+        });
+    }
     let level: SmallVec<[&str; 4]> = own.map_or_else(SmallVec::new, |own| own.visible.clone());
     if let Some(key) = distinct_key_outside(select, &level) {
         let otherwise = match crate::executor::utils::expression_contains_aggregate(key) {
@@ -153,6 +165,32 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
         check_select(&op.right, outer)?;
     }
     Ok(())
+}
+
+/// The first ORDER BY position of `select` that names none of the `width`
+/// columns its list shows; without a width, as a star leaves it until the
+/// star is expanded, only a position below one
+pub(crate) fn order_position_outside(
+    select: &SelectStatement,
+    width: Option<usize>,
+) -> Option<&IntegerLiteral> {
+    select
+        .order_by
+        .iter()
+        .find_map(|order| match &order.expression {
+            Expression::IntegerLiteral(position)
+                if position.value < 1
+                    || width.is_some_and(|width| position.value as u64 > width as u64) =>
+            {
+                Some(position)
+            }
+            _ => None,
+        })
+}
+
+/// The refusal of an ORDER BY position outside the SELECT list
+pub(crate) fn order_position_message(position: i64) -> String {
+    format!("ORDER BY position {position} is not in the select list")
 }
 
 /// Under SELECT DISTINCT, the first ORDER BY key the SELECT items do not
