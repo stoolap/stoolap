@@ -607,6 +607,8 @@ impl Program {
 
                 // Multi-column IN: pop N, push 1
                 Op::InTupleSet { tuple_size, .. } => 1 - (*tuple_size as i32),
+                // Two rows: pop 2N, push 1
+                Op::CompareRows(_, width) | Op::RowsDistinct(_, width) => 1 - 2 * i32::from(*width),
 
                 // Pop only (-1)
                 Op::Pop => -1,

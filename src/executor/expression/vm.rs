@@ -32,7 +32,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::pattern::Pattern;
-use crate::core::predicate::{sql_compare, sql_distinct, sql_eq};
+use crate::core::predicate::{sql_compare, sql_distinct, sql_eq, sql_rows_distinct};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Error, Result, Row, Value, NULL_VALUE};
 use crate::executor::context::KeptMembers;
@@ -650,6 +650,24 @@ impl ExprVM {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     self.stack.push(Value::Boolean(!sql_distinct(&a, &b)));
+                    pc += 1;
+                }
+
+                Op::CompareRows(op, width) => {
+                    let start = self.stack.len().saturating_sub(2 * *width as usize);
+                    let (a, b) = self.stack[start..].split_at(*width as usize);
+                    let result = truth(op.compare_rows(a, b));
+                    self.stack.truncate(start);
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::RowsDistinct(negated, width) => {
+                    let start = self.stack.len().saturating_sub(2 * *width as usize);
+                    let (a, b) = self.stack[start..].split_at(*width as usize);
+                    let result = Value::Boolean(sql_rows_distinct(a, b) != *negated);
+                    self.stack.truncate(start);
+                    self.stack.push(result);
                     pc += 1;
                 }
 

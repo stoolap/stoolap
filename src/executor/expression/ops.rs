@@ -103,6 +103,15 @@ pub enum Op {
     /// Stack: [a, b] -> [bool]
     IsNotDistinctFrom,
 
+    /// Two rows of N values compared: (a1, .., aN) op (b1, .., bN)
+    /// Stack: [a1, .., aN, b1, .., bN] -> [bool]
+    CompareRows(CompareOp, u16),
+
+    /// Two rows of N values, IS DISTINCT FROM, or IS NOT DISTINCT FROM when
+    /// negated
+    /// Stack: [a1, .., aN, b1, .., bN] -> [bool]
+    RowsDistinct(bool, u16),
+
     // =========================================================================
     // FUSED COMPARISON OPERATIONS - Single instruction for column vs constant
     // These avoid push/pop overhead for the most common filter patterns
@@ -657,6 +666,32 @@ impl CompareOp {
     pub fn compare(&self, a: &Value, b: &Value) -> Option<bool> {
         QuantifiedMembers::compares(*self, a, b)
     }
+
+    /// `(a1, ..) op (b1, ..)` over two rows of one width: `=` holds when
+    /// every pair is equal, `<>` when one is not; an ordering is the first
+    /// unequal pair's, UNKNOWN when that pair's equality is
+    pub fn compare_rows(&self, a: &[Value], b: &[Value]) -> Option<bool> {
+        debug_assert_eq!(a.len(), b.len());
+        let mut equal = Some(true);
+        for (x, y) in a.iter().zip(b) {
+            match QuantifiedMembers::compares(CompareOp::Eq, x, y) {
+                Some(true) => {}
+                Some(false) if matches!(self, CompareOp::Eq | CompareOp::Ne) => {
+                    equal = Some(false);
+                    break;
+                }
+                Some(false) => return self.compare(x, y),
+                None if matches!(self, CompareOp::Eq | CompareOp::Ne) => equal = None,
+                None => return None,
+            }
+        }
+        match self {
+            CompareOp::Eq => equal,
+            CompareOp::Ne => equal.map(|eq| !eq),
+            CompareOp::Le | CompareOp::Ge => Some(true),
+            CompareOp::Lt | CompareOp::Gt => Some(false),
+        }
+    }
 }
 
 // Make Op Debug-printable (without showing full function pointers)
@@ -779,6 +814,10 @@ impl std::fmt::Debug for Op {
                     values.len(),
                     negated
                 )
+            }
+            Op::CompareRows(op, width) => write!(f, "CompareRows({:?}, {})", op, width),
+            Op::RowsDistinct(negated, width) => {
+                write!(f, "RowsDistinct(negated={}, {})", negated, width)
             }
             Op::IsTrue => write!(f, "IsTrue"),
             Op::IsNotTrue => write!(f, "IsNotTrue"),

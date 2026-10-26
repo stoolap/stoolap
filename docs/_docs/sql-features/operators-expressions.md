@@ -20,6 +20,22 @@ Stoolap supports a comprehensive set of SQL operators for building expressions i
 | `>` | Greater than | `WHERE score > 90` |
 | `>=` | Greater than or equal | `WHERE date >= '2024-01-01'` |
 
+### Row Comparisons
+
+Two rows of the same number of values compare value by value, each pair as two values compare. `=` is false when a pair is unequal, else NULL when a pair holds a NULL, else true; `<>` is its negation. `<`, `<=`, `>` and `>=` are decided by the first pair that is not equal, and are NULL when that pair holds a NULL. `IS DISTINCT FROM` is true when any pair is distinct, and `IS NOT DISTINCT FROM` is its negation.
+
+```sql
+SELECT (1, 2) = (1, 2);          -- true
+SELECT (1, NULL) = (2, 3);       -- false: the first pair decides
+SELECT (1, NULL) = (1, 3);       -- NULL
+SELECT (1, 2) < (1, 3);          -- true
+SELECT (1, 2) < (2, NULL);       -- true: the first pair decides
+SELECT (1, NULL) < (1, 3);       -- NULL
+SELECT (1, NULL) IS NOT DISTINCT FROM (1, NULL);  -- true
+```
+
+A row is compared only with a row of as many values: `(1, 2) = (1, 2, 3)` and `(1, 2) = 1` are errors, and so is a row anywhere a single value is read, such as `SELECT (1, 2)` or `(1, 2) IS NULL`.
+
 ## Logical Operators
 
 | Operator | Description | Example |

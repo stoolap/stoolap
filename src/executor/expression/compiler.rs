@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{IntervalStep, Op, QuantifiedMembers};
+use super::ops::{CompareOp, IntervalStep, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::interval::IntervalUnit;
@@ -730,6 +730,11 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === LIST ===
+            Expression::List(_) | Expression::ExpressionList(_) if row_values(expr).is_some() => {
+                return Err(CompileError::TypeError(
+                    "a row of values stands where one value is read".to_string(),
+                ));
+            }
             Expression::List(list) => {
                 if list.elements.is_empty() {
                     builder.emit(Op::LoadNull(DataType::Null));
@@ -836,6 +841,9 @@ impl<'a> ExprCompiler<'a> {
         infix: &InfixExpression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        if self.compile_row_comparison(infix, builder)? {
+            return Ok(());
+        }
         match infix.op_type {
             // Short-circuit AND
             InfixOperator::And => {
@@ -1308,6 +1316,54 @@ impl<'a> ExprCompiler<'a> {
             let count = self.compile_multipliers(&operand, builder)?;
             builder.emit(Op::TimestampAddScaledInterval(step, subtract, count));
         }
+        Ok(true)
+    }
+
+    /// Compile `infix` when a side is a row: two rows of one width compared
+    /// value by value, each value read once; false when neither side is one
+    fn compile_row_comparison(
+        &self,
+        infix: &InfixExpression,
+        builder: &mut ProgramBuilder,
+    ) -> Result<bool, CompileError> {
+        let (left, right) = (row_values(&infix.left), row_values(&infix.right));
+        if left.is_none() && right.is_none() {
+            return Ok(false);
+        }
+        let op: fn(u16) -> Op = match infix.op_type {
+            InfixOperator::Equal => |width| Op::CompareRows(CompareOp::Eq, width),
+            InfixOperator::NotEqual => |width| Op::CompareRows(CompareOp::Ne, width),
+            InfixOperator::LessThan => |width| Op::CompareRows(CompareOp::Lt, width),
+            InfixOperator::LessEqual => |width| Op::CompareRows(CompareOp::Le, width),
+            InfixOperator::GreaterThan => |width| Op::CompareRows(CompareOp::Gt, width),
+            InfixOperator::GreaterEqual => |width| Op::CompareRows(CompareOp::Ge, width),
+            InfixOperator::IsDistinctFrom => |width| Op::RowsDistinct(false, width),
+            InfixOperator::IsNotDistinctFrom => |width| Op::RowsDistinct(true, width),
+            _ => {
+                return Err(CompileError::TypeError(format!(
+                    "a row takes no {}",
+                    infix.operator
+                )))
+            }
+        };
+        let (left, right) = match (left, right) {
+            (Some(left), Some(right)) if left.len() == right.len() => (left, right),
+            (left, right) => {
+                let width = |row: Option<&[Expression]>| row.map_or(1, <[Expression]>::len);
+                return Err(CompileError::TypeError(format!(
+                    "a row of {} values compared with {} values",
+                    width(left),
+                    width(right)
+                )));
+            }
+        };
+        let width = u16::try_from(left.len()).map_err(|_| {
+            CompileError::UnsupportedExpression(format!("a row of {} values", left.len()))
+        })?;
+        for value in left.iter().chain(right) {
+            self.compile_expr(value, builder)?;
+        }
+        builder.emit(op(width));
         Ok(true)
     }
 
@@ -2150,6 +2206,15 @@ pub(crate) fn literal_value(expr: &Expression) -> Option<Value> {
         Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::Null(DataType::Null)),
+        _ => None,
+    }
+}
+
+/// The values of a row, `(a, b)`: a list of more than one
+fn row_values(expr: &Expression) -> Option<&[Expression]> {
+    match expr {
+        Expression::List(list) if list.elements.len() > 1 => Some(&list.elements),
+        Expression::ExpressionList(list) if list.expressions.len() > 1 => Some(&list.expressions),
         _ => None,
     }
 }
