@@ -632,14 +632,14 @@ fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<
 }
 
 // Argument source for inline function evaluation
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ArgSource {
     Column(usize),
     Const(Value),
 }
 
 // Simple condition for inline CASE: column comparisons
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CaseCondition {
     Equals { col_idx: usize, value: Value },
     NotEquals { col_idx: usize, value: Value },
@@ -651,14 +651,14 @@ enum CaseCondition {
 }
 
 // A single WHEN branch for inline CASE
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CaseBranch {
     condition: CaseCondition,
     result: ArgSource,
 }
 
 /// How one SELECT expression of an uncorrelated projection is evaluated
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ExprAction {
     SimpleColumn(usize),
     StarExpand,
@@ -786,10 +786,30 @@ fn lower_index_map(
 
 /// Where one projected value comes from: a column of the input row, or a
 /// program compiled once for the statement
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ItemSource {
     Column(usize),
     Program(SharedProgram),
+}
+
+/// `items` with each program `program_of` finds bound to `params`, None
+/// when none binds: a plan may be held, so each run binds its own copy.
+/// Out of line, so the row loop after it compiles as it would without it
+#[inline(never)]
+fn bound_items<T: Clone>(
+    items: &[T],
+    params: &[Value],
+    program_of: impl Fn(&T) -> Option<&SharedProgram>,
+    with_program: impl Fn(SharedProgram) -> T,
+) -> Option<Vec<T>> {
+    let mut bound: Option<Vec<T>> = None;
+    for (at, item) in items.iter().enumerate() {
+        if let Some(program) = program_of(item).and_then(|program| program.bind(params)) {
+            bound.get_or_insert_with(|| items.to_vec())[at] =
+                with_program(CompactArc::new(program));
+        }
+    }
+    bound
 }
 
 /// Where a projection puts the rows it builds
@@ -10052,7 +10072,21 @@ impl Executor {
                 }
             }
             SelectProjection::Actions(actions) => {
-                return Self::run_projection_actions(actions, rows, ctx, out)
+                let bound = bound_items(
+                    actions,
+                    ctx.params(),
+                    |action| match action {
+                        ExprAction::Compiled(program) => Some(program),
+                        _ => None,
+                    },
+                    ExprAction::Compiled,
+                );
+                return Self::run_projection_actions(
+                    bound.as_deref().unwrap_or(actions),
+                    rows,
+                    ctx,
+                    out,
+                );
             }
         }
         Ok(())
@@ -11339,29 +11373,53 @@ impl Executor {
                 crate::test_failpoints::general_path_reached(
                     crate::test_failpoints::GeneralPath::ProjectionEvaluator,
                 );
-                let mut vm = ExprVM::new();
-                let (transaction_id, outer) = (ctx.transaction_id(), ctx.outer_row());
-                for (row_id, row) in rows.drain_rows().enumerate() {
-                    let mut exec = ExecuteContext::with_common_params(&row, params, transaction_id);
-                    if let Some(outer) = outer {
-                        exec = exec.with_outer_row(outer);
-                    }
-                    if let Some(blocks) = blocks {
-                        exec = exec.with_subquery_executor(blocks);
-                    }
-                    let mut values = projected.storage(sources.len());
-                    for source in sources {
-                        values.push(match source {
-                            Ok(ItemSource::Column(idx)) => {
-                                row.get(*idx).cloned().unwrap_or(Value::null_unknown())
-                            }
-                            Ok(ItemSource::Program(program)) => vm.execute_cow(program, &exec)?,
-                            Err(e) => return Err(e.clone()),
-                        });
-                    }
-                    projected.put(row_id as i64, Row::from_compact_vec(values));
-                }
+                let bound = bound_items(
+                    sources,
+                    params,
+                    |source| match source {
+                        Ok(ItemSource::Program(program)) => Some(program),
+                        _ => None,
+                    },
+                    |program| Ok(ItemSource::Program(program)),
+                );
+                let sources = bound.as_deref().unwrap_or(sources);
+                Self::project_items_into(sources, rows, ctx, params, blocks, projected)?;
             }
+        }
+        Ok(())
+    }
+
+    /// The rows `sources` project, read with `params`, put into `projected`
+    /// with their positions
+    fn project_items_into(
+        sources: &[Result<ItemSource>],
+        mut rows: RowVec,
+        ctx: &ExecutionContext,
+        params: &[Value],
+        blocks: Option<&dyn SubqueryExecutor>,
+        projected: &mut impl RowSink,
+    ) -> Result<()> {
+        let mut vm = ExprVM::new();
+        let (transaction_id, outer) = (ctx.transaction_id(), ctx.outer_row());
+        for (row_id, row) in rows.drain_rows().enumerate() {
+            let mut exec = ExecuteContext::with_common_params(&row, params, transaction_id);
+            if let Some(outer) = outer {
+                exec = exec.with_outer_row(outer);
+            }
+            if let Some(blocks) = blocks {
+                exec = exec.with_subquery_executor(blocks);
+            }
+            let mut values = projected.storage(sources.len());
+            for source in sources {
+                values.push(match source {
+                    Ok(ItemSource::Column(idx)) => {
+                        row.get(*idx).cloned().unwrap_or(Value::null_unknown())
+                    }
+                    Ok(ItemSource::Program(program)) => vm.execute_cow(program, &exec)?,
+                    Err(e) => return Err(e.clone()),
+                });
+            }
+            projected.put(row_id as i64, Row::from_compact_vec(values));
         }
         Ok(())
     }

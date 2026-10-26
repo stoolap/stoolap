@@ -17,7 +17,7 @@
 //! once per cached plan into programs, and run with each subquery as a
 //! parameterised scan whose outer reads fill parameter slots.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::{Arc, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2504,6 +2504,10 @@ struct PreparedWhere {
     /// How many conjuncts `pushdown` holds, of the WHERE's `conjuncts`
     pushed: usize,
     conjuncts: usize,
+    /// Whether the program asks an uncorrelated block, and whether it loads
+    /// a parameter or asks one, which a run may bind it to
+    asks_blocks: bool,
+    binds: bool,
 }
 
 /// `column [NOT] IN (block)` or `column op ANY|ALL (block)` at the top of
@@ -2610,8 +2614,25 @@ impl WhereParts {
             .iter()
             .filter(|test| narrowed(test.0))
             .find_map(slot);
+        let asks_blocks = program.ops().iter().any(|op| match *op {
+            Op::ExecScalarSubquery(id)
+            | Op::ExecExists(id)
+            | Op::ExecInSubquery(id)
+            | Op::ExecQuantified(id, ..) => blocks
+                .subqueries
+                .get(id as usize)
+                .is_some_and(|sq| sq.uncorrelated),
+            _ => false,
+        });
+        let binds = asks_blocks
+            || program
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::LoadParam(_)));
         PreparedWhere {
             program,
+            asks_blocks,
+            binds,
             pushed: self.pushed.len(),
             conjuncts: self.conjuncts,
             pushdown: conjunction(self.pushed),
@@ -3270,6 +3291,9 @@ struct PreparedProjection {
     outputs: Vec<Output>,
     /// The outputs are the row's columns in order: each row is its own projection
     whole_row: bool,
+    /// Whether an output's program loads a parameter or asks a block, which
+    /// a run may bind it to
+    binds: bool,
 }
 
 /// What preparing one statement builds up
@@ -4872,7 +4896,31 @@ impl PreparedProjection {
                 .iter()
                 .enumerate()
                 .all(|(i, output)| matches!(output, Output::Column(c) if *c == i));
-        Ok((Self { outputs, whole_row }, extra_names, extra_sources))
+        let binds = outputs.iter().any(|output| match output {
+            Output::Program(program)
+            | Output::Key(program)
+            | Output::Block(program)
+            | Output::AliasKey(program, _) => program.ops().iter().any(|op| {
+                matches!(
+                    op,
+                    Op::LoadParam(_)
+                        | Op::ExecScalarSubquery(_)
+                        | Op::ExecExists(_)
+                        | Op::ExecInSubquery(_)
+                        | Op::ExecQuantified(..)
+                )
+            }),
+            Output::Column(_) | Output::Copy(_) => false,
+        });
+        Ok((
+            Self {
+                outputs,
+                whole_row,
+                binds,
+            },
+            extra_names,
+            extra_sources,
+        ))
     }
 
     /// Each row's output, its subqueries answered by the run's blocks
@@ -4885,8 +4933,9 @@ impl PreparedProjection {
             return Ok(projected);
         }
         let mut vm = ExprVM::new();
+        let mut bound = self.unbound();
         for (row_id, row) in rows.drain_rows().enumerate() {
-            let out = self.project_row::<false>(&mut vm, &row, run, &[])?;
+            let out = self.project_row::<false>(&mut vm, &row, run, &[], &mut bound)?;
             projected.push((row_id as i64, out));
         }
         Ok(projected)
@@ -4943,6 +4992,7 @@ impl PreparedProjection {
         );
         // The storage of a row the sort does not keep holds the next row's keys
         let mut spare: Vec<Value> = Vec::new();
+        let mut bound = self.unbound();
         for (i, row) in rows.drain_rows().enumerate() {
             let values = match spare.capacity() {
                 0 => Vec::with_capacity(width + 1),
@@ -4951,7 +5001,8 @@ impl PreparedProjection {
                     std::mem::take(&mut spare)
                 }
             };
-            let mut out = self.project_into::<true>(&mut vm, &row, run, &read, values)?;
+            let mut out =
+                self.project_into::<true>(&mut vm, &row, run, &read, &mut bound, values)?;
             // The row's place among the sources, past the outputs
             out.set(width, Value::Integer(i as i64))?;
             sources.push(row);
@@ -4970,6 +5021,7 @@ impl PreparedProjection {
             for (position, output) in self.outputs.iter().enumerate() {
                 if let Output::Program(program) | Output::Block(program) = output {
                     if !read.contains(&position) {
+                        let program = Self::bound_output(run, &mut bound, position, program);
                         out.set(position, vm.execute(program, &exec)?)?;
                     }
                 }
@@ -4990,9 +5042,10 @@ impl PreparedProjection {
         row: &Row,
         run: &PreparedRunner<'_>,
         read: &[usize],
+        bound: &mut OutputsBound,
     ) -> Result<Row> {
         let values = Vec::with_capacity(self.outputs.len() + usize::from(FIRST));
-        self.project_into::<FIRST>(vm, row, run, read, values)
+        self.project_into::<FIRST>(vm, row, run, read, bound, values)
     }
 
     /// [`Self::project_row`] built in `values`, an empty buffer whose room
@@ -5004,6 +5057,7 @@ impl PreparedProjection {
         row: &Row,
         run: &PreparedRunner<'_>,
         read: &[usize],
+        bound: &mut OutputsBound,
         mut values: Vec<Value>,
     ) -> Result<Row> {
         let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
@@ -5015,7 +5069,7 @@ impl PreparedProjection {
                     Value::null_unknown()
                 }
                 Output::Program(program) | Output::Key(program) | Output::Block(program) => {
-                    vm.execute(program, &exec)?
+                    vm.execute(Self::bound_output(run, bound, position, program), &exec)?
                 }
                 Output::AliasKey(..) => Value::null_unknown(),
                 Output::Copy(item) => values
@@ -5034,13 +5088,38 @@ impl PreparedProjection {
                 let mut exec =
                     ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
                 exec.row2 = Some(&out);
-                let key = vm.execute(program, &exec)?;
+                let key = vm.execute(Self::bound_output(run, bound, position, program), &exec)?;
                 out.set(position, key)?;
             }
         }
         Ok(out)
     }
+
+    /// No output bound yet, for one run; none to bind when no output binds
+    fn unbound(&self) -> OutputsBound {
+        match self.binds {
+            true => self.outputs.iter().map(|_| None).collect(),
+            false => OutputsBound::new(),
+        }
+    }
+
+    /// The program of the output at `position`, bound to `run`
+    #[inline]
+    fn bound_output<'b>(
+        run: &PreparedRunner<'_>,
+        bound: &'b mut OutputsBound,
+        position: usize,
+        program: &'b SharedProgram,
+    ) -> &'b SharedProgram {
+        match bound.get_mut(position) {
+            Some(bound) => run.current(bound.get_or_insert_with(|| run.bind(program))),
+            None => program,
+        }
+    }
 }
+
+/// Each output's program bound to one run, once a row computes it
+type OutputsBound = SmallVec<[Option<Bound>; 4]>;
 
 impl PreparedSelect {
     /// Prepare `stmt` over its table, named `scope_name` and holding
@@ -6750,6 +6829,16 @@ impl<'a> DmlRunner<'a> {
         Ok(Self { runner, prepared })
     }
 
+    /// `program` bound to all the run knows now, see [`PreparedRunner::bind`]
+    pub(crate) fn bind(&self, program: &SharedProgram) -> Bound {
+        self.runner.bind(program)
+    }
+
+    /// `bound`'s program, bound again when a block was read since
+    pub(crate) fn current<'b>(&self, bound: &'b mut Bound) -> &'b SharedProgram {
+        self.runner.current(bound)
+    }
+
     /// What the statement's programs read for `row`: its parameters, its
     /// run slots and its blocks
     pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
@@ -6761,7 +6850,7 @@ impl<'a> DmlRunner<'a> {
     /// statement without one
     pub(crate) fn matches(&self, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<bool> {
         match &self.prepared.where_ {
-            Some(where_) => vm.execute_bool_checked(&where_.program, exec),
+            Some(where_) => self.runner.passes(vm, where_, exec),
             None => Ok(true),
         }
     }
@@ -7565,6 +7654,7 @@ impl Executor {
     ) -> Result<RowVec> {
         let (mut vm, mut filter_vm) = (ExprVM::new(), ExprVM::new());
         let (mut values, mut kept) = (Vec::new(), RowVec::new());
+        let mut outputs = projection.unbound();
         let mut scanned = 0u64;
         while scan.next() {
             scanned += 1;
@@ -7584,7 +7674,14 @@ impl Executor {
                 }
                 row.clone()
             } else {
-                let out = projection.project_into::<false>(&mut vm, row, runner, &[], values)?;
+                let out = projection.project_into::<false>(
+                    &mut vm,
+                    row,
+                    runner,
+                    &[],
+                    &mut outputs,
+                    values,
+                )?;
                 if !distinct.is_new(&out) {
                     values = out.into_values();
                     values.clear();
@@ -8112,6 +8209,18 @@ pub(crate) struct PreparedRunner<'a> {
     tables: BlockTables,
     /// Each subquery's state for this run, by its id
     blocks: Vec<BlockState>,
+    /// The WHERE bound to the run, once a row asks it; boxed, as a larger
+    /// runner costs a point query its move
+    where_bound: OnceCell<Box<RefCell<Bound>>>,
+}
+
+/// A statement program bound to its run's parameters and run slots and to
+/// the uncorrelated blocks read when it was bound
+pub(crate) struct Bound {
+    source: SharedProgram,
+    program: SharedProgram,
+    /// The uncorrelated block ops not read when it was bound
+    pending: SmallVec<[Op; 2]>,
 }
 
 /// What one run keeps for one subquery
@@ -8309,6 +8418,7 @@ impl<'a> PreparedRunner<'a> {
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
+            where_bound: OnceCell::new(),
         }
     }
 
@@ -8341,6 +8451,43 @@ impl<'a> PreparedRunner<'a> {
         let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
             .with_subquery_executor(self);
         vm.execute_bool_checked(condition, &exec)
+    }
+
+    /// Whether `row` passes `where_`, see [`Self::passes`]. Out of line: a
+    /// scan loop that builds the context costs a point query its codegen
+    #[inline(never)]
+    fn row_passes(&self, vm: &mut ExprVM, where_: &PreparedWhere, row: &Row) -> Result<bool> {
+        let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
+            .with_subquery_executor(self);
+        self.passes(vm, where_, &exec)
+    }
+
+    /// Whether the row of `exec` passes `where_`, its program bound to what
+    /// the run knows once a row asks it, unless binding cannot shrink it
+    fn passes(
+        &self,
+        vm: &mut ExprVM,
+        where_: &PreparedWhere,
+        exec: &ExecuteContext,
+    ) -> Result<bool> {
+        let bound = match self.where_bound.get() {
+            Some(bound) => Some(bound),
+            None if where_.binds
+                && (where_.asks_blocks || !where_.program.bind_never_shrinks()) =>
+            {
+                Some(
+                    self.where_bound
+                        .get_or_init(|| Box::new(RefCell::new(self.bind(&where_.program)))),
+                )
+            }
+            None => None,
+        };
+        match bound.and_then(|bound| bound.try_borrow_mut().ok()) {
+            Some(mut bound) if CompactArc::ptr_eq(&bound.source, &where_.program) => {
+                vm.execute_bool_checked(self.current(&mut bound), exec)
+            }
+            _ => vm.execute_bool_checked(&where_.program, exec),
+        }
     }
 
     /// The subquery's pushed comparisons for this call, None when there
@@ -8688,7 +8835,7 @@ impl<'a> PreparedRunner<'a> {
                 Some(Err(_)) => false,
                 Some(Ok(true)) | None => true,
             };
-            if ((passed && taken) || self.matches(&mut vm, &where_.program, &row)?)
+            if ((passed && taken) || self.row_passes(&mut vm, where_, &row)?)
                 && !keep(id, scanned, row)
             {
                 break;
@@ -8728,19 +8875,18 @@ impl<'a> PreparedRunner<'a> {
             let (id, row) = read?;
             // Rows read in no table are narrowed by no key: the narrowing's
             // set is a set conjunct like the others
-            let program = program.get_or_insert_with(|| {
+            let bound = program.get_or_insert_with(|| {
                 let slots: SmallVec<[SetSlot; 2]> = where_
                     .sets
                     .iter()
                     .copied()
                     .chain(where_.narrowing_set)
                     .collect();
-                match slots.is_empty() {
-                    true => CompactArc::clone(&where_.program),
-                    false => self.with_bound_sets(&where_.program, &slots),
-                }
+                self.with_bound_sets(&where_.program, &slots)
             });
-            if self.matches(&mut vm, program, row.row())? && !keep(id, scanned, row.into_row()) {
+            if self.matches(&mut vm, self.current(bound), row.row())?
+                && !keep(id, scanned, row.into_row())
+            {
                 break;
             }
         }
@@ -9899,51 +10045,44 @@ impl PreparedRunner<'_> {
     /// when it asks another block, a read fails or a candidate failed,
     /// whose error stays with the row that needs it
     pub(crate) fn bound_program(&self, program: &SharedProgram) -> Option<SharedProgram> {
-        if !program.has_subqueries() {
-            return Some(CompactArc::clone(program));
+        let unknown_value = program.ops().iter().any(|op| {
+            matches!(op, Op::ExecScalarSubquery(_) | Op::ExecExists(_))
+                && self.known_op(op).is_none()
+        });
+        if unknown_value {
+            return None;
         }
-        let mut ops = Vec::with_capacity(program.len());
         for op in program.ops() {
-            let index = match op {
-                Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) => *index as usize,
-                Op::ExecScalarSubquery(_) | Op::ExecExists(_) => return None,
-                op => {
-                    ops.push(op.clone());
-                    continue;
-                }
-            };
-            ops.push(self.bound_set(index)?);
+            if let Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) = op {
+                self.read_set(*index as usize)?;
+            }
         }
-        Some(CompactArc::new(super::expression::Program::new(ops)))
+        let bound = self.bound_now(program, program.ops().iter().any(|op| self.asks_block(op)));
+        (!bound.has_subqueries()).then_some(bound)
     }
 
     /// `program` with the member tests of `slots` bound to the sets this run
-    /// read; a test whose set is not read stays one the run answers
-    fn with_bound_sets(&self, program: &SharedProgram, slots: &[SetSlot]) -> SharedProgram {
-        let ops = program.ops().iter().map(|op| match op {
-            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..)
-                if slots.iter().any(|slot| slot.id == *index) =>
+    /// read, read now, and all else this run knows bound; a test whose set
+    /// is not read stays one the run answers
+    fn with_bound_sets(&self, program: &SharedProgram, slots: &[SetSlot]) -> Bound {
+        for slot in slots {
+            if program.ops().iter().any(|op| {
+                matches!(op, Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) if *index == slot.id)
+            }) && self.read_set(slot.id as usize).is_some()
             {
-                match self.bound_set(*index as usize) {
-                    Some(bound) => {
-                        #[cfg(feature = "test-failpoints")]
-                        crate::test_failpoints::prepared_strategy_ran(
-                            crate::test_failpoints::PreparedStrategy::RowsTakeMembers,
-                        );
-                        bound
-                    }
-                    None => op.clone(),
-                }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::prepared_strategy_ran(
+                    crate::test_failpoints::PreparedStrategy::RowsTakeMembers,
+                );
             }
-            op => op.clone(),
-        });
-        CompactArc::new(super::expression::Program::new(ops.collect()))
+        }
+        self.bind(program)
     }
 
-    /// The test over the members uncorrelated block `index` holds for this
-    /// run, read now; None when the read fails or a candidate failed, whose
-    /// error stays with the row that needs it
-    fn bound_set(&self, index: usize) -> Option<Op> {
+    /// The members uncorrelated block `index` holds for this run, read now,
+    /// when a test over them binds; None when the read fails or a candidate
+    /// failed, whose error stays with the row that needs it
+    fn read_set(&self, index: usize) -> Option<()> {
         let sq = self.prepared.subqueries.get(index)?;
         let Answer::Members(kept, members) = &sq.answer else {
             return None;
@@ -9960,6 +10099,15 @@ impl PreparedRunner<'_> {
             self.holes,
         )
         .ok()?;
+        self.members_op(index).map(drop)
+    }
+
+    /// The test over the members uncorrelated block `index` has read in
+    /// this run; None before the read, or when it failed for a candidate
+    fn members_op(&self, index: usize) -> Option<Op> {
+        if !self.prepared.subqueries.get(index)?.uncorrelated {
+            return None;
+        }
         let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
             return None;
         };
@@ -9971,6 +10119,95 @@ impl PreparedRunner<'_> {
             MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
             MemberSet::In(_) => return None,
         })
+    }
+
+    /// What `op` reads in this run, when the run knows it already: a
+    /// parameter or run slot, an uncorrelated block's value or members read
+    fn known_op(&self, op: &Op) -> Option<Op> {
+        match *op {
+            Op::LoadParam(slot) => self.base.get(slot as usize).cloned().map(Op::LoadConst),
+            Op::ExecScalarSubquery(index) | Op::ExecExists(index) => {
+                if !self.prepared.subqueries.get(index as usize)?.uncorrelated {
+                    return None;
+                }
+                let value = self.blocks[index as usize].value.borrow();
+                value.clone().map(Op::LoadConst)
+            }
+            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) => {
+                self.members_op(index as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// `program` bound to all this run knows now; one that asks no
+    /// uncorrelated block binds only when that shrinks it
+    fn bound_now(&self, program: &SharedProgram, asks_blocks: bool) -> SharedProgram {
+        let bound = match asks_blocks {
+            true => program.bind_with(|op| self.known_op(op)),
+            false => program.bind(&self.base),
+        };
+        match bound {
+            Some(bound) => CompactArc::new(bound),
+            None => CompactArc::clone(program),
+        }
+    }
+
+    /// Whether `op` asks an uncorrelated block, whose answer a run reads once
+    fn asks_block(&self, op: &Op) -> bool {
+        match *op {
+            Op::ExecScalarSubquery(index)
+            | Op::ExecExists(index)
+            | Op::ExecInSubquery(index)
+            | Op::ExecQuantified(index, ..) => self
+                .prepared
+                .subqueries
+                .get(index as usize)
+                .is_some_and(|sq| sq.uncorrelated),
+            _ => false,
+        }
+    }
+
+    /// Whether the run has read the answer block op `op` asks, as
+    /// [`Self::known_op`] binds it
+    fn knows(&self, op: &Op) -> bool {
+        match *op {
+            Op::ExecScalarSubquery(index) | Op::ExecExists(index) => {
+                self.blocks[index as usize].value.borrow().is_some()
+            }
+            Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) => matches!(
+                self.blocks[index as usize].members.get(),
+                Some(BlockAnswer::Members(set))
+                    if set.failed.is_none() && !matches!(set.set, MemberSet::In(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// `program` bound to all this run knows now, to bind again once it
+    /// knows more
+    pub(crate) fn bind(&self, program: &SharedProgram) -> Bound {
+        let pending: SmallVec<[Op; 2]> = program
+            .ops()
+            .iter()
+            .filter(|op| self.asks_block(op))
+            .cloned()
+            .collect();
+        let program_bound = self.bound_now(program, !pending.is_empty());
+        Bound {
+            source: CompactArc::clone(program),
+            program: program_bound,
+            pending: pending.into_iter().filter(|op| !self.knows(op)).collect(),
+        }
+    }
+
+    /// `bound`'s program, bound again when a block it asks was read since
+    #[inline]
+    pub(crate) fn current<'b>(&self, bound: &'b mut Bound) -> &'b SharedProgram {
+        if bound.pending.iter().any(|op| self.knows(op)) {
+            *bound = self.bind(&bound.source);
+        }
+        &bound.program
     }
 
     /// `read` of block `index`'s set, or the error a read of it raised

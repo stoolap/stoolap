@@ -656,6 +656,11 @@ impl ExprMappedResult {
     /// The projections see `ctx`'s parameters and transaction
     pub fn with_context(mut self, ctx: &super::context::ExecutionContext) -> Self {
         self.params = (!ctx.params().is_empty()).then(|| ctx.params_arc().clone());
+        for projection in &mut self.projections {
+            if let CompiledProjection::Compiled(program) = projection {
+                *program = super::expression::bind_params(program.clone(), ctx.params());
+            }
+        }
         self.transaction_id = ctx.transaction_id();
         self
     }

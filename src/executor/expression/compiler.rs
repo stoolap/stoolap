@@ -494,8 +494,6 @@ impl<'a> ExprCompiler<'a> {
         use std::cell::RefCell;
 
         thread_local! {
-            static FOLD_VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
-            static FOLD_ROW: Row = Row::new();
             static FOLD_OPS: RefCell<Vec<Op>> = const { RefCell::new(Vec::new()) };
         }
 
@@ -515,16 +513,7 @@ impl<'a> ExprCompiler<'a> {
         builder.emit(Op::Return);
         let program = builder.build_unoptimized();
 
-        let value = FOLD_ROW.with(|empty_row| {
-            let exec_ctx =
-                ExecuteContext::new(empty_row).with_params(self.ctx.params.unwrap_or(&[]));
-            FOLD_VM.with(|vm_cell| {
-                let mut vm = vm_cell.borrow_mut();
-                let value = vm.execute(&program, &exec_ctx).ok();
-                vm.release_values();
-                value
-            })
-        });
+        let value = run_fold(&program, self.ctx.params.unwrap_or(&[]));
         let mut spent = program.into_ops();
         spent.clear();
         FOLD_OPS.with(|ops| *ops.borrow_mut() = spent);
@@ -538,7 +527,18 @@ impl<'a> ExprCompiler<'a> {
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
         let start = builder.position();
+        let params_loaded = builder.params_loaded();
         self.compile_node(expr, builder)?;
+        // What folds once the execution's parameters are known is marked
+        // for the program bound to them to fold
+        if builder.params_loaded() > params_loaded
+            && !self.folding.get()
+            && self.ctx.params.is_none()
+            && builder.emitted_since(start) > 1
+            && foldable(expr, self.ctx, true)
+        {
+            builder.mark_fold(start);
+        }
         if let Some(&column_type) = self
             .ctx
             .read_as
@@ -1414,12 +1414,7 @@ impl<'a> ExprCompiler<'a> {
             } else {
                 // Optimized: use pre-built HashSet
                 self.compile_expr(&in_expr.left, builder)?;
-                let set = CompactArc::new(PredicateSet::new(CompactArc::new(values), has_null));
-                if in_expr.not {
-                    builder.emit(Op::NotInSet(set));
-                } else {
-                    builder.emit(Op::InSet(set));
-                }
+                builder.emit(set_test(values, has_null, in_expr.not));
             }
         } else {
             // An item that is not a constant is compared in turn:
@@ -1832,6 +1827,131 @@ impl<'a> ExprCompiler<'a> {
 // HELPER FUNCTIONS
 // ============================================================================
 
+thread_local! {
+    static FOLD_VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+    static FOLD_ROW: Row = Row::new();
+}
+
+/// The value `program`, which reads no row, gives as a fold runs it; None
+/// when it errors, and the fold is not taken
+fn run_fold(program: &Program, params: &[Value]) -> Option<Value> {
+    FOLD_ROW.with(|empty_row| {
+        let exec_ctx = ExecuteContext::new(empty_row).with_params(params);
+        FOLD_VM.with(|vm_cell| {
+            let mut vm = vm_cell.borrow_mut();
+            let value = vm.execute(program, &exec_ctx).ok();
+            vm.release_values();
+            value
+        })
+    })
+}
+
+/// The value the ops of a range the compiler marked to fold give, their
+/// parameters bound in and their jumps relative to the range; None when it
+/// errors, and the ops run per row
+pub(crate) fn fold_ops(mut ops: Vec<Op>) -> Option<Value> {
+    ops.push(Op::Return);
+    run_fold(&Program::new_unoptimized(ops), &[])
+}
+
+/// The test of a value against an IN list of the constants `values`, NULL
+/// among them when `has_null`; NOT IN when `not`
+fn set_test(values: ValueSet, has_null: bool, not: bool) -> Op {
+    let set = CompactArc::new(PredicateSet::new(CompactArc::new(values), has_null));
+    match not {
+        true => Op::NotInSet(set),
+        false => Op::InSet(set),
+    }
+}
+
+/// The op that takes the last of `values`, known once the program's
+/// execution starts and loaded by the ops before `consumer`, as the compiler
+/// builds it from them written as literals: how many it takes, whether it
+/// takes `next`, the op after, too, and the op; None when `consumer` reads
+/// them as it runs either way
+pub(crate) fn bound_consumer(
+    consumer: &Op,
+    values: &[&Value],
+    next: Option<&Op>,
+) -> Option<(usize, bool, Op)> {
+    match (Consumer::of(consumer)?, values) {
+        (Consumer::List(count), values) if values.len() >= count => {
+            let mut set = ValueSet::default();
+            let mut has_null = false;
+            for value in &values[values.len() - count..] {
+                match value.is_null() {
+                    true => has_null = true,
+                    false => {
+                        set.insert((*value).clone());
+                    }
+                }
+            }
+            // NOT IN is the list's test and a NOT after it
+            let not = matches!(next, Some(Op::Not));
+            Some((count, not, set_test(set, has_null, not)))
+        }
+        (Consumer::ReadAs(column_type), [.., value]) => Some((
+            1,
+            false,
+            Op::LoadConst(read_as_column(column_type, (*value).clone())),
+        )),
+        (Consumer::EscapedLike(case_insensitive), [.., pattern, escape]) => {
+            let Value::Text(escape) = escape else {
+                return None;
+            };
+            let kind = PatternKind::Like {
+                case_insensitive,
+                escape: Some(escape.chars().next()?),
+            };
+            let op = kind.constant_op(pattern.as_string()?.as_str()).ok()?;
+            Some((2, false, op))
+        }
+        (Consumer::Pattern(kind), [.., value]) => Some((
+            1,
+            false,
+            kind.constant_op(value.as_string()?.as_str()).ok()?,
+        )),
+        _ => None,
+    }
+}
+
+/// Whether `op` takes values loaded before it that [`bound_consumer`]
+/// builds again once they are known
+pub(crate) fn takes_values(op: &Op) -> bool {
+    Consumer::of(op).is_some()
+}
+
+/// How many values loaded before `op` it takes, when it takes any
+pub(crate) fn values_taken(op: &Op) -> Option<usize> {
+    Some(match Consumer::of(op)? {
+        Consumer::List(count) => count,
+        Consumer::ReadAs(_) | Consumer::Pattern(_) => 1,
+        Consumer::EscapedLike(_) => 2,
+    })
+}
+
+/// An op reading values loaded before it, which the compiler builds
+/// otherwise when they are literals
+enum Consumer {
+    /// An IN list of this many items
+    List(usize),
+    ReadAs(DataType),
+    /// A LIKE whose pattern and escape are read as it runs
+    EscapedLike(bool),
+    Pattern(PatternKind),
+}
+
+impl Consumer {
+    fn of(op: &Op) -> Option<Self> {
+        Some(match *op {
+            Op::InList(count) => Consumer::List(count as usize),
+            Op::ReadAsColumn(column_type) => Consumer::ReadAs(column_type),
+            Op::LikeDynamicEscapeExpr(case_insensitive) => Consumer::EscapedLike(case_insensitive),
+            ref op => Consumer::Pattern(PatternKind::of_dynamic(op)?),
+        })
+    }
+}
+
 /// What a pattern operator matches by
 #[derive(Clone, Copy)]
 enum PatternKind {
@@ -1866,6 +1986,23 @@ impl PatternKind {
                 case_insensitive,
                 escape: None,
             } => Op::Like(Arc::new(Pattern::like(text, case_insensitive))),
+        })
+    }
+
+    /// The kind `op` matches by, when it is a [`Self::dynamic_op`]
+    fn of_dynamic(op: &Op) -> Option<Self> {
+        Some(match *op {
+            Op::RegexpDynamic => PatternKind::Regexp,
+            Op::GlobDynamic => PatternKind::Glob,
+            Op::LikeDynamicEscape(case_insensitive, escape) => PatternKind::Like {
+                case_insensitive,
+                escape: Some(escape),
+            },
+            Op::LikeDynamic(case_insensitive) => PatternKind::Like {
+                case_insensitive,
+                escape: None,
+            },
+            _ => return None,
         })
     }
 
@@ -1913,31 +2050,38 @@ pub(crate) fn like_escape_pattern(pattern: &str, escape: char) -> String {
 /// Whether `expr` is worth folding into a constant and may be: an operator,
 /// call or cast (a literal is a constant already)
 fn is_foldable_expr(expr: &Expression, ctx: &CompileContext) -> bool {
+    foldable(expr, ctx, ctx.params.is_some())
+}
+
+/// [`is_foldable_expr`] with the parameters known when `params`: what a
+/// program binding its execution's parameters folds then
+fn foldable(expr: &Expression, ctx: &CompileContext, params: bool) -> bool {
     matches!(
         expr,
         Expression::Infix(_)
             | Expression::Prefix(_)
             | Expression::FunctionCall(_)
             | Expression::Cast(_)
-    ) && may_fold(expr, ctx)
+    ) && is_column_free(expr, ctx, params)
+        && expression_volatility(expr, ctx.functions) == Volatility::Fixed
 }
 
 /// Whether `expr` may be folded into a constant under `ctx`: it reads no
 /// column, no slot and no parameter `ctx` does not hold, and answers the
 /// same every time
 fn may_fold(expr: &Expression, ctx: &CompileContext) -> bool {
-    is_column_free(expr, ctx) && expression_volatility(expr, ctx.functions) == Volatility::Fixed
+    is_column_free(expr, ctx, ctx.params.is_some())
+        && expression_volatility(expr, ctx.functions) == Volatility::Fixed
 }
 
 /// Check if an expression references no columns (is entirely self-contained);
 /// a part read from an aggregated row's slot counts as one, and so does a
-/// parameter unless `ctx` holds the values
-fn is_column_free(expr: &Expression, ctx: &CompileContext) -> bool {
+/// parameter unless `params` says the values are known
+fn is_column_free(expr: &Expression, ctx: &CompileContext, params: bool) -> bool {
     if ctx.check_expression_alias(expr).is_some() {
         return false;
     }
-    let params = ctx.params.is_some();
-    let is_column_free = |expr: &Expression| is_column_free(expr, ctx);
+    let is_column_free = |expr: &Expression| is_column_free(expr, ctx, params);
     match expr {
         // Literals are always column-free
         Expression::IntegerLiteral(_)

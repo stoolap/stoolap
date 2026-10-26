@@ -3036,10 +3036,11 @@ impl Executor {
                     // The executor's registry, not the global one: custom
                     // function overrides must behave like the evaluator
                     // path this replaces
-                    super::expression::compile_expression_with_context(
+                    super::expression::compile_expression_with_params(
                         expr,
                         &column_names,
                         None,
+                        params,
                         &self.function_registry,
                     )
                     .ok()
@@ -3563,10 +3564,11 @@ impl Executor {
                 .as_ref()
                 .filter(|expr| !Self::expr_contains_subquery(expr))
                 .and_then(|expr| {
-                    super::expression::compile_expression_with_context(
+                    super::expression::compile_expression_with_params(
                         expr,
                         &column_names_with_prefix,
                         None,
+                        params,
                         &self.function_registry,
                     )
                     .ok()
@@ -4437,6 +4439,8 @@ impl Executor {
         if let Some((run, programs)) = prepared.and_then(|run| Some((run, run.returning()?))) {
             let mut vm = ExprVM::new();
             let mut result_rows = RowVec::with_capacity(source_rows.len());
+            let mut bound: smallvec::SmallVec<[_; 4]> =
+                programs.iter().map(|program| run.bind(program)).collect();
             for (row_id, row) in source_rows.into_iter().enumerate() {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::prepared_dml_site_ran(
@@ -4444,8 +4448,8 @@ impl Executor {
                 );
                 let exec_ctx = run.context(&row);
                 let mut row_values = Vec::with_capacity(programs.len());
-                for program in programs {
-                    row_values.push(vm.execute_cow(program, &exec_ctx)?);
+                for program in &mut bound {
+                    row_values.push(vm.execute_cow(run.current(program), &exec_ctx)?);
                 }
                 result_rows.push((row_id as i64, Row::from_values(row_values)));
             }
@@ -4471,7 +4475,10 @@ impl Executor {
                         compiled_exprs.push(compile_expression(&column, column_names)?);
                     }
                 }
-                _ => compiled_exprs.push(compile_expression(expr, column_names)?),
+                _ => compiled_exprs.push(super::expression::bind_params(
+                    compile_expression(expr, column_names)?,
+                    ctx.params(),
+                )),
             }
         }
 
