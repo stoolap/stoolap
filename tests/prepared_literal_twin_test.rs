@@ -454,3 +454,20 @@ fn a_bound_statement_runs_its_literal_twins_programs() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_runner_output_known_before_the_rows_runs_no_program_per_row() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = open("prepared_known_outputs");
+    // The block makes each statement the prepared runner's
+    for sql in [
+        "SELECT id, (SELECT MAX(x) FROM u) FROM t",
+        "SELECT id, (SELECT MAX(x) FROM u), $1 FROM t",
+        "SELECT id, (SELECT MAX(x) FROM u), 'k' FROM t",
+        "SELECT id, (SELECT MAX(x) FROM u), 'k', $1, s FROM t",
+    ] {
+        let programs = row_programs(&db, sql, &[Value::text("p")]);
+        assert_eq!(programs, Ok(Vec::new()), "{sql}");
+    }
+}
