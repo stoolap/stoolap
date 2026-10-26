@@ -185,6 +185,15 @@ fn an_aggregate_group_by_key_is_one_error_however_it_is_written() {
         "SELECT COUNT(*) AS c GROUP BY c",
         "SELECT COUNT(*) GROUP BY COUNT(*)",
         "SELECT id, (SELECT COUNT(*) AS c FROM u GROUP BY c) FROM one",
+        "SELECT COUNT(*) FROM one GROUP BY SUM(id) IN ()",
+        "SELECT COUNT(*) FROM one GROUP BY SUM(id) IN (1, 2)",
+        "SELECT COUNT(*) FROM one GROUP BY a IN (SUM(id))",
+        "SELECT COUNT(*) FROM one GROUP BY SUM(id) BETWEEN 1 AND 2",
+        "SELECT COUNT(*) FROM one GROUP BY a BETWEEN 1 AND MAX(id)",
+        "SELECT COUNT(*) FROM one GROUP BY CASE SUM(id) WHEN 1 THEN 1 END",
+        "SELECT COUNT(*) FROM one GROUP BY CAST(SUM(id) AS TEXT) LIKE '1%'",
+        "SELECT COUNT(*) FROM one GROUP BY 'x' LIKE CAST(MIN(id) AS TEXT)",
+        "SELECT COUNT(*) FROM one GROUP BY (a, SUM(id)) = (1, 2)",
     ] {
         match error(&db, sql) {
             Some(e) if e.contains("an aggregate function cannot be a GROUP BY key") => {}
