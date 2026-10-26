@@ -43,7 +43,12 @@ Based on the implementation, Stoolap recognizes various date and time formats:
 ```
 2023-05-15 14:30:45.123       -- SQL format with milliseconds
 2023-05-15 14:30:45           -- SQL format without fractional seconds
+2023-05-15 14:30:45+02:00     -- SQL format with a time zone
 ```
+
+Either form may end with a time zone after the time: `Z`, `+HH`, `+HHMM` or `+HH:MM` (or with `-`), optionally after a space. The value is that instant in UTC, so `'2023-05-15 16:30:45+02:00'`, `'2023-05-15T09:30:45-05'` and `'2023-05-15 14:30:45Z'` are all `2023-05-15 14:30:45` UTC. A zone outside `-23:59` to `+23:59`, or one written as a name such as `UTC`, does not read: the text is no timestamp.
+
+A typed literal, `TIMESTAMP '...'` or `DATE '...'`, whose text does not read as a timestamp is an error, as writing that text into a TIMESTAMP column is.
 
 ### Date Only
 ```
@@ -320,6 +325,7 @@ Stoolap normalizes timestamps to UTC internally for consistent storage and compa
 INSERT INTO events VALUES (1, '2023-05-15T14:30:45Z');
 INSERT INTO events VALUES (2, '2023-05-15T14:30:45+00:00');
 INSERT INTO events VALUES (3, '2023-05-15 14:30:45'); -- Assumed UTC
+INSERT INTO events VALUES (4, '2023-05-15 16:30:45+02:00');
 ```
 
 ## Date and Time Comparisons
