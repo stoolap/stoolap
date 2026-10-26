@@ -1018,6 +1018,11 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             }
             hash_classification_inputs(&subquery.subquery, hasher);
         }
+        Expression::ValuesSource(values) => {
+            if let Some(ref alias) = values.alias {
+                alias.value_lower.hash(hasher);
+            }
+        }
         Expression::FunctionTableSource(fs) => {
             fs.function.value_lower.hash(hasher);
             if let Some(ref alias) = fs.alias {
