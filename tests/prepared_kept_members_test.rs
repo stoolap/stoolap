@@ -18,7 +18,7 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::kept_member_calls;
+use stoolap::test_failpoints::{kept_member_calls, prepared_strategy_runs, PreparedStrategy};
 use stoolap::Database;
 
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
@@ -66,11 +66,16 @@ fn a_member_test_asks_its_block_once_per_statement() {
     ] {
         let sql = format!("SELECT id FROM t WHERE {test}");
         let before = kept_member_calls();
+        let reads = prepared_strategy_runs(PreparedStrategy::MemberSet);
         let got = ids(&db, &sql);
+        assert!(
+            kept_member_calls() - before <= 1,
+            "{sql}: the block asked at most once"
+        );
         assert_eq!(
-            kept_member_calls() - before,
+            prepared_strategy_runs(PreparedStrategy::MemberSet) - reads,
             1,
-            "{sql}: the block asked once"
+            "{sql}: the members read once"
         );
         assert_eq!(
             got,

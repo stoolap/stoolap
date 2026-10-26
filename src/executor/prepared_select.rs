@@ -38,7 +38,9 @@ use crate::storage::expression::{
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::TableUse;
-use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Scanner, Table, Transaction};
+use crate::storage::traits::{
+    CappedEqual, Engine, ProbeScratch, QueryResult, Scanner, Table, Transaction,
+};
 
 use super::aggregation::{
     aggregate_slot_keys, check_grouped_reads, grouping_items, ungrouped_column, AggregatePath,
@@ -54,12 +56,14 @@ use super::expression::{
     QuantifiedMembers, RowFilter, SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
-use super::projection::Item;
+use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
-use super::result::{DistinctRows, ExecutorResult, FilteredResult, ScannerResult};
+use super::result::{
+    DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
+};
 use super::utils::{
     build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, get_table_alias_from_expr, infix_to_operator,
@@ -8525,6 +8529,16 @@ impl Executor {
                 .chain(stmt.order_by.iter().map(|ob| &ob.expression))
                 .any(mentions_subquery))
         .then(|| DistinctRows::new(prepared.visible));
+        // Rows nothing sorts, counts or merges, whose output is the row or
+        // columns of it, reach the caller as the scan reads them, which checks
+        // the cancel; a timed read is collected, so its deadline holds while it reads
+        let projection = &prepared.projection;
+        let flows = !ctx.has_timeout()
+            && distinct.is_none()
+            && stmt.order_by.is_empty()
+            && limit.is_none()
+            && offset == 0
+            && (projection.whole_row || projection.columns.is_some());
         let read = match (ordered, source) {
             (Some(rows), _) => Ok(Passing::Answers(rows)),
             (None, StatementSource::Table(table)) => runner.passing_rows(
@@ -8533,7 +8547,7 @@ impl Executor {
                 &*table,
                 ctx,
                 target,
-                distinct.is_some(),
+                distinct.is_some() || flows,
                 &mut keep,
             ),
             (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
@@ -8560,10 +8574,47 @@ impl Executor {
                 &mut keep,
             ),
         };
-        // Only a DISTINCT asks the read for its scan
-        let streamed = |scan: Box<dyn Scanner>, bound| -> Result<PreparedOutput> {
-            let distinct = distinct
-                .ok_or_else(|| Error::internal("a prepared statement streamed its scan"))?;
+        let streamed = |scan: Box<dyn Scanner>,
+                        bound: Option<SharedProgram>|
+         -> Result<PreparedOutput> {
+            // A flowing read: the general path's scan, filter and projection
+            let Some(distinct) = distinct else {
+                let names = match projection.whole_row {
+                    true => &output_columns,
+                    false => &prepared.columns,
+                };
+                let mut rows: Box<dyn QueryResult> = Box::new(
+                    ScannerResult::new(scan, CompactArc::clone(names))
+                        .with_cancel(ctx.cancellation_handle()),
+                );
+                if let Some(bound) = bound {
+                    let mut filter = RowFilter::from_program(bound).with_context(ctx);
+                    // The values the run computed once sit past the statement's own
+                    if runner.base.len() > ctx.params().len() {
+                        filter = filter.with_params(CompactArc::new(runner.base.clone()));
+                    }
+                    rows = Box::new(FilteredResult::from_filter(rows, filter));
+                }
+                if let Some(columns) = projection
+                    .columns
+                    .as_ref()
+                    .filter(|_| !projection.whole_row)
+                {
+                    rows = Box::new(ProjectionResult::new(
+                        rows,
+                        Projection::columns(columns.iter().copied()),
+                        output_columns.to_vec(),
+                    ));
+                }
+                return Ok((
+                    rows,
+                    CompactArc::clone(&output_columns),
+                    false,
+                    prepared.visible,
+                    prepared.layout.clone(),
+                    false,
+                ));
+            };
             // Without an ORDER BY the first rows a LIMIT keeps end the read;
             // a set operation's LIMIT counts its own rows, not the branch's
             let branch = !stmt.set_operations.is_empty();
