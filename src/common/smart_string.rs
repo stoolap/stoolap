@@ -195,8 +195,7 @@ impl SmartString {
     /// A heap string holding a copy of `s`
     #[inline]
     fn new_heap(s: &str) -> Self {
-        // SAFETY: the bytes copied are `s`'s, which are valid UTF-8
-        unsafe { Self::heap_with(s.len(), |bytes| bytes.copy_from_slice(s.as_bytes())) }
+        Self::heap_from(&[s])
     }
 
     /// The layout of a heap block holding a string of `len` bytes
@@ -213,21 +212,29 @@ impl SmartString {
         }
     }
 
-    /// A heap string of `len` bytes, which `fill` writes in place
-    ///
-    /// # Safety
-    ///
-    /// `fill` must write all `len` bytes, and they must form valid UTF-8.
+    /// A heap string holding `parts` joined in order
     #[inline]
-    unsafe fn heap_with(len: usize, fill: impl FnOnce(&mut [u8])) -> Self {
+    fn heap_from(parts: &[&str]) -> Self {
+        // Saturating, so a total past usize fails heap_layout's bound
+        let len = parts
+            .iter()
+            .fold(0usize, |len, part| len.saturating_add(part.len()));
         let layout = Self::heap_layout(len);
-        let block = std::alloc::alloc(layout);
+        // SAFETY: the layout has a nonzero size, as HEADER is nonzero
+        let block = unsafe { std::alloc::alloc(layout) };
         if block.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        // The block's count starts at one, for the string returned
-        block.cast::<AtomicUsize>().write(AtomicUsize::new(1));
-        fill(std::slice::from_raw_parts_mut(block.add(HEADER), len));
+        // SAFETY: the block holds HEADER + len bytes aligned for the count;
+        // the parts are copied end to end into the len bytes after it
+        unsafe {
+            block.cast::<AtomicUsize>().write(AtomicUsize::new(1));
+            let mut at = block.add(HEADER);
+            for part in parts {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), at, part.len());
+                at = at.add(part.len());
+            }
+        }
         let mut data = [0u8; 15];
         data[..LEN_BYTES].copy_from_slice(&len.to_le_bytes()[..LEN_BYTES]);
         let end = ptr_layout::OFFSET + ptr_layout::SIZE;
@@ -279,11 +286,23 @@ impl SmartString {
         self.heap_parts().1
     }
 
+    /// A heap string's bytes, to change in place
+    ///
+    /// # Safety
+    ///
+    /// The block must have no other share, and the bytes written must stay
+    /// valid UTF-8.
+    #[inline]
+    unsafe fn heap_bytes_mut(&mut self) -> &mut [u8] {
+        let (block, len) = self.heap_parts();
+        std::slice::from_raw_parts_mut(block.add(HEADER), len)
+    }
+
     /// A heap string's reference count, at the start of its block
     #[inline(always)]
     fn heap_count(&self) -> &AtomicUsize {
         // SAFETY: a heap string's block is live while the string is, and
-        // begins with the AtomicUsize heap_with wrote there
+        // begins with the AtomicUsize heap_from wrote there
         unsafe { &*self.heap_block().cast::<AtomicUsize>() }
     }
 
@@ -339,7 +358,7 @@ impl SmartString {
         } else {
             let (block, len) = self.heap_parts();
             // SAFETY: the block is live while the string is, and its `len`
-            // bytes after the count are the valid UTF-8 heap_with wrote
+            // bytes after the count are the valid UTF-8 heap_from copied
             unsafe {
                 std::str::from_utf8_unchecked(std::slice::from_raw_parts(block.add(HEADER), len))
             }
@@ -483,15 +502,11 @@ impl SmartString {
         if let Some(len) = self.tag.inline_len() {
             self.data[..len].make_ascii_uppercase();
         } else {
-            let bytes = self.as_str().as_bytes();
-            // SAFETY: the copy fills the block, and ASCII case mapping keeps
-            // the bytes valid UTF-8
-            *self = unsafe {
-                Self::heap_with(bytes.len(), |buf| {
-                    buf.copy_from_slice(bytes);
-                    buf.make_ascii_uppercase();
-                })
-            };
+            let mut upper = Self::heap_from(&[self.as_str()]);
+            // SAFETY: the block is new, so this is its only share, and ASCII
+            // case mapping keeps the bytes valid UTF-8
+            unsafe { upper.heap_bytes_mut() }.make_ascii_uppercase();
+            *self = upper;
         }
     }
 
@@ -500,15 +515,11 @@ impl SmartString {
         if let Some(len) = self.tag.inline_len() {
             self.data[..len].make_ascii_lowercase();
         } else {
-            let bytes = self.as_str().as_bytes();
-            // SAFETY: the copy fills the block, and ASCII case mapping keeps
-            // the bytes valid UTF-8
-            *self = unsafe {
-                Self::heap_with(bytes.len(), |buf| {
-                    buf.copy_from_slice(bytes);
-                    buf.make_ascii_lowercase();
-                })
-            };
+            let mut lower = Self::heap_from(&[self.as_str()]);
+            // SAFETY: the block is new, so this is its only share, and ASCII
+            // case mapping keeps the bytes valid UTF-8
+            unsafe { lower.heap_bytes_mut() }.make_ascii_lowercase();
+            *self = lower;
         }
     }
 
@@ -529,14 +540,7 @@ impl SmartString {
                 data,
             }
         } else {
-            // SAFETY: the two strings fill the block, and their bytes in
-            // order are valid UTF-8
-            unsafe {
-                Self::heap_with(total_len, |bytes| {
-                    bytes[..a.len()].copy_from_slice(a.as_bytes());
-                    bytes[a.len()..].copy_from_slice(b.as_bytes());
-                })
-            }
+            Self::heap_from(&[a, b])
         }
     }
 
@@ -555,17 +559,7 @@ impl SmartString {
                 data,
             }
         } else {
-            // SAFETY: the strings fill the block, and their bytes in order
-            // are valid UTF-8
-            unsafe {
-                Self::heap_with(total_len, |bytes| {
-                    let mut pos = 0;
-                    for s in strings {
-                        bytes[pos..pos + s.len()].copy_from_slice(s.as_bytes());
-                        pos += s.len();
-                    }
-                })
-            }
+            Self::heap_from(strings)
         }
     }
 
@@ -629,7 +623,7 @@ impl Drop for SmartString {
             fence(AtomicOrdering::Acquire);
             let (block, len) = self.heap_parts();
             // SAFETY: no other share is left, and the block was allocated
-            // with this layout by heap_with
+            // with this layout by heap_from
             unsafe { std::alloc::dealloc(block, Self::heap_layout(len)) }
         }
     }
