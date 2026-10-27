@@ -59,10 +59,6 @@ pub struct Program {
 
     /// The program this one was bound from, which a later bind binds again
     bound_from: Option<CompactArc<Program>>,
-
-    /// Source expression string (for debugging)
-    #[cfg(debug_assertions)]
-    source: Option<String>,
 }
 
 impl Program {
@@ -104,8 +100,6 @@ impl Program {
             cow_supported,
             binding,
             bound_from: None,
-            #[cfg(debug_assertions)]
-            source: None,
         }
     }
 
@@ -143,8 +137,6 @@ impl Program {
             cow_supported,
             binding,
             bound_from: None,
-            #[cfg(debug_assertions)]
-            source: None,
         }
     }
 
@@ -482,19 +474,6 @@ impl Program {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
-    }
-
-    /// Set source string for debugging
-    #[cfg(debug_assertions)]
-    pub fn with_source(mut self, source: String) -> Self {
-        self.source = Some(source);
-        self
-    }
-
-    /// Get source string
-    #[cfg(debug_assertions)]
-    pub fn source(&self) -> Option<&str> {
-        self.source.as_deref()
     }
 
     /// Compute the maximum stack depth needed for a sequence of operations

@@ -4337,33 +4337,6 @@ impl Executor {
         })
     }
 
-    /// Check if index-nested-loop should be preferred over anti-join for NOT EXISTS.
-    ///
-    /// For NOT EXISTS, anti-join using HashJoinOperator is almost always more efficient
-    /// than both index-nested-loop and InHashSet because:
-    /// 1. HashJoinOperator does bulk hash table build/probe (cache-efficient)
-    /// 2. No per-row expression evaluation overhead
-    /// 3. Even with LIMIT, the bulk operation is faster than per-row checking
-    ///
-    /// The only case where we might prefer index-nested-loop is for VERY small LIMIT
-    /// (e.g., LIMIT 10) with a highly selective index, but benchmarks show hash join
-    /// is still faster in most cases.
-    pub fn should_use_index_nested_loop_for_anti_join(
-        &self,
-        _info: &SemiJoinInfo,
-        outer_limit: Option<i64>,
-    ) -> bool {
-        // For very small LIMIT (<= 10), index-nested-loop might be faster
-        // because it can terminate very early
-        if let Some(limit) = outer_limit {
-            if limit <= 10 {
-                return true;
-            }
-        }
-        // For all other cases, prefer anti-join for NOT EXISTS
-        false
-    }
-
     /// Execute the semi-join optimization for an EXISTS subquery.
     ///
     /// Instead of executing the subquery for each outer row, we:

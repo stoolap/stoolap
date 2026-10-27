@@ -172,9 +172,6 @@ pub struct CompileContext<'a> {
     /// The aggregated row's slot of each group item and aggregate, by identity
     expression_aliases: FxHashMap<ExprKey, u16>,
 
-    /// Column aliases
-    column_aliases: StringMap<String>,
-
     /// A prepared plan compiles: a subquery mark compiles to its block's id
     prepared_subqueries: bool,
 
@@ -225,7 +222,6 @@ impl<'a> CompileContext<'a> {
             outer_columns: None,
             functions,
             expression_aliases: FxHashMap::default(),
-            column_aliases: StringMap::new(),
             prepared_subqueries: false,
             row2_bindings: None,
             read_as: None,
@@ -300,12 +296,6 @@ impl<'a> CompileContext<'a> {
         self
     }
 
-    /// Add column aliases
-    pub fn with_column_aliases(mut self, aliases: StringMap<String>) -> Self {
-        self.column_aliases = aliases;
-        self
-    }
-
     /// Compile each subquery mark to the prepared id it carries; a written
     /// subquery is then a compile error
     pub fn with_prepared_subqueries(mut self) -> Self {
@@ -337,13 +327,6 @@ impl<'a> CompileContext<'a> {
     /// Resolve a column name to its source (Row1 or Row2)
     fn resolve_column(&self, name: &str) -> Option<ColumnSource> {
         let lower = name.to_lowercase();
-
-        // Check column aliases first
-        if let Some(original) = self.column_aliases.get(&lower) {
-            if let Some(&idx) = self.columns.get(original) {
-                return Some(ColumnSource::Row1(idx));
-            }
-        }
 
         // Direct lookup in primary columns (Row1)
         if let Some(&idx) = self.columns.get(&lower) {
