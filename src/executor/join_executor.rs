@@ -85,7 +85,7 @@ use crate::executor::expression::{
     compile_expression, JoinFilter, RowFilter, SharedProgram, SubqueryExecutor,
 };
 use crate::executor::hash_table::JoinHashTable;
-use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
+use crate::executor::operator::{MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
 use crate::executor::parallel::{
@@ -528,12 +528,13 @@ impl JoinExecutor {
             )
         } else {
             // Standard path: build hash table during open()
-            let build_schema: Vec<ColumnInfo> =
-                request.build_columns.iter().map(ColumnInfo::new).collect();
             // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
             let build_rows_vec =
                 CompactArc::try_unwrap(request.build_rows).unwrap_or_else(|arc| (*arc).clone());
-            let build_op = Box::new(MaterializedOperator::new(build_rows_vec, build_schema));
+            let build_op = Box::new(MaterializedOperator::new(
+                build_rows_vec,
+                request.build_columns.len(),
+            ));
 
             let (left_op, right_op): (Box<dyn Operator>, Box<dyn Operator>) =
                 if request.build_is_left {
@@ -874,13 +875,15 @@ impl JoinExecutor {
         blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::Hash.taken();
-        // Build schema for operators from column names
-        let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
-        let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
-
         // Create input operators from Arc (unwraps if sole owner, clones if shared)
-        let left_op = Box::new(MaterializedOperator::from_arc(left_rows, left_schema));
-        let right_op = Box::new(MaterializedOperator::from_arc(right_rows, right_schema));
+        let left_op = Box::new(MaterializedOperator::from_arc(
+            left_rows,
+            left_columns.len(),
+        ));
+        let right_op = Box::new(MaterializedOperator::from_arc(
+            right_rows,
+            right_columns.len(),
+        ));
 
         let build_side = if build_left {
             JoinSide::Left
@@ -937,17 +940,13 @@ impl JoinExecutor {
         blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::NestedLoop.taken();
-        // Build schema for operators
-        let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
-        let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
-
         // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
         let left_vec = CompactArc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
         let right_vec = CompactArc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
 
         // Create input operators - takes ownership, no clone
-        let left_op = Box::new(MaterializedOperator::new(left_vec, left_schema));
-        let right_op = Box::new(MaterializedOperator::new(right_vec, right_schema));
+        let left_op = Box::new(MaterializedOperator::new(left_vec, left_columns.len()));
+        let right_op = Box::new(MaterializedOperator::new(right_vec, right_columns.len()));
 
         // Convert join type string to enum
         let join_type = if join_type_str.contains("CROSS") {
@@ -962,11 +961,9 @@ impl JoinExecutor {
             JoinType::Inner
         };
 
-        // Create nested loop join operator
-        let mut nl_op =
-            NestedLoopJoinOperator::new(left_op, right_op, join_type, condition.cloned());
         let site = blocks.map(|blocks| blocks.site(true));
         let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
+        let mut filter = None;
         if let Some(cond) = condition {
             // With the statement's blocks, the ON they rewrote, over the pair
             let compile = || -> Result<BuiltPrograms> {
@@ -984,7 +981,7 @@ impl JoinExecutor {
                     .first()
                     .map(|program| JoinFilter::from_program(CompactArc::clone(program)))
             };
-            let filter = match prepared {
+            let compiled = match prepared {
                 Some(prepared) => prepared.programs(
                     |held| {
                         matches!(held, JoinProgramKey::Pair { left_cols, right_cols }
@@ -999,12 +996,12 @@ impl JoinExecutor {
                 )?,
                 None => read(&compile()?),
             };
-            if let Some(filter) = filter {
-                nl_op = nl_op
-                    .with_filter(filter.with_context(ctx))
-                    .with_blocks(site);
-            }
+            filter = compiled.map(|filter| filter.with_context(ctx));
         }
+
+        // Create nested loop join operator
+        let mut nl_op =
+            NestedLoopJoinOperator::new(left_op, right_op, join_type, filter).with_blocks(site);
 
         // Execute with Volcano model
         self.execute_operator_with_filter(&mut nl_op, limit, &[], None)

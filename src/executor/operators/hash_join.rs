@@ -42,27 +42,8 @@ use crate::executor::expression::{RowFilter, SubqueryExecutor};
 use crate::executor::hash_table::{
     hash_key_value, hash_row_keys, verify_key_equality, JoinHashTable,
 };
-use crate::executor::operator::{ColumnInfo, Operator, RowRef};
+use crate::executor::operator::{Operator, RowRef};
 use crate::executor::operators::index_nested_loop::reading_key;
-
-/// Pre-computed column names to avoid format! allocations in hot paths.
-/// Covers most common cases (up to 32 columns).
-const BUILD_COLUMN_NAMES: [&str; 32] = [
-    "build_0", "build_1", "build_2", "build_3", "build_4", "build_5", "build_6", "build_7",
-    "build_8", "build_9", "build_10", "build_11", "build_12", "build_13", "build_14", "build_15",
-    "build_16", "build_17", "build_18", "build_19", "build_20", "build_21", "build_22", "build_23",
-    "build_24", "build_25", "build_26", "build_27", "build_28", "build_29", "build_30", "build_31",
-];
-
-/// Get a build column name efficiently, using pre-computed names when possible.
-#[inline]
-fn get_build_column_name(i: usize) -> String {
-    if i < BUILD_COLUMN_NAMES.len() {
-        BUILD_COLUMN_NAMES[i].to_string()
-    } else {
-        format!("build_{}", i)
-    }
-}
 
 /// Which side of the join to use as the build side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,8 +205,8 @@ pub struct HashJoinOperator<'a> {
     build_rows: CompactArc<Vec<Row>>,
     hash_table: Option<JoinHashTable>,
 
-    // Output schema
-    schema: Vec<ColumnInfo>,
+    // Output width
+    width: usize,
     left_col_count: usize,
     right_col_count: usize,
 
@@ -293,18 +274,15 @@ impl<'a> HashJoinOperator<'a> {
         right_key_indices: Vec<usize>,
         build_side: JoinSide,
     ) -> Self {
-        // Build schema
-        // For Semi/Anti joins, only return left (probe) columns
-        let mut schema = Vec::new();
-        if join_type.is_semi() || join_type.is_anti() {
-            schema.extend(left.schema().iter().cloned());
-        } else {
-            schema.extend(left.schema().iter().cloned());
-            schema.extend(right.schema().iter().cloned());
-        }
+        let left_col_count = left.width();
+        let right_col_count = right.width();
 
-        let left_col_count = left.schema().len();
-        let right_col_count = right.schema().len();
+        // For Semi/Anti joins, only return left (probe) columns
+        let width = if join_type.is_semi() || join_type.is_anti() {
+            left_col_count
+        } else {
+            left_col_count + right_col_count
+        };
 
         Self {
             left,
@@ -315,7 +293,7 @@ impl<'a> HashJoinOperator<'a> {
             right_key_indices,
             build_rows: CompactArc::new(Vec::new()),
             hash_table: None,
-            schema,
+            width,
             left_col_count,
             right_col_count,
             current_probe_row: None,
@@ -352,7 +330,7 @@ impl<'a> HashJoinOperator<'a> {
     /// * `join_type` - Type of join
     /// * `probe_key_indices` - Key indices for probe side
     /// * `build_key_indices` - Key indices for build side
-    /// * `build_is_left` - Whether build side is left (for schema ordering)
+    /// * `build_is_left` - Whether build side is left (for column ordering)
     pub fn with_prebuilt(
         probe: Box<dyn Operator>,
         build_rows: CompactArc<Vec<Row>>,
@@ -362,30 +340,19 @@ impl<'a> HashJoinOperator<'a> {
         build_key_indices: Vec<usize>,
         build_is_left: bool,
     ) -> Self {
-        let probe_col_count = probe.schema().len();
+        let probe_col_count = probe.width();
         let build_col_count = if build_rows.is_empty() {
             0
         } else {
             build_rows[0].len()
         };
 
-        // Build schema based on build side position
-        // Pre-allocate schema with known capacity
-        let total_cols = build_col_count + probe_col_count;
-        let mut schema = Vec::with_capacity(total_cols);
+        let width = build_col_count + probe_col_count;
         let (left_col_count, right_col_count) = if build_is_left {
             // Build is left: [build_cols, probe_cols]
-            for i in 0..build_col_count {
-                schema.push(ColumnInfo::new(get_build_column_name(i)));
-            }
-            schema.extend(probe.schema().iter().cloned());
             (build_col_count, probe_col_count)
         } else {
             // Build is right: [probe_cols, build_cols]
-            schema.extend(probe.schema().iter().cloned());
-            for i in 0..build_col_count {
-                schema.push(ColumnInfo::new(get_build_column_name(i)));
-            }
             (probe_col_count, build_col_count)
         };
 
@@ -429,7 +396,7 @@ impl<'a> HashJoinOperator<'a> {
             right_key_indices,
             build_rows,
             hash_table: Some(hash_table),
-            schema,
+            width,
             left_col_count,
             right_col_count,
             current_probe_row: None,
@@ -463,12 +430,8 @@ impl<'a> HashJoinOperator<'a> {
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
     ) -> Self {
-        // For self-join, schema is input schema duplicated
-        let mut schema = Vec::new();
-        schema.extend(input.schema().iter().cloned());
-        schema.extend(input.schema().iter().cloned());
-
-        let col_count = input.schema().len();
+        // For self-join, the output is the input's columns twice
+        let col_count = input.width();
 
         // We'll use left as the input, right will be unused
         Self {
@@ -480,7 +443,7 @@ impl<'a> HashJoinOperator<'a> {
             right_key_indices,
             build_rows: CompactArc::new(Vec::new()),
             hash_table: None,
-            schema,
+            width: col_count * 2,
             left_col_count: col_count,
             right_col_count: col_count,
             current_probe_row: None,
@@ -927,8 +890,8 @@ impl Operator for HashJoinOperator<'_> {
         Ok(())
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        self.width
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -975,8 +938,7 @@ mod tests {
 
     fn make_operator(data: Vec<Vec<i64>>, cols: Vec<&str>) -> Box<dyn Operator> {
         let rows = make_rows(data);
-        let schema = cols.into_iter().map(ColumnInfo::new).collect();
-        Box::new(MaterializedOperator::new(rows, schema))
+        Box::new(MaterializedOperator::new(rows, cols.len()))
     }
 
     fn collect_results(op: &mut dyn Operator) -> Result<Vec<Row>> {
@@ -1149,8 +1111,8 @@ mod tests {
         // User 3 has 1 order - should appear
         assert_eq!(results.len(), 2);
 
-        // Schema should only have left columns
-        assert_eq!(join.schema().len(), 2);
+        // Output should only have left columns
+        assert_eq!(join.width(), 2);
 
         // Verify we got users 1 and 3
         let ids: Vec<i64> = results
@@ -1189,8 +1151,8 @@ mod tests {
         // User 3 has orders - should NOT appear
         assert_eq!(results.len(), 1);
 
-        // Schema should only have left columns
-        assert_eq!(join.schema().len(), 2);
+        // Output should only have left columns
+        assert_eq!(join.width(), 2);
 
         // Verify we only got user 2
         let row = &results[0];

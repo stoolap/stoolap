@@ -42,7 +42,7 @@
 
 use crate::core::Result;
 use crate::executor::hash_table::hash_keys_with;
-use crate::executor::operator::{ColumnInfo, Operator, RowRef};
+use crate::executor::operator::{Operator, RowRef};
 use crate::optimizer::bloom::RuntimeBloomFilter;
 
 /// Operator that filters rows using a bloom filter before hash join probe.
@@ -157,9 +157,9 @@ impl Operator for BloomFilterOperator {
         self.child.close()
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        // Schema passes through unchanged
-        self.child.schema()
+    fn width(&self) -> usize {
+        // Rows pass through unchanged
+        self.child.width()
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -210,8 +210,7 @@ mod tests {
             Row::from_values(vec![Value::Integer(5)]),
         ];
 
-        let schema = vec![ColumnInfo::new("id")];
-        let child = Box::new(MaterializedOperator::new(probe_rows, schema));
+        let child = Box::new(MaterializedOperator::new(probe_rows, 1));
 
         let mut op = BloomFilterOperator::new(child, bloom, vec![0]);
 
@@ -240,8 +239,7 @@ mod tests {
         let bloom = builder.build();
 
         let probe_rows: Vec<Row> = vec![];
-        let schema = vec![ColumnInfo::new("id")];
-        let child = Box::new(MaterializedOperator::new(probe_rows, schema));
+        let child = Box::new(MaterializedOperator::new(probe_rows, 1));
 
         let mut op = BloomFilterOperator::new(child, bloom, vec![0]);
 

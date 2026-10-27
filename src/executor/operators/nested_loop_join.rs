@@ -25,9 +25,7 @@
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row};
 use crate::executor::expression::{JoinFilter, SubqueryExecutor};
-use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::functions::registry::global_registry;
-use crate::parser::ast::Expression;
+use crate::executor::operator::{Operator, RowRef};
 
 use super::hash_join::JoinType;
 
@@ -42,17 +40,14 @@ pub struct NestedLoopJoinOperator<'a> {
 
     // Join configuration
     join_type: JoinType,
-    condition: Option<Expression>,
 
-    // Compiled filter (created in open())
+    // The compiled join condition, None for CROSS JOIN
     filter: Option<JoinFilter>,
     // The statement's subquery blocks, as the filter's site calls them
     blocks: Option<&'a dyn SubqueryExecutor>,
     // Set when the filter read an error as false; JoinFilter::take_error has it
     condition_failed: bool,
 
-    // Output schema
-    schema: Vec<ColumnInfo>,
     left_col_count: usize,
     right_col_count: usize,
 
@@ -87,30 +82,24 @@ impl<'a> NestedLoopJoinOperator<'a> {
     /// * `left` - Left (outer) input operator
     /// * `right` - Right (inner) input operator
     /// * `join_type` - Type of join (INNER, LEFT, RIGHT, FULL, CROSS)
-    /// * `condition` - Join condition (None for CROSS JOIN)
+    /// * `filter` - Join condition compiled over the pair, carrying the query's
+    ///   parameters (None for CROSS JOIN)
     pub fn new(
         left: Box<dyn Operator>,
         right: Box<dyn Operator>,
         join_type: JoinType,
-        condition: Option<Expression>,
+        filter: Option<JoinFilter>,
     ) -> Self {
-        // Build combined schema
-        let mut schema = Vec::new();
-        schema.extend(left.schema().iter().cloned());
-        schema.extend(right.schema().iter().cloned());
-
-        let left_col_count = left.schema().len();
-        let right_col_count = right.schema().len();
+        let left_col_count = left.width();
+        let right_col_count = right.width();
 
         Self {
             left,
             right,
             join_type,
-            condition,
-            filter: None,
+            filter,
             blocks: None,
             condition_failed: false,
-            schema,
             left_col_count,
             right_col_count,
             right_rows: Vec::new(),
@@ -125,12 +114,6 @@ impl<'a> NestedLoopJoinOperator<'a> {
             opened: false,
             left_exhausted: false,
         }
-    }
-
-    /// Use a filter compiled for the condition, carrying the query's parameters.
-    pub fn with_filter(mut self, filter: JoinFilter) -> Self {
-        self.filter = Some(filter);
-        self
     }
 
     /// The statement's subquery blocks the filter calls
@@ -202,19 +185,6 @@ impl Operator for NestedLoopJoinOperator<'_> {
                 Row::from_values(vec![NULL_VALUE; self.left_col_count]).into_shared();
         }
 
-        // Build column names for filter compilation
-        let left_cols: Vec<String> = self.left.schema().iter().map(|c| c.name.clone()).collect();
-        let right_cols: Vec<String> = self.right.schema().iter().map(|c| c.name.clone()).collect();
-
-        // Compile join filter if condition exists
-        if let (None, Some(cond)) = (&self.filter, &self.condition) {
-            self.filter = Some(JoinFilter::new(
-                cond,
-                &left_cols,
-                &right_cols,
-                global_registry(),
-            )?);
-        }
         // An error a join on this thread left behind is not this one's
         if let Some(filter) = &self.filter {
             let _ = filter.take_error();
@@ -246,7 +216,6 @@ impl Operator for NestedLoopJoinOperator<'_> {
 
         let is_left_outer = matches!(self.join_type, JoinType::Left | JoinType::Full);
         let is_right_outer = matches!(self.join_type, JoinType::Right | JoinType::Full);
-        let is_cross = matches!(self.join_type, JoinType::Cross);
 
         // Phase 2: Return unmatched right rows (for RIGHT/FULL OUTER)
         if self.returning_unmatched_right {
@@ -310,7 +279,7 @@ impl Operator for NestedLoopJoinOperator<'_> {
                     )
                 } else {
                     // CROSS JOIN or no condition
-                    is_cross || self.condition.is_none()
+                    true
                 };
 
                 if matches {
@@ -358,8 +327,8 @@ impl Operator for NestedLoopJoinOperator<'_> {
         Ok(())
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        self.left_col_count + self.right_col_count
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -395,7 +364,8 @@ mod tests {
     use super::*;
     use crate::core::Value;
     use crate::executor::operator::MaterializedOperator;
-    use crate::parser::ast::{Identifier, InfixExpression};
+    use crate::functions::registry::global_registry;
+    use crate::parser::ast::{Expression, Identifier, InfixExpression};
     use crate::parser::token::{Position, Token, TokenType};
 
     fn make_rows(data: Vec<Vec<i64>>) -> Vec<Row> {
@@ -406,8 +376,16 @@ mod tests {
 
     fn make_operator(data: Vec<Vec<i64>>, cols: Vec<&str>) -> Box<dyn Operator> {
         let rows = make_rows(data);
-        let schema = cols.into_iter().map(ColumnInfo::new).collect();
-        Box::new(MaterializedOperator::new(rows, schema))
+        Box::new(MaterializedOperator::new(rows, cols.len()))
+    }
+
+    /// `left_id = right_id` over the left columns (left_id, value) and the
+    /// right columns (right_id, data)
+    fn make_eq_filter() -> JoinFilter {
+        let left = ["left_id".to_string(), "value".to_string()];
+        let right = ["right_id".to_string(), "data".to_string()];
+        let condition = make_eq_condition("left_id", "right_id");
+        JoinFilter::new(&condition, &left, &right, global_registry()).unwrap()
     }
 
     fn collect_results(op: &mut dyn Operator) -> Result<Vec<Row>> {
@@ -443,9 +421,9 @@ mod tests {
         );
         let right = make_operator(vec![vec![1, 100], vec![3, 300]], vec!["right_id", "data"]);
 
-        let condition = make_eq_condition("left_id", "right_id");
+        let filter = make_eq_filter();
 
-        let mut join = NestedLoopJoinOperator::new(left, right, JoinType::Inner, Some(condition));
+        let mut join = NestedLoopJoinOperator::new(left, right, JoinType::Inner, Some(filter));
 
         let results = collect_results(&mut join).unwrap();
 
@@ -474,9 +452,9 @@ mod tests {
         );
         let right = make_operator(vec![vec![1, 100]], vec!["right_id", "data"]);
 
-        let condition = make_eq_condition("left_id", "right_id");
+        let filter = make_eq_filter();
 
-        let mut join = NestedLoopJoinOperator::new(left, right, JoinType::Left, Some(condition));
+        let mut join = NestedLoopJoinOperator::new(left, right, JoinType::Left, Some(filter));
 
         let results = collect_results(&mut join).unwrap();
 
@@ -499,9 +477,9 @@ mod tests {
             vec!["right_id", "data"],
         );
 
-        let condition = make_eq_condition("left_id", "right_id");
+        let filter = make_eq_filter();
 
-        let mut join = NestedLoopJoinOperator::new(left, right, JoinType::Right, Some(condition));
+        let mut join = NestedLoopJoinOperator::new(left, right, JoinType::Right, Some(filter));
 
         let results = collect_results(&mut join).unwrap();
 
