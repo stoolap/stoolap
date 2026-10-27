@@ -5286,10 +5286,9 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<std::sync::Arc<PreparedJoin>> {
         let epoch = self.engine.schema_epoch();
-        let scope = ctx.cte_scope();
         let current = |guard: &CompiledExecution| match guard {
             CompiledExecution::PreparedJoin(held)
-                if held.cached_epoch == epoch && held.cte_scope == scope =>
+                if held.cached_epoch == epoch && held.cte_scope.holds(ctx) =>
             {
                 Some(std::sync::Arc::clone(held))
             }
@@ -5302,7 +5301,7 @@ impl Executor {
         if let Some(held) = current(&guard) {
             return Some(held);
         }
-        let held = std::sync::Arc::new(PreparedJoin::new(epoch, scope));
+        let held = std::sync::Arc::new(PreparedJoin::new(epoch, ctx.cte_scope()));
         *guard = CompiledExecution::PreparedJoin(std::sync::Arc::clone(&held));
         Some(held)
     }

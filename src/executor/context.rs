@@ -1262,9 +1262,6 @@ pub struct ExecutionContext {
     /// CTE data for subqueries to reference CTEs from outer query
     /// Maps CTE name (lowercase) to (columns, rows)
     cte_data: Option<Arc<CteDataMap>>,
-    /// The names and columns of those CTEs as one number, 0 for none: a plan
-    /// made in this context holds only where the same CTEs are bound
-    cte_scope: u64,
     /// Current transaction ID for CURRENT_TRANSACTION_ID() function
     transaction_id: Option<u64>,
     /// One transaction for every fetch of a statement that has no explicit
@@ -1325,6 +1322,32 @@ type CteData = (CompactArc<Vec<String>>, CompactArc<Vec<(i64, Row)>>);
 /// to enable zero-copy sharing of CTE results with joins
 type CteDataMap = StringMap<CteData>;
 
+/// The names and columns of the CTEs a context brought when a plan was made,
+/// None for none
+#[derive(Debug)]
+pub struct CteScope(Option<Box<[ScopedCte]>>);
+
+/// A CTE's name and its columns
+type ScopedCte = (String, CompactArc<Vec<String>>);
+
+impl CteScope {
+    /// Whether `ctx` brings these CTEs and no other, each with its columns
+    pub(crate) fn holds(&self, ctx: &ExecutionContext) -> bool {
+        let data = ctx.cte_data.as_deref().filter(|data| !data.is_empty());
+        match (&self.0, data) {
+            (None, None) => true,
+            (Some(held), Some(data)) => {
+                held.len() == data.len()
+                    && held.iter().all(|(name, columns)| {
+                        data.get(name)
+                            .is_some_and(|(now, _)| now.as_slice() == columns.as_slice())
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self::new()
@@ -1347,7 +1370,6 @@ impl ExecutionContext {
             outer_row: None,
             outer_columns: None,
             cte_data: None,
-            cte_scope: 0,
             transaction_id: None,
             statement_snapshot: None,
             statement_view: None,
@@ -1489,7 +1511,6 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: None,
-            cte_scope: 0,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1515,7 +1536,6 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
-            cte_scope: self.cte_scope,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1566,7 +1586,6 @@ impl ExecutionContext {
             outer_row: Some(outer_row),
             outer_columns: Some(outer_columns), // Arc clone = cheap
             cte_data: self.cte_data.clone(),    // Arc clone = cheap
-            cte_scope: self.cte_scope,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1595,14 +1614,23 @@ impl ExecutionContext {
     /// Whether this context brings CTEs a statement run in it may read
     #[inline]
     pub(crate) fn brings_ctes(&self) -> bool {
-        self.cte_scope != 0
+        self.cte_data
+            .as_deref()
+            .is_some_and(|data| !data.is_empty())
     }
 
-    /// The names and columns of the CTEs this context brings as one number,
-    /// 0 for none
-    #[inline]
-    pub(crate) fn cte_scope(&self) -> u64 {
-        self.cte_scope
+    /// The names and columns of the CTEs this context brings
+    pub(crate) fn cte_scope(&self) -> CteScope {
+        CteScope(
+            self.cte_data
+                .as_deref()
+                .filter(|data| !data.is_empty())
+                .map(|data| {
+                    data.iter()
+                        .map(|(name, (columns, _))| (name.clone(), columns.clone()))
+                        .collect()
+                }),
+        )
     }
 
     /// Check if context has CTE data by name that is already lowercase.
@@ -1617,14 +1645,6 @@ impl ExecutionContext {
     /// Create a new context with CTE data for subqueries to reference
     /// Takes an Arc to avoid cloning large CTE datasets
     pub fn with_cte_data(&self, cte_data: Arc<CteDataMap>) -> Self {
-        // The same CTEs give the same number in any order; a name and its
-        // columns in turn add one hash with its low bit set, so past 0
-        let cte_scope = cte_data.iter().fold(0u64, |scope, (name, (columns, _))| {
-            let mut hasher = rustc_hash::FxHasher::default();
-            std::hash::Hash::hash(name.as_str(), &mut hasher);
-            std::hash::Hash::hash(columns.as_slice(), &mut hasher);
-            scope.wrapping_add(std::hash::Hasher::finish(&hasher) | 1)
-        });
         Self {
             params: self.params.clone(),
             auto_commit: self.auto_commit,
@@ -1637,7 +1657,6 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: Some(cte_data),
-            cte_scope,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1816,7 +1835,6 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
-            cte_scope: self.cte_scope,
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),

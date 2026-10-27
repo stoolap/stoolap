@@ -23,6 +23,7 @@ use smallvec::SmallVec;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Schema};
 
+use super::context::CteScope;
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
 use super::prepared_select::{JoinBlocks, PreparedGrouped};
@@ -193,8 +194,8 @@ pub(crate) type JoinSides = [JoinSide; 2];
 #[derive(Debug)]
 pub struct PreparedJoin {
     pub cached_epoch: u64,
-    /// The CTEs its context bound, as `ExecutionContext::cte_scope`
-    pub cte_scope: u64,
+    /// The CTEs its context bound
+    pub cte_scope: CteScope,
     /// An empty list stands for a clause that leaves nothing to ask
     programs: Shelf<JoinProgramKey, [SharedProgram]>,
     analyses: Shelf<AnalysisKey, JoinAnalysis>,
@@ -216,7 +217,7 @@ pub struct PreparedJoin {
 }
 
 impl PreparedJoin {
-    pub fn new(cached_epoch: u64, cte_scope: u64) -> Self {
+    pub fn new(cached_epoch: u64, cte_scope: CteScope) -> Self {
         Self {
             cached_epoch,
             cte_scope,

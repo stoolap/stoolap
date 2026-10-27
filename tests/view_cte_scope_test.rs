@@ -278,6 +278,67 @@ fn a_cte_of_the_same_name_with_other_columns_gets_its_own_plan() {
     );
 }
 
+/// A context bringing CTEs of the column id, each of the one row its id
+fn id_ctes_context(ctes: &[(&str, i64)]) -> ExecutionContext {
+    let mut map = StringMap::default();
+    for (name, id) in ctes {
+        map.insert(
+            name.to_string(),
+            (
+                CompactArc::new(vec!["id".to_string()]),
+                CompactArc::new(vec![(0, Row::from_values(vec![Value::Integer(*id)]))]),
+            ),
+        );
+    }
+    ExecutionContext::new().with_cte_data(Arc::new(map))
+}
+
+#[test]
+fn ctes_are_told_apart_by_their_names_not_a_number_made_of_them() {
+    /// With the column id, FxHash gives this name the value it gives u
+    const TWIN: &str = "jjs6mwdf4v\"m/`r@";
+    /// With the column id, FxHash gives this name and u values summing to 0
+    const CANCEL: &str = "zfph0mgb6<h.d,*s";
+    let mut wrong = Vec::new();
+    for text in [
+        "SELECT id FROM u WHERE id = 1",
+        "SELECT id FROM u",
+        "SELECT t.id FROM t JOIN u ON u.id = t.id WHERE t.id <= (SELECT MAX(id) FROM t)",
+    ] {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let executor = Executor::new(Arc::new(engine));
+        for sql in &SETUP[..4] {
+            executor.execute(sql).unwrap();
+        }
+        let table = vec![1];
+        let cte = if text.ends_with("= 1") {
+            vec![]
+        } else {
+            vec![2]
+        };
+        for (ctes, want) in [
+            (&[("u", 2), (CANCEL, 3)][..], &cte),
+            (&[("u", 2)][..], &cte),
+            (&[(TWIN, 3)][..], &table),
+            (&[("u", 2), (CANCEL, 3)][..], &cte),
+            (&[(TWIN, 3)][..], &table),
+            (&[("u", 2)][..], &cte),
+        ] {
+            let got = executor_ids(executor.execute_with_context(text, &id_ctes_context(ctes)));
+            if got.as_ref() != Ok(want) {
+                wrong.push(format!("{text} under {ctes:?}: {got:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
