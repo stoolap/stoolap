@@ -35,6 +35,7 @@ fn serial() -> MutexGuard<'static, ()> {
 #[derive(Clone, Copy, Debug)]
 enum Path {
     /// A general path mechanism, until the step named prepares it
+    #[allow(dead_code)]
     Old(&'static str),
     /// No general path mechanism
     Prepared,
@@ -399,7 +400,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT t.id FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.a \
          WHERE t.b > (SELECT MAX(x) FROM u)",
         "SELECT t.id FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.a WHERE t.b > 3",
-        Old("a joined side whose run merges or names its columns: #576"),
+        Prepared,
     ),
     (
         "join_with_a_joined_values_side",

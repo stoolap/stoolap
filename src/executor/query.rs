@@ -379,6 +379,8 @@ type ReadSchema = (LayoutToken, CompactArc<Schema>);
 struct SideRead<'a> {
     filter: Option<&'a Expression>,
     run: Option<(StatementRun<'a>, usize)>,
+    /// A side that is a join keeps both columns of a pair it merges
+    apart: bool,
 }
 
 /// A WHERE asked of joined rows, bound to what the statement's run holds
@@ -572,6 +574,158 @@ impl CteNames<'_> {
             CteNames::Listed(names) => names.iter().any(|name| name == name_lower),
         }
     }
+}
+
+/// The joined rows of `all_columns`, each NATURAL or USING pair shown once:
+/// `excluded` holds each pair's right column and `renames` its left one by
+/// its bare name. A SELECT * drops the right column and names the left bare;
+/// an explicit select list finds the left by its bare name too, as a column
+/// of its own beside the qualified ones, so `a`, `x.a` and `x.*` all see it
+fn merged_columns(
+    stmt: &SelectStatement,
+    all_columns: &[String],
+    filtered_rows: RowVec,
+    (excluded_column_indices, join_col_renames): (&[usize], &[(usize, String)]),
+) -> (Vec<String>, RowVec) {
+    if excluded_column_indices.is_empty() && join_col_renames.is_empty() {
+        return (all_columns.to_vec(), filtered_rows);
+    }
+    // Check if SELECT * is used (need to deduplicate columns)
+    let has_star = stmt
+        .columns
+        .iter()
+        .any(|c| matches!(c, Expression::Star(_)));
+
+    if has_star {
+        // Create a set for O(1) lookup
+        let excluded_set: FxHashSet<usize> = excluded_column_indices.iter().copied().collect();
+
+        // Create rename map for join columns
+        let rename_map: FxHashMap<usize, String> = join_col_renames.iter().cloned().collect();
+
+        // Build list of indices to keep (all except excluded)
+        let kept_indices: Vec<usize> = (0..all_columns.len())
+            .filter(|i| !excluded_set.contains(i))
+            .collect();
+
+        // Filter columns and apply renames for join columns
+        let filtered_columns: Vec<String> = kept_indices
+            .iter()
+            .map(|&i| {
+                if let Some(base_name) = rename_map.get(&i) {
+                    // Use unqualified name for join columns per SQL standard
+                    base_name.clone()
+                } else {
+                    all_columns[i].clone()
+                }
+            })
+            .collect();
+
+        // Filter row values using clone_subset, preserving row IDs
+        let filtered_rows: RowVec = filtered_rows
+            .into_iter()
+            .map(|(row_id, row)| (row_id, row.clone_subset(&kept_indices)))
+            .collect();
+
+        (filtered_columns, filtered_rows)
+    } else {
+        let mut columns = all_columns.to_vec();
+        let mut rows = filtered_rows;
+        for (idx, base_name) in join_col_renames {
+            columns.push(base_name.clone());
+            for (_, row) in rows.iter_mut() {
+                let value = row.get(*idx).cloned().unwrap_or_else(Value::null_unknown);
+                row.push(value);
+            }
+        }
+        (columns, rows)
+    }
+}
+
+/// Into `excluded` and `renames`, as [`merged_columns`] takes them, the pairs
+/// `held`'s joined sides merge, which the blocks read apart, over `columns`,
+/// for `stmt`'s star or a qualified star; the left columns a clause names
+/// bare otherwise, to name bare in place. A column already named is named once
+fn side_pairs(
+    stmt: &SelectStatement,
+    held: &JoinBlocks,
+    columns: &[String],
+    (excluded, renames): (&mut Vec<usize>, &mut Vec<(usize, String)>),
+) -> Vec<(usize, String)> {
+    let star = stmt
+        .columns
+        .iter()
+        .any(|c| matches!(c, Expression::Star(_)));
+    let qualified_star = stmt
+        .columns
+        .iter()
+        .any(|c| matches!(c, Expression::QualifiedStar(_)));
+    let mut in_place = Vec::new();
+    for (left, right) in held.side_merges() {
+        if star {
+            excluded.push(right);
+        }
+        let name = bare_name(&columns[left]);
+        if renames.iter().any(|(named, _)| *named == left) || !(star || names_bare(stmt, name)) {
+            continue;
+        }
+        match star || qualified_star {
+            true => renames.push((left, name.to_string())),
+            false => in_place.push((left, name.to_string())),
+        }
+    }
+    in_place
+}
+
+/// `columns` and `rows`, joined rows of a join path that does not run
+/// [`merged_columns`] itself, with the pairs of `held`'s joined sides shown
+/// as the join's own are; as they are without `held`
+fn merged_side_rows(
+    stmt: &SelectStatement,
+    held: Option<&JoinBlocks>,
+    columns: Vec<String>,
+    rows: RowVec,
+) -> (Vec<String>, RowVec) {
+    let Some(held) = held else {
+        return (columns, rows);
+    };
+    let (mut excluded, mut renames) = (Vec::new(), Vec::new());
+    let in_place = side_pairs(stmt, held, &columns, (&mut excluded, &mut renames));
+    let (mut columns, rows) = match excluded.is_empty() && renames.is_empty() {
+        true => (columns, rows),
+        false => merged_columns(stmt, &columns, rows, (&excluded, &renames)),
+    };
+    for (at, name) in in_place {
+        columns[at] = name;
+    }
+    (columns, rows)
+}
+
+/// Whether a clause of `stmt` the projection, grouping or sort reads by name
+/// names `name` bare, or reads more than its names say
+fn names_bare(stmt: &SelectStatement, name: &str) -> bool {
+    if !stmt.window_defs.is_empty() {
+        return true;
+    }
+    let mut named = false;
+    let clauses = stmt
+        .columns
+        .iter()
+        .chain(&stmt.group_by.columns)
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+        .chain(&stmt.distinct_on);
+    for clause in clauses {
+        let read_all = visit_column_refs(clause, &mut |column| {
+            if let Expression::Identifier(id) = column {
+                named |= eq_folded(name, &id.value_lower);
+            }
+        });
+        if !read_all || named {
+            return true;
+        }
+    }
+    false
 }
 
 /// The equalities a NATURAL join or a USING list makes of the sides'
@@ -2429,7 +2583,7 @@ impl Executor {
                 self.execute_simple_table_scan(table_source, stmt, ctx, classification, None, None)
             }
             Expression::JoinSource(join_source) => {
-                self.execute_join_source(join_source, stmt, ctx, classification, compiled)
+                self.execute_join_source(join_source, stmt, ctx, classification, compiled, false)
             }
             Expression::SubquerySource(subquery_source) => {
                 self.execute_subquery_source(subquery_source, stmt, ctx, classification)
@@ -5069,7 +5223,8 @@ impl Executor {
 
     /// Execute a JOIN source. A GROUP BY + LIMIT join fetches its left side in
     /// a limited chunk; when the final rows stop short of the limit and the
-    /// chunk was full, the join runs again with a larger chunk
+    /// chunk was full, the join runs again with a larger chunk. Run `apart`,
+    /// it and each join it holds keep both columns of a pair they merge
     fn execute_join_source(
         &self,
         join_source: &JoinTableSource,
@@ -5077,6 +5232,7 @@ impl Executor {
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        apart: bool,
     ) -> SelectResult {
         let reduction = std::cell::Cell::new(None);
         let mut left_cap = None;
@@ -5087,7 +5243,7 @@ impl Executor {
                 ctx,
                 classification,
                 compiled,
-                left_cap,
+                (left_cap, apart),
                 &reduction,
             )?;
             let pass = match reduction.get() {
@@ -5163,29 +5319,23 @@ impl Executor {
 
     /// Whether a join with a subquery in a clause keeps its plan, its CTEs
     /// bound or inlined, so its blocks may run; a join with a CTE not named
-    /// before it runs, or with a joined side that merges columns, stays there
+    /// before it runs stays there
     pub(crate) fn join_keeps_plan(&self, stmt: &SelectStatement, with: &WithClause) -> bool {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return false;
         };
-        let source = |side: &Expression| match side {
-            Expression::JoinSource(join) => Self::joined_side_reason(join).is_none(),
-            _ => true,
-        };
         let classification = get_classification(stmt);
-        source(&join.left)
-            && source(&join.right)
-            && (classification.where_has_subqueries
-                || classification.output_has_subqueries
-                || Self::ons_hold_subqueries(join))
+        (classification.where_has_subqueries
+            || classification.output_has_subqueries
+            || Self::ons_hold_subqueries(join))
             && self.named_ctes(with).is_ok()
     }
 
     /// Each side's columns as the join's blocks read them, a base table's
     /// schema or the names a FROM gives any other source, and whether it is
     /// read as rows; a side that is a join, read as rows, has its tables'
-    /// columns side by side. None when a table is read with AS OF, a source
-    /// is not named without reading it, or a joined side merges columns
+    /// columns side by side. None when a table is read with AS OF or a source
+    /// is not named without reading it
     pub(crate) fn join_side_schemas(
         &self,
         join_source: &JoinTableSource,
@@ -5215,10 +5365,9 @@ impl Executor {
                     rows,
                 })
             }
-            // Its rows lay out each table's columns in turn, unless a NATURAL
-            // or USING join merges them; a VALUES list's are named bare, so
-            // the join's ON could bind them to another table's of that name
-            Expression::JoinSource(join) if Self::joined_side_reason(join).is_none() => {
+            // Its rows lay out each table's columns in turn, both of a pair
+            // a NATURAL or USING join merges among them
+            Expression::JoinSource(join) => {
                 let mut leaves = smallvec::SmallVec::new();
                 for side in [&join.left, &join.right] {
                     let side = self.join_side(side, ctx)?;
@@ -5238,18 +5387,16 @@ impl Executor {
         join.join_type.to_uppercase().contains("NATURAL") || !join.using_columns.is_empty()
     }
 
-    /// Why `join`, a side of a join, cannot be read as its tables' columns
-    /// in turn, or of a join it holds; None when it can
-    fn joined_side_reason(join: &JoinTableSource) -> Option<OutOfFamily> {
-        if Self::merges_columns(join) {
-            return Some("a joined side that is a NATURAL or USING join");
+    /// Whether the join side `side` is or holds a NATURAL or USING join
+    fn merges_within(side: &Expression) -> bool {
+        match side {
+            Expression::JoinSource(join) => {
+                Self::merges_columns(join)
+                    || Self::merges_within(&join.left)
+                    || Self::merges_within(&join.right)
+            }
+            _ => false,
         }
-        [&*join.left, &*join.right]
-            .into_iter()
-            .find_map(|side| match side {
-                Expression::JoinSource(join) => Self::joined_side_reason(join),
-                _ => None,
-            })
     }
 
     /// Whether the ON of `join`, or of a join it holds as a side, holds a
@@ -5276,13 +5423,7 @@ impl Executor {
         sides: Option<&JoinSides>,
     ) -> std::result::Result<(), OutOfFamily> {
         let Some(sides @ [left, right]) = sides else {
-            let joined = |side: &Expression| match side {
-                Expression::JoinSource(join) => Self::joined_side_reason(join),
-                _ => None,
-            };
-            return Err(joined(&join_source.left)
-                .or_else(|| joined(&join_source.right))
-                .unwrap_or("a side read with AS OF or not named before it is read"));
+            return Err("a side read with AS OF or not named before it is read");
         };
         // The blocks qualify each side's columns by its name, a joined
         // side's by its tables'
@@ -5396,7 +5537,11 @@ impl Executor {
         if !found {
             return Ok(false);
         }
-        if join_type.contains("NATURAL") || !join_source.using_columns.is_empty() {
+        if join_type.contains("NATURAL")
+            || !join_source.using_columns.is_empty()
+            || Self::merges_within(&join_source.left)
+            || Self::merges_within(&join_source.right)
+        {
             return Err("a NATURAL or USING join whose output holds a subquery");
         }
         if classification.has_aggregation
@@ -5587,7 +5732,7 @@ impl Executor {
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
-        left_cap_override: Option<usize>,
+        (left_cap_override, apart): (Option<usize>, bool),
         reduction: &std::cell::Cell<Option<ReductionPass>>,
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
@@ -5818,12 +5963,18 @@ impl Executor {
             (Some(blocks), Some(run)) => Some(StatementRun { blocks, run }),
             _ => None,
         };
+        // A joined side whose merged pairs the blocks read apart has each pair
+        // shown and named as the join's own, which only the standard path does
+        let side_merged = blocks
+            .as_deref()
+            .is_some_and(|held| held.side_merges().next().is_some());
         let left_read = SideRead {
             filter: match rows_sides[0] {
                 true => left_plain.as_ref(),
                 false => left_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 0)),
+            apart,
         };
         let right_read = SideRead {
             filter: match rows_sides[1] {
@@ -5831,6 +5982,7 @@ impl Executor {
                 false => right_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 1)),
+            apart,
         };
         let where_blocks = statement_run.map(|run| run.site(false));
         let where_blocks = where_blocks
@@ -6835,6 +6987,11 @@ impl Executor {
                         }
                     }
 
+                    let merging = blocks
+                        .as_deref()
+                        .filter(|_| side_merged && !apart && projection_pushdown.is_none());
+                    let (all_columns, final_rows) =
+                        merged_side_rows(stmt, merging, all_columns, final_rows);
                     let held = if has_agg || has_window || projection_pushdown.is_some() {
                         None
                     } else {
@@ -7189,6 +7346,9 @@ impl Executor {
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::streaming_join_streamed();
                     let join_result = join_executor.execute_streaming(streaming_request)?;
+                    let merging = blocks.as_deref().filter(|_| side_merged && !apart);
+                    let (all_cols, joined_rows) =
+                        merged_side_rows(stmt, merging, all_cols, join_result.rows);
                     let held = self.held_join_output(
                         prepared.as_deref(),
                         stmt,
@@ -7198,13 +7358,13 @@ impl Executor {
                         ctx,
                     )?;
                     if let Some(output) = held.as_deref().and_then(Option::as_ref) {
-                        return output_result(output, join_result.rows, false);
+                        return output_result(output, joined_rows, false);
                     }
 
                     // Project and return results
                     let projected_rows = self.project_rows_with_alias(
                         &stmt.columns,
-                        join_result.rows,
+                        joined_rows,
                         &all_cols,
                         None,
                         ctx,
@@ -7296,7 +7456,20 @@ impl Executor {
         );
 
         // Destructure the tuple: (condition, excluded_column_indices, column_renames)
-        let (natural_join_cond, excluded_column_indices, join_col_renames) = natural_join_condition;
+        let (natural_join_cond, mut excluded_column_indices, mut join_col_renames) =
+            natural_join_condition;
+        // Run apart, it keeps both columns of each pair it merges
+        if apart {
+            excluded_column_indices.clear();
+            join_col_renames.clear();
+        }
+        let side_names = match blocks.as_deref().filter(|_| side_merged && !apart) {
+            Some(held) => {
+                let lists = (&mut excluded_column_indices, &mut join_col_renames);
+                side_pairs(stmt, held, &all_columns, lists)
+            }
+            None => Vec::new(),
+        };
 
         // Use natural join condition if present, otherwise use explicit
         // condition, whose subqueries were read at the top of the function
@@ -7454,69 +7627,15 @@ impl Executor {
             result_rows
         };
 
-        // For NATURAL JOIN and JOIN USING, filter out duplicate columns from right side
-        // when SELECT * is used. We need to remove these columns from both all_columns
-        // and the row values to maintain consistency.
-        // Also rename join columns to unqualified names per SQL standard.
-        let (final_columns, final_rows) = if !excluded_column_indices.is_empty() {
-            // Check if SELECT * is used (need to deduplicate columns)
-            let has_star = stmt
-                .columns
-                .iter()
-                .any(|c| matches!(c, Expression::Star(_)));
-
-            if has_star {
-                // Create a set for O(1) lookup
-                let excluded_set: FxHashSet<usize> =
-                    excluded_column_indices.iter().copied().collect();
-
-                // Create rename map for join columns
-                let rename_map: FxHashMap<usize, String> =
-                    join_col_renames.iter().cloned().collect();
-
-                // Build list of indices to keep (all except excluded)
-                let kept_indices: Vec<usize> = (0..all_columns.len())
-                    .filter(|i| !excluded_set.contains(i))
-                    .collect();
-
-                // Filter columns and apply renames for join columns
-                let filtered_columns: Vec<String> = kept_indices
-                    .iter()
-                    .map(|&i| {
-                        if let Some(base_name) = rename_map.get(&i) {
-                            // Use unqualified name for join columns per SQL standard
-                            base_name.clone()
-                        } else {
-                            all_columns[i].clone()
-                        }
-                    })
-                    .collect();
-
-                // Filter row values using clone_subset, preserving row IDs
-                let filtered_rows: RowVec = filtered_rows
-                    .into_iter()
-                    .map(|(row_id, row)| (row_id, row.clone_subset(&kept_indices)))
-                    .collect();
-
-                (filtered_columns, filtered_rows)
-            } else {
-                // An explicit select list finds the join column by its
-                // bare name too, as a column of its own beside the
-                // qualified ones, so `a`, `x.a` and `x.*` all see it
-                let mut columns = all_columns.clone();
-                let mut rows = filtered_rows;
-                for (idx, base_name) in &join_col_renames {
-                    columns.push(base_name.clone());
-                    for (_, row) in rows.iter_mut() {
-                        let value = row.get(*idx).cloned().unwrap_or_else(Value::null_unknown);
-                        row.push(value);
-                    }
-                }
-                (columns, rows)
-            }
-        } else {
-            (all_columns.clone(), filtered_rows)
-        };
+        let (mut final_columns, final_rows) = merged_columns(
+            stmt,
+            &all_columns,
+            filtered_rows,
+            (&excluded_column_indices, &join_col_renames),
+        );
+        for (at, name) in side_names {
+            final_columns[at] = name;
+        }
 
         if classification.has_aggregation || classification.has_window_functions {
             return self.grouped_join_select(
@@ -8669,12 +8788,14 @@ impl Executor {
     }
 
     /// The rows of `join`, a side that is itself a join, each table's columns
-    /// in turn: a SELECT * of it, held in `compiled` when it has a plan
+    /// in turn: a SELECT * of it, held in `compiled` when it has a plan. Read
+    /// `apart`, a NATURAL or USING join in it keeps both columns of a pair
     fn joined_side_rows(
         &self,
         join: &JoinTableSource,
         ctx: &ExecutionContext,
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        apart: bool,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         let select_all = SelectStatement {
             param_count: 0,
@@ -8698,7 +8819,7 @@ impl Executor {
         };
         let classification = get_classification(&select_all);
         let (result, columns, _, _) =
-            self.execute_join_source(join, &select_all, ctx, &classification, compiled)?;
+            self.execute_join_source(join, &select_all, ctx, &classification, compiled, apart)?;
         Ok((result, columns.to_vec()))
     }
 
@@ -8833,7 +8954,7 @@ impl Executor {
 
                 Ok((result, qualified_columns))
             }
-            Expression::JoinSource(js) => self.joined_side_rows(js, ctx, None),
+            Expression::JoinSource(js) => self.joined_side_rows(js, ctx, None, false),
             Expression::SubquerySource(ss) => {
                 // Execute subquery with incremented depth to avoid creating new TimeoutGuard
                 let subquery_ctx = ctx.with_incremented_query_depth();
@@ -8971,16 +9092,18 @@ impl Executor {
         }
         let mut read = None;
         let read_out = side.run.is_some().then_some(&mut read);
-        // A joined side runs as a join of its own, under the plan it holds
+        // A joined side runs as a join of its own, under the plan it holds,
+        // both columns of a pair it merges kept as the blocks read them
         let nested = match (rows, expr) {
             (Some((run, index)), Expression::JoinSource(join)) => {
                 Some((join, run.blocks.nested[index].as_ref()))
             }
+            (None, Expression::JoinSource(join)) if side.apart => Some((join, None)),
             _ => None,
         };
         let fetched = match nested {
             Some((join, compiled)) => {
-                let (result, columns) = self.joined_side_rows(join, ctx, compiled)?;
+                let (result, columns) = self.joined_side_rows(join, ctx, compiled, true)?;
                 (result, columns, false, None)
             }
             None => self.execute_table_expression_with_filter_limit(
