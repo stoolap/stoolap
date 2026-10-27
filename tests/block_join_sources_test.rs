@@ -416,6 +416,8 @@ fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
     let _guard = serial();
     let db = hot("dropped");
     let refused = |position: &str| Err(format!("invalid argument: {}", position));
+    let ambiguous =
+        |name: &str| format!("invalid argument: column reference '{name}' is ambiguous");
     let mut wrong = Vec::new();
     for (sql, want) in [
         (
@@ -444,12 +446,12 @@ fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
         (
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT v.x FROM u CROSS JOIN (VALUES (1)) \
              AS v(x) GROUP BY x)",
-            Ok(vec!["5".to_string()]),
+            Err(ambiguous("x")),
         ),
         (
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x FROM u CROSS JOIN (VALUES (1)) \
              AS v(x) GROUP BY x)",
-            Err("Compile error: Column 'u.x' not found".to_string()),
+            Err(ambiguous("x")),
         ),
         (
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT g.value FROM u CROSS JOIN \
@@ -459,7 +461,7 @@ fn an_exists_over_a_join_checks_its_dropped_clauses_as_its_run_names_them() {
         (
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT q.x FROM u CROSS JOIN \
              (SELECT 1 AS x) AS q GROUP BY x)",
-            Err("Compile error: Column 'q.x' not found".to_string()),
+            Err(ambiguous("x")),
         ),
         (
             "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT u.x AS y FROM u CROSS JOIN \
