@@ -18,7 +18,8 @@
 //! through niche optimization. The design:
 //!
 //! - **Inline**: strings ≤15 bytes stored inline (no heap allocation)
-//! - **Heap**: strings >15 bytes stored as Arc<String> for O(1) clone
+//! - **Heap**: strings >15 bytes stored in one shared block, `[count][bytes]`,
+//!   for O(1) clone
 //!
 //! ## Memory Layout (16 bytes, 8-byte aligned)
 //!
@@ -28,12 +29,14 @@
 //!   tag = 0-15 (encodes length)
 //!
 //! Heap (>15 bytes) on 64-bit:
-//!   [tag: 1 byte] [pad: 7 bytes] [Arc<String>: 8 bytes]
+//!   [tag: 1 byte] [length: 7 bytes] [block pointer: 8 bytes]
 //!   tag = 16 (heap marker), pointer at data[7..15]
 //!
 //! Heap (>15 bytes) on 32-bit:
-//!   [tag: 1 byte] [pad: 11 bytes] [Arc<String>: 4 bytes]
+//!   [tag: 1 byte] [length: 4 bytes] [pad: 7 bytes] [block pointer: 4 bytes]
 //!   tag = 16 (heap marker), pointer at data[11..15]
+//!
+//! Heap block: [reference count: AtomicUsize] [the string's bytes]
 //! ```
 //!
 //! ## Niche Optimization
@@ -47,10 +50,35 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::sync::atomic::{fence, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 /// Maximum inline string length (15 bytes)
 pub const MAX_INLINE_LEN: usize = 15;
+
+/// Bytes of a heap block before the string: its reference count
+const HEADER: usize = std::mem::size_of::<AtomicUsize>();
+
+/// Bytes of `data` before the block pointer that hold a heap string's length
+const LEN_BYTES: usize = if ptr_layout::OFFSET < std::mem::size_of::<usize>() {
+    ptr_layout::OFFSET
+} else {
+    std::mem::size_of::<usize>()
+};
+
+/// Longest heap string: what the length bytes hold, and what a block can be
+const MAX_HEAP_LEN: usize = {
+    let held = match 1usize.checked_shl(8 * LEN_BYTES as u32) {
+        Some(limit) => limit - 1,
+        None => usize::MAX,
+    };
+    let block = (isize::MAX as usize & !(std::mem::align_of::<AtomicUsize>() - 1)) - HEADER;
+    if held < block {
+        held
+    } else {
+        block
+    }
+};
 
 /// Platform-specific pointer layout for heap strings.
 /// On 64-bit: 8-byte pointer stored at data[7..15]
@@ -61,8 +89,6 @@ mod ptr_layout {
     pub const OFFSET: usize = 7;
     /// Pointer size in bytes
     pub const SIZE: usize = 8;
-    /// Type alias for pointer bytes array
-    pub type Bytes = [u8; 8];
 }
 
 #[cfg(target_pointer_width = "32")]
@@ -71,8 +97,6 @@ mod ptr_layout {
     pub const OFFSET: usize = 11;
     /// Pointer size in bytes
     pub const SIZE: usize = 4;
-    /// Type alias for pointer bytes array
-    pub type Bytes = [u8; 4];
 }
 
 /// String tag that encodes storage mode and inline length.
@@ -145,9 +169,9 @@ impl StringTag {
 pub struct SmartString {
     /// Tag byte: encodes storage mode (inline length or heap)
     tag: StringTag,
-    /// Data bytes: inline string data OR (padding + Arc pointer)
-    /// - 64-bit: 7 bytes padding + 8-byte pointer at data[7..15]
-    /// - 32-bit: 11 bytes padding + 4-byte pointer at data[11..15]
+    /// Data bytes: inline string data OR (length + heap block pointer)
+    /// - 64-bit: 7-byte length + 8-byte pointer at data[7..15]
+    /// - 32-bit: 4-byte length + 4-byte pointer at data[11..15]
     data: [u8; 15],
 }
 
@@ -164,22 +188,103 @@ impl SmartString {
                 data,
             }
         } else {
-            Self::new_heap(s.to_string())
+            Self::new_heap(s)
         }
     }
 
-    /// Create a SmartString from an owned String (heap case)
+    /// A heap string holding a copy of `s`
     #[inline]
-    fn new_heap(s: String) -> Self {
-        let arc = Arc::new(s);
-        let ptr = Arc::into_raw(arc) as usize;
+    fn new_heap(s: &str) -> Self {
+        // SAFETY: the bytes copied are `s`'s, which are valid UTF-8
+        unsafe { Self::heap_with(s.len(), |bytes| bytes.copy_from_slice(s.as_bytes())) }
+    }
+
+    /// The layout of a heap block holding a string of `len` bytes
+    #[inline]
+    fn heap_layout(len: usize) -> std::alloc::Layout {
+        assert!(len <= MAX_HEAP_LEN, "string too long for a SmartString");
+        // SAFETY: the alignment is a power of two, and HEADER + len rounded
+        // up to it stays within isize::MAX, which MAX_HEAP_LEN keeps
+        unsafe {
+            std::alloc::Layout::from_size_align_unchecked(
+                HEADER + len,
+                std::mem::align_of::<AtomicUsize>(),
+            )
+        }
+    }
+
+    /// A heap string of `len` bytes, which `fill` writes in place
+    ///
+    /// # Safety
+    ///
+    /// `fill` must write all `len` bytes, and they must form valid UTF-8.
+    #[inline]
+    unsafe fn heap_with(len: usize, fill: impl FnOnce(&mut [u8])) -> Self {
+        let layout = Self::heap_layout(len);
+        let block = std::alloc::alloc(layout);
+        if block.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // The block's count starts at one, for the string returned
+        block.cast::<AtomicUsize>().write(AtomicUsize::new(1));
+        fill(std::slice::from_raw_parts_mut(block.add(HEADER), len));
         let mut data = [0u8; 15];
+        data[..LEN_BYTES].copy_from_slice(&len.to_le_bytes()[..LEN_BYTES]);
         let end = ptr_layout::OFFSET + ptr_layout::SIZE;
-        data[ptr_layout::OFFSET..end].copy_from_slice(&ptr.to_ne_bytes());
+        data[ptr_layout::OFFSET..end].copy_from_slice(&block.expose_provenance().to_ne_bytes());
         SmartString {
             tag: StringTag::Heap,
             data,
         }
+    }
+
+    /// A heap string's block
+    #[inline(always)]
+    fn heap_block(&self) -> *mut u8 {
+        debug_assert!(self.tag.is_heap());
+        let end = ptr_layout::OFFSET + ptr_layout::SIZE;
+        let mut ptr_bytes = [0u8; std::mem::size_of::<usize>()];
+        ptr_bytes.copy_from_slice(&self.data[ptr_layout::OFFSET..end]);
+        std::ptr::with_exposed_provenance_mut(usize::from_ne_bytes(ptr_bytes))
+    }
+
+    /// A heap string's block and length, read as the string's two words: the
+    /// tag with the little-endian length after it, then the block pointer
+    #[cfg(target_pointer_width = "64")]
+    #[inline(always)]
+    fn heap_parts(&self) -> (*mut u8, usize) {
+        debug_assert!(self.tag.is_heap());
+        // SAFETY: a SmartString is 16 initialized bytes aligned to 8, with
+        // no padding, so it reads as two u64 words
+        let words: [u64; 2] = unsafe { std::ptr::read((self as *const Self).cast::<[u64; 2]>()) };
+        (
+            std::ptr::with_exposed_provenance_mut(words[1] as usize),
+            (u64::from_le(words[0]) >> 8) as usize,
+        )
+    }
+
+    /// A heap string's block and length
+    #[cfg(target_pointer_width = "32")]
+    #[inline(always)]
+    fn heap_parts(&self) -> (*mut u8, usize) {
+        debug_assert!(self.tag.is_heap());
+        let mut len_bytes = [0u8; LEN_BYTES];
+        len_bytes.copy_from_slice(&self.data[..LEN_BYTES]);
+        (self.heap_block(), usize::from_le_bytes(len_bytes))
+    }
+
+    /// A heap string's length
+    #[inline(always)]
+    fn heap_len(&self) -> usize {
+        self.heap_parts().1
+    }
+
+    /// A heap string's reference count, at the start of its block
+    #[inline(always)]
+    fn heap_count(&self) -> &AtomicUsize {
+        // SAFETY: a heap string's block is live while the string is, and
+        // begins with the AtomicUsize heap_with wrote there
+        unsafe { &*self.heap_block().cast::<AtomicUsize>() }
     }
 
     /// Create from a string slice - for API compatibility
@@ -213,7 +318,7 @@ impl SmartString {
                 data,
             }
         } else {
-            Self::new_heap(s)
+            Self::new_heap(&s)
         }
     }
 
@@ -232,23 +337,21 @@ impl SmartString {
             // SAFETY: SmartString only stores valid UTF-8
             unsafe { std::str::from_utf8_unchecked(&self.data[..len]) }
         } else {
-            // Heap case: Arc<String> pointer at platform-specific offset
-            let end = ptr_layout::OFFSET + ptr_layout::SIZE;
-            let ptr_bytes: ptr_layout::Bytes =
-                self.data[ptr_layout::OFFSET..end].try_into().unwrap();
-            let ptr = usize::from_ne_bytes(ptr_bytes) as *const String;
-            // SAFETY: We only store valid Arc<String> pointers
-            unsafe { (*ptr).as_str() }
+            let (block, len) = self.heap_parts();
+            // SAFETY: the block is live while the string is, and its `len`
+            // bytes after the count are the valid UTF-8 heap_with wrote
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(block.add(HEADER), len))
+            }
         }
     }
 
-    /// Bytes a heap string owns beyond the SmartString itself: the String's
-    /// capacity, which `from_string` keeps as it came. Zero when inline.
+    /// Bytes a heap string's block holds beyond the SmartString itself: its
+    /// count and the string. Zero when inline.
     #[inline]
     pub fn heap_capacity(&self) -> usize {
         if self.tag.is_heap() {
-            // SAFETY: heap strings hold a valid Arc<String> pointer
-            unsafe { (*self.get_arc_ptr()).capacity() }
+            HEADER + self.heap_len()
         } else {
             0
         }
@@ -260,7 +363,7 @@ impl SmartString {
         if let Some(len) = self.tag.inline_len() {
             len
         } else {
-            self.as_str().len()
+            self.heap_len()
         }
     }
 
@@ -277,15 +380,6 @@ impl SmartString {
     #[inline]
     pub fn is_heap(&self) -> bool {
         self.tag.is_heap()
-    }
-
-    /// Get the raw Arc<String> pointer for heap strings
-    #[inline]
-    fn get_arc_ptr(&self) -> *const String {
-        debug_assert!(self.tag.is_heap());
-        let end = ptr_layout::OFFSET + ptr_layout::SIZE;
-        let ptr_bytes: ptr_layout::Bytes = self.data[ptr_layout::OFFSET..end].try_into().unwrap();
-        usize::from_ne_bytes(ptr_bytes) as *const String
     }
 
     /// Convert to a version that will use Arc for future clones (no-op now, kept for API compat)
@@ -389,9 +483,15 @@ impl SmartString {
         if let Some(len) = self.tag.inline_len() {
             self.data[..len].make_ascii_uppercase();
         } else {
-            let mut s = self.as_str().to_string();
-            s.make_ascii_uppercase();
-            *self = Self::from_string(s);
+            let bytes = self.as_str().as_bytes();
+            // SAFETY: the copy fills the block, and ASCII case mapping keeps
+            // the bytes valid UTF-8
+            *self = unsafe {
+                Self::heap_with(bytes.len(), |buf| {
+                    buf.copy_from_slice(bytes);
+                    buf.make_ascii_uppercase();
+                })
+            };
         }
     }
 
@@ -400,28 +500,21 @@ impl SmartString {
         if let Some(len) = self.tag.inline_len() {
             self.data[..len].make_ascii_lowercase();
         } else {
-            let mut s = self.as_str().to_string();
-            s.make_ascii_lowercase();
-            *self = Self::from_string(s);
+            let bytes = self.as_str().as_bytes();
+            // SAFETY: the copy fills the block, and ASCII case mapping keeps
+            // the bytes valid UTF-8
+            *self = unsafe {
+                Self::heap_with(bytes.len(), |buf| {
+                    buf.copy_from_slice(bytes);
+                    buf.make_ascii_lowercase();
+                })
+            };
         }
     }
 
     #[inline]
     pub fn into_string(self) -> String {
-        if self.tag.is_inline() {
-            self.as_str().to_owned()
-        } else {
-            // Take ownership of the Arc without incrementing refcount
-            let ptr = self.get_arc_ptr();
-            std::mem::forget(self); // Prevent Drop from decrementing
-                                    // SAFETY: ptr is a valid Arc<String> pointer, and we've prevented
-                                    // self's Drop from running, so we're taking over its ownership
-            let arc = unsafe { Arc::from_raw(ptr) };
-            match Arc::try_unwrap(arc) {
-                Ok(s) => s,
-                Err(arc) => (*arc).clone(),
-            }
-        }
+        self.as_str().to_owned()
     }
 
     #[inline]
@@ -436,10 +529,14 @@ impl SmartString {
                 data,
             }
         } else {
-            let mut s = String::with_capacity(total_len);
-            s.push_str(a);
-            s.push_str(b);
-            SmartString::from_string(s)
+            // SAFETY: the two strings fill the block, and their bytes in
+            // order are valid UTF-8
+            unsafe {
+                Self::heap_with(total_len, |bytes| {
+                    bytes[..a.len()].copy_from_slice(a.as_bytes());
+                    bytes[a.len()..].copy_from_slice(b.as_bytes());
+                })
+            }
         }
     }
 
@@ -458,18 +555,24 @@ impl SmartString {
                 data,
             }
         } else {
-            let mut result = String::with_capacity(total_len);
-            for s in strings {
-                result.push_str(s);
+            // SAFETY: the strings fill the block, and their bytes in order
+            // are valid UTF-8
+            unsafe {
+                Self::heap_with(total_len, |bytes| {
+                    let mut pos = 0;
+                    for s in strings {
+                        bytes[pos..pos + s.len()].copy_from_slice(s.as_bytes());
+                        pos += s.len();
+                    }
+                })
             }
-            SmartString::from_string(result)
         }
     }
 
     #[inline]
     pub fn from_string_heap(s: String) -> Self {
         debug_assert!(s.len() > MAX_INLINE_LEN);
-        Self::new_heap(s)
+        Self::new_heap(&s)
     }
 
     /// Build an inline SmartString by writing bytes directly.
@@ -499,10 +602,11 @@ impl Clone for SmartString {
     #[inline]
     fn clone(&self) -> Self {
         if self.tag.is_heap() {
-            // Heap: increment Arc refcount to balance the new owner's Drop
-            // SAFETY: get_arc_ptr() returns a valid Arc<String> pointer
-            unsafe {
-                Arc::increment_strong_count(self.get_arc_ptr());
+            // The new owner's share; Relaxed as for Arc: the block is reached
+            // only through a share already held
+            let held = self.heap_count().fetch_add(1, AtomicOrdering::Relaxed);
+            if held > isize::MAX as usize {
+                std::process::abort();
             }
         }
         // Data bytes already contain the correct content (inline bytes or pointer)
@@ -517,12 +621,16 @@ impl Drop for SmartString {
     #[inline]
     fn drop(&mut self) {
         if self.tag.is_heap() {
-            // Heap: decrement Arc refcount
-            let ptr = self.get_arc_ptr();
-            // SAFETY: We only store valid Arc<String> pointers
-            unsafe {
-                Arc::from_raw(ptr);
+            // The last share frees the block once every other owner's use
+            // of it happened before, as Arc orders its drop
+            if self.heap_count().fetch_sub(1, AtomicOrdering::Release) != 1 {
+                return;
             }
+            fence(AtomicOrdering::Acquire);
+            let (block, len) = self.heap_parts();
+            // SAFETY: no other share is left, and the block was allocated
+            // with this layout by heap_with
+            unsafe { std::alloc::dealloc(block, Self::heap_layout(len)) }
         }
     }
 }
@@ -988,5 +1096,97 @@ mod tests {
             })
         };
         assert!(s.is_none());
+    }
+
+    #[test]
+    fn a_string_goes_to_the_heap_past_fifteen_bytes() {
+        for (text, heap) in [
+            ("", false),
+            ("abcdefghijklmno", false),
+            ("abcdefghijklmnop", true),
+            ("abcdefghijklmn\u{e9}", true),
+            ("abcdefghijklm\u{e9}", false),
+            ("\u{1f600}\u{1f600}\u{1f600}\u{1f600}", true),
+        ] {
+            for s in [
+                SmartString::new(text),
+                SmartString::from_string(text.to_string()),
+            ] {
+                assert_eq!((s.as_str(), s.len(), s.is_heap()), (text, text.len(), heap));
+                assert_eq!(
+                    s.heap_capacity(),
+                    if heap { HEADER + text.len() } else { 0 }
+                );
+                let copy = s.clone();
+                drop(s);
+                assert_eq!(copy.as_str(), text, "a clone outlives the original");
+                assert_eq!(copy.into_string(), text);
+            }
+        }
+    }
+
+    #[test]
+    fn a_heap_string_keeps_its_bytes_not_a_strings_spare_capacity() {
+        let mut spacious = String::with_capacity(4096);
+        spacious.push_str("a text value that lives on the heap");
+        let s = SmartString::from_string(spacious);
+        assert_eq!(s.as_str(), "a text value that lives on the heap");
+        assert_eq!(s.heap_capacity(), HEADER + s.len());
+    }
+
+    #[test]
+    fn a_concatenation_past_fifteen_bytes_is_built_on_the_heap() {
+        let joined = SmartString::concat("abcdefgh", "ijklmnop");
+        assert_eq!(
+            (joined.as_str(), joined.is_heap()),
+            ("abcdefghijklmnop", true)
+        );
+        let many = SmartString::concat_many(&["abc", "", "defgh\u{e9}", "ijklmnop"]);
+        assert_eq!(many.as_str(), "abcdefgh\u{e9}ijklmnop");
+        let mut pushed = SmartString::new("abcdefghijklmno");
+        pushed.push('p');
+        pushed.push_str("qr");
+        assert_eq!(
+            (pushed.as_str(), pushed.is_heap()),
+            ("abcdefghijklmnopqr", true)
+        );
+    }
+
+    #[test]
+    fn a_heap_strings_case_change_leaves_its_clones_alone() {
+        let original = SmartString::new("Mixed Case Text \u{e9}");
+        let mut upper = original.clone();
+        upper.make_ascii_uppercase();
+        let mut lower = upper.clone();
+        lower.make_ascii_lowercase();
+        assert_eq!(
+            (original.as_str(), upper.as_str(), lower.as_str()),
+            (
+                "Mixed Case Text \u{e9}",
+                "MIXED CASE TEXT \u{e9}",
+                "mixed case text \u{e9}"
+            )
+        );
+    }
+
+    #[test]
+    fn clones_of_a_heap_string_on_many_threads_free_it_once() {
+        let shared = SmartString::new("a heap string shared by several threads");
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let mine = shared.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        let copy = mine.clone();
+                        assert_eq!(copy.len(), mine.len());
+                    }
+                    mine
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), shared);
+        }
+        assert_eq!(shared.heap_count().load(AtomicOrdering::Relaxed), 1);
     }
 }

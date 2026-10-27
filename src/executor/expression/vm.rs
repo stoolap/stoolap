@@ -86,9 +86,9 @@ pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) 
         }
     }
     if all_text {
-        // A text that fits inline is built in place, any other at its
-        // exact length
-        if total_len <= 15 && count <= 8 {
+        // Up to eight texts are joined straight into the result, any more
+        // through a buffer at their exact length
+        if count <= 8 {
             let texts: SmallVec<[&str; 8]> = parts
                 .filter_map(|part| match part {
                     Value::Text(text) => Some(text.as_str()),
