@@ -1262,8 +1262,8 @@ pub struct ExecutionContext {
     /// CTE data for subqueries to reference CTEs from outer query
     /// Maps CTE name (lowercase) to (columns, rows)
     cte_data: Option<Arc<CteDataMap>>,
-    /// The names of those CTEs as one number, 0 for none: a plan made in
-    /// this context holds only where the same names are bound
+    /// The names and columns of those CTEs as one number, 0 for none: a plan
+    /// made in this context holds only where the same CTEs are bound
     cte_scope: u64,
     /// Current transaction ID for CURRENT_TRANSACTION_ID() function
     transaction_id: Option<u64>,
@@ -1598,7 +1598,8 @@ impl ExecutionContext {
         self.cte_scope != 0
     }
 
-    /// The names of the CTEs this context brings as one number, 0 for none
+    /// The names and columns of the CTEs this context brings as one number,
+    /// 0 for none
     #[inline]
     pub(crate) fn cte_scope(&self) -> u64 {
         self.cte_scope
@@ -1616,11 +1617,12 @@ impl ExecutionContext {
     /// Create a new context with CTE data for subqueries to reference
     /// Takes an Arc to avoid cloning large CTE datasets
     pub fn with_cte_data(&self, cte_data: Arc<CteDataMap>) -> Self {
-        // The same names give the same number in any order; a name adds one
-        // hash with its low bit set, so names give a number past 0
-        let cte_scope = cte_data.keys().fold(0u64, |scope, name| {
+        // The same CTEs give the same number in any order; a name and its
+        // columns in turn add one hash with its low bit set, so past 0
+        let cte_scope = cte_data.iter().fold(0u64, |scope, (name, (columns, _))| {
             let mut hasher = rustc_hash::FxHasher::default();
             std::hash::Hash::hash(name.as_str(), &mut hasher);
+            std::hash::Hash::hash(columns.as_slice(), &mut hasher);
             scope.wrapping_add(std::hash::Hasher::finish(&hasher) | 1)
         });
         Self {

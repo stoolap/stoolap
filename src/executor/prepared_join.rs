@@ -193,7 +193,7 @@ pub(crate) type JoinSides = [JoinSide; 2];
 #[derive(Debug)]
 pub struct PreparedJoin {
     pub cached_epoch: u64,
-    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    /// The CTEs its context bound, as `ExecutionContext::cte_scope`
     pub cte_scope: u64,
     /// An empty list stands for a clause that leaves nothing to ask
     programs: Shelf<JoinProgramKey, [SharedProgram]>,

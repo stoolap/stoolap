@@ -3143,7 +3143,7 @@ impl WhereParts {
 #[derive(Debug)]
 pub struct PreparedSelect {
     cached_epoch: u64,
-    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    /// The CTEs its context bound, as `ExecutionContext::cte_scope`
     cte_scope: u64,
     /// The columns of the statement's table or derived table at preparation
     columns: CompactArc<Vec<String>>,
@@ -6337,7 +6337,7 @@ impl PreparedSelect {
 #[derive(Debug)]
 pub struct PreparedGrouped {
     cached_epoch: u64,
-    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    /// The CTEs its context bound, as `ExecutionContext::cte_scope`
     cte_scope: u64,
     /// The table's schema the clauses were prepared over, or the columns of
     /// the rows of another source
@@ -7047,7 +7047,7 @@ impl Executor {
 #[derive(Debug)]
 pub struct PreparedDml {
     cached_epoch: u64,
-    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    /// The CTEs its context bound, as `ExecutionContext::cte_scope`
     cte_scope: u64,
     /// The target's columns at preparation
     columns: CompactArc<Vec<String>>,

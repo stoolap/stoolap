@@ -15,7 +15,8 @@
 //! A view's query reads the tables and views it names, never a CTE of the
 //! statement that reads the view, whichever statement read the view first;
 //! a statement run in a context bringing CTEs reads them, and its text's
-//! plan stays the one its text alone means
+//! plan stays the one its text alone means, and a plan made for CTEs holds
+//! only for CTEs of the same names and columns
 
 use std::sync::Arc;
 
@@ -126,12 +127,17 @@ fn a_view_reads_its_own_tables_under_a_cte_of_the_same_name() {
 
 /// A context bringing a CTE `name` of the row 2
 fn cte_context(name: &str) -> ExecutionContext {
+    cte_context_of(name, &["id"], vec![Value::Integer(2)])
+}
+
+/// A context bringing a CTE `name` of `columns` and the one row `row`
+fn cte_context_of(name: &str, columns: &[&str], row: Vec<Value>) -> ExecutionContext {
     let mut ctes = StringMap::default();
     ctes.insert(
         name.into(),
         (
-            CompactArc::new(vec!["id".to_string()]),
-            CompactArc::new(vec![(0, Row::from_values(vec![Value::Integer(2)]))]),
+            CompactArc::new(columns.iter().map(|c| c.to_string()).collect()),
+            CompactArc::new(vec![(0, Row::from_values(row))]),
         ),
     );
     ExecutionContext::new().with_cte_data(Arc::new(ctes))
@@ -229,6 +235,47 @@ fn a_join_on_subquery_runs_as_its_blocks_in_a_context_bringing_ctes() {
             "a CTE the statement does not read leaves its answer"
         );
     }
+}
+
+#[test]
+fn a_cte_of_the_same_name_with_other_columns_gets_its_own_plan() {
+    let engine = MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
+    let executor = Executor::new(Arc::new(engine));
+    for sql in &SETUP[..3] {
+        executor.execute(sql).unwrap();
+    }
+    let texts = [
+        "SELECT t.id FROM t JOIN u ON u.id = t.id WHERE t.id <= (SELECT MAX(id) FROM t)",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u)",
+        "SELECT id FROM u",
+    ];
+    let mut wrong = Vec::new();
+    for text in texts {
+        for (columns, row) in [
+            (&["id"][..], vec![Value::Integer(1)]),
+            (
+                &["extra", "id"][..],
+                vec![Value::Integer(99), Value::Integer(1)],
+            ),
+            (
+                &["id", "extra"][..],
+                vec![Value::Integer(1), Value::Integer(99)],
+            ),
+        ] {
+            let context = cte_context_of("u", columns, row);
+            let got = executor_ids(executor.execute_with_context(text, &context));
+            if got != Ok(vec![1]) {
+                wrong.push(format!("{text}: u{columns:?}: {got:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 #[cfg(feature = "test-failpoints")]
