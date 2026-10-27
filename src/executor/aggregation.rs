@@ -45,7 +45,7 @@ use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{
     bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
-    qualified_index, qualified_key_index, split_qualified,
+    qualified_index, qualified_key_index, shown_name, split_qualified,
 };
 use super::window::WindowOutput;
 use super::Executor;
@@ -1012,12 +1012,16 @@ impl<'a> RowFeed<'a> {
                 .iter()
                 .map(|agg| {
                     if agg.column == "*" || agg.expression.is_some() {
-                        None
-                    } else {
-                        Executor::lookup_column_index(&agg.column_lower, col_index_map)
+                        return Ok(None);
+                    }
+                    match Executor::lookup_column_index(&agg.column_lower, col_index_map) {
+                        Some(idx) => Ok(Some(idx)),
+                        // The outer row's column is one value for every row
+                        None if names_outer_column(&agg.column, ctx) => Ok(None),
+                        None => Err(ungrouped_column(&shown_name(&agg.column))),
                     }
                 })
-                .collect(),
+                .collect::<Result<_>>()?,
             items,
             key_columns,
             programs,

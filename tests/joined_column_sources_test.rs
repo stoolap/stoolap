@@ -22,6 +22,8 @@ const SETUP: &[&str] = &[
     "CREATE TABLE y (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
     "INSERT INTO y VALUES (1, 1, 5), (2, 1, 50), (3, 1, 7), (4, 2, 9), (5, 2, 20)",
     "CREATE VIEW vy AS SELECT a, b FROM y",
+    "CREATE TABLE ta (a INTEGER, b INTEGER)",
+    "INSERT INTO ta VALUES (1, 5), (2, 9)",
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
     "INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 4, 30), (4, NULL, 40), (5, 3, 50), (6, 1, 60)",
     "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
@@ -30,18 +32,21 @@ const SETUP: &[&str] = &[
     "INSERT INTO w VALUES (1), (2)",
 ];
 
-fn hot(name: &str) -> Database {
+/// An index on y.a, which a join on it reads y through
+const INDEXED: &str = "CREATE INDEX y_a ON y (a)";
+
+fn hot(name: &str, index: bool) -> Database {
     let db = Database::open(&format!("memory://joined_column_sources_{name}")).unwrap();
-    for sql in SETUP {
+    for sql in SETUP.iter().chain(index.then_some(&INDEXED)) {
         db.execute(sql, ()).unwrap();
     }
     db
 }
 
-fn sealed(dir: &tempfile::TempDir) -> Database {
+fn sealed(dir: &tempfile::TempDir, index: bool) -> Database {
     let path = dir.path().join("db");
     let db = Database::open(&format!("file://{}?checkpoint_interval=0", path.display())).unwrap();
-    for sql in SETUP {
+    for sql in SETUP.iter().chain(index.then_some(&INDEXED)) {
         db.execute(sql, ()).unwrap();
     }
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
@@ -50,6 +55,7 @@ fn sealed(dir: &tempfile::TempDir) -> Database {
 
 /// A source named v holding a and b, never id, as each kind of FROM entry
 const SIDES: &[(&str, &str, &str)] = &[
+    ("table", "", "ta AS v"),
     ("view", "", "vy AS v"),
     ("cte", "WITH c AS (SELECT a, b FROM y) ", "c AS v"),
     ("derived", "", "(SELECT a, b FROM y) AS v"),
@@ -67,6 +73,14 @@ const MISSING: &[&str] = &[
     "SELECT v.id, (SELECT MAX(k) FROM w) FROM {v} JOIN y ON y.a = v.a",
     "SELECT y.b FROM {v} JOIN y ON y.a = v.a WHERE v.id > (SELECT MIN(k) FROM w)",
     "SELECT y.b FROM {v} JOIN y ON y.a = v.a WHERE EXISTS (SELECT 1 FROM w WHERE w.k = v.id)",
+    "SELECT y.id FROM {v} JOIN y ON y.a = v.a ORDER BY v.id",
+    "SELECT y.b FROM {v} JOIN y ON y.a = v.a ORDER BY v.id LIMIT 2",
+    "SELECT v.id FROM {v} JOIN y ON y.a = v.a LIMIT 2",
+    "SELECT DISTINCT v.id FROM {v} JOIN y ON y.a = v.a",
+    "SELECT SUM(v.id) FROM {v} JOIN y ON y.a = v.a",
+    "SELECT y.a FROM {v} JOIN y ON y.a = v.a GROUP BY y.a HAVING MAX(v.id) > 0",
+    "SELECT RANK() OVER (ORDER BY v.id) FROM {v} JOIN y ON y.a = v.a",
+    "SELECT COUNT(*) OVER (PARTITION BY v.id) FROM {v} JOIN y ON y.a = v.a",
 ];
 
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
@@ -127,6 +141,18 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
             "SELECT COUNT(*), t.id FROM t JOIN u USING (id) GROUP BY t.id",
             "SELECT COUNT(*), t.id FROM t JOIN u ON u.id = t.id GROUP BY t.id",
         ),
+        (
+            "SELECT t.id, u.id, id, v.a FROM t JOIN u USING (id) CROSS JOIN ta AS v",
+            "SELECT t.id, u.id, t.id, v.a FROM t JOIN u ON u.id = t.id CROSS JOIN ta AS v",
+        ),
+        (
+            "SELECT COUNT(*) FROM t JOIN u USING (id) CROSS JOIN ta AS v GROUP BY u.id",
+            "SELECT COUNT(*) FROM t JOIN u ON u.id = t.id CROSS JOIN ta AS v GROUP BY u.id",
+        ),
+        (
+            "SELECT RANK() OVER (ORDER BY u.id), COUNT(*) OVER (PARTITION BY t.id) FROM t JOIN u USING (id)",
+            "SELECT RANK() OVER (ORDER BY u.id), COUNT(*) OVER (PARTITION BY t.id) FROM t JOIN u ON u.id = t.id",
+        ),
     ] {
         let (got, want) = (answer(db, sql), answer(db, same_as));
         if got.is_err() || got != want {
@@ -162,9 +188,12 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
 #[test]
 fn a_qualified_name_reads_its_own_source_and_no_other() {
     let mut wrong = Vec::new();
-    check(&hot("matrix"), "hot", &mut wrong);
+    check(&hot("matrix", false), "hot", &mut wrong);
+    check(&hot("indexed", true), "hot indexed", &mut wrong);
     let dir = tempfile::tempdir().unwrap();
-    check(&sealed(&dir), "sealed", &mut wrong);
+    check(&sealed(&dir, false), "sealed", &mut wrong);
+    let dir = tempfile::tempdir().unwrap();
+    check(&sealed(&dir, true), "sealed indexed", &mut wrong);
     assert!(
         wrong.is_empty(),
         "{} wrong:\n{}",

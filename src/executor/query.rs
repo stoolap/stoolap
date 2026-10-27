@@ -236,21 +236,33 @@ pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec
 }
 
 /// The input column a plain column reference reads, as the projection finds
-/// it: the qualified name, then the bare name, then a qualified column whose
-/// last part is the bare name. The names come lowercased
+/// it: a qualified name by [`by_qualifier`]; a bare name, then a qualified
+/// column whose last part is the bare name. The names come lowercased
 fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -> Option<usize> {
-    qualifier
-        .and_then(|qualifier| {
-            columns
-                .iter()
-                .position(|c| eq_folded_qualified(c, qualifier, name))
-        })
-        .or_else(|| columns.iter().position(|c| eq_folded(c, name)))
-        .or_else(|| {
+    let bare = |name: &str| {
+        columns.iter().position(|c| eq_folded(c, name)).or_else(|| {
             columns
                 .iter()
                 .position(|c| split_qualified(c).is_some_and(|(_, last)| eq_folded(last, name)))
         })
+    };
+    let Some(qualifier) = qualifier else {
+        return bare(name);
+    };
+    by_qualifier(
+        columns
+            .iter()
+            .position(|c| eq_folded_qualified(c, qualifier, name)),
+        qualifier,
+        name,
+        bare,
+        |qualifier| {
+            columns
+                .iter()
+                .any(|c| split_qualified(c).is_some_and(|(q, _)| eq_folded(q, qualifier)))
+        },
+        |index| split_qualified(&columns[index]).is_none(),
+    )
 }
 
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
@@ -1763,11 +1775,23 @@ impl Executor {
                 // name the input column at the position the layout gives it
                 let mut sort_slots = aggregate_slots;
                 if let Some(layout) = layout {
+                    // A qualified name no input column answers names none
+                    // of its source's, which no output name stands in for
+                    let mut missing = None;
                     visit_order_by_inputs(stmt, &mut |column, key| {
                         if let Some(position) = layout.position(&key) {
                             sort_slots.entry(ExprKey::of(column)).or_insert(position);
+                        } else if let OrderKey::Input(Some(qualifier), name) = key {
+                            if input_column_index(&layout.input_columns, Some(qualifier), name)
+                                .is_none()
+                            {
+                                missing.get_or_insert_with(|| format!("{qualifier}.{name}"));
+                            }
                         }
                     });
+                    if let Some(name) = missing {
+                        return Err(super::aggregation::ungrouped_column(&name));
+                    }
                 }
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
@@ -10166,15 +10190,10 @@ impl Executor {
                 })
         };
         let find_qualified = |qid: &QualifiedIdentifier| {
-            by_qualifier(
-                &qualified(&qid.qualifier.value_lower, &qid.name.value_lower),
-                |name| find_column_index(name, all_columns),
-                |qualifier| {
-                    all_columns
-                        .iter()
-                        .any(|c| split_qualified(c).is_some_and(|(q, _)| eq_folded(q, qualifier)))
-                },
-                |index| split_qualified(&all_columns[index]).is_none(),
+            input_column_index(
+                all_columns,
+                Some(&qid.qualifier.value_lower),
+                &qid.name.value_lower,
             )
         };
 
