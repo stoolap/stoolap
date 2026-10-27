@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Preparing a subquery block allocates the same for a qualified name as
-//! for a bare one
+//! for a bare one, and once per column of the statement's table
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -48,10 +48,15 @@ unsafe impl GlobalAlloc for ThreadCounting {
 #[global_allocator]
 static COUNTING: ThreadCounting = ThreadCounting;
 
-fn open(name: &str) -> Database {
+/// t with `columns` more columns after id and a, and u
+fn open(name: &str, columns: usize) -> Database {
     let db = Database::open(&format!("memory://{name}")).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
-        .unwrap();
+    let more: String = (0..columns).map(|i| format!(", c{i} INTEGER")).collect();
+    db.execute(
+        &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER{more})"),
+        (),
+    )
+    .unwrap();
     db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)", ())
         .unwrap();
     db.execute("INSERT INTO t (id, a) VALUES (1, 10)", ())
@@ -72,7 +77,7 @@ fn first_run(db: &Database, sql: &str) -> usize {
 
 #[test]
 fn a_qualified_name_prepares_as_a_bare_one_does() {
-    let db = open("block_prepare_qualified");
+    let db = open("block_prepare_qualified", 0);
     let terms = |term: &str| vec![term; 8].join(" AND ");
     let qualified = first_run(
         &db,
@@ -89,4 +94,15 @@ fn a_qualified_name_prepares_as_a_bare_one_does() {
         ),
     );
     assert_eq!(qualified, bare, "eight qualified names against eight bare");
+}
+
+#[test]
+fn a_block_names_each_column_of_its_statement_once() {
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.v < t.a)";
+    let narrow = first_run(&open("block_prepare_narrow", 0), sql);
+    let wide = first_run(&open("block_prepare_wide", 64), sql);
+    assert!(
+        wide <= narrow + 64 + 8,
+        "{wide} allocations over 66 columns, {narrow} over 2"
+    );
 }

@@ -672,26 +672,29 @@ fn substitute_in_table_expr(
 /// (e.g., "t.val" also registers "val") when the base name is unambiguous.
 pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     let mut map: StringMap<usize> = StringMap::with_capacity(columns.len());
+    let mut bases: Vec<(String, usize)> = Vec::new();
     for (i, c) in columns.iter().enumerate() {
-        map.insert(c.to_lowercase(), i);
+        let lower = c.to_lowercase();
+        if let Some((_, base)) = split_qualified(&lower) {
+            bases.push((base.to_string(), i));
+        }
+        map.insert(lower, i);
     }
     // Add unqualified fallbacks for qualified column names (e.g., "t.val" → "val")
     // Only add when the base name is unambiguous (appears in exactly one table)
     // and doesn't conflict with an existing entry (e.g., an unqualified column)
-    let mut base_count: StringMap<u8> = StringMap::default();
-    for c in columns {
-        let lower = c.to_lowercase();
-        if let Some((_, base)) = split_qualified(&lower) {
-            let entry = base_count.entry(base.to_string()).or_insert(0);
-            *entry = entry.saturating_add(1);
-        }
+    let mut base_count: FxHashMap<&str, u8> = FxHashMap::default();
+    for (base, _) in &bases {
+        let entry = base_count.entry(base.as_str()).or_insert(0);
+        *entry = entry.saturating_add(1);
     }
-    for (i, c) in columns.iter().enumerate() {
-        let lower = c.to_lowercase();
-        if let Some((_, base)) = split_qualified(&lower) {
-            if base_count.get(base).copied().unwrap_or(0) == 1 && !map.contains_key(base) {
-                map.insert(base.to_string(), i);
-            }
+    let unique: Vec<bool> = bases
+        .iter()
+        .map(|(base, _)| base_count.get(base.as_str()) == Some(&1))
+        .collect();
+    for ((base, i), unique) in bases.into_iter().zip(unique) {
+        if unique && !map.contains_key(&base) {
+            map.insert(base, i);
         }
     }
     map
@@ -3165,6 +3168,24 @@ mod tests {
         assert_eq!(map.get("name"), Some(&1));
         assert_eq!(map.get("age"), Some(&2));
         assert_eq!(map.get("unknown"), None);
+    }
+
+    #[test]
+    fn test_build_column_index_map_base_names() {
+        let column = super::qualified;
+        let columns = vec![
+            column("T", "Val"),
+            column("t", "ID"),
+            column("u", "id"),
+            column("U", "Name"),
+            "name".to_string(),
+        ];
+        let map = build_column_index_map(&columns);
+
+        assert_eq!(map.get(column("t", "val").as_str()), Some(&0));
+        assert_eq!(map.get("val"), Some(&0), "a base one table has");
+        assert_eq!(map.get("id"), None, "a base two tables have");
+        assert_eq!(map.get("name"), Some(&4), "a column's own name wins");
     }
 
     #[test]
