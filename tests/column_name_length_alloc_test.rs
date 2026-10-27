@@ -52,10 +52,15 @@ const FIFTEEN: &str = "abcdefghijklmno";
 const SIXTEEN: &str = "abcdefghijklmnop";
 const RUNS: usize = 8;
 
+/// Closing a database clears the process-wide program and classification
+/// caches, which another test's measured runs read
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The allocations of `RUNS` warm runs of `sql`, `{c}` standing for a
 /// column named `column`, over t, u and f holding three rows each; f's
 /// column is BOOLEAN, true on even ids
 fn runs(test: &str, column: &str, sql: &str) -> usize {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open(&format!("memory://{test}_{}", column.len())).unwrap();
     db.execute(
         &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {column} INTEGER)"),
