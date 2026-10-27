@@ -246,3 +246,22 @@ fn a_prepared_where_of_comparisons_is_not_converted_per_run() {
         1
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_prepared_where_the_scan_converts_reads_only_the_rows_it_keeps() {
+    use stoolap::test_failpoints as fp;
+
+    let db = hot("converted_reads");
+    for sql in [
+        "SELECT id, (SELECT 1) FROM w WHERE id BETWEEN 10 AND 20",
+        "SELECT id, (SELECT 1) FROM w WHERE id IN (10, 11)",
+        "SELECT id, (SELECT 1) FROM w WHERE id = 10 AND n IS NULL",
+        "SELECT id, (SELECT 1) FROM w WHERE id = 10 OR id = 12",
+    ] {
+        let before = fp::hot_scan_step_rows();
+        answer(db.query(sql, ())).unwrap();
+        let read = fp::hot_scan_step_rows() - before;
+        assert!(read < 300, "{sql}: the scan stepped through {read} rows");
+    }
+}

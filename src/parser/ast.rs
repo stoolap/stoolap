@@ -49,6 +49,8 @@ pub enum Expression {
     Identifier(Identifier),
     /// Qualified identifier (table.column)
     QualifiedIdentifier(QualifiedIdentifier),
+    /// A name the prepared builder bound to a column of the row it reads
+    Column(ColumnRef),
     /// Integer literal
     IntegerLiteral(IntegerLiteral),
     /// Float literal
@@ -125,6 +127,7 @@ impl fmt::Display for Expression {
         match self {
             Expression::Identifier(e) => write!(f, "{}", e),
             Expression::QualifiedIdentifier(e) => write!(f, "{}", e),
+            Expression::Column(e) => write!(f, "{}", e.name),
             Expression::IntegerLiteral(e) => write!(f, "{}", e),
             Expression::FloatLiteral(e) => write!(f, "{}", e),
             Expression::StringLiteral(e) => write!(f, "{}", e),
@@ -230,7 +233,8 @@ impl Expression {
                     .iter_mut()
                     .for_each(|o| o.expression.rename_references(binds, new));
             }
-            Expression::IntegerLiteral(_)
+            Expression::Column(_)
+            | Expression::IntegerLiteral(_)
             | Expression::FloatLiteral(_)
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
@@ -256,6 +260,7 @@ impl Expression {
         match self {
             Expression::Identifier(e) => e.position,
             Expression::QualifiedIdentifier(e) => e.qualifier.position,
+            Expression::Column(e) => e.name.position,
             Expression::IntegerLiteral(e) => e.token.position,
             Expression::FloatLiteral(e) => e.token.position,
             Expression::StringLiteral(e) => e.token.position,
@@ -307,6 +312,14 @@ pub struct Identifier {
     pub position: Position,
     /// Whether the name was written double-quoted
     pub quoted: bool,
+}
+
+/// A column the prepared builder bound a name to: the column at `index` of
+/// the row its program reads, and its name, which a message shows
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnRef {
+    pub index: u32,
+    pub name: Identifier,
 }
 
 impl Identifier {

@@ -1072,6 +1072,8 @@ pub fn extract_column_name(expr: &Expression) -> Option<String> {
         Expression::QualifiedIdentifier(QualifiedIdentifier { name, .. }) => {
             Some(name.value.to_string())
         }
+        // A column the prepared builder bound in the table's own scope
+        Expression::Column(column) => Some(column.name.value.to_string()),
         _ => None,
     }
 }
@@ -2284,18 +2286,18 @@ pub fn extract_join_keys_and_residual(
     extract_join_keys_and_residual_keeping(condition, left_columns, right_columns, &|_, _| true)
 }
 
-/// What an index join asks of each pair besides its lookup key, the column
-/// pair (`outer_idx`, `inner_idx`): every other conjunct of the ON clause
+/// What an index join asks of each pair besides its lookup key: every other
+/// conjunct of the ON clause. The sides come in the statement's order, as a
+/// bound column reads them, and `key` is the looked-up pair in that order
 pub(crate) fn index_join_residual(
     on: &Expression,
-    outer_columns: &[String],
-    inner_columns: &[String],
-    outer_idx: usize,
-    inner_idx: Option<usize>,
+    left_columns: &[String],
+    right_columns: &[String],
+    key: (Option<usize>, Option<usize>),
 ) -> Option<Expression> {
     let (_, _, residual) =
-        extract_join_keys_and_residual_keeping(on, outer_columns, inner_columns, &|o, i| {
-            o == outer_idx && Some(i) == inner_idx
+        extract_join_keys_and_residual_keeping(on, left_columns, right_columns, &|l, r| {
+            (Some(l), Some(r)) == key
         });
     combine_predicates_with_and(residual)
 }
@@ -2398,6 +2400,21 @@ fn extract_join_keys_recursive(
             );
         }
         Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
+            // Columns bound over the joined row, the right side's after the left's
+            if let (Expression::Column(a), Expression::Column(b)) = (&*infix.left, &*infix.right) {
+                let split = left_columns.len();
+                let (a, b) = (a.index as usize, b.index as usize);
+                let pair = match (a < split, b < split) {
+                    (true, false) => Some((a, b - split)),
+                    (false, true) => Some((b, a - split)),
+                    _ => None,
+                };
+                if let Some((left_idx, right_idx)) = pair.filter(|(l, r)| keep(*l, *r)) {
+                    left_indices.push(left_idx);
+                    right_indices.push(right_idx);
+                    return;
+                }
+            }
             // Extract equality condition
             if let (Some(left_col), Some(right_col)) = (
                 extract_column_name_with_qualifier(&infix.left),

@@ -611,6 +611,7 @@ impl Executor {
             // Leaf expressions - no nested window functions
             Expression::Identifier(_)
             | Expression::QualifiedIdentifier(_)
+            | Expression::Column(_)
             | Expression::IntegerLiteral(_)
             | Expression::FloatLiteral(_)
             | Expression::StringLiteral(_)

@@ -617,3 +617,61 @@ fn a_program_deeper_than_the_inline_stack_runs_owned() {
     ]);
     assert!(shallow.cow_supported(), "two values on the stack");
 }
+
+#[test]
+fn a_bound_program_reads_its_columns_by_index_and_no_name() {
+    use crate::functions::registry::global_registry;
+    use crate::parser::ast::{ColumnRef, Identifier};
+    use crate::parser::token::{Position, Token, TokenType};
+
+    let ident = |name: &str| {
+        Identifier::new(
+            Token::new(TokenType::Identifier, name, Position::default()),
+            name,
+        )
+    };
+    let column = |index: u32| {
+        Expression::Column(ColumnRef {
+            index,
+            name: ident("a"),
+        })
+    };
+    let bound = CompileContext::bound(global_registry());
+    let row = Row::from_values(
+        (0..=u16::MAX)
+            .map(|i| Value::Integer(i64::from(i)))
+            .collect(),
+    );
+    for index in [1, u32::from(u16::MAX)] {
+        let program = ExprCompiler::new(&bound).compile(&column(index)).unwrap();
+        let read = ExprVM::new().execute(&program, &ExecuteContext::new(&row));
+        assert_eq!(
+            read.unwrap(),
+            Value::Integer(i64::from(index)),
+            "column {index}"
+        );
+    }
+    assert!(
+        ExprCompiler::new(&bound)
+            .compile(&Expression::Identifier(ident("a")))
+            .is_err(),
+        "a bound program looks no name up"
+    );
+    // A joined index past u16 still picks its row, then the column within it
+    let pair = CompileContext::bound_pair(global_registry(), 40_000);
+    let program = ExprCompiler::new(&pair).compile(&column(69_999)).unwrap();
+    assert!(
+        matches!(program.ops().first(), Some(Op::LoadColumn2(29_999))),
+        "{:?}",
+        program.ops()
+    );
+    assert!(
+        ExprCompiler::new(&bound).compile(&column(1 << 16)).is_err(),
+        "a column past what a row holds"
+    );
+    let named = CompileContext::with_global_registry(&["a".to_string()]);
+    assert!(
+        ExprCompiler::new(&named).compile(&column(0)).is_err(),
+        "a bound column compiles only in a bound program"
+    );
+}

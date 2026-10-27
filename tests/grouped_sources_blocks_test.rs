@@ -702,6 +702,34 @@ fn a_rolled_up_column_reads_the_cell_of_the_item_naming_it() {
             assert_eq!(got, want, "{sql}");
         }
     }
+    // A name reads the first item grouping the expression it is, through an
+    // alias or a position, else the last the grouping names by its column
+    for (item, sets, name) in [
+        ("a AS g", "ROLLUP(g, t.a)", "a"),
+        ("a AS g", "ROLLUP(1, t.a)", "a"),
+        ("a AS g", "ROLLUP(t.a, t.a)", "a"),
+        ("a AS g", "ROLLUP(a, a)", "t.a"),
+        ("a AS g", "ROLLUP(a, 1)", "t.a"),
+        ("a AS g", "ROLLUP(t.a, a, t.a)", "t.a"),
+        ("t.a AS a", "ROLLUP(t.a, a)", "a"),
+        ("t.a AS a", "ROLLUP(a, t.a)", "t.a"),
+    ] {
+        let mut want = rows(
+            &db,
+            &format!(
+                "SELECT {item}, COUNT(*), CASE WHEN {name} = 1 THEN 10 END FROM t GROUP BY {sets}"
+            ),
+        )
+        .unwrap();
+        want.sort();
+        let sql = format!(
+            "SELECT {item}, COUNT(*), (SELECT MAX(u.x) FROM u WHERE u.k = {name}) FROM t \
+             GROUP BY {sets}"
+        );
+        let mut got = rows(&db, &sql).unwrap();
+        got.sort();
+        assert_eq!(got, want, "{sql}");
+    }
 }
 
 #[test]

@@ -6375,14 +6375,19 @@ impl Executor {
                         };
                         // The equality the probe answers is left out, so
                         // only the rest of the clause is asked of each pair
-                        let rest = on.and_then(|on| {
-                            index_join_residual(
+                        let rest = on.and_then(|on| match swapped {
+                            true => index_join_residual(
+                                on,
+                                inner_names,
+                                outer_names,
+                                (inner_key_idx, Some(outer_idx)),
+                            ),
+                            false => index_join_residual(
                                 on,
                                 outer_names,
                                 inner_names,
-                                outer_idx,
-                                inner_key_idx,
-                            )
+                                (Some(outer_idx), inner_key_idx),
+                            ),
                         });
                         let combined = match (rest, inner_filter) {
                             (Some(on), Some(f)) => Some(Expression::Infix(InfixExpression::new(
@@ -9523,6 +9528,7 @@ impl Executor {
             E::ScalarSubquery(_) | E::Exists(_) | E::AllAny(_) => true,
             E::Identifier(_)
             | E::QualifiedIdentifier(_)
+            | E::Column(_)
             | E::IntegerLiteral(_)
             | E::FloatLiteral(_)
             | E::StringLiteral(_)
@@ -9846,7 +9852,13 @@ impl Executor {
         };
         let residual = combine_predicates_with_and(
             on.and_then(|on| {
-                index_join_residual(on, outer_names, inner_names, outer_key_idx, inner_key_idx)
+                // The left side is the outer one here
+                index_join_residual(
+                    on,
+                    outer_names,
+                    inner_names,
+                    (Some(outer_key_idx), inner_key_idx),
+                )
             })
             .into_iter()
             .chain(right.filter(|_| inner_filter.is_none()))

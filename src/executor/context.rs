@@ -343,6 +343,7 @@ pub(crate) fn expr_tables(expr: &Expression, tables: &mut CacheTables) -> Option
         }
         Expression::Identifier(_)
         | Expression::QualifiedIdentifier(_)
+        | Expression::Column(_)
         | Expression::IntegerLiteral(_)
         | Expression::FloatLiteral(_)
         | Expression::StringLiteral(_)

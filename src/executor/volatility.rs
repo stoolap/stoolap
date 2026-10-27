@@ -131,6 +131,7 @@ impl Walk<'_> {
             }
             Expression::Identifier(_)
             | Expression::QualifiedIdentifier(_)
+            | Expression::Column(_)
             | Expression::Star(_)
             | Expression::QualifiedStar(_)
             | Expression::Default(_) => varies,
