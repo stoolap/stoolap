@@ -448,7 +448,7 @@ use super::expression::{
 };
 use super::hash_table::JoinHashTable;
 use super::join_executor::{JoinExecutor, JoinPath, StatementRun, StreamingJoinRequest};
-use super::operator::{ColumnInfo, Operator, QueryResultOperator};
+use super::operator::{Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
@@ -6697,10 +6697,8 @@ impl Executor {
                         let mut fetched = 0usize;
                         let mut consistent = false;
                         loop {
-                            let outer_op: Box<dyn Operator> = Box::new(QueryResultOperator::new(
-                                outer_result,
-                                outer_cols.clone(),
-                            ));
+                            let outer_op: Box<dyn Operator> =
+                                Box::new(QueryResultOperator::new(outer_result, outer_cols.len()));
                             let table = match inner_table.take() {
                                 Some(table) => table,
                                 None => match self.index_join_inner(
@@ -6720,7 +6718,7 @@ impl Executor {
                             let mut op = IndexNestedLoopJoinOperator::new(
                                 outer_op,
                                 table,
-                                inner_cols.iter().map(ColumnInfo::new).collect(),
+                                inner_cols.len(),
                                 op_join_type,
                                 outer_idx,
                                 lookup_strategy.clone(),
@@ -6735,9 +6733,7 @@ impl Executor {
                                 op = op.with_outer_on_right();
                             }
                             if let Some(ref proj) = projection_pushdown {
-                                let projected_schema: Vec<ColumnInfo> =
-                                    proj.output_columns.iter().map(ColumnInfo::new).collect();
-                                op = op.with_projection(proj.columns.clone(), projected_schema);
+                                op = op.with_projection(proj.columns.clone());
                             }
                             Self::collect_join_rows(
                                 &mut op,
@@ -6831,12 +6827,12 @@ impl Executor {
                     } else {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
                         let outer_op: Box<dyn Operator> =
-                            Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+                            Box::new(QueryResultOperator::new(outer_result, outer_cols.len()));
                         JoinPath::BatchIndexNestedLoop.taken();
                         let mut op = BatchIndexNestedLoopJoinOperator::new(
                             outer_op,
                             inner_table,
-                            inner_cols.iter().map(ColumnInfo::new).collect(),
+                            inner_cols.len(),
                             op_join_type,
                             outer_idx,
                             lookup_strategy.clone(),
@@ -6851,9 +6847,7 @@ impl Executor {
                             op = op.with_outer_on_right();
                         }
                         if let Some(ref proj) = projection_pushdown {
-                            let projected_schema: Vec<ColumnInfo> =
-                                proj.output_columns.iter().map(ColumnInfo::new).collect();
-                            op = op.with_projection(proj.columns.clone(), projected_schema);
+                            op = op.with_projection(proj.columns.clone());
                         }
                         Self::collect_join_rows(
                             &mut op,
@@ -7300,7 +7294,7 @@ impl Executor {
 
                     // Convert probe side to streaming operator
                     let probe_source: Box<dyn Operator> =
-                        Box::new(QueryResultOperator::new(probe_result, probe_cols.clone()));
+                        Box::new(QueryResultOperator::new(probe_result, probe_cols.len()));
 
                     // Build hash table and bloom filter together in a single pass
                     // This avoids iterating build_rows twice (once for bloom, once for hash table)
@@ -9912,7 +9906,6 @@ impl Executor {
         let projection = if cross_filter.is_none() {
             use crate::executor::operators::index_nested_loop::ColumnSource;
             let mut sources: Vec<ColumnSource> = Vec::new();
-            let mut names: Vec<String> = Vec::new();
             let mut place = |idx: usize| -> usize {
                 let source = if idx < outer_cols.len() {
                     ColumnSource::Outer(idx)
@@ -9923,7 +9916,6 @@ impl Executor {
                     Some(at) => at,
                     None => {
                         sources.push(source);
-                        names.push(all_columns[idx].clone());
                         sources.len() - 1
                     }
                 }
@@ -9934,8 +9926,7 @@ impl Executor {
             for idx in agg_idx.iter_mut().flatten() {
                 *idx = place(*idx);
             }
-            let schema: Vec<ColumnInfo> = names.iter().map(ColumnInfo::new).collect();
-            Some((sources, schema))
+            Some(sources)
         } else {
             None
         };
@@ -10089,7 +10080,7 @@ impl Executor {
         let mut consistent = false;
         loop {
             let outer_op: Box<dyn Operator> =
-                Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+                Box::new(QueryResultOperator::new(outer_result, outer_cols.len()));
             let table = match inner_table.take() {
                 Some(table) => table,
                 None => match self.index_join_inner(
@@ -10108,7 +10099,7 @@ impl Executor {
             let mut op = IndexNestedLoopJoinOperator::new(
                 outer_op,
                 table,
-                inner_cols.iter().map(ColumnInfo::new).collect(),
+                inner_cols.len(),
                 op_join_type,
                 outer_key_idx,
                 lookup_strategy.clone(),
@@ -10119,8 +10110,8 @@ impl Executor {
             if let Some(filter) = &inner_filter {
                 op = op.with_inner_filter(filter.clone());
             }
-            if let Some((sources, schema)) = &projection {
-                op = op.with_projection(sources.clone(), schema.clone());
+            if let Some(sources) = &projection {
+                op = op.with_projection(sources.clone());
             }
             op.open()?;
             // The group columns cover the left primary key, so a change in them

@@ -30,7 +30,7 @@ use crate::core::value::NULL_VALUE;
 use crate::core::ValueMap;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::{JoinFilter, SubqueryExecutor};
-use crate::executor::operator::{ColumnInfo, Operator, RowRef};
+use crate::executor::operator::{Operator, RowRef};
 use crate::storage::expression::{ConstBoolExpr, Expression};
 use crate::storage::traits::{CappedEqual, Index, ProbeScratch, Table};
 use smallvec::SmallVec;
@@ -262,8 +262,8 @@ pub struct IndexNestedLoopJoinOperator<'a> {
     // The side of a cross that column is on, for outer keys no probe answers
     inner_side: Option<KeySide>,
 
-    // Output schema
-    schema: Vec<ColumnInfo>,
+    // Output width
+    width: usize,
     inner_col_count: usize,
 
     // Optional projection pushdown: create projected rows during combine
@@ -366,7 +366,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
     /// # Arguments
     /// * `outer` - Outer input operator
     /// * `inner_table` - Inner table to lookup from
-    /// * `inner_schema` - Schema of the inner table
+    /// * `inner_width` - Number of columns of the inner table's rows
     /// * `join_type` - Type of join (INNER or LEFT)
     /// * `outer_key_idx` - Column index of the join key in outer rows
     /// * `lookup_strategy` - How to find matching inner rows
@@ -374,21 +374,16 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
     pub fn new(
         outer: Box<dyn Operator>,
         inner_table: Box<dyn Table>,
-        inner_schema: Vec<ColumnInfo>,
+        inner_width: usize,
         join_type: JoinType,
         outer_key_idx: usize,
         lookup_strategy: IndexLookupStrategy,
         residual_filter: Option<JoinFilter>,
     ) -> Self {
-        // Build combined schema
-        let mut schema = Vec::new();
-        schema.extend(outer.schema().iter().cloned());
-        schema.extend(inner_schema.iter().cloned());
-
-        let inner_col_count = inner_schema.len();
+        let inner_col_count = inner_width;
 
         // Pre-allocate row buffer for typical join output size
-        let outer_col_count = outer.schema().len();
+        let outer_col_count = outer.width();
         let total_cols = outer_col_count + inner_col_count;
         // A table probe copies up to the cap under the index lock, so the
         // buffer holds the cap before the first probe and grows on none
@@ -407,7 +402,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             residual_filter,
             inner_key_idx: None,
             inner_side,
-            schema,
+            width: total_cols,
             inner_col_count,
             projection: None,
             outer_on_right: false,
@@ -442,31 +437,22 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
     ///
     /// # Arguments
     /// * `columns` - Column sources in SELECT order (preserves original column ordering)
-    /// * `projected_schema` - Schema for the projected output
-    pub fn with_projection(
-        mut self,
-        columns: Vec<ColumnSource>,
-        projected_schema: Vec<ColumnInfo>,
-    ) -> Self {
+    pub fn with_projection(mut self, columns: Vec<ColumnSource>) -> Self {
         let repeats_source = columns
             .iter()
             .enumerate()
             .any(|(i, c)| columns[..i].contains(c));
+        self.width = columns.len();
         self.projection = Some(JoinProjection {
             columns,
             repeats_source,
         });
-        self.schema = projected_schema;
         self
     }
 
     /// The outer side is the statement's right side, so each joined row and
     /// the residual's pair read the inner side first
     pub fn with_outer_on_right(mut self) -> Self {
-        if self.projection.is_none() {
-            let outer_len = self.schema.len() - self.inner_col_count;
-            self.schema.rotate_left(outer_len);
-        }
         self.outer_on_right = true;
         self
     }
@@ -904,8 +890,8 @@ impl Operator for IndexNestedLoopJoinOperator<'_> {
         self.outer.close()
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        self.width
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -953,8 +939,8 @@ pub struct BatchIndexNestedLoopJoinOperator<'a> {
     // The side of a cross that column is on, for outer keys no probe answers
     inner_side: Option<KeySide>,
 
-    // Output schema
-    schema: Vec<ColumnInfo>,
+    // Output width
+    width: usize,
     inner_col_count: usize,
 
     // Optional projection pushdown: create projected rows during combine
@@ -981,17 +967,14 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
     pub fn new(
         outer: Box<dyn Operator>,
         inner_table: Box<dyn Table>,
-        inner_schema: Vec<ColumnInfo>,
+        inner_width: usize,
         join_type: JoinType,
         outer_key_idx: usize,
         lookup_strategy: IndexLookupStrategy,
         residual_filter: Option<JoinFilter>,
     ) -> Self {
-        let mut schema = Vec::new();
-        schema.extend(outer.schema().iter().cloned());
-        schema.extend(inner_schema.iter().cloned());
-
-        let inner_col_count = inner_schema.len();
+        let inner_col_count = inner_width;
+        let width = outer.width() + inner_col_count;
         let inner_side = inner_key_side(&*inner_table, &lookup_strategy, None);
 
         Self {
@@ -1004,7 +987,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
             inner_filter: None,
             inner_key_idx: None,
             inner_side,
-            schema,
+            width,
             inner_col_count,
             projection: None,
             outer_on_right: false,
@@ -1028,10 +1011,6 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
     /// The outer side is the statement's right side, so each joined row and
     /// the residual's pair read the inner side first
     pub fn with_outer_on_right(mut self) -> Self {
-        if self.projection.is_none() {
-            let outer_len = self.schema.len() - self.inner_col_count;
-            self.schema.rotate_left(outer_len);
-        }
         self.outer_on_right = true;
         self
     }
@@ -1057,21 +1036,16 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
     ///
     /// # Arguments
     /// * `columns` - Column sources in SELECT order (preserves original column ordering)
-    /// * `projected_schema` - Schema for the projected output
-    pub fn with_projection(
-        mut self,
-        columns: Vec<ColumnSource>,
-        projected_schema: Vec<ColumnInfo>,
-    ) -> Self {
+    pub fn with_projection(mut self, columns: Vec<ColumnSource>) -> Self {
         let repeats_source = columns
             .iter()
             .enumerate()
             .any(|(i, c)| columns[..i].contains(c));
+        self.width = columns.len();
         self.projection = Some(JoinProjection {
             columns,
             repeats_source,
         });
-        self.schema = projected_schema;
         self
     }
 
@@ -1357,8 +1331,8 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
         self.outer.close()
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        self.width
     }
 
     fn estimated_rows(&self) -> Option<usize> {

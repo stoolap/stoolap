@@ -46,7 +46,7 @@ use super::context::{
 use super::expr_key::ExprKey;
 use super::expression::compute_expression_hash;
 use super::index_optimizer::SetTest;
-use super::operator::{ColumnInfo, MaterializedOperator, Operator};
+use super::operator::{MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::query_cache::check_compiled_token;
@@ -4607,16 +4607,12 @@ impl Executor {
         // Inner column is always index 0 (we extracted only the join key)
         let inner_key_idx = 0;
 
-        // Create schemas for operators
-        let outer_schema: Vec<ColumnInfo> = outer_columns.iter().map(ColumnInfo::new).collect();
-        let inner_schema = vec![ColumnInfo::new(&info.inner_column)];
-
         // Create MaterializedOperators
         let outer_op = Box::new(MaterializedOperator::from_arc(
             outer_rows,
-            outer_schema.clone(),
+            outer_columns.len(),
         ));
-        let inner_op = Box::new(MaterializedOperator::new(inner_rows, inner_schema));
+        let inner_op = Box::new(MaterializedOperator::new(inner_rows, 1));
 
         // Create anti-join operator
         // Anti-join: return outer rows that have NO match in inner

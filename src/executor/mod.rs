@@ -150,9 +150,7 @@ pub use semantic_cache::{
 // New streaming operator infrastructure
 pub use hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
 pub use join_executor::{JoinAnalysis, JoinExecutor, JoinRequest, JoinResult};
-pub use operator::{
-    ColumnInfo, CompositeRow, EmptyOperator, MaterializedOperator, Operator, RowRef,
-};
+pub use operator::{CompositeRow, EmptyOperator, MaterializedOperator, Operator, RowRef};
 pub use operators::{
     BatchIndexNestedLoopJoinOperator, HashJoinOperator, IndexLookupStrategy,
     IndexNestedLoopJoinOperator, JoinProjection, JoinSide, JoinType, NestedLoopJoinOperator,

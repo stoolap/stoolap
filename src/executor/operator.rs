@@ -48,33 +48,6 @@ use std::fmt;
 use crate::common::{CompactArc, CompactVec};
 use crate::core::{Result, Row, Value};
 
-/// Column information for operator schema.
-#[derive(Debug, Clone)]
-pub struct ColumnInfo {
-    /// Column name
-    pub name: String,
-    /// Original table alias (if from a table)
-    pub table_alias: Option<String>,
-}
-
-impl ColumnInfo {
-    /// Create a new column info with just a name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            table_alias: None,
-        }
-    }
-
-    /// Create a column info with table alias.
-    pub fn with_table(name: impl Into<String>, table_alias: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            table_alias: Some(table_alias.into()),
-        }
-    }
-}
-
 /// Volcano-style iterator interface for query operators.
 ///
 /// Each operator implements this trait to participate in the streaming
@@ -113,8 +86,8 @@ pub trait Operator {
     /// also be closed.
     fn close(&mut self) -> Result<()>;
 
-    /// Get the schema (column information) for this operator's output.
-    fn schema(&self) -> &[ColumnInfo];
+    /// The number of columns in each row this operator produces.
+    fn width(&self) -> usize;
 
     /// Get an estimate of the number of rows this operator will produce.
     ///
@@ -522,25 +495,13 @@ impl fmt::Display for DirectBuildCompositeRow {
 ///
 /// Useful as a placeholder or for empty result sets.
 pub struct EmptyOperator {
-    schema: Vec<ColumnInfo>,
     opened: bool,
 }
 
 impl EmptyOperator {
-    /// Create an empty operator with no schema.
+    /// Create an empty operator with no columns.
     pub fn new() -> Self {
-        Self {
-            schema: Vec::new(),
-            opened: false,
-        }
-    }
-
-    /// Create an empty operator with a specific schema.
-    pub fn with_schema(schema: Vec<ColumnInfo>) -> Self {
-        Self {
-            schema,
-            opened: false,
-        }
+        Self { opened: false }
     }
 }
 
@@ -564,8 +525,8 @@ impl Operator for EmptyOperator {
         Ok(())
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        0
     }
 
     fn name(&self) -> &str {
@@ -581,17 +542,17 @@ impl Operator for EmptyOperator {
 /// - Subquery results
 pub struct MaterializedOperator {
     rows: Vec<Row>,
-    schema: Vec<ColumnInfo>,
+    width: usize,
     current_idx: usize,
     opened: bool,
 }
 
 impl MaterializedOperator {
-    /// Create an operator from a vector of rows.
-    pub fn new(rows: Vec<Row>, schema: Vec<ColumnInfo>) -> Self {
+    /// Create an operator from a vector of rows of `width` columns.
+    pub fn new(rows: Vec<Row>, width: usize) -> Self {
         Self {
             rows,
-            schema,
+            width,
             current_idx: 0,
             opened: false,
         }
@@ -599,15 +560,9 @@ impl MaterializedOperator {
 
     /// Create from an CompactArc<Vec<Row>>, unwrapping if sole owner or cloning if shared.
     /// This is optimal for CTE results which may have multiple references.
-    pub fn from_arc(arc_rows: CompactArc<Vec<Row>>, schema: Vec<ColumnInfo>) -> Self {
+    pub fn from_arc(arc_rows: CompactArc<Vec<Row>>, width: usize) -> Self {
         let rows = CompactArc::try_unwrap(arc_rows).unwrap_or_else(|arc| (*arc).clone());
-        Self::new(rows, schema)
-    }
-
-    /// Create from rows with column names as strings.
-    pub fn from_rows(rows: Vec<Row>, columns: Vec<String>) -> Self {
-        let schema = columns.into_iter().map(ColumnInfo::new).collect();
-        Self::new(rows, schema)
+        Self::new(rows, width)
     }
 }
 
@@ -635,8 +590,8 @@ impl Operator for MaterializedOperator {
         Ok(())
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        self.width
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -667,17 +622,16 @@ use crate::storage::QueryResult as StorageQueryResult;
 /// - **Streaming pipeline**: Fits into Volcano execution model
 pub struct QueryResultOperator {
     result: Box<dyn StorageQueryResult>,
-    schema: Vec<ColumnInfo>,
+    width: usize,
     opened: bool,
 }
 
 impl QueryResultOperator {
-    /// Create a new streaming operator from a QueryResult.
-    pub fn new(result: Box<dyn StorageQueryResult>, columns: Vec<String>) -> Self {
-        let schema = columns.into_iter().map(ColumnInfo::new).collect();
+    /// Create a new streaming operator from a QueryResult of `width` columns.
+    pub fn new(result: Box<dyn StorageQueryResult>, width: usize) -> Self {
         Self {
             result,
-            schema,
+            width,
             opened: false,
         }
     }
@@ -709,8 +663,8 @@ impl Operator for QueryResultOperator {
         self.result.close()
     }
 
-    fn schema(&self) -> &[ColumnInfo] {
-        &self.schema
+    fn width(&self) -> usize {
+        self.width
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -797,9 +751,7 @@ mod tests {
             Row::from_values(vec![Value::integer(2)]),
             Row::from_values(vec![Value::integer(3)]),
         ];
-        let schema = vec![ColumnInfo::new("id")];
-
-        let mut op = MaterializedOperator::new(rows, schema);
+        let mut op = MaterializedOperator::new(rows, 1);
         op.open().unwrap();
 
         let row1 = op.next().unwrap().unwrap();
