@@ -364,3 +364,35 @@ fn test_double_not() {
     // Same as category = 'Electronics'
     assert_eq!(count, 3, "Expected 3 Electronics products with double NOT");
 }
+
+#[test]
+fn a_call_over_a_call_over_a_column_filters_as_its_value_does() {
+    let db = Database::open("memory://expression_pushdown_nested_calls").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+        "INSERT INTO t VALUES (1, 'alpha', -3), (2, 'be', 4), (3, 'gamma', NULL)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    // Each condition against the same value computed in the SELECT list
+    for condition in [
+        "LENGTH(UPPER(name)) > 3",
+        "LOWER(UPPER(name)) = 'be'",
+        "ABS(ABS(v)) = 3",
+        "COALESCE(UPPER(name), '') = 'GAMMA'",
+        "LENGTH(CONCAT(name, name)) = 4",
+    ] {
+        let filtered = ids(&format!("SELECT id FROM t WHERE {condition} ORDER BY id"));
+        let computed = ids(&format!(
+            "SELECT id FROM (SELECT id, {condition} AS hit FROM t) AS s WHERE hit ORDER BY id"
+        ));
+        assert_eq!(filtered, computed, "{condition}");
+        assert!(!filtered.is_empty(), "{condition}: no row passed");
+    }
+}

@@ -294,3 +294,37 @@ fn a_limited_group_counts_all_its_rows() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_select_item_naming_a_grouped_column_reads_it_beside_an_aggregate_of_that_alias() {
+    let db = Database::open("memory://group_by_rule_alias_shadow").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1, 1, 10), (2, 2, 10), (3, 3, 20)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // An alias is not visible to the other items of its SELECT list
+    for (sql, want) in [
+        (
+            "SELECT SUM(a) AS b, b FROM t GROUP BY b",
+            vec!["i:3|i:10", "i:3|i:20"],
+        ),
+        (
+            "SELECT b, SUM(a) AS b FROM t GROUP BY b",
+            vec!["i:10|i:3", "i:20|i:3"],
+        ),
+        (
+            "SELECT SUM(a) AS b, b, (SELECT MAX(id) FROM one) FROM t GROUP BY b",
+            vec!["i:3|i:10|i:1", "i:3|i:20|i:1"],
+        ),
+        (
+            "SELECT COUNT(*) AS b, b + 1 FROM t GROUP BY b",
+            vec!["i:1|i:21", "i:2|i:11"],
+        ),
+    ] {
+        assert_eq!(rows(&db, sql), want, "{sql}");
+    }
+}

@@ -869,9 +869,11 @@ impl FunctionRule {
         expr: &ast::Expression,
         ctx: &PushdownContext<'_>,
     ) -> Option<FunctionArg> {
-        // Column reference
+        // Column reference: a name the table has not is left to the executor
         if let Some(col_name) = extract_column_name(expr) {
-            return Some(FunctionArg::Column(col_name));
+            return ctx
+                .has_column(&col_name)
+                .then_some(FunctionArg::Column(col_name));
         }
 
         // Literal value
@@ -890,6 +892,7 @@ impl FunctionRule {
                 return Some(FunctionArg::Function {
                     function: Arc::from(scalar_func),
                     arguments: nested_args,
+                    indices: Vec::new(),
                 });
             }
         }

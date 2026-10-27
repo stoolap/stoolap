@@ -1707,10 +1707,10 @@ impl Executor {
             final_columns.push(item_name(original_expr));
             match col_expr {
                 Expression::Identifier(id) => {
-                    // A name no result column carries may be another alias of a shared slot
-                    match slot_of(col_expr)
-                        .filter(|_| !agg_col_index_map.contains_key(id.value_lower.as_str()))
-                    {
+                    // A name a group item or aggregate is keyed by reads its slot,
+                    // before a result column of that name: another item's alias
+                    // is not visible in the SELECT list
+                    match slot_of(col_expr) {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
                         None if agg_col_index_map.contains_key(id.value_lower.as_str()) => {
                             column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
@@ -2045,20 +2045,19 @@ impl Executor {
             _ => return None,
         };
 
-        // Find the matching GROUP BY column
-        for (idx, item) in group_by_columns.iter().enumerate() {
-            let matches = match item {
-                GroupByItem::Column(col_name) => col_name.to_lowercase() == arg_name,
-                GroupByItem::Expression { display_name, .. } => {
-                    display_name.to_lowercase() == arg_name
-                }
-            };
-            if matches {
-                return Some(idx);
-            }
+        // The item keyed as the argument is, as the grouping keys its items;
+        // else the one whose column or alias has the argument's own name
+        let key = ExprKey::of(arg);
+        if let Some(idx) = group_by_columns
+            .iter()
+            .position(|item| group_by_item_key(item) == key)
+        {
+            return Some(idx);
         }
-
-        None
+        group_by_columns.iter().position(|item| match item {
+            GroupByItem::Column(col_name) => eq_folded(bare_name(col_name), arg_name),
+            GroupByItem::Expression { display_name, .. } => display_name.to_lowercase() == arg_name,
+        })
     }
 
     /// The ORDER BY of an aggregate that orders its own input, with the

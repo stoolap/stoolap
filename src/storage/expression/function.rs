@@ -79,6 +79,8 @@ pub enum FunctionArg {
     Function {
         function: Arc<dyn ScalarFunction>,
         arguments: Vec<FunctionArg>,
+        /// Each argument's column in the row, filled when prepared for a schema
+        indices: Vec<Option<usize>>,
     },
 }
 
@@ -90,6 +92,7 @@ impl Debug for FunctionArg {
             FunctionArg::Function {
                 function,
                 arguments,
+                ..
             } => f
                 .debug_struct("Function")
                 .field("name", &function.name())
@@ -181,11 +184,13 @@ impl FunctionExpr {
             FunctionArg::Function {
                 function,
                 arguments,
+                indices,
             } => {
                 // Recursively evaluate nested function
                 let args: Result<Vec<Value>> = arguments
                     .iter()
-                    .map(|a| self.evaluate_arg(a, None, row))
+                    .enumerate()
+                    .map(|(i, a)| self.evaluate_arg(a, indices.get(i).copied().flatten(), row))
                     .collect();
                 function.evaluate(&args?)
             }
@@ -206,6 +211,23 @@ impl FunctionExpr {
             _ => false,
         }
     }
+}
+
+/// Each argument's column in `schema`, a nested call's own filled within it
+fn prepare_args(arguments: &mut [FunctionArg], schema: &Schema) -> Vec<Option<usize>> {
+    arguments
+        .iter_mut()
+        .map(|arg| match arg {
+            FunctionArg::Column(col) => find_column_index(schema, col),
+            FunctionArg::Literal(_) => None,
+            FunctionArg::Function {
+                arguments, indices, ..
+            } => {
+                *indices = prepare_args(arguments, schema);
+                None
+            }
+        })
+        .collect()
 }
 
 impl Debug for FunctionExpr {
@@ -274,6 +296,7 @@ impl Expression for FunctionExpr {
                 FunctionArg::Function {
                     function,
                     arguments,
+                    ..
                 } => {
                     // Recursively resolve aliases in nested functions
                     FunctionArg::Function {
@@ -287,6 +310,7 @@ impl Expression for FunctionExpr {
                                 other => other.clone(),
                             })
                             .collect(),
+                        indices: Vec::new(),
                     }
                 }
             })
@@ -303,14 +327,7 @@ impl Expression for FunctionExpr {
     }
 
     fn prepare_for_schema(&mut self, schema: &Schema) {
-        self.arg_indices = self
-            .arguments
-            .iter()
-            .map(|arg| match arg {
-                FunctionArg::Column(col) => find_column_index(schema, col),
-                _ => None,
-            })
-            .collect();
+        self.arg_indices = prepare_args(&mut self.arguments, schema);
         self.prepared = true;
     }
 

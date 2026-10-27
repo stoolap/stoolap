@@ -705,6 +705,41 @@ fn test_grouping_sets_three_columns() {
 }
 
 /// The rows of `sql`, sorted
+#[test]
+fn grouping_finds_its_key_however_the_key_is_written() {
+    let db = Database::open("memory://grouping_key_spelling").expect("open");
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1, 1, 10), (2, 2, 10), (3, 3, 20)",
+        "INSERT INTO u VALUES (1), (2), (3)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let flags = |sql: &str| -> Vec<String> {
+        sorted_rows(&db, sql)
+            .into_iter()
+            .map(|row| row.rsplit('|').next().unwrap_or_default().to_string())
+            .collect()
+    };
+    // The total row rolls b up: its flag is 1, each b's row 0
+    let rolled = vec![
+        "Some(Integer(0))".to_string(),
+        "Some(Integer(0))".to_string(),
+        "Some(Integer(1))".to_string(),
+    ];
+    for sql in [
+        "SELECT t.b, GROUPING(t.b) FROM t GROUP BY ROLLUP(t.b)",
+        "SELECT t.b, GROUPING(b) FROM t GROUP BY ROLLUP(t.b)",
+        "SELECT b, GROUPING(t.b) FROM t GROUP BY ROLLUP(b)",
+        "SELECT t.b, GROUPING(t.b) FROM t GROUP BY CUBE(t.b)",
+        "SELECT t.b, GROUPING(t.b) FROM t GROUP BY GROUPING SETS ((t.b), ())",
+        "SELECT t.b, GROUPING(t.b) FROM t JOIN u ON u.id = t.id GROUP BY ROLLUP(t.b)",
+    ] {
+        assert_eq!(flags(sql), rolled, "{sql}");
+    }
+}
+
 fn sorted_rows(db: &Database, sql: &str) -> Vec<String> {
     let mut out: Vec<String> = db
         .query(sql, ())
