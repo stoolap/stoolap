@@ -102,8 +102,8 @@ impl ComparisonValue {
 /// - `price <= 99.99`
 #[derive(Debug, Clone)]
 pub struct ComparisonExpr {
-    /// Column name to compare
-    column: String,
+    /// Column name to compare, kept inline when short
+    column: SmartString,
     /// Comparison operator
     operator: Operator,
     /// Pre-computed comparison value (for fast evaluation)
@@ -122,7 +122,7 @@ pub struct ComparisonExpr {
 
 impl ComparisonExpr {
     /// Create a new comparison expression
-    pub fn new(column: impl Into<String>, operator: Operator, value: Value) -> Self {
+    pub fn new(column: impl Into<SmartString>, operator: Operator, value: Value) -> Self {
         Self {
             column: column.into(),
             operator,
@@ -142,32 +142,32 @@ impl ComparisonExpr {
     }
 
     /// Create an equality expression (column = value)
-    pub fn eq(column: impl Into<String>, value: Value) -> Self {
+    pub fn eq(column: impl Into<SmartString>, value: Value) -> Self {
         Self::new(column, Operator::Eq, value)
     }
 
     /// Create a not-equal expression (column != value)
-    pub fn ne(column: impl Into<String>, value: Value) -> Self {
+    pub fn ne(column: impl Into<SmartString>, value: Value) -> Self {
         Self::new(column, Operator::Ne, value)
     }
 
     /// Create a greater-than expression (column > value)
-    pub fn gt(column: impl Into<String>, value: Value) -> Self {
+    pub fn gt(column: impl Into<SmartString>, value: Value) -> Self {
         Self::new(column, Operator::Gt, value)
     }
 
     /// Create a greater-than-or-equal expression (column >= value)
-    pub fn gte(column: impl Into<String>, value: Value) -> Self {
+    pub fn gte(column: impl Into<SmartString>, value: Value) -> Self {
         Self::new(column, Operator::Gte, value)
     }
 
     /// Create a less-than expression (column < value)
-    pub fn lt(column: impl Into<String>, value: Value) -> Self {
+    pub fn lt(column: impl Into<SmartString>, value: Value) -> Self {
         Self::new(column, Operator::Lt, value)
     }
 
     /// Create a less-than-or-equal expression (column <= value)
-    pub fn lte(column: impl Into<String>, value: Value) -> Self {
+    pub fn lte(column: impl Into<SmartString>, value: Value) -> Self {
         Self::new(column, Operator::Lte, value)
     }
 
@@ -406,9 +406,9 @@ impl Expression for ComparisonExpr {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
-        if resolved != self.column {
-            expr.original_column = Some(self.column.clone());
-            expr.column = resolved.to_string();
+        if resolved != self.column.as_str() {
+            expr.original_column = Some(self.column.to_string());
+            expr.column = SmartString::from(resolved);
         }
 
         expr.aliases = aliases.clone();

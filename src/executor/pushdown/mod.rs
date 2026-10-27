@@ -159,6 +159,10 @@ pub(crate) fn coerce_constant(
     value: Value,
 ) -> Option<Value> {
     use crate::core::DataType;
+    // A value of the column's own type reads as it is
+    if column_type.is_some_and(|t| !value.is_null() && value.data_type() == t) {
+        return Some(value);
+    }
     if column_type.is_some_and(|t| !reads_as_column(t, &value)) {
         return None;
     }
