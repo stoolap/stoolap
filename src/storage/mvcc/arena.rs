@@ -43,7 +43,7 @@ pub fn row_bytes(values: &[Value]) -> usize {
     let mut bytes = 16 + std::mem::size_of_val(values);
     for value in values {
         match value {
-            Value::Text(s) if s.is_heap() => bytes += 40 + s.heap_capacity(),
+            Value::Text(s) if s.is_heap() => bytes += s.heap_capacity(),
             Value::Extension(bytes_ref) => bytes += 16 + bytes_ref.len(),
             _ => {}
         }
@@ -569,9 +569,10 @@ mod tests {
             Value::Integer(1),
             Value::Text(crate::common::SmartString::from_string(spacious)),
         ];
-        assert!(
-            row_bytes(&spacious) >= row_bytes(&long) + 4096 - 64,
-            "a String's spare capacity is memory the row owns"
+        assert_eq!(
+            row_bytes(&spacious),
+            row_bytes(&long),
+            "a heap text keeps its bytes, not a String's spare capacity"
         );
         let idx = arena.insert(1, 1, &short);
         assert_eq!(arena.bytes(), row_bytes(&short));
