@@ -14,10 +14,12 @@
 
 //! A join of two tables whose WHERE holds a subquery in a condition on one
 //! side reads that side through the plan's blocks, on every join path: it
-//! answers as the general path does, hot and sealed, and run again
-//! compiles nothing
+//! answers as recorded where the general path gave the same answer, hot
+//! and sealed, and run again compiles nothing
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -184,10 +186,25 @@ fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it
-fn general_path(sql: &str) -> String {
-    format!("SELECT * FROM ({sql}) AS general")
+/// The answers each test checks its statements, or their unlimited forms,
+/// against, recorded where the general path gave the same ones
+const RECORDED: oracle::Answers = answers!("join_side_blocks");
+const RECORDED_INDEX_RULES: oracle::Answers = answers!("join_side_blocks_index_rules");
+#[cfg(not(feature = "test-filedb"))]
+const RECORDED_INNER_FETCH: oracle::Answers = answers!("join_side_blocks_inner_fetch");
+const RECORDED_BOUND: oracle::Answers = answers!("join_side_blocks_bound");
+const RECORDED_RIGHT: oracle::Answers = answers!("join_side_blocks_right");
+
+/// The rows of `sql`, checked against its recorded answer in `answers`
+fn anchored(
+    db: &Database,
+    answers: &oracle::Answers,
+    sql: &str,
+    wrong: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    let answer = rows(db, sql);
+    wrong.extend(oracle::check_answer(answers, sql, &answer));
+    answer
 }
 
 /// Whether every row of `part` is in `whole`, as often as it is there
@@ -233,9 +250,9 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
                 cases += 1;
                 let sql = shape.sql.replace("{f}", form);
                 let plain = sql.replace("{l}", "l").replace("{r}", "r");
-                let general = match plain.rfind(" LIMIT ") {
-                    Some(at) if shape.limit.is_some() => general_path(&plain[..at]),
-                    _ => general_path(&plain),
+                let reference = match plain.rfind(" LIMIT ") {
+                    Some(at) if shape.limit.is_some() => plain[..at].to_string(),
+                    _ => plain.clone(),
                 };
                 let first = rows(&db, &plain);
                 let compiles = (bridge_compiles(), program_compiles());
@@ -246,9 +263,11 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
                     bridge_compiles() - compiles.0,
                     program_compiles() - compiles.1,
                 );
-                let want = rows(&db, &general);
+                let mut why = Vec::new();
+                let want = anchored(&db, &RECORDED, &reference, &mut why);
+                wrong.extend(why.into_iter().map(|why| format!("sealed {sealed}: {why}")));
                 if !want.as_ref().is_ok_and(|rows| !rows.is_empty()) {
-                    wrong.push(format!("sealed {sealed}: {general}: answers {want:?}"));
+                    wrong.push(format!("sealed {sealed}: {reference}: answers {want:?}"));
                 }
                 let path = match shape.without_l {
                     Some(path) if !form.contains("l.") => path,
@@ -275,7 +294,7 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
                 };
                 if !answers(&first) || !answers(&again) {
                     wrong.push(format!(
-                        "sealed {sealed}: {plain}: gave {first:?} then {again:?}, the general path {want:?}"
+                        "sealed {sealed}: {plain}: gave {first:?} then {again:?}, recorded {want:?}"
                     ));
                 }
             }
@@ -293,23 +312,19 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
 fn a_condition_on_the_right_side_reads_the_right_side() {
     let db = Database::open("memory://join_side_blocks_right").unwrap();
     fill(&db);
-    for (sql, same_as) in [
-        (
-            "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g WHERE (l.k, l.g) IN ((1, 0), (2, 1))",
-            "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
-             WHERE (l.k = 1 AND l.g = 0) OR (l.k = 2 AND l.g = 1)",
-        ),
-        (
-            "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
-             WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)",
-            "SELECT * FROM (SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
-             WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)) AS general",
-        ),
-    ] {
-        let want = rows(&db, same_as);
-        assert!(want.as_ref().is_ok_and(|rows| !rows.is_empty()), "{want:?}");
-        assert_eq!(rows(&db, sql), want, "{sql}");
-    }
+    let sql = "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g WHERE (l.k, l.g) IN ((1, 0), (2, 1))";
+    let want = rows(
+        &db,
+        "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
+         WHERE (l.k = 1 AND l.g = 0) OR (l.k = 2 AND l.g = 1)",
+    );
+    assert!(want.as_ref().is_ok_and(|rows| !rows.is_empty()), "{want:?}");
+    assert_eq!(rows(&db, sql), want, "{sql}");
+    let sql = "SELECT r.id, l.id FROM r JOIN l ON r.w = l.g \
+               WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)";
+    let got = rows(&db, sql);
+    assert!(got.as_ref().is_ok_and(|rows| !rows.is_empty()), "{got:?}");
+    assert_eq!(oracle::check_answer(&RECORDED_RIGHT, sql, &got), None);
 }
 
 #[test]
@@ -378,14 +393,16 @@ fn the_index_joins_answer_with_a_side_subquery_beside_their_own_rules() {
         ),
     ] {
         let plain = sql.replace("{l}", "l").replace("{r}", "r");
-        let general = general_path(&plain[..plain.rfind(" LIMIT ").unwrap()]);
-        let want = rows(&db, &general).unwrap();
+        let mut wrong = Vec::new();
+        let reference = &plain[..plain.rfind(" LIMIT ").unwrap()];
+        let want = anchored(&db, &RECORDED_INDEX_RULES, reference, &mut wrong).unwrap();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         reset_join_paths();
         let got = rows(&db, &plain).unwrap();
         assert_eq!(join_paths_taken(), [path], "{plain}");
         assert!(
             !got.is_empty() && got.len() <= want.len() && contained(&got, &want),
-            "{plain}: {got:?}, the general path {want:?}"
+            "{plain}: {got:?}, recorded {want:?}"
         );
     }
 }
@@ -418,7 +435,6 @@ fn an_index_join_fetches_its_inner_rows_through_their_conditions() {
     ] {
         let sql = format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.k = r.k WHERE {condition}");
         let plain = sql.replace("{l}", "l").replace("{r}", "r");
-        let want = rows(&db, &general_path(&plain));
         reset_join_paths();
         let before = inner_fetch_filters();
         let got = rows(&db, &plain);
@@ -428,13 +444,13 @@ fn an_index_join_fetches_its_inner_rows_through_their_conditions() {
             taken,
             "{plain}: taken by the fetch"
         );
-        match (&got, &want) {
-            (Err(got), Err(want)) => assert!(
-                got.contains("overflow") && want.contains("overflow"),
-                "{plain}: {got}, the general path {want}"
-            ),
-            _ => assert_eq!(got, want, "{plain}"),
+        if let Err(e) = &got {
+            assert!(e.contains("overflow"), "{plain}: {e}");
         }
+        assert_eq!(
+            oracle::check_answer(&RECORDED_INNER_FETCH, &plain, &got),
+            None
+        );
     }
 }
 
@@ -466,7 +482,6 @@ fn a_side_whose_rows_need_the_where_streams_it_bound_to_its_sets() {
         let sql =
             format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON r.id = l.k WHERE {condition}");
         let plain = sql.replace("{l}", "l").replace("{r}", "r");
-        let want = rows(&db, &general_path(&plain));
         let before = bound_side_reads();
         let got = rows(&db, &plain);
         assert_eq!(
@@ -474,13 +489,10 @@ fn a_side_whose_rows_need_the_where_streams_it_bound_to_its_sets() {
             bound,
             "{plain}: streamed bound"
         );
-        match (&got, &want) {
-            (Err(got), Err(want)) => assert!(
-                got.contains("overflow") && want.contains("overflow"),
-                "{plain}: {got}, the general path {want}"
-            ),
-            _ => assert_eq!(got, want, "{plain}"),
+        if let Err(e) = &got {
+            assert!(e.contains("overflow"), "{plain}: {e}");
         }
+        assert_eq!(oracle::check_answer(&RECORDED_BOUND, &plain, &got), None);
     }
 }
 

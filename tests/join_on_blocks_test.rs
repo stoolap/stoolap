@@ -15,9 +15,12 @@
 //! A join of two tables whose ON holds subqueries runs them as the plan's
 //! blocks, inside every join algorithm: over the pair an index join or a
 //! nested loop asks, over the joined row a hash join asks. It answers as
-//! the general path does, hot and sealed, and run again compiles nothing
+//! its WHERE form, whose answer is recorded, or as computed here, hot and
+//! sealed, and run again compiles nothing
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::collections::BTreeSet;
 
@@ -118,15 +121,9 @@ fn left_nested_exists() -> Vec<String> {
     out
 }
 
-/// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it
-fn general(sql: &str) -> String {
-    format!("SELECT * FROM ({sql}) AS general")
-}
-
 enum Reference {
-    /// The same statement with the ON's subquery moved to its WHERE, which
-    /// the general path answers per joined row
+    /// The same statement with the ON's subquery moved to its WHERE, its
+    /// answer recorded in `RECORDED`
     Moved(&'static str),
     Computed(fn() -> Vec<String>),
 }
@@ -240,6 +237,14 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// The answers of the WHERE forms, recorded where the general path gave
+/// the same ones
+const RECORDED: oracle::Answers = answers!("join_on_blocks");
+
+/// The answers of the condition forms' references, recorded where the
+/// general path gave the same ones
+const RECORDED_FORMS: oracle::Answers = answers!("join_on_blocks_forms");
+
 /// The first two values of each row of `sql` as sorted text, or the error
 fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let result = db.query(sql, ()).map_err(|e| e.to_string())?;
@@ -294,7 +299,15 @@ fn a_join_on_runs_its_subqueries_as_blocks() {
             let taken = join_paths_taken();
             let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
             let want = match &case.reference {
-                Reference::Moved(sql) => rows(&db, &general(sql)),
+                Reference::Moved(sql) => {
+                    let want = rows(&db, sql);
+                    let answer = want.clone().unwrap_or_else(|e| vec![format!("error: {e}")]);
+                    wrong.extend(
+                        oracle::check(&RECORDED, sql, &answer)
+                            .map(|why| format!("sealed {sealed}: the reference {why}")),
+                    );
+                    want
+                }
                 Reference::Computed(rows) => Ok(rows()),
             };
             if taken != [case.path] {
@@ -333,21 +346,19 @@ fn a_join_on_runs_its_subqueries_as_blocks() {
 }
 
 #[test]
-fn an_on_block_that_errors_errors_as_the_general_path_does() {
+fn an_on_block_that_errors_errors_as_its_where_form_does() {
     let _turn = turn();
     let db = Database::open("memory://join_on_blocks_error").unwrap();
     fill(&db);
     let want = rows(
         &db,
-        &general(
-            "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
-             WHERE l.id < (SELECT s.b FROM s WHERE s.a = r.w)",
-        ),
+        "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+         WHERE l.id < (SELECT s.b FROM s WHERE s.a = r.w)",
     );
     assert!(
         want.as_ref()
             .is_err_and(|e| e.contains("more than one row")),
-        "the general path errors: {want:?}"
+        "the WHERE form errors: {want:?}"
     );
     let sql = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < (SELECT s.b FROM s WHERE s.a = r.w)";
     for _ in 0..2 {
@@ -482,18 +493,12 @@ fn a_join_rewrites_every_condition_form_beside_its_blocks() {
     let mut wrong = Vec::new();
     for (shape, reference) in &shapes {
         let sql = shape.replace("{l}", "l").replace("{r}", "r");
-        let want = rows(
-            &db,
-            &general(&reference.replace("{l}", "l").replace("{r}", "r")),
+        let reference = reference.replace("{l}", "l").replace("{r}", "r");
+        let got = rows(&db, &sql).unwrap_or_else(|e| vec![format!("error: {e}")]);
+        wrong.extend(
+            oracle::check(&RECORDED_FORMS, &reference, &got)
+                .map(|why| format!("{sql}, as recorded for {why}")),
         );
-        if want.is_err() {
-            wrong.push(format!("the reference of {sql} fails: {want:?}"));
-            continue;
-        }
-        let got = rows(&db, &sql);
-        if got != want {
-            wrong.push(format!("{sql}: gave {got:?}, the reference {want:?}"));
-        }
     }
     assert!(
         wrong.is_empty(),

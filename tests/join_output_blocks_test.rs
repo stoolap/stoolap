@@ -13,10 +13,13 @@
 // limitations under the License.
 
 //! A join of two tables whose SELECT list or ORDER BY holds a subquery
-//! runs it through the plan's blocks on every join path: it answers as the
-//! general path does, hot and sealed, and run again compiles nothing
+//! runs it through the plan's blocks on every join path: it answers as
+//! recorded where the general path gave the same answer, or as its literal
+//! twin, hot and sealed, and run again compiles nothing
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -145,10 +148,27 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it
-fn general(sql: &str) -> String {
-    format!("SELECT * FROM ({sql}) AS general")
+/// The answers each test checks against, recorded where the general path
+/// gave the same ones
+const RECORDED: oracle::Answers = answers!("join_output_blocks");
+const RECORDED_BEFORE: oracle::Answers = answers!("join_output_blocks_before");
+const RECORDED_AROUND: oracle::Answers = answers!("join_output_blocks_around");
+const RECORDED_ERRORS: oracle::Answers = answers!("join_output_blocks_errors");
+const RECORDED_CONTEXTS: oracle::Answers = answers!("join_output_blocks_contexts");
+const RECORDED_SCHEMA: oracle::Answers = answers!("join_output_blocks_schema");
+
+/// The rows of `sql`, or its error, against `answers` under `key`
+fn recorded(
+    db: &Database,
+    answers: &oracle::Answers,
+    key: &str,
+    sql: &str,
+) -> Result<Vec<String>, String> {
+    let answer = rows(db, sql);
+    if let Some(why) = oracle::check_answer(answers, key, &answer) {
+        panic!("{why}");
+    }
+    answer
 }
 
 #[test]
@@ -176,13 +196,16 @@ fn a_join_reads_its_output_s_subqueries_through_its_blocks() {
                 ] {
                     cases += 1;
                     let sql = shape.replace("{o}", &item).replace("{k}", &keys);
-                    let want = rows(&db, &general(&sql));
-                    if !want.as_ref().is_ok_and(|rows| rows.len() > 1) {
-                        wrong.push(format!("sealed {sealed}: {sql}: the general path {want:?}"));
-                        continue;
-                    }
                     let hits = general_hits();
                     let first = rows(&db, &sql);
+                    wrong.extend(
+                        oracle::check_answer(&RECORDED, &sql, &first)
+                            .map(|why| format!("sealed {sealed}: {why}")),
+                    );
+                    if !first.as_ref().is_ok_and(|rows| rows.len() > 1) {
+                        wrong.push(format!("sealed {sealed}: {sql}: answers {first:?}"));
+                        continue;
+                    }
                     let compiles = (bridge_compiles(), program_compiles());
                     reset_join_paths();
                     let again = rows(&db, &sql);
@@ -209,9 +232,9 @@ fn a_join_reads_its_output_s_subqueries_through_its_blocks() {
                             "sealed {sealed}: {sql}: run again compiled {compiled:?}"
                         ));
                     }
-                    if first != want || again != want {
+                    if again != first {
                         wrong.push(format!(
-                            "sealed {sealed}: {sql}: gave {first:?} then {again:?}, the general path {want:?}"
+                            "sealed {sealed}: {sql}: gave {first:?} then {again:?}"
                         ));
                     }
                 }
@@ -237,12 +260,8 @@ fn an_uncorrelated_output_subquery_is_read_before_the_join_reads_a_row() {
         "SELECT l.id, r.w IN (SELECT s.a * 9223372036854775807 FROM s WHERE s.b = 33) \
          FROM l JOIN r ON l.k = r.k WHERE l.id < 0",
     ] {
-        let got = rows(&db, sql);
-        let want = rows(&db, &general(sql));
-        assert!(
-            got.as_ref().is_err() && got == want,
-            "{sql}: {got:?}, the general path {want:?}"
-        );
+        let got = recorded(&db, &RECORDED_BEFORE, sql, sql);
+        assert!(got.is_err(), "{sql}: {got:?}");
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
 }
@@ -257,9 +276,9 @@ fn a_value_around_an_uncorrelated_output_subquery_is_computed_only_for_a_row() {
         "SELECT l.id FROM l JOIN r ON l.id = r.id WHERE l.id < 0 \
          ORDER BY 9223372036854775807 + (SELECT 1)",
     ] {
-        let got = rows(&db, sql);
+        let got = recorded(&db, &RECORDED_AROUND, sql, sql);
         assert!(
-            got.as_ref().is_ok_and(|rows| rows.len() == 1) && got == rows(&db, &general(sql)),
+            got.as_ref().is_ok_and(|rows| rows.len() == 1),
             "{sql}: {got:?}"
         );
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
@@ -276,9 +295,7 @@ fn a_correlated_output_subquery_raises_its_error_for_the_row_that_reaches_it() {
         "SELECT l.id FROM l JOIN r ON l.k = r.k ORDER BY (SELECT s.a FROM s WHERE s.b = r.w)",
         "SELECT l.id, (SELECT s.a FROM s WHERE s.b = l.k) FROM l JOIN r ON l.k = r.k WHERE l.id = 50",
     ] {
-        let got = rows(&db, sql);
-        let want = rows(&db, &general(sql));
-        assert_eq!(got, want, "{sql}");
+        let _ = recorded(&db, &RECORDED_ERRORS, sql, sql);
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
 }
@@ -331,16 +348,12 @@ fn a_join_output_s_subqueries_answer_in_every_context() {
             true,
         ),
     ] {
-        let got = rows(&db, sql);
-        // The general path cannot sort by a subquery beside a qualified star
-        let want = rows(&db, &general(&sql.replace("l.*", "l.id, l.k, l.g")));
-        match (&got, &want) {
-            (Err(got), Err(want)) => assert!(
-                got.to_lowercase().contains("column 'x' not found")
-                    && want.to_lowercase().contains("column 'x' not found"),
-                "{sql}: {got}, the general path {want}"
-            ),
-            _ => assert_eq!(got, want, "{sql}"),
+        let got = recorded(&db, &RECORDED_CONTEXTS, sql, sql);
+        if let Err(e) = &got {
+            assert!(
+                e.to_lowercase().contains("column 'x' not found"),
+                "{sql}: {e}"
+            );
         }
         let line = prepared_line(&db, sql);
         assert_eq!(line == "Prepared: yes", prepared, "{sql}: {line}");
@@ -366,13 +379,12 @@ fn a_join_output_s_subqueries_read_parameters_and_the_transaction_s_writes() {
             })
             .collect()
     };
+    // Each run against its literal twin, the parameters written in
     let literal = |a: i64, b: i64| {
         rows(
             &db,
-            &general(
-                &sql.replace("$1", &a.to_string())
-                    .replace("$2", &b.to_string()),
-            ),
+            &sql.replace("$1", &a.to_string())
+                .replace("$2", &b.to_string()),
         )
         .unwrap()[1..]
             .to_vec()
@@ -450,7 +462,7 @@ fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
         }
         // Twice, so a check the first run passed is kept for the next
         for _ in 0..2 {
-            assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: prepared");
+            let _ = recorded(&db, &RECORDED_SCHEMA, &format!("{name} before: {sql}"), sql);
         }
         let writer = db.clone();
         let done = Rc::new(Cell::new(false));
@@ -477,6 +489,6 @@ fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
             got.as_ref().is_err_and(|e| e.contains("schema changed")),
             "{sql}: {got:?}"
         );
-        assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: run again");
+        let _ = recorded(&db, &RECORDED_SCHEMA, &format!("{name} after: {sql}"), sql);
     }
 }

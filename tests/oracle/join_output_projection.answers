@@ -1,0 +1,210 @@
+8	81b940998350c9e3	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t FULL JOIN u ON u.id = t.a
+8	81b940998350c9e3	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t FULL JOIN u ON u.id = t.a ORDER BY t.id, u.id
+3	743607fb1c3da66d	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t FULL JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 2 OFFSET 1
+4	c1cec1ff7338436a	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t FULL JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 3
+5	3b9ab63d7f48e0da	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a
+5	5d06014993badafc	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id
+5	5d06014993badafc	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.id, u.id
+3	35385f3e73944f18	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.id, u.id LIMIT 2 OFFSET 1
+4	ba66479eb6605ef1	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.id, u.id LIMIT 3
+5	3b9ab63d7f48e0da	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a ORDER BY t.id, u.id
+3	a9f8ff8a2ee0abda	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 2 OFFSET 1
+4	e893a683bc991f85	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 3
+7	913d40fc01034af6	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t LEFT JOIN u ON u.id = t.a
+7	913d40fc01034af6	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.id, u.id
+3	743607fb1c3da66d	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 2 OFFSET 1
+4	c1cec1ff7338436a	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 3
+6	03a7c4af32ac5e07	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t RIGHT JOIN u ON u.id = t.a
+6	03a7c4af32ac5e07	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.id, u.id
+3	a9f8ff8a2ee0abda	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 2 OFFSET 1
+4	e893a683bc991f85	SELECT *, (SELECT COUNT(*) FROM w WHERE w.x = t.a) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.id, u.id LIMIT 3
+7	aafbf352a1e5984a	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC
+3	050b0dca5c0582ac	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 2 OFFSET 1
+4	f08af6412542f3c7	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 3
+5	119664d527ecb066	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b, t.id DESC
+3	6f59ca1169a6e24a	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b, t.id DESC LIMIT 2 OFFSET 1
+4	3fea64293c18a489	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b, t.id DESC LIMIT 3
+5	119664d527ecb066	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC
+3	6f59ca1169a6e24a	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 2 OFFSET 1
+4	3fea64293c18a489	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 3
+6	cd61feedcbb2165f	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC
+3	050b0dca5c0582ac	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 2 OFFSET 1
+4	f08af6412542f3c7	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 3
+6	d88c03a4d7a125d1	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC
+3	6f59ca1169a6e24a	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 2 OFFSET 1
+4	3fea64293c18a489	SELECT DISTINCT ON (t.b) t.b, t.id, (SELECT MAX(x) FROM w WHERE w.x <= t.id) AS m FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b, t.id DESC LIMIT 3
+8	b7bf56a5a5b537a9	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t FULL JOIN u ON u.id = t.a
+8	1362b506c574ff2f	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t FULL JOIN u ON u.id = t.a ORDER BY t.id DESC, m
+3	6bae5c1907d270e6	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t FULL JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 2 OFFSET 1
+4	8d82e5fb8025e842	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t FULL JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 3
+5	d90d2fdd5de6f9c3	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a
+5	d90d2fdd5de6f9c3	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id
+5	280d414cc5ad2fbd	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.id DESC, m
+3	ae939a7ed6d483df	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.id DESC, m LIMIT 2 OFFSET 1
+4	7ffdcc8731e68cb9	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.id DESC, m LIMIT 3
+5	280d414cc5ad2fbd	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a ORDER BY t.id DESC, m
+3	ae939a7ed6d483df	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 2 OFFSET 1
+4	7ffdcc8731e68cb9	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 3
+7	c94ef74b9cf4fcd7	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t LEFT JOIN u ON u.id = t.a
+7	7e5c7bd21dad3d43	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.id DESC, m
+3	88b677804aa9d3c8	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 2 OFFSET 1
+4	9ff0c2ba6546b856	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 3
+6	6ed5546a916efc25	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t RIGHT JOIN u ON u.id = t.a
+6	23a1210927690989	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.id DESC, m
+3	6bae5c1907d270e6	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 2 OFFSET 1
+4	8d82e5fb8025e842	SELECT t.*, (SELECT MAX(x) FROM w) AS m FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.id DESC, m LIMIT 3
+8	b0a98147b1b41b71	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a
+8	9a9434f67c21728d	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY c DESC, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 3
+8	c93819a0cc860faf	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY k + 1 DESC
+3	dfeeb4a3c4cc59f3	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 2 OFFSET 1
+4	4e6d2ee12735e058	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 3
+8	9a9434f67c21728d	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY u.x, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t FULL JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 3
+5	9e3b86bc36e4c9ff	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a
+5	9e3b86bc36e4c9ff	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id
+5	c7dc5f72264ee09b	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY c DESC, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY c DESC, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY c DESC, k LIMIT 3
+5	77ba7e74ce4c43bf	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY k + 1 DESC
+3	080d1c9232fb1708	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY k + 1 DESC LIMIT 2 OFFSET 1
+4	2230ebc40970adaa	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY k + 1 DESC LIMIT 3
+5	c7dc5f72264ee09b	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY u.x, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY u.x, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY u.x, k LIMIT 3
+5	c7dc5f72264ee09b	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY c DESC, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 3
+5	77ba7e74ce4c43bf	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY k + 1 DESC
+3	080d1c9232fb1708	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 2 OFFSET 1
+4	2230ebc40970adaa	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 3
+5	c7dc5f72264ee09b	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY u.x, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 3
+7	c98ff8a2924487f8	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a
+7	def30c49984c4fd4	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY c DESC, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 3
+7	247a224db97db824	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY k + 1 DESC
+3	2d18c2a3f22928bb	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 2 OFFSET 1
+4	06b561f8f87531c1	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 3
+7	def30c49984c4fd4	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY u.x, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t LEFT JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 3
+6	0c9fe9361d3766ac	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a
+6	b76c465a93fc0058	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY c DESC, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY c DESC, k LIMIT 3
+6	3f3e51d4aa9d187c	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY k + 1 DESC
+3	dfeeb4a3c4cc59f3	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 2 OFFSET 1
+4	4e6d2ee12735e058	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY k + 1 DESC LIMIT 3
+6	b76c465a93fc0058	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY u.x, k
+3	1c92849885e6ec18	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 2 OFFSET 1
+4	b79400d138da0e91	SELECT t.id AS k, (SELECT COUNT(*) FROM w WHERE w.x = u.id) AS c FROM t RIGHT JOIN u ON u.id = t.a ORDER BY u.x, k LIMIT 3
+8	e60bba1691a3114c	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a
+8	e60bba1691a3114c	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a ORDER BY 2, 1
+3	a5e721d797a47f24	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 2 OFFSET 1
+4	390ea9c024488318	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 3
+8	0fea98384a406d12	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id
+3	d60a80324ccc8a36	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 2 OFFSET 1
+4	805eae518a1344a2	SELECT t.id, (SELECT MAX(x) FROM w) FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 3
+5	c56b7fc44ba01815	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a
+5	c56b7fc44ba01815	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id
+5	c56b7fc44ba01815	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY 2, 1
+3	80d13dc5d86daf92	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY 2, 1 LIMIT 2 OFFSET 1
+4	1d8225f5133e9e2e	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY 2, 1 LIMIT 3
+5	bee65448266dd6d5	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b DESC, t.id
+3	9cd1c4c7d29bff06	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b DESC, t.id LIMIT 2 OFFSET 1
+4	870c41b916e01369	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b DESC, t.id LIMIT 3
+5	c56b7fc44ba01815	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a ORDER BY 2, 1
+3	80d13dc5d86daf92	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 2 OFFSET 1
+4	1d8225f5133e9e2e	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 3
+5	bee65448266dd6d5	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id
+3	9cd1c4c7d29bff06	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 2 OFFSET 1
+4	870c41b916e01369	SELECT t.id, (SELECT MAX(x) FROM w) FROM t JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 3
+7	5d0ce45dd7fb666e	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a
+7	5d0ce45dd7fb666e	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a ORDER BY 2, 1
+3	a5e721d797a47f24	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 2 OFFSET 1
+4	390ea9c024488318	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 3
+7	86fd71a16e5e529e	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id
+3	61d94897cba48ef0	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 2 OFFSET 1
+4	a6d58da77e8cfcd7	SELECT t.id, (SELECT MAX(x) FROM w) FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 3
+6	f2c2911de8e28be1	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a
+6	f2c2911de8e28be1	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY 2, 1
+3	80d13dc5d86daf92	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 2 OFFSET 1
+4	1d8225f5133e9e2e	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY 2, 1 LIMIT 3
+6	994b63cea5c7cac1	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id
+3	d60a80324ccc8a36	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 2 OFFSET 1
+4	805eae518a1344a2	SELECT t.id, (SELECT MAX(x) FROM w) FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b DESC, t.id LIMIT 3
+8	5be8da59d711b935	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t FULL JOIN u ON u.id = t.a
+8	5be8da59d711b935	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t FULL JOIN u ON u.id = t.a ORDER BY p, t.id
+3	0bdb9d2a6c72512f	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t FULL JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 2 OFFSET 1
+4	6e68043c8edf1b2f	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t FULL JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 3
+5	9026b407f1f803e0	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a
+5	9026b407f1f803e0	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id
+5	9026b407f1f803e0	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY p, t.id
+3	da0a3fb2e2b94324	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY p, t.id LIMIT 2 OFFSET 1
+4	bb67638361948124	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY p, t.id LIMIT 3
+5	9026b407f1f803e0	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a ORDER BY p, t.id
+3	da0a3fb2e2b94324	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 2 OFFSET 1
+4	bb67638361948124	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 3
+7	dc7adbeea2b5757d	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t LEFT JOIN u ON u.id = t.a
+7	dc7adbeea2b5757d	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t LEFT JOIN u ON u.id = t.a ORDER BY p, t.id
+3	0bdb9d2a6c72512f	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t LEFT JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 2 OFFSET 1
+4	6e68043c8edf1b2f	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t LEFT JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 3
+6	c398c226d7ecd554	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t RIGHT JOIN u ON u.id = t.a
+6	c398c226d7ecd554	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t RIGHT JOIN u ON u.id = t.a ORDER BY p, t.id
+3	da0a3fb2e2b94324	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t RIGHT JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 2 OFFSET 1
+4	bb67638361948124	SELECT t.id, t.b * $1 + (SELECT MAX(x) FROM w) AS p FROM t RIGHT JOIN u ON u.id = t.a ORDER BY p, t.id LIMIT 3
+8	c90ad7bc4ffc9f37	SELECT t.id, t.b FROM t FULL JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id
+3	3cb731b765ce8db4	SELECT t.id, t.b FROM t FULL JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 2 OFFSET 1
+4	f445b287db479a6e	SELECT t.id, t.b FROM t FULL JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 3
+8	f6df58cb58aa170d	SELECT t.id, t.b FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id
+3	217d2d9008d1c76f	SELECT t.id, t.b FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 2 OFFSET 1
+4	fea9b4a63d9ad149	SELECT t.id, t.b FROM t FULL JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 3
+5	907f25a589683fd0	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id
+3	b1a65bd78533d31c	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 2 OFFSET 1
+4	926608685713fa66	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 3
+5	5553a57cbf956220	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b + (SELECT 0), t.id
+3	77fd682bf7655f94	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b + (SELECT 0), t.id LIMIT 2 OFFSET 1
+4	97b0240a45f03c6e	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY t.b + (SELECT 0), t.id LIMIT 3
+5	907f25a589683fd0	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id
+3	b1a65bd78533d31c	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 2 OFFSET 1
+4	926608685713fa66	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 3
+5	5553a57cbf956220	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id
+3	77fd682bf7655f94	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 2 OFFSET 1
+4	97b0240a45f03c6e	SELECT t.id, t.b FROM t JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 3
+7	61e82d25c853b70b	SELECT t.id, t.b FROM t LEFT JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id
+3	3cb731b765ce8db4	SELECT t.id, t.b FROM t LEFT JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 2 OFFSET 1
+4	f445b287db479a6e	SELECT t.id, t.b FROM t LEFT JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 3
+7	deccb1eaa8778275	SELECT t.id, t.b FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id
+3	217d2d9008d1c76f	SELECT t.id, t.b FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 2 OFFSET 1
+4	fea9b4a63d9ad149	SELECT t.id, t.b FROM t LEFT JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 3
+6	c4ea6c05eb553a64	SELECT t.id, t.b FROM t RIGHT JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id
+3	b1a65bd78533d31c	SELECT t.id, t.b FROM t RIGHT JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 2 OFFSET 1
+4	926608685713fa66	SELECT t.id, t.b FROM t RIGHT JOIN u ON u.id = t.a ORDER BY (SELECT MAX(x) FROM w) - t.id, t.id LIMIT 3
+6	60d9ffc88cec0f14	SELECT t.id, t.b FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id
+3	77fd682bf7655f94	SELECT t.id, t.b FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 2 OFFSET 1
+4	97b0240a45f03c6e	SELECT t.id, t.b FROM t RIGHT JOIN u ON u.id = t.a ORDER BY t.b + (SELECT 0), t.id LIMIT 3
+8	36d69962fa411c22	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t FULL JOIN u ON u.id = t.a
+8	4bc36b16a6d3c6d0	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t FULL JOIN u ON u.id = t.a ORDER BY s, u.id, t.id
+3	dbd3d44655097093	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t FULL JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 2 OFFSET 1
+4	1519459a595190b3	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t FULL JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 3
+5	c06d16ae080f08bb	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a
+5	c06d16ae080f08bb	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id
+5	93db4018a6449fa1	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY s, u.id, t.id
+3	7a075b850e2cf296	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY s, u.id, t.id LIMIT 2 OFFSET 1
+4	b52b3b2af9ffd9b6	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id ORDER BY s, u.id, t.id LIMIT 3
+5	93db4018a6449fa1	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a ORDER BY s, u.id, t.id
+3	7a075b850e2cf296	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 2 OFFSET 1
+4	b52b3b2af9ffd9b6	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 3
+7	8648f11b0fdefd3b	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t LEFT JOIN u ON u.id = t.a
+7	ea078fa674cc2505	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t LEFT JOIN u ON u.id = t.a ORDER BY s, u.id, t.id
+3	dbd3d44655097093	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t LEFT JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 2 OFFSET 1
+4	1519459a595190b3	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t LEFT JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 3
+6	09ca76ede3a277a2	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t RIGHT JOIN u ON u.id = t.a
+6	0225808805fb1634	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t RIGHT JOIN u ON u.id = t.a ORDER BY s, u.id, t.id
+3	7a075b850e2cf296	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t RIGHT JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 2 OFFSET 1
+4	b52b3b2af9ffd9b6	SELECT u.*, t.b + (SELECT MIN(x) FROM w) AS s FROM t RIGHT JOIN u ON u.id = t.a ORDER BY s, u.id, t.id LIMIT 3

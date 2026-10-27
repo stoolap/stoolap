@@ -1,0 +1,8 @@
+8	d6366ed1495b3dfd	SELECT * FROM l JOIN r ON l.k = r.k ORDER BY EXISTS (SELECT 1 FROM s WHERE s.a = r.w AND s.b = l.k), l.id, r.id LIMIT 7
+6	eb94e0d26ba2c0ef	SELECT *, (SELECT MAX(s.a) FROM s WHERE s.b = l.k) AS m FROM l JOIN r ON l.k = r.k ORDER BY m DESC, l.id, r.id LIMIT 5
+8	45859e231adbf12c	SELECT DISTINCT l.k, (SELECT MAX(s.a) FROM s WHERE s.b = l.k) FROM l JOIN r ON l.k = r.k ORDER BY 1
+8	b6059a781c809d2a	SELECT l.*, r.w FROM l JOIN r ON l.k = r.k ORDER BY (SELECT s.a FROM s WHERE s.id = r.id), l.id, r.id LIMIT 7
+1	d656fa079bbaabdf	SELECT l.id AS x, r.id FROM l JOIN r ON l.k = r.k ORDER BY (SELECT s.a FROM s WHERE s.id = x), 1, 2
+688	e543c5ffb9dc00ba	SELECT l.id, CASE WHEN r.w IN (SELECT s.a FROM s WHERE s.b < 10) THEN -1 ELSE (SELECT MAX(s.a) FROM s WHERE s.b = r.w) END FROM l JOIN r ON l.k = r.k ORDER BY 1, 2
+688	dc579c75279d0b63	SELECT l.id, r.id, (SELECT s.a FROM s WHERE s.id = l.id) FROM l JOIN r USING (k) ORDER BY 1, 2
+8	ad83e173f8624c2c	SELECT l.k, COUNT(*), (SELECT MAX(s.a) FROM s WHERE s.b = l.k) FROM l JOIN r ON l.k = r.k GROUP BY l.k ORDER BY 1

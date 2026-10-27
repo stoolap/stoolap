@@ -1,0 +1,2 @@
+2	57333eede11ab0dd	SELECT t.id, r.id, (SELECT MAX(y) FROM w) FROM t NATURAL JOIN r JOIN u ON u.id = t.a
+3	7c89142bf461b8a0	SELECT t.id, u.id, (SELECT MIN(y) * 10 FROM w) FROM t JOIN u USING (id) JOIN r ON r.id = t.a

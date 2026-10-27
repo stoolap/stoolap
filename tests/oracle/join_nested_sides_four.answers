@@ -1,0 +1,6 @@
+6	8f936d1d93c16805	SELECT t.id, (SELECT MAX(y) FROM w WHERE w.x = p.k) FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id JOIN p ON p.k = r.id
+5	242b964fc6bef46c	SELECT t.id, p.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id JOIN p ON p.k = r.id WHERE p.id IN (SELECT y FROM w)
+3	66de72f62d7e11b1	SELECT t.id, p.id FROM t LEFT JOIN u ON u.id = t.a JOIN r ON r.id = t.a LEFT JOIN p ON p.k = r.id AND p.id > (SELECT MIN(y) FROM w) WHERE t.b > 10
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t CROSS JOIN u JOIN r ON r.id = u.id WHERE t.a = u.id AND t.b > (SELECT MIN(y) * 10 FROM w)
+8	571292a978b90d09	SELECT t.id, u.id, r.id FROM t JOIN u ON u.id = t.a CROSS JOIN r WHERE r.id IN (SELECT x FROM w WHERE y > 4)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t JOIN u ON u.id = t.a JOIN r ON r.id = u.id AND r.id IN (SELECT x FROM w WHERE y < 6)

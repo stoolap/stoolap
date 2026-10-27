@@ -18,6 +18,8 @@
 
 #![cfg(feature = "test-failpoints")]
 
+mod oracle;
+
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{general_path_hits, GeneralPath};
@@ -226,11 +228,35 @@ fn a_join_whose_limit_is_cut_into_a_cte_it_keeps_runs_as_explain_says() {
     }
 }
 
-/// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it
-fn general(sql: &str) -> String {
-    format!("SELECT * FROM ({sql}) AS general")
-}
+const RECORDED_UNNAMED: oracle::Answers = answers!("join_source_sides_unnamed");
+const RECORDED_CTE_OVER_JOIN: oracle::Answers = answers!("join_source_sides_cte_over_join");
+
+/// The row count and the most RANDOM() draws the general path made for
+/// each side and shape, in the order the test reads them
+const DRAWS: [[(usize, usize); 6]; 4] = [
+    [(1, 1), (15, 17), (1, 5000), (1, 5000), (1, 5000), (1, 5000)],
+    [(1, 1), (15, 17), (1, 2), (1, 1), (1, 5000), (1, 3)],
+    [(1, 1), (15, 17), (1, 5000), (1, 5000), (1, 5000), (1, 5000)],
+    [
+        (1, 5000),
+        (15, 5000),
+        (1, 5000),
+        (1, 5000),
+        (1, 5000),
+        (1, 5000),
+    ],
+];
+
+/// The row count and the most rows the general path generated for each
+/// table function shape
+const GENERATED: [(usize, usize); 6] = [
+    (1, 100000),
+    (1, 100000),
+    (1, 1),
+    (1, 3),
+    (1, 100000),
+    (1, 9),
+];
 
 #[test]
 fn a_side_without_a_name_runs_on_the_general_path() {
@@ -243,7 +269,10 @@ fn a_side_without_a_name_runs_on_the_general_path() {
             "SELECT t.id, (SELECT MAX(y) FROM w) FROM t JOIN {s} ON TRUE",
         ] {
             let sql = shape.replace("{s}", side);
-            assert_eq!(answer(&db, &sql), answer(&db, &general(&sql)), "{sql}");
+            assert_eq!(
+                oracle::check_answer(&RECORDED_UNNAMED, &sql, &answer(&db, &sql)),
+                None
+            );
             assert_eq!(
                 prepared_line(&db, &sql),
                 "Prepared: no (a side without a name)",
@@ -275,13 +304,16 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
         (count(sql), random_draws() - before)
     };
     let mut wrong = Vec::new();
-    for (with, side) in [
+    for ((with, side), bounds) in [
         ("", "(SELECT id, x, RANDOM() AS r FROM u) AS s"),
         ("", "ru AS s"),
         ("WITH s AS (SELECT id, x, RANDOM() AS r FROM u) ", "s"),
         ("WITH s (id, x, r) AS (SELECT id, x, RANDOM() FROM u) ", "s"),
-    ] {
-        for shape in [
+    ]
+    .into_iter()
+    .zip(DRAWS)
+    {
+        for (shape, bound) in [
             "SELECT s.id, (SELECT 1) FROM {s} JOIN t ON t.a = s.id LIMIT 1",
             "SELECT s.id, t.id FROM {s} JOIN t ON t.id = s.x \
              WHERE t.b > (SELECT MIN(x) FROM w) LIMIT 15",
@@ -292,13 +324,15 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
             "SELECT s.id FROM {s} JOIN t ON t.a = s.id \
              WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) LIMIT 1",
             "SELECT s.id, (SELECT 1) FROM {s} JOIN t ON t.a = s.id WHERE s.id = 3 LIMIT 1",
-        ] {
+        ]
+        .into_iter()
+        .zip(bounds)
+        {
             let sql = format!("{with}{}", shape.replace("{s}", side));
-            let reference = format!("{with}{}", general(&shape.replace("{s}", side)));
-            let (got, want) = (draws(&sql), draws(&reference));
-            if got.0 != want.0 || got.1 > want.1 {
+            let got = draws(&sql);
+            if got.0 != Ok(bound.0) || got.1 > bound.1 {
                 wrong.push(format!(
-                    "{sql}: rows and draws {got:?}, the general path {want:?}"
+                    "{sql}: rows and draws {got:?}, the general path {bound:?}"
                 ));
             }
         }
@@ -307,7 +341,7 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
         let before = tvf_rows();
         (count(sql), tvf_rows() - before)
     };
-    for series in [
+    for (series, bound) in [
         "SELECT s.id, (SELECT 1) FROM generate_series(1, 100000) AS s (id) \
          JOIN t ON t.a = s.id LIMIT 1",
         "SELECT s.id, t.id FROM generate_series(1, 100000) AS s (id) JOIN t ON t.a = s.id \
@@ -320,11 +354,14 @@ fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
          WHERE s.id > 0 OR s.id = (SELECT MIN(x) FROM w) LIMIT 1",
         "SELECT s.id FROM generate_series(1, 100000) AS s (id) JOIN t ON t.a = s.id \
          WHERE s.id < 10 AND EXISTS (SELECT 1 FROM w WHERE w.x = s.id) LIMIT 1",
-    ] {
-        let (got, want) = (generated(series), generated(&general(series)));
-        if got.0 != want.0 || got.1 > want.1 {
+    ]
+    .into_iter()
+    .zip(GENERATED)
+    {
+        let got = generated(series);
+        if got.0 != Ok(bound.0) || got.1 > bound.1 {
             wrong.push(format!(
-                "{series}: rows and generated {got:?}, the general path {want:?}"
+                "{series}: rows and generated {got:?}, the general path {bound:?}"
             ));
         }
     }
@@ -352,9 +389,8 @@ fn a_cte_over_a_join_keeps_its_plan_unless_its_names_wait_for_its_run() {
         let sql = &format!("{with}{join}");
         let (got, ran) = run(&db, sql);
         assert_eq!(
-            got,
-            answer(&db, &format!("{with}{}", general(join))),
-            "{sql}"
+            oracle::check_answer(&RECORDED_CTE_OVER_JOIN, sql, &got),
+            None
         );
         assert_eq!(prepared_line(&db, sql), line, "{sql}");
         assert_eq!(
@@ -442,10 +478,9 @@ mod drops_before_the_join {
             ] {
                 let shape =
                     format!("SELECT s.id, t.id FROM {side} JOIN t ON t.k = s.k WHERE {condition}");
-                let (got, want) = (
-                    run(&format!("{with}{shape}")),
-                    run(&format!("{with}{}", super::general(&shape))),
-                );
+                // The general path's rows and calls: each side row once
+                let want = (Ok(100), 500);
+                let got = run(&format!("{with}{shape}"));
                 if got.0 != want.0 || got.1 > want.1 {
                     wrong.push(format!(
                         "{with}{shape}: {:?} rows and {} calls, the general path {:?} and {}",

@@ -13,9 +13,12 @@
 // limitations under the License.
 
 //! A join of more than two sources, a join whose side is itself a join, runs
-//! its subqueries as the plan's blocks and answers as the general path does
+//! its subqueries as the plan's blocks and answers as recorded where the
+//! general path gave the same answer
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -128,10 +131,6 @@ const SHAPES: &[&str] = &[
      FROM {f} ORDER BY (SELECT COUNT(*) FROM w WHERE w.x = u.id), ti, ui, si",
 ];
 
-/// The order an ordered shape's rows are compared in, as its general path
-/// reference sorts them by the columns it selects
-const ORDERED: &str = " ORDER BY k, ti, ui, si";
-
 /// The FROMs of three sources, the side third or second, with its ON
 /// holding a subquery or not
 const FROMS: &[&str] = &[
@@ -176,34 +175,27 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it, in the order an ordered shape compares
-fn general(with: &str, sql: &str) -> String {
-    let order = match sql.contains(" ORDER BY ") {
-        true => ORDERED,
-        false => "",
-    };
-    format!("{with}SELECT * FROM ({sql}) AS general{order}")
-}
+const RECORDED_THREE: oracle::Answers = answers!("join_nested_sides_three");
+const RECORDED_FOUR: oracle::Answers = answers!("join_nested_sides_four");
+const RECORDED_MERGES: oracle::Answers = answers!("join_nested_sides_merges");
 
-/// Every statement of `sqls`, `{with}` before it, answers as the general
-/// path; prepared, as EXPLAIN says `line`, it runs no general path mechanism
+/// Every statement of `sqls`, `{with}` before it, answers as `answers`
+/// records; prepared, as EXPLAIN says `line`, it runs no general path
+/// mechanism
 fn check(
     db: &Database,
     context: &str,
+    answers: &oracle::Answers,
     (with, line): (&str, &str),
     sqls: &[String],
     wrong: &mut Vec<String>,
 ) {
     for sql in sqls {
-        let (want, _) = run(db, &general(with, sql));
         let full = format!("{with}{sql}");
         let (got, ran) = run(db, &full);
-        if got != want {
-            wrong.push(format!(
-                "{context}: {full}: gave {got:?}, the general path {want:?}"
-            ));
-        }
+        wrong.extend(
+            oracle::check_answer(answers, &full, &got).map(|why| format!("{context}: {why}")),
+        );
         if line == "Prepared: yes" && !ran.is_empty() {
             wrong.push(format!("{context}: {full}: ran {ran:?}"));
         }
@@ -239,7 +231,14 @@ fn a_join_of_three_sources_runs_its_blocks_and_answers_as_the_general_path() {
                 }
                 count += sqls.len();
                 let context = format!("{context} {kind}");
-                check(&db, &context, (with, "Prepared: yes"), &sqls, &mut wrong);
+                check(
+                    &db,
+                    &context,
+                    &RECORDED_THREE,
+                    (with, "Prepared: yes"),
+                    &sqls,
+                    &mut wrong,
+                );
             }
         }
     }
@@ -275,7 +274,14 @@ fn a_join_of_four_sources_and_a_cross_join_run_their_blocks() {
     .map(|sql| sql.to_string())
     .collect();
     for (context, db) in [("hot", hot("deep")), ("sealed", sealed(&dir))] {
-        check(&db, context, ("", "Prepared: yes"), &sqls, &mut wrong);
+        check(
+            &db,
+            context,
+            &RECORDED_FOUR,
+            ("", "Prepared: yes"),
+            &sqls,
+            &mut wrong,
+        );
     }
     assert!(
         wrong.is_empty(),
@@ -302,7 +308,14 @@ fn a_subquery_in_the_output_over_a_joined_side_that_merges_stays_on_the_general_
             "Prepared: no (a NATURAL or USING join whose output holds a subquery)",
         ),
     ] {
-        check(&db, "hot", ("", line), &[sql.to_string()], &mut wrong);
+        check(
+            &db,
+            "hot",
+            &RECORDED_MERGES,
+            ("", line),
+            &[sql.to_string()],
+            &mut wrong,
+        );
     }
     assert!(
         wrong.is_empty(),

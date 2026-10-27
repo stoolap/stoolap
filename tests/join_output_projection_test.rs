@@ -14,9 +14,11 @@
 
 //! A prepared join projects its SELECT list, ORDER BY and DISTINCT ON keys
 //! as a prepared statement over one table does, and answers, with the same
-//! columns, as the general path
+//! columns, as recorded where the general path gave the same answer
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -163,9 +165,12 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Each statement answers as itself read through a derived table, which
-/// holds no plan, so the general path answers it; prepared, it runs no
-/// general path mechanism
+/// Each statement's columns and rows, recorded where the general path gave
+/// the same ones
+const RECORDED: oracle::Answers = answers!("join_output_projection");
+
+/// Each statement answers as recorded; prepared, it runs no general path
+/// mechanism
 fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
     for from in FROMS {
         for (select, orders) in SHAPES {
@@ -184,10 +189,13 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
                         .filter(|(_, (before, now))| now > before)
                         .map(|(path, _)| *path)
                         .collect();
-                    let want = answer(db, &format!("SELECT * FROM ({sql}) AS general"));
-                    if got != want {
-                        wrong.push(format!("{context}: {sql}\n  got  {got:?}\n  want {want:?}"));
-                    }
+                    let got = got.map(|(columns, rows)| {
+                        std::iter::once(columns.join("|")).chain(rows).collect()
+                    });
+                    wrong.extend(
+                        oracle::check_answer(&RECORDED, &sql, &got)
+                            .map(|why| format!("{context}: {why}")),
+                    );
                     let line = prepared_line(db, &sql);
                     if line != "Prepared: yes" || !ran.is_empty() {
                         wrong.push(format!("{context}: {sql}\n  {line}, ran {ran:?}"));
