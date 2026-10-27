@@ -144,8 +144,8 @@ impl Executor {
                 explain_stmt,
                 &mut plan_lines,
                 0,
-                row_count,
-                &time_str,
+                (row_count, &time_str),
+                plan.is_some(),
             );
 
             // Return the plan as a result
@@ -183,14 +183,15 @@ impl Executor {
         }
     }
 
-    /// Generate EXPLAIN output with actual execution statistics
+    /// Generate EXPLAIN output with actual execution statistics, `held`
+    /// when `stmt` ran under a plan
     fn explain_statement_with_stats(
         &self,
         stmt: &Statement,
         lines: &mut Vec<String>,
         indent: usize,
-        row_count: usize,
-        time_str: &str,
+        (row_count, time_str): (usize, &str),
+        held: bool,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -235,7 +236,7 @@ impl Executor {
                         lines,
                         indent + 1,
                         row_count,
-                        self.join_index_use(select, self.join_runs_blocks(select, true)),
+                        self.join_index_use(select, self.join_runs_blocks(select, held)),
                         &cte_names(select),
                     );
                 }
@@ -275,7 +276,7 @@ impl Executor {
                 ));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2, true);
+                    self.explain_select(select, lines, indent + 2, held);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
