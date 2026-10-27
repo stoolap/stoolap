@@ -9523,6 +9523,7 @@ impl Executor {
             E::ScalarSubquery(_) | E::Exists(_) | E::AllAny(_) => true,
             E::Identifier(_)
             | E::QualifiedIdentifier(_)
+            | E::Column(_)
             | E::IntegerLiteral(_)
             | E::FloatLiteral(_)
             | E::StringLiteral(_)

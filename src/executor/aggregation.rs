@@ -244,6 +244,23 @@ pub(crate) fn grouping_items(stmt: &SelectStatement) -> Vec<&Expression> {
     }
 }
 
+/// The SELECT item of `stmt` the GROUP BY key `key` names: the last item
+/// holding no aggregate whose alias it is written as, or its position
+pub(crate) fn grouped_item(stmt: &SelectStatement, key: &Expression) -> Option<usize> {
+    match key {
+        Expression::Identifier(id) => stmt.columns.iter().rposition(|col| {
+            matches!(col, Expression::Aliased(aliased)
+                if aliased.alias.value_lower == id.value_lower
+                    && !expression_contains_aggregate(&aliased.expression))
+        }),
+        Expression::IntegerLiteral(lit) => usize::try_from(lit.value)
+            .ok()
+            .filter(|at| (1..=stmt.columns.len()).contains(at))
+            .map(|at| at - 1),
+        _ => None,
+    }
+}
+
 /// The identity of a GROUP BY item
 fn group_by_item_key(item: &GroupByItem) -> ExprKey {
     match item {
@@ -2572,38 +2589,17 @@ impl Executor {
     ) -> Result<Vec<GroupByItem>> {
         let mut group_items = Vec::new();
 
-        // Build a map of aliases to their expressions from SELECT clause; an
-        // aggregate cannot be grouped, so its alias leaves the name to the source column
-        let alias_map: FxHashMap<String, Expression> = stmt
-            .columns
-            .iter()
-            .filter_map(|col| {
-                if let Expression::Aliased(aliased) = col {
-                    if expression_contains_aggregate(&aliased.expression) {
-                        return None;
-                    }
-                    Some((
-                        aliased.alias.value_lower.to_string(),
-                        (*aliased.expression).clone(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         for expr in grouping_items(stmt) {
             if expression_contains_aggregate(expr) {
                 return Err(aggregate_group_key());
             }
             match expr {
                 Expression::Identifier(id) => {
-                    // Check if this identifier is an alias defined in SELECT
-                    let id_lower: &str = id.value_lower.as_str();
-                    if let Some(aliased_expr) = alias_map.get(id_lower) {
+                    let named = grouped_item(stmt, expr).map(|item| &stmt.columns[item]);
+                    if let Some(Expression::Aliased(aliased)) = named {
                         // Use the aliased expression, with the alias as the display name
                         group_items.push(GroupByItem::Expression {
-                            expr: aliased_expr.clone(),
+                            expr: (*aliased.expression).clone(),
                             display_name: id.value.to_string(),
                         });
                     } else {
@@ -2618,10 +2614,9 @@ impl Executor {
                 }
                 Expression::IntegerLiteral(lit) => {
                     // GROUP BY 1 refers to first SELECT column (1-indexed)
-                    let pos = lit.value as usize;
-                    if pos > 0 && pos <= stmt.columns.len() {
+                    if let Some(at) = grouped_item(stmt, expr) {
                         // Convert position to the actual SELECT column expression
-                        let select_col = &stmt.columns[pos - 1];
+                        let select_col = &stmt.columns[at];
                         if expression_contains_aggregate(select_col) {
                             return Err(aggregate_group_key());
                         }

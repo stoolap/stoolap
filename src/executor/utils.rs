@@ -2398,6 +2398,21 @@ fn extract_join_keys_recursive(
             );
         }
         Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
+            // Columns bound over the joined row, the right side's after the left's
+            if let (Expression::Column(a), Expression::Column(b)) = (&*infix.left, &*infix.right) {
+                let split = left_columns.len();
+                let (a, b) = (usize::from(a.index), usize::from(b.index));
+                let pair = match (a < split, b < split) {
+                    (true, false) => Some((a, b - split)),
+                    (false, true) => Some((b, a - split)),
+                    _ => None,
+                };
+                if let Some((left_idx, right_idx)) = pair.filter(|(l, r)| keep(*l, *r)) {
+                    left_indices.push(left_idx);
+                    right_indices.push(right_idx);
+                    return;
+                }
+            }
             // Extract equality condition
             if let (Some(left_col), Some(right_col)) = (
                 extract_column_name_with_qualifier(&infix.left),

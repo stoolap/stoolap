@@ -44,8 +44,8 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
-    grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem, Modifiers,
-    SqlAggregateFunction, COUNT_STAR,
+    grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
+    Modifiers, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -68,10 +68,10 @@ use super::result::{
     DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
 };
 use super::utils::{
-    bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
-    extract_literal_value, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name,
-    order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
+    bare_name, combine_predicates_with_and, expression_contains_aggregate, extract_literal_value,
+    flip_operator, for_each_qualified_star_column, get_table_alias_from_expr, infix_to_operator,
+    is_aggregate_function, item_name, order_by_names_an_alias, split_qualified,
+    strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -1224,19 +1224,6 @@ impl ScopeTable {
         }
     }
 
-    /// The column a program name `name` of this scope reads: a position
-    /// name, or a resolved own name
-    fn column_of(&self, name: &str) -> Option<usize> {
-        let name = name.strip_prefix(RESOLVED)?;
-        match name.strip_prefix('#') {
-            Some(at) => at.parse().ok().filter(|at| *at < self.lower.len()),
-            None => {
-                let name = name.strip_prefix(QUALIFIER_SEP)?;
-                self.lower.iter().position(|c| c == name)
-            }
-        }
-    }
-
     /// Whether more than one of its tables has a column named `name`
     fn shared(&self, name: &str) -> bool {
         let mut tables = self.tables.iter().enumerate().filter(|(at, _)| {
@@ -1386,19 +1373,6 @@ impl ScopeTable {
                 spelled
             ))),
             false => Ok(()),
-        }
-    }
-
-    /// The column `expr` names as this scope spells its own columns
-    fn position(&self, expr: &Expression) -> Option<usize> {
-        match expr {
-            Expression::Identifier(id) if self.tables.len() > 1 => {
-                self.columns.iter().position(|c| *c == id.value_lower)
-            }
-            Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
-                self.lower.iter().position(|c| *c == q.name.value_lower)
-            }
-            _ => None,
         }
     }
 }
@@ -2004,19 +1978,13 @@ impl Chain<'_> {
         }
     }
 
-    /// The column `index` of the scope at `depth`, as a name its own
-    /// programs compile against. Over one table, qualified by a name no
-    /// table can have, so the compiler reads it as a column wherever it
-    /// stands, never a literal; over a join, the scope's name for its position
+    /// The column `index` of the scope at `depth`, bound for the programs
+    /// that read that scope's row
     fn column(&self, depth: usize, index: usize) -> Expression {
-        let scope = self.scopes[depth];
-        let spelled = scope.columns[index].as_str();
-        if scope.tables.len() > 1 {
-            return Expression::Identifier(ident(spelled, spelled));
-        }
-        Expression::QualifiedIdentifier(QualifiedIdentifier {
-            qualifier: ident(RESOLVED, RESOLVED),
-            name: ident(spelled, &scope.lower[index]),
+        let name = self.scopes[depth].lower[index].as_str();
+        Expression::Column(ColumnRef {
+            index: index as u16,
+            name: ident(name, name),
         })
     }
 
@@ -2356,33 +2324,56 @@ fn rebuild(
     })
 }
 
-/// `expr`, rewritten over the scope `side` alone, with each of its columns
-/// spelled as the scope `joined` names it, the side's first at `offset`
-fn in_joined(
-    expr: &Expression,
-    side: &ScopeTable,
-    joined: &ScopeTable,
-    offset: usize,
-) -> Result<Expression> {
-    let index = bound_column(expr).and_then(|name| side.lower.iter().position(|c| c == name));
-    match index {
-        Some(index) => {
-            let spelled = joined.columns[offset + index].as_str();
-            Ok(Expression::Identifier(Identifier::new(
-                Token::new(TokenType::Identifier, spelled, Position::default()),
-                spelled,
-            )))
-        }
-        None => rebuild(expr, &mut |child| in_joined(child, side, joined, offset)),
+/// `expr`, bound over a side alone, with each of its columns read from
+/// the joined row, where the side's first is at `offset`
+fn in_joined(expr: &Expression, offset: usize) -> Result<Expression> {
+    match expr {
+        Expression::Column(c) => Ok(Expression::Column(ColumnRef {
+            index: (offset + usize::from(c.index)) as u16,
+            name: c.name.clone(),
+        })),
+        _ => rebuild(expr, &mut |child| in_joined(child, offset)),
     }
 }
 
-/// The lowercase name of a column the resolver bound, as `column` spells it
-fn bound_column(expr: &Expression) -> Option<&str> {
+/// `expr` with each name of the chain's own scope bound to its column; a
+/// name `keep` takes, or one the compiler reads as a literal, stays
+fn bind_own(
+    chain: &Chain<'_>,
+    expr: &Expression,
+    keep: &dyn Fn(&Identifier) -> bool,
+) -> Result<Expression> {
     match expr {
-        Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
-            Some(q.name.value_lower.as_str())
+        Expression::Identifier(id) if keep(id) => Ok(expr.clone()),
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+            match chain.resolve(expr)? {
+                Some((0, index)) => Ok(chain.column(0, index)),
+                Some(_) => Err(Error::internal("an enclosing column read by a statement")),
+                None => Ok(expr.clone()),
+            }
         }
+        _ => rebuild(expr, &mut |child| bind_own(chain, child, keep)),
+    }
+}
+
+/// `expr` with each column bound over `scope` named again, quoted as its
+/// column is, for a statement the general path runs
+fn spelled_columns(expr: &Expression, scope: &ScopeTable) -> Result<Expression> {
+    match expr {
+        Expression::Column(c) => {
+            let name = scope.columns[usize::from(c.index)].as_str();
+            let mut id = ident(name, &scope.lower[usize::from(c.index)]);
+            id.quoted = true;
+            Ok(Expression::Identifier(id))
+        }
+        _ => rebuild(expr, &mut |child| spelled_columns(child, scope)),
+    }
+}
+
+/// The column of its scope's row a name the builder bound reads
+fn bound_column(expr: &Expression) -> Option<usize> {
+    match expr {
+        Expression::Column(c) => Some(usize::from(c.index)),
         _ => None,
     }
 }
@@ -2412,9 +2403,10 @@ fn bind_aliases(
 /// Whether every column `expr` reads is one the scan compares
 fn scans_whole(expr: &Expression, schema: &Schema) -> bool {
     match expr {
-        Expression::QualifiedIdentifier(_) => bound_column(expr)
-            .and_then(|name| schema.column_index_map().get(name))
-            .is_none_or(|&i| scan_compares(schema.columns[i].data_type)),
+        Expression::Column(c) => schema
+            .columns
+            .get(usize::from(c.index))
+            .is_none_or(|column| scan_compares(column.data_type)),
         other => {
             let mut whole = true;
             let _ = for_each_child(other, &mut |child| {
@@ -2430,7 +2422,9 @@ fn scans_whole(expr: &Expression, schema: &Schema) -> bool {
 /// subquery's value is a value, whatever its own block reads
 fn reads_row_column(expr: &Expression) -> bool {
     match expr {
-        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => true,
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) | Expression::Column(_) => {
+            true
+        }
         other => {
             let mut reads = false;
             let _ = for_each_child(other, &mut |child| {
@@ -2448,8 +2442,8 @@ fn reads_row_column(expr: &Expression) -> bool {
 fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
     let column_type = |e: &Expression| {
         bound_column(e)
-            .and_then(|name| schema.column_index_map().get(name))
-            .map(|&i| schema.columns[i].data_type)
+            .and_then(|i| schema.columns.get(i))
+            .map(|column| column.data_type)
             .filter(|t| *t != DataType::Null)
     };
     let mut read_as = |value: &Expression, t: DataType| {
@@ -2509,6 +2503,7 @@ fn is_leaf(expr: &Expression) -> bool {
         expr,
         Expression::Identifier(_)
             | Expression::QualifiedIdentifier(_)
+            | Expression::Column(_)
             | Expression::IntegerLiteral(_)
             | Expression::FloatLiteral(_)
             | Expression::StringLiteral(_)
@@ -3730,14 +3725,14 @@ impl PreparedComparison {
                 Expression::Parameter(p) if p.index > 0 => PreparedValue::Slot(p.index - 1),
                 other => PreparedValue::Const(extract_literal_value(other)?),
             };
-            let index = *schema.column_index_map().get(column)?;
-            if !scan_compares(schema.columns[index].data_type) {
+            let read = schema.columns.get(column)?;
+            if !scan_compares(read.data_type) {
                 return None;
             }
             return Some(Self {
-                column: schema.columns[index].name.clone(),
-                index,
-                data_type: schema.columns[index].data_type,
+                column: read.name.clone(),
+                index: column,
+                data_type: read.data_type,
                 operator,
                 value,
             });
@@ -4122,12 +4117,12 @@ impl Builder<'_> {
         let holes = if work.holes.is_empty() {
             Vec::new()
         } else {
-            let parent = CompileContext::new(&outer[0].columns, &self.executor.function_registry);
+            let parent = CompileContext::bound(&self.executor.function_registry);
             work.holes
                 .iter()
-                .map(|(slot, hole)| match outer[0].position(hole) {
-                    Some(index) => Ok((*slot, Hole::Column(index))),
-                    None => compile_with(&parent, hole).map(|p| (*slot, Hole::Program(p))),
+                .map(|(slot, hole)| match hole {
+                    Expression::Column(c) => Ok((*slot, Hole::Column(usize::from(c.index)))),
+                    _ => compile_with(&parent, hole).map(|p| (*slot, Hole::Program(p))),
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -4187,7 +4182,7 @@ impl Builder<'_> {
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
         let registry = &self.executor.function_registry;
-        let compile = CompileContext::new(&own.columns, registry).with_prepared_subqueries();
+        let compile = CompileContext::bound(registry).with_prepared_subqueries();
         for ob in &sq.order_by {
             let key = with_aliases(&ob.expression, &sq.columns, &own.columns);
             let key = self.trial_rewrite(&chain, id, &key, &work.outer)?;
@@ -4230,7 +4225,7 @@ impl Builder<'_> {
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
         let registry = &self.executor.function_registry;
-        let compile = CompileContext::new(&scope.columns, registry).with_prepared_subqueries();
+        let compile = CompileContext::bound(registry).with_prepared_subqueries();
         let windowed = windowed_block(sq);
         let grouped = grouped_block(sq) && !windowed;
         let items: Vec<&Expression> = sq
@@ -5046,7 +5041,7 @@ impl Builder<'_> {
         for expr in candidates.iter().chain(&filter) {
             compare_as_scan(expr, &schema, &mut read_as);
         }
-        let own = CompileContext::new(&scope.columns, registry)
+        let own = CompileContext::bound(registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Option<Expression>| match expr {
@@ -5276,10 +5271,10 @@ impl Builder<'_> {
             }
         }
         for expr in projection.iter().chain(&having).chain(&listed) {
-            if let Some(name) = ungrouped(expr, &item_keys) {
-                let name = match scope.column_of(&name) {
-                    Some(at) if scope.tables.len() > 1 => scope.spelled(at),
-                    _ => name,
+            if let Some(at) = ungrouped(expr, &item_keys) {
+                let name = match scope.tables.len() > 1 || scope.columns[at].starts_with(RESOLVED) {
+                    true => scope.spelled(at),
+                    false => scope.columns[at].clone(),
                 };
                 return Err(ungrouped_column(&name));
             }
@@ -5303,27 +5298,26 @@ impl Builder<'_> {
             set_operations: Vec::new(),
             prepared: None,
         };
-        let (aggregations, _) = executor.parse_aggregations(&calls_of, None)?;
+        let (mut aggregations, _) = executor.parse_aggregations(&calls_of, None)?;
+        // A call whose argument is one bound column reads that column
+        let columns = aggregations
+            .iter_mut()
+            .map(|agg| match agg.expression.take() {
+                Some(Expression::Column(c)) => Ok(Some(usize::from(c.index))),
+                expression if expression.is_some() || agg.column == "*" => {
+                    agg.expression = expression;
+                    Ok(None)
+                }
+                _ => Err(Error::internal("an aggregate's column outside its block")),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let calls = aggregations
             .iter()
             .map(|agg| agg.template(registry))
             .collect::<Result<Vec<_>>>()?;
-        let own = CompileContext::new(&scope.columns, registry);
+        let own = CompileContext::bound(registry);
         let inputs = CallInputs::compile_with(&aggregations, |expr| compile_with(&own, expr))?;
-        let columns = aggregations
-            .iter()
-            .map(|agg| {
-                if agg.column == "*" || agg.expression.is_some() {
-                    return Ok(None);
-                }
-                scope
-                    .column_of(&agg.column_lower)
-                    .map(Some)
-                    .ok_or_else(|| Error::internal("an aggregate's column outside its block"))
-            })
-            .collect::<Result<Vec<_>>>()?;
 
-        let width = items.len() + aggregations.len();
         let slot = |i: usize| {
             u16::try_from(i).map_err(|_| Error::internal("too many grouped values in a block"))
         };
@@ -5334,8 +5328,8 @@ impl Builder<'_> {
         for (i, agg) in aggregations.iter().enumerate() {
             slots.entry(agg.key).or_insert(slot(items.len() + i)?);
         }
-        let names: Vec<String> = (0..width).map(|i| format!("{RESOLVED}#{i}")).collect();
-        let over_slots = CompileContext::new(&names, registry).with_expression_aliases(slots);
+        // A group's values are read by identity alone: no column is in reach
+        let over_slots = CompileContext::new(&[], registry).with_expression_aliases(slots);
         let projection = projection
             .iter()
             .map(|expr| compile_with(&over_slots, expr))
@@ -5352,9 +5346,7 @@ impl Builder<'_> {
         let items = items
             .iter()
             .map(|item| {
-                let column =
-                    bound_column(item).and_then(|name| scope.lower.iter().position(|c| c == name));
-                Ok(match column {
+                Ok(match bound_column(item) {
                     Some(column) => Hole::Column(column),
                     None => Hole::Program(compile_with(&own, item)?),
                 })
@@ -5433,19 +5425,15 @@ struct Grouped {
     reads: SmallVec<[usize; 2]>,
 }
 
-/// The name of a block's own column that `expr` reads outside every
-/// aggregate call and every GROUP BY item, keyed by `items`
-fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<String> {
+/// The block's own column that `expr` reads outside every aggregate call
+/// and every GROUP BY item, keyed by `items`
+fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<usize> {
     if items.contains(&ExprKey::of(expr)) {
         return None;
     }
     match expr {
         Expression::FunctionCall(call) if is_aggregate_function(&call.function) => None,
-        Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
-            Some(q.name.value.to_string())
-        }
-        // A column of a scope read by position
-        Expression::Identifier(id) if id.value.starts_with(RESOLVED) => Some(id.value.to_string()),
+        Expression::Column(c) => Some(usize::from(c.index)),
         other => {
             let mut found = None;
             let _ = for_each_child(other, &mut |child| {
@@ -5580,7 +5568,9 @@ fn nested_statements<'e>(expr: &'e Expression, out: &mut Vec<&'e SelectStatement
 
 fn mentions_column(expr: &Expression) -> bool {
     match expr {
-        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => true,
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) | Expression::Column(_) => {
+            true
+        }
         Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => true,
         other => {
             let mut mentions = false;
@@ -5683,14 +5673,7 @@ impl PreparedProjection {
         };
         let keys = (&stmt.order_by[..], &stmt.distinct_on[..]);
         let rewritten_keys = [rewritten[1], rewritten[2]];
-        Self::build(
-            executor,
-            stmt,
-            items,
-            keys,
-            (columns, columns),
-            rewritten_keys,
-        )
+        Self::build(executor, stmt, chain, items, keys, columns, rewritten_keys)
     }
 
     /// The SELECT list over a join's rows of `all_columns` and, unless the
@@ -5742,18 +5725,19 @@ impl PreparedProjection {
                 [&blocks.order_by, &blocks.distinct_on],
             ),
         };
-        let columns = (all_columns, &blocks.all[..]);
-        Self::build(executor, stmt, items, keys, columns, rewritten)
+        Self::build(executor, stmt, &chain, items, keys, all_columns, rewritten)
     }
 
-    /// `items` and the columns `order_by` and `distinct_on` append, compiled
-    /// over `columns`, an item or key the blocks rewrote over `blocks_columns`
+    /// `items` and the columns `order_by` and `distinct_on` append over the
+    /// rows of `columns`, each bound in `chain`, or compiled as the blocks
+    /// rewrote it
     fn build(
         executor: &Executor,
         stmt: &SelectStatement,
+        chain: &Chain<'_>,
         items: SelectItems<'_>,
         (order_by, distinct_on): (&[OrderByExpression], &[Expression]),
-        (columns, blocks_columns): (&[String], &[String]),
+        columns: &[String],
         rewritten: [&[Option<Expression>]; 2],
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
         let SelectItems {
@@ -5773,20 +5757,11 @@ impl PreparedProjection {
             true,
         );
         let registry = &executor.function_registry;
-        let ctx = std::cell::OnceCell::new();
-        let blocks_ctx = std::cell::OnceCell::new();
-        // An expression as written, or as the blocks rewrote it
+        let bound = CompileContext::bound(registry).with_prepared_subqueries();
+        // An expression bound here, or as the blocks rewrote it
         let compile = |expr: &Expression, rewritten: Option<&Expression>| match rewritten {
-            Some(rewritten) => compile_with(
-                blocks_ctx.get_or_init(|| {
-                    CompileContext::new(blocks_columns, registry).with_prepared_subqueries()
-                }),
-                rewritten,
-            ),
-            None => compile_with(
-                ctx.get_or_init(|| CompileContext::new(columns, registry)),
-                unaliased(expr),
-            ),
+            Some(rewritten) => compile_with(&bound, rewritten),
+            None => compile_with(&bound, &bind_own(chain, unaliased(expr), &|_| false)?),
         };
         let mut outputs = Vec::with_capacity(select_exprs.len() + plan.extra_names.len());
         for (((expr, index), star), rewritten) in select_exprs
@@ -5856,12 +5831,18 @@ impl PreparedProjection {
         let keys: Vec<&Expression> = sort_keys()
             .filter(|key| !is_leaf(key) && names_any(key, &|name| positions.contains_key(name)))
             .collect();
+        // Each key's columns bound, its aliases left for their positions
+        let is_alias = |id: &Identifier| positions.contains_key(id.value_lower.as_str());
+        let bound_keys = keys
+            .iter()
+            .map(|key| bind_own(chain, key, &is_alias))
+            .collect::<Result<Vec<_>>>()?;
         let mut bindings = FxHashMap::default();
-        for key in &keys {
+        for key in &bound_keys {
             bind_aliases(key, &positions, &mut bindings);
         }
-        let alias_ctx = CompileContext::new(columns, registry).with_row2_bindings(&bindings);
-        for key in keys {
+        let alias_ctx = CompileContext::bound(registry).with_row2_bindings(&bindings);
+        for (key, bound_key) in keys.into_iter().zip(&bound_keys) {
             let name = ExprKey::of(key).hidden_column_name();
             if extra_names.contains(&name) {
                 continue;
@@ -5872,7 +5853,7 @@ impl PreparedProjection {
                 .map(|(_, position)| usize::from(*position))
                 .collect();
             outputs.push(Output::AliasKey(
-                Computed::new(compile_with(&alias_ctx, key)?),
+                Computed::new(compile_with(&alias_ctx, bound_key)?),
                 items,
             ));
             extra_names.push(name);
@@ -6270,7 +6251,7 @@ impl PreparedSelect {
         let output_blocks = first_output_block..builder.subqueries.len();
         let mut read_as = FxHashMap::default();
         parts.read_as(schema, &mut read_as);
-        let own = CompileContext::new(&scope.columns, registry)
+        let own = CompileContext::bound(registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Expression| compile_with(&own, expr);
@@ -6555,48 +6536,14 @@ impl PreparedGrouped {
             input.resize(builder.subqueries.len(), true);
             Ok(rewritten)
         }
-        // A SELECT item the GROUP BY names by its alias or position groups the
-        // rows, found by asking parse_group_by of the list with each marked
-        let mark = |i: usize| format!("\0select item {i}");
-        let marked = SelectStatement {
-            columns: stmt
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| {
-                    let item = unaliased(column);
-                    if !mentions_subquery(item) || expression_contains_aggregate(item) {
-                        return column.clone();
-                    }
-                    let name = mark(i);
-                    let id = Expression::Identifier(Identifier::new(
-                        Token::new(TokenType::Identifier, &name, Position::default()),
-                        &name,
-                    ));
-                    match column {
-                        Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
-                            token: aliased.token.clone(),
-                            expression: Box::new(id),
-                            alias: aliased.alias.clone(),
-                        }),
-                        _ => id,
-                    }
-                })
-                .collect(),
-            ..stmt.clone()
-        };
+        // The keys are refused as every grouping path refuses them; a SELECT
+        // item holding a subquery that one names by alias or position groups
+        executor.parse_group_by(stmt, &[])?;
         let mut keys = vec![false; stmt.columns.len()];
-        for item in executor.parse_group_by(&marked, &[])? {
-            let name = match &item {
-                GroupByItem::Column(name) => name.as_str(),
-                GroupByItem::Expression {
-                    expr: Expression::Identifier(id),
-                    ..
-                } => id.value.as_str(),
-                GroupByItem::Expression { .. } => continue,
-            };
-            if let Some(key) = (0..keys.len()).find(|&i| name == mark(i)) {
-                keys[key] = true;
+        for key in grouping_items(stmt) {
+            if let Some(at) = grouped_item(stmt, key) {
+                let item = unaliased(&stmt.columns[at]);
+                keys[at] |= mentions_subquery(item) && !expression_contains_aggregate(item);
             }
         }
         // A grouped SELECT item or GROUP BY expression holding a subquery is
@@ -6711,8 +6658,7 @@ impl PreparedGrouped {
             ob.expression = Expression::Identifier(column);
         }
         let blocks_read = builder.subqueries.len();
-        let values = CompileContext::new(&scope.columns, &executor.function_registry)
-            .with_prepared_subqueries();
+        let values = CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
@@ -6721,7 +6667,7 @@ impl PreparedGrouped {
         if let Some(parts) = &where_parts {
             parts.read_as(&schema, &mut read_as);
         }
-        let own = CompileContext::new(&scope.columns, &executor.function_registry)
+        let own = CompileContext::bound(&executor.function_registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let where_program = where_parts
@@ -6729,54 +6675,42 @@ impl PreparedGrouped {
             .map(|parts| parts.programs(|expr| compile_with(&own, expr)))
             .transpose()?;
         let (blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
-        let where_clause = where_parts.as_ref().map(|parts| parts.clause.clone());
+        // The statement the grouped run reads names its columns again
+        let where_clause = where_parts
+            .as_ref()
+            .map(|parts| spelled_columns(&parts.clause, &scope))
+            .transpose()?;
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
         // A group's row holds its GROUP BY items first, each holding the
-        // column the grouping reads it from when it reads one. A hole reads
-        // an item holding the column it resolved to; between several, the
-        // one the output reads for what the block wrote
-        let registry = &executor.function_registry;
-        let group_items = executor.parse_group_by(stmt, &[])?;
-        let names = schema.column_names_arc();
-        let name_index = build_column_index_map(&names);
-        let names_ctx = CompileContext::new(&names, registry);
-        let held: Vec<Option<usize>> = group_items
-            .iter()
-            .map(|group| match group {
-                GroupByItem::Column(name) => {
-                    Executor::lookup_column_index(&name.to_lowercase(), &name_index)
-                }
-                GroupByItem::Expression { expr, .. } => names_ctx
-                    .reference(expr)
-                    .and_then(|reference| reference.row_column())
-                    .map(usize::from),
+        // column it binds to when it is one, and whether it is written as that
+        // column rather than through a SELECT item. A hole reads an item
+        // holding the column it binds to: the one written as the hole is,
+        // else one written as a column, else the first
+        let held: Vec<(Option<usize>, ExprKey, bool)> = grouping_items(stmt)
+            .into_iter()
+            .map(|key| {
+                let item = grouped_item(stmt, key);
+                let read = item.map_or(key, |at| unaliased(&stmt.columns[at]));
+                let column = match chain.resolve(read) {
+                    Ok(Some((0, column))) => Some(column),
+                    _ => None,
+                };
+                (column, ExprKey::of(key), item.is_none())
             })
             .collect();
-        let item_names =
-            executor.resolve_group_by_column_names_new(&group_items, &names, &name_index);
-        let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
-        let item_ctx = CompileContext::new(&item_names, registry);
-        // The item a reference reads its resolved `column` from
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {
             let holding: SmallVec<[usize; 2]> = (0..held.len())
-                .filter(|&item| held[item] == Some(column))
+                .filter(|&item| held[item].0 == Some(column))
                 .collect();
-            let output = item_keys.get(&ExprKey::of(reference)).copied().or_else(|| {
-                item_ctx
-                    .reference(reference)
-                    .and_then(|reference| reference.row_column())
-                    .map(usize::from)
-            });
-            output
-                .filter(|item| holding.contains(item))
+            let written = ExprKey::of(reference);
+            let first = |test: &dyn Fn(usize) -> bool| holding.iter().copied().find(|&i| test(i));
+            first(&|item| held[item].1 == written)
+                .or_else(|| first(&|item| held[item].2))
                 .or(holding.first().copied())
         };
-        let slot_names: Vec<String> = (0..group_items.len())
-            .map(|item| format!("\0group item {item}"))
-            .collect();
-        let slots_ctx = CompileContext::new(&slot_names, registry);
+        let slots_ctx = CompileContext::bound(&executor.function_registry);
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
         for (id, sq) in blocks.subqueries.iter().enumerate() {
             if input.get(id) == Some(&true) {
@@ -7312,11 +7246,7 @@ impl PreparedDml {
             let mut values = Vec::with_capacity(sites.values.len());
             for value in sites.values.iter().map(unaliased) {
                 if matches!(value, Expression::Star(_)) {
-                    values.extend(sites.schema.columns.iter().map(|column| {
-                        let token =
-                            Token::new(TokenType::Identifier, &column.name, Position::default());
-                        Expression::Identifier(Identifier::new(token, column.name.as_str()))
-                    }));
+                    values.extend((0..sites.schema.columns.len()).map(|i| chain.column(0, i)));
                     continue;
                 }
                 let first = builder.subqueries.len();
@@ -7344,7 +7274,7 @@ impl PreparedDml {
         if let Some(parts) = &where_parts {
             parts.read_as(schema, &mut read_as);
         }
-        let own = CompileContext::new(&scope.columns, &executor.function_registry)
+        let own = CompileContext::bound(&executor.function_registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let where_program = where_parts
@@ -7364,9 +7294,9 @@ impl PreparedDml {
             })
             .collect::<Result<Vec<_>>>()?;
         let prepared_conflict = match (conflict, &joined, conflict_parts) {
-            (Some(sites), Some(joined), Some((sets, where_, reads_target))) => {
-                let over_joined = CompileContext::new(&joined.columns, &executor.function_registry)
-                    .with_prepared_subqueries();
+            (Some(sites), Some(_), Some((sets, where_, reads_target))) => {
+                let over_joined =
+                    CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
                 let updates = sets
                     .iter()
                     .map(|(index, value)| {
@@ -7388,10 +7318,9 @@ impl PreparedDml {
             _ => None,
         };
         let prepared_returning = match (returning, &returning_scope, returning_parts) {
-            (Some(sites), Some(scope), Some((values, reads_target))) => {
+            (Some(sites), Some(_), Some((values, reads_target))) => {
                 let over_returned =
-                    CompileContext::new(&scope.columns, &executor.function_registry)
-                        .with_prepared_subqueries();
+                    CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
                 let columns = sites.schema.column_names_arc();
                 Some(PreparedReturning {
                     names: CompactArc::new(Executor::returning_names(sites.values, &columns)),
@@ -7677,15 +7606,15 @@ impl JoinBlocks {
             )?;
             let mut read_as = FxHashMap::default();
             parts.read_as(schema, &mut read_as);
-            let own = CompileContext::new(&side.columns, registry)
+            let own = CompileContext::bound(registry)
                 .with_prepared_subqueries()
                 .with_read_as(&read_as);
             let program = parts.programs(|expr| compile_with(&own, expr))?;
             let offset = if i == 0 { 0 } else { left_width };
-            let joined_clause = in_joined(&parts.clause, &side, &scope, offset)?;
+            let joined_clause = in_joined(&parts.clause, offset)?;
             side_parts[i] = Some((parts, program, joined_clause));
         }
-        let values = CompileContext::new(&scope.columns, registry).with_prepared_subqueries();
+        let values = CompileContext::bound(registry).with_prepared_subqueries();
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
@@ -7713,16 +7642,12 @@ impl JoinBlocks {
         }
         let left = scope.columns[..left_width].to_vec();
         let right = scope.columns[left_width..].to_vec();
-        let pair_ctx = CompileContext::new(&left, registry).with_second_row(&right);
+        let pair_ctx = CompileContext::bound_pair(registry, left_width as u16);
         let position = |hole: &Expression| match hole {
-            Expression::Identifier(id) => scope
-                .columns
-                .iter()
-                .position(|c| *c == id.value_lower)
-                .map(|i| match i.checked_sub(left_width) {
-                    Some(i) => Hole::Column2(i),
-                    None => Hole::Column(i),
-                }),
+            Expression::Column(c) => Some(match usize::from(c.index).checked_sub(left_width) {
+                Some(i) => Hole::Column2(i),
+                None => Hole::Column(usize::from(c.index)),
+            }),
             _ => None,
         };
         let pair = HoleSet {
@@ -7778,8 +7703,8 @@ impl JoinBlocks {
         registry: &FunctionRegistry,
     ) -> Result<SharedProgram> {
         let ctx = match pair {
-            true => CompileContext::new(&self.left, registry).with_second_row(&self.right),
-            false => CompileContext::new(&self.all, registry),
+            true => CompileContext::bound_pair(registry, self.left.len() as u16),
+            false => CompileContext::bound(registry),
         };
         compile_with(&ctx.with_prepared_subqueries(), clause)
     }
@@ -8501,14 +8426,12 @@ impl Builder<'_> {
                     }
                 }
                 Expression::In(in_expr) => match (&*in_expr.right, bound_column(&in_expr.left)) {
-                    (Expression::ScalarSubquery(mark), Some(name)) => schema
-                        .column_index_map()
-                        .get(name)
-                        .map(|&column| (&mark.subquery, in_expr.not, Some(column))),
+                    (Expression::ScalarSubquery(mark), Some(column)) => {
+                        Some((&mark.subquery, in_expr.not, Some(column)))
+                    }
                     _ => None,
                 },
                 Expression::AllAny(all_any) => bound_column(&all_any.left)
-                    .and_then(|name| schema.column_index_map().get(name).copied())
                     .map(|column| (&all_any.subquery, false, Some(column))),
                 _ => None,
             };
@@ -9567,7 +9490,7 @@ impl StatementSource<'_> {
 }
 
 /// `expr`, read over a group's row: each column it names, resolved in the
-/// `chain`, spelled as the group item `item_of` reads it from
+/// `chain`, bound to the group item `item_of` reads it from
 fn over_items(
     expr: &Expression,
     chain: &Chain<'_>,
@@ -9577,14 +9500,14 @@ fn over_items(
         Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
             match chain.resolve(expr)? {
                 None => Ok(expr.clone()),
-                Some((_, column)) => {
+                Some((depth, column)) => {
                     let item = item_of(column, expr)
                         .ok_or_else(|| Error::internal("a column outside the groups"))?;
-                    let name = format!("\0group item {item}");
-                    Ok(Expression::Identifier(Identifier::new(
-                        Token::new(TokenType::Identifier, &name, Position::default()),
-                        &name,
-                    )))
+                    let name = chain.scopes[depth].lower[column].as_str();
+                    Ok(Expression::Column(ColumnRef {
+                        index: item as u16,
+                        name: ident(name, name),
+                    }))
                 }
             }
         }

@@ -245,6 +245,11 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b'I');
             hasher.name(&id.value_lower);
         }
+        // A bound column is one column however it was written
+        Expression::Column(c) => {
+            hasher.tag(b'C');
+            hasher.write_u32(u32::from(c.index));
+        }
         Expression::QualifiedIdentifier(qid) if hasher.by_column_name => {
             hasher.tag(b'I');
             hasher.name(&qid.name.value_lower);

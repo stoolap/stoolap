@@ -617,3 +617,39 @@ fn a_program_deeper_than_the_inline_stack_runs_owned() {
     ]);
     assert!(shallow.cow_supported(), "two values on the stack");
 }
+
+#[test]
+fn a_bound_program_reads_its_columns_by_index_and_no_name() {
+    use crate::functions::registry::global_registry;
+    use crate::parser::ast::{ColumnRef, Identifier};
+    use crate::parser::token::{Position, Token, TokenType};
+
+    let ident = |name: &str| {
+        Identifier::new(
+            Token::new(TokenType::Identifier, name, Position::default()),
+            name,
+        )
+    };
+    let column = |index: u16| {
+        Expression::Column(ColumnRef {
+            index,
+            name: ident("a"),
+        })
+    };
+    let bound = CompileContext::bound(global_registry());
+    let program = ExprCompiler::new(&bound).compile(&column(1)).unwrap();
+    let row = Row::from_values(vec![Value::Integer(1), Value::Integer(2)]);
+    let read = ExprVM::new().execute(&program, &ExecuteContext::new(&row));
+    assert_eq!(read.unwrap(), Value::Integer(2));
+    assert!(
+        ExprCompiler::new(&bound)
+            .compile(&Expression::Identifier(ident("a")))
+            .is_err(),
+        "a bound program looks no name up"
+    );
+    let named = CompileContext::with_global_registry(&["a".to_string()]);
+    assert!(
+        ExprCompiler::new(&named).compile(&column(0)).is_err(),
+        "a bound column compiles only in a bound program"
+    );
+}

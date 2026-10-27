@@ -152,6 +152,7 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
             qid.qualifier.value_lower.hash(hasher);
             qid.name.value_lower.hash(hasher);
         }
+        Expression::Column(c) => c.index.hash(hasher),
         Expression::IntegerLiteral(lit) => {
             lit.value.hash(hasher);
         }
@@ -1215,6 +1216,7 @@ impl<'a> CompiledEvaluator<'a> {
                 qid.qualifier.value_lower.hash(hasher);
                 qid.name.value_lower.hash(hasher);
             }
+            Expression::Column(c) => c.index.hash(hasher),
             Expression::IntegerLiteral(lit) => {
                 lit.value.hash(hasher);
             }

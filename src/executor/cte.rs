@@ -1329,7 +1329,7 @@ impl Executor {
                 }
             }
             // A bare name is a column: a source is parsed as a TableSource
-            Expression::Identifier(_) => {}
+            Expression::Identifier(_) | Expression::Column(_) => {}
             Expression::JoinSource(js) => {
                 self.count_cte_references_in_expr(&js.left, ref_counts);
                 self.count_cte_references_in_expr(&js.right, ref_counts);

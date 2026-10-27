@@ -186,6 +186,10 @@ pub struct CompileContext<'a> {
 
     /// The parameters of the one execution the program serves, which folding reads
     params: Option<&'a [Value]>,
+
+    /// A program over the prepared builder's bound columns: one below the
+    /// split reads the first row, the rest the second row from the split on
+    bound: Option<u16>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -226,6 +230,24 @@ impl<'a> CompileContext<'a> {
             row2_bindings: None,
             read_as: None,
             params: None,
+            bound: None,
+        }
+    }
+
+    /// A context for the prepared builder's programs, which read the bound
+    /// columns of one row: no name is looked up, so one left unbound fails
+    pub(crate) fn bound(functions: &'a FunctionRegistry) -> Self {
+        Self {
+            bound: Some(u16::MAX),
+            ..Self::new(&[], functions)
+        }
+    }
+
+    /// The same over a joined row whose second row starts at column `split`
+    pub(crate) fn bound_pair(functions: &'a FunctionRegistry, split: u16) -> Self {
+        Self {
+            bound: Some(split),
+            ..Self::new(&[], functions)
         }
     }
 
@@ -638,6 +660,17 @@ impl<'a> ExprCompiler<'a> {
             Expression::QualifiedIdentifier(_) => {
                 self.emit_reference(expr, builder)?;
             }
+
+            Expression::Column(column) => match self.ctx.bound {
+                Some(split) if column.index < split => builder.emit(Op::LoadColumn(column.index)),
+                Some(split) => builder.emit(Op::LoadColumn2(column.index - split)),
+                None => {
+                    return Err(CompileError::InvalidExpression(format!(
+                        "bound column '{}' outside a prepared program",
+                        column.name
+                    )))
+                }
+            },
 
             // === PARAMETERS ===
             Expression::Parameter(param) => {
@@ -2186,7 +2219,9 @@ fn is_column_free(expr: &Expression, ctx: &CompileContext, params: bool) -> bool
         | Expression::IntervalLiteral(_) => true,
 
         // Identifiers reference columns (not column-free)
-        Expression::Identifier(_) | Expression::QualifiedIdentifier { .. } => false,
+        Expression::Identifier(_)
+        | Expression::QualifiedIdentifier { .. }
+        | Expression::Column(_) => false,
 
         // Parameters: known only for a program that serves one execution
         Expression::Parameter(_) => params,
