@@ -124,6 +124,8 @@ FROM orders
 JOIN returns USING (order_id, product_id);
 ```
 
+When a side is itself a join holding two columns of the name, a `USING` or `NATURAL` join merges the first of them, the one its bare name reads: in `t LEFT JOIN u ON u.id = t.id JOIN s USING (id)` the condition is `s.id = t.id`, so a `t` row without a `u` row still joins.
+
 ## Examples
 
 ### Basic JOIN Example

@@ -1083,11 +1083,8 @@ fn test_classifier_rules() {
             "a named window",
         ),
         (
-            format!(
-                "SELECT t.id FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id \
-                 WHERE a > {sq}"
-            ),
-            "a joined side that is a NATURAL or USING join",
+            format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),
+            "a NATURAL or USING join whose output holds a subquery",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"

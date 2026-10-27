@@ -1083,8 +1083,13 @@ impl Executor {
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
             Some(Expression::JoinSource(join)) => {
+                let side_merges = |side: &Expression| {
+                    matches!(side, Expression::JoinSource(_)) && merges_columns(side)
+                };
                 if join.join_type.to_uppercase().contains("NATURAL")
                     || !join.using_columns.is_empty()
+                    || side_merges(&join.left)
+                    || side_merges(&join.right)
                 {
                     return Err("a NATURAL or USING join whose output holds a subquery");
                 }
@@ -1207,6 +1212,19 @@ impl ScopeTable {
         let mut scope = Self::beside(left, right);
         scope.merged.extend(merged);
         scope
+    }
+
+    /// The scope of the FROM entry `side`, its tables `leaves` in turn and
+    /// each join among them merging columns as [`Self::joined`] does
+    fn of_side(side: &Expression, leaves: &mut impl Iterator<Item = Self>) -> Option<Self> {
+        match side {
+            Expression::JoinSource(join) => {
+                let left = Self::of_side(&join.left, leaves)?;
+                let right = Self::of_side(&join.right, leaves)?;
+                Some(Self::joined(join, left, right))
+            }
+            _ => leaves.next(),
+        }
     }
 
     /// This scope read by position, each column under a name no column can
@@ -7442,6 +7460,18 @@ impl JoinBlocks {
         self.side_wheres[side].is_some()
     }
 
+    /// The pairs a joined side merges, each its left and right column in the
+    /// joined row, which its run keeps apart; the join's own pairs straddle
+    /// the sides
+    pub(crate) fn side_merges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let left_width = self.left.len();
+        self.scope
+            .merged
+            .iter()
+            .copied()
+            .filter(move |&(left, right)| (left < left_width) == (right < left_width))
+    }
+
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
     fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
@@ -7483,9 +7513,13 @@ impl JoinBlocks {
             ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
         };
         // Each side's tables side by side, read by position in the joined row
-        let side_scope = |side: &JoinSide| side.leaves.iter().map(table).reduce(ScopeTable::beside);
-        let (Some(left_scope), Some(right_scope)) = (side_scope(&sides[0]), side_scope(&sides[1]))
-        else {
+        let side_scope = |expr: &Expression, side: &JoinSide| {
+            ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
+        };
+        let (Some(left_scope), Some(right_scope)) = (
+            side_scope(&join.left, &sides[0]),
+            side_scope(&join.right, &sides[1]),
+        ) else {
             return Ok(None);
         };
         let left_width = left_scope.columns.len();
