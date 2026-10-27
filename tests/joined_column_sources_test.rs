@@ -131,6 +131,14 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
             "SELECT DISTINCT a FROM ta",
         ),
         (
+            "SELECT DISTINCT ON (v.a) v.b FROM ta AS v JOIN y ON y.a = v.a",
+            "SELECT b FROM ta",
+        ),
+        (
+            "SELECT DISTINCT ON (2) v.b, v.a FROM y JOIN ta AS v ON y.a = v.a",
+            "SELECT b, a FROM ta",
+        ),
+        (
             "SELECT q.a FROM y AS q ORDER BY q.b",
             "SELECT a FROM y ORDER BY b",
         ),

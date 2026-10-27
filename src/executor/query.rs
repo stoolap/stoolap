@@ -116,11 +116,20 @@ impl OutputLayout {
     /// The output position of what `key` reads: the column its SELECT item
     /// gives, or a column holding its input column unchanged
     fn position(&self, key: &OrderKey) -> Option<usize> {
+        Self::position_over(&self.sources, &self.input_columns, key)
+    }
+
+    /// [`Self::position`] of a layout of `sources` over `input_columns`
+    fn position_over(
+        sources: &[ColumnSource],
+        input_columns: &[String],
+        key: &OrderKey,
+    ) -> Option<usize> {
         match *key {
-            OrderKey::Item(item) => self.item_position(item),
+            OrderKey::Item(item) => sources.iter().position(|s| s.item == Some(item)),
             OrderKey::Input(qualifier, name) => {
-                let input = input_column_index(&self.input_columns, qualifier, name)?;
-                self.sources.iter().position(|s| s.input == Some(input))
+                let input = input_column_index(input_columns, qualifier, name)?;
+                sources.iter().position(|s| s.input == Some(input))
             }
             OrderKey::Ordinal(_) | OrderKey::Expression => None,
         }
@@ -6439,13 +6448,13 @@ impl Executor {
                     let op_join_type = OperatorJoinType::parse(&join_type);
 
                     // Try to push projection into the join operator for ~2.3x speedup
-                    // Eligibility: no cross filter, no ORDER BY or DISTINCT ON,
-                    // no aggregation/window, simple column references only
+                    // Eligibility: no cross filter, no ORDER BY, DISTINCT ON keys
+                    // the projection carries, no aggregation/window, simple
+                    // column references only
                     // Note: JoinProjection uses ColumnSource enum to preserve SELECT column order
                     // regardless of whether the join was swapped (outer/inner assignment)
                     let projection_pushdown = if cross_filter.is_none()
                         && stmt.order_by.is_empty()
-                        && stmt.distinct_on.is_empty()
                         && !classification.has_aggregation
                         && !classification.has_window_functions
                     {
@@ -6453,6 +6462,37 @@ impl Executor {
                     } else {
                         None
                     };
+                    // Where each projected column comes from in the joined
+                    // row, for DISTINCT ON to read the projected rows by
+                    let pushdown_sources: Option<LayoutSources> = projection_pushdown
+                        .as_ref()
+                        .filter(|_| !stmt.distinct_on.is_empty())
+                        .map(|proj| {
+                            use crate::executor::operators::index_nested_loop::ColumnSource as Side;
+                            proj.columns
+                                .iter()
+                                .enumerate()
+                                .map(|(item, side)| ColumnSource {
+                                    item: Some(item),
+                                    input: Some(match (*side, swapped) {
+                                        (Side::Outer(idx), false) | (Side::Inner(idx), true) => idx,
+                                        (Side::Outer(idx), true) => inner_cols.len() + idx,
+                                        (Side::Inner(idx), false) => outer_cols.len() + idx,
+                                    }),
+                                })
+                                .collect()
+                        });
+                    let projection_pushdown = projection_pushdown.filter(|_| {
+                        pushdown_sources.as_ref().is_none_or(|sources| {
+                            stmt.distinct_on
+                                .iter()
+                                .all(|key| match bind_order_key(key, stmt) {
+                                    OrderKey::Ordinal(_) => true,
+                                    key => OutputLayout::position_over(sources, &all_columns, &key)
+                                        .is_some(),
+                                })
+                        })
+                    });
 
                     // A cross-table WHERE filter counts toward LIMIT, so it is
                     // applied per joined row rather than after collection
@@ -6826,7 +6866,15 @@ impl Executor {
                             CompactArc::clone(&output_columns),
                             final_rows,
                         );
-                        return Ok((Box::new(result), output_columns, order_limit_applied, None));
+                        return Ok((
+                            Box::new(result),
+                            output_columns,
+                            order_limit_applied,
+                            SelectShape::laid_out(pushdown_sources.map(|sources| OutputLayout {
+                                input_columns: CompactArc::new(all_columns),
+                                sources,
+                            })),
+                        ));
                     } else if !order_limit_applied
                         && self.order_by_needs_extra_columns(stmt, &all_columns)
                     {
