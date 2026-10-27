@@ -26,6 +26,8 @@ const SETUP: &[&str] = &[
     "INSERT INTO u VALUES (1, 7), (2, 8), (3, 9), (5, NULL), (9, 1)",
     "CREATE TABLE w (x INTEGER, y INTEGER)",
     "INSERT INTO w VALUES (1, 5), (2, 6), (9, 7)",
+    "CREATE TABLE s (id INTEGER PRIMARY KEY, x INTEGER)",
+    "INSERT INTO s VALUES (1, 7), (2, 3), (4, 4), (6, NULL), (9, 1)",
 ];
 
 fn hot(name: &str) -> Database {
@@ -61,18 +63,44 @@ const MERGING: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// The join around the side, `{m}` the side, and the columns its other
-/// tables add to a star
-const AROUND: &[(&str, &str)] = &[
-    ("{m} JOIN u AS r ON r.id = t.a", "r.id, r.x"),
-    ("{m} LEFT JOIN u AS r ON r.id = t.a", "r.id, r.x"),
+/// The join around the side, `{m}` the side, as written and as ON joins, and
+/// the columns its other tables add to a star. One that merges a column with
+/// the side's merged one merges it with the side's left column
+const AROUND: &[(&str, &str, &str)] = &[
+    (
+        "{m} JOIN u AS r ON r.id = t.a",
+        "{m} JOIN u AS r ON r.id = t.a",
+        ", r.id, r.x",
+    ),
+    (
+        "{m} LEFT JOIN u AS r ON r.id = t.a",
+        "{m} LEFT JOIN u AS r ON r.id = t.a",
+        ", r.id, r.x",
+    ),
     (
         "{m} LEFT JOIN u AS r ON r.id = t.a AND r.id IN (SELECT x FROM w)",
-        "r.id, r.x",
+        "{m} LEFT JOIN u AS r ON r.id = t.a AND r.id IN (SELECT x FROM w)",
+        ", r.id, r.x",
     ),
     (
         "{m} LEFT JOIN u AS r ON r.id = t.a LEFT JOIN u AS p ON p.id = t.id",
-        "r.id, r.x, p.id, p.x",
+        "{m} LEFT JOIN u AS r ON r.id = t.a LEFT JOIN u AS p ON p.id = t.id",
+        ", r.id, r.x, p.id, p.x",
+    ),
+    (
+        "{m} JOIN s AS r USING (id)",
+        "{m} JOIN s AS r ON r.id = t.id",
+        ", r.x",
+    ),
+    (
+        "{m} LEFT JOIN s AS r USING (id)",
+        "{m} LEFT JOIN s AS r ON r.id = t.id",
+        ", r.x",
+    ),
+    (
+        "{m} NATURAL JOIN s AS r",
+        "{m} JOIN s AS r ON r.id = t.id AND r.x = u.x",
+        "",
     ),
 ];
 
@@ -85,9 +113,10 @@ const SHAPES: &[&str] = &[
     "SELECT {id}, COUNT(*), SUM(t.b) FROM {f} WHERE COALESCE(u.x, 0) < (SELECT MAX(y) FROM w) + 100 GROUP BY {id}",
     "SELECT u.id, COUNT(*) FROM {f} WHERE COALESCE(u.x, 0) < (SELECT MAX(y) FROM w) + 100 GROUP BY u.id",
     "SELECT {id}, t.id, u.id FROM {f} WHERE EXISTS (SELECT 1 FROM w WHERE w.x = u.id OR w.x = t.a)",
-    "SELECT {id}, u.id, r.x FROM {f} WHERE r.x IS NULL OR r.x < (SELECT MAX(y) FROM w) + 100 ORDER BY u.id, {id}",
+    "SELECT {id}, u.id, r.x FROM {f} WHERE r.x IS NULL OR r.x < (SELECT MAX(y) FROM w) + 100 ORDER BY u.id, {id}, r.x",
 ];
 
+/// The rows of `sql` in the order it gives them, sorted unless it orders them
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -103,7 +132,9 @@ fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
                 .join("|"),
         );
     }
-    out.sort();
+    if !sql.contains(" ORDER BY ") {
+        out.sort();
+    }
     Ok(out)
 }
 
@@ -121,12 +152,12 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) -> usize {
     for (merging, as_on, kinds) in MERGING {
         for kind in kinds.iter() {
             let (merging, as_on) = (merging.replace("{j}", kind), as_on.replace("{j}", kind));
-            for (around, others) in AROUND {
+            for (around, around_on, others) in AROUND {
                 let from = around.replace("{m}", &merging);
-                let from_on = around.replace("{m}", &as_on);
+                let from_on = around_on.replace("{m}", &as_on);
                 for shape in SHAPES {
                     let sql = shape.replace("{f}", &from).replace("{id}", "id");
-                    let star = format!("t.id, t.a, t.b, u.x, {others}");
+                    let star = format!("t.id, t.a, t.b, u.x{others}");
                     let want = shape
                         .replace("SELECT *", &format!("SELECT {star}"))
                         .replace("{f}", &from_on)
@@ -154,6 +185,36 @@ fn a_joined_side_that_merges_columns_runs_its_blocks_and_answers_as_at_the_top()
     let dir = tempfile::tempdir().unwrap();
     check(&sealed(&dir), "sealed", &mut wrong);
     assert!(count > 150, "{count} statements");
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_join_merging_a_name_its_side_holds_twice_merges_the_first() {
+    let db = hot("twice");
+    let mut wrong = Vec::new();
+    for side in ["t LEFT JOIN u ON u.id = t.id", "t LEFT JOIN u USING (id)"] {
+        for (merging, as_on) in [
+            ("JOIN s AS r USING (id)", "JOIN s AS r ON r.id = t.id"),
+            (
+                "LEFT JOIN s AS r USING (id)",
+                "LEFT JOIN s AS r ON r.id = t.id",
+            ),
+        ] {
+            for filter in ["t.b > 0", "t.b > (SELECT MIN(y) FROM w) - 100"] {
+                let sql = format!("SELECT t.id, u.id, r.x FROM {side} {merging} WHERE {filter}");
+                let want = format!("SELECT t.id, u.id, r.x FROM {side} {as_on} WHERE {filter}");
+                let (got, want) = (answer(&db, &sql), answer(&db, &want));
+                if got.is_err() || got != want {
+                    wrong.push(format!("{sql}: {got:?}, want {want:?}"));
+                }
+            }
+        }
+    }
     assert!(
         wrong.is_empty(),
         "{} wrong:\n{}",

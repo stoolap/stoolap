@@ -770,34 +770,35 @@ fn natural_join_condition(
     let mut conditions: Vec<Expression> = Vec::new();
     let mut excluded_right_indices: Vec<usize> = Vec::new();
     let mut join_column_renames: Vec<(usize, String)> = Vec::new(); // (left_idx, base_name)
+                                                                    // Each name the join merges is one column of each side, its first of
+                                                                    // that name, as the bare name reads it in a side that is a join
+    let mut merged: Vec<&str> = Vec::new();
     for (left_idx, left_base) in &left_base_cols {
-        for (right_idx, right_base) in &right_base_cols {
-            // For NATURAL JOIN, match all common columns
-            // For USING, only match specified columns
-            let should_match = if !using_col_names.is_empty() {
-                // USING clause - match only specified columns
-                using_col_names.contains(left_base) && left_base == right_base
-            } else {
-                // NATURAL JOIN - match all common columns
-                left_base == right_base
-            };
-
-            if should_match {
-                // Track right-side columns to exclude from SELECT *
-                // The index in all_columns is left_columns.len() + right_idx
-                excluded_right_indices.push(left_columns.len() + *right_idx);
-                // Track left column to rename to unqualified name
-                join_column_renames.push((*left_idx, left_base.clone()));
-
-                // Create equality condition: left_col = right_col
-                conditions.push(Expression::Infix(InfixExpression::new(
-                    Token::new(TokenType::Operator, "=", Position::default()),
-                    Box::new(column(false, *left_idx)),
-                    "=".to_string(),
-                    Box::new(column(true, *right_idx)),
-                )));
-            }
+        // For NATURAL JOIN, match all common columns
+        // For USING, only match specified columns
+        let named = using_col_names.is_empty() || using_col_names.contains(left_base);
+        if !named || merged.contains(&left_base.as_str()) {
+            continue;
         }
+        let Some((right_idx, _)) = right_base_cols.iter().find(|(_, right)| right == left_base)
+        else {
+            continue;
+        };
+        merged.push(left_base);
+
+        // Track right-side columns to exclude from SELECT *
+        // The index in all_columns is left_columns.len() + right_idx
+        excluded_right_indices.push(left_columns.len() + *right_idx);
+        // Track left column to rename to unqualified name
+        join_column_renames.push((*left_idx, left_base.clone()));
+
+        // Create equality condition: left_col = right_col
+        conditions.push(Expression::Infix(InfixExpression::new(
+            Token::new(TokenType::Operator, "=", Position::default()),
+            Box::new(column(false, *left_idx)),
+            "=".to_string(),
+            Box::new(column(true, *right_idx)),
+        )));
     }
 
     // Combine conditions with AND
