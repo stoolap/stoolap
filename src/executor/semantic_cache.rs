@@ -85,11 +85,12 @@ use std::time::Duration;
 use crate::common::{CompactArc, StringMap};
 use crate::core::{Result, Row};
 
-/// Convert to lowercase without allocation if already lowercase.
-/// Returns Cow::Borrowed for already-lowercase strings (zero allocation).
+/// Convert to lowercase without allocation if already lowercase ASCII.
+/// Returns Cow::Borrowed for those (zero allocation); any other name is
+/// lowercased as `str::to_lowercase` does.
 #[inline]
 fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
-    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
+    if s.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
         Cow::Borrowed(s)
     } else {
         Cow::Owned(s.to_lowercase())
@@ -1636,5 +1637,38 @@ mod tests {
                 "{stamp:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_table_names_fold_unicode_case() {
+        let cache = SemanticCache::new();
+        let columns = vec!["id".to_string(), "amount".to_string()];
+        let row = || {
+            vec![Row::from_values(vec![
+                Value::Integer(1),
+                Value::Integer(150),
+            ])]
+        };
+        let insert = |table: &str| {
+            cache.insert(
+                table,
+                columns.clone(),
+                row(),
+                Some(make_gt("amount", 100)),
+                STAMP,
+            )
+        };
+        let lookup =
+            |table: &str| cache.lookup(table, &columns, Some(&make_gt("amount", 100)), STAMP);
+
+        insert("Ö");
+        assert!(matches!(lookup("ö"), CacheLookupResult::ExactHit(_)));
+        cache.invalidate_table("ö");
+        assert_eq!(cache.size(), 0, "Ö is gone under ö");
+
+        insert("ö");
+        assert!(matches!(lookup("Ö"), CacheLookupResult::ExactHit(_)));
+        cache.invalidate_table("Ö");
+        assert_eq!(cache.size(), 0, "ö is gone under Ö");
     }
 }
