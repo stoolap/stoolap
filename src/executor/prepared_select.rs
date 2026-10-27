@@ -3780,7 +3780,7 @@ impl PreparedPush {
     fn storage(&self, params: &[Value]) -> Option<Box<dyn StorageExpr>> {
         Some(match self {
             Self::Comparison(c) => Box::new(
-                ComparisonExpr::new(c.column.clone(), c.operator, c.value(params)?)
+                ComparisonExpr::new(c.column.as_str(), c.operator, c.value(params)?)
                     .with_column_index(c.index),
             ),
             Self::And(left, right) => Box::new(AndExpr::new(vec![
@@ -3815,7 +3815,7 @@ impl BoundPushdown {
             ([one], None) => {
                 *bound = values.into_iter().next().map(|value| {
                     BoundPushdown::One(
-                        ComparisonExpr::new(one.column.clone(), one.operator, value)
+                        ComparisonExpr::new(one.column.as_str(), one.operator, value)
                             .with_column_index(one.index),
                     )
                 })
@@ -3826,7 +3826,7 @@ impl BoundPushdown {
                         .zip(values)
                         .map(|(c, value)| {
                             Box::new(
-                                ComparisonExpr::new(c.column.clone(), c.operator, value)
+                                ComparisonExpr::new(c.column.as_str(), c.operator, value)
                                     .with_column_index(c.index),
                             ) as Box<dyn StorageExpr>
                         })
