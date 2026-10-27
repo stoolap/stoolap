@@ -1,0 +1,4 @@
+1	363ddcbdacaf891e	grouped_output_blocks_retype after: SELECT k, k IN (SELECT u.a FROM u) FROM t GROUP BY k
+1	2009c3b5f229d0f4	grouped_output_blocks_retype before: SELECT k, k IN (SELECT u.a FROM u) FROM t GROUP BY k
+1	363ddcbdacaf891e	grouped_output_blocks_retype_where after: SELECT k, k IN (SELECT u.a FROM u) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) GROUP BY k
+1	2009c3b5f229d0f4	grouped_output_blocks_retype_where before: SELECT k, k IN (SELECT u.a FROM u) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) GROUP BY k

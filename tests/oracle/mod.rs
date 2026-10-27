@@ -113,6 +113,50 @@ pub fn check_answer(
     }
 }
 
+/// `check_answer`, recording `answer` only when `confirm`, another path's
+/// answer to the same statement, gives the same rows
+pub fn check_confirmed(
+    answers: &Answers,
+    sql: &str,
+    answer: &Result<Vec<String>, String>,
+    confirm: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Option<String> {
+    if recording() {
+        let other = confirm();
+        assert_eq!(
+            &other, answer,
+            "{sql}: another path disagrees, not recorded"
+        );
+    }
+    check_answer(answers, sql, answer)
+}
+
+/// Where `keyword` stands in `sql` outside every parenthesis and quote
+fn top_level(sql: &str, keyword: &str) -> Option<usize> {
+    let (mut depth, mut quoted) = (0i32, false);
+    for (at, c) in sql.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            _ if !quoted && depth == 0 && sql[at..].starts_with(keyword) => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `sql` with an unused named window, which no prepared family takes: the
+/// general path answers it for as long as it lives
+pub fn general_twin(sql: &str) -> String {
+    let at = [" ORDER BY ", " LIMIT ", " OFFSET "]
+        .iter()
+        .filter_map(|keyword| top_level(sql, keyword))
+        .min()
+        .unwrap_or(sql.len());
+    format!("{} WINDOW oracle_unused AS (){}", &sql[..at], &sql[at..])
+}
+
 /// A value written as a literal that reads back as the same value
 fn literal(value: &stoolap::core::Value) -> String {
     use stoolap::core::Value;

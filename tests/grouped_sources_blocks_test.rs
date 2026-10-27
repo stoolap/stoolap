@@ -14,9 +14,12 @@
 
 //! A grouped statement holding subqueries runs them through prepared blocks
 //! over any source and with any grouping modifier: it answers as the same
-//! statement over a table does, or as its twin written without them
+//! statement over a table does, whose answer is recorded when the general
+//! path gave the same one, or as its twin written without them
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -304,6 +307,26 @@ fn check(
     }
 }
 
+/// Each site's answer over t, recorded when the general path gave the same
+const RECORDED_SITES: oracle::Answers = answers!("grouped_sources_blocks_sites");
+
+/// The sites over t the general path cannot group, each written with its
+/// subquery as a derived table's column, the form it answers
+const GENERAL_FORMS: &[(&str, &str)] = &[
+    (
+        "SELECT COUNT(*), SUM(b) FROM t GROUP BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) \
+         ORDER BY 1, 2",
+        "SELECT COUNT(*), SUM(b) FROM (SELECT b, (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g \
+         FROM t) d GROUP BY g ORDER BY 1, 2",
+    ),
+    (
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g, COUNT(*) FROM t GROUP BY g \
+         ORDER BY 1",
+        "SELECT g, COUNT(*) FROM (SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g FROM t) d \
+         GROUP BY g ORDER BY 1",
+    ),
+];
+
 #[test]
 fn every_source_answers_a_grouped_statement_as_its_table_does() {
     let _guard = serial();
@@ -311,8 +334,20 @@ fn every_source_answers_a_grouped_statement_as_its_table_does() {
     let mut wrong = Vec::new();
     for (sealed, db) in databases(&dir, "grouped_sources_sites") {
         for site in SITES {
-            let want = rows(&db, &site.replace("{t}", "t"))
-                .unwrap_or_else(|e| panic!("{site} over t: {e}"));
+            let over_t = site.replace("{t}", "t");
+            let want = rows(&db, &over_t);
+            let form = GENERAL_FORMS
+                .iter()
+                .find(|(site, _)| *site == over_t)
+                .map_or(over_t.as_str(), |(_, form)| form);
+            let general = || rows(&db, &oracle::general_twin(form));
+            wrong.extend(oracle::check_confirmed(
+                &RECORDED_SITES,
+                &over_t,
+                &want,
+                general,
+            ));
+            let want = want.unwrap_or_else(|e| panic!("{site} over t: {e}"));
             for source in sources() {
                 let sql = format!("{}{}", source.with, site.replace("{t}", &source.from));
                 let mut found = Vec::new();
