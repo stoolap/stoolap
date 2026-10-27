@@ -284,6 +284,17 @@ pub struct CompiledCountStar {
     pub cached_epoch: u64,
 }
 
+/// The plan of a statement or block that a statement runs inside itself,
+/// held in the plan of the one that runs it and dropped with it
+#[derive(Debug, Default)]
+pub(crate) struct NestedPlan(RwLock<CompiledExecution>);
+
+impl NestedPlan {
+    pub(crate) fn slot(&self) -> &RwLock<CompiledExecution> {
+        &self.0
+    }
+}
+
 /// Pre-compiled execution state for fast paths
 #[derive(Debug, Clone, Default)]
 pub enum CompiledExecution {
@@ -340,7 +351,7 @@ pub struct CachedPlanRef {
 #[derive(Debug)]
 pub struct CountsSlot {
     /// The subqueries' prepared blocks
-    pub(crate) compiled: RwLock<CompiledExecution>,
+    pub(crate) compiled: NestedPlan,
     /// The identity of the LIMIT and of the OFFSET expression
     pub(crate) keys: [Option<super::expr_key::ExprKey>; 2],
 }
@@ -357,7 +368,7 @@ fn counts_slot(statement: &Statement) -> Option<Arc<CountsSlot>> {
         .any(super::Executor::has_subqueries)
         .then(|| {
             Arc::new(CountsSlot {
-                compiled: RwLock::new(CompiledExecution::Unknown),
+                compiled: NestedPlan::default(),
                 keys: counts.map(|count| count.map(super::expr_key::ExprKey::of)),
             })
         })

@@ -463,7 +463,7 @@ use super::prepared_select::{
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
-use super::query_cache::CompiledExecution;
+use super::query_cache::{CompiledExecution, NestedPlan};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     AliasedResult, DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, FilteredResult,
@@ -1486,7 +1486,7 @@ impl Executor {
         // A count is read before any row: its scope is a table without columns
         let values = clauses.map(|(count, _)| count.map_or(&[][..], std::slice::from_ref));
         let (prepared, tables) = self.open_prepared_dml(
-            slot.map(|slot| &slot.compiled),
+            slot.map(|slot| slot.compiled.slot()),
             &super::prepared_select::NO_COLUMNS,
             &SmartString::default(),
             None,
@@ -9104,9 +9104,10 @@ impl Executor {
         // A joined side runs as a join of its own, under the plan it holds,
         // both columns of a pair it merges kept as the blocks read them
         let nested = match (rows, expr) {
-            (Some((run, index)), Expression::JoinSource(join)) => {
-                Some((join, run.blocks.nested[index].as_ref()))
-            }
+            (Some((run, index)), Expression::JoinSource(join)) => Some((
+                join,
+                run.blocks.nested[index].as_ref().map(NestedPlan::slot),
+            )),
             (None, Expression::JoinSource(join)) if side.apart => Some((join, None)),
             _ => None,
         };
@@ -9597,7 +9598,7 @@ impl Executor {
                 &held.stmt,
                 &ctx,
                 &held.classification,
-                Some(plan),
+                Some(plan.slot()),
             );
         }
         let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {

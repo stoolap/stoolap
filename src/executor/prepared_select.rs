@@ -62,7 +62,7 @@ use super::prepared_join::{JoinSide, JoinSides};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
-use super::query_cache::CompiledExecution;
+use super::query_cache::{CompiledExecution, NestedPlan};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
@@ -3473,7 +3473,7 @@ struct Grouping {
 struct StatementRun {
     statement: SelectStatement,
     classification: std::sync::OnceLock<Arc<super::query_classification::QueryClassification>>,
-    compiled: RwLock<CompiledExecution>,
+    compiled: NestedPlan,
 }
 
 impl std::fmt::Debug for StatementRun {
@@ -4359,7 +4359,7 @@ impl Builder<'_> {
             run: StatementRun {
                 statement,
                 classification: std::sync::OnceLock::new(),
-                compiled: RwLock::new(CompiledExecution::Unknown),
+                compiled: NestedPlan::default(),
             },
             form,
             windowed: windowed_block(sq),
@@ -4842,7 +4842,7 @@ impl Builder<'_> {
                 let run = StatementRun {
                     statement: (*derived.subquery).clone(),
                     classification: std::sync::OnceLock::new(),
-                    compiled: RwLock::new(CompiledExecution::Unknown),
+                    compiled: NestedPlan::default(),
                 };
                 let tables = executor.read_tables(&derived.subquery);
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
@@ -5185,7 +5185,7 @@ impl Builder<'_> {
                 grouping.statement = Some(Box::new(StatementRun {
                     statement: sq.clone(),
                     classification: std::sync::OnceLock::new(),
-                    compiled: RwLock::new(CompiledExecution::Unknown),
+                    compiled: NestedPlan::default(),
                 }));
             }
         }
@@ -6353,7 +6353,7 @@ pub struct PreparedGrouped {
     /// Every subquery is a run slot: the statement runs as any grouped
     /// statement does, reading them as parameters, under this plan of its
     /// own over a table, and groups another source's rows so
-    pub(crate) runs_alone: Option<RwLock<CompiledExecution>>,
+    pub(crate) runs_alone: Option<NestedPlan>,
 }
 
 /// What a grouped statement's rows come from, which says what its blocks run
@@ -6775,7 +6775,7 @@ impl PreparedGrouped {
             && !stmt.having.as_deref().is_some_and(mentions_subquery)
             && !grouping_items(&stmt).into_iter().any(mentions_subquery)
             && !stmt.where_clause.as_deref().is_some_and(mentions_subquery))
-        .then(|| RwLock::new(CompiledExecution::Unknown));
+        .then(NestedPlan::default);
         // An argument read once for its call holds only run slots: one reading
         // the row is the general path's to refuse
         // The ORDER BY keys a hidden item computes count with the list
@@ -7392,7 +7392,7 @@ pub(crate) struct JoinBlocks {
     pub(crate) rows_sides: [bool; 2],
     /// The plan of a side that is itself a join, which runs its ON's
     /// subqueries as its own blocks; None for a side that is one source
-    pub(crate) nested: [Option<RwLock<CompiledExecution>>; 2],
+    pub(crate) nested: [Option<NestedPlan>; 2],
     /// The conditions on a side asked of the joined row with the WHERE's
     /// others there: one on a side read as rows that asks a block of each
     /// row, or one whose subquery reads the other side
@@ -7703,9 +7703,9 @@ impl JoinBlocks {
             side_columns,
             fitted: Default::default(),
             rows_sides,
-            nested: sides.each_ref().map(|side| {
-                (side.leaves.len() > 1).then(|| RwLock::new(CompiledExecution::Unknown))
-            }),
+            nested: sides
+                .each_ref()
+                .map(|side| (side.leaves.len() > 1).then(NestedPlan::default)),
             moved,
             select,
             order_by,
@@ -8606,7 +8606,7 @@ impl Executor {
             &run.statement,
             ctx,
             Some(&run.classification),
-            Some(&run.compiled),
+            Some(run.compiled.slot()),
             None,
         )?;
         let columns = result.columns().to_vec();
@@ -12484,7 +12484,7 @@ impl PreparedRunner<'_> {
             &block.run.statement,
             &ctx,
             Some(&block.run.classification),
-            Some(&block.run.compiled),
+            Some(block.run.compiled.slot()),
             None,
         )
     }
@@ -12498,7 +12498,7 @@ impl PreparedRunner<'_> {
             &run.statement,
             &self.ctx,
             Some(&run.classification),
-            Some(&run.compiled),
+            Some(run.compiled.slot()),
             None,
         )?;
         let mut values = Vec::new();
