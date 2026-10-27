@@ -1133,8 +1133,9 @@ struct ScopeTable {
     /// The first columns, which a bare name may bind; past them a column is
     /// read only through its table's name
     bare: usize,
-    /// The names a NATURAL or USING join merges, one column to a bare name
-    merged: SmallVec<[SmartString; 1]>,
+    /// The columns a NATURAL or USING join merges, each a left side's column
+    /// and the right side's it is one column with under a bare name
+    merged: SmallVec<[(usize, usize); 1]>,
 }
 
 impl ScopeTable {
@@ -1164,7 +1165,12 @@ impl ScopeTable {
             CompactArc::new(left.iter().chain(right).cloned().collect::<Vec<_>>())
         };
         let mut merged = left.merged;
-        merged.extend(right.merged);
+        merged.extend(
+            right
+                .merged
+                .iter()
+                .map(|(left, right)| (left + offset, right + offset)),
+        );
         Self {
             tables,
             columns: joined(&left.columns, &right.columns),
@@ -1175,22 +1181,26 @@ impl ScopeTable {
         }
     }
 
-    /// The scope of `join` of `left` and `right`, a name its USING list or
-    /// a NATURAL join merges one column to a bare name
+    /// The scope of `join` of `left` and `right`, each name its USING list or
+    /// a NATURAL join merges one column: the left side's first column of
+    /// that name with the right side's first
     fn joined(join: &JoinTableSource, left: Self, right: Self) -> Self {
-        let mut merged: SmallVec<[SmartString; 1]> = join
+        let (left_names, right_names) = (&left.lower[..left.bare], &right.lower[..right.bare]);
+        let natural = join.join_type.to_uppercase().contains("NATURAL");
+        let names = join
             .using_columns
             .iter()
-            .map(|c| c.value_lower.clone())
-            .collect();
-        if join.join_type.to_uppercase().contains("NATURAL") {
-            let right_names = &right.lower[..right.bare];
-            merged.extend(
-                left.lower[..left.bare]
-                    .iter()
-                    .filter(|name| right_names.contains(name))
-                    .map(|name| SmartString::from(name.as_str())),
-            );
+            .map(|c| c.value_lower.as_str())
+            .chain(left_names.iter().map(String::as_str).filter(|_| natural));
+        let mut merged: SmallVec<[(usize, usize); 1]> = SmallVec::new();
+        for name in names {
+            let at = |names: &[String]| names.iter().position(|c| c == name);
+            if let (Some(l), Some(r)) = (at(left_names), at(right_names)) {
+                let pair = (l, left.lower.len() + r);
+                if !merged.contains(&pair) {
+                    merged.push(pair);
+                }
+            }
         }
         let mut scope = Self::beside(left, right);
         scope.merged.extend(merged);
@@ -1362,8 +1372,13 @@ impl ScopeTable {
 
     /// An error when a column in `rest` is also named `name`: a reference to
     /// a name two columns have is ambiguous, in one table or in two
-    fn unique(&self, mut rest: std::ops::Range<usize>, name: &str, spelled: &str) -> Result<()> {
-        match rest.any(|i| self.lower[i] == name) {
+    fn unique(
+        &self,
+        rest: impl IntoIterator<Item = usize>,
+        name: &str,
+        spelled: &str,
+    ) -> Result<()> {
+        match rest.into_iter().any(|i| self.lower[i] == name) {
             true => Err(Error::invalid_argument(format!(
                 "column reference '{}' is ambiguous",
                 spelled
@@ -1921,9 +1936,9 @@ impl Chain<'_> {
         for (depth, scope) in self.scopes.iter().enumerate() {
             let bare = &scope.lower[..scope.bare];
             if let Some(index) = bare.iter().position(|c| *c == id.value_lower) {
-                if !scope.merged.contains(&id.value_lower) {
-                    scope.unique(index + 1..scope.bare, &id.value_lower, &id.value)?;
-                }
+                let rest =
+                    (index + 1..scope.bare).filter(|&at| !scope.merged.contains(&(index, at)));
+                scope.unique(rest, &id.value_lower, &id.value)?;
                 return Ok(Some((depth, index)));
             }
         }

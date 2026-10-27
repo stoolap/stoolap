@@ -127,12 +127,39 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
             }
         }
     }
-    // A block over a join of two sources that have the name
-    let sql = "SELECT t.b FROM t WHERE EXISTS \
-               (SELECT 1 FROM u JOIN u AS v ON v.id = u.a WHERE id = t.a)";
-    match answer(db, sql) {
-        Err(e) if e.contains("column reference 'id' is ambiguous") => {}
-        got => wrong.push(format!("{context}: {sql}: {got:?}")),
+    // A join that merges a name merges one column of each side, never a
+    // source's repeated one or a third source's
+    for (sql, name) in [
+        (
+            "SELECT t.b FROM t WHERE EXISTS \
+             (SELECT 1 FROM u JOIN u AS v ON v.id = u.a WHERE id = t.a)",
+            "id",
+        ),
+        (
+            "SELECT t.b FROM t WHERE EXISTS (SELECT x FROM (SELECT 1 AS x, 2 AS x) AS q \
+             JOIN (SELECT 1 AS x) AS r USING (x))",
+            "x",
+        ),
+        (
+            "SELECT t.b FROM t WHERE EXISTS (SELECT x FROM (SELECT 1 AS x) AS q \
+             JOIN (SELECT 1 AS x, 2 AS x) AS r USING (x))",
+            "x",
+        ),
+        (
+            "SELECT t.b FROM t WHERE EXISTS (SELECT 1 FROM u JOIN uv USING (id) \
+             JOIN u AS q ON q.id = u.a WHERE id = t.a)",
+            "id",
+        ),
+        (
+            "SELECT t.b FROM t JOIN (SELECT 1 AS id, 2 AS id) AS q USING (id) \
+             WHERE id > (SELECT 0)",
+            "q.id",
+        ),
+    ] {
+        match answer(db, sql) {
+            Err(e) if e.contains(&format!("column reference '{name}' is ambiguous")) => {}
+            got => wrong.push(format!("{context}: {sql}: {got:?}")),
+        }
     }
     // Each statement whose bare name one column answers
     for (sql, want) in [
@@ -150,6 +177,11 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
         ),
         (
             "SELECT t.b FROM t WHERE EXISTS (SELECT 1 FROM u JOIN uv USING (id) WHERE id = t.a)",
+            vec![10, 20],
+        ),
+        (
+            "SELECT t.b FROM t WHERE EXISTS (SELECT 1 FROM u JOIN uv USING (id) \
+             JOIN u AS q USING (id) WHERE id = t.a)",
             vec![10, 20],
         ),
         (
