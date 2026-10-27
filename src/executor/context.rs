@@ -1262,6 +1262,9 @@ pub struct ExecutionContext {
     /// CTE data for subqueries to reference CTEs from outer query
     /// Maps CTE name (lowercase) to (columns, rows)
     cte_data: Option<Arc<CteDataMap>>,
+    /// The names of those CTEs as one number, 0 for none: a plan made in
+    /// this context holds only where the same names are bound
+    cte_scope: u64,
     /// Current transaction ID for CURRENT_TRANSACTION_ID() function
     transaction_id: Option<u64>,
     /// One transaction for every fetch of a statement that has no explicit
@@ -1344,6 +1347,7 @@ impl ExecutionContext {
             outer_row: None,
             outer_columns: None,
             cte_data: None,
+            cte_scope: 0,
             transaction_id: None,
             statement_snapshot: None,
             statement_view: None,
@@ -1485,6 +1489,7 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: None,
+            cte_scope: 0,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1510,6 +1515,7 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
+            cte_scope: self.cte_scope,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1560,6 +1566,7 @@ impl ExecutionContext {
             outer_row: Some(outer_row),
             outer_columns: Some(outer_columns), // Arc clone = cheap
             cte_data: self.cte_data.clone(),    // Arc clone = cheap
+            cte_scope: self.cte_scope,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1588,7 +1595,13 @@ impl ExecutionContext {
     /// Whether this context brings CTEs a statement run in it may read
     #[inline]
     pub(crate) fn brings_ctes(&self) -> bool {
-        self.cte_data.is_some()
+        self.cte_scope != 0
+    }
+
+    /// The names of the CTEs this context brings as one number, 0 for none
+    #[inline]
+    pub(crate) fn cte_scope(&self) -> u64 {
+        self.cte_scope
     }
 
     /// Check if context has CTE data by name that is already lowercase.
@@ -1603,6 +1616,13 @@ impl ExecutionContext {
     /// Create a new context with CTE data for subqueries to reference
     /// Takes an Arc to avoid cloning large CTE datasets
     pub fn with_cte_data(&self, cte_data: Arc<CteDataMap>) -> Self {
+        // The same names give the same number in any order; a name adds one
+        // hash with its low bit set, so names give a number past 0
+        let cte_scope = cte_data.keys().fold(0u64, |scope, name| {
+            let mut hasher = rustc_hash::FxHasher::default();
+            std::hash::Hash::hash(name.as_str(), &mut hasher);
+            scope.wrapping_add(std::hash::Hasher::finish(&hasher) | 1)
+        });
         Self {
             params: self.params.clone(),
             auto_commit: self.auto_commit,
@@ -1615,6 +1635,7 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: Some(cte_data),
+            cte_scope,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1793,6 +1814,7 @@ impl ExecutionContext {
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
+            cte_scope: self.cte_scope,
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),

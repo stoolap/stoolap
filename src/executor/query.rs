@@ -5277,15 +5277,20 @@ impl Executor {
         }
     }
 
-    /// The join programs `slot` holds for the current schema epoch; a slot
-    /// holding none for it holds an empty set from now on
+    /// The join programs `slot` holds for the current schema epoch and the
+    /// CTEs `ctx` binds; a slot holding none for them holds an empty set
+    /// from now on
     fn prepared_join(
         &self,
         slot: &std::sync::RwLock<CompiledExecution>,
+        ctx: &ExecutionContext,
     ) -> Option<std::sync::Arc<PreparedJoin>> {
         let epoch = self.engine.schema_epoch();
+        let scope = ctx.cte_scope();
         let current = |guard: &CompiledExecution| match guard {
-            CompiledExecution::PreparedJoin(held) if held.cached_epoch == epoch => {
+            CompiledExecution::PreparedJoin(held)
+                if held.cached_epoch == epoch && held.cte_scope == scope =>
+            {
                 Some(std::sync::Arc::clone(held))
             }
             _ => None,
@@ -5297,7 +5302,7 @@ impl Executor {
         if let Some(held) = current(&guard) {
             return Some(held);
         }
-        let held = std::sync::Arc::new(PreparedJoin::new(epoch));
+        let held = std::sync::Arc::new(PreparedJoin::new(epoch, scope));
         *guard = CompiledExecution::PreparedJoin(std::sync::Arc::clone(&held));
         Some(held)
     }
@@ -5795,7 +5800,7 @@ impl Executor {
             .is_some_and(Self::has_subqueries);
         let plan = compiled
             .filter(|_| ctx.outer_row().is_none())
-            .and_then(|slot| self.prepared_join(slot));
+            .and_then(|slot| self.prepared_join(slot, ctx));
         let asks_blocks = classification.where_has_subqueries
             || Self::ons_hold_subqueries(join_source)
             || classification.output_has_subqueries;

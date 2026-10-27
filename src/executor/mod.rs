@@ -1242,8 +1242,8 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         check_param_count(&plan.params, ctx.params().len())?;
         let gate = self.enter(changes_session(&plan.statement));
-        // CTEs the context brings give the text a meaning its plan was not
-        // made for, so the statement runs without its plan
+        // The fast paths read tables by name: CTEs the context brings are
+        // read by the plans, which hold the CTE names they bound
         let held = !ctx.brings_ctes();
         if let (Statement::Insert(stmt), true) = (plan.statement.as_ref(), held) {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, plan.compiled.slot());
@@ -1265,8 +1265,8 @@ impl Executor {
             ctx,
             active_txn_id,
             Some(&plan.classification),
-            held.then_some(&*plan.compiled),
-            plan.counts.as_deref().filter(|_| held),
+            Some(&*plan.compiled),
+            plan.counts.as_deref(),
         )
     }
 }

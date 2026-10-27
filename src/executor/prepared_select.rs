@@ -3143,6 +3143,8 @@ impl WhereParts {
 #[derive(Debug)]
 pub struct PreparedSelect {
     cached_epoch: u64,
+    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    cte_scope: u64,
     /// The columns of the statement's table or derived table at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
@@ -6315,6 +6317,7 @@ impl PreparedSelect {
         let where_ = parts.prepare(where_programs, &blocks, schema);
         Ok(Self {
             cached_epoch: epoch,
+            cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
             holes,
@@ -6334,6 +6337,8 @@ impl PreparedSelect {
 #[derive(Debug)]
 pub struct PreparedGrouped {
     cached_epoch: u64,
+    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    cte_scope: u64,
     /// The table's schema the clauses were prepared over, or the columns of
     /// the rows of another source
     schema: CompactArc<Schema>,
@@ -6793,6 +6798,7 @@ impl PreparedGrouped {
         }
         Ok(Some(Self {
             cached_epoch: epoch,
+            cte_scope: ctx.cte_scope(),
             schema,
             source,
             blocks,
@@ -6867,7 +6873,9 @@ impl Executor {
             .and_then(|slot| slot.read().ok())
             .and_then(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p)
-                    if p.cached_epoch == epoch && p.blocks.param_count == ctx.params().len() =>
+                    if p.cached_epoch == epoch
+                        && p.cte_scope == ctx.cte_scope()
+                        && p.blocks.param_count == ctx.params().len() =>
                 {
                     Some(Arc::clone(p))
                 }
@@ -6988,11 +6996,13 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope == ctx.cte_scope()
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
                 CompiledExecution::PreparedJoin(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope == ctx.cte_scope()
                         && p.holds_grouped()
                         && ctx.outer_row().is_none()
                 }
@@ -7037,6 +7047,8 @@ impl Executor {
 #[derive(Debug)]
 pub struct PreparedDml {
     cached_epoch: u64,
+    /// The CTE names its context bound, as `ExecutionContext::cte_scope`
+    cte_scope: u64,
     /// The target's columns at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
@@ -7355,6 +7367,7 @@ impl PreparedDml {
             .map(|(parts, program)| parts.prepare(program, &blocks, schema));
         Ok(Self {
             cached_epoch: epoch,
+            cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
             holes,
@@ -8741,6 +8754,7 @@ impl Executor {
         let epoch = self.engine.schema_epoch();
         let fits = |p: &PreparedSelect| {
             p.cached_epoch == epoch
+                && p.cte_scope == ctx.cte_scope()
                 && p.blocks.param_count == ctx.params().len()
                 && (std::ptr::eq(p.columns.as_slice(), columns) || p.columns.as_slice() == columns)
         };
@@ -8806,6 +8820,7 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedSelect(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope == ctx.cte_scope()
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
@@ -8825,6 +8840,7 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedDml(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope == ctx.cte_scope()
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
@@ -8886,6 +8902,7 @@ impl Executor {
         let returning_columns = returning.map(|sites| sites.schema.column_names_arc());
         let fits = |p: &PreparedDml| {
             p.cached_epoch == epoch
+                && p.cte_scope == ctx.cte_scope()
                 && p.blocks.param_count == ctx.params().len()
                 && same(&p.columns, &columns)
                 && match (&p.conflict, &conflict_columns) {

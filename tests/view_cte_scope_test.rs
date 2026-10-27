@@ -124,11 +124,11 @@ fn a_view_reads_its_own_tables_under_a_cte_of_the_same_name() {
     );
 }
 
-/// A context bringing a CTE u of the row 2
-fn cte_context() -> ExecutionContext {
+/// A context bringing a CTE `name` of the row 2
+fn cte_context(name: &str) -> ExecutionContext {
     let mut ctes = StringMap::default();
     ctes.insert(
-        "u".into(),
+        name.into(),
         (
             CompactArc::new(vec!["id".to_string()]),
             CompactArc::new(vec![(0, Row::from_values(vec![Value::Integer(2)]))]),
@@ -158,6 +158,7 @@ fn a_statement_in_a_context_bringing_ctes_keeps_its_text_s_plan_apart() {
         "SELECT id FROM t WHERE id IN (SELECT id FROM u)",
         "SELECT id FROM u WHERE id = 2",
         "SELECT t.id FROM t JOIN u ON u.id = t.id WHERE t.id <= (SELECT MAX(id) FROM u)",
+        "SELECT t.id FROM t JOIN u ON EXISTS (SELECT 1 FROM u w WHERE w.id = t.id)",
     ];
     let mut wrong = Vec::new();
     for (index, text) in texts.iter().enumerate() {
@@ -176,7 +177,7 @@ fn a_statement_in_a_context_bringing_ctes_keeps_its_text_s_plan_apart() {
                     wrong.push(format!("{text}: plain first: {got:?}"));
                 }
             }
-            let got = executor_ids(executor.execute_with_context(text, &cte_context()));
+            let got = executor_ids(executor.execute_with_context(text, &cte_context("u")));
             if got != Ok(vec![2]) {
                 wrong.push(format!(
                     "{text}: with the CTE, context first {context_first}: {got:?}"
@@ -205,5 +206,49 @@ fn a_statement_in_a_context_bringing_ctes_keeps_its_text_s_plan_apart() {
         "{} wrong:\n{}",
         wrong.len(),
         wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_join_on_subquery_runs_as_its_blocks_in_a_context_bringing_ctes() {
+    let engine = MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
+    let executor = Executor::new(Arc::new(engine));
+    for sql in &SETUP[..4] {
+        executor.execute(sql).unwrap();
+    }
+    let sql = "SELECT t.id FROM t JOIN u ON EXISTS (SELECT 1 FROM u w WHERE w.id = t.id)";
+    for context in [
+        cte_context("extra"),
+        cte_context("extra"),
+        cte_context("other"),
+    ] {
+        assert_eq!(
+            executor_ids(executor.execute_with_context(sql, &context)),
+            Ok(vec![1]),
+            "a CTE the statement does not read leaves its answer"
+        );
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
+    use stoolap::test_failpoints::{bridge_compiles, program_compiles};
+    let engine = MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
+    let executor = Executor::new(Arc::new(engine));
+    for sql in &SETUP[..4] {
+        executor.execute(sql).unwrap();
+    }
+    let sql = "SELECT t.id FROM t JOIN u ON EXISTS (SELECT 1 FROM u w WHERE w.id = t.id)";
+    executor_ids(executor.execute_with_context(sql, &cte_context("u"))).unwrap();
+    let compiles = (bridge_compiles(), program_compiles());
+    let again = executor_ids(executor.execute_with_context(sql, &cte_context("u")));
+    assert_eq!(again, Ok(vec![2]));
+    assert_eq!(
+        (bridge_compiles(), program_compiles()),
+        compiles,
+        "the same CTE names keep the plan"
     );
 }
