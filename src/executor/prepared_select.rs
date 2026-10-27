@@ -1360,7 +1360,7 @@ impl ScopeTable {
         &self,
         rest: impl IntoIterator<Item = usize>,
         name: &str,
-        spelled: &str,
+        spelled: &dyn std::fmt::Display,
     ) -> Result<()> {
         match rest.into_iter().any(|i| self.lower[i] == name) {
             true => Err(Error::invalid_argument(format!(
@@ -1730,8 +1730,7 @@ impl StatementWalk<'_> {
                     .position(|scope| scope.tables.iter().any(|(name, _)| name == qualifier));
                 match named.and_then(beyond) {
                     Some(_) => {
-                        let (depth, index) =
-                            chain.qualified(qualifier, &q.name.value_lower, &q.to_string())?;
+                        let (depth, index) = chain.qualified(qualifier, &q.name.value_lower, q)?;
                         match beyond(depth) {
                             Some(depth) => self.outer(expr, depth, index),
                             None => Ok(expr.clone()),
@@ -1739,7 +1738,7 @@ impl StatementWalk<'_> {
                     }
                     None => {
                         if level.check {
-                            chain.qualified(qualifier, &q.name.value_lower, &q.to_string())?;
+                            chain.qualified(qualifier, &q.name.value_lower, q)?;
                         }
                         Ok(expr.clone())
                     }
@@ -1937,7 +1936,12 @@ impl Chain<'_> {
     }
 
     /// `qualifier.column` in the table of the nearest scope the qualifier names
-    fn qualified(&self, qualifier: &str, column: &str, spelled: &str) -> Result<(usize, usize)> {
+    fn qualified(
+        &self,
+        qualifier: &str,
+        column: &str,
+        spelled: &dyn std::fmt::Display,
+    ) -> Result<(usize, usize)> {
         let (depth, start) = self
             .scopes
             .iter()
@@ -1963,11 +1967,7 @@ impl Chain<'_> {
         match expr {
             Expression::Identifier(id) => self.bare(id),
             Expression::QualifiedIdentifier(q) => self
-                .qualified(
-                    &q.qualifier.value_lower,
-                    &q.name.value_lower,
-                    &q.to_string(),
-                )
+                .qualified(&q.qualifier.value_lower, &q.name.value_lower, q)
                 .map(Some),
             _ => Ok(None),
         }
@@ -2668,6 +2668,7 @@ fn block_identity(sq: &SelectStatement, form: Form<'_>) -> (Expression, String, 
 /// What the block answers and how its members are read, then the names,
 /// columns and types of the scopes `outer`: part of what is kept
 fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
+    use std::fmt::Write as _;
     let mut scopes = signature;
     for scope in outer {
         for (name, _) in &scope.tables {
@@ -2675,7 +2676,8 @@ fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
             scopes.push('\u{2}');
         }
         for (column, data_type) in scope.lower.iter().zip(&scope.types) {
-            scopes.push_str(&format!("\u{0}{column}:{data_type:?}"));
+            // Writing to a String cannot fail
+            let _ = write!(scopes, "\u{0}{column}:{data_type:?}");
         }
         scopes.push('\u{1}');
     }
