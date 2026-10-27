@@ -407,7 +407,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
          WHERE t.b > (SELECT MAX(x) FROM u)",
         "SELECT t.id FROM t JOIN (VALUES (1), (2)) AS v (n) ON v.n = t.a JOIN u ON u.id = t.a \
          WHERE t.b > 3",
-        Old("a joined side whose run merges or names its columns: #576"),
+        Prepared,
     ),
     (
         "block_over_a_derived_table",

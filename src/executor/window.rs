@@ -563,7 +563,7 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, split_qualified,
+    get_table_alias_from_expr, item_name, qualified, qualified_index, split_qualified,
 };
 use super::volatility::expression_volatility;
 use super::Executor;
@@ -1985,18 +1985,10 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Qualified column reference (table.column)
-                    // Try full qualified name first (e.g., "c.name" for JOINs)
-                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(&idx) = col_index_map.get(&full_name) {
+                    let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
+                    if let Some(idx) = qualified_index(&col_index_map, qualifier, name) {
                         items.push(SelectItem {
                             output_name: item_name(col_expr),
-                            source: SelectItemSource::BaseColumn(idx),
-                        });
-                    } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                        // Fall back to unqualified name
-                        items.push(SelectItem {
-                            output_name: qid.name.value.to_string(),
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else {
@@ -3469,15 +3461,11 @@ impl Executor {
     ) -> Option<usize> {
         match expr {
             Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
-            Expression::QualifiedIdentifier(qid) => {
-                // Try fully qualified name first (e.g., "s.qty")
-                let qualified = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                col_index_map
-                    .get(&qualified)
-                    // Then try unqualified (e.g., "qty") for CTE/subquery cases
-                    .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
-                    .copied()
-            }
+            Expression::QualifiedIdentifier(qid) => qualified_index(
+                col_index_map,
+                &qid.qualifier.value_lower,
+                &qid.name.value_lower,
+            ),
             // A group item or aggregate computed before the window reads its slot,
             // and a derived table's aggregate column the name it carries
             _ => (!group_slots.is_empty())
@@ -3560,14 +3548,11 @@ impl Executor {
                     Expression::Identifier(id) => {
                         col_index_map.get(id.value_lower.as_str()).copied()
                     }
-                    Expression::QualifiedIdentifier(qid) => {
-                        let qualified =
-                            qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                        col_index_map
-                            .get(&qualified)
-                            .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
-                            .copied()
-                    }
+                    Expression::QualifiedIdentifier(qid) => qualified_index(
+                        col_index_map,
+                        &qid.qualifier.value_lower,
+                        &qid.name.value_lower,
+                    ),
                     _ => None,
                 })
                 .collect();

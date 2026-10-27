@@ -45,7 +45,7 @@ use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{
     bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
-    split_qualified,
+    qualified_index, qualified_key_index, split_qualified,
 };
 use super::window::WindowOutput;
 use super::Executor;
@@ -1695,18 +1695,11 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Use only the base column name (strip table alias prefix)
-                    // e.g., u.username -> username
-                    // Try qualified name first, then fall back to unqualified column name
-                    let qualified_lower =
-                        qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    let unqualified_lower: String = qid.name.value_lower.to_string();
-                    if agg_col_index_map.contains_key(&qualified_lower) {
-                        column_sources.push(ColumnSource::AggColumn(qualified_lower));
-                    } else if agg_col_index_map.contains_key(&unqualified_lower) {
-                        column_sources.push(ColumnSource::AggColumn(unqualified_lower));
-                    } else {
-                        column_sources.push(make_source(col_expr, is_correlated));
+                    let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
+                    match qualified_index(&agg_col_index_map, qualifier, name) {
+                        Some(index) => column_sources
+                            .push(ColumnSource::AggColumn(agg_columns[index].to_lowercase())),
+                        None => column_sources.push(make_source(col_expr, is_correlated)),
                     }
                 }
                 Expression::FunctionCall(func) => {
@@ -2993,25 +2986,16 @@ impl Executor {
         names
     }
 
-    /// Look up column index, handling both qualified (e.g., "o.amount") and unqualified names.
-    /// If a qualified name lookup fails, tries the unqualified part (after the dot).
+    /// Look up column index, handling both qualified (e.g., "o.amount") and unqualified names,
+    /// a qualified one by [`qualified_index`]
     pub(crate) fn lookup_column_index(
         column_lower: &str,
         col_index_map: &StringMap<usize>,
     ) -> Option<usize> {
-        // First try exact match
-        if let Some(&idx) = col_index_map.get(column_lower) {
-            return Some(idx);
+        match split_qualified(column_lower) {
+            Some(_) => qualified_key_index(col_index_map, column_lower),
+            None => col_index_map.get(column_lower).copied(),
         }
-
-        // If it's a qualified name, try the unqualified part
-        if let Some((_, unqualified)) = split_qualified(column_lower) {
-            if let Some(&idx) = col_index_map.get(unqualified) {
-                return Some(idx);
-            }
-        }
-
-        None
     }
 
     /// Apply HAVING clause to aggregated results

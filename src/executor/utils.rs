@@ -704,6 +704,51 @@ pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     map
 }
 
+/// The column the qualified name `key` reads, lowercase, `find` finding a
+/// column by its name, `qualifies` telling whether a column is qualified by
+/// a qualifier and `bare` whether a column is named bare: the column so
+/// qualified, else the bare name when no column is qualified by the
+/// qualifier, as over one source named bare, or when that column is named
+/// bare, as one a USING or NATURAL join merges; None for another source's
+pub(crate) fn by_qualifier(
+    key: &str,
+    find: impl Fn(&str) -> Option<usize>,
+    qualifies: impl FnOnce(&str) -> bool,
+    bare: impl FnOnce(usize) -> bool,
+) -> Option<usize> {
+    if let Some(index) = find(key) {
+        return Some(index);
+    }
+    let (qualifier, name) = split_qualified(key)?;
+    let found = find(name)?;
+    (!qualifies(qualifier) || bare(found)).then_some(found)
+}
+
+/// [`by_qualifier`] over `map`, built by [`build_column_index_map`]
+pub(crate) fn qualified_key_index(map: &StringMap<usize>, key: &str) -> Option<usize> {
+    by_qualifier(
+        key,
+        |name| map.get(name).copied(),
+        |qualifier| {
+            map.keys()
+                .any(|key| split_qualified(key).is_some_and(|(q, _)| q == qualifier))
+        },
+        |index| {
+            !map.iter()
+                .any(|(key, &at)| at == index && split_qualified(key).is_some())
+        },
+    )
+}
+
+/// [`qualified_key_index`] of `qualifier.name`, both lowercase
+pub(crate) fn qualified_index(
+    map: &StringMap<usize>,
+    qualifier: &str,
+    name: &str,
+) -> Option<usize> {
+    qualified_key_index(map, &qualified(qualifier, name))
+}
+
 // ============================================================================
 // Row Combination Utilities
 // ============================================================================

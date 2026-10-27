@@ -112,7 +112,7 @@ impl IntervalOperand<'_> {
 }
 
 /// Result of column resolution - indicates which row the column is from
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnSource {
     /// Column from first row with given index
     Row1(u16),
@@ -343,10 +343,19 @@ impl<'a> CompileContext<'a> {
         let table_lower = table.to_lowercase();
         let column_lower = column.to_lowercase();
 
+        // A table these columns name has its own columns, and a column named
+        // bare, as one a USING or NATURAL join merges; never another table's
         if let Some(table_cols) = self.qualified_columns.get(&table_lower) {
             if let Some(&source) = table_cols.get(&column_lower) {
                 return Some(source);
             }
+            let spelled = |source: &ColumnSource| {
+                !self
+                    .qualified_columns
+                    .values()
+                    .any(|columns| columns.get(&column_lower) == Some(source))
+            };
+            return self.resolve_column(&column_lower).filter(spelled);
         }
 
         // Check if the FULLY QUALIFIED name (table.column) exists in outer_columns.

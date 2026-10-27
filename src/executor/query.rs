@@ -426,14 +426,15 @@ use super::result::{
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, bare_name, build_column_index_map, collect_table_qualifiers,
+    add_table_qualifier, bare_name, build_column_index_map, by_qualifier, collect_table_qualifiers,
     collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name, named_as_written,
-    order_by_names_an_alias, qualified, shown_name, split_qualified, star_takes_every_column,
-    string_literal_value, strip_table_qualifier, substitute_filter_column, visit_column_refs,
+    order_by_names_an_alias, qualified, qualified_index, shown_name, split_qualified,
+    star_takes_every_column, string_literal_value, strip_table_qualifier, substitute_filter_column,
+    visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
@@ -684,19 +685,16 @@ fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<
                 .copied()
                 .ok_or_else(|| Error::ColumnNotFound(id.value.to_string())),
         ),
-        Expression::QualifiedIdentifier(qid) => {
-            // The full name first: two tables in a join may share a column name
-            let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-            Some(
-                col_index_map
-                    .get(&full_name)
-                    .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
-                    .copied()
-                    .ok_or_else(|| {
-                        Error::ColumnNotFound(format!("{}.{}", qid.qualifier.value, qid.name.value))
-                    }),
+        Expression::QualifiedIdentifier(qid) => Some(
+            qualified_index(
+                col_index_map,
+                &qid.qualifier.value_lower,
+                &qid.name.value_lower,
             )
-        }
+            .ok_or_else(|| {
+                Error::ColumnNotFound(format!("{}.{}", qid.qualifier.value, qid.name.value))
+            }),
+        ),
         _ => None,
     }
 }
@@ -5213,7 +5211,6 @@ impl Executor {
             .into_iter()
             .find_map(|side| match side {
                 Expression::JoinSource(join) => Self::joined_side_reason(join),
-                Expression::ValuesSource(_) => Some("a joined side holding a VALUES list"),
                 _ => None,
             })
     }
@@ -8394,14 +8391,11 @@ impl Executor {
         let mut qualified_col_indices: Vec<Option<usize>> = Vec::new();
         for col_expr in &stmt.columns {
             if let Expression::QualifiedIdentifier(qi) = col_expr {
-                // Build qualified key once
-                let key = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
-                qualified_col_indices.push(
-                    col_index_map
-                        .get(&key)
-                        .copied()
-                        .or_else(|| col_index_map.get(qi.name.value_lower.as_str()).copied()),
-                );
+                qualified_col_indices.push(qualified_index(
+                    &col_index_map,
+                    &qi.qualifier.value_lower,
+                    &qi.name.value_lower,
+                ));
             } else {
                 qualified_col_indices.push(None);
             }
@@ -8823,7 +8817,12 @@ impl Executor {
                 let classification = get_classification(&select_all);
                 let (result, columns, _, _) =
                     self.execute_values_source(vs, &select_all, ctx, &classification)?;
-                Ok((result, columns.to_vec()))
+                // Its columns by its alias, as a table's are
+                let columns = match &vs.alias {
+                    Some(alias) => columns.iter().map(|c| qualified(&alias.value, c)).collect(),
+                    None => columns.to_vec(),
+                };
+                Ok((result, columns))
             }
             Expression::FunctionTableSource(tvf_source) => {
                 Self::execute_tvf_for_join(tvf_source, ctx, filter, None, 0)
@@ -10166,6 +10165,18 @@ impl Executor {
                     })
                 })
         };
+        let find_qualified = |qid: &QualifiedIdentifier| {
+            by_qualifier(
+                &qualified(&qid.qualifier.value_lower, &qid.name.value_lower),
+                |name| find_column_index(name, all_columns),
+                |qualifier| {
+                    all_columns
+                        .iter()
+                        .any(|c| split_qualified(c).is_some_and(|(q, _)| eq_folded(q, qualifier)))
+                },
+                |index| split_qualified(&all_columns[index]).is_none(),
+            )
+        };
 
         // Fast path: Check if all expressions are simple column references
         // If so, we can use direct index-based projection without creating Evaluators
@@ -10198,12 +10209,7 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Try full qualified name first (table.column)
-                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(idx) = find_column_index(&full_name, all_columns) {
-                        simple_column_indices.push(idx);
-                    } else if let Some(idx) = find_column_index(&qid.name.value_lower, all_columns)
-                    {
+                    if let Some(idx) = find_qualified(qid) {
                         simple_column_indices.push(idx);
                     } else {
                         all_simple = false;
@@ -10222,13 +10228,7 @@ impl Executor {
                             }
                         }
                         Expression::QualifiedIdentifier(qid) => {
-                            let full_name =
-                                qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                            if let Some(idx) = find_column_index(&full_name, all_columns) {
-                                simple_column_indices.push(idx);
-                            } else if let Some(idx) =
-                                find_column_index(&qid.name.value_lower, all_columns)
-                            {
+                            if let Some(idx) = find_qualified(qid) {
                                 simple_column_indices.push(idx);
                             } else {
                                 all_simple = false;
@@ -10514,18 +10514,12 @@ impl Executor {
                         args.push(ArgSource::Column(idx));
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        // Try full name first, then just column name
-                        let full_name =
-                            qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                        if let Some(&idx) = col_index_map_lower.get(&full_name) {
-                            args.push(ArgSource::Column(idx));
-                        } else if let Some(&idx) =
-                            col_index_map_lower.get(qid.name.value_lower.as_str())
-                        {
-                            args.push(ArgSource::Column(idx));
-                        } else {
-                            return None; // Unknown column
-                        }
+                        let idx = qualified_index(
+                            col_index_map_lower,
+                            &qid.qualifier.value_lower,
+                            &qid.name.value_lower,
+                        )?;
+                        args.push(ArgSource::Column(idx));
                     }
                     // Handle all literal types
                     Expression::IntegerLiteral(lit) => {
@@ -10555,13 +10549,11 @@ impl Executor {
                 Expression::Identifier(id) => {
                     col_index_map_lower.get(id.value_lower.as_str()).copied()
                 }
-                Expression::QualifiedIdentifier(qid) => {
-                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    col_index_map_lower
-                        .get(&full)
-                        .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
-                        .copied()
-                }
+                Expression::QualifiedIdentifier(qid) => qualified_index(
+                    col_index_map_lower,
+                    &qid.qualifier.value_lower,
+                    &qid.name.value_lower,
+                ),
                 _ => None,
             }
         }
@@ -10577,11 +10569,12 @@ impl Executor {
                     Some(ArgSource::Column(idx))
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    let idx = col_index_map_lower
-                        .get(&full)
-                        .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))?;
-                    Some(ArgSource::Column(*idx))
+                    let idx = qualified_index(
+                        col_index_map_lower,
+                        &qid.qualifier.value_lower,
+                        &qid.name.value_lower,
+                    )?;
+                    Some(ArgSource::Column(idx))
                 }
                 Expression::IntegerLiteral(lit) => {
                     Some(ArgSource::Const(Value::Integer(lit.value)))
@@ -10714,19 +10707,14 @@ impl Executor {
                         ExprAction::Compiled(program)
                     }
                 }
-                Expression::QualifiedIdentifier(qid) => {
-                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(&idx) = col_index_map_lower.get(&full_name) {
-                        ExprAction::SimpleColumn(idx)
-                    } else if let Some(&idx) =
-                        col_index_map_lower.get(qid.name.value_lower.as_str())
-                    {
-                        ExprAction::SimpleColumn(idx)
-                    } else {
-                        let program = compile_expression(expr, all_columns)?;
-                        ExprAction::Compiled(program)
-                    }
-                }
+                Expression::QualifiedIdentifier(qid) => match qualified_index(
+                    col_index_map_lower,
+                    &qid.qualifier.value_lower,
+                    &qid.name.value_lower,
+                ) {
+                    Some(idx) => ExprAction::SimpleColumn(idx),
+                    None => ExprAction::Compiled(compile_expression(expr, all_columns)?),
+                },
                 Expression::Aliased(aliased) => {
                     // Recurse into the inner expression
                     match &*aliased.expression {
@@ -10738,20 +10726,17 @@ impl Executor {
                                 ExprAction::Compiled(program)
                             }
                         }
-                        Expression::QualifiedIdentifier(qid) => {
-                            let full_name =
-                                qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                            if let Some(&idx) = col_index_map_lower.get(&full_name) {
-                                ExprAction::SimpleColumn(idx)
-                            } else if let Some(&idx) =
-                                col_index_map_lower.get(qid.name.value_lower.as_str())
-                            {
-                                ExprAction::SimpleColumn(idx)
-                            } else {
-                                let program = compile_expression(&aliased.expression, all_columns)?;
-                                ExprAction::Compiled(program)
-                            }
-                        }
+                        Expression::QualifiedIdentifier(qid) => match qualified_index(
+                            col_index_map_lower,
+                            &qid.qualifier.value_lower,
+                            &qid.name.value_lower,
+                        ) {
+                            Some(idx) => ExprAction::SimpleColumn(idx),
+                            None => ExprAction::Compiled(compile_expression(
+                                &aliased.expression,
+                                all_columns,
+                            )?),
+                        },
                         Expression::FunctionCall(func) => {
                             // Try inline COALESCE optimization
                             if let Some(action) =
@@ -11600,11 +11585,12 @@ impl Executor {
                     let full_name = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
                     // Only match against full qualified name in SELECT to avoid ambiguity
                     if !select_column_names.contains(&full_name) {
-                        // Prefer fully qualified lookup
-                        let idx_opt = col_index_map_lower
-                            .get(full_name.as_str())
-                            .or_else(|| col_index_map_lower.get(qi.name.value_lower.as_str()));
-                        if let Some(&idx) = idx_opt {
+                        let idx_opt = qualified_index(
+                            &col_index_map_lower,
+                            &qi.qualifier.value_lower,
+                            &qi.name.value_lower,
+                        );
+                        if let Some(idx) = idx_opt {
                             if !extra_order_indices.contains(&idx) {
                                 extra_order_indices.push(idx);
                             }
@@ -11686,14 +11672,11 @@ impl Executor {
                         .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Prefer full qualified name to handle same-named columns across tables
-                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    select_column_indices.push(
-                        col_index_map_lower
-                            .get(full.as_str())
-                            .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
-                            .copied(),
-                    );
+                    select_column_indices.push(qualified_index(
+                        &col_index_map_lower,
+                        &qid.qualifier.value_lower,
+                        &qid.name.value_lower,
+                    ));
                 }
                 Expression::Aliased(aliased) => match &*aliased.expression {
                     Expression::Identifier(id) => {
@@ -11701,13 +11684,11 @@ impl Executor {
                             .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                        select_column_indices.push(
-                            col_index_map_lower
-                                .get(full.as_str())
-                                .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
-                                .copied(),
-                        );
+                        select_column_indices.push(qualified_index(
+                            &col_index_map_lower,
+                            &qid.qualifier.value_lower,
+                            &qid.name.value_lower,
+                        ));
                     }
                     _ => select_column_indices.push(None),
                 },
