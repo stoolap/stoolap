@@ -696,6 +696,8 @@ pub struct MVCCEngine {
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
     open: Arc<AtomicBool>,
+    /// The operations every transaction of the engine shares, built once
+    operations: OnceLock<Arc<EngineOperations>>,
     /// Cache of transaction version stores per (txn_id, table_name) for proper commit/rollback
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
@@ -930,6 +932,7 @@ impl MVCCEngine {
             version_stores: Arc::new(RwLock::new(FxHashMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
             open: Arc::new(AtomicBool::new(false)),
+            operations: OnceLock::new(),
             txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
@@ -3215,13 +3218,8 @@ impl MVCCEngine {
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        EngineOperations::new(self).get_table_for_transaction(
-            txn_id,
-            table_name,
-            None,
-            None,
-            TableUse::Write,
-        )
+        self.operations()
+            .get_table_for_transaction(txn_id, table_name, None, None, TableUse::Write)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -4553,7 +4551,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-        EngineOperations::new(self).rename_table(old_name, new_name)
+        self.operations().rename_table(old_name, new_name)
     }
 
     /// Validates a schema
@@ -4584,14 +4582,21 @@ impl MVCCEngine {
         schema.validate_cluster_key()
     }
 
+    /// The operations every transaction of the engine shares: their fields
+    /// are the engine's own for its whole life
+    fn operations(&self) -> &Arc<EngineOperations> {
+        self.operations
+            .get_or_init(|| Arc::new(EngineOperations::new(self)))
+    }
+
     /// Creates an engine operations wrapper for a transaction
     fn create_engine_operations(&self) -> Arc<dyn TransactionEngineOperations> {
-        Arc::new(EngineOperations::new(self))
+        Arc::clone(self.operations()) as Arc<dyn TransactionEngineOperations>
     }
 
     /// Undo one failed statement without changing its transaction or savepoints.
     pub(crate) fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
-        EngineOperations::new(self).rollback_dml_after(txn_id, timestamp);
+        self.operations().rollback_dml_after(txn_id, timestamp);
     }
 
     // --- View Management Methods ---
@@ -9908,6 +9913,12 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn rollback_all_tables(&self, txn_id: i64, handed_out: bool) {
+        // A transaction that opened no store of its own touched no table
+        if let Ok(cache) = self.txn_version_stores().read() {
+            if cache.get(txn_id).is_none() {
+                return;
+            }
+        }
         // Collect touched table names BEFORE removing the cache entry,
         // so we only rollback tombstones on tables this txn actually used
         // instead of iterating every segment manager (O(tables) → O(touched)).

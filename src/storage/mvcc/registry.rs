@@ -696,6 +696,10 @@ impl TransactionRegistry {
 
     /// Removes the isolation level override for a transaction.
     pub fn remove_transaction_isolation_level(&self, txn_id: i64) {
+        // No transaction holds a level of its own
+        if self.override_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         if self.isolation_overrides.lock().remove(txn_id).is_some() {
             self.override_count.fetch_sub(1, Ordering::Relaxed);
         }
