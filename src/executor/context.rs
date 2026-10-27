@@ -1083,7 +1083,8 @@ pub fn cache_exists_correlation(
 pub struct StatementSnapshot(Arc<SnapshotState>);
 
 struct SnapshotState {
-    transaction: Mutex<Box<dyn crate::storage::traits::Transaction>>,
+    /// Locked without allocating: every run of a statement opens one
+    transaction: parking_lot::Mutex<Box<dyn crate::storage::traits::Transaction>>,
     /// Whether its reads see each commit as it lands (READ COMMITTED with
     /// no statement view), so a result read through it is no older than a
     /// stamp taken before the read
@@ -1129,7 +1130,7 @@ impl StatementSnapshot {
         table_use: TableUse,
     ) -> Self {
         Self(Arc::new(SnapshotState {
-            transaction: Mutex::new(transaction),
+            transaction: parking_lot::Mutex::new(transaction),
             reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
             view,
             table_use,
@@ -1158,11 +1159,7 @@ impl StatementSnapshot {
         &self,
         name: &str,
     ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
-        self.0
-            .transaction
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_table(name)
+        self.0.transaction.lock().get_table(name)
     }
 
     /// The table the executor's own statements use, without the write gate,
@@ -1183,7 +1180,6 @@ impl StatementSnapshot {
         self.0
             .transaction
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_read_table_at(name, view, self.0.table_use)
     }
 
