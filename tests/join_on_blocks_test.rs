@@ -702,6 +702,20 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
             ),
             vec![yes, yes],
         ),
+        (
+            format!(
+                "SELECT l.id, d.k FROM l JOIN r ON r.id = l.id \
+                 AND EXISTS (SELECT 1 FROM s WHERE s.id = r.id) JOIN ({join}) d ON d.id = l.id"
+            ),
+            vec![yes, yes],
+        ),
+        (
+            format!(
+                "SELECT l.id, d.k FROM l JOIN ({join}) d ON d.id = l.id JOIN r ON r.id = l.id \
+                 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)"
+            ),
+            vec![yes, outside],
+        ),
     ];
     let mut wrong = Vec::new();
     for (sql, want) in &selects {

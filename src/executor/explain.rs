@@ -682,9 +682,7 @@ impl Executor {
             Some(Expression::JoinSource(join)) => Some(&**join),
             _ => None,
         };
-        let on_subqueries = join
-            .and_then(|join| join.condition.as_deref())
-            .is_some_and(Self::has_subqueries);
+        let on_subqueries = join.is_some_and(Self::ons_hold_subqueries);
         let classification = get_classification(select);
         let grouped_output = Self::grouped_family_reach(select, &classification);
         // A derived FROM or join side holds a plan in that of a statement the
@@ -1016,6 +1014,15 @@ impl Executor {
                 if let Some(ref jf) = join_filter {
                     lines.push(format!("{}   Join Filter: {}", prefix, jf));
                 }
+                // A side that is a join holds a plan its sides' do only when
+                // it runs its own blocks, as the statement it runs as decides
+                let side_plan = |side: &Expression| match side {
+                    Expression::JoinSource(inner) => {
+                        from_plan
+                            && self.join_runs_blocks(&Self::joined_side_statement(inner), true)
+                    }
+                    _ => from_plan,
+                };
                 self.explain_table_expr_inner(
                     &join.left,
                     left_where.as_ref(),
@@ -1024,7 +1031,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
-                    from_plan,
+                    side_plan(&join.left),
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -1034,7 +1041,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
-                    from_plan,
+                    side_plan(&join.right),
                 );
             }
             Expression::CteReference(cte_ref) => {

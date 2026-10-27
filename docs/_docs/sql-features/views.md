@@ -155,3 +155,4 @@ SHOW CREATE VIEW engineering;
 - View definitions and their column names are stored in the WAL and persist across restarts
 - A view cannot take parameters (`$1`, `?`, `:name`): it is stored SQL with no values of its own, so `CREATE VIEW` refuses one, and reading a view stored with one is an error
 - A view's query follows the qualifier rule of every statement: `CREATE VIEW` refuses a qualified name that names no FROM entry of the view's query, and reading a view stored with one is an error. A query that reads the view names it by the view's name or alias, never by a table inside the view
+- A view's query reads the tables and views it names, never a CTE of the statement that reads the view: in `WITH u AS (...) SELECT * FROM v`, a `u` inside `v` is still the table `u`

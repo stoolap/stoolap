@@ -295,7 +295,8 @@ pub struct NestedPlan {
 }
 
 impl NestedPlan {
-    pub(crate) fn slot(&self) -> &RwLock<CompiledExecution> {
+    /// The compiled state of this statement itself
+    pub fn slot(&self) -> &RwLock<CompiledExecution> {
         &self.plan
     }
 

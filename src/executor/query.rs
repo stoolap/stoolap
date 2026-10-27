@@ -5407,7 +5407,7 @@ impl Executor {
 
     /// Whether the ON of `join`, or of a join it holds as a side, holds a
     /// subquery
-    fn ons_hold_subqueries(join: &JoinTableSource) -> bool {
+    pub(crate) fn ons_hold_subqueries(join: &JoinTableSource) -> bool {
         let nested = |side: &Expression| match side {
             Expression::JoinSource(join) => Self::ons_hold_subqueries(join),
             _ => false,
@@ -8803,17 +8803,9 @@ impl Executor {
         ))
     }
 
-    /// The rows of `join`, a side that is itself a join, each table's columns
-    /// in turn: a SELECT * of it, held in `compiled` when it has a plan. Read
-    /// `apart`, a NATURAL or USING join in it keeps both columns of a pair
-    fn joined_side_rows(
-        &self,
-        join: &JoinTableSource,
-        ctx: &ExecutionContext,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
-        apart: bool,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        let select_all = SelectStatement {
+    /// The statement a joined side runs as: a SELECT * of its join
+    pub(crate) fn joined_side_statement(join: &JoinTableSource) -> SelectStatement {
+        SelectStatement {
             param_count: 0,
             token: dummy_token("SELECT", TokenType::Keyword),
             distinct: false,
@@ -8832,7 +8824,20 @@ impl Executor {
             offset: None,
             set_operations: vec![],
             prepared: None,
-        };
+        }
+    }
+
+    /// The rows of `join`, a side that is itself a join, each table's columns
+    /// in turn: a SELECT * of it, held in `compiled` when it has a plan. Read
+    /// `apart`, a NATURAL or USING join in it keeps both columns of a pair
+    fn joined_side_rows(
+        &self,
+        join: &JoinTableSource,
+        ctx: &ExecutionContext,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        apart: bool,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        let select_all = Self::joined_side_statement(join);
         let classification = get_classification(&select_all);
         let (result, columns, _, _) =
             self.execute_join_source(join, &select_all, ctx, &classification, compiled, apart)?;

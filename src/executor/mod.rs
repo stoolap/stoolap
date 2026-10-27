@@ -136,8 +136,9 @@ pub use parallel::{
 pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
-use query_cache::NestedPlan;
-pub use query_cache::{CacheStats, CachedPlanRef, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
+pub use query_cache::{
+    CacheStats, CachedPlanRef, CachedQueryPlan, NestedPlan, QueryCache, DEFAULT_CACHE_SIZE,
+};
 pub use query_classification::clear_classification_cache;
 pub use result::{ColumnarResult, ExecResult, ExecutorResult};
 pub use semantic_cache::{
