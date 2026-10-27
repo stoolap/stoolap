@@ -1612,24 +1612,8 @@ impl Executor {
         };
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
-        // The names every SELECT item reads the aggregated row by: each group
-        // item's, and an aggregate's only where no group item's column has
-        // it, since an aggregate's alias names no column of the FROM
-        let group_count = group_by_columns.len().min(agg_columns.len());
-        let group_index_map = build_column_index_map(&agg_columns[..group_count]);
-        let slot_names: Vec<String> = agg_columns
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let shadowed =
-                    i >= group_count && group_index_map.contains_key(name.to_lowercase().as_str());
-                match shadowed {
-                    true => String::new(),
-                    false => name.clone(),
-                }
-            })
-            .collect();
-        let agg_col_index_map = build_column_index_map(&slot_names);
+        // Names find the result columns that bare names and aliases point at
+        let agg_col_index_map = build_column_index_map(&agg_columns);
         // Identities find the slot of each group item and aggregate, however it is named
         let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
@@ -1723,9 +1707,10 @@ impl Executor {
             final_columns.push(item_name(original_expr));
             match col_expr {
                 Expression::Identifier(id) => {
-                    // A name a group item or aggregate is keyed by reads its slot,
-                    // else the result column of its name among `slot_names`
-                    match slot_of(col_expr) {
+                    // A name no result column carries may be another alias of a shared slot
+                    match slot_of(col_expr)
+                        .filter(|_| !agg_col_index_map.contains_key(id.value_lower.as_str()))
+                    {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
                         None if agg_col_index_map.contains_key(id.value_lower.as_str()) => {
                             column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
@@ -1737,7 +1722,8 @@ impl Executor {
                 Expression::QualifiedIdentifier(qid) => {
                     let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
                     match qualified_index(&agg_col_index_map, qualifier, name) {
-                        Some(index) => column_sources.push(ColumnSource::AggSlot(index)),
+                        Some(index) => column_sources
+                            .push(ColumnSource::AggColumn(agg_columns[index].to_lowercase())),
                         None => column_sources.push(make_source(col_expr, is_correlated)),
                     }
                 }
@@ -1938,7 +1924,7 @@ impl Executor {
             .map(|s| match s {
                 ColumnSource::Expression(expr) => compile_over_slots(
                     expr,
-                    &slot_names,
+                    &agg_columns,
                     crate::functions::registry::global_registry(),
                     Some(&slot_keys),
                     outer_columns.as_deref(),
@@ -2000,7 +1986,7 @@ impl Executor {
                                     .map(|outer| outer.keys().map(|k| k.to_string()).collect());
                                 let program = compile_over_slots(
                                     &processed_expr,
-                                    &slot_names,
+                                    &agg_columns,
                                     &self.function_registry,
                                     None,
                                     outer.as_deref(),
@@ -2059,19 +2045,20 @@ impl Executor {
             _ => return None,
         };
 
-        // The item keyed as the argument is, as the grouping keys its items;
-        // else the one whose column or alias has the argument's own name
-        let key = ExprKey::of(arg);
-        if let Some(idx) = group_by_columns
-            .iter()
-            .position(|item| group_by_item_key(item) == key)
-        {
-            return Some(idx);
+        // Find the matching GROUP BY column
+        for (idx, item) in group_by_columns.iter().enumerate() {
+            let matches = match item {
+                GroupByItem::Column(col_name) => col_name.to_lowercase() == arg_name,
+                GroupByItem::Expression { display_name, .. } => {
+                    display_name.to_lowercase() == arg_name
+                }
+            };
+            if matches {
+                return Some(idx);
+            }
         }
-        group_by_columns.iter().position(|item| match item {
-            GroupByItem::Column(col_name) => eq_folded(bare_name(col_name), arg_name),
-            GroupByItem::Expression { display_name, .. } => display_name.to_lowercase() == arg_name,
-        })
+
+        None
     }
 
     /// The ORDER BY of an aggregate that orders its own input, with the
