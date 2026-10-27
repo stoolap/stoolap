@@ -219,16 +219,6 @@ impl RowRef {
         }
     }
 
-    /// Get a reference to the underlying Row if this is Owned.
-    #[inline]
-    pub fn as_row(&self) -> Option<&Row> {
-        match self {
-            RowRef::Owned(row) => Some(row),
-            RowRef::Composite(_) => None,
-            RowRef::DirectBuildComposite(_) => None,
-        }
-    }
-
     /// Create a direct-build composite RowRef.
     ///
     /// OPTIMIZATION: Avoids Arc allocation for probe row.
@@ -281,18 +271,6 @@ impl CompositeRow {
     #[inline]
     pub fn new(left: Row, right: Row) -> Self {
         let left_cols = left.len();
-        Self {
-            left,
-            right,
-            left_cols,
-        }
-    }
-
-    /// Create a composite row with explicit column count.
-    ///
-    /// Use this when the left row has been modified (e.g., projection).
-    #[inline]
-    pub fn with_counts(left: Row, right: Row, left_cols: usize) -> Self {
         Self {
             left,
             right,

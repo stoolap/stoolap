@@ -1573,14 +1573,6 @@ impl ExecutionContext {
         }
     }
 
-    /// Get CTE data by name (case-insensitive)
-    /// Returns Arc references to enable zero-copy sharing with joins
-    pub fn get_cte(&self, name: &str) -> Option<&CteData> {
-        self.cte_data
-            .as_ref()
-            .and_then(|data| data.get(&name.to_lowercase()))
-    }
-
     /// Get CTE data by name that is already lowercase.
     /// Use this when the name is known to be lowercase (e.g., from value_lower fields)
     /// to avoid redundant to_lowercase() allocation.

@@ -32,7 +32,6 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use crate::common::StringMap;
 
 use crate::core::predicate::kind;
-use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
@@ -68,12 +67,6 @@ pub(crate) fn probes_by_equality(table: &dyn crate::storage::traits::Table, colu
 /// Token literal is not used during execution, only for display/errors.
 static DUMMY_TOKEN: LazyLock<Token> =
     LazyLock::new(|| Token::new(TokenType::Identifier, String::new(), Position::default()));
-
-/// Get a reference to a pre-allocated dummy token (zero allocation).
-#[inline]
-pub fn dummy_token_ref() -> &'static Token {
-    &DUMMY_TOKEN
-}
 
 /// Clone the static dummy token (single String allocation for empty string).
 #[inline]
@@ -755,38 +748,6 @@ pub(crate) fn qualified_index(
     name: &str,
 ) -> Option<usize> {
     qualified_key_index(map, &qualified(qualifier, name))
-}
-
-// ============================================================================
-// Row Combination Utilities
-// ============================================================================
-
-/// Combine two rows into one for join output.
-#[inline]
-pub fn combine_rows(left: &Row, right: &Row, left_count: usize, right_count: usize) -> Vec<Value> {
-    let mut combined = Vec::with_capacity(left_count + right_count);
-    combined.extend(left.iter().cloned());
-    combined.extend(right.iter().cloned());
-    combined
-}
-
-/// Combine a row with NULLs for the other side (used in OUTER JOINs).
-#[inline]
-pub fn combine_rows_with_nulls(
-    row: &Row,
-    row_count: usize,
-    null_count: usize,
-    row_is_left: bool,
-) -> Vec<Value> {
-    let mut values = Vec::with_capacity(row_count + null_count);
-    if row_is_left {
-        values.extend(row.iter().cloned());
-        values.resize(row_count + null_count, NULL_VALUE);
-    } else {
-        values.resize(null_count, NULL_VALUE);
-        values.extend(row.iter().cloned());
-    }
-    values
 }
 
 // ============================================================================
@@ -3211,47 +3172,6 @@ mod tests {
         let columns: Vec<String> = vec![];
         let map = build_column_index_map(&columns);
         assert!(map.is_empty());
-    }
-
-    // ============================================================================
-    // Row Combination Tests
-    // ============================================================================
-
-    #[test]
-    fn test_combine_rows() {
-        let left = Row::from(vec![Value::Integer(1), Value::Text("a".into())]);
-        let right = Row::from(vec![Value::Integer(2), Value::Text("b".into())]);
-
-        let combined = combine_rows(&left, &right, 2, 2);
-        assert_eq!(combined.len(), 4);
-        assert_eq!(combined[0], Value::Integer(1));
-        assert_eq!(combined[1], Value::Text("a".into()));
-        assert_eq!(combined[2], Value::Integer(2));
-        assert_eq!(combined[3], Value::Text("b".into()));
-    }
-
-    #[test]
-    fn test_combine_rows_with_nulls_left() {
-        let row = Row::from(vec![Value::Integer(1), Value::Text("a".into())]);
-        let combined = combine_rows_with_nulls(&row, 2, 2, true);
-
-        assert_eq!(combined.len(), 4);
-        assert_eq!(combined[0], Value::Integer(1));
-        assert_eq!(combined[1], Value::Text("a".into()));
-        assert!(combined[2].is_null());
-        assert!(combined[3].is_null());
-    }
-
-    #[test]
-    fn test_combine_rows_with_nulls_right() {
-        let row = Row::from(vec![Value::Integer(1), Value::Text("a".into())]);
-        let combined = combine_rows_with_nulls(&row, 2, 2, false);
-
-        assert_eq!(combined.len(), 4);
-        assert!(combined[0].is_null());
-        assert!(combined[1].is_null());
-        assert_eq!(combined[2], Value::Integer(1));
-        assert_eq!(combined[3], Value::Text("a".into()));
     }
 
     // ============================================================================

@@ -101,10 +101,6 @@ type PreparedOutput = (
 /// The classifier's walk over one statement
 struct Family<'a> {
     executor: &'a Executor,
-    ctx: Option<&'a ExecutionContext>,
-    /// A grouped statement's own FROM, a table, checked against the catalog
-    /// once the syntax passed
-    tables: RefCell<SmallVec<[&'a SimpleTableSource; 4]>>,
     /// Every block's FROM that names a table, a view or a CTE
     blocks: RefCell<SmallVec<[&'a SimpleTableSource; 4]>>,
     /// The statement's own CTEs, which its FROM may name and no block may
@@ -123,12 +119,6 @@ impl<'a> Family<'a> {
             return Err("FROM reads AS OF");
         }
         Ok(ts)
-    }
-
-    /// A FROM the family reads by its syntax: one table, no AS OF
-    fn from(&self, table_expr: Option<&'a Expression>) -> std::result::Result<(), OutOfFamily> {
-        self.tables.borrow_mut().push(Self::one_table(table_expr)?);
-        Ok(())
     }
 
     /// The statement's FROM: one table, view or CTE, a derived table, a
@@ -154,7 +144,7 @@ impl<'a> Family<'a> {
                 }
             }
             Some(Expression::TableSource(ts)) if ts.as_of.is_none() => Ok(()),
-            other => self.from(other),
+            other => Self::one_table(other).map(drop),
         }
     }
 
@@ -293,9 +283,9 @@ impl<'a> Family<'a> {
         nested.into_iter().try_for_each(|s| self.derived(s))
     }
 
-    /// A grouped statement's FROM names a table, not a CTE or a view; a
-    /// block's a table, a view or a CTE the context holds, and no CTE of the
-    /// statement's own WITH, which may inline into a derived table
+    /// A block's FROM names a table, a view or a CTE the context holds, and
+    /// no CTE of the statement's own WITH, which may inline into a derived
+    /// table
     fn catalog(&self) -> std::result::Result<(), OutOfFamily> {
         let own_cte = |name: &str| {
             self.with
@@ -308,15 +298,6 @@ impl<'a> Family<'a> {
                 .map(|view| view.is_some())
                 .map_err(|_| "the catalog could not be read")
         };
-        for ts in self.tables.borrow().iter() {
-            let name = ts.name.value_lower.as_str();
-            if own_cte(name) || self.ctx.is_some_and(|ctx| ctx.has_cte_by_lower(name)) {
-                return Err("FROM names a CTE");
-            }
-            if view(name)? {
-                return Err("FROM names a view");
-            }
-        }
         for ts in self.blocks.borrow().iter() {
             let name = ts.name.value_lower.as_str();
             if own_cte(name) {
@@ -886,8 +867,6 @@ impl Executor {
         }
         let family = Family {
             executor: self,
-            ctx,
-            tables: RefCell::new(SmallVec::new()),
             blocks: RefCell::new(SmallVec::new()),
             with: stmt.with.as_ref(),
         };
@@ -1039,8 +1018,6 @@ impl Executor {
             .map_err(|_| "a GROUP BY position outside the SELECT list")?;
         let family = Family {
             executor: self,
-            ctx,
-            tables: RefCell::new(SmallVec::new()),
             blocks: RefCell::new(SmallVec::new()),
             with: stmt.with.as_ref(),
         };
@@ -7774,8 +7751,6 @@ impl Executor {
     ) -> std::result::Result<(), OutOfFamily> {
         let family = Family {
             executor: self,
-            ctx: None,
-            tables: RefCell::new(SmallVec::new()),
             blocks: RefCell::new(SmallVec::new()),
             with: None,
         };
@@ -8866,8 +8841,6 @@ impl Executor {
         }
         let family = Family {
             executor: self,
-            ctx: Some(ctx),
-            tables: RefCell::new(SmallVec::new()),
             blocks: RefCell::new(SmallVec::new()),
             with: None,
         };

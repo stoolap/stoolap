@@ -36,7 +36,7 @@ use crate::api::params::ParamVec;
 // instead of allocating fresh empty collections per instance
 static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
     std::sync::LazyLock::new(|| CompactArc::new(ParamVec::new()));
-use crate::common::{CompactArc, StringMap};
+use crate::common::CompactArc;
 use crate::executor::expr_key::ExprKey;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -1024,9 +1024,6 @@ pub struct CompiledEvaluator<'a> {
     /// Expression aliases for HAVING clause
     expression_aliases: FxHashMap<ExprKey, u16>,
 
-    /// Column aliases
-    column_aliases: StringMap<String>,
-
     /// VM instance (reusable)
     vm: ExprVM,
 
@@ -1052,7 +1049,6 @@ impl<'a> CompiledEvaluator<'a> {
             outer_row: None,
             transaction_id: None,
             expression_aliases: FxHashMap::default(),
-            column_aliases: StringMap::new(),
             vm: ExprVM::new(),
             local_cache: FxHashMap::default(),
             current_row: None,
@@ -1492,11 +1488,6 @@ impl<'a> CompiledEvaluator<'a> {
         // Add expression aliases
         if !self.expression_aliases.is_empty() {
             ctx = ctx.with_expression_aliases(self.expression_aliases.clone());
-        }
-
-        // Add column aliases
-        if !self.column_aliases.is_empty() {
-            ctx = ctx.with_column_aliases(self.column_aliases.clone());
         }
 
         // The parameters are known here: each compiles as its value
