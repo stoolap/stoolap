@@ -10142,7 +10142,7 @@ impl<'a> PreparedRunner<'a> {
                     (CompareOp::Eq, false) => list(&mut values.iter().cloned(), false),
                     (CompareOp::Ne, true) => list(&mut values.iter().cloned(), true),
                     _ => filter(pushdown::quantified_filter(
-                        column(),
+                        SmartString::new(&schema.columns[slot.column].name_lower),
                         op,
                         all,
                         values,

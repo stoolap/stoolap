@@ -96,6 +96,7 @@ fn assert_same_for_both_lengths(test: &str, sql: &str) {
 
 #[test]
 fn a_prepared_where_allocates_alike_for_both_lengths() {
+    assert_same_for_both_lengths("name_len_where", "SELECT id FROM t WHERE {c} = $1");
     assert_same_for_both_lengths(
         "name_len_runner",
         "SELECT id, (SELECT 1) FROM t WHERE {c} = $1",

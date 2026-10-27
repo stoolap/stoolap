@@ -28,8 +28,9 @@ use crate::storage::expression::{
 use std::sync::Arc;
 
 use super::{registry, PushdownContext, PushdownResult, PushdownRule};
+use crate::common::SmartString;
 use crate::executor::utils::{
-    extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
+    column_name_of, extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
 };
 
 // =============================================================================
@@ -81,23 +82,23 @@ fn extract_comparison_parts(
     left: &ast::Expression,
     right: &ast::Expression,
     ctx: &PushdownContext<'_>,
-) -> Option<(String, Value, bool)> {
+) -> Option<(SmartString, Value, bool)> {
     // Try column on left, value on right
-    if let Some(column) = extract_column_name(left) {
-        if ctx.has_column(&column) {
+    if let Some(column) = column_name_of(left) {
+        if ctx.has_column(column) {
             if let Some(value) = extract_literal_with_ctx(right, ctx) {
-                let coerced = ctx.coerce_to_column_type(&column, value)?;
-                return Some((column, coerced, false)); // false = not flipped
+                let coerced = ctx.coerce_to_column_type(column, value)?;
+                return Some((column.clone(), coerced, false)); // false = not flipped
             }
         }
     }
 
     // Try value on left, column on right (will need to flip operator)
-    if let Some(column) = extract_column_name(right) {
-        if ctx.has_column(&column) {
+    if let Some(column) = column_name_of(right) {
+        if ctx.has_column(column) {
             if let Some(value) = extract_literal_with_ctx(left, ctx) {
-                let coerced = ctx.coerce_to_column_type(&column, value)?;
-                return Some((column, coerced, true)); // true = flipped
+                let coerced = ctx.coerce_to_column_type(column, value)?;
+                return Some((column.clone(), coerced, true)); // true = flipped
             }
         }
     }
@@ -188,13 +189,13 @@ impl PushdownRule for QuantifiedSetRule {
         if quantified.has_null {
             return PushdownResult::CannotPush;
         }
-        let Some(column) = extract_column_name(&quantified.left) else {
+        let Some(column) = column_name_of(&quantified.left) else {
             return PushdownResult::CannotPush;
         };
         let Some(op) = QuantifiedMembers::operator(&quantified.operator) else {
             return PushdownResult::CannotPush;
         };
-        match quantified_filter(column, op, quantified.all, &quantified.members, ctx) {
+        match quantified_filter(column.clone(), op, quantified.all, &quantified.members, ctx) {
             Some(filter) => PushdownResult::Converted(filter),
             None => PushdownResult::CannotPush,
         }
@@ -204,7 +205,7 @@ impl PushdownRule for QuantifiedSetRule {
 /// `column op ANY|ALL (members)`, the members holding no NULL, as the scan
 /// takes it: `column op bound` over a number column; None when it cannot
 pub(crate) fn quantified_filter(
-    column: String,
+    column: SmartString,
     op: crate::executor::expression::CompareOp,
     all: bool,
     members: &[Value],

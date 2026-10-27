@@ -25,7 +25,7 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 
-use crate::common::CompactArc;
+use crate::common::{CompactArc, SmartString};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
@@ -1031,13 +1031,17 @@ pub(crate) fn needed_columns(
 /// Returns the column name without table qualifier.
 #[inline]
 pub fn extract_column_name(expr: &Expression) -> Option<String> {
+    column_name_of(expr).map(SmartString::to_string)
+}
+
+/// The column name `extract_column_name` returns, as the expression holds it
+#[inline]
+pub fn column_name_of(expr: &Expression) -> Option<&SmartString> {
     match expr {
-        Expression::Identifier(Identifier { value, .. }) => Some(value.to_string()),
-        Expression::QualifiedIdentifier(QualifiedIdentifier { name, .. }) => {
-            Some(name.value.to_string())
-        }
+        Expression::Identifier(Identifier { value, .. }) => Some(value),
+        Expression::QualifiedIdentifier(QualifiedIdentifier { name, .. }) => Some(&name.value),
         // A column the prepared builder bound in the table's own scope
-        Expression::Column(column) => Some(column.name.value.to_string()),
+        Expression::Column(column) => Some(&column.name.value),
         _ => None,
     }
 }
