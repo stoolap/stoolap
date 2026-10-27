@@ -318,7 +318,7 @@ pub struct Identifier {
 /// the row its program reads, and its name, which a message shows
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnRef {
-    pub index: u16,
+    pub index: u32,
     pub name: Identifier,
 }
 

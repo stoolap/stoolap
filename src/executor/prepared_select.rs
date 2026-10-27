@@ -1983,7 +1983,7 @@ impl Chain<'_> {
     fn column(&self, depth: usize, index: usize) -> Expression {
         let name = self.scopes[depth].lower[index].as_str();
         Expression::Column(ColumnRef {
-            index: index as u16,
+            index: index as u32,
             name: ident(name, name),
         })
     }
@@ -2329,7 +2329,7 @@ fn rebuild(
 fn in_joined(expr: &Expression, offset: usize) -> Result<Expression> {
     match expr {
         Expression::Column(c) => Ok(Expression::Column(ColumnRef {
-            index: (offset + usize::from(c.index)) as u16,
+            index: (offset + c.index as usize) as u32,
             name: c.name.clone(),
         })),
         _ => rebuild(expr, &mut |child| in_joined(child, offset)),
@@ -2361,8 +2361,8 @@ fn bind_own(
 fn spelled_columns(expr: &Expression, scope: &ScopeTable) -> Result<Expression> {
     match expr {
         Expression::Column(c) => {
-            let name = scope.columns[usize::from(c.index)].as_str();
-            let mut id = ident(name, &scope.lower[usize::from(c.index)]);
+            let name = scope.columns[c.index as usize].as_str();
+            let mut id = ident(name, &scope.lower[c.index as usize]);
             id.quoted = true;
             Ok(Expression::Identifier(id))
         }
@@ -2373,7 +2373,7 @@ fn spelled_columns(expr: &Expression, scope: &ScopeTable) -> Result<Expression> 
 /// The column of its scope's row a name the builder bound reads
 fn bound_column(expr: &Expression) -> Option<usize> {
     match expr {
-        Expression::Column(c) => Some(usize::from(c.index)),
+        Expression::Column(c) => Some(c.index as usize),
         _ => None,
     }
 }
@@ -2405,7 +2405,7 @@ fn scans_whole(expr: &Expression, schema: &Schema) -> bool {
     match expr {
         Expression::Column(c) => schema
             .columns
-            .get(usize::from(c.index))
+            .get(c.index as usize)
             .is_none_or(|column| scan_compares(column.data_type)),
         other => {
             let mut whole = true;
@@ -4121,7 +4121,7 @@ impl Builder<'_> {
             work.holes
                 .iter()
                 .map(|(slot, hole)| match hole {
-                    Expression::Column(c) => Ok((*slot, Hole::Column(usize::from(c.index)))),
+                    Expression::Column(c) => Ok((*slot, Hole::Column(c.index as usize))),
                     _ => compile_with(&parent, hole).map(|p| (*slot, Hole::Program(p))),
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -5303,7 +5303,7 @@ impl Builder<'_> {
         let columns = aggregations
             .iter_mut()
             .map(|agg| match agg.expression.take() {
-                Some(Expression::Column(c)) => Ok(Some(usize::from(c.index))),
+                Some(Expression::Column(c)) => Ok(Some(c.index as usize)),
                 expression if expression.is_some() || agg.column == "*" => {
                     agg.expression = expression;
                     Ok(None)
@@ -5433,7 +5433,7 @@ fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<usize> {
     }
     match expr {
         Expression::FunctionCall(call) if is_aggregate_function(&call.function) => None,
-        Expression::Column(c) => Some(usize::from(c.index)),
+        Expression::Column(c) => Some(c.index as usize),
         other => {
             let mut found = None;
             let _ = for_each_child(other, &mut |child| {
@@ -6541,7 +6541,7 @@ impl PreparedGrouped {
         }
         // The keys are refused as every grouping path refuses them; a SELECT
         // item holding a subquery that one names by alias or position groups
-        executor.parse_group_by(stmt, &[])?;
+        let group_items = executor.parse_group_by(stmt, &[])?;
         let mut keys = vec![false; stmt.columns.len()];
         for key in grouping_items(stmt) {
             if let Some(at) = grouped_item(stmt, key) {
@@ -6688,20 +6688,21 @@ impl PreparedGrouped {
             .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
         // A group's row holds its GROUP BY items first, each holding the
         // column it binds to when it is one, the identity of what it groups,
-        // through an alias or a position, and whether it is written as that
-        // column. A hole reads an item holding the column it binds to: the
-        // one grouping what the hole is, else one written as a column, else
-        // the first
+        // through an alias or a position, and whether the grouping names it
+        // by its column. A hole reads an item holding the column it binds
+        // to, as the group's output reads one: the first grouping what the
+        // hole is, else the last named by its column, else the first
         let held: Vec<(Option<usize>, ExprKey, bool)> = grouping_items(stmt)
             .into_iter()
-            .map(|key| {
-                let item = grouped_item(stmt, key);
-                let read = item.map_or(key, |at| unaliased(&stmt.columns[at]));
+            .zip(&group_items)
+            .map(|(key, group)| {
+                let read = grouped_item(stmt, key).map_or(key, |at| unaliased(&stmt.columns[at]));
                 let column = match chain.resolve(read) {
                     Ok(Some((0, column))) => Some(column),
                     _ => None,
                 };
-                (column, ExprKey::of(read), item.is_none())
+                let named = matches!(group, GroupByItem::Column(_));
+                (column, ExprKey::of(read), named)
             })
             .collect();
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {
@@ -6709,9 +6710,11 @@ impl PreparedGrouped {
                 .filter(|&item| held[item].0 == Some(column))
                 .collect();
             let written = ExprKey::of(reference);
-            let first = |test: &dyn Fn(usize) -> bool| holding.iter().copied().find(|&i| test(i));
-            first(&|item| held[item].1 == written)
-                .or_else(|| first(&|item| held[item].2))
+            let mut items = holding.iter().copied();
+            items
+                .clone()
+                .find(|&item| held[item].1 == written)
+                .or_else(|| items.rfind(|&item| held[item].2))
                 .or(holding.first().copied())
         };
         let slots_ctx = CompileContext::bound(&executor.function_registry);
@@ -7646,11 +7649,11 @@ impl JoinBlocks {
         }
         let left = scope.columns[..left_width].to_vec();
         let right = scope.columns[left_width..].to_vec();
-        let pair_ctx = CompileContext::bound_pair(registry, left_width as u16);
+        let pair_ctx = CompileContext::bound_pair(registry, left_width as u32);
         let position = |hole: &Expression| match hole {
-            Expression::Column(c) => Some(match usize::from(c.index).checked_sub(left_width) {
+            Expression::Column(c) => Some(match (c.index as usize).checked_sub(left_width) {
                 Some(i) => Hole::Column2(i),
-                None => Hole::Column(usize::from(c.index)),
+                None => Hole::Column(c.index as usize),
             }),
             _ => None,
         };
@@ -7707,7 +7710,7 @@ impl JoinBlocks {
         registry: &FunctionRegistry,
     ) -> Result<SharedProgram> {
         let ctx = match pair {
-            true => CompileContext::bound_pair(registry, self.left.len() as u16),
+            true => CompileContext::bound_pair(registry, self.left.len() as u32),
             false => CompileContext::bound(registry),
         };
         compile_with(&ctx.with_prepared_subqueries(), clause)
@@ -9509,7 +9512,7 @@ fn over_items(
                         .ok_or_else(|| Error::internal("a column outside the groups"))?;
                     let name = chain.scopes[depth].lower[column].as_str();
                     Ok(Expression::Column(ColumnRef {
-                        index: item as u16,
+                        index: item as u32,
                         name: ident(name, name),
                     }))
                 }

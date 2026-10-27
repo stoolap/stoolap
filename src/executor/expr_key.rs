@@ -248,7 +248,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
         // A bound column is one column however it was written
         Expression::Column(c) => {
             hasher.tag(b'C');
-            hasher.write_u32(u32::from(c.index));
+            hasher.write_u32(c.index);
         }
         Expression::QualifiedIdentifier(qid) if hasher.by_column_name => {
             hasher.tag(b'I');

@@ -2403,7 +2403,7 @@ fn extract_join_keys_recursive(
             // Columns bound over the joined row, the right side's after the left's
             if let (Expression::Column(a), Expression::Column(b)) = (&*infix.left, &*infix.right) {
                 let split = left_columns.len();
-                let (a, b) = (usize::from(a.index), usize::from(b.index));
+                let (a, b) = (a.index as usize, b.index as usize);
                 let pair = match (a < split, b < split) {
                     (true, false) => Some((a, b - split)),
                     (false, true) => Some((b, a - split)),

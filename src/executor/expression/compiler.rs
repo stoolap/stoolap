@@ -244,9 +244,9 @@ impl<'a> CompileContext<'a> {
     }
 
     /// The same over a joined row whose second row starts at column `split`
-    pub(crate) fn bound_pair(functions: &'a FunctionRegistry, split: u16) -> Self {
+    pub(crate) fn bound_pair(functions: &'a FunctionRegistry, split: u32) -> Self {
         Self {
-            bound: Some(u32::from(split)),
+            bound: Some(split),
             ..Self::new(&[], functions)
         }
     }
@@ -662,10 +662,23 @@ impl<'a> ExprCompiler<'a> {
             }
 
             Expression::Column(column) => match self.ctx.bound {
-                Some(split) => match u32::from(column.index).checked_sub(split) {
-                    None => builder.emit(Op::LoadColumn(column.index)),
-                    Some(second) => builder.emit(Op::LoadColumn2(second as u16)),
-                },
+                Some(split) => {
+                    // The row is chosen on the joined index, then the column within it
+                    let (second, at) = match column.index.checked_sub(split) {
+                        Some(at) => (true, at),
+                        None => (false, column.index),
+                    };
+                    let at = u16::try_from(at).map_err(|_| {
+                        CompileError::InvalidExpression(format!(
+                            "column '{}' past the columns a row can hold",
+                            column.name
+                        ))
+                    })?;
+                    builder.emit(match second {
+                        true => Op::LoadColumn2(at),
+                        false => Op::LoadColumn(at),
+                    });
+                }
                 None => {
                     return Err(CompileError::InvalidExpression(format!(
                         "bound column '{}' outside a prepared program",
