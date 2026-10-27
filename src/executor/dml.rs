@@ -3527,7 +3527,6 @@ impl Executor {
         let column_count = schema.columns.len();
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col_idx = schema.pk_column_index();
-        let pk_col_name = pk_col_idx.map(|idx| schema.columns[idx].name.clone());
 
         let has_referencing_fks = !referencing_fks.is_empty();
 
@@ -3770,9 +3769,7 @@ impl Executor {
 
             // Delete matching rows by primary key
             let mut delete_count = 0;
-            let integer_pk =
-                pk_col_idx.is_some_and(|idx| schema.columns[idx].data_type == DataType::Integer);
-            if integer_pk && !rows_to_delete.is_empty() {
+            if !rows_to_delete.is_empty() {
                 // An integer key is the row id, so the rows go in one call,
                 // read once from the volumes they sit in, as the rows named
                 // by id below do
@@ -3801,19 +3798,6 @@ impl Executor {
                                 _ => None,
                             },
                         ));
-                    }
-                }
-            } else if let Some(ref pk_name) = pk_col_name {
-                for (pk_value, row_data) in rows_to_delete {
-                    let mut pk_expr =
-                        ComparisonExpr::new(pk_name, crate::core::Operator::Eq, pk_value);
-                    pk_expr.prepare_for_schema(&schema_arc);
-                    let deleted = table.delete(Some(&pk_expr))?;
-                    if deleted > 0 {
-                        if let Some(row) = row_data {
-                            returning_rows.push(row);
-                        }
-                        delete_count += deleted;
                     }
                 }
             } else if !rows_to_delete_by_row_id.is_empty() {
