@@ -324,6 +324,22 @@ fn a_select_item_naming_a_grouped_column_reads_it_beside_an_aggregate_of_that_al
             "SELECT COUNT(*) AS b, b + 1 FROM t GROUP BY b",
             vec!["i:1|i:21", "i:2|i:11"],
         ),
+        (
+            "SELECT SUM(a) AS b, b FROM t GROUP BY t.b",
+            vec!["i:3|i:10", "i:3|i:20"],
+        ),
+        (
+            "SELECT SUM(a) AS b, t.b FROM t GROUP BY b",
+            vec!["i:3|i:10", "i:3|i:20"],
+        ),
+        (
+            "SELECT SUM(a) AS b, t.b FROM t GROUP BY t.b",
+            vec!["i:3|i:10", "i:3|i:20"],
+        ),
+        (
+            "SELECT SUM(a) AS b, t.b, (SELECT MAX(id) FROM one) FROM t GROUP BY b",
+            vec!["i:3|i:10|i:1", "i:3|i:20|i:1"],
+        ),
     ] {
         assert_eq!(rows(&db, sql), want, "{sql}");
     }

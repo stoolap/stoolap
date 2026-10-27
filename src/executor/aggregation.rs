@@ -1614,6 +1614,10 @@ impl Executor {
 
         // Names find the result columns that bare names and aliases point at
         let agg_col_index_map = build_column_index_map(&agg_columns);
+        // The group items' own names, which a column name reads before any
+        // result column: an aggregate's alias names no column of the FROM
+        let group_names = &agg_columns[..group_by_columns.len().min(agg_columns.len())];
+        let group_index_map = build_column_index_map(group_names);
         // Identities find the slot of each group item and aggregate, however it is named
         let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
@@ -1707,10 +1711,11 @@ impl Executor {
             final_columns.push(item_name(original_expr));
             match col_expr {
                 Expression::Identifier(id) => {
-                    // A name a group item or aggregate is keyed by reads its slot,
-                    // before a result column of that name: another item's alias
-                    // is not visible in the SELECT list
-                    match slot_of(col_expr) {
+                    // A name a group item or aggregate is keyed by, or a group
+                    // item's column has, reads that slot before a result column
+                    // of the name: another item's alias is not visible here
+                    let grouped = || group_index_map.get(id.value_lower.as_str()).copied();
+                    match slot_of(col_expr).or_else(grouped) {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
                         None if agg_col_index_map.contains_key(id.value_lower.as_str()) => {
                             column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
@@ -1721,10 +1726,14 @@ impl Executor {
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
-                    match qualified_index(&agg_col_index_map, qualifier, name) {
-                        Some(index) => column_sources
-                            .push(ColumnSource::AggColumn(agg_columns[index].to_lowercase())),
-                        None => column_sources.push(make_source(col_expr, is_correlated)),
+                    // A group item's column first, by the one qualified-name rule
+                    match qualified_index(&group_index_map, qualifier, name) {
+                        Some(index) => column_sources.push(ColumnSource::AggSlot(index)),
+                        None => match qualified_index(&agg_col_index_map, qualifier, name) {
+                            Some(index) => column_sources
+                                .push(ColumnSource::AggColumn(agg_columns[index].to_lowercase())),
+                            None => column_sources.push(make_source(col_expr, is_correlated)),
+                        },
                     }
                 }
                 Expression::FunctionCall(func) => {
