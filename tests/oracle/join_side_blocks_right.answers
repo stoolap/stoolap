@@ -1,0 +1,1 @@
+320	d267ced71fc29b05	SELECT r.id, l.id FROM r JOIN l ON r.w = l.g WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)

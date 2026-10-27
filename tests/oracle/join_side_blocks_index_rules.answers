@@ -1,0 +1,2 @@
+30	1f45f8fab8cfb7fa	SELECT l.id, SUM(r.w) FROM l LEFT JOIN r ON l.k = r.k WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33) AND l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 3) GROUP BY l.id
+60	3623a447c37361d6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.k = 3 AND r.w IN (SELECT s.a FROM s WHERE s.b < 30) AND l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)

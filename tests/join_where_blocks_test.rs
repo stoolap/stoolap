@@ -13,10 +13,13 @@
 // limitations under the License.
 
 //! A join of two tables whose WHERE asks subqueries of its joined rows runs
-//! them as the plan's blocks: it answers as the general path does, hot and
+//! them as the plan's blocks: it answers as its literal twin does, or as
+//! recorded when the general path still gave the same answer, hot and
 //! sealed, and run again compiles nothing
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use stoolap::test_failpoints::{
     bridge_compiles, join_paths_taken, program_compiles, reset_join_paths,
@@ -37,64 +40,78 @@ fn fill(db: &Database) {
     }
 }
 
-/// Each statement, with `{l}` and `{r}` for its sides, and the join path
-/// it takes over the two tables
-const CASES: &[(&str, &str)] = &[
+/// The uncorrelated subquery a literal twin writes as its answer, and
+/// whether it is an `IN` list
+type Twin = Option<(&'static str, bool)>;
+
+/// Each statement, with `{l}` and `{r}` for its sides, the join path it
+/// takes over the two tables, and its literal twin's subquery
+const CASES: &[(&str, &str, Twin)] = &[
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE r.id IN (SELECT s.b FROM s WHERE s.a = l.g)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id < ALL (SELECT s.b FROM s WHERE s.a = r.w + 20)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g < r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         "nested_loop",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} LEFT JOIN {r} ON l.g = r.w AND r.id < 20 WHERE r.id IS NULL OR EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} RIGHT JOIN {r} ON l.g = r.w AND l.id < 12 WHERE l.id IS NULL OR r.id IN (SELECT s.b FROM s WHERE s.a = l.g)",
         "hash",
+        None,
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
         "hash",
+        Some(("SELECT MIN(s.b) FROM s WHERE s.a = 5", false)),
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id + r.id IN (SELECT s.b FROM s)",
         "hash",
+        Some(("SELECT s.b FROM s", true)),
     ),
     (
         "SELECT l.id, r.id FROM {l} JOIN {r} ON l.k = r.id WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
         "batch_index_nested_loop",
+        Some(("SELECT MIN(s.b) FROM s WHERE s.a = 5", false)),
     ),
 ];
 
-/// `sql` as a derived table's statement, which holds no plan, so the
-/// general path answers it
-fn general(sql: &str) -> String {
-    format!("SELECT * FROM ({sql}) AS general")
-}
+/// The answers of the correlated cases, recorded where the general path
+/// gave the same ones
+const RECORDED: oracle::Answers = answers!("join_where_blocks");
 
 /// The rows of `sql` as sorted text, or the error
 fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
@@ -127,9 +144,8 @@ fn a_join_where_runs_its_subqueries_as_blocks() {
             fill(&db);
             db
         };
-        for &(shape, path) in CASES {
+        for &(shape, path, twin) in CASES {
             let sql = shape.replace("{l}", "l").replace("{r}", "r");
-            let reference = general(&sql);
             let first = rows(&db, &sql);
             let bridge = bridge_compiles();
             let programs = program_compiles();
@@ -137,7 +153,6 @@ fn a_join_where_runs_its_subqueries_as_blocks() {
             let again = rows(&db, &sql);
             let taken = join_paths_taken();
             let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
-            let want = rows(&db, &reference);
             if taken != [path] {
                 wrong.push(format!(
                     "sealed {sealed}: {sql}: took {taken:?}, expected {path}"
@@ -148,10 +163,26 @@ fn a_join_where_runs_its_subqueries_as_blocks() {
                     "sealed {sealed}: {sql}: run again, compiled {compiled:?}"
                 ));
             }
-            if first != want || again != want {
+            if again != first {
                 wrong.push(format!(
-                    "sealed {sealed}: {sql}: gave {first:?} then {again:?}, the general path {want:?}"
+                    "sealed {sealed}: {sql}: gave {first:?}, then {again:?}"
                 ));
+            }
+            let answer = first.unwrap_or_else(|e| vec![format!("error: {e}")]);
+            match twin {
+                Some((subquery, list)) => {
+                    let twin = oracle::literal_twin(&db, &sql, subquery, list);
+                    let want = rows(&db, &twin);
+                    if Ok(&answer) != want.as_ref() {
+                        wrong.push(format!(
+                            "sealed {sealed}: {sql}: gave {answer:?}, its literal twin {want:?}"
+                        ));
+                    }
+                }
+                None => wrong.extend(
+                    oracle::check(&RECORDED, &sql, &answer)
+                        .map(|why| format!("sealed {sealed}: {why}")),
+                ),
             }
         }
     }
@@ -171,13 +202,6 @@ fn an_uncorrelated_block_no_joined_row_reaches_is_not_read() {
     let sql = shape.replace("{l}", "l").replace("{r}", "r");
     let blocks = rows(&db, &sql);
     assert_eq!(blocks, Ok(Vec::new()), "no joined row reads the block");
-    let folded = rows(&db, &general(&sql));
-    assert!(
-        folded
-            .as_ref()
-            .is_err_and(|e| e.contains("more than one row")),
-        "the general path folds the subquery before any row: {folded:?}"
-    );
 }
 
 #[test]
@@ -231,8 +255,7 @@ fn a_column_named_with_a_dot_binds_by_position_inside_a_block() {
     let shape = "SELECT l.id, r.id FROM {l} JOIN {r} ON l.id = r.id \
                  WHERE EXISTS (SELECT 1 FROM s WHERE s.v = l.\"x.y\" + r.id)";
     let sql = shape.replace("{l}", "l").replace("{r}", "r");
-    let want = rows(&db, &general(&sql));
-    assert_eq!(want, Ok(vec!["Integer(1)|Integer(1)".to_string()]));
+    let want = Ok(vec!["Integer(1)|Integer(1)".to_string()]);
     for _ in 0..2 {
         assert_eq!(rows(&db, &sql), want, "{sql}");
     }

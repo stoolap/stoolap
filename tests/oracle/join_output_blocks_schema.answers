@@ -1,0 +1,12 @@
+2	fedc90713bb902f3	join_output_blocks_drop_hashed after: SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.k = r.w
+2	fedc90713bb902f3	join_output_blocks_drop_hashed before: SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.k = r.w
+2	fedc90713bb902f3	join_output_blocks_drop_inner after: SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.id = r.id
+2	fedc90713bb902f3	join_output_blocks_drop_inner before: SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.id = r.id
+1	2879d490ccfa3ef2	join_output_blocks_drop_never after: SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id WHERE FALSE
+1	2879d490ccfa3ef2	join_output_blocks_drop_never before: SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id WHERE FALSE
+2	d680ef6459c9305d	join_output_blocks_drop_outer after: SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id
+2	d680ef6459c9305d	join_output_blocks_drop_outer before: SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id
+2	3d526a9f3930d8d8	join_output_blocks_rename_swap after: SELECT l.k, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id LIMIT 1
+2	e0ebdab86c00b6fe	join_output_blocks_rename_swap before: SELECT l.k, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id LIMIT 1
+2	c0517c40043966e1	join_output_blocks_retype after: SELECT l.id, l.k IN (SELECT u.t FROM u) FROM l LEFT JOIN r ON l.id = r.id
+2	831b4ebea86bd1b8	join_output_blocks_retype before: SELECT l.id, l.k IN (SELECT u.t FROM u) FROM l LEFT JOIN r ON l.id = r.id

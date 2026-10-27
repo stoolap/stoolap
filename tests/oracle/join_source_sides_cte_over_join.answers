@@ -1,0 +1,2 @@
+18	f3911d3c9651d256	WITH c AS (SELECT * FROM u JOIN w ON w.id = u.id) SELECT t2.id FROM t AS t2 JOIN c ON TRUE WHERE EXISTS (SELECT 1 FROM t WHERE t.id = t2.id)
+3	fb3efa191b399257	WITH c AS (SELECT u.id FROM u JOIN w ON w.id = u.id) SELECT a.id FROM c a JOIN c b ON a.id = b.id WHERE EXISTS (SELECT 1 FROM t WHERE t.id = a.id)

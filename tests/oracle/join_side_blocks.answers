@@ -1,0 +1,90 @@
+60	5c33295c707d4b0a	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50) GROUP BY l.id
+30	b058b6a24d18a376	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33) GROUP BY l.id
+1	8890fb454b9f4c53	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50) GROUP BY l.id
+30	b058b6a24d18a376	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20) GROUP BY l.id
+52	4353d6434a47dfb3	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5) GROUP BY l.id
+9	2f7620ca37f8daef	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) GROUP BY l.id
+52	4353d6434a47dfb3	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10) GROUP BY l.id
+9	2f7620ca37f8daef	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) GROUP BY l.id
+60	5c33295c707d4b0a	SELECT l.id, COUNT(r.id) FROM l LEFT JOIN r ON l.k = r.k WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30) GROUP BY l.id
+60	0f336f3e122b1de3	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50) GROUP BY l.id
+30	29eedf9b94067cb3	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33) GROUP BY l.id
+1	87f37736760542bd	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50) GROUP BY l.id
+30	29eedf9b94067cb3	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20) GROUP BY l.id
+52	529646157df34870	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5) GROUP BY l.id
+9	7ea37721bfbd1821	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) GROUP BY l.id
+52	529646157df34870	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10) GROUP BY l.id
+9	7ea37721bfbd1821	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) GROUP BY l.id
+60	0f336f3e122b1de3	SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30) GROUP BY l.id
+1600	0b4facf390e90a89	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50)
+160	41e53d0a7768b451	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)
+48	5fc75adc4b2c8e95	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50)
+160	41e53d0a7768b451	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20)
+1408	a63d01668d3bf90b	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+256	5d12ba2e27153c63	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+1408	a63d01668d3bf90b	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10)
+240	13a0e4fae8326a33	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+1600	0b4facf390e90a89	SELECT l.id, r.id FROM l JOIN r ON l.g < r.w WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30)
+800	2702e245fcc441ad	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50)
+800	2702e245fcc441ad	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+320	bb8c11ad3d985861	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)
+320	bb8c11ad3d985861	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+16	5fdb2a529d93a909	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50)
+16	5fdb2a529d93a909	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+320	bb8c11ad3d985861	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20)
+320	bb8c11ad3d985861	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+688	c64fc83daf736449	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+688	c64fc83daf736449	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+128	4bde857b40adb99f	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+128	4bde857b40adb99f	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+688	c64fc83daf736449	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10)
+688	c64fc83daf736449	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+120	270b7f097944448f	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+120	270b7f097944448f	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+800	2702e245fcc441ad	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30)
+800	2702e245fcc441ad	SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+52	caa8834849f777f6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50)
+26	72cd95aa1c92cdd6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)
+1	f3906cc4356ebf02	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50)
+26	72cd95aa1c92cdd6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20)
+52	caa8834849f777f6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+9	3d7e6afd6612b239	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+52	caa8834849f777f6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10)
+9	3d7e6afd6612b239	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+52	caa8834849f777f6	SELECT l.id, r.id FROM l JOIN r ON l.k = r.id WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30)
+687	197a36011235d195	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50)
+687	197a36011235d195	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+343	07a3ce834c044708	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)
+343	07a3ce834c044708	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+11	3cfcf62429b5c5c2	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50)
+11	3cfcf62429b5c5c2	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+343	07a3ce834c044708	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20)
+343	07a3ce834c044708	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+599	8ba0e043a24850b8	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+599	8ba0e043a24850b8	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+108	26fcecc330333497	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+108	26fcecc330333497	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+599	8ba0e043a24850b8	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10)
+599	8ba0e043a24850b8	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+108	26fcecc330333497	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+108	26fcecc330333497	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+687	197a36011235d195	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30)
+687	197a36011235d195	SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30) AND EXISTS (SELECT 1 FROM s WHERE s.a = l.k AND s.b >= r.w)
+810	c2f7eb844382d6d9	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50)
+330	26ae3d3a04e8e95d	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)
+16	5fdb2a529d93a909	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50)
+330	26ae3d3a04e8e95d	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20)
+697	2cca1dd89ddcd204	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+129	14752baf93753b8d	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+697	2cca1dd89ddcd204	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10)
+120	270b7f097944448f	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+800	2702e245fcc441ad	SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30)
+52	4459ab0c18690a3c	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE EXISTS (SELECT 1 FROM s WHERE s.b = 50)
+26	78455e1d80ef3338	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.g > ANY (SELECT s.a FROM s WHERE s.b = 33)
+1	d9276a9d5f576474	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.id = (SELECT s.a FROM s WHERE s.b = 50)
+26	78455e1d80ef3338	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.id NOT IN (SELECT s.a FROM s WHERE s.b < 20)
+52	4459ab0c18690a3c	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.k + 1 > (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+9	5b8d09668a2a15a9	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+52	4459ab0c18690a3c	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE l.k IN (SELECT s.a FROM s WHERE s.b < 10)
+9	5b8d09668a2a15a9	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE r.k = (SELECT MIN(s.a) FROM s WHERE s.b < 5)
+52	4459ab0c18690a3c	SELECT r.id, l.id FROM r JOIN l ON r.id = l.k WHERE r.w IN (SELECT s.a FROM s WHERE s.b < 30)
