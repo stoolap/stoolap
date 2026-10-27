@@ -670,7 +670,7 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
 }
 
 #[test]
-fn explain_says_no_for_a_join_outside_the_statement_s_own_select() {
+fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
     let _turn = turn();
     let db = Database::open("memory://join_on_blocks_explain_sites").unwrap();
     fill(&db);
@@ -678,7 +678,7 @@ fn explain_says_no_for_a_join_outside_the_statement_s_own_select() {
         .unwrap();
     let join = "SELECT l.id, r.k FROM l JOIN r ON l.id = r.id \
                 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
-    let outside = "Prepared: no (a join outside the statement's own SELECT)";
+    let outside = "Prepared: no (a join in a SELECT that holds no plan)";
     let lines = |sql: &str| -> Vec<String> {
         db.query(&format!("EXPLAIN {sql}"), ())
             .unwrap()
@@ -686,25 +686,37 @@ fn explain_says_no_for_a_join_outside_the_statement_s_own_select() {
             .filter(|line| line.starts_with("Prepared:"))
             .collect()
     };
+    let yes = "Prepared: yes";
     let selects = [
-        (format!("SELECT 0, 0 UNION ALL {join}"), outside),
-        (format!("{join} UNION ALL SELECT 0, 0"), "Prepared: yes"),
-        (format!("SELECT d.id, d.k FROM ({join}) d"), outside),
+        (format!("SELECT 0, 0 UNION ALL {join}"), vec![yes]),
+        (format!("{join} UNION ALL SELECT 0, 0"), vec![yes]),
+        (format!("SELECT d.id, d.k FROM ({join}) d"), vec![outside]),
+        (
+            format!("SELECT d.id, d.k FROM ({join}) d WHERE d.id > (SELECT MIN(id) FROM s)"),
+            vec![yes, yes],
+        ),
+        (
+            format!(
+                "SELECT l.id, d.k FROM l JOIN ({join}) d ON d.id = l.id \
+                 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)"
+            ),
+            vec![yes, yes],
+        ),
     ];
     let mut wrong = Vec::new();
     for (sql, want) in &selects {
         let got = lines(sql);
-        if got != [*want] {
-            wrong.push(format!("{sql}: {got:?}, expected {want}"));
+        if got != *want {
+            wrong.push(format!("{sql}: {got:?}, expected {want:?}"));
         }
         let ran = rows(&db, sql).and_then(|_| {
             let compiles = (bridge_compiles(), program_compiles());
             rows(&db, sql)?;
             Ok((bridge_compiles(), program_compiles()) == compiles)
         });
-        if ran != Ok(*want == "Prepared: yes") {
+        if ran != Ok(want.iter().all(|line| *line == yes)) {
             wrong.push(format!(
-                "{sql}: says {want}, run again it compiled nothing: {ran:?}"
+                "{sql}: says {want:?}, run again it compiled nothing: {ran:?}"
             ));
         }
     }

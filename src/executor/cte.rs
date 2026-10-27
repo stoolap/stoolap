@@ -41,6 +41,7 @@ use crate::storage::traits::QueryResult;
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
+use super::query_cache::NestedPlan;
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, static_row_counts};
@@ -215,7 +216,7 @@ impl Executor {
             return self.execute_select(&inlined_stmt, ctx);
         }
 
-        self.run_over_cut_ctes(stmt, with_clause, ctx, |cte_registry| {
+        self.run_over_cut_ctes(stmt, with_clause, None, ctx, |cte_registry| {
             self.execute_main_query_with_ctes(stmt, ctx, cte_registry)
         })
     }
@@ -227,14 +228,16 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         with_clause: &WithClause,
+        plan: Option<&NestedPlan>,
         ctx: &ExecutionContext,
         mut main: impl FnMut(&mut CteRegistry) -> Result<Box<dyn QueryResult>>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
+        let plan = plan.map(|plan| (plan, stmt));
 
         loop {
             let mut cte_registry =
-                self.materialize_ctes(with_clause, ctx, Some(&cte_limit_hints))?;
+                self.materialize_ctes(with_clause, plan, ctx, Some(&cte_limit_hints))?;
 
             let result = main(&mut cte_registry)?;
 
@@ -266,10 +269,12 @@ impl Executor {
     }
 
     /// Run the CTEs of a WITH clause in order and store each result, so
-    /// the statement that follows, a SELECT or a DML, can read them
+    /// the statement that follows, a SELECT or a DML, can read them; a body
+    /// run as written runs under its own plan in `plan`, the SELECT's
     pub(crate) fn materialize_ctes(
         &self,
         with_clause: &WithClause,
+        plan: Option<(&NestedPlan, &SelectStatement)>,
         ctx: &ExecutionContext,
         cte_limit_hints: Option<&StringMap<CtePushdownHint>>,
     ) -> Result<CteRegistry> {
@@ -279,7 +284,7 @@ impl Executor {
         let ctx = scoped.as_ref().unwrap_or(ctx);
 
         // Execute each CTE in order
-        for cte in &with_clause.ctes {
+        for (index, cte) in with_clause.ctes.iter().enumerate() {
             // Check if we have a pushdown hint for this CTE
             let cte_name_lower: String = cte.name.value_lower.to_string();
             let pushdown_hint = cte_limit_hints.and_then(|hints| hints.get(&cte_name_lower));
@@ -303,7 +308,8 @@ impl Executor {
                 // Execute CTE with pushed-down LIMIT and optional ORDER BY
                 self.execute_cte_query_with_hint(&cte.query, ctx, &mut cte_registry, hint)?
             } else {
-                self.execute_cte_query(&cte.query, ctx, &mut cte_registry)?
+                let plan = plan.and_then(|(plan, stmt)| plan.cte(stmt, index));
+                self.execute_cte_query(&cte.query, plan, ctx, &mut cte_registry)?
             };
 
             // Apply column aliases if specified
@@ -333,10 +339,11 @@ impl Executor {
         Ok(cte_registry)
     }
 
-    /// Execute a single CTE query
+    /// Execute a single CTE query, under `plan` when it holds one
     fn execute_cte_query(
         &self,
         stmt: &SelectStatement,
+        plan: Option<&NestedPlan>,
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
     ) -> Result<(Vec<String>, RowVec)> {
@@ -368,7 +375,7 @@ impl Executor {
         // Execute as a normal SELECT and materialize
         // Create context with CTE data so tables can resolve CTE references
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
-        let result = self.execute_select(stmt, &ctx_with_ctes)?;
+        let result = self.execute_select_with_plan(stmt, &ctx_with_ctes, None, plan, None)?;
         let columns = result.columns().to_vec();
         let rows = Self::materialize_result(result)?;
 
@@ -459,7 +466,7 @@ impl Executor {
                 recursive_members.push(&set_op.right);
                 continue;
             }
-            let (_, rows) = self.execute_cte_query(&set_op.right, ctx, cte_registry)?;
+            let (_, rows) = self.execute_cte_query(&set_op.right, None, ctx, cte_registry)?;
             let base_id = all_rows.len() as i64;
             for (i, (_, row)) in rows.into_iter().enumerate() {
                 all_rows.push((base_id + i as i64, row));
@@ -507,7 +514,8 @@ impl Executor {
             // Execute each recursive member
             let mut new_rows = RowVec::new();
             for member in &recursive_members {
-                let recursive_result = self.execute_cte_query(member, ctx, &mut temp_registry)?;
+                let recursive_result =
+                    self.execute_cte_query(member, None, ctx, &mut temp_registry)?;
 
                 // Extend with rows from recursive result, renumbering row IDs
                 let base_id = new_rows.len() as i64;
@@ -1802,7 +1810,7 @@ impl Executor {
         }
 
         // Execute with the pushed optimizations
-        self.execute_cte_query(&modified_stmt, ctx, cte_registry)
+        self.execute_cte_query(&modified_stmt, None, ctx, cte_registry)
     }
 }
 

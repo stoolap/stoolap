@@ -74,7 +74,8 @@ fn ran(before: &[usize]) -> Vec<GeneralPath> {
         .collect()
 }
 
-/// t: id 1..6, a = id % 3, b = id * 10. u: id 1..3, x = id. vt is t
+/// t: id 1..6, a = id % 3, b = id * 10. u: id 1..3, x = id. vt is t, vj a
+/// join of them with a subquery
 fn setup(name: &str) -> Database {
     let db = Database::open(&format!("memory://{name}")).unwrap();
     for sql in [
@@ -83,6 +84,8 @@ fn setup(name: &str) -> Database {
         "INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 0, 30), (4, 1, 40), (5, 2, 50), (6, 0, 60)",
         "INSERT INTO u VALUES (1, 1), (2, 2), (3, 3)",
         "CREATE VIEW vt AS SELECT id, a, b FROM t",
+        "CREATE VIEW vj AS SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -436,6 +439,69 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT id FROM t WHERE a IN (1, 2, 3)",
         Prepared,
     ),
+    (
+        "join_inside_a_derived_table",
+        "SELECT * FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d",
+        "SELECT * FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d",
+        Old("7b: parent on the general path"),
+    ),
+    (
+        "join_inside_a_derived_table_of_a_prepared_statement",
+        "SELECT d.id FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d WHERE d.id > (SELECT MIN(x) FROM u)",
+        "SELECT d.id FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d \
+         WHERE d.id > 1",
+        Prepared,
+    ),
+    (
+        "join_inside_a_view",
+        "SELECT * FROM vj",
+        "SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3",
+        Prepared,
+    ),
+    (
+        "join_inside_a_view_of_a_prepared_statement",
+        "SELECT vj.id FROM vj WHERE vj.id > (SELECT MIN(x) FROM u)",
+        "SELECT t.id FROM t JOIN u ON u.id = t.a WHERE t.b > 3 AND t.id > 1",
+        Prepared,
+    ),
+    (
+        "block_over_a_view_of_a_join",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM vj WHERE vj.id = t.id)",
+        "SELECT id FROM t WHERE a IN (1, 2)",
+        Prepared,
+    ),
+    (
+        "join_inside_a_cte",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) SELECT * FROM c",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) SELECT * FROM c",
+        Old("7b: parent on the general path"),
+    ),
+    (
+        "join_inside_a_cte_of_a_prepared_statement",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) SELECT c.id FROM c WHERE c.id > (SELECT MIN(x) FROM u)",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) \
+         SELECT c.id FROM c WHERE c.id > 1",
+        Prepared,
+    ),
+    (
+        "join_in_a_set_operation_branch",
+        "SELECT x FROM u UNION SELECT t.id FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "SELECT x FROM u UNION SELECT t.id FROM t JOIN u ON u.id = t.a WHERE t.b > 3",
+        Prepared,
+    ),
+    (
+        "join_with_a_derived_side_that_is_a_join",
+        "SELECT t.id FROM t JOIN (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d ON d.id = t.id WHERE t.b > (SELECT MIN(x) FROM u)",
+        "SELECT t.id FROM t JOIN (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d \
+         ON d.id = t.id WHERE t.b > 1",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
@@ -465,6 +531,13 @@ const WRITES: &[(&str, &str, &str, Path)] = &[
         "DELETE FROM t WHERE id > (SELECT MAX(x) FROM u) AND a || '' = '1'",
         "DELETE FROM t WHERE id > 3 AND a || '' = '1'",
         Prepared,
+    ),
+    (
+        "insert_select_of_a_join",
+        "INSERT INTO t SELECT t.id + 10, u.x, t.b FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)",
+        "INSERT INTO t SELECT t.id + 10, u.x, t.b FROM t JOIN u ON u.id = t.a WHERE t.b > 3",
+        Old("#717: no parent plan"),
     ),
 ];
 

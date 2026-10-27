@@ -1702,7 +1702,7 @@ impl Executor {
         &self,
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
-        compiled_cache: &Arc<RwLock<CompiledExecution>>,
+        compiled_cache: &RwLock<CompiledExecution>,
     ) -> Result<Box<dyn QueryResult>> {
         // Conflict handling requires special handling - fall back to non-cached path
         if stmt.on_duplicate || stmt.do_nothing {
@@ -2225,7 +2225,7 @@ impl Executor {
         let ctx_with_ctes;
         let ctx = match &stmt.with {
             Some(with_clause) => {
-                let registry = self.materialize_ctes(with_clause, ctx, None)?;
+                let registry = self.materialize_ctes(with_clause, None, ctx, None)?;
                 ctx_with_ctes = ctx.with_cte_data(registry.data());
                 &ctx_with_ctes
             }
@@ -3302,7 +3302,7 @@ impl Executor {
         let ctx_with_ctes;
         let ctx = match &stmt.with {
             Some(with_clause) => {
-                let registry = self.materialize_ctes(with_clause, ctx, None)?;
+                let registry = self.materialize_ctes(with_clause, None, ctx, None)?;
                 ctx_with_ctes = ctx.with_cte_data(registry.data());
                 &ctx_with_ctes
             }

@@ -589,7 +589,7 @@ impl Executor {
 
     /// Whether the join `select` reads from runs its subqueries as prepared
     /// blocks, as the statement run alone decides it, or why not; `own`
-    /// when `select` is the statement's own, which alone holds a plan
+    /// when `select` holds a plan
     fn join_prepared(
         &self,
         select: &SelectStatement,
@@ -597,7 +597,7 @@ impl Executor {
         own: bool,
     ) -> std::result::Result<(), OutOfFamily> {
         if !own {
-            return Err("a join outside the statement's own SELECT");
+            return Err("a join in a SELECT that holds no plan");
         }
         // A join with CTEs keeps its plan as execution keeps it, its CTE
         // sides named by their bodies
@@ -625,7 +625,7 @@ impl Executor {
     }
 
     /// Whether the join `select` reads from runs its subqueries as prepared
-    /// blocks, `own` when `select` is the statement's own
+    /// blocks, `own` when `select` holds a plan
     fn join_runs_blocks(&self, select: &SelectStatement, own: bool) -> bool {
         match select.table_expr.as_deref() {
             Some(Expression::JoinSource(join)) => self.join_prepared(select, join, own).is_ok(),
@@ -633,8 +633,9 @@ impl Executor {
         }
     }
 
-    /// Generate EXPLAIN output for a SELECT statement; `own` when it is the
-    /// statement's own SELECT, not a branch, a FROM subquery or a source
+    /// Generate EXPLAIN output for a SELECT statement; `own` when it holds a
+    /// plan: the statement's own, a branch of one that does, or a derived
+    /// FROM or join side of one the runner runs
     fn explain_select(
         &self,
         select: &SelectStatement,
@@ -686,6 +687,9 @@ impl Executor {
             .is_some_and(Self::has_subqueries);
         let classification = get_classification(select);
         let grouped_output = Self::grouped_family_reach(select, &classification);
+        // A derived FROM or join side holds a plan in that of a statement the
+        // runner runs
+        let mut from_plan = false;
         if on_subqueries
             || classification.output_has_subqueries
             || grouped_output
@@ -700,7 +704,10 @@ impl Executor {
                 None => self.prepared_family(select, None),
             };
             match prepared {
-                Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),
+                Ok(()) => {
+                    from_plan = own;
+                    lines.push(format!("{}  Prepared: yes", prefix))
+                }
                 Err(reason) => lines.push(format!("{}  Prepared: no ({})", prefix, reason)),
             }
         }
@@ -736,6 +743,7 @@ impl Executor {
                 indent + 1,
                 self.join_index_use(select, self.join_runs_blocks(select, own)),
                 &cte_names(select),
+                from_plan,
             );
         }
 
@@ -770,7 +778,7 @@ impl Executor {
         if !select.set_operations.is_empty() {
             for set_op in &select.set_operations {
                 lines.push(format!("{}  {}", prefix, set_op.operation));
-                self.explain_select(&set_op.right, lines, indent + 2, false);
+                self.explain_select(&set_op.right, lines, indent + 2, own);
             }
         }
     }
@@ -786,9 +794,21 @@ impl Executor {
         index_use: JoinIndexUse,
         ctes: &[String],
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, false, index_use, ctes)
+        self.explain_table_expr_inner(
+            expr,
+            where_clause,
+            lines,
+            indent,
+            false,
+            index_use,
+            ctes,
+            false,
+        )
     }
 
+    /// `from_plan` when `expr`, a derived table or a join of them, holds a
+    /// plan for each
+    #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_with_where(
         &self,
         expr: &Expression,
@@ -797,8 +817,18 @@ impl Executor {
         indent: usize,
         index_use: JoinIndexUse,
         ctes: &[String],
+        from_plan: bool,
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, true, index_use, ctes)
+        self.explain_table_expr_inner(
+            expr,
+            where_clause,
+            lines,
+            indent,
+            true,
+            index_use,
+            ctes,
+            from_plan,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -811,6 +841,7 @@ impl Executor {
         show_join_cost: bool,
         index_use: JoinIndexUse,
         ctes: &[String],
+        from_plan: bool,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -882,7 +913,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1, false);
+                self.explain_select(&subquery.subquery, lines, indent + 1, from_plan);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
@@ -993,6 +1024,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
+                    from_plan,
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -1002,6 +1034,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
+                    from_plan,
                 );
             }
             Expression::CteReference(cte_ref) => {

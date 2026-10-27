@@ -463,7 +463,7 @@ use super::prepared_select::{
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
-use super::query_cache::{CompiledExecution, NestedPlan};
+use super::query_cache::{CachedPlanRef, CompiledExecution, NestedPlan};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     AliasedResult, DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, FilteredResult,
@@ -1534,7 +1534,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
         counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         let result = self.select_with_plan(stmt, ctx, plan_classification, compiled, counts)?;
@@ -1559,7 +1559,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
         counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // Start timeout guard ONLY at the top level (query_depth == 0).
@@ -1621,8 +1621,9 @@ impl Executor {
                 .with
                 .as_ref()
                 .ok_or_else(|| Error::internal("a statement with CTEs without WITH"))?;
-            if !self.holds_prepared_select(compiled, ctx)
-                && !self.holds_prepared_grouped(compiled, ctx)
+            let slot = compiled.map(NestedPlan::slot);
+            if !self.holds_prepared_select(slot, ctx)
+                && !self.holds_prepared_grouped(slot, ctx)
                 && self.prepared_family(stmt, Some(ctx)).is_err()
                 && !grouped()
                 && !self.join_keeps_plan(stmt, with)
@@ -1637,7 +1638,7 @@ impl Executor {
                 None => self.with_counts_snapshot(ctx)?,
             };
             let ctx = snapshot.as_ref().unwrap_or(ctx);
-            return self.run_over_cut_ctes(stmt, with, ctx, |ctes| {
+            return self.run_over_cut_ctes(stmt, with, compiled, ctx, |ctes| {
                 let ctx = ctx.with_cte_data(ctes.data());
                 self.select_rows_with_plan(
                     stmt,
@@ -1666,7 +1667,7 @@ impl Executor {
         ctx: &ExecutionContext,
         reads_blocks: bool,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
         counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // The subquery is read once, before any path reads a row, with the
@@ -1688,15 +1689,16 @@ impl Executor {
         };
 
         // A statement of the prepared family runs on that path and no other
+        let slot = compiled.map(NestedPlan::slot);
         let in_family = (classification.where_has_subqueries
             || classification.output_has_subqueries)
-            && (self.holds_prepared_select(compiled, ctx)
+            && (self.holds_prepared_select(slot, ctx)
                 || self.prepared_family(stmt, Some(ctx)).is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
         // them as its blocks
         let grouped_family = Self::grouped_family_reach(stmt, &classification)
             && !in_family
-            && (self.holds_prepared_grouped(compiled, ctx)
+            && (self.holds_prepared_grouped(slot, ctx)
                 || self.grouped_family(stmt, Some(ctx)).is_ok());
 
         // Correlated probes read the statement's tables through one transaction
@@ -1848,7 +1850,7 @@ impl Executor {
         } else if let Some(grouped) = grouped {
             self.execute_prepared_grouped(grouped, branch, ctx)?
         } else {
-            let compiled = compiled.filter(|_| !folded_select);
+            let compiled = slot.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, branch_classification, compiled)?
         };
         let SelectShape {
@@ -1914,7 +1916,7 @@ impl Executor {
         // Pass limit+offset to enable early termination for UNION ALL
         let mut limit_offset_applied = limit_offset_applied;
         if !stmt.set_operations.is_empty() {
-            result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
+            result = self.execute_set_operations(result, stmt, compiled, ctx, set_limit)?;
 
             // The set operation gathers LIMIT + OFFSET rows at most; the
             // OFFSET is skipped and the LIMIT cut below, on the whole
@@ -7975,10 +7977,10 @@ impl Executor {
         ))
     }
 
-    /// Parse a view's SQL query and return the cached Statement.
+    /// Parse a view's SQL query and return its cached plan.
     /// Uses the query cache to avoid re-parsing the same view query multiple times.
-    /// Returns Arc<Statement> - caller should extract SelectStatement via pattern match.
-    pub(super) fn parse_view_statement(&self, view_query: &str) -> Result<Arc<Statement>> {
+    /// The plan's statement is a SELECT - caller should extract it via pattern match.
+    pub(super) fn parse_view_statement(&self, view_query: &str) -> Result<CachedPlanRef> {
         // Try to get from cache first (cheap Arc clone, no Statement clone)
         if let Some(cached) = self.query_cache.get(view_query) {
             // Validate it's a SELECT statement
@@ -7990,7 +7992,7 @@ impl Executor {
             if cached.params.count > 0 {
                 return Err(view_parameters());
             }
-            return Ok(cached.statement);
+            return Ok(cached);
         }
 
         // Parse the view's query
@@ -8019,10 +8021,9 @@ impl Executor {
         let stmt_arc = Arc::new(statements.into_iter().next().unwrap());
 
         // Cache the parsed statement for future use
-        self.query_cache
-            .put(view_query, stmt_arc.clone(), ParamSlots::default());
-
-        Ok(stmt_arc)
+        Ok(self
+            .query_cache
+            .put(view_query, stmt_arc, ParamSlots::default()))
     }
 
     /// The rows of a view's own query, one view deeper than `ctx`
@@ -8040,16 +8041,22 @@ impl Executor {
             )));
         }
 
-        // Parse the view's query using cache (returns Arc<Statement>, no clone)
-        let view_stmt = self.parse_view_statement(&view_def.query)?;
-        let view_select = match view_stmt.as_ref() {
+        // Parse the view's query using cache (an Arc clone of its plan, no clone)
+        let view_plan = self.parse_view_statement(&view_def.query)?;
+        let view_select = match view_plan.statement.as_ref() {
             Statement::Select(s) => s,
             _ => unreachable!("parse_view_statement validates this is a SELECT"),
         };
 
-        // Execute the view's query with incremented depth
+        // Execute the view's query with incremented depth, under its own plan
         let nested_ctx = ctx.with_incremented_view_depth();
-        let result = self.execute_select(view_select, &nested_ctx)?;
+        let result = self.execute_select_with_plan(
+            view_select,
+            &nested_ctx,
+            Some(&view_plan.classification),
+            Some(&view_plan.compiled),
+            view_plan.counts.as_deref(),
+        )?;
         let columns = match view_def.columns() {
             Some(columns) => columns,
             None => view_def.record_columns(result.columns().to_vec()),
@@ -8964,40 +8971,7 @@ impl Executor {
                 Ok((result, qualified_columns))
             }
             Expression::JoinSource(js) => self.joined_side_rows(js, ctx, None, false),
-            Expression::SubquerySource(ss) => {
-                // Execute subquery with incremented depth to avoid creating new TimeoutGuard
-                let subquery_ctx = ctx.with_incremented_query_depth();
-                let result = self.execute_select(&ss.subquery, &subquery_ctx)?;
-                let columns = result.columns().to_vec();
-
-                // Prefix column names with subquery alias (required for proper ON condition resolution)
-                // Without this, ON a.id = b.id cannot resolve qualified column names
-                let qualified_columns: Vec<String> = if let Some(alias) = &ss.alias {
-                    columns
-                        .iter()
-                        .map(|col| qualified(&alias.value, col))
-                        .collect()
-                } else {
-                    columns.clone()
-                };
-
-                // Apply filter to subquery result if present
-                // This is needed when WHERE clause conditions are pushed down to subquery sources
-                if let Some(filter_expr) = filter {
-                    // Use qualified_columns for filter column resolution since WHERE clause
-                    // has qualified names like "ds.avg_salary" not just "avg_salary"
-                    let row_filter =
-                        RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
-                    // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
-                    let mut materialized = Self::materialize_result(result)?;
-                    row_filter.retain_checked(&mut materialized)?;
-                    let filtered_result: Box<dyn QueryResult> =
-                        Box::new(super::result::ExecutorResult::new(columns, materialized));
-                    return Ok((filtered_result, qualified_columns));
-                }
-
-                Ok((result, qualified_columns))
-            }
+            Expression::SubquerySource(ss) => self.derived_side_rows(ss, ctx, filter, None),
             Expression::ValuesSource(vs) => {
                 // A SELECT * of the VALUES, with the filter pushed to this side
                 let select_all = SelectStatement {
@@ -9111,12 +9085,23 @@ impl Executor {
             (None, Expression::JoinSource(join)) if side.apart => Some((join, None)),
             _ => None,
         };
-        let fetched = match nested {
-            Some((join, compiled)) => {
+        // A derived table read as rows runs under the plan it holds
+        let derived = match (rows, expr) {
+            (Some((run, index)), Expression::SubquerySource(ss)) => {
+                Some((ss, run.blocks.nested[index].as_ref()))
+            }
+            _ => None,
+        };
+        let fetched = match (nested, derived) {
+            (Some((join, compiled)), _) => {
                 let (result, columns) = self.joined_side_rows(join, ctx, compiled, true)?;
                 (result, columns, false, None)
             }
-            None => self.execute_table_expression_with_filter_limit(
+            (None, Some((ss, plan))) => {
+                let (result, columns) = self.derived_side_rows(ss, ctx, filter, plan)?;
+                (result, columns, false, None)
+            }
+            (None, None) => self.execute_table_expression_with_filter_limit(
                 expr, ctx, filter, limit, offset, read_out,
             )?,
         };
@@ -9132,6 +9117,49 @@ impl Executor {
             run.blocks.side_fits(index, &schema)?;
         }
         Ok(fetched)
+    }
+
+    /// A derived table's rows and its columns qualified by its alias, those
+    /// `filter` passes, its statement run under `plan` when it holds one
+    fn derived_side_rows(
+        &self,
+        ss: &SubqueryTableSource,
+        ctx: &ExecutionContext,
+        filter: Option<&Expression>,
+        plan: Option<&NestedPlan>,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        // Execute subquery with incremented depth to avoid creating new TimeoutGuard
+        let subquery_ctx = ctx.with_incremented_query_depth();
+        let result =
+            self.execute_select_with_plan(&ss.subquery, &subquery_ctx, None, plan, None)?;
+        let columns = result.columns().to_vec();
+
+        // Prefix column names with subquery alias (required for proper ON condition resolution)
+        // Without this, ON a.id = b.id cannot resolve qualified column names
+        let qualified_columns: Vec<String> = if let Some(alias) = &ss.alias {
+            columns
+                .iter()
+                .map(|col| qualified(&alias.value, col))
+                .collect()
+        } else {
+            columns.clone()
+        };
+
+        // Apply filter to subquery result if present
+        // This is needed when WHERE clause conditions are pushed down to subquery sources
+        if let Some(filter_expr) = filter {
+            // Use qualified_columns for filter column resolution since WHERE clause
+            // has qualified names like "ds.avg_salary" not just "avg_salary"
+            let row_filter = RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+            // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
+            let mut materialized = Self::materialize_result(result)?;
+            row_filter.retain_checked(&mut materialized)?;
+            let filtered_result: Box<dyn QueryResult> =
+                Box::new(super::result::ExecutorResult::new(columns, materialized));
+            return Ok((filtered_result, qualified_columns));
+        }
+
+        Ok((result, qualified_columns))
     }
 
     /// `read_out` takes the layout and schema a plain table's rows were read
