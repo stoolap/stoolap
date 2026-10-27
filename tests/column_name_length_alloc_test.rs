@@ -53,7 +53,8 @@ const SIXTEEN: &str = "abcdefghijklmnop";
 const RUNS: usize = 8;
 
 /// The allocations of `RUNS` warm runs of `sql`, `{c}` standing for a
-/// column named `column`, over t and u holding three rows each
+/// column named `column`, over t, u and f holding three rows each; f's
+/// column is BOOLEAN, true on even ids
 fn runs(test: &str, column: &str, sql: &str) -> usize {
     let db = Database::open(&format!("memory://{test}_{}", column.len())).unwrap();
     db.execute(
@@ -66,10 +67,17 @@ fn runs(test: &str, column: &str, sql: &str) -> usize {
         (),
     )
     .unwrap();
+    db.execute(
+        &format!("CREATE TABLE f (id INTEGER PRIMARY KEY, {column} BOOLEAN)"),
+        (),
+    )
+    .unwrap();
     for i in 1..=3 {
         db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"), ())
             .unwrap();
         db.execute(&format!("INSERT INTO u VALUES ({i}, {i}, {i})"), ())
+            .unwrap();
+        db.execute(&format!("INSERT INTO f VALUES ({i}, {})", i % 2 == 0), ())
             .unwrap();
     }
     let statement = db.prepare(&sql.replace("{c}", column)).unwrap();
@@ -105,6 +113,16 @@ fn a_prepared_where_allocates_alike_for_both_lengths() {
         "name_len_two",
         "SELECT id, (SELECT 1) FROM t WHERE {c} = $1 AND id > 0",
     );
+}
+
+#[test]
+fn a_boolean_check_allocates_alike_for_both_lengths() {
+    for check in ["IS TRUE", "IS FALSE", "IS NOT TRUE", "IS NOT FALSE"] {
+        assert_same_for_both_lengths(
+            &format!("name_len_{}", check.replace(' ', "_").to_lowercase()),
+            &format!("SELECT id FROM f WHERE {{c}} {check} AND id >= $1"),
+        );
+    }
 }
 
 #[test]

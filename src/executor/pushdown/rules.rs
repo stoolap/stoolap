@@ -711,17 +711,17 @@ impl PushdownRule for BooleanCheckRule {
                     _ => return PushdownResult::NotApplicable,
                 };
 
-                let column = match extract_column_name(&infix.left) {
+                let column = match column_name_of(&infix.left) {
                     Some(c) => c,
                     None => return PushdownResult::CannotPush,
                 };
 
                 // Validate column exists in schema
-                if !ctx.has_column(&column) {
+                if !ctx.has_column(column) {
                     return PushdownResult::CannotPush;
                 }
 
-                let mut expr = ComparisonExpr::eq(column, Value::Boolean(bool_val));
+                let mut expr = ComparisonExpr::eq(column.clone(), Value::Boolean(bool_val));
                 expr.prepare_for_schema(ctx.schema);
                 PushdownResult::Converted(Box::new(expr))
             }
@@ -733,19 +733,19 @@ impl PushdownRule for BooleanCheckRule {
                     _ => return PushdownResult::NotApplicable,
                 };
 
-                let column = match extract_column_name(&infix.left) {
+                let column = match column_name_of(&infix.left) {
                     Some(c) => c,
                     None => return PushdownResult::CannotPush,
                 };
 
                 // Validate column exists in schema
-                if !ctx.has_column(&column) {
+                if !ctx.has_column(column) {
                     return PushdownResult::CannotPush;
                 }
 
-                let mut ne_expr = ComparisonExpr::ne(&column, Value::Boolean(bool_val));
+                let mut ne_expr = ComparisonExpr::ne(column.clone(), Value::Boolean(bool_val));
                 ne_expr.prepare_for_schema(ctx.schema);
-                let mut null_expr = NullCheckExpr::is_null(&column);
+                let mut null_expr = NullCheckExpr::is_null(column.as_str());
                 null_expr.prepare_for_schema(ctx.schema);
 
                 PushdownResult::Converted(Box::new(OrExpr::new(vec![
