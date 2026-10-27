@@ -411,7 +411,9 @@ use super::parallel::{self, ParallelConfig};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
-use super::prepared_select::{names_any_within, Bound, JoinBlocks, OutOfFamily};
+use super::prepared_select::{
+    names_any_within, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
+};
 use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
@@ -783,7 +785,7 @@ enum OrderedProjection {
 /// is projected, the output column names, and where each comes from
 #[derive(Debug)]
 pub(crate) struct JoinOutput {
-    projection: OutputProjection,
+    projection: JoinProjection,
     columns: CompactArc<Vec<String>>,
     layout: Option<CompactArc<OutputLayout>>,
     /// The columns shown, when ORDER BY keys follow a star's
@@ -797,34 +799,11 @@ enum OutputProjection {
     Ordered(OrderedProjection),
 }
 
-impl JoinOutput {
-    /// This output with its member tests bound to the sets `run` read; None
-    /// when no program tests a block's members
-    fn bound_to(&self, run: &super::prepared_select::PreparedRunner<'_>) -> Option<JoinOutput> {
-        let OutputProjection::Ordered(OrderedProjection::Items(sources)) = &self.projection else {
-            return None;
-        };
-        let asks = |source: &Result<ItemSource>| matches!(source, Ok(ItemSource::Program(p)) if p.has_subqueries());
-        if !sources.iter().any(asks) {
-            return None;
-        }
-        let sources = sources
-            .iter()
-            .map(|source| match source {
-                Ok(ItemSource::Program(p)) => Ok(ItemSource::Program(
-                    run.bound_program(p).unwrap_or_else(|| CompactArc::clone(p)),
-                )),
-                Ok(ItemSource::Column(i)) => Ok(ItemSource::Column(*i)),
-                Err(e) => Err(e.clone()),
-            })
-            .collect();
-        Some(JoinOutput {
-            projection: OutputProjection::Ordered(OrderedProjection::Items(sources)),
-            columns: CompactArc::clone(&self.columns),
-            layout: self.layout.clone(),
-            visible: self.visible,
-        })
-    }
+#[derive(Debug)]
+enum JoinProjection {
+    General(OutputProjection),
+    /// A SELECT list or ORDER BY holding subqueries the statement's blocks run
+    Prepared(PreparedProjection),
 }
 
 /// The columns of the row a statement runs for, which its programs read by name
@@ -3298,9 +3277,7 @@ impl Executor {
         let Some(mut top) = self.projected_top(stmt, columns, layout, ctx)? else {
             let rows = match plan {
                 OutputProjection::Select(plan) => Self::run_select_projection(plan, rows, ctx)?,
-                OutputProjection::Ordered(plan) => {
-                    Self::run_ordered_projection(plan, rows, ctx, None)?
-                }
+                OutputProjection::Ordered(plan) => Self::run_ordered_projection(plan, rows, ctx)?,
             };
             return Ok((rows, false));
         };
@@ -3314,7 +3291,7 @@ impl Executor {
                 Self::project_select_into(plan, rows, ctx, &mut kept)?
             }
             OutputProjection::Ordered(plan) => {
-                Self::project_ordered_into(plan, rows, ctx, None, &mut kept)?
+                Self::project_ordered_into(plan, rows, ctx, &mut kept)?
             }
         }
         Ok((top.into_row_vec(), true))
@@ -5830,14 +5807,11 @@ impl Executor {
             .as_ref()
             .map(|site| site as &dyn SubqueryExecutor);
         // The result a held output builds, its blocks told how many rows ask
-        // and its member tests bound to the sets the run read
         let output_result = |output: &JoinOutput, rows: RowVec, applied: bool| {
-            let bound = blocks_run.as_ref().and_then(|run| {
+            if let Some(run) = &blocks_run {
                 run.ask_rows(Some(rows.len()));
-                output.bound_to(run)
-            });
-            let output = bound.as_ref().unwrap_or(output);
-            Self::join_output_result(output, rows, applied, ctx, where_blocks)
+            }
+            Self::join_output_result(output, rows, applied, ctx, blocks_run.as_ref())
         };
         // A WHERE that keeps no row joins no rows whatever the join type; the
         // sides run with no rows only to name their columns
@@ -11164,7 +11138,7 @@ impl Executor {
             table_alias,
             ctx,
         )?;
-        let projected = Self::run_ordered_projection(&plan, rows, ctx, None)?;
+        let projected = Self::run_ordered_projection(&plan, rows, ctx)?;
         Ok((projected, extra_names, layout))
     }
 
@@ -11363,7 +11337,7 @@ impl Executor {
             );
             columns.extend(extra_names);
             return Ok(Some(JoinOutput {
-                projection: OutputProjection::Ordered(plan),
+                projection: JoinProjection::General(OutputProjection::Ordered(plan)),
                 columns: CompactArc::new(columns),
                 layout: Some(CompactArc::new(layout)),
                 visible: None,
@@ -11371,7 +11345,7 @@ impl Executor {
         }
         let plan = self.select_projection(&stmt.columns, all_columns, None, None)?;
         Ok(Some(JoinOutput {
-            projection: OutputProjection::Select(plan),
+            projection: JoinProjection::General(OutputProjection::Select(plan)),
             columns: CompactArc::new(columns),
             layout: Self::output_layout(stmt, all_columns, None).map(CompactArc::new),
             visible: None,
@@ -11379,8 +11353,7 @@ impl Executor {
     }
 
     /// The output of a join whose SELECT list or ORDER BY holds subqueries
-    /// the statement's `blocks` run: each item and each key that holds one
-    /// compiled as the blocks rewrote it, each key a column of its own
+    /// the statement's `blocks` run, projected as a prepared statement's is
     fn blocks_output(
         &self,
         stmt: &SelectStatement,
@@ -11388,84 +11361,24 @@ impl Executor {
         sorted: bool,
         blocks: &JoinBlocks,
     ) -> Result<JoinOutput> {
-        let registry = &self.function_registry;
-        let plain = CompileContext::new(all_columns, registry);
-        let compile = |rewritten: Option<&Expression>, expr: &Expression| {
-            match rewritten {
-                Some(rewritten) => blocks.compile(rewritten, false, registry),
-                None => ExprCompiler::new(&plain)
-                    .compile(expr)
-                    .map(CompactArc::new)
-                    .map_err(|e| Error::internal(format!("Compile error: {}", e))),
-            }
-            .map(ItemSource::Program)
-        };
-        let index_map = build_column_index_map(all_columns);
-        let mut sources: Vec<Result<ItemSource>> = Vec::with_capacity(stmt.columns.len());
-        for (item, rewritten) in stmt.columns.iter().zip(&blocks.select) {
-            match item {
-                Expression::Star(_) => {
-                    sources.extend((0..all_columns.len()).map(|i| Ok(ItemSource::Column(i))))
-                }
-                Expression::QualifiedStar(star) => {
-                    for_each_qualified_star_column(all_columns, &star.qualifier, None, |i, _| {
-                        sources.push(Ok(ItemSource::Column(i)))
-                    })
-                }
-                _ => sources.push(match (rewritten, select_column(item, &index_map)) {
-                    (None, Some(index)) => index.map(ItemSource::Column),
-                    (rewritten, _) => compile(rewritten.as_ref(), unaliased_item(item)),
-                }),
-            }
-        }
+        let (projection, extra_names, extra_sources) =
+            PreparedProjection::prepare_joined(self, stmt, all_columns, sorted, blocks)?;
         let mut columns = self.get_output_column_names(&stmt.columns, all_columns, None);
-        let keys_hold_subqueries = blocks
-            .order_by
-            .iter()
-            .chain(&blocks.distinct_on)
-            .any(Option::is_some);
-        if sorted || !(keys_hold_subqueries || self.order_by_needs_extra_columns(stmt, all_columns))
-        {
+        if extra_names.is_empty() {
             return Ok(JoinOutput {
-                projection: OutputProjection::Ordered(OrderedProjection::Items(sources)),
+                projection: JoinProjection::Prepared(projection),
                 columns: CompactArc::new(columns),
                 layout: Self::output_layout(stmt, all_columns, None).map(CompactArc::new),
                 visible: None,
             });
         }
         let visible = columns.len();
-        let plan = self.order_by_projection(
-            &stmt.columns,
-            &stmt.order_by,
-            &stmt.distinct_on,
-            stmt.table_expr.as_deref(),
-            all_columns,
-            true,
-        );
-        sources.extend(
-            plan.extra_order_indices
-                .iter()
-                .map(|&i| Ok(ItemSource::Column(i))),
-        );
-        for key in &plan.computed_order_by {
-            let at = stmt
-                .order_by
-                .iter()
-                .position(|ob| std::ptr::eq(&ob.expression, *key));
-            let rewritten = at.and_then(|at| blocks.order_by[at].as_ref());
-            sources.push(compile(rewritten, key));
-        }
-        for key in &plan.computed_distinct_on {
-            let at = stmt.distinct_on.iter().position(|k| std::ptr::eq(k, *key));
-            let rewritten = at.and_then(|at| blocks.distinct_on[at].as_ref());
-            sources.push(compile(rewritten, key));
-        }
         let mut layout =
             Self::shared_select_layout(&stmt.columns, CompactArc::new(all_columns.to_vec()), None);
-        layout.sources.extend(plan.extra_sources);
-        columns.extend(plan.extra_names);
+        layout.sources.extend(extra_sources);
+        columns.extend(extra_names);
         Ok(JoinOutput {
-            projection: OutputProjection::Ordered(OrderedProjection::Items(sources)),
+            projection: JoinProjection::Prepared(projection),
             columns: CompactArc::new(columns),
             layout: Some(CompactArc::new(layout)),
             visible: Some(visible),
@@ -11493,19 +11406,26 @@ impl Executor {
     }
 
     /// The result `output` builds from joined rows, its subqueries answered
-    /// by the statement's `blocks`; `applied` when the join applied the
-    /// LIMIT and OFFSET
+    /// by the statement's `run`; `applied` when the join applied the LIMIT
+    /// and OFFSET
     fn join_output_result(
         output: &JoinOutput,
         rows: RowVec,
         applied: bool,
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        run: Option<&super::prepared_select::PreparedRunner<'_>>,
     ) -> SelectResult {
         let rows = match &output.projection {
-            OutputProjection::Select(plan) => Self::run_select_projection(plan, rows, ctx)?,
-            OutputProjection::Ordered(plan) => {
-                Self::run_ordered_projection(plan, rows, ctx, blocks)?
+            JoinProjection::General(OutputProjection::Select(plan)) => {
+                Self::run_select_projection(plan, rows, ctx)?
+            }
+            JoinProjection::General(OutputProjection::Ordered(plan)) => {
+                Self::run_ordered_projection(plan, rows, ctx)?
+            }
+            JoinProjection::Prepared(projection) => {
+                let run =
+                    run.ok_or_else(|| Error::internal("a join's blocks output without a run"))?;
+                projection.project(rows, run)?
             }
         };
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output.columns), rows);
@@ -11522,16 +11442,14 @@ impl Executor {
         ))
     }
 
-    /// The rows `plan` projects, each with its position as its id, its
-    /// subqueries answered by the statement's `blocks`
+    /// The rows `plan` projects, each with its position as its id
     fn run_ordered_projection(
         plan: &OrderedProjection,
         rows: RowVec,
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<RowVec> {
         let mut projected = RowVec::with_capacity(rows.len());
-        Self::project_ordered_into(plan, rows, ctx, blocks, &mut projected)?;
+        Self::project_ordered_into(plan, rows, ctx, &mut projected)?;
         Ok(projected)
     }
 
@@ -11540,10 +11458,9 @@ impl Executor {
         plan: &OrderedProjection,
         mut rows: RowVec,
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
         projected: &mut impl RowSink,
     ) -> Result<()> {
-        let params = blocks.and_then(|b| b.params()).unwrap_or(ctx.params());
+        let params = ctx.params();
         match plan {
             OrderedProjection::Columns { select, extra } => {
                 for (row_id, row) in rows.drain_rows().enumerate() {
@@ -11570,7 +11487,7 @@ impl Executor {
                     |program| Ok(ItemSource::Program(program)),
                 );
                 let sources = bound.as_deref().unwrap_or(sources);
-                Self::project_items_into(sources, rows, ctx, params, blocks, projected)?;
+                Self::project_items_into(sources, rows, ctx, params, projected)?;
             }
         }
         Ok(())
@@ -11583,7 +11500,6 @@ impl Executor {
         mut rows: RowVec,
         ctx: &ExecutionContext,
         params: &[Value],
-        blocks: Option<&dyn SubqueryExecutor>,
         projected: &mut impl RowSink,
     ) -> Result<()> {
         let mut vm = ExprVM::new();
@@ -11592,9 +11508,6 @@ impl Executor {
             let mut exec = ExecuteContext::with_common_params(&row, params, transaction_id);
             if let Some(outer) = outer {
                 exec = exec.with_outer_row(outer);
-            }
-            if let Some(blocks) = blocks {
-                exec = exec.with_subquery_executor(blocks);
             }
             let mut values = projected.storage(sources.len());
             for source in sources {

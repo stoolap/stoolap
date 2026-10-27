@@ -357,7 +357,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "join_with_a_subquery_in_its_select_list",
         "SELECT t.id, (SELECT MAX(x) FROM u) FROM t JOIN u v ON v.id = t.a",
         "SELECT t.id, 3 FROM t JOIN u v ON v.id = t.a",
-        Old("a join's SELECT list projected by the general evaluator: step 7b"),
+        Prepared,
     ),
     (
         "join_with_a_view_side",
