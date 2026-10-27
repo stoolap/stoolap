@@ -770,21 +770,24 @@ fn natural_join_condition(
     let mut conditions: Vec<Expression> = Vec::new();
     let mut excluded_right_indices: Vec<usize> = Vec::new();
     let mut join_column_renames: Vec<(usize, String)> = Vec::new(); // (left_idx, base_name)
-                                                                    // Each name the join merges is one column of each side, its first of
-                                                                    // that name, as the bare name reads it in a side that is a join
-    let mut merged: Vec<&str> = Vec::new();
+
+    // Each name the join merges is one column of each side, its first of
+    // that name, as the bare name reads it in a side that is a join
     for (left_idx, left_base) in &left_base_cols {
         // For NATURAL JOIN, match all common columns
         // For USING, only match specified columns
         let named = using_col_names.is_empty() || using_col_names.contains(left_base);
-        if !named || merged.contains(&left_base.as_str()) {
+        if !named
+            || join_column_renames
+                .iter()
+                .any(|(_, name)| name == left_base)
+        {
             continue;
         }
         let Some((right_idx, _)) = right_base_cols.iter().find(|(_, right)| right == left_base)
         else {
             continue;
         };
-        merged.push(left_base);
 
         // Track right-side columns to exclude from SELECT *
         // The index in all_columns is left_columns.len() + right_idx
