@@ -5524,7 +5524,7 @@ impl Executor {
                 .map(|key| Some(key).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
             self.prepare_join_blocks(
-                (on, Self::inner_on(join_source, join_type)),
+                (join_source, on, Self::inner_on(join_source, join_type)),
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
                 [&select, &keys, &distinct],
@@ -5753,6 +5753,13 @@ impl Executor {
                 ctx,
             )?,
             false => None,
+        };
+        // Each side reads the conditions the blocks left it; the joined row
+        // asks the rest, the ones the blocks moved among them
+        let where_split = left_filter.is_some() || right_filter.is_some();
+        let (left_filter, right_filter) = match blocks.as_deref().and_then(|b| b.written.as_ref()) {
+            Some([left, right]) => (left.clone(), right.clone()),
+            None => (left_filter, right_filter),
         };
         // A side read as rows reads its conditions without a block; the
         // blocks ask those of its others that bind as it is read, and the
@@ -7302,7 +7309,7 @@ impl Executor {
         // we should ONLY apply cross_filter (predicates that reference both tables).
         // If cross_filter is None and any pushdown happened, we don't need post-join filtering.
         // Only use stmt.where_clause when NO pushdown happened at all.
-        let did_any_pushdown = left_filter.is_some() || right_filter.is_some();
+        let did_any_pushdown = where_split;
         let effective_where = if did_any_pushdown {
             // Pushdown happened - only apply cross predicates (if any)
             cross_filter.clone()

@@ -1130,6 +1130,11 @@ struct ScopeTable {
     /// Each column's own name, lowercase, as a bare reference names it
     lower: CompactArc<Vec<String>>,
     types: Vec<DataType>,
+    /// The first columns, which a bare name may bind; past them a column is
+    /// read only through its table's name
+    bare: usize,
+    /// The names a NATURAL or USING join merges, one column to a bare name
+    merged: SmallVec<[SmartString; 1]>,
 }
 
 impl ScopeTable {
@@ -1139,6 +1144,8 @@ impl ScopeTable {
             columns: schema.column_names_arc(),
             lower: schema.column_names_lower_arc(),
             types: schema.columns.iter().map(|c| c.data_type).collect(),
+            bare: schema.columns.len(),
+            merged: SmallVec::new(),
         }
     }
 
@@ -1156,12 +1163,38 @@ impl ScopeTable {
         let joined = |left: &[String], right: &[String]| {
             CompactArc::new(left.iter().chain(right).cloned().collect::<Vec<_>>())
         };
+        let mut merged = left.merged;
+        merged.extend(right.merged);
         Self {
             tables,
             columns: joined(&left.columns, &right.columns),
             lower: joined(&left.lower, &right.lower),
             types: left.types.into_iter().chain(right.types).collect(),
+            bare: offset + right.lower.len(),
+            merged,
         }
+    }
+
+    /// The scope of `join` of `left` and `right`, a name its USING list or
+    /// a NATURAL join merges one column to a bare name
+    fn joined(join: &JoinTableSource, left: Self, right: Self) -> Self {
+        let mut merged: SmallVec<[SmartString; 1]> = join
+            .using_columns
+            .iter()
+            .map(|c| c.value_lower.clone())
+            .collect();
+        if join.join_type.to_uppercase().contains("NATURAL") {
+            let right_names = &right.lower[..right.bare];
+            merged.extend(
+                left.lower[..left.bare]
+                    .iter()
+                    .filter(|name| right_names.contains(name))
+                    .map(|name| SmartString::from(name.as_str())),
+            );
+        }
+        let mut scope = Self::beside(left, right);
+        scope.merged.extend(merged);
+        scope
     }
 
     /// This scope read by position, each column under a name no column can
@@ -1174,6 +1207,8 @@ impl ScopeTable {
             columns: CompactArc::new((0..width).map(|i| format!("{RESOLVED}#{i}")).collect()),
             lower: CompactArc::clone(&self.lower),
             types: self.types.clone(),
+            bare: self.bare,
+            merged: self.merged.clone(),
         }
     }
 
@@ -1217,6 +1252,8 @@ impl ScopeTable {
             columns: CompactArc::new(Vec::new()),
             lower: CompactArc::new(Vec::new()),
             types: Vec::new(),
+            bare: 0,
+            merged: SmallVec::new(),
         }
     }
 
@@ -1303,6 +1340,8 @@ impl ScopeTable {
             ),
             lower: CompactArc::new(lower),
             types: vec![DataType::Null; columns.len()],
+            bare: columns.len(),
+            merged: SmallVec::new(),
         })
     }
 
@@ -1321,8 +1360,8 @@ impl ScopeTable {
         (&self.tables[at].0, self.tables[at].1..end)
     }
 
-    /// An error when a column in `rest` of one table is also named `name`:
-    /// a derived table may repeat a name, and a reference to it is ambiguous
+    /// An error when a column in `rest` is also named `name`: a reference to
+    /// a name two columns have is ambiguous, in one table or in two
     fn unique(&self, mut rest: std::ops::Range<usize>, name: &str, spelled: &str) -> Result<()> {
         match rest.any(|i| self.lower[i] == name) {
             true => Err(Error::invalid_argument(format!(
@@ -1390,6 +1429,22 @@ struct StatementWalk<'w> {
 }
 
 impl StatementWalk<'_> {
+    /// Each subquery of `expr`, walked over the scopes `enclosing`
+    fn subqueries_of(&mut self, expr: &Expression, enclosing: &[&ScopeTable]) -> Result<()> {
+        let block = |walk: &mut Self, sq: &SelectStatement| {
+            walk.statement(sq, enclosing, 0, Check::All).map(drop)
+        };
+        match expr {
+            Expression::ScalarSubquery(sq) => block(self, &sq.subquery),
+            Expression::Exists(exists) => block(self, &exists.subquery),
+            Expression::AllAny(all_any) => {
+                self.subqueries_of(&all_any.left, enclosing)?;
+                block(self, &all_any.subquery)
+            }
+            other => for_each_child(other, &mut |child| self.subqueries_of(child, enclosing)),
+        }
+    }
+
     /// `stmt` over the scopes `enclosing`, nearest first, the first `inside`
     /// of them inside the block, with the names its rows have, as
     /// `output_names` gives them, and the scope its FROM gives it
@@ -1623,7 +1678,7 @@ impl StatementWalk<'_> {
                 let (Some(left), Some(right)) = (left, right) else {
                     return Err(Error::internal("a join side without a source"));
                 };
-                let scope = ScopeTable::beside(left_scope, right_scope);
+                let scope = ScopeTable::joined(join, left_scope, right_scope);
                 let condition = match join.condition.as_deref() {
                     Some(on) => {
                         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
@@ -1864,9 +1919,11 @@ impl Chain<'_> {
         }
         // A name is a column's whole name, dots and all, before a qualifier's
         for (depth, scope) in self.scopes.iter().enumerate() {
-            if let Some(index) = scope.lower.iter().position(|c| *c == id.value_lower) {
-                let (_, range) = scope.table(index);
-                scope.unique(index + 1..range.end, &id.value_lower, &id.value)?;
+            let bare = &scope.lower[..scope.bare];
+            if let Some(index) = bare.iter().position(|c| *c == id.value_lower) {
+                if !scope.merged.contains(&id.value_lower) {
+                    scope.unique(index + 1..scope.bare, &id.value_lower, &id.value)?;
+                }
                 return Ok(Some((depth, index)));
             }
         }
@@ -7075,11 +7132,14 @@ impl PreparedDml {
             } else {
                 sites.table.clone()
             };
-            ScopeTable::beside(
+            // A bare name reads the row met; the excluded row only by its name
+            let mut joined = ScopeTable::beside(
                 ScopeTable::of(target, sites.schema),
                 ScopeTable::of(excluded, sites.schema),
             )
-            .by_position()
+            .by_position();
+            joined.bare = sites.schema.columns.len();
+            joined
         });
         let mut conflict_parts = None;
         if let (Some(sites), Some(joined)) = (conflict, &joined) {
@@ -7258,6 +7318,9 @@ pub(crate) struct JoinBlocks {
     /// The WHERE's conditions on the left side alone, and on the right,
     /// over the joined row
     pub(crate) sides: [Option<Expression>; 2],
+    /// The same conditions as written, which the sides' reads are given,
+    /// when a subquery that reads the other side moved one to the joined row
+    pub(crate) written: Option<[Option<Expression>; 2]>,
     /// The same conditions as their side's scan reads them
     side_wheres: [Option<PreparedWhere>; 2],
     /// The columns of each side the clauses were prepared over
@@ -7270,8 +7333,9 @@ pub(crate) struct JoinBlocks {
     /// The plan of a side that is itself a join, which runs its ON's
     /// subqueries as its own blocks; None for a side that is one source
     pub(crate) nested: [Option<RwLock<CompiledExecution>>; 2],
-    /// The conditions on a side read as rows that ask a block of each row,
-    /// asked of the joined row with the WHERE's others there
+    /// The conditions on a side asked of the joined row with the WHERE's
+    /// others there: one on a side read as rows that asks a block of each
+    /// row, or one whose subquery reads the other side
     pub(crate) moved: Option<Expression>,
     /// Each SELECT item, ORDER BY key and DISTINCT ON key holding a
     /// subquery, over the joined row
@@ -7330,16 +7394,16 @@ impl JoinBlocks {
         })
     }
 
-    /// `on`, `inner_on` when it is an INNER join's, `cross`, the conditions on
-    /// one side, `side_filters`, and the SELECT items, ORDER BY keys and
-    /// DISTINCT ON keys holding a subquery, `output`, over the joined row of
-    /// `sides`, each a name, its columns' schema and whether it is read as
-    /// rows; None when the join's `width` columns do not line up
+    /// `join`'s `on`, `inner_on` when it is an INNER join's, `cross`, the
+    /// conditions on one side, `side_filters`, and the SELECT items, ORDER BY
+    /// keys and DISTINCT ON keys holding a subquery, `output`, over the
+    /// joined row of `sides`, each a name, its columns' schema and whether it
+    /// is read as rows; None when the join's `width` columns do not line up
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
-        (on, inner_on): (Option<&Expression>, bool),
+        (join, on, inner_on): (&JoinTableSource, Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
@@ -7358,7 +7422,7 @@ impl JoinBlocks {
             return Ok(None);
         };
         let left_width = left_scope.columns.len();
-        let scope = ScopeTable::beside(left_scope, right_scope).by_position();
+        let scope = ScopeTable::joined(join, left_scope, right_scope).by_position();
         if scope.columns.len() != width {
             return Ok(None);
         }
@@ -7377,11 +7441,33 @@ impl JoinBlocks {
         // before its first row; one that asks a block of each row is asked
         // of the joined row
         let mut kept: [Option<Expression>; 2] = [None, None];
+        let mut written: [Option<Expression>; 2] = [None, None];
+        let mut crossed = false;
         let mut moved = Vec::new();
         for (i, filter) in side_filters.into_iter().enumerate() {
             let Some(filter) = filter else {
                 continue;
             };
+            // A condition whose subquery reads the other side is the joined row's
+            let mut parts = Vec::new();
+            conjuncts(filter, &mut parts);
+            let mut own = Vec::new();
+            for part in parts {
+                let other = 2 >> i;
+                match mentions_subquery(part)
+                    && sides_read_within(executor, ctx, part, &scope, left_width)? & other != 0
+                {
+                    true => {
+                        crossed = true;
+                        moved.push(part.clone())
+                    }
+                    false => own.push(part.clone()),
+                }
+            }
+            let Some(filter) = conjunction(own) else {
+                continue;
+            };
+            let filter = &*written[i].insert(filter);
             if !rows_sides[i] {
                 kept[i] = Some(filter.clone());
                 continue;
@@ -7538,6 +7624,7 @@ impl JoinBlocks {
             on,
             cross,
             sides: side_filters,
+            written: crossed.then_some(written),
             side_wheres,
             side_columns,
             fitted: Default::default(),
@@ -7668,7 +7755,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_join_blocks(
         &self,
-        on: (Option<&Expression>, bool),
+        on: (&JoinTableSource, Option<&Expression>, bool),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
@@ -8225,6 +8312,34 @@ fn mentions_subquery(expr: &Expression) -> bool {
             found
         }
     }
+}
+
+/// The sides of the joined row `scope`, the left one its first `left_width`
+/// columns, that a subquery of `expr` reads: bit 0 the left, bit 1 the right
+fn sides_read_within(
+    executor: &Executor,
+    ctx: &ExecutionContext,
+    expr: &Expression,
+    scope: &ScopeTable,
+    left_width: usize,
+) -> Result<u8> {
+    let mut read = 0;
+    let mut on = |reach: Reach<'_>| match reach {
+        Reach::Outer(expr, depth, index) => {
+            if depth == 1 {
+                read |= if index < left_width { 1 } else { 2 };
+            }
+            Ok(Some(expr.clone()))
+        }
+        Reach::Param(_) => Ok(None),
+    };
+    let mut walk = StatementWalk {
+        executor,
+        ctx,
+        on: &mut on,
+    };
+    walk.subqueries_of(expr, &[scope])?;
+    Ok(read)
 }
 
 impl Builder<'_> {
