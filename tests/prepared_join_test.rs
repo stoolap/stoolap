@@ -203,3 +203,28 @@ fn a_subquery_in_the_select_list_is_read_each_execution() {
         .collect();
     assert_eq!((before, after), (vec![50], vec![1000]));
 }
+
+#[test]
+fn an_index_join_reading_its_left_side_by_key_asks_the_rest_of_the_on() {
+    let db = Database::open("memory://prepared_join_swapped_residual").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO l VALUES (1, 999)",
+        "INSERT INTO r VALUES (2, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT l.id, r.id, (SELECT 1) FROM l JOIN r ON l.id = r.k AND l.k = r.id WHERE r.id = 2",
+        "SELECT l.id, r.id FROM l JOIN r ON l.id = r.k AND l.k = r.id WHERE r.id = 2",
+    ] {
+        reset_join_paths();
+        assert_eq!(rows(&db, sql), Vec::<String>::new(), "{sql}");
+        let taken = join_paths_taken();
+        assert!(
+            taken.iter().any(|path| path.contains("index")),
+            "{sql}: took {taken:?}"
+        );
+    }
+}

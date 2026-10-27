@@ -68,10 +68,10 @@ use super::result::{
     DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
 };
 use super::utils::{
-    bare_name, combine_predicates_with_and, expression_contains_aggregate, extract_literal_value,
-    flip_operator, for_each_qualified_star_column, get_table_alias_from_expr, infix_to_operator,
-    is_aggregate_function, item_name, order_by_names_an_alias, split_qualified,
-    strip_table_qualifier, QUALIFIER_SEP,
+    bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
+    extract_literal_value, flip_operator, for_each_qualified_star_column,
+    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name,
+    order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -6687,34 +6687,40 @@ impl PreparedGrouped {
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
         // A group's row holds its GROUP BY items first, each holding the
-        // column it binds to when it is one, the identity of what it groups,
-        // through an alias or a position, and whether the grouping names it
-        // by its column. A hole reads an item holding the column it binds
-        // to, as the group's output reads one: the first grouping what the
-        // hole is, else the last named by its column, else the first
-        let held: Vec<(Option<usize>, ExprKey, bool)> = grouping_items(stmt)
+        // column its key binds to when it is one. A hole reads an item holding
+        // the column it binds to: between several, the one the grouped output
+        // reads for what the block wrote, by that output's own keys and item
+        // names, which it binds by text until it reads bound columns
+        let held: Vec<Option<usize>> = grouping_items(stmt)
             .into_iter()
-            .zip(&group_items)
-            .map(|(key, group)| {
+            .map(|key| {
                 let read = grouped_item(stmt, key).map_or(key, |at| unaliased(&stmt.columns[at]));
-                let column = match chain.resolve(read) {
+                match chain.resolve(read) {
                     Ok(Some((0, column))) => Some(column),
                     _ => None,
-                };
-                let named = matches!(group, GroupByItem::Column(_));
-                (column, ExprKey::of(read), named)
+                }
             })
             .collect();
+        let names = schema.column_names_arc();
+        let item_names = executor.resolve_group_by_column_names_new(
+            &group_items,
+            &names,
+            &build_column_index_map(&names),
+        );
+        let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
+        let item_ctx = CompileContext::new(&item_names, &executor.function_registry);
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {
             let holding: SmallVec<[usize; 2]> = (0..held.len())
-                .filter(|&item| held[item].0 == Some(column))
+                .filter(|&item| held[item] == Some(column))
                 .collect();
-            let written = ExprKey::of(reference);
-            let mut items = holding.iter().copied();
-            items
-                .clone()
-                .find(|&item| held[item].1 == written)
-                .or_else(|| items.rfind(|&item| held[item].2))
+            let output = item_keys.get(&ExprKey::of(reference)).copied().or_else(|| {
+                item_ctx
+                    .reference(reference)
+                    .and_then(|reference| reference.row_column())
+                    .map(usize::from)
+            });
+            output
+                .filter(|item| holding.contains(item))
                 .or(holding.first().copied())
         };
         let slots_ctx = CompileContext::bound(&executor.function_registry);
