@@ -136,7 +136,9 @@ pub use parallel::{
 pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
-pub use query_cache::{CacheStats, CachedPlanRef, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
+pub use query_cache::{
+    CacheStats, CachedPlanRef, CachedQueryPlan, NestedPlan, QueryCache, DEFAULT_CACHE_SIZE,
+};
 pub use query_classification::clear_classification_cache;
 pub use result::{ColumnarResult, ExecResult, ExecutorResult};
 pub use semantic_cache::{
@@ -477,13 +479,13 @@ impl Executor {
         // Try compiled fast paths based on statement type
         self.fast_path_until_held(&plan.statement, None, || match plan.statement.as_ref() {
             Statement::Select(stmt) => {
-                self.try_fast_pk_lookup_with_params(stmt, params, &plan.compiled)
+                self.try_fast_pk_lookup_with_params(stmt, params, plan.compiled.slot())
             }
             Statement::Update(stmt) => {
-                self.try_fast_pk_update_with_params(stmt, params, &plan.compiled)
+                self.try_fast_pk_update_with_params(stmt, params, plan.compiled.slot())
             }
             Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_with_params(stmt, params, &plan.compiled)
+                self.try_fast_pk_delete_with_params(stmt, params, plan.compiled.slot())
             }
             _ => None,
         })
@@ -623,7 +625,7 @@ impl Executor {
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
-        compiled: &Arc<std::sync::RwLock<query_cache::CompiledExecution>>,
+        compiled: &std::sync::RwLock<query_cache::CompiledExecution>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         self.fast_path_until_held(statement, Some(ctx), || {
@@ -685,7 +687,7 @@ impl Executor {
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
-        compiled: &Arc<std::sync::RwLock<query_cache::CompiledExecution>>,
+        compiled: &std::sync::RwLock<query_cache::CompiledExecution>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         match statement {
@@ -894,7 +896,7 @@ impl Executor {
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
-        compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
         counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // A SELECT clears them where its top level starts
@@ -975,7 +977,7 @@ impl Executor {
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
-        compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
         counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut _deadline = None;
@@ -1021,7 +1023,7 @@ impl Executor {
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
-        compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
         counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         match statement {
@@ -1035,9 +1037,15 @@ impl Executor {
             Statement::DropView(stmt) => self.execute_drop_view(stmt, ctx),
 
             // DML statements
-            Statement::Insert(stmt) => self.execute_insert(stmt, ctx, compiled),
-            Statement::Update(stmt) => self.execute_update(stmt, ctx, compiled),
-            Statement::Delete(stmt) => self.execute_delete(stmt, ctx, compiled),
+            Statement::Insert(stmt) => {
+                self.execute_insert(stmt, ctx, compiled.map(NestedPlan::slot))
+            }
+            Statement::Update(stmt) => {
+                self.execute_update(stmt, ctx, compiled.map(NestedPlan::slot))
+            }
+            Statement::Delete(stmt) => {
+                self.execute_delete(stmt, ctx, compiled.map(NestedPlan::slot))
+            }
             Statement::Truncate(stmt) => self.execute_truncate(stmt, ctx),
 
             // Query statements - try fast-path first for simple PK lookups
@@ -1234,17 +1242,22 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         check_param_count(&plan.params, ctx.params().len())?;
         let gate = self.enter(changes_session(&plan.statement));
-        if let Statement::Insert(stmt) = plan.statement.as_ref() {
-            return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
+        // The fast paths read tables by name: CTEs the context brings are
+        // read by the plans, which hold the CTE names they bound
+        let held = !ctx.brings_ctes();
+        if let (Statement::Insert(stmt), true) = (plan.statement.as_ref(), held) {
+            return self.execute_insert_with_compiled_cache(stmt, &ctx, plan.compiled.slot());
         }
         let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-        if let Some(result) = self.compiled_fast_paths_until_held(
-            plan.statement.as_ref(),
-            &ctx,
-            &plan.compiled,
-            active_txn_id.is_some(),
-        ) {
-            return result;
+        if held {
+            if let Some(result) = self.compiled_fast_paths_until_held(
+                plan.statement.as_ref(),
+                &ctx,
+                plan.compiled.slot(),
+                active_txn_id.is_some(),
+            ) {
+                return result;
+            }
         }
 
         self.execute_statement_inner(
@@ -1252,7 +1265,7 @@ impl Executor {
             ctx,
             active_txn_id,
             Some(&plan.classification),
-            Some(&plan.compiled),
+            Some(&*plan.compiled),
             plan.counts.as_deref(),
         )
     }

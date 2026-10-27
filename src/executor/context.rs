@@ -1322,6 +1322,32 @@ type CteData = (CompactArc<Vec<String>>, CompactArc<Vec<(i64, Row)>>);
 /// to enable zero-copy sharing of CTE results with joins
 type CteDataMap = StringMap<CteData>;
 
+/// The names and columns of the CTEs a context brought when a plan was made,
+/// None for none
+#[derive(Debug)]
+pub struct CteScope(Option<Box<[ScopedCte]>>);
+
+/// A CTE's name and its columns
+type ScopedCte = (String, CompactArc<Vec<String>>);
+
+impl CteScope {
+    /// Whether `ctx` brings these CTEs and no other, each with its columns
+    pub(crate) fn holds(&self, ctx: &ExecutionContext) -> bool {
+        let data = ctx.cte_data.as_deref().filter(|data| !data.is_empty());
+        match (&self.0, data) {
+            (None, None) => true,
+            (Some(held), Some(data)) => {
+                held.len() == data.len()
+                    && held.iter().all(|(name, columns)| {
+                        data.get(name)
+                            .is_some_and(|(now, _)| now.as_slice() == columns.as_slice())
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self::new()
@@ -1471,6 +1497,7 @@ impl ExecutionContext {
     /// Create a new context with incremented view depth.
     /// Used when executing nested views to track recursion depth.
     /// Also increments query_depth since views are nested queries.
+    /// A view's query reads none of the CTEs of the statement reading it.
     pub fn with_incremented_view_depth(&self) -> Self {
         Self {
             params: self.params.clone(),
@@ -1483,7 +1510,7 @@ impl ExecutionContext {
             query_depth: self.query_depth + 1, // Views are nested queries
             outer_row: self.outer_row.clone(),
             outer_columns: self.outer_columns.clone(),
-            cte_data: self.cte_data.clone(),
+            cte_data: None,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1582,6 +1609,28 @@ impl ExecutionContext {
         self.cte_data
             .as_ref()
             .is_some_and(|data| data.contains_key(&name.to_lowercase()))
+    }
+
+    /// Whether this context brings CTEs a statement run in it may read
+    #[inline]
+    pub(crate) fn brings_ctes(&self) -> bool {
+        self.cte_data
+            .as_deref()
+            .is_some_and(|data| !data.is_empty())
+    }
+
+    /// The names and columns of the CTEs this context brings
+    pub(crate) fn cte_scope(&self) -> CteScope {
+        CteScope(
+            self.cte_data
+                .as_deref()
+                .filter(|data| !data.is_empty())
+                .map(|data| {
+                    data.iter()
+                        .map(|(name, (columns, _))| (name.clone(), columns.clone()))
+                        .collect()
+                }),
+        )
     }
 
     /// Check if context has CTE data by name that is already lowercase.

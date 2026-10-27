@@ -45,7 +45,7 @@ use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
 use crate::core::Schema;
-use crate::parser::ast::{ParamSlots, Statement};
+use crate::parser::ast::{ParamSlots, SelectStatement, Statement};
 use crate::storage::mvcc::version_store::LayoutToken;
 
 use super::query_classification::QueryClassification;
@@ -284,14 +284,45 @@ pub struct CompiledCountStar {
     pub cached_epoch: u64,
 }
 
-/// The plan of a statement or block that a statement runs inside itself,
-/// held in the plan of the one that runs it and dropped with it
+/// The plan of a statement, and those of the statements it runs inside
+/// itself, each held in the plan of the one that runs it and dropped with it
 #[derive(Debug, Default)]
-pub(crate) struct NestedPlan(RwLock<CompiledExecution>);
+pub struct NestedPlan {
+    plan: RwLock<CompiledExecution>,
+    /// Its derived FROM's, then its later set operation branches', then its
+    /// CTEs', made when one first runs
+    nested: std::sync::OnceLock<Box<[NestedPlan]>>,
+}
 
 impl NestedPlan {
-    pub(crate) fn slot(&self) -> &RwLock<CompiledExecution> {
-        &self.0
+    /// The compiled state of this statement itself
+    pub fn slot(&self) -> &RwLock<CompiledExecution> {
+        &self.plan
+    }
+
+    /// The plans nested in this one, `stmt`'s being the plan this is
+    fn nested(&self, stmt: &SelectStatement) -> &[NestedPlan] {
+        self.nested.get_or_init(|| {
+            let ctes = stmt.with.as_ref().map_or(0, |with| with.ctes.len());
+            (0..1 + stmt.set_operations.len() + ctes)
+                .map(|_| NestedPlan::default())
+                .collect()
+        })
+    }
+
+    /// The plan of `stmt`'s derived FROM
+    pub(crate) fn from(&self, stmt: &SelectStatement) -> Option<&NestedPlan> {
+        self.nested(stmt).first()
+    }
+
+    /// The plan of `stmt`'s set operation branch at `index`
+    pub(crate) fn branch(&self, stmt: &SelectStatement, index: usize) -> Option<&NestedPlan> {
+        self.nested(stmt).get(1 + index)
+    }
+
+    /// The plan of the body of `stmt`'s CTE at `index`
+    pub(crate) fn cte(&self, stmt: &SelectStatement, index: usize) -> Option<&NestedPlan> {
+        self.nested(stmt).get(1 + stmt.set_operations.len() + index)
     }
 }
 
@@ -339,7 +370,7 @@ pub struct CachedPlanRef {
     /// The parameter slots the statement takes
     pub params: ParamSlots,
     /// Shared reference to compiled execution state (lazily populated)
-    pub compiled: Arc<RwLock<CompiledExecution>>,
+    pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
     /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
@@ -390,7 +421,7 @@ pub struct CachedQueryPlan {
     /// Normalized query text (cache key)
     pub normalized_query: SmartString,
     /// Compiled execution state (lazily populated on first execution)
-    pub compiled: Arc<RwLock<CompiledExecution>>,
+    pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
     /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
@@ -414,7 +445,7 @@ impl CachedQueryPlan {
             usage_count: 1,
             params,
             normalized_query,
-            compiled: Arc::new(RwLock::new(CompiledExecution::Unknown)),
+            compiled: Arc::new(NestedPlan::default()),
             classification: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -479,7 +510,7 @@ impl QueryCache {
         let normalized_key = SmartString::new(normalize_query(query));
 
         // Create the compiled state upfront - shared between stored plan and returned ref
-        let compiled = Arc::new(RwLock::new(CompiledExecution::Unknown));
+        let compiled = Arc::new(NestedPlan::default());
         let classification = Arc::new(std::sync::OnceLock::new());
         let counts = counts_slot(&statement);
 
@@ -534,7 +565,7 @@ impl QueryCache {
             // Check both the compiled lookup table name and query text
             plans.retain(|_key, plan| {
                 // Check if compiled lookup references this table
-                if let Ok(compiled) = plan.compiled.read() {
+                if let Ok(compiled) = plan.compiled.slot().read() {
                     match &*compiled {
                         CompiledExecution::PkLookup(lookup)
                             if lookup.table_name == *table_lower =>

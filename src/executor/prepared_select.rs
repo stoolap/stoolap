@@ -49,7 +49,7 @@ use super::aggregation::{
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
-    ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys, MemberSet,
+    CteScope, ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys, MemberSet,
 };
 use super::expr_key::ExprKey;
 use super::expression::{
@@ -3143,6 +3143,8 @@ impl WhereParts {
 #[derive(Debug)]
 pub struct PreparedSelect {
     cached_epoch: u64,
+    /// The CTEs its context bound
+    cte_scope: CteScope,
     /// The columns of the statement's table or derived table at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
@@ -4743,7 +4745,7 @@ impl Builder<'_> {
             return Ok(None);
         };
         let parsed = self.executor.parse_view_statement(&view.query)?;
-        let tables = match parsed.as_ref() {
+        let tables = match parsed.statement.as_ref() {
             Statement::Select(select) => self.executor.read_tables(select),
             _ => None,
         };
@@ -6315,6 +6317,7 @@ impl PreparedSelect {
         let where_ = parts.prepare(where_programs, &blocks, schema);
         Ok(Self {
             cached_epoch: epoch,
+            cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
             holes,
@@ -6334,6 +6337,8 @@ impl PreparedSelect {
 #[derive(Debug)]
 pub struct PreparedGrouped {
     cached_epoch: u64,
+    /// The CTEs its context bound
+    cte_scope: CteScope,
     /// The table's schema the clauses were prepared over, or the columns of
     /// the rows of another source
     schema: CompactArc<Schema>,
@@ -6793,6 +6798,7 @@ impl PreparedGrouped {
         }
         Ok(Some(Self {
             cached_epoch: epoch,
+            cte_scope: ctx.cte_scope(),
             schema,
             source,
             blocks,
@@ -6857,16 +6863,19 @@ impl Executor {
     /// when the statement's blocks read a column outside its groups
     pub(crate) fn prepared_grouped<'s>(
         &self,
-        compiled: Option<&RwLock<CompiledExecution>>,
+        plan: Option<&NestedPlan>,
         stmt: &'s SelectStatement,
         ctx: &'s ExecutionContext,
     ) -> Result<Option<GroupedRun<'s>>> {
         let epoch = self.engine.schema_epoch();
+        let compiled = plan.map(NestedPlan::slot);
         let held = compiled
             .and_then(|slot| slot.read().ok())
             .and_then(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p)
-                    if p.cached_epoch == epoch && p.blocks.param_count == ctx.params().len() =>
+                    if p.cached_epoch == epoch
+                        && p.cte_scope.holds(ctx)
+                        && p.blocks.param_count == ctx.params().len() =>
                 {
                     Some(Arc::clone(p))
                 }
@@ -6890,7 +6899,7 @@ impl Executor {
         }
         let inner_ctx = ctx.with_incremented_query_depth();
         // A grouped statement reads every row
-        let (source, scope_name) = self.read_source(stmt, ctx, &inner_ctx, None)?;
+        let (source, scope_name) = self.read_source(stmt, plan, ctx, &inner_ctx, None)?;
         let scope_name = scope_name.cloned().unwrap_or_default();
         let columns = source.as_ref().and_then(StatementSource::columns);
         if let Some(held) = held.filter(|p| {
@@ -6987,11 +6996,13 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
                 CompiledExecution::PreparedJoin(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope.holds(ctx)
                         && p.holds_grouped()
                         && ctx.outer_row().is_none()
                 }
@@ -7036,6 +7047,8 @@ impl Executor {
 #[derive(Debug)]
 pub struct PreparedDml {
     cached_epoch: u64,
+    /// The CTEs its context bound
+    cte_scope: CteScope,
     /// The target's columns at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
@@ -7354,6 +7367,7 @@ impl PreparedDml {
             .map(|(parts, program)| parts.prepare(program, &blocks, schema));
         Ok(Self {
             cached_epoch: epoch,
+            cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
             holes,
@@ -7393,7 +7407,8 @@ pub(crate) struct JoinBlocks {
     /// Whether each side is read whole as rows, not scanned as a table
     pub(crate) rows_sides: [bool; 2],
     /// The plan of a side that is itself a join, which runs its ON's
-    /// subqueries as its own blocks; None for a side that is one source
+    /// subqueries as its own blocks, or of a derived table's statement read
+    /// as rows; None for a side scanned as a table
     pub(crate) nested: [Option<NestedPlan>; 2],
     /// The conditions on a side asked of the joined row with the WHERE's
     /// others there: one on a side read as rows that asks a block of each
@@ -7707,7 +7722,7 @@ impl JoinBlocks {
             rows_sides,
             nested: sides
                 .each_ref()
-                .map(|side| (side.leaves.len() > 1).then(NestedPlan::default)),
+                .map(|side| (side.leaves.len() > 1 || side.rows).then(NestedPlan::default)),
             moved,
             select,
             order_by,
@@ -8608,7 +8623,7 @@ impl Executor {
             &run.statement,
             ctx,
             Some(&run.classification),
-            Some(run.compiled.slot()),
+            Some(&run.compiled),
             None,
         )?;
         let columns = result.columns().to_vec();
@@ -8739,6 +8754,7 @@ impl Executor {
         let epoch = self.engine.schema_epoch();
         let fits = |p: &PreparedSelect| {
             p.cached_epoch == epoch
+                && p.cte_scope.holds(ctx)
                 && p.blocks.param_count == ctx.params().len()
                 && (std::ptr::eq(p.columns.as_slice(), columns) || p.columns.as_slice() == columns)
         };
@@ -8804,6 +8820,7 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedSelect(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
@@ -8823,6 +8840,7 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedDml(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
+                        && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
@@ -8884,6 +8902,7 @@ impl Executor {
         let returning_columns = returning.map(|sites| sites.schema.column_names_arc());
         let fits = |p: &PreparedDml| {
             p.cached_epoch == epoch
+                && p.cte_scope.holds(ctx)
                 && p.blocks.param_count == ctx.params().len()
                 && same(&p.columns, &columns)
                 && match (&p.conflict, &conflict_columns) {
@@ -8984,12 +9003,14 @@ impl Executor {
     /// What `stmt` reads its rows from, and the name its scope bears: None
     /// for a base table, left closed; else a CTE's rows, a VALUES list, or a
     /// view's, a derived table's or a table function's rows, read once under
-    /// the statement's snapshot, before a plan is taken, or without FROM the
-    /// one row without columns. A table function
-    /// generates at most `first` rows when the caller needs no more
+    /// the statement's snapshot, before a plan is taken, a derived table
+    /// under its own in `plan`, or without FROM the one row without columns.
+    /// A table function generates at most `first` rows when the caller
+    /// needs no more
     fn read_source<'s>(
         &self,
         stmt: &'s SelectStatement,
+        plan: Option<&NestedPlan>,
         ctx: &'s ExecutionContext,
         inner_ctx: &ExecutionContext,
         first: Option<usize>,
@@ -9018,7 +9039,9 @@ impl Executor {
                 (source, Some(scope))
             }
             Some(Expression::SubquerySource(ss)) => {
-                let result = self.execute_select(&ss.subquery, inner_ctx)?;
+                let plan = plan.and_then(|plan| plan.from(stmt));
+                let result =
+                    self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan, None)?;
                 let columns = result.columns().to_vec();
                 let rows = Self::materialize_result(result)?;
                 (Some(StatementSource::Rows(columns, rows)), named(&ss.alias))
@@ -9122,7 +9145,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        compiled: Option<&RwLock<CompiledExecution>>,
+        plan: Option<&NestedPlan>,
         limit: Option<usize>,
         offset: usize,
     ) -> Result<PreparedOutput> {
@@ -9131,7 +9154,8 @@ impl Executor {
         let first = limit
             .filter(|_| stmt.where_clause.is_none() && stmt.order_by.is_empty())
             .map(|limit| limit.saturating_add(offset));
-        let (source, scope_name) = self.read_source(stmt, ctx, &inner_ctx, first)?;
+        let (source, scope_name) = self.read_source(stmt, plan, ctx, &inner_ctx, first)?;
+        let compiled = plan.map(NestedPlan::slot);
         let source = match (source, stmt.table_expr.as_deref()) {
             (Some(source), _) => source,
             (None, Some(Expression::TableSource(ts))) => {
@@ -12486,7 +12510,7 @@ impl PreparedRunner<'_> {
             &block.run.statement,
             &ctx,
             Some(&block.run.classification),
-            Some(block.run.compiled.slot()),
+            Some(&block.run.compiled),
             None,
         )
     }
@@ -12500,7 +12524,7 @@ impl PreparedRunner<'_> {
             &run.statement,
             &self.ctx,
             Some(&run.classification),
-            Some(run.compiled.slot()),
+            Some(&run.compiled),
             None,
         )?;
         let mut values = Vec::new();

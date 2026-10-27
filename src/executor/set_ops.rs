@@ -21,12 +21,13 @@
 
 use crate::core::row_vec::RowVec;
 use crate::core::{Result, Row};
-use crate::parser::ast::{SetOperation, SetOperationType};
+use crate::parser::ast::{SelectStatement, SetOperationType};
 use crate::storage::traits::QueryResult;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::context::ExecutionContext;
+use super::query_cache::NestedPlan;
 use super::result::ExecutorResult;
 use super::utils::{hash_row, rows_equal};
 use super::Executor;
@@ -34,13 +35,16 @@ use super::Executor;
 impl Executor {
     /// Execute set operations (UNION, INTERSECT, EXCEPT)
     /// The limit parameter enables early termination for UNION ALL
+    /// Each later branch runs under its own plan in `plan`, `stmt`'s
     pub(crate) fn execute_set_operations(
         &self,
         left_result: Box<dyn QueryResult>,
-        set_ops: &[SetOperation],
+        stmt: &SelectStatement,
+        plan: Option<&NestedPlan>,
         ctx: &ExecutionContext,
         limit: Option<usize>,
     ) -> Result<Box<dyn QueryResult>> {
+        let set_ops = &stmt.set_operations;
         // Materialize the left result (with limit for UNION ALL optimization)
         let columns = left_result.columns().to_vec();
 
@@ -79,7 +83,7 @@ impl Executor {
         };
 
         // Process each set operation in sequence
-        for set_op in set_ops {
+        for (index, set_op) in set_ops.iter().enumerate() {
             // For UNION ALL with limit, check if we already have enough rows
             if matches!(set_op.operation, SetOperationType::UnionAll) {
                 if let Some(lim) = limit {
@@ -92,7 +96,9 @@ impl Executor {
 
             // Execute the right side query with incremented depth (part of same logical query)
             let set_ctx = ctx.with_incremented_query_depth();
-            let right_result = self.execute_select(&set_op.right, &set_ctx)?;
+            let branch = plan.and_then(|plan| plan.branch(stmt, index));
+            let right_result =
+                self.execute_select_with_plan(&set_op.right, &set_ctx, None, branch, None)?;
 
             // Validate column count matches (SQL standard requirement)
             let right_col_count = right_result.columns().len();
