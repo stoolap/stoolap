@@ -716,6 +716,16 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
             ),
             vec![yes, outside],
         ),
+        (
+            format!(
+                "WITH c(id) AS (SELECT id FROM l WHERE id > (SELECT MIN(id) - 1000 FROM s)) \
+                 SELECT c.id, d.k FROM c JOIN ({join}) d \
+                 ON d.id = c.id AND EXISTS (SELECT 1 FROM s WHERE s.id = d.id) JOIN r z \
+                 ON z.id = c.id WHERE EXISTS (SELECT 1 FROM s WHERE s.id = c.id) \
+                 AND c.id IN (SELECT id FROM c)"
+            ),
+            vec![yes, yes],
+        ),
     ];
     let mut wrong = Vec::new();
     for (sql, want) in &selects {

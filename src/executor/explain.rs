@@ -589,19 +589,20 @@ impl Executor {
 
     /// Whether the join `select` reads from runs its subqueries as prepared
     /// blocks, as the statement run alone decides it, or why not; `own`
-    /// when `select` holds a plan
+    /// when `select` holds a plan, `with` the clause naming its CTEs
     fn join_prepared(
         &self,
         select: &SelectStatement,
         join: &JoinTableSource,
         own: bool,
+        with: Option<&WithClause>,
     ) -> std::result::Result<(), OutOfFamily> {
         if !own {
             return Err("a join in a SELECT that holds no plan");
         }
         // A join with CTEs keeps its plan as execution keeps it, its CTE
         // sides named by their bodies
-        let ctx = match select.with.as_ref() {
+        let ctx = match with {
             Some(with) if self.join_keeps_plan(select, with) => {
                 self.named_ctes(with).map_err(|_| "a WITH clause")?
             }
@@ -628,7 +629,9 @@ impl Executor {
     /// blocks, `own` when `select` holds a plan
     fn join_runs_blocks(&self, select: &SelectStatement, own: bool) -> bool {
         match select.table_expr.as_deref() {
-            Some(Expression::JoinSource(join)) => self.join_prepared(select, join, own).is_ok(),
+            Some(Expression::JoinSource(join)) => self
+                .join_prepared(select, join, own, select.with.as_ref())
+                .is_ok(),
             _ => false,
         }
     }
@@ -698,7 +701,7 @@ impl Executor {
         {
             let prepared = match join {
                 _ if grouped_output => self.grouped_family(select, None),
-                Some(join) => self.join_prepared(select, join, own),
+                Some(join) => self.join_prepared(select, join, own, select.with.as_ref()),
                 None => self.prepared_family(select, None),
             };
             match prepared {
@@ -741,7 +744,7 @@ impl Executor {
                 indent + 1,
                 self.join_index_use(select, self.join_runs_blocks(select, own)),
                 &cte_names(select),
-                from_plan,
+                (from_plan, select.with.as_ref()),
             );
         }
 
@@ -800,12 +803,12 @@ impl Executor {
             false,
             index_use,
             ctes,
-            false,
+            (false, None),
         )
     }
 
-    /// `from_plan` when `expr`, a derived table or a join of them, holds a
-    /// plan for each
+    /// `plans`: whether `expr`, a derived table or a join of them, holds a
+    /// plan for each, and the WITH clause naming the statement's CTEs
     #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_with_where(
         &self,
@@ -815,7 +818,7 @@ impl Executor {
         indent: usize,
         index_use: JoinIndexUse,
         ctes: &[String],
-        from_plan: bool,
+        plans: (bool, Option<&WithClause>),
     ) {
         self.explain_table_expr_inner(
             expr,
@@ -825,7 +828,7 @@ impl Executor {
             true,
             index_use,
             ctes,
-            from_plan,
+            plans,
         )
     }
 
@@ -839,7 +842,7 @@ impl Executor {
         show_join_cost: bool,
         index_use: JoinIndexUse,
         ctes: &[String],
-        from_plan: bool,
+        (from_plan, with): (bool, Option<&WithClause>),
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -1016,12 +1019,14 @@ impl Executor {
                 }
                 // A side that is a join holds a plan its sides' do only when
                 // it runs its own blocks, as the statement it runs as decides
+                // with the statement's CTEs named
                 let side_plan = |side: &Expression| match side {
                     Expression::JoinSource(inner) => {
-                        from_plan
-                            && self.join_runs_blocks(&Self::joined_side_statement(inner), true)
+                        let statement = Self::joined_side_statement(inner);
+                        let held = self.join_prepared(&statement, inner, from_plan, with);
+                        (held.is_ok(), with)
                     }
-                    _ => from_plan,
+                    _ => (from_plan, with),
                 };
                 self.explain_table_expr_inner(
                     &join.left,

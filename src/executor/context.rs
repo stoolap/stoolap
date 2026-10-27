@@ -1585,6 +1585,12 @@ impl ExecutionContext {
             .is_some_and(|data| data.contains_key(&name.to_lowercase()))
     }
 
+    /// Whether this context brings CTEs a statement run in it may read
+    #[inline]
+    pub(crate) fn brings_ctes(&self) -> bool {
+        self.cte_data.is_some()
+    }
+
     /// Check if context has CTE data by name that is already lowercase.
     /// Use this when the name is known to be lowercase to avoid allocation.
     #[inline]

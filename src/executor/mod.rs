@@ -1242,17 +1242,22 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         check_param_count(&plan.params, ctx.params().len())?;
         let gate = self.enter(changes_session(&plan.statement));
-        if let Statement::Insert(stmt) = plan.statement.as_ref() {
+        // CTEs the context brings give the text a meaning its plan was not
+        // made for, so the statement runs without its plan
+        let held = !ctx.brings_ctes();
+        if let (Statement::Insert(stmt), true) = (plan.statement.as_ref(), held) {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, plan.compiled.slot());
         }
         let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-        if let Some(result) = self.compiled_fast_paths_until_held(
-            plan.statement.as_ref(),
-            &ctx,
-            plan.compiled.slot(),
-            active_txn_id.is_some(),
-        ) {
-            return result;
+        if held {
+            if let Some(result) = self.compiled_fast_paths_until_held(
+                plan.statement.as_ref(),
+                &ctx,
+                plan.compiled.slot(),
+                active_txn_id.is_some(),
+            ) {
+                return result;
+            }
         }
 
         self.execute_statement_inner(
@@ -1260,8 +1265,8 @@ impl Executor {
             ctx,
             active_txn_id,
             Some(&plan.classification),
-            Some(&*plan.compiled),
-            plan.counts.as_deref(),
+            held.then_some(&*plan.compiled),
+            plan.counts.as_deref().filter(|_| held),
         )
     }
 }

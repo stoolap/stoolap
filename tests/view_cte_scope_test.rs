@@ -13,8 +13,16 @@
 // limitations under the License.
 
 //! A view's query reads the tables and views it names, never a CTE of the
-//! statement that reads the view, whichever statement read the view first
+//! statement that reads the view, whichever statement read the view first;
+//! a statement run in a context bringing CTEs reads them, and its text's
+//! plan stays the one its text alone means
 
+use std::sync::Arc;
+
+use stoolap::common::{CompactArc, StringMap};
+use stoolap::core::{Row, Value};
+use stoolap::executor::{ExecutionContext, Executor};
+use stoolap::storage::mvcc::engine::MVCCEngine;
 use stoolap::Database;
 
 /// t: 1, 2. u: 1. Each view reads u where a CTE named u would differ
@@ -105,6 +113,90 @@ fn a_view_reads_its_own_tables_under_a_cte_of_the_same_name() {
                         ));
                     }
                 }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// A context bringing a CTE u of the row 2
+fn cte_context() -> ExecutionContext {
+    let mut ctes = StringMap::default();
+    ctes.insert(
+        "u".into(),
+        (
+            CompactArc::new(vec!["id".to_string()]),
+            CompactArc::new(vec![(0, Row::from_values(vec![Value::Integer(2)]))]),
+        ),
+    );
+    ExecutionContext::new().with_cte_data(Arc::new(ctes))
+}
+
+fn executor_ids(
+    result: stoolap::Result<Box<dyn stoolap::storage::traits::QueryResult>>,
+) -> Result<Vec<i64>, String> {
+    let mut result = result.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while result.next() {
+        match result.row().get(0) {
+            Some(Value::Integer(id)) => out.push(*id),
+            other => return Err(format!("{other:?}")),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[test]
+fn a_statement_in_a_context_bringing_ctes_keeps_its_text_s_plan_apart() {
+    let texts = [
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u)",
+        "SELECT id FROM u WHERE id = 2",
+        "SELECT t.id FROM t JOIN u ON u.id = t.id WHERE t.id <= (SELECT MAX(id) FROM u)",
+    ];
+    let mut wrong = Vec::new();
+    for (index, text) in texts.iter().enumerate() {
+        for context_first in [true, false] {
+            let engine = MVCCEngine::in_memory();
+            engine.open_engine().unwrap();
+            let executor = Executor::new(Arc::new(engine));
+            for sql in &SETUP[..4] {
+                executor.execute(sql).unwrap();
+            }
+            let plain = |executor: &Executor| executor_ids(executor.execute(text));
+            let want_plain = if index == 1 { vec![] } else { vec![1] };
+            if !context_first {
+                let got = plain(&executor);
+                if got != Ok(want_plain.clone()) {
+                    wrong.push(format!("{text}: plain first: {got:?}"));
+                }
+            }
+            let got = executor_ids(executor.execute_with_context(text, &cte_context()));
+            if got != Ok(vec![2]) {
+                wrong.push(format!(
+                    "{text}: with the CTE, context first {context_first}: {got:?}"
+                ));
+            }
+            let got = plain(&executor);
+            if got != Ok(want_plain.clone()) {
+                wrong.push(format!(
+                    "{text}: plain after, context first {context_first}: {got:?}"
+                ));
+            }
+            let view = format!("CREATE VIEW v AS {text}");
+            let got = executor
+                .execute(&view)
+                .map_err(|e| e.to_string())
+                .and_then(|_| executor_ids(executor.execute("SELECT id FROM v")));
+            if got != Ok(want_plain) {
+                wrong.push(format!(
+                    "{text}: as a view, context first {context_first}: {got:?}"
+                ));
             }
         }
     }
