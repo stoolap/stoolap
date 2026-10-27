@@ -28,8 +28,9 @@ use crate::storage::expression::{
 use std::sync::Arc;
 
 use super::{registry, PushdownContext, PushdownResult, PushdownRule};
+use crate::common::SmartString;
 use crate::executor::utils::{
-    extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
+    column_name_of, extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
 };
 
 // =============================================================================
@@ -81,23 +82,23 @@ fn extract_comparison_parts(
     left: &ast::Expression,
     right: &ast::Expression,
     ctx: &PushdownContext<'_>,
-) -> Option<(String, Value, bool)> {
+) -> Option<(SmartString, Value, bool)> {
     // Try column on left, value on right
-    if let Some(column) = extract_column_name(left) {
-        if ctx.has_column(&column) {
+    if let Some(column) = column_name_of(left) {
+        if ctx.has_column(column) {
             if let Some(value) = extract_literal_with_ctx(right, ctx) {
-                let coerced = ctx.coerce_to_column_type(&column, value)?;
-                return Some((column, coerced, false)); // false = not flipped
+                let coerced = ctx.coerce_to_column_type(column, value)?;
+                return Some((column.clone(), coerced, false)); // false = not flipped
             }
         }
     }
 
     // Try value on left, column on right (will need to flip operator)
-    if let Some(column) = extract_column_name(right) {
-        if ctx.has_column(&column) {
+    if let Some(column) = column_name_of(right) {
+        if ctx.has_column(column) {
             if let Some(value) = extract_literal_with_ctx(left, ctx) {
-                let coerced = ctx.coerce_to_column_type(&column, value)?;
-                return Some((column, coerced, true)); // true = flipped
+                let coerced = ctx.coerce_to_column_type(column, value)?;
+                return Some((column.clone(), coerced, true)); // true = flipped
             }
         }
     }
@@ -188,13 +189,13 @@ impl PushdownRule for QuantifiedSetRule {
         if quantified.has_null {
             return PushdownResult::CannotPush;
         }
-        let Some(column) = extract_column_name(&quantified.left) else {
+        let Some(column) = column_name_of(&quantified.left) else {
             return PushdownResult::CannotPush;
         };
         let Some(op) = QuantifiedMembers::operator(&quantified.operator) else {
             return PushdownResult::CannotPush;
         };
-        match quantified_filter(column, op, quantified.all, &quantified.members, ctx) {
+        match quantified_filter(column.clone(), op, quantified.all, &quantified.members, ctx) {
             Some(filter) => PushdownResult::Converted(filter),
             None => PushdownResult::CannotPush,
         }
@@ -204,7 +205,7 @@ impl PushdownRule for QuantifiedSetRule {
 /// `column op ANY|ALL (members)`, the members holding no NULL, as the scan
 /// takes it: `column op bound` over a number column; None when it cannot
 pub(crate) fn quantified_filter(
-    column: String,
+    column: SmartString,
     op: crate::executor::expression::CompareOp,
     all: bool,
     members: &[Value],
@@ -710,17 +711,17 @@ impl PushdownRule for BooleanCheckRule {
                     _ => return PushdownResult::NotApplicable,
                 };
 
-                let column = match extract_column_name(&infix.left) {
+                let column = match column_name_of(&infix.left) {
                     Some(c) => c,
                     None => return PushdownResult::CannotPush,
                 };
 
                 // Validate column exists in schema
-                if !ctx.has_column(&column) {
+                if !ctx.has_column(column) {
                     return PushdownResult::CannotPush;
                 }
 
-                let mut expr = ComparisonExpr::eq(column, Value::Boolean(bool_val));
+                let mut expr = ComparisonExpr::eq(column.clone(), Value::Boolean(bool_val));
                 expr.prepare_for_schema(ctx.schema);
                 PushdownResult::Converted(Box::new(expr))
             }
@@ -732,19 +733,19 @@ impl PushdownRule for BooleanCheckRule {
                     _ => return PushdownResult::NotApplicable,
                 };
 
-                let column = match extract_column_name(&infix.left) {
+                let column = match column_name_of(&infix.left) {
                     Some(c) => c,
                     None => return PushdownResult::CannotPush,
                 };
 
                 // Validate column exists in schema
-                if !ctx.has_column(&column) {
+                if !ctx.has_column(column) {
                     return PushdownResult::CannotPush;
                 }
 
-                let mut ne_expr = ComparisonExpr::ne(&column, Value::Boolean(bool_val));
+                let mut ne_expr = ComparisonExpr::ne(column.clone(), Value::Boolean(bool_val));
                 ne_expr.prepare_for_schema(ctx.schema);
-                let mut null_expr = NullCheckExpr::is_null(&column);
+                let mut null_expr = NullCheckExpr::is_null(column.as_str());
                 null_expr.prepare_for_schema(ctx.schema);
 
                 PushdownResult::Converted(Box::new(OrExpr::new(vec![

@@ -4100,7 +4100,7 @@ impl Executor {
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema
             .pk_column_index()
-            .map(|idx| schema.columns[idx].name.clone());
+            .map(|idx| schema.columns[idx].name.as_str());
 
         let where_expr: Option<Box<dyn StorageExpr>> = if let Some(pk_name) = pk_col {
             // Table has PK — target by primary key value
@@ -4121,8 +4121,7 @@ impl Executor {
                         .get(idx)
                         .cloned()
                         .unwrap_or(Value::null_unknown());
-                    let mut expr =
-                        ComparisonExpr::new(col_name.to_string(), crate::core::Operator::Eq, value);
+                    let mut expr = ComparisonExpr::new(*col_name, crate::core::Operator::Eq, value);
                     expr.prepare_for_schema(schema);
                     comparisons.push(Box::new(expr));
                 }
@@ -4317,8 +4316,7 @@ impl Executor {
                 .cloned()
                 .unwrap_or(Value::null_unknown());
 
-            let mut expr =
-                ComparisonExpr::new(col_name.to_string(), crate::core::Operator::Eq, value);
+            let mut expr = ComparisonExpr::new(*col_name, crate::core::Operator::Eq, value);
             expr.prepare_for_schema(schema);
             comparisons.push(Box::new(expr));
         }
