@@ -674,7 +674,7 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
     let _turn = turn();
     let db = Database::open("memory://join_on_blocks_explain_sites").unwrap();
     fill(&db);
-    db.execute("CREATE TABLE tgt (id INTEGER PRIMARY KEY, k INTEGER)", ())
+    db.execute("CREATE TABLE tgt (id INTEGER, k INTEGER)", ())
         .unwrap();
     let join = "SELECT l.id, r.k FROM l JOIN r ON l.id = r.id \
                 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
@@ -745,8 +745,18 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         }
     }
     let insert = format!("INSERT INTO tgt {join}");
-    if lines(&insert) != [outside] {
+    if lines(&insert) != [yes] {
         wrong.push(format!("{insert}: {:?}", lines(&insert)));
+    }
+    let ran = db.execute(&insert, ()).and_then(|_| {
+        let compiles = (bridge_compiles(), program_compiles());
+        db.execute(&insert, ())?;
+        Ok((bridge_compiles(), program_compiles()) == compiles)
+    });
+    if ran.as_ref().map_err(|e| e.to_string()) != Ok(&true) {
+        wrong.push(format!(
+            "{insert}: says yes, run again it compiled ({ran:?})"
+        ));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

@@ -32,6 +32,7 @@ use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
 use super::prepared_select::OutOfFamily;
 use super::pushdown;
 use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
+use super::query_cache::NestedPlan;
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::utils::{
@@ -41,11 +42,13 @@ use super::utils::{
 use super::Executor;
 
 impl Executor {
-    /// Execute EXPLAIN statement - shows query plan
+    /// Execute EXPLAIN statement - shows query plan; EXPLAIN ANALYZE runs
+    /// its statement under the plan `plan` holds for it
     pub(crate) fn execute_explain(
         &self,
         stmt: &ExplainStatement,
         ctx: &ExecutionContext,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut plan_lines: Vec<String> = Vec::new();
 
@@ -68,7 +71,14 @@ impl Executor {
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
             let start = crate::common::time_compat::Instant::now();
-            let mut result = self.run_statement(&stmt.statement, ctx)?;
+            let mut result = self.execute_statement_inner(
+                &stmt.statement,
+                std::borrow::Cow::Borrowed(ctx),
+                self.active_txn_id(),
+                None,
+                plan.and_then(NestedPlan::source),
+                None,
+            )?;
 
             // Count rows by iterating through the result
             let mut row_count = 0usize;
@@ -265,7 +275,7 @@ impl Executor {
                 ));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2, false);
+                    self.explain_select(select, lines, indent + 2, true);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
@@ -555,7 +565,7 @@ impl Executor {
                 lines.push(format!("{}INSERT INTO {}", prefix, insert.table_name));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2, false);
+                    self.explain_select(select, lines, indent + 2, true);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
@@ -637,8 +647,8 @@ impl Executor {
     }
 
     /// Generate EXPLAIN output for a SELECT statement; `own` when it holds a
-    /// plan: the statement's own, a branch of one that does, or a derived
-    /// FROM or join side of one the runner runs
+    /// plan: the statement's own, an INSERT's source, a branch of one that
+    /// does, or a derived FROM or join side of one the runner runs
     fn explain_select(
         &self,
         select: &SelectStatement,

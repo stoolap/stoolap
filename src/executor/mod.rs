@@ -1035,15 +1035,9 @@ impl Executor {
             Statement::DropView(stmt) => self.execute_drop_view(stmt, ctx),
 
             // DML statements
-            Statement::Insert(stmt) => {
-                self.execute_insert(stmt, ctx, compiled.map(NestedPlan::slot))
-            }
-            Statement::Update(stmt) => {
-                self.execute_update(stmt, ctx, compiled.map(NestedPlan::slot))
-            }
-            Statement::Delete(stmt) => {
-                self.execute_delete(stmt, ctx, compiled.map(NestedPlan::slot))
-            }
+            Statement::Insert(stmt) => self.execute_insert(stmt, ctx, compiled),
+            Statement::Update(stmt) => self.execute_update(stmt, ctx, compiled),
+            Statement::Delete(stmt) => self.execute_delete(stmt, ctx, compiled),
             Statement::Truncate(stmt) => self.execute_truncate(stmt, ctx),
 
             // Query statements - try fast-path first for simple PK lookups
@@ -1076,7 +1070,7 @@ impl Executor {
             Statement::Describe(stmt) => self.execute_describe(stmt, ctx),
             Statement::Pragma(stmt) => self.execute_pragma(stmt, ctx),
             Statement::Expression(stmt) => self.execute_expression_stmt(stmt, ctx),
-            Statement::Explain(stmt) => self.execute_explain(stmt, ctx),
+            Statement::Explain(stmt) => self.execute_explain(stmt, ctx, compiled),
             Statement::Analyze(stmt) => self.execute_analyze(stmt, ctx),
             Statement::Vacuum(stmt) => self.execute_vacuum(stmt, ctx),
             Statement::Copy(stmt) => self.execute_copy(stmt, ctx),
@@ -1244,7 +1238,7 @@ impl Executor {
         // read by the plans, which hold the CTE names they bound
         let held = !ctx.brings_ctes();
         if let (Statement::Insert(stmt), true) = (plan.statement.as_ref(), held) {
-            return self.execute_insert_with_compiled_cache(stmt, &ctx, plan.compiled.slot());
+            return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
         let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
         if held {

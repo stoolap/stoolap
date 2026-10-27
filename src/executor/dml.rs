@@ -36,7 +36,7 @@ use std::sync::Arc;
 use super::context::ExecutionContext;
 use super::expression::CompiledEvaluator;
 use super::pushdown;
-use super::query_cache::{CompiledConflictInsert, CompiledExecution, CompiledInsert};
+use super::query_cache::{CompiledConflictInsert, CompiledExecution, CompiledInsert, NestedPlan};
 use super::result::{ExecResult, ExecutorResult};
 use super::utils::{dummy_token_clone, qualified};
 use super::Executor;
@@ -740,8 +740,9 @@ impl Executor {
         &self,
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
-        plan_cache: Option<&RwLock<CompiledExecution>>,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
+        let plan_cache = plan.map(NestedPlan::slot);
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
         let reads_through_view = super::insert_reads_through_a_view(stmt);
@@ -816,7 +817,7 @@ impl Executor {
 
         // Prepared subqueries are read before the first write, through this
         // statement's transaction; a commit-time retry runs the statement again
-        let retry_of = (stmt, ctx, plan_cache);
+        let retry_of = (stmt, ctx, plan);
         let prepared;
         let mut runner = None;
         let conflict_run;
@@ -1048,7 +1049,9 @@ impl Executor {
             // to ensure statement atomicity: a late runtime error (e.g., invalid REGEXP)
             // won't leave partial inserts pending for commit. Auto-commit transactions
             // stream rows directly since the standalone transaction rolls back on drop.
-            let mut select_result = self.execute_select(select_stmt, ctx)?;
+            let source = plan.and_then(NestedPlan::source);
+            let mut select_result =
+                self.execute_select_with_plan(select_stmt, ctx, None, source, None)?;
             if !should_auto_commit {
                 // Explicit tx: fully materialize before writes for atomicity.
                 // A late runtime error (e.g., invalid REGEXP) will fail here
@@ -1303,9 +1306,9 @@ impl Executor {
                                 // a concurrent plain INSERT committed first. Retry once.
                                 drop(returning_result);
                                 drop(_upsert_guard);
-                                let (stmt, ctx, plan_cache) = retry_of;
+                                let (stmt, ctx, plan) = retry_of;
                                 let retry_ctx = ctx.with_incremented_query_depth();
-                                return self.execute_insert(stmt, &retry_ctx, plan_cache);
+                                return self.execute_insert(stmt, &retry_ctx, plan);
                             }
                             if stmt.do_nothing {
                                 // DO NOTHING: returning 0 rows is the correct semantic
@@ -1667,9 +1670,9 @@ impl Executor {
                         if stmt.on_duplicate && ctx.query_depth == 0 {
                             drop(returning_result);
                             drop(_upsert_guard);
-                            let (stmt, ctx, plan_cache) = retry_of;
+                            let (stmt, ctx, plan) = retry_of;
                             let retry_ctx = ctx.with_incremented_query_depth();
-                            return self.execute_insert(stmt, &retry_ctx, plan_cache);
+                            return self.execute_insert(stmt, &retry_ctx, plan);
                         }
                         if stmt.do_nothing {
                             // DO NOTHING: returning 0 rows is the correct semantic
@@ -1702,12 +1705,13 @@ impl Executor {
         &self,
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
-        compiled_cache: &RwLock<CompiledExecution>,
+        plan: &NestedPlan,
     ) -> Result<Box<dyn QueryResult>> {
         // Conflict handling requires special handling - fall back to non-cached path
         if stmt.on_duplicate || stmt.do_nothing {
-            return self.execute_insert(stmt, ctx, Some(compiled_cache));
+            return self.execute_insert(stmt, ctx, Some(plan));
         }
+        let compiled_cache = plan.slot();
 
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
@@ -2001,7 +2005,8 @@ impl Executor {
 
         // Check if this is INSERT ... SELECT
         if let Some(ref select_stmt) = stmt.select {
-            let mut select_result = self.execute_select(select_stmt, ctx)?;
+            let mut select_result =
+                self.execute_select_with_plan(select_stmt, ctx, None, plan.source(), None)?;
             if !should_auto_commit {
                 // Explicit tx: fully materialize before writes for atomicity
                 let columns = select_result.columns().to_vec();
@@ -2219,13 +2224,15 @@ impl Executor {
         &self,
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
-        compiled: Option<&std::sync::RwLock<super::query_cache::CompiledExecution>>,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
+        let compiled = plan.map(NestedPlan::slot);
         // A WITH clause is run first, so the subqueries can read it
         let ctx_with_ctes;
         let ctx = match &stmt.with {
             Some(with_clause) => {
-                let registry = self.materialize_ctes(with_clause, None, ctx, None)?;
+                let plans = plan.map_or(&[][..], |plan| plan.dml_ctes(with_clause));
+                let registry = self.materialize_ctes(with_clause, plans, ctx, None)?;
                 ctx_with_ctes = ctx.with_cte_data(registry.data());
                 &ctx_with_ctes
             }
@@ -3296,13 +3303,15 @@ impl Executor {
         &self,
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
-        compiled: Option<&std::sync::RwLock<super::query_cache::CompiledExecution>>,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
+        let compiled = plan.map(NestedPlan::slot);
         // A WITH clause is run first, so the subqueries can read it
         let ctx_with_ctes;
         let ctx = match &stmt.with {
             Some(with_clause) => {
-                let registry = self.materialize_ctes(with_clause, None, ctx, None)?;
+                let plans = plan.map_or(&[][..], |plan| plan.dml_ctes(with_clause));
+                let registry = self.materialize_ctes(with_clause, plans, ctx, None)?;
                 ctx_with_ctes = ctx.with_cte_data(registry.data());
                 &ctx_with_ctes
             }
