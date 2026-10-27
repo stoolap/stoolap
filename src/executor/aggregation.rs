@@ -1016,9 +1016,13 @@ impl<'a> RowFeed<'a> {
                     }
                     match Executor::lookup_column_index(&agg.column_lower, col_index_map) {
                         Some(idx) => Ok(Some(idx)),
-                        // The outer row's column is one value for every row
-                        None if names_outer_column(&agg.column, ctx) => Ok(None),
-                        None => Err(ungrouped_column(&shown_name(&agg.column))),
+                        // A qualified name its source lacks, unless the outer row's
+                        None if split_qualified(&agg.column).is_some()
+                            && !names_outer_column(&agg.column, ctx) =>
+                        {
+                            Err(ungrouped_column(&shown_name(&agg.column)))
+                        }
+                        None => Ok(None),
                     }
                 })
                 .collect::<Result<_>>()?,

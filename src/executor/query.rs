@@ -125,6 +125,30 @@ impl OutputLayout {
             OrderKey::Ordinal(_) | OrderKey::Expression => None,
         }
     }
+
+    /// Each name `stmt`'s sort keys read, into `slots` at the column this
+    /// layout gives it; an error for a qualified name no input column
+    /// answers, which no output name stands in for
+    fn sort_slots(
+        &self,
+        stmt: &SelectStatement,
+        slots: &mut FxHashMap<ExprKey, usize>,
+    ) -> Result<()> {
+        let mut missing = None;
+        visit_order_by_inputs(stmt, &mut |column, key| {
+            if let Some(position) = self.position(&key) {
+                slots.entry(ExprKey::of(column)).or_insert(position);
+            } else if let OrderKey::Input(Some(qualifier), name) = key {
+                if input_column_index(&self.input_columns, Some(qualifier), name).is_none() {
+                    missing.get_or_insert_with(|| format!("{qualifier}.{name}"));
+                }
+            }
+        });
+        match missing {
+            Some(name) => Err(super::aggregation::ungrouped_column(&name)),
+            None => Ok(()),
+        }
+    }
 }
 
 /// What one ORDER BY item sorts by, bound once by one rule: a bare name a
@@ -1775,23 +1799,7 @@ impl Executor {
                 // name the input column at the position the layout gives it
                 let mut sort_slots = aggregate_slots;
                 if let Some(layout) = layout {
-                    // A qualified name no input column answers names none
-                    // of its source's, which no output name stands in for
-                    let mut missing = None;
-                    visit_order_by_inputs(stmt, &mut |column, key| {
-                        if let Some(position) = layout.position(&key) {
-                            sort_slots.entry(ExprKey::of(column)).or_insert(position);
-                        } else if let OrderKey::Input(Some(qualifier), name) = key {
-                            if input_column_index(&layout.input_columns, Some(qualifier), name)
-                                .is_none()
-                            {
-                                missing.get_or_insert_with(|| format!("{qualifier}.{name}"));
-                            }
-                        }
-                    });
-                    if let Some(name) = missing {
-                        return Err(super::aggregation::ungrouped_column(&name));
-                    }
+                    layout.sort_slots(stmt, &mut sort_slots)?;
                 }
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
@@ -2215,11 +2223,7 @@ impl Executor {
             return Ok(Box::new(DistinctOnResult::new(result, indices)));
         }
         if let Some(layout) = layout {
-            visit_order_by_inputs(stmt, &mut |column, key| {
-                if let Some(position) = layout.position(&key) {
-                    slots.entry(ExprKey::of(column)).or_insert(position);
-                }
-            });
+            layout.sort_slots(stmt, &mut slots)?;
         }
         let outer = outer_column_names(ctx);
         // Each key no column holds is computed into a column appended to the
@@ -6435,12 +6439,13 @@ impl Executor {
                     let op_join_type = OperatorJoinType::parse(&join_type);
 
                     // Try to push projection into the join operator for ~2.3x speedup
-                    // Eligibility: no cross filter, no ORDER BY,
+                    // Eligibility: no cross filter, no ORDER BY or DISTINCT ON,
                     // no aggregation/window, simple column references only
                     // Note: JoinProjection uses ColumnSource enum to preserve SELECT column order
                     // regardless of whether the join was swapped (outer/inner assignment)
                     let projection_pushdown = if cross_filter.is_none()
                         && stmt.order_by.is_empty()
+                        && stmt.distinct_on.is_empty()
                         && !classification.has_aggregation
                         && !classification.has_window_functions
                     {

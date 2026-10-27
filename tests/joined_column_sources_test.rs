@@ -77,6 +77,7 @@ const MISSING: &[&str] = &[
     "SELECT y.b FROM {v} JOIN y ON y.a = v.a ORDER BY v.id LIMIT 2",
     "SELECT v.id FROM {v} JOIN y ON y.a = v.a LIMIT 2",
     "SELECT DISTINCT v.id FROM {v} JOIN y ON y.a = v.a",
+    "SELECT DISTINCT ON (v.id) y.id FROM {v} JOIN y ON y.a = v.a",
     "SELECT SUM(v.id) FROM {v} JOIN y ON y.a = v.a",
     "SELECT y.a FROM {v} JOIN y ON y.a = v.a GROUP BY y.a HAVING MAX(v.id) > 0",
     "SELECT RANK() OVER (ORDER BY v.id) FROM {v} JOIN y ON y.a = v.a",
@@ -121,6 +122,14 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
     // and a column a USING join merges through either table
     for (sql, same_as) in [
         ("SELECT y.a FROM y", "SELECT a FROM y"),
+        (
+            "SELECT COUNT(\"missing\") FROM (VALUES (1), (2)) AS v (x)",
+            "SELECT 2",
+        ),
+        (
+            "SELECT DISTINCT ON (v.a) v.a FROM ta AS v JOIN y ON y.a = v.a",
+            "SELECT DISTINCT a FROM ta",
+        ),
         (
             "SELECT q.a FROM y AS q ORDER BY q.b",
             "SELECT a FROM y ORDER BY b",
