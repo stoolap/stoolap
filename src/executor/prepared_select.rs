@@ -43,8 +43,9 @@ use crate::storage::traits::{
 };
 
 use super::aggregation::{
-    aggregate_slot_keys, check_grouped_reads, grouping_items, ungrouped_column, AggregatePath,
-    CallInputs, GroupByItem, Modifiers, SqlAggregateFunction, COUNT_STAR,
+    aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
+    grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem, Modifiers,
+    SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -1533,13 +1534,16 @@ impl StatementWalk<'_> {
                 })
                 .collect::<Result<Vec<_>>>()
         };
-        let modifier = match &stmt.group_by.modifier {
-            GroupByModifier::GroupingSets(sets) => GroupByModifier::GroupingSets(
+        let group_by = match &stmt.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => GroupByClause::grouping_sets(
                 sets.iter()
                     .map(|set| all(self, set))
                     .collect::<Result<_>>()?,
             ),
-            other => other.clone(),
+            modifier => GroupByClause {
+                columns: all(self, &stmt.group_by.columns)?,
+                modifier: modifier.clone(),
+            },
         };
         let walked = SelectStatement {
             distinct_on: all(self, &stmt.distinct_on)?,
@@ -1550,10 +1554,7 @@ impl StatementWalk<'_> {
                 .collect::<Result<_>>()?,
             table_expr: table_expr.map(Box::new),
             where_clause: one(self, &stmt.where_clause)?,
-            group_by: GroupByClause {
-                columns: all(self, &stmt.group_by.columns)?,
-                modifier,
-            },
+            group_by,
             having: one(self, &stmt.having)?,
             window_defs: stmt
                 .window_defs
@@ -5233,7 +5234,12 @@ impl Builder<'_> {
         let scope = chain.scopes[0];
         let bound = group_by_expressions(executor, sq, &scope.columns)?;
         let mut items = Vec::with_capacity(bound.len());
-        for expr in bound {
+        for (expr, written) in bound.into_iter().zip(grouping_items(sq)) {
+            // It binds where the resolver took another alias or a scope holds it
+            let binds = &expr != written || matches!(chain.resolve(written), Ok(Some(_)));
+            if aggregate_alias_key(Some(written), &sq.columns, binds) {
+                return Err(aggregate_group_key());
+            }
             items.push(self.rewrite(chain, Some(id), &expr, work)?);
         }
         let having = match sq.having.as_deref() {
@@ -6516,19 +6522,21 @@ impl PreparedGrouped {
                 .or_insert_with(|| rewritten.clone())
                 .clone())
         };
-        let group_by = stmt
-            .group_by
-            .columns
-            .iter()
-            .map(&mut group_item)
-            .collect::<Result<Vec<_>>>()?;
-        let modifier = match &stmt.group_by.modifier {
-            GroupByModifier::GroupingSets(sets) => GroupByModifier::GroupingSets(
+        let group_by = match &stmt.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => GroupByClause::grouping_sets(
                 sets.iter()
                     .map(|set| set.iter().map(&mut group_item).collect())
                     .collect::<Result<_>>()?,
             ),
-            other => other.clone(),
+            modifier => GroupByClause {
+                columns: stmt
+                    .group_by
+                    .columns
+                    .iter()
+                    .map(&mut group_item)
+                    .collect::<Result<_>>()?,
+                modifier: modifier.clone(),
+            },
         };
         // An item the GROUP BY names is read for each input row, as rewritten
         // above, and so is every item of rows that do not group; any other
@@ -6700,10 +6708,7 @@ impl PreparedGrouped {
         let stmt = SelectStatement {
             columns,
             having,
-            group_by: GroupByClause {
-                columns: group_by,
-                modifier,
-            },
+            group_by,
             where_clause: where_clause
                 .map(Box::new)
                 .or_else(|| stmt.where_clause.clone()),

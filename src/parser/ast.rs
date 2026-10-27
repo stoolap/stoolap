@@ -1770,6 +1770,24 @@ pub struct GroupByClause {
     pub modifier: GroupByModifier,
 }
 
+impl GroupByClause {
+    /// GROUPING SETS of `sets`, its `columns` the sets' distinct expressions
+    /// in the order they first appear, as ROLLUP and CUBE hold theirs
+    pub fn grouping_sets(sets: Vec<Vec<Expression>>) -> Self {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let columns = sets
+            .iter()
+            .flatten()
+            .filter(|expr| seen.insert(crate::executor::expr_key::ExprKey::of(expr)))
+            .cloned()
+            .collect();
+        Self {
+            columns,
+            modifier: GroupByModifier::GroupingSets(sets),
+        }
+    }
+}
+
 impl fmt::Display for GroupByClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // GROUPING SETS uses its own column lists, not self.columns

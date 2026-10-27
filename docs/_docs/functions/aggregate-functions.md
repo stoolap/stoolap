@@ -240,6 +240,8 @@ Clothing    | 3     | 145.00  | 48.33   | 25.00   | 70.00
 
 A name in GROUP BY may be a SELECT alias: `SELECT a + 1 AS k, COUNT(*) FROM t GROUP BY k` groups by `a + 1`. An alias of an aggregate cannot be grouped by, so in `SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g` the name `g` is the column of `t`. A number in GROUP BY is a position in the SELECT list, from 1; a position the list does not have is an error.
 
+A GROUP BY key cannot be or hold an aggregate: `GROUP BY COUNT(*)`, a position naming `COUNT(*)` and an alias of `COUNT(*)` that no column of the source carries all fail with "an aggregate function cannot be a GROUP BY key". A name that is no column of the source, no SELECT alias and no column of an enclosing query's row is an error too: `GROUP BY nosuch` fails as `SELECT nosuch` does. Under GROUPING SETS, the statement groups by each set whether or not the SELECT list names its expressions: `SELECT COUNT(*) FROM t GROUP BY GROUPING SETS ((a), ())` gives a count for each `a` and one for all rows.
+
 A query that aggregates, with GROUP BY or with an aggregate call alone, reads a column of its rows only through a GROUP BY item or inside an aggregate call. Reading one anywhere else is an error, in the SELECT list, HAVING and ORDER BY alike: `SELECT b, COUNT(*) FROM t GROUP BY a` and `SELECT b, COUNT(*) FROM t` both fail with `Column 'b' not found`. A subquery that aggregates follows the same rule, while a column of an enclosing query is one value for it and may be read anywhere.
 
 Two rows share a group exactly when their keys are equal the way DISTINCT and UNION compare them, and every row lands in a group:

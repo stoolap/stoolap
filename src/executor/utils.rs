@@ -1803,7 +1803,37 @@ pub fn expression_contains_aggregate(expr: &Expression) -> bool {
         Expression::Prefix(prefix) => expression_contains_aggregate(&prefix.right),
         Expression::Cast(cast) => expression_contains_aggregate(&cast.expr),
         Expression::QuantifiedSet(set) => expression_contains_aggregate(&set.left),
+        Expression::In(in_expr) => {
+            expression_contains_aggregate(&in_expr.left)
+                || expression_contains_aggregate(&in_expr.right)
+        }
+        Expression::List(list) => list.elements.iter().any(expression_contains_aggregate),
+        Expression::ExpressionList(list) => {
+            list.expressions.iter().any(expression_contains_aggregate)
+        }
+        Expression::Between(between) => {
+            expression_contains_aggregate(&between.expr)
+                || expression_contains_aggregate(&between.lower)
+                || expression_contains_aggregate(&between.upper)
+        }
+        Expression::Like(like) => {
+            expression_contains_aggregate(&like.left)
+                || expression_contains_aggregate(&like.pattern)
+                || like
+                    .escape
+                    .as_deref()
+                    .is_some_and(expression_contains_aggregate)
+        }
+        Expression::AllAny(all_any) => expression_contains_aggregate(&all_any.left),
+        Expression::Distinct(distinct) => expression_contains_aggregate(&distinct.expr),
         Expression::Case(case) => {
+            if case
+                .value
+                .as_deref()
+                .is_some_and(expression_contains_aggregate)
+            {
+                return true;
+            }
             for when_clause in &case.when_clauses {
                 if expression_contains_aggregate(&when_clause.condition)
                     || expression_contains_aggregate(&when_clause.then_result)

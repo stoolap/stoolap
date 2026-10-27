@@ -1915,10 +1915,7 @@ impl Parser<'_> {
                         self.next_token(); // consume (
                         let sets = self.parse_grouping_sets();
                         // cur_token should now be at )
-                        return GroupByClause {
-                            columns: Vec::new(),
-                            modifier: GroupByModifier::GroupingSets(sets),
-                        };
+                        return GroupByClause::grouping_sets(sets);
                     }
                 }
                 GroupByModifier::None
