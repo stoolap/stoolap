@@ -13,11 +13,13 @@
 // limitations under the License.
 
 //! A grouped statement over one table whose SELECT list or HAVING holds a
-//! subquery runs it through prepared blocks: it answers as the general path
-//! does, hot and sealed, and an uncorrelated value keeps the aggregate path
-//! its literal takes
+//! subquery runs it through prepared blocks: it answers as recorded when the
+//! general path gave the same answer, hot and sealed, and an uncorrelated
+//! value keeps the aggregate path its literal takes
 
 #![cfg(feature = "test-failpoints")]
+
+mod oracle;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -303,9 +305,28 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The statement over a derived table, out of the blocks
-fn general(sql: &str) -> String {
-    sql.replace(" FROM t", " FROM (SELECT * FROM t) t")
+const RECORDED: oracle::Answers = answers!("grouped_output_blocks");
+const RECORDED_INPUT: oracle::Answers = answers!("grouped_output_blocks_input");
+const RECORDED_BEFORE: oracle::Answers = answers!("grouped_output_blocks_before");
+const RECORDED_AROUND: oracle::Answers = answers!("grouped_output_blocks_around");
+const RECORDED_ERRORS: oracle::Answers = answers!("grouped_output_blocks_errors");
+const RECORDED_KEYED: oracle::Answers = answers!("grouped_output_blocks_keyed");
+const RECORDED_SCHEMA: oracle::Answers = answers!("grouped_output_blocks_schema");
+
+/// The rows of `sql`, or its error, as `answers` records them under `key`,
+/// recorded only when the general path gives the same ones
+fn confirmed(
+    db: &Database,
+    answers: &oracle::Answers,
+    key: &str,
+    sql: &str,
+) -> Result<Vec<String>, String> {
+    let got = rows(db, sql);
+    let general = || rows(db, &oracle::general_twin(sql));
+    if let Some(why) = oracle::check_confirmed(answers, key, &got, general) {
+        panic!("{why}");
+    }
+    got
 }
 
 #[test]
@@ -325,16 +346,6 @@ fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
             db
         };
         for (sql, literal) in CASES {
-            // The general path cannot run a mixed SELECT list: compare its literal
-            let mixed = sql.contains("(SELECT MAX(u.x) FROM u), (SELECT COUNT");
-            let want = match mixed {
-                true => rows(&db, &general(&sql.replace("(SELECT MAX(u.x) FROM u)", "6"))),
-                false => rows(&db, &general(sql)),
-            };
-            if !want.as_ref().is_ok_and(|rows| !rows.is_empty()) {
-                wrong.push(format!("sealed {sealed}: {sql}: the general path {want:?}"));
-                continue;
-            }
             let hits = general_hits();
             let first = rows(&db, sql);
             reset_aggregate_paths();
@@ -346,13 +357,29 @@ fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
                     "sealed {sealed}: {sql}: reached the general path {hits:?} -> {reached:?}"
                 ));
             }
+            // The general path cannot run a mixed SELECT list: it confirms its literal
+            let general = match sql.contains("(SELECT MAX(u.x) FROM u), (SELECT COUNT") {
+                true => sql.replace("(SELECT MAX(u.x) FROM u)", "6"),
+                false => sql.to_string(),
+            };
+            wrong.extend(
+                oracle::check_confirmed(&RECORDED, sql, &first, || {
+                    rows(&db, &oracle::general_twin(&general))
+                })
+                .map(|why| format!("sealed {sealed}: {why}")),
+            );
+            let want = first.clone();
+            if !want.as_ref().is_ok_and(|rows| !rows.is_empty()) {
+                wrong.push(format!("sealed {sealed}: {sql}: answers {want:?}"));
+                continue;
+            }
             let line = prepared_line(&db, sql);
             if line != "Prepared: yes" {
                 wrong.push(format!("sealed {sealed}: {sql}: {line}"));
             }
-            if first != want || again != want {
+            if again != want {
                 wrong.push(format!(
-                    "sealed {sealed}: {sql}: gave {first:?} then {again:?}, the general path {want:?}"
+                    "sealed {sealed}: {sql}: gave {first:?} then {again:?}"
                 ));
             }
             if let Some(literal) = literal {
@@ -396,7 +423,15 @@ fn a_grouped_statement_reads_its_input_rows_subqueries_through_its_blocks() {
             db
         };
         for (sql, reference, literal) in INPUT_CASES {
+            // The reference reads its subqueries as a derived table's columns,
+            // recorded when the general path gives it the same answer
             let want = rows(&db, reference);
+            wrong.extend(
+                oracle::check_confirmed(&RECORDED_INPUT, reference, &want, || {
+                    rows(&db, &oracle::general_twin(reference))
+                })
+                .map(|why| format!("sealed {sealed}: {why}")),
+            );
             if !want.as_ref().is_ok_and(|rows| !rows.is_empty()) {
                 wrong.push(format!("sealed {sealed}: {reference}: {want:?}"));
                 continue;
@@ -486,12 +521,8 @@ fn an_uncorrelated_grouped_subquery_is_read_before_any_group() {
         "SELECT a, COUNT(*) FROM t WHERE a < 0 GROUP BY a HAVING COUNT(*) > (SELECT u.x FROM u)",
         "SELECT a, a IN (SELECT u.x * 9223372036854775807 FROM u) FROM t WHERE a < 0 GROUP BY a",
     ] {
-        let got = rows(&db, sql);
-        let want = rows(&db, &general(sql));
-        assert!(
-            got.is_err() && got == want,
-            "{sql}: {got:?}, the general path {want:?}"
-        );
+        let got = confirmed(&db, &RECORDED_BEFORE, sql, sql);
+        assert!(got.is_err(), "{sql}: {got:?}");
     }
 }
 
@@ -504,8 +535,11 @@ fn a_value_around_an_uncorrelated_grouped_subquery_is_computed_only_for_a_group(
         "SELECT a, 9223372036854775807 + (SELECT 1) FROM t WHERE a < 0 GROUP BY a",
         "SELECT a FROM t WHERE a < 0 GROUP BY a HAVING 9223372036854775807 + (SELECT 1) > 0",
     ] {
-        assert_eq!(rows(&db, sql), Ok(Vec::new()), "{sql}");
-        assert_eq!(rows(&db, &general(sql)), Ok(Vec::new()), "{sql}");
+        assert_eq!(
+            confirmed(&db, &RECORDED_AROUND, sql, sql),
+            Ok(Vec::new()),
+            "{sql}"
+        );
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
 }
@@ -520,7 +554,7 @@ fn a_correlated_grouped_subquery_raises_its_error_for_the_group_that_reaches_it(
         "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > (SELECT u.x FROM u WHERE u.k = t.a)",
         "SELECT a, (SELECT u.x FROM u WHERE u.k = t.a) FROM t WHERE a = 0 GROUP BY a",
     ] {
-        assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}");
+        let _ = confirmed(&db, &RECORDED_ERRORS, sql, sql);
     }
 }
 
@@ -685,7 +719,8 @@ fn a_grouped_statement_s_subqueries_read_parameters_and_the_transaction_s_writes
             let literal = sql
                 .replace("$1", &p1.to_string())
                 .replace("$2", &p2.to_string());
-            let want = rows(&db, &general(&literal)).unwrap();
+            // Its literal twin, the parameters written in
+            let want = rows(&db, &literal).unwrap();
             assert_eq!(read(sql, (p1, p2)), want, "{sql}: {p1} {p2}");
         }
     }
@@ -765,8 +800,13 @@ fn a_grouped_statement_keyed_by_an_item_holding_a_subquery_groups_by_it() {
         };
         let got = sorted(sql);
         assert!(
-            got.as_ref().is_ok_and(|rows| rows.len() == 2) && got == sorted(&general(sql)),
+            got.as_ref().is_ok_and(|rows| rows.len() == 2),
             "{sql}: {got:?}"
+        );
+        let general = || sorted(&oracle::general_twin(sql));
+        assert_eq!(
+            oracle::check_confirmed(&RECORDED_KEYED, sql, &got, general),
+            None
         );
     }
 }
@@ -796,7 +836,7 @@ fn a_table_whose_columns_changed_after_preparing_raises_schema_changed() {
         }
         // Twice, so the second run reads the plan the first one held
         for _ in 0..2 {
-            assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: prepared");
+            let _ = confirmed(&db, &RECORDED_SCHEMA, &format!("{name} before: {sql}"), sql);
         }
         let writer = db.clone();
         let done = Rc::new(Cell::new(false));
@@ -816,7 +856,7 @@ fn a_table_whose_columns_changed_after_preparing_raises_schema_changed() {
             got.as_ref().is_err_and(|e| e.contains("schema changed")),
             "{sql}: {got:?}"
         );
-        assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: run again");
+        let _ = confirmed(&db, &RECORDED_SCHEMA, &format!("{name} after: {sql}"), sql);
     }
 }
 

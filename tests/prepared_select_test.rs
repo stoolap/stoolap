@@ -25,6 +25,11 @@ use stoolap::test_failpoints::{
 };
 use stoolap::{Database, Params};
 
+mod oracle;
+
+/// The in-family statements' answers, recorded when their old path twins gave the same
+const RECORDED_IN_FAMILY: oracle::Answers = answers!("prepared_select_in_family");
+
 // The counters are process-wide
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -467,10 +472,13 @@ fn test_expressions_see_the_transaction_id() {
     let sql = "SELECT id, CURRENT_TRANSACTION_ID() FROM t WHERE b = 1 \
                AND a > (SELECT v FROM u WHERE u.id = t.id) \
                AND CURRENT_TRANSACTION_ID() IS NOT NULL ORDER BY a";
-    let old = "SELECT id, CURRENT_TRANSACTION_ID() FROM t WHERE b = 1 \
-               AND a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1) \
-               AND CURRENT_TRANSACTION_ID() IS NOT NULL ORDER BY a";
     db.execute("BEGIN", ()).unwrap();
+    let transaction: i64 = db
+        .query("SELECT CURRENT_TRANSACTION_ID()", ())
+        .unwrap()
+        .map(|row| row.unwrap().get(0).unwrap())
+        .next()
+        .unwrap();
     let scalar_before = prepared_scalar_runs();
     let (_, found, projections) = pairs(&db, sql);
     assert!(
@@ -478,9 +486,11 @@ fn test_expressions_see_the_transaction_id() {
         "the WHERE ran prepared"
     );
     assert_eq!(projections, 1, "the projection ran prepared");
-    let (_, expected, _) = pairs(&db, old);
-    assert_eq!(expected.len(), 1, "the old path finds id 1");
-    assert_eq!(found, expected, "both paths read the same transaction id");
+    assert_eq!(
+        found,
+        vec![(1, transaction)],
+        "id 1, with the transaction's id"
+    );
     db.execute("COMMIT", ()).unwrap();
 }
 
@@ -1054,18 +1064,23 @@ fn test_classifier_rules() {
     };
     for sql in &yes {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-        // An inner ORDER BY position keeps the same question out of the family
-        let old = sql
-            .replace(" = t.id)", " = t.id ORDER BY 1)")
-            .replace("u.id = 2)", "u.id = 2 ORDER BY 1)");
-        let old = old.replace(" = o.id)", " = o.id ORDER BY 1)");
-        assert!(
-            prepared_line(&db, &old).starts_with("Prepared: no"),
-            "{old}"
-        );
         let runs = prepared_scalar_runs();
-        assert_eq!(rows(sql), rows(&old), "{sql} answers as the old path");
+        let found = Ok(rows(sql));
         assert!(prepared_scalar_runs() > runs, "{sql} ran prepared");
+        let old_path = || {
+            // An inner ORDER BY position keeps the same question out of the family
+            let old = sql
+                .replace(" = t.id)", " = t.id ORDER BY 1)")
+                .replace("u.id = 2)", "u.id = 2 ORDER BY 1)");
+            let old = old.replace(" = o.id)", " = o.id ORDER BY 1)");
+            assert!(
+                prepared_line(&db, &old).starts_with("Prepared: no"),
+                "{old}"
+            );
+            Ok(rows(&old))
+        };
+        let wrong = oracle::check_confirmed(&RECORDED_IN_FAMILY, sql, &found, old_path);
+        assert_eq!(wrong, None);
     }
     let no = [
         (
@@ -1464,9 +1479,6 @@ fn test_an_order_by_key_reading_an_alias_is_prepared() {
     let db = setup("prepared_order_alias");
     let sql = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) IS NOT NULL \
                ORDER BY x % 3, id";
-    let old = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id ORDER BY 1) \
-               IS NOT NULL ORDER BY x % 3, id";
-    let expected = pairs(&db, old);
     let before = general_path_hits(GeneralPath::OrderByEvaluator);
     let found = pairs(&db, sql);
     assert_eq!(
@@ -1474,7 +1486,13 @@ fn test_an_order_by_key_reading_an_alias_is_prepared() {
         0,
         "the sort reads the key the projection computed"
     );
-    assert_eq!((found.0, found.1), (expected.0, expected.1));
+    assert_eq!(
+        (found.0, found.1),
+        (
+            vec!["id".to_string(), "x".to_string()],
+            vec![(6, 60), (1, 10), (2, 20), (5, 50)]
+        )
+    );
 }
 
 #[test]

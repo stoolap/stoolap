@@ -1,0 +1,31 @@
+2	7164b455f4b0c10c	SELECT * FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+2	d9f3a5e1b0bbb11a	SELECT DISTINCT ON (b) id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) ORDER BY b, id
+2	d9f3a5e1b0bbb11a	SELECT DISTINCT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+2	d9f3a5e1b0bbb11a	SELECT id FROM t AS o WHERE a > (SELECT v FROM u WHERE u.id = o.id)
+1	1c0282ae46ea93e6	SELECT id FROM t WHERE 'x' || CAST((SELECT v FROM u WHERE u.id = t.id) AS TEXT) = 'x5'
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) BETWEEN 1 AND 10
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) IN (5, 7)
+6	7046a852f0e5a52a	SELECT id FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) IS DISTINCT FROM a
+3	ea0ed6a62c9bf92f	SELECT id FROM t WHERE ABS((SELECT v FROM u WHERE u.id = t.id)) > 1 AND NOT (b = 2) AND -a < 0
+4	98b82a7fafa8db4d	SELECT id FROM t WHERE CASE WHEN (SELECT v FROM u WHERE u.id = t.id) IS NULL THEN 0 ELSE 1 END = 1
+1	1c0282ae46ea93e6	SELECT id FROM t WHERE CAST((SELECT v FROM u WHERE u.id = t.id) AS TEXT) LIKE '5%'
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT (SELECT v FROM u WHERE u.id = t.id) FROM u WHERE u.id = 1)
+1	d7a67ed3259599ea	SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT u.v FROM u JOIN uv ON uv.id = u.id) AS q WHERE q.v = t.id)
+0	cbf29ce484222325	SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT v FROM u WHERE u.id <> t.b) AS q WHERE q.v = t.id)
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT q.v FROM (SELECT id, v FROM u) AS q WHERE q.id = t.id)
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT v FROM u JOIN t AS x ON x.id = u.id WHERE u.id = t.id)
+4	82af95eb907513ed	SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = 2)
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+1	1272dc93a8b3baef	SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) LIMIT 2 OFFSET $1
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) ORDER BY (SELECT v FROM u WHERE u.id = t.id)
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) ORDER BY a DESC NULLS LAST, id
+5	8e843cf8bb488f82	SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) UNION SELECT id FROM u
+2	d9f3a5e1b0bbb11a	SELECT id FROM t WHERE a > (SELECT v FROM uv WHERE uv.id = t.id)
+3	ea0ed6a62c9bf92f	SELECT id FROM t WHERE b = 1 ORDER BY (SELECT v FROM u WHERE u.id = t.id)
+3	ea0ed6a62c9bf92f	SELECT id FROM t WHERE b IN ((SELECT v FROM u WHERE u.id = t.id), 1)
+6	9cf16c9bbe74b493	SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t
+3	d37e7a1d21dad975	SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t ORDER BY (SELECT v FROM u WHERE u.id = t.id) DESC, id LIMIT 3 OFFSET $1
+2	0fbdd16a18131326	SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+2	e9f561c810a20390	SELECT id, a + 1 AS s, CASE WHEN b = 1 THEN 'x' END FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+2	7164b455f4b0c10c	SELECT t.* FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+2	d9f3a5e1b0bbb11a	SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > (SELECT v FROM u WHERE u.id = t.id)

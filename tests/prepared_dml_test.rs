@@ -13,9 +13,10 @@
 // limitations under the License.
 
 //! An UPDATE or DELETE whose subqueries are in the prepared family leaves
-//! the table the general path computes for the same expressions over the
-//! table as the statement found it, under every EXISTS strategy, and the
-//! corpus reaches every registered prepared DML site.
+//! the table a SELECT computes for the same expressions over the table as
+//! the statement found it, and the answer recorded when the general path
+//! gave the same, under every EXISTS strategy; the corpus reaches every
+//! registered prepared DML site.
 
 #![cfg(feature = "test-failpoints")]
 
@@ -23,6 +24,12 @@ use stoolap::test_failpoints::{
     force_exists_strategy, prepared_dml_built, prepared_dml_site_runs, PreparedDmlSite,
 };
 use stoolap::Database;
+
+mod oracle;
+
+/// The table each statement leaves, and the rows each RETURNING gives
+const RECORDED_TABLES: oracle::Answers = answers!("prepared_dml_tables");
+const RECORDED_RETURNING: oracle::Answers = answers!("prepared_dml_returning");
 
 /// The forced strategy and the preparation counts are process-wide: tests
 /// that force one or prepare a statement take turns
@@ -60,7 +67,15 @@ fn table(db: &Database, sql: &str) -> Vec<String> {
 
 const ROWS: &str = "SELECT id, k, x, s FROM t ORDER BY id";
 
-/// Each statement with the general path's SELECT of the rows it leaves:
+/// The rows of `sql` on the general path, each operand of a UNION ALL apart
+fn general_table(db: &Database, sql: &str) -> Vec<String> {
+    let operands = sql.split(" UNION ALL ");
+    operands
+        .flat_map(|operand| table(db, &oracle::general_twin(operand)))
+        .collect()
+}
+
+/// Each statement with a SELECT of the rows it leaves:
 /// an UPDATE's as a CASE in the select list, a DELETE's as the ids it keeps
 const CORPUS: &[(&str, &str)] = &[
     (
@@ -145,7 +160,7 @@ const CORPUS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Each statement with RETURNING with the general path's SELECT of the rows
+/// Each statement with RETURNING with a SELECT of the rows
 /// it returns, read before the statement runs
 const RETURNING_CORPUS: &[(&str, &str)] = &[
     (
@@ -170,11 +185,10 @@ const RETURNING_CORPUS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The rows `expected` names: an UPDATE's or an upsert's whole rows, the
-/// rows of t whose id a DELETE's CASE marks 0, or t with the rows an INSERT
-/// adds after it
-fn expected_rows(db: &Database, dml: &str, expected: &str) -> Vec<String> {
-    let rows = table(db, expected);
+/// The rows an expected SELECT's `rows` name: an UPDATE's or an upsert's
+/// whole rows, the rows of t whose id a DELETE's CASE marks 0, or t with
+/// the rows an INSERT adds after it
+fn expected_rows(db: &Database, dml: &str, rows: Vec<String>) -> Vec<String> {
     if dml.starts_with("INSERT") && !dml.contains("ON CONFLICT") {
         let mut all = table(db, ROWS);
         all.extend(rows);
@@ -202,18 +216,32 @@ fn test_every_prepared_dml_site_leaves_the_general_answer_and_is_reached() {
         force_exists_strategy(strategy);
         for (i, (dml, expected)) in CORPUS.iter().enumerate() {
             let db = setup(&format!("prepared_dml_corpus_{n}_{i}"));
-            let want = expected_rows(&db, dml, expected);
+            let want = expected_rows(&db, dml, table(&db, expected));
+            let general =
+                oracle::recording().then(|| expected_rows(&db, dml, general_table(&db, expected)));
             db.execute(dml, ())
                 .unwrap_or_else(|e| panic!("{dml} under {strategy:?}: {e}"));
-            assert_eq!(table(&db, ROWS), want, "{dml} under {strategy:?}");
+            let got = Ok(table(&db, ROWS));
+            assert_eq!(got, Ok(want), "{dml} under {strategy:?}");
+            let general = || Ok(general.unwrap_or_default());
+            let wrong = oracle::check_confirmed(&RECORDED_TABLES, dml, &got, general);
+            assert_eq!(wrong, None, "under {strategy:?}");
         }
         for (i, (dml, expected)) in RETURNING_CORPUS.iter().enumerate() {
             let db = setup(&format!("prepared_dml_returning_{n}_{i}"));
             let mut want = table(&db, expected);
+            let general = oracle::recording().then(|| {
+                let mut rows = general_table(&db, expected);
+                rows.sort();
+                rows
+            });
             let mut got = table(&db, dml);
             want.sort();
             got.sort();
             assert_eq!(got, want, "{dml} under {strategy:?}");
+            let general = || Ok(general.unwrap_or_default());
+            let wrong = oracle::check_confirmed(&RECORDED_RETURNING, dml, &Ok(got), general);
+            assert_eq!(wrong, None, "under {strategy:?}");
         }
     }
     force_exists_strategy(None);
