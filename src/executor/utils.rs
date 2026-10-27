@@ -704,6 +704,59 @@ pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     map
 }
 
+/// The column `qualifier.name` reads, lowercase, `own` the column so
+/// qualified, `find` finding a column by its name, `qualifies` telling
+/// whether a column is qualified by a qualifier and `bare` whether a column
+/// is named bare: `own`, else the bare name when no column is qualified by
+/// the qualifier, as over one source named bare, or when that column is
+/// named bare, as one a USING or NATURAL join merges; None for another
+/// source's
+pub(crate) fn by_qualifier(
+    own: Option<usize>,
+    qualifier: &str,
+    name: &str,
+    find: impl FnOnce(&str) -> Option<usize>,
+    qualifies: impl FnOnce(&str) -> bool,
+    bare: impl FnOnce(usize) -> bool,
+) -> Option<usize> {
+    if own.is_some() {
+        return own;
+    }
+    let found = find(name)?;
+    (!qualifies(qualifier) || bare(found)).then_some(found)
+}
+
+/// [`by_qualifier`] over `map`, built by [`build_column_index_map`]
+pub(crate) fn qualified_key_index(map: &StringMap<usize>, key: &str) -> Option<usize> {
+    let own = map.get(key).copied();
+    let Some((qualifier, name)) = split_qualified(key) else {
+        return own;
+    };
+    by_qualifier(
+        own,
+        qualifier,
+        name,
+        |name| map.get(name).copied(),
+        |qualifier| {
+            map.keys()
+                .any(|key| split_qualified(key).is_some_and(|(q, _)| q == qualifier))
+        },
+        |index| {
+            !map.iter()
+                .any(|(key, &at)| at == index && split_qualified(key).is_some())
+        },
+    )
+}
+
+/// [`qualified_key_index`] of `qualifier.name`, both lowercase
+pub(crate) fn qualified_index(
+    map: &StringMap<usize>,
+    qualifier: &str,
+    name: &str,
+) -> Option<usize> {
+    qualified_key_index(map, &qualified(qualifier, name))
+}
+
 // ============================================================================
 // Row Combination Utilities
 // ============================================================================
@@ -2710,12 +2763,25 @@ pub fn compute_join_projection(
         found
     };
     let resolve_qualified = |qualifier: &str, name: &str| -> Option<usize> {
-        columns_all()
-            .enumerate()
-            .filter(|(_, c)| eq_folded_qualified(c, qualifier, name))
-            .last()
-            .map(|(i, _)| i)
-            .or_else(|| resolve(name))
+        by_qualifier(
+            columns_all()
+                .enumerate()
+                .filter(|(_, c)| eq_folded_qualified(c, qualifier, name))
+                .last()
+                .map(|(i, _)| i),
+            qualifier,
+            name,
+            resolve,
+            |qualifier| {
+                columns_all()
+                    .any(|c| split_qualified(c).is_some_and(|(q, _)| eq_folded(q, qualifier)))
+            },
+            |index| {
+                columns_all()
+                    .nth(index)
+                    .is_some_and(|c| split_qualified(c).is_none())
+            },
+        )
     };
     let source = |idx: usize| {
         if idx < outer_col_count {

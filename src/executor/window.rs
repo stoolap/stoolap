@@ -563,7 +563,8 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, split_qualified,
+    get_table_alias_from_expr, item_name, qualified, qualified_index, qualified_key_index,
+    split_qualified,
 };
 use super::volatility::expression_volatility;
 use super::Executor;
@@ -1985,18 +1986,10 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Qualified column reference (table.column)
-                    // Try full qualified name first (e.g., "c.name" for JOINs)
-                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(&idx) = col_index_map.get(&full_name) {
+                    let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
+                    if let Some(idx) = qualified_index(&col_index_map, qualifier, name) {
                         items.push(SelectItem {
                             output_name: item_name(col_expr),
-                            source: SelectItemSource::BaseColumn(idx),
-                        });
-                    } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                        // Fall back to unqualified name
-                        items.push(SelectItem {
-                            output_name: qid.name.value.to_string(),
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else {
@@ -2637,15 +2630,27 @@ impl Executor {
     ) -> Result<FxHashMap<PartitionKey, Vec<usize>>> {
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
 
-        // Check if any PARTITION BY expression is complex (not a simple column reference)
-        let has_complex_expr = wf_info.partition_by_exprs.iter().any(|e| {
-            !matches!(
-                e,
-                Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-            )
-        });
+        // Each key a column holds, by its name; none when a key is computed
+        // or names no column, which the compiled path reports
+        let partition_indices: Option<SmallVec<[usize; 4]>> =
+            match wf_info.partition_by.len() == wf_info.partition_by_exprs.len() {
+                true => wf_info
+                    .partition_by
+                    .iter()
+                    .map(|part_col| qualified_key_index(col_index_map, &part_col.to_lowercase()))
+                    .collect(),
+                false => None,
+            };
 
-        if has_complex_expr && !wf_info.partition_by_exprs.is_empty() {
+        if let Some(partition_indices) = partition_indices {
+            for (i, (_, row)) in rows.iter().enumerate() {
+                let key: PartitionKey = partition_indices
+                    .iter()
+                    .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                partitions.entry(key).or_default().push(i);
+            }
+        } else {
             // Complex path: evaluate the expressions per row
             let mut eval = RowPrograms::compile(
                 &wf_info.partition_by_exprs,
@@ -2653,45 +2658,13 @@ impl Executor {
                 Some(group_slots),
                 ctx,
                 blocks,
-            )
-            .map_err(|e| {
-                Error::internal(format!("Failed to compile PARTITION BY expression: {}", e))
-            })?;
+            )?;
             let mut values = Vec::with_capacity(wf_info.partition_by_exprs.len());
             for (i, (_, row)) in rows.iter().enumerate() {
                 eval.eval_into(row, &mut values).map_err(|e| {
                     Error::internal(format!("Failed to evaluate PARTITION BY expression: {}", e))
                 })?;
                 let key: PartitionKey = values.drain(..).collect();
-                partitions.entry(key).or_default().push(i);
-            }
-        } else {
-            // Fast path: simple column references
-            let partition_indices: SmallVec<[Option<usize>; 4]> = wf_info
-                .partition_by
-                .iter()
-                .map(|part_col| {
-                    let lower = part_col.to_lowercase();
-                    col_index_map.get(&lower).copied().or_else(|| {
-                        if let Some((_, name)) = split_qualified(&lower) {
-                            col_index_map.get(name).copied()
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
-            for (i, (_, row)) in rows.iter().enumerate() {
-                let mut key: PartitionKey = SmallVec::with_capacity(partition_indices.len());
-                for idx_opt in &partition_indices {
-                    let value = if let Some(&idx) = idx_opt.as_ref() {
-                        row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                    } else {
-                        Value::null_unknown()
-                    };
-                    key.push(value);
-                }
                 partitions.entry(key).or_default().push(i);
             }
         }
@@ -3469,15 +3442,11 @@ impl Executor {
     ) -> Option<usize> {
         match expr {
             Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
-            Expression::QualifiedIdentifier(qid) => {
-                // Try fully qualified name first (e.g., "s.qty")
-                let qualified = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                col_index_map
-                    .get(&qualified)
-                    // Then try unqualified (e.g., "qty") for CTE/subquery cases
-                    .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
-                    .copied()
-            }
+            Expression::QualifiedIdentifier(qid) => qualified_index(
+                col_index_map,
+                &qid.qualifier.value_lower,
+                &qid.name.value_lower,
+            ),
             // A group item or aggregate computed before the window reads its slot,
             // and a derived table's aggregate column the name it carries
             _ => (!group_slots.is_empty())
@@ -3522,20 +3491,39 @@ impl Executor {
             .map(|ob| crate::core::value::nulls_first(ob.ascending, ob.nulls_first))
             .collect();
 
-        // Check if any ORDER BY expression is complex (not a simple column reference)
-        let has_complex_expr = order_by.iter().any(|ob| {
-            !matches!(
-                &ob.expression,
-                Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-            )
-        });
+        // Each key a column holds, by its name; none when a key is computed
+        // or names no column, which the compiled path reports
+        let order_by_indices: Option<Vec<usize>> = order_by
+            .iter()
+            .map(|ob| match &ob.expression {
+                Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
+                Expression::QualifiedIdentifier(qid) => qualified_index(
+                    col_index_map,
+                    &qid.qualifier.value_lower,
+                    &qid.name.value_lower,
+                ),
+                _ => None,
+            })
+            .collect();
 
         // Pre-allocate columns with exact capacity
         let mut result_columns: Vec<Vec<Value>> = (0..num_cols)
             .map(|_| Vec::with_capacity(num_rows))
             .collect();
 
-        if has_complex_expr {
+        if let Some(order_by_indices) = order_by_indices {
+            // Extract values column by column for better cache locality
+            for (col_idx, src_idx) in order_by_indices.iter().enumerate() {
+                let col = &mut result_columns[col_idx];
+                for (_, row) in rows {
+                    col.push(
+                        row.get(*src_idx)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                    );
+                }
+            }
+        } else {
             // Extract order_by expressions
             let order_exprs: Vec<Expression> =
                 order_by.iter().map(|ob| ob.expression.clone()).collect();
@@ -3549,46 +3537,6 @@ impl Executor {
                 for (col_idx, value) in values.drain(..).enumerate() {
                     if col_idx < result_columns.len() {
                         result_columns[col_idx].push(value);
-                    }
-                }
-            }
-        } else {
-            // Fast path: simple column references
-            let order_by_indices: Vec<Option<usize>> = order_by
-                .iter()
-                .map(|ob| match &ob.expression {
-                    Expression::Identifier(id) => {
-                        col_index_map.get(id.value_lower.as_str()).copied()
-                    }
-                    Expression::QualifiedIdentifier(qid) => {
-                        let qualified =
-                            qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                        col_index_map
-                            .get(&qualified)
-                            .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
-                            .copied()
-                    }
-                    _ => None,
-                })
-                .collect();
-
-            // Extract values column by column for better cache locality
-            for (col_idx, idx_opt) in order_by_indices.iter().enumerate() {
-                let col = &mut result_columns[col_idx];
-                match idx_opt {
-                    Some(src_idx) => {
-                        for (_, row) in rows {
-                            col.push(
-                                row.get(*src_idx)
-                                    .cloned()
-                                    .unwrap_or_else(Value::null_unknown),
-                            );
-                        }
-                    }
-                    None => {
-                        for _ in 0..num_rows {
-                            col.push(Value::null_unknown());
-                        }
                     }
                 }
             }

@@ -224,7 +224,7 @@ fn a_join_of_three_sources_runs_its_blocks_and_answers_as_the_general_path() {
     let mut count = 0;
     for (context, db) in [("hot", hot("matrix")), ("sealed", sealed(&dir))] {
         for &(kind, with, side) in SIDES {
-            for (at, from) in FROMS.iter().enumerate() {
+            for from in FROMS {
                 let mut sqls = Vec::new();
                 for j1 in FIRST {
                     for j2 in SECOND {
@@ -237,14 +237,9 @@ fn a_join_of_three_sources_runs_its_blocks_and_answers_as_the_general_path() {
                         }
                     }
                 }
-                // A VALUES list inside the joined side names its columns bare
-                let line = match (kind, at) {
-                    ("values", 3) => "Prepared: no (a joined side holding a VALUES list)",
-                    _ => "Prepared: yes",
-                };
                 count += sqls.len();
                 let context = format!("{context} {kind}");
-                check(&db, &context, (with, line), &sqls, &mut wrong);
+                check(&db, &context, (with, "Prepared: yes"), &sqls, &mut wrong);
             }
         }
     }
@@ -305,11 +300,6 @@ fn a_joined_side_named_only_by_its_run_stays_on_the_general_path() {
             "SELECT t.id, r.id FROM t NATURAL JOIN r JOIN u ON u.id = t.a \
              WHERE u.x IN (SELECT y + 6 FROM w)",
             "Prepared: no (a joined side that is a NATURAL or USING join)",
-        ),
-        (
-            "SELECT t.id, s.id FROM t JOIN (VALUES (1), (2)) AS s (id) ON s.id = t.a \
-             JOIN u ON u.id = t.a WHERE u.x IN (SELECT y + 6 FROM w)",
-            "Prepared: no (a joined side holding a VALUES list)",
         ),
     ] {
         check(&db, "hot", ("", line), &[sql.to_string()], &mut wrong);

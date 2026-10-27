@@ -116,13 +116,46 @@ impl OutputLayout {
     /// The output position of what `key` reads: the column its SELECT item
     /// gives, or a column holding its input column unchanged
     fn position(&self, key: &OrderKey) -> Option<usize> {
+        Self::position_over(&self.sources, &self.input_columns, key)
+    }
+
+    /// [`Self::position`] of a layout of `sources` over `input_columns`
+    fn position_over(
+        sources: &[ColumnSource],
+        input_columns: &[String],
+        key: &OrderKey,
+    ) -> Option<usize> {
         match *key {
-            OrderKey::Item(item) => self.item_position(item),
+            OrderKey::Item(item) => sources.iter().position(|s| s.item == Some(item)),
             OrderKey::Input(qualifier, name) => {
-                let input = input_column_index(&self.input_columns, qualifier, name)?;
-                self.sources.iter().position(|s| s.input == Some(input))
+                let input = input_column_index(input_columns, qualifier, name)?;
+                sources.iter().position(|s| s.input == Some(input))
             }
             OrderKey::Ordinal(_) | OrderKey::Expression => None,
+        }
+    }
+
+    /// Each name `stmt`'s sort keys read, into `slots` at the column this
+    /// layout gives it; an error for a qualified name no input column
+    /// answers, which no output name stands in for
+    fn sort_slots(
+        &self,
+        stmt: &SelectStatement,
+        slots: &mut FxHashMap<ExprKey, usize>,
+    ) -> Result<()> {
+        let mut missing = None;
+        visit_order_by_inputs(stmt, &mut |column, key| {
+            if let Some(position) = self.position(&key) {
+                slots.entry(ExprKey::of(column)).or_insert(position);
+            } else if let OrderKey::Input(Some(qualifier), name) = key {
+                if input_column_index(&self.input_columns, Some(qualifier), name).is_none() {
+                    missing.get_or_insert_with(|| format!("{qualifier}.{name}"));
+                }
+            }
+        });
+        match missing {
+            Some(name) => Err(super::aggregation::ungrouped_column(&name)),
+            None => Ok(()),
         }
     }
 }
@@ -236,21 +269,33 @@ pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec
 }
 
 /// The input column a plain column reference reads, as the projection finds
-/// it: the qualified name, then the bare name, then a qualified column whose
-/// last part is the bare name. The names come lowercased
+/// it: a qualified name by [`by_qualifier`]; a bare name, then a qualified
+/// column whose last part is the bare name. The names come lowercased
 fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -> Option<usize> {
-    qualifier
-        .and_then(|qualifier| {
-            columns
-                .iter()
-                .position(|c| eq_folded_qualified(c, qualifier, name))
-        })
-        .or_else(|| columns.iter().position(|c| eq_folded(c, name)))
-        .or_else(|| {
+    let bare = |name: &str| {
+        columns.iter().position(|c| eq_folded(c, name)).or_else(|| {
             columns
                 .iter()
                 .position(|c| split_qualified(c).is_some_and(|(_, last)| eq_folded(last, name)))
         })
+    };
+    let Some(qualifier) = qualifier else {
+        return bare(name);
+    };
+    by_qualifier(
+        columns
+            .iter()
+            .position(|c| eq_folded_qualified(c, qualifier, name)),
+        qualifier,
+        name,
+        bare,
+        |qualifier| {
+            columns
+                .iter()
+                .any(|c| split_qualified(c).is_some_and(|(q, _)| eq_folded(q, qualifier)))
+        },
+        |index| split_qualified(&columns[index]).is_none(),
+    )
 }
 
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
@@ -426,14 +471,15 @@ use super::result::{
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, bare_name, build_column_index_map, collect_table_qualifiers,
+    add_table_qualifier, bare_name, build_column_index_map, by_qualifier, collect_table_qualifiers,
     collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name, named_as_written,
-    order_by_names_an_alias, qualified, shown_name, split_qualified, star_takes_every_column,
-    string_literal_value, strip_table_qualifier, substitute_filter_column, visit_column_refs,
+    order_by_names_an_alias, qualified, qualified_index, shown_name, split_qualified,
+    star_takes_every_column, string_literal_value, strip_table_qualifier, substitute_filter_column,
+    visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
@@ -684,19 +730,16 @@ fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<
                 .copied()
                 .ok_or_else(|| Error::ColumnNotFound(id.value.to_string())),
         ),
-        Expression::QualifiedIdentifier(qid) => {
-            // The full name first: two tables in a join may share a column name
-            let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-            Some(
-                col_index_map
-                    .get(&full_name)
-                    .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
-                    .copied()
-                    .ok_or_else(|| {
-                        Error::ColumnNotFound(format!("{}.{}", qid.qualifier.value, qid.name.value))
-                    }),
+        Expression::QualifiedIdentifier(qid) => Some(
+            qualified_index(
+                col_index_map,
+                &qid.qualifier.value_lower,
+                &qid.name.value_lower,
             )
-        }
+            .ok_or_else(|| {
+                Error::ColumnNotFound(format!("{}.{}", qid.qualifier.value, qid.name.value))
+            }),
+        ),
         _ => None,
     }
 }
@@ -1765,11 +1808,7 @@ impl Executor {
                 // name the input column at the position the layout gives it
                 let mut sort_slots = aggregate_slots;
                 if let Some(layout) = layout {
-                    visit_order_by_inputs(stmt, &mut |column, key| {
-                        if let Some(position) = layout.position(&key) {
-                            sort_slots.entry(ExprKey::of(column)).or_insert(position);
-                        }
-                    });
+                    layout.sort_slots(stmt, &mut sort_slots)?;
                 }
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
@@ -2193,11 +2232,7 @@ impl Executor {
             return Ok(Box::new(DistinctOnResult::new(result, indices)));
         }
         if let Some(layout) = layout {
-            visit_order_by_inputs(stmt, &mut |column, key| {
-                if let Some(position) = layout.position(&key) {
-                    slots.entry(ExprKey::of(column)).or_insert(position);
-                }
-            });
+            layout.sort_slots(stmt, &mut slots)?;
         }
         let outer = outer_column_names(ctx);
         // Each key no column holds is computed into a column appended to the
@@ -5213,7 +5248,6 @@ impl Executor {
             .into_iter()
             .find_map(|side| match side {
                 Expression::JoinSource(join) => Self::joined_side_reason(join),
-                Expression::ValuesSource(_) => Some("a joined side holding a VALUES list"),
                 _ => None,
             })
     }
@@ -6414,8 +6448,9 @@ impl Executor {
                     let op_join_type = OperatorJoinType::parse(&join_type);
 
                     // Try to push projection into the join operator for ~2.3x speedup
-                    // Eligibility: no cross filter, no ORDER BY,
-                    // no aggregation/window, simple column references only
+                    // Eligibility: no cross filter, no ORDER BY, DISTINCT ON keys
+                    // the projection carries, no aggregation/window, simple
+                    // column references only
                     // Note: JoinProjection uses ColumnSource enum to preserve SELECT column order
                     // regardless of whether the join was swapped (outer/inner assignment)
                     let projection_pushdown = if cross_filter.is_none()
@@ -6427,6 +6462,37 @@ impl Executor {
                     } else {
                         None
                     };
+                    // Where each projected column comes from in the joined
+                    // row, for DISTINCT ON to read the projected rows by
+                    let pushdown_sources: Option<LayoutSources> = projection_pushdown
+                        .as_ref()
+                        .filter(|_| !stmt.distinct_on.is_empty())
+                        .map(|proj| {
+                            use crate::executor::operators::index_nested_loop::ColumnSource as Side;
+                            proj.columns
+                                .iter()
+                                .enumerate()
+                                .map(|(item, side)| ColumnSource {
+                                    item: Some(item),
+                                    input: Some(match (*side, swapped) {
+                                        (Side::Outer(idx), false) | (Side::Inner(idx), true) => idx,
+                                        (Side::Outer(idx), true) => inner_cols.len() + idx,
+                                        (Side::Inner(idx), false) => outer_cols.len() + idx,
+                                    }),
+                                })
+                                .collect()
+                        });
+                    let projection_pushdown = projection_pushdown.filter(|_| {
+                        pushdown_sources.as_ref().is_none_or(|sources| {
+                            stmt.distinct_on
+                                .iter()
+                                .all(|key| match bind_order_key(key, stmt) {
+                                    OrderKey::Ordinal(_) => true,
+                                    key => OutputLayout::position_over(sources, &all_columns, &key)
+                                        .is_some(),
+                                })
+                        })
+                    });
 
                     // A cross-table WHERE filter counts toward LIMIT, so it is
                     // applied per joined row rather than after collection
@@ -6800,7 +6866,15 @@ impl Executor {
                             CompactArc::clone(&output_columns),
                             final_rows,
                         );
-                        return Ok((Box::new(result), output_columns, order_limit_applied, None));
+                        return Ok((
+                            Box::new(result),
+                            output_columns,
+                            order_limit_applied,
+                            SelectShape::laid_out(pushdown_sources.map(|sources| OutputLayout {
+                                input_columns: CompactArc::new(all_columns),
+                                sources,
+                            })),
+                        ));
                     } else if !order_limit_applied
                         && self.order_by_needs_extra_columns(stmt, &all_columns)
                     {
@@ -8394,14 +8468,11 @@ impl Executor {
         let mut qualified_col_indices: Vec<Option<usize>> = Vec::new();
         for col_expr in &stmt.columns {
             if let Expression::QualifiedIdentifier(qi) = col_expr {
-                // Build qualified key once
-                let key = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
-                qualified_col_indices.push(
-                    col_index_map
-                        .get(&key)
-                        .copied()
-                        .or_else(|| col_index_map.get(qi.name.value_lower.as_str()).copied()),
-                );
+                qualified_col_indices.push(qualified_index(
+                    &col_index_map,
+                    &qi.qualifier.value_lower,
+                    &qi.name.value_lower,
+                ));
             } else {
                 qualified_col_indices.push(None);
             }
@@ -8823,7 +8894,12 @@ impl Executor {
                 let classification = get_classification(&select_all);
                 let (result, columns, _, _) =
                     self.execute_values_source(vs, &select_all, ctx, &classification)?;
-                Ok((result, columns.to_vec()))
+                // Its columns by its alias, as a table's are
+                let columns = match &vs.alias {
+                    Some(alias) => columns.iter().map(|c| qualified(&alias.value, c)).collect(),
+                    None => columns.to_vec(),
+                };
+                Ok((result, columns))
             }
             Expression::FunctionTableSource(tvf_source) => {
                 Self::execute_tvf_for_join(tvf_source, ctx, filter, None, 0)
@@ -10166,6 +10242,13 @@ impl Executor {
                     })
                 })
         };
+        let find_qualified = |qid: &QualifiedIdentifier| {
+            input_column_index(
+                all_columns,
+                Some(&qid.qualifier.value_lower),
+                &qid.name.value_lower,
+            )
+        };
 
         // Fast path: Check if all expressions are simple column references
         // If so, we can use direct index-based projection without creating Evaluators
@@ -10198,12 +10281,7 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Try full qualified name first (table.column)
-                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(idx) = find_column_index(&full_name, all_columns) {
-                        simple_column_indices.push(idx);
-                    } else if let Some(idx) = find_column_index(&qid.name.value_lower, all_columns)
-                    {
+                    if let Some(idx) = find_qualified(qid) {
                         simple_column_indices.push(idx);
                     } else {
                         all_simple = false;
@@ -10222,13 +10300,7 @@ impl Executor {
                             }
                         }
                         Expression::QualifiedIdentifier(qid) => {
-                            let full_name =
-                                qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                            if let Some(idx) = find_column_index(&full_name, all_columns) {
-                                simple_column_indices.push(idx);
-                            } else if let Some(idx) =
-                                find_column_index(&qid.name.value_lower, all_columns)
-                            {
+                            if let Some(idx) = find_qualified(qid) {
                                 simple_column_indices.push(idx);
                             } else {
                                 all_simple = false;
@@ -10514,18 +10586,12 @@ impl Executor {
                         args.push(ArgSource::Column(idx));
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        // Try full name first, then just column name
-                        let full_name =
-                            qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                        if let Some(&idx) = col_index_map_lower.get(&full_name) {
-                            args.push(ArgSource::Column(idx));
-                        } else if let Some(&idx) =
-                            col_index_map_lower.get(qid.name.value_lower.as_str())
-                        {
-                            args.push(ArgSource::Column(idx));
-                        } else {
-                            return None; // Unknown column
-                        }
+                        let idx = qualified_index(
+                            col_index_map_lower,
+                            &qid.qualifier.value_lower,
+                            &qid.name.value_lower,
+                        )?;
+                        args.push(ArgSource::Column(idx));
                     }
                     // Handle all literal types
                     Expression::IntegerLiteral(lit) => {
@@ -10555,13 +10621,11 @@ impl Executor {
                 Expression::Identifier(id) => {
                     col_index_map_lower.get(id.value_lower.as_str()).copied()
                 }
-                Expression::QualifiedIdentifier(qid) => {
-                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    col_index_map_lower
-                        .get(&full)
-                        .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
-                        .copied()
-                }
+                Expression::QualifiedIdentifier(qid) => qualified_index(
+                    col_index_map_lower,
+                    &qid.qualifier.value_lower,
+                    &qid.name.value_lower,
+                ),
                 _ => None,
             }
         }
@@ -10577,11 +10641,12 @@ impl Executor {
                     Some(ArgSource::Column(idx))
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    let idx = col_index_map_lower
-                        .get(&full)
-                        .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))?;
-                    Some(ArgSource::Column(*idx))
+                    let idx = qualified_index(
+                        col_index_map_lower,
+                        &qid.qualifier.value_lower,
+                        &qid.name.value_lower,
+                    )?;
+                    Some(ArgSource::Column(idx))
                 }
                 Expression::IntegerLiteral(lit) => {
                     Some(ArgSource::Const(Value::Integer(lit.value)))
@@ -10714,19 +10779,14 @@ impl Executor {
                         ExprAction::Compiled(program)
                     }
                 }
-                Expression::QualifiedIdentifier(qid) => {
-                    let full_name = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(&idx) = col_index_map_lower.get(&full_name) {
-                        ExprAction::SimpleColumn(idx)
-                    } else if let Some(&idx) =
-                        col_index_map_lower.get(qid.name.value_lower.as_str())
-                    {
-                        ExprAction::SimpleColumn(idx)
-                    } else {
-                        let program = compile_expression(expr, all_columns)?;
-                        ExprAction::Compiled(program)
-                    }
-                }
+                Expression::QualifiedIdentifier(qid) => match qualified_index(
+                    col_index_map_lower,
+                    &qid.qualifier.value_lower,
+                    &qid.name.value_lower,
+                ) {
+                    Some(idx) => ExprAction::SimpleColumn(idx),
+                    None => ExprAction::Compiled(compile_expression(expr, all_columns)?),
+                },
                 Expression::Aliased(aliased) => {
                     // Recurse into the inner expression
                     match &*aliased.expression {
@@ -10738,20 +10798,17 @@ impl Executor {
                                 ExprAction::Compiled(program)
                             }
                         }
-                        Expression::QualifiedIdentifier(qid) => {
-                            let full_name =
-                                qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                            if let Some(&idx) = col_index_map_lower.get(&full_name) {
-                                ExprAction::SimpleColumn(idx)
-                            } else if let Some(&idx) =
-                                col_index_map_lower.get(qid.name.value_lower.as_str())
-                            {
-                                ExprAction::SimpleColumn(idx)
-                            } else {
-                                let program = compile_expression(&aliased.expression, all_columns)?;
-                                ExprAction::Compiled(program)
-                            }
-                        }
+                        Expression::QualifiedIdentifier(qid) => match qualified_index(
+                            col_index_map_lower,
+                            &qid.qualifier.value_lower,
+                            &qid.name.value_lower,
+                        ) {
+                            Some(idx) => ExprAction::SimpleColumn(idx),
+                            None => ExprAction::Compiled(compile_expression(
+                                &aliased.expression,
+                                all_columns,
+                            )?),
+                        },
                         Expression::FunctionCall(func) => {
                             // Try inline COALESCE optimization
                             if let Some(action) =
@@ -11600,11 +11657,12 @@ impl Executor {
                     let full_name = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
                     // Only match against full qualified name in SELECT to avoid ambiguity
                     if !select_column_names.contains(&full_name) {
-                        // Prefer fully qualified lookup
-                        let idx_opt = col_index_map_lower
-                            .get(full_name.as_str())
-                            .or_else(|| col_index_map_lower.get(qi.name.value_lower.as_str()));
-                        if let Some(&idx) = idx_opt {
+                        let idx_opt = qualified_index(
+                            &col_index_map_lower,
+                            &qi.qualifier.value_lower,
+                            &qi.name.value_lower,
+                        );
+                        if let Some(idx) = idx_opt {
                             if !extra_order_indices.contains(&idx) {
                                 extra_order_indices.push(idx);
                             }
@@ -11686,14 +11744,11 @@ impl Executor {
                         .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    // Prefer full qualified name to handle same-named columns across tables
-                    let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                    select_column_indices.push(
-                        col_index_map_lower
-                            .get(full.as_str())
-                            .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
-                            .copied(),
-                    );
+                    select_column_indices.push(qualified_index(
+                        &col_index_map_lower,
+                        &qid.qualifier.value_lower,
+                        &qid.name.value_lower,
+                    ));
                 }
                 Expression::Aliased(aliased) => match &*aliased.expression {
                     Expression::Identifier(id) => {
@@ -11701,13 +11756,11 @@ impl Executor {
                             .push(col_index_map_lower.get(id.value_lower.as_str()).copied());
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        let full = qualified(&qid.qualifier.value_lower, &qid.name.value_lower);
-                        select_column_indices.push(
-                            col_index_map_lower
-                                .get(full.as_str())
-                                .or_else(|| col_index_map_lower.get(qid.name.value_lower.as_str()))
-                                .copied(),
-                        );
+                        select_column_indices.push(qualified_index(
+                            &col_index_map_lower,
+                            &qid.qualifier.value_lower,
+                            &qid.name.value_lower,
+                        ));
                     }
                     _ => select_column_indices.push(None),
                 },
