@@ -266,14 +266,24 @@ pub(crate) fn aggregate_group_key() -> crate::core::Error {
     crate::core::Error::invalid_argument("an aggregate function cannot be a GROUP BY key")
 }
 
-/// Whether `name` is the alias of a SELECT item of `select` holding an
-/// aggregate call
-pub(crate) fn names_aggregate_item(name: &str, select: &[Expression]) -> bool {
-    select.iter().any(|item| {
-        matches!(item, Expression::Aliased(aliased)
-            if aliased.alias.value.eq_ignore_ascii_case(name)
-                && expression_contains_aggregate(&aliased.expression))
-    })
+/// Whether the GROUP BY key `written` is a bare name that, `binds` false,
+/// binds to no column, enclosing column or other SELECT alias, and is the
+/// alias of an item of `select` holding an aggregate: the one rule every
+/// path refuses such a key by
+pub(crate) fn aggregate_alias_key(
+    written: Option<&Expression>,
+    select: &[Expression],
+    binds: bool,
+) -> bool {
+    let Some(Expression::Identifier(name)) = written else {
+        return false;
+    };
+    !binds
+        && select.iter().any(|item| {
+            matches!(item, Expression::Aliased(aliased)
+                if aliased.alias.value.eq_ignore_ascii_case(&name.value)
+                    && expression_contains_aggregate(&aliased.expression))
+        })
 }
 
 /// The quoted name `stmt` writes as its GROUP BY key at `at`, itself or as
@@ -956,11 +966,13 @@ impl<'a> RowFeed<'a> {
                             Some(idx) => KeyItem::Column(idx),
                             // The outer row's column is one value for every row
                             None if names_outer_column(name, ctx) => KeyItem::Null,
-                            // A name written as the key that only an aggregate
-                            // item's alias carries
+                            // No column or outer column binds it, nor another alias
                             None if stmt.is_some_and(|s| {
-                                matches!(grouping_items(s).get(at), Some(Expression::Identifier(_)))
-                                    && names_aggregate_item(name, &s.columns)
+                                aggregate_alias_key(
+                                    grouping_items(s).get(at).copied(),
+                                    &s.columns,
+                                    false,
+                                )
                             }) =>
                             {
                                 return Err(aggregate_group_key())

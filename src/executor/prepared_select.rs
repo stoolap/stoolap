@@ -43,8 +43,8 @@ use crate::storage::traits::{
 };
 
 use super::aggregation::{
-    aggregate_group_key, aggregate_slot_keys, check_grouped_reads, grouping_items,
-    names_aggregate_item, ungrouped_column, AggregatePath, CallInputs, GroupByItem, Modifiers,
+    aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
+    grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem, Modifiers,
     SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
@@ -5235,13 +5235,9 @@ impl Builder<'_> {
         let bound = group_by_expressions(executor, sq, &scope.columns)?;
         let mut items = Vec::with_capacity(bound.len());
         for (expr, written) in bound.into_iter().zip(grouping_items(sq)) {
-            // A name written as the key that binds to no other SELECT alias,
-            // no scope holds and only an aggregate item's alias carries
-            if matches!(written, Expression::Identifier(name)
-                if names_aggregate_item(&name.value, &sq.columns))
-                && &expr == written
-                && !matches!(chain.resolve(written), Ok(Some(_)))
-            {
+            // It binds where the resolver took another alias or a scope holds it
+            let binds = &expr != written || matches!(chain.resolve(written), Ok(Some(_)));
+            if aggregate_alias_key(Some(written), &sq.columns, binds) {
                 return Err(aggregate_group_key());
             }
             items.push(self.rewrite(chain, Some(id), &expr, work)?);
