@@ -75,7 +75,7 @@
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
 use crate::common::time_compat::Instant;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -282,9 +282,9 @@ pub enum SubsumptionResult {
 /// Intelligently caches query results and detects when new queries
 /// can be answered by filtering cached results.
 pub struct SemanticCache {
-    /// Cached results: table_name -> (column_key -> Vec<CachedResult>)
+    /// Cached results: table_name -> (hash of the column names in order -> Vec<CachedResult>)
     /// Nested structure enables O(1) table invalidation
-    cache: RwLock<StringMap<StringMap<Vec<CachedResult>>>>,
+    cache: RwLock<StringMap<FxHashMap<u64, Vec<CachedResult>>>>,
     /// Maximum cache size per table+column combination
     max_size: usize,
     /// Cache TTL
@@ -411,7 +411,7 @@ impl SemanticCache {
             };
 
             // Navigate nested structure: table -> columns -> entries
-            let table_cache = match cache.get(&table_key) {
+            let table_cache = match cache.get(table_key.as_ref()) {
                 Some(tc) => tc,
                 None => {
                     drop(cache);
@@ -487,7 +487,7 @@ impl SemanticCache {
                 // TOCTOU safety: verify the entry's fingerprint hash matches
                 // If entry was evicted/replaced, skip update (benign miss)
                 if let Ok(mut cache) = self.cache.write() {
-                    if let Some(table_cache) = cache.get_mut(&table_key) {
+                    if let Some(table_cache) = cache.get_mut(table_key.as_ref()) {
                         if let Some(entries) = table_cache.get_mut(&column_key) {
                             if let Some(entry) = entries.get_mut(idx) {
                                 // Only update if it's still the same entry
@@ -573,8 +573,8 @@ impl SemanticCache {
         &self,
         entry: CachedResult,
         new_row_count: usize,
-        table_key: String,
-        column_key: String,
+        table_key: Cow<'_, str>,
+        column_key: u64,
     ) {
         let mut cache = match self.cache.write() {
             Ok(c) => c,
@@ -593,7 +593,7 @@ impl SemanticCache {
         }
 
         // Navigate to nested entries: table -> columns -> entries
-        let table_cache = cache.entry(table_key).or_default();
+        let table_cache = cache.entry(table_key.into_owned()).or_default();
         let entries = table_cache.entry(column_key).or_default();
 
         // Evict expired entries and track row count reduction
@@ -645,13 +645,13 @@ impl SemanticCache {
     /// Evict entries across all tables using global LRU until rows_to_free rows are freed
     fn evict_global_lru(
         &self,
-        cache: &mut StringMap<StringMap<Vec<CachedResult>>>,
+        cache: &mut StringMap<FxHashMap<u64, Vec<CachedResult>>>,
         mut rows_to_free: usize,
         skip_table: &str,
     ) {
         while rows_to_free > 0 {
             // Find the globally oldest entry across all tables
-            let mut oldest: Option<(String, String, usize, Instant, u64, usize)> = None;
+            let mut oldest: Option<(String, u64, usize, Instant, u64, usize)> = None;
 
             for (table_key, table_cache) in cache.iter() {
                 if table_key == skip_table {
@@ -668,7 +668,7 @@ impl SemanticCache {
                         if dominated {
                             oldest = Some((
                                 table_key.clone(),
-                                col_key.clone(),
+                                *col_key,
                                 idx,
                                 entry.last_accessed,
                                 entry.access_count,
@@ -808,15 +808,12 @@ impl SemanticCache {
 
     // Private helpers
 
-    /// Returns (table_key, column_key) for the nested cache structure
-    fn cache_keys(table_name: &str, columns: &[String]) -> (String, String) {
-        // Use null byte as delimiter for column key since it's invalid in SQL identifiers
-        // This prevents collision between columns like ["a,b", "c"] and ["a", "b,c"]
-        let table_key = table_name.to_lowercase();
-        let mut sorted_cols = columns.to_vec();
-        sorted_cols.sort();
-        let column_key = sorted_cols.join("\0");
-        (table_key, column_key)
+    /// Returns (table_key, column_key) for the nested cache structure; an
+    /// entry's own column names decide a match, so equal hashes may share
+    fn cache_keys<'a>(table_name: &'a str, columns: &[String]) -> (Cow<'a, str>, u64) {
+        let mut hasher = FxHasher::default();
+        columns.hash(&mut hasher);
+        (to_lowercase_cow(table_name), hasher.finish())
     }
 
     fn record_exact_hit(&self) {
