@@ -30,8 +30,8 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The SELECT list's projection apart, which the ledger keeps as its own cell
-const MECHANISMS: [GeneralPath; 5] = [
+const MECHANISMS: [GeneralPath; 6] = [
+    GeneralPath::ProjectionEvaluator,
     GeneralPath::ScalarSubquery,
     GeneralPath::CorrelatedExpression,
     GeneralPath::OuterBinding,

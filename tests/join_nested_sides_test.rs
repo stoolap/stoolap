@@ -54,17 +54,14 @@ fn hits() -> Vec<usize> {
         .collect()
 }
 
-/// The answer of `sql` and the general path mechanisms it ran, the blocks'
-/// own projection apart
+/// The answer of `sql` and the general path mechanisms it ran
 fn run(db: &Database, sql: &str) -> (Result<Vec<String>, String>, Vec<GeneralPath>) {
     let before = hits();
     let got = answer(db, sql);
     let ran = MECHANISMS
         .iter()
         .zip(before.iter().zip(hits()))
-        .filter(|(path, (before, now))| {
-            now > *before && !matches!(path, GeneralPath::ProjectionEvaluator)
-        })
+        .filter(|(_, (before, now))| now > *before)
         .map(|(path, _)| *path)
         .collect();
     (got, ran)

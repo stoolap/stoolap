@@ -68,9 +68,9 @@ use super::result::{
 };
 use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
-    extract_literal_value, flip_operator, get_table_alias_from_expr, infix_to_operator,
-    is_aggregate_function, item_name, order_by_names_an_alias, split_qualified,
-    strip_table_qualifier, QUALIFIER_SEP,
+    extract_literal_value, flip_operator, for_each_qualified_star_column,
+    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name,
+    order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -1123,6 +1123,7 @@ fn counts_fit(
 /// One scope of a chain: the tables it reads, each by the name that
 /// qualifies it and the position of its first column, and their columns
 /// in that order; a join's statement scope holds its two sides
+#[derive(Debug)]
 struct ScopeTable {
     tables: SmallVec<[(SmartString, usize); 2]>,
     /// The names its programs compile against
@@ -1925,6 +1926,16 @@ struct Chain<'a> {
     scopes: &'a [&'a ScopeTable],
 }
 
+/// An identifier spelled `value`, matched as `lower`
+fn ident(value: &str, lower: &str) -> Identifier {
+    let mut id = Identifier::new(
+        Token::new(TokenType::Identifier, value, Position::default()),
+        value,
+    );
+    id.value_lower = SmartString::from(lower);
+    id
+}
+
 impl Chain<'_> {
     /// `id` by the name rules: the nearest scope with that column, or None
     /// for a name the compiler reads as a literal
@@ -1997,14 +2008,6 @@ impl Chain<'_> {
     /// table can have, so the compiler reads it as a column wherever it
     /// stands, never a literal; over a join, the scope's name for its position
     fn column(&self, depth: usize, index: usize) -> Expression {
-        let ident = |value: &str, lower: &str| {
-            let mut id = Identifier::new(
-                Token::new(TokenType::Identifier, value, Position::default()),
-                value,
-            );
-            id.value_lower = SmartString::from(lower);
-            id
-        };
         let scope = self.scopes[depth];
         let spelled = scope.columns[index].as_str();
         if scope.tables.len() > 1 {
@@ -3900,7 +3903,7 @@ impl Computed {
 
 /// The SELECT list, then the columns and expressions ORDER BY appends for the sort
 #[derive(Debug)]
-struct PreparedProjection {
+pub(crate) struct PreparedProjection {
     outputs: Vec<Output>,
     /// The outputs are the row's columns in order: each row is its own projection
     whole_row: bool,
@@ -3911,6 +3914,15 @@ struct PreparedProjection {
     slots: usize,
     /// Whether a key reads SELECT aliases from the projected row
     alias_keys: bool,
+}
+
+/// A SELECT list's items, each `*` spelled out as its columns
+struct SelectItems<'a> {
+    exprs: Vec<Expression>,
+    /// The column each item of a `*` is, by position: names may repeat
+    stars: Vec<Option<usize>>,
+    /// Each item as the blocks rewrote it, when it holds subqueries
+    rewritten: Vec<Option<&'a Expression>>,
 }
 
 /// What preparing one statement builds up
@@ -5587,6 +5599,34 @@ fn check_names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str]) -> Result
     }
 }
 
+/// Each ORDER BY and DISTINCT ON key's names as `chain` binds them, over the
+/// rows of `columns`: a bare key names a SELECT alias first; inside an
+/// expression a column of the same name comes first
+fn check_key_names(stmt: &SelectStatement, chain: &Chain<'_>, columns: &[String]) -> Result<()> {
+    let aliases: Vec<&str> = stmt
+        .columns
+        .iter()
+        .filter_map(|c| match c {
+            Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+            _ => None,
+        })
+        .collect();
+    let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+    let inner_aliases: Vec<&str> = alias_map.keys().map(String::as_str).collect();
+    let keys = stmt
+        .order_by
+        .iter()
+        .map(|ob| &ob.expression)
+        .chain(&stmt.distinct_on);
+    for key in keys {
+        match key {
+            Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str()) => {}
+            key => check_names(chain, key, &inner_aliases)?,
+        }
+    }
+    Ok(())
+}
+
 impl PreparedProjection {
     /// The SELECT list over `chain`'s one table and what ORDER BY and
     /// DISTINCT ON append, with the names and the sources of the appended
@@ -5601,14 +5641,6 @@ impl PreparedProjection {
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
         let scope = chain.scopes[0];
         let columns: &[String] = &scope.columns;
-        let aliases: Vec<&str> = stmt
-            .columns
-            .iter()
-            .filter_map(|c| match c {
-                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-                _ => None,
-            })
-            .collect();
         let mut select_exprs = Vec::with_capacity(stmt.columns.len());
         // The column each item of a `*` is, by position: names may repeat
         let mut star_columns: Vec<Option<usize>> = Vec::with_capacity(stmt.columns.len());
@@ -5637,27 +5669,99 @@ impl PreparedProjection {
                 }
             }
         }
-        // A bare key names an alias first; inside an expression a column of
-        // the same name comes first, so only the aliases this map keeps
-        let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
-        let inner_aliases: Vec<&str> = alias_map.keys().map(String::as_str).collect();
-        let sort_keys = || {
-            stmt.order_by
-                .iter()
-                .map(|ob| &ob.expression)
-                .chain(&stmt.distinct_on)
+        check_key_names(stmt, chain, columns)?;
+        let items = SelectItems {
+            exprs: select_exprs,
+            stars: star_columns,
+            rewritten: item_rewritten,
         };
-        for key in sort_keys() {
-            match key {
-                Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str()) => {}
-                key => check_names(chain, key, &inner_aliases)?,
+        let keys = (&stmt.order_by[..], &stmt.distinct_on[..]);
+        let rewritten_keys = [rewritten[1], rewritten[2]];
+        Self::build(
+            executor,
+            stmt,
+            items,
+            keys,
+            (columns, columns),
+            rewritten_keys,
+        )
+    }
+
+    /// The SELECT list over a join's rows of `all_columns` and, unless the
+    /// join sorted them already, what ORDER BY and DISTINCT ON append; an
+    /// item or key holding subqueries compiles as `blocks` rewrote it
+    pub(crate) fn prepare_joined(
+        executor: &Executor,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        sorted: bool,
+        blocks: &JoinBlocks,
+    ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
+        let scopes = [&blocks.scope];
+        let chain = Chain { scopes: &scopes };
+        check_key_names(stmt, &chain, all_columns)?;
+        let mut items = SelectItems {
+            exprs: Vec::with_capacity(stmt.columns.len()),
+            stars: Vec::with_capacity(stmt.columns.len()),
+            rewritten: Vec::with_capacity(stmt.columns.len()),
+        };
+        let star = |items: &mut SelectItems<'_>, i: usize| {
+            let spelled = all_columns[i].as_str();
+            items
+                .exprs
+                .push(Expression::Identifier(ident(spelled, spelled)));
+            items.stars.push(Some(i));
+            items.rewritten.push(None);
+        };
+        for (item, rewritten) in stmt.columns.iter().zip(&blocks.select) {
+            match item {
+                Expression::Star(_) => (0..all_columns.len()).for_each(|i| star(&mut items, i)),
+                Expression::QualifiedStar(q) => {
+                    for_each_qualified_star_column(all_columns, &q.qualifier, None, |i, _| {
+                        star(&mut items, i)
+                    })
+                }
+                other => {
+                    check_names(&chain, unaliased(other), &[])?;
+                    items.exprs.push(other.clone());
+                    items.stars.push(None);
+                    items.rewritten.push(rewritten.as_ref());
+                }
             }
         }
+        let (keys, rewritten): (_, [&[Option<Expression>]; 2]) = match sorted {
+            true => ((&[][..], &[][..]), [&[], &[]]),
+            false => (
+                (&stmt.order_by[..], &stmt.distinct_on[..]),
+                [&blocks.order_by, &blocks.distinct_on],
+            ),
+        };
+        let columns = (all_columns, &blocks.all[..]);
+        Self::build(executor, stmt, items, keys, columns, rewritten)
+    }
+
+    /// `items` and the columns `order_by` and `distinct_on` append, compiled
+    /// over `columns`, an item or key the blocks rewrote over `blocks_columns`
+    fn build(
+        executor: &Executor,
+        stmt: &SelectStatement,
+        items: SelectItems<'_>,
+        (order_by, distinct_on): (&[OrderByExpression], &[Expression]),
+        (columns, blocks_columns): (&[String], &[String]),
+        rewritten: [&[Option<Expression>]; 2],
+    ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
+        let SelectItems {
+            exprs: select_exprs,
+            stars: star_columns,
+            rewritten: item_rewritten,
+        } = items;
+        let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+        let sort_keys = || order_by.iter().map(|ob| &ob.expression).chain(distinct_on);
         // A key holding a subquery is computed into a column named after it
         let plan = executor.order_by_projection(
             &select_exprs,
-            &stmt.order_by,
-            &stmt.distinct_on,
+            order_by,
+            distinct_on,
             stmt.table_expr.as_deref(),
             columns,
             true,
@@ -5669,7 +5773,7 @@ impl PreparedProjection {
         let compile = |expr: &Expression, rewritten: Option<&Expression>| match rewritten {
             Some(rewritten) => compile_with(
                 blocks_ctx.get_or_init(|| {
-                    CompileContext::new(columns, registry).with_prepared_subqueries()
+                    CompileContext::new(blocks_columns, registry).with_prepared_subqueries()
                 }),
                 rewritten,
             ),
@@ -5694,14 +5798,13 @@ impl PreparedProjection {
         outputs.extend(plan.extra_order_indices.iter().map(|&i| Output::Column(i)));
         // Each key as the blocks rewrote it, found by the node it is
         let rewritten_key = |expr: &Expression| {
-            let order_at = stmt
-                .order_by
+            let order_at = order_by
                 .iter()
                 .position(|ob| std::ptr::eq(&ob.expression, expr));
-            let distinct_at = stmt.distinct_on.iter().position(|k| std::ptr::eq(k, expr));
+            let distinct_at = distinct_on.iter().position(|k| std::ptr::eq(k, expr));
             match (order_at, distinct_at) {
-                (Some(at), _) => rewritten[1][at].as_ref(),
-                (None, Some(at)) => rewritten[2][at].as_ref(),
+                (Some(at), _) => rewritten[0][at].as_ref(),
+                (None, Some(at)) => rewritten[1][at].as_ref(),
                 (None, None) => None,
             }
         };
@@ -5812,7 +5915,7 @@ impl PreparedProjection {
     }
 
     /// Each row's output, its subqueries answered by the run's blocks
-    fn project(&self, mut rows: RowVec, run: &PreparedRunner<'_>) -> Result<RowVec> {
+    pub(crate) fn project(&self, mut rows: RowVec, run: &PreparedRunner<'_>) -> Result<RowVec> {
         if self.whole_row {
             for (row_id, (id, _)) in rows.iter_mut().enumerate() {
                 *id = row_id as i64;
@@ -7364,6 +7467,8 @@ pub(crate) struct JoinBlocks {
     pub(crate) left: Vec<String>,
     pub(crate) right: Vec<String>,
     pub(crate) all: CompactArc<Vec<String>>,
+    /// The joined scope, which the output's names bind in
+    scope: ScopeTable,
 }
 
 impl JoinBlocks {
@@ -7655,6 +7760,7 @@ impl JoinBlocks {
             left,
             right,
             all: CompactArc::clone(&scope.columns),
+            scope,
         }))
     }
 

@@ -177,16 +177,11 @@ fn a_join_over_a_side_that_is_not_a_table_runs_its_blocks() {
                         "{context} {kind}: {sql}: gave {got:?}, a table side {want:?}"
                     ));
                 }
-                // The blocks' own projection counts as an evaluator, over a table side too
-                let evaluator =
-                    |path: &&GeneralPath| !matches!(path, GeneralPath::ProjectionEvaluator);
-                let table_ran: Vec<_> = table_ran.iter().filter(evaluator).collect();
                 if !table_ran.is_empty() {
                     wrong.push(format!(
                         "{context}: {shape} over a table: ran {table_ran:?}"
                     ));
                 }
-                let ran: Vec<_> = ran.iter().filter(evaluator).collect();
                 if !ran.is_empty() {
                     wrong.push(format!("{context} {kind}: {sql}: ran {ran:?}"));
                 }
@@ -225,14 +220,9 @@ fn a_join_whose_limit_is_cut_into_a_cte_it_keeps_runs_as_explain_says() {
     ] {
         let sql = format!("{with}{shape}");
         let (got, ran) = run(&db, &sql);
-        let evaluator = |path: &&GeneralPath| !matches!(path, GeneralPath::ProjectionEvaluator);
         assert_eq!(got.map(|rows| rows.len()), Ok(2), "{sql}");
         assert_eq!(prepared_line(&db, &sql), line, "{sql}");
-        assert_eq!(
-            ran.iter().any(|path| evaluator(&path)),
-            old,
-            "{sql}: ran {ran:?}"
-        );
+        assert_eq!(!ran.is_empty(), old, "{sql}: ran {ran:?}");
     }
 }
 
@@ -367,9 +357,8 @@ fn a_cte_over_a_join_keeps_its_plan_unless_its_names_wait_for_its_run() {
             "{sql}"
         );
         assert_eq!(prepared_line(&db, sql), line, "{sql}");
-        let evaluator = |path: &&GeneralPath| !matches!(path, GeneralPath::ProjectionEvaluator);
         assert_eq!(
-            ran.iter().any(|path| evaluator(&path)),
+            !ran.is_empty(),
             line != "Prepared: yes",
             "{sql}: the CTE path runs the join without its plan: {ran:?}"
         );

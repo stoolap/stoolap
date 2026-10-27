@@ -66,6 +66,9 @@ const SHAPES: &[&str] = &[
     "SELECT t.b FROM {f} WHERE CASE WHEN {id} > 1 THEN (SELECT 1) ELSE 0 END = 1",
     "SELECT t.b FROM {f} WHERE EXISTS (SELECT 1 FROM w WHERE w.k = {id})",
     "SELECT t.b, (SELECT COUNT(*) FROM w WHERE w.k = {id}) FROM {f}",
+    "SELECT {id}, (SELECT MAX(y) FROM w) FROM {f}",
+    "SELECT {id} + 1, (SELECT MAX(y) FROM w) FROM {f} ORDER BY t.b",
+    "SELECT t.b, (SELECT MAX(y) FROM w) FROM {f} ORDER BY {id}",
     "SELECT t.b FROM {f} ORDER BY {id} + (SELECT 0)",
     "SELECT t.b FROM {f}{on} AND {id} > (SELECT 0)",
 ];
