@@ -340,6 +340,22 @@ fn a_select_item_naming_a_grouped_column_reads_it_beside_an_aggregate_of_that_al
             "SELECT SUM(a) AS b, t.b, (SELECT MAX(id) FROM one) FROM t GROUP BY b",
             vec!["i:3|i:10|i:1", "i:3|i:20|i:1"],
         ),
+        (
+            "SELECT SUM(a) AS b, b AS original_b FROM t GROUP BY t.b",
+            vec!["i:3|i:10", "i:3|i:20"],
+        ),
+        (
+            "SELECT SUM(a) AS b, b + 1 FROM t GROUP BY t.b",
+            vec!["i:3|i:11", "i:3|i:21"],
+        ),
+        (
+            "SELECT SUM(a) AS b, t.b * 2 FROM t GROUP BY b",
+            vec!["i:3|i:20", "i:3|i:40"],
+        ),
+        (
+            "SELECT SUM(a) AS b, CASE WHEN b > 15 THEN 'big' ELSE 'small' END FROM t GROUP BY t.b",
+            vec!["i:3|big", "i:3|small"],
+        ),
     ] {
         assert_eq!(rows(&db, sql), want, "{sql}");
     }

@@ -1612,12 +1612,24 @@ impl Executor {
         };
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
-        // Names find the result columns that bare names and aliases point at
-        let agg_col_index_map = build_column_index_map(&agg_columns);
-        // The group items' own names, which a column name reads before any
-        // result column: an aggregate's alias names no column of the FROM
-        let group_names = &agg_columns[..group_by_columns.len().min(agg_columns.len())];
-        let group_index_map = build_column_index_map(group_names);
+        // The names every SELECT item reads the aggregated row by: each group
+        // item's, and an aggregate's only where no group item's column has
+        // it, since an aggregate's alias names no column of the FROM
+        let group_count = group_by_columns.len().min(agg_columns.len());
+        let group_index_map = build_column_index_map(&agg_columns[..group_count]);
+        let slot_names: Vec<String> = agg_columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let shadowed =
+                    i >= group_count && group_index_map.contains_key(name.to_lowercase().as_str());
+                match shadowed {
+                    true => String::new(),
+                    false => name.clone(),
+                }
+            })
+            .collect();
+        let agg_col_index_map = build_column_index_map(&slot_names);
         // Identities find the slot of each group item and aggregate, however it is named
         let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
@@ -1711,11 +1723,9 @@ impl Executor {
             final_columns.push(item_name(original_expr));
             match col_expr {
                 Expression::Identifier(id) => {
-                    // A name a group item or aggregate is keyed by, or a group
-                    // item's column has, reads that slot before a result column
-                    // of the name: another item's alias is not visible here
-                    let grouped = || group_index_map.get(id.value_lower.as_str()).copied();
-                    match slot_of(col_expr).or_else(grouped) {
+                    // A name a group item or aggregate is keyed by reads its slot,
+                    // else the result column of its name among `slot_names`
+                    match slot_of(col_expr) {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
                         None if agg_col_index_map.contains_key(id.value_lower.as_str()) => {
                             column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
@@ -1726,14 +1736,9 @@ impl Executor {
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
-                    // A group item's column first, by the one qualified-name rule
-                    match qualified_index(&group_index_map, qualifier, name) {
+                    match qualified_index(&agg_col_index_map, qualifier, name) {
                         Some(index) => column_sources.push(ColumnSource::AggSlot(index)),
-                        None => match qualified_index(&agg_col_index_map, qualifier, name) {
-                            Some(index) => column_sources
-                                .push(ColumnSource::AggColumn(agg_columns[index].to_lowercase())),
-                            None => column_sources.push(make_source(col_expr, is_correlated)),
-                        },
+                        None => column_sources.push(make_source(col_expr, is_correlated)),
                     }
                 }
                 Expression::FunctionCall(func) => {
@@ -1933,7 +1938,7 @@ impl Executor {
             .map(|s| match s {
                 ColumnSource::Expression(expr) => compile_over_slots(
                     expr,
-                    &agg_columns,
+                    &slot_names,
                     crate::functions::registry::global_registry(),
                     Some(&slot_keys),
                     outer_columns.as_deref(),
@@ -1995,7 +2000,7 @@ impl Executor {
                                     .map(|outer| outer.keys().map(|k| k.to_string()).collect());
                                 let program = compile_over_slots(
                                     &processed_expr,
-                                    &agg_columns,
+                                    &slot_names,
                                     &self.function_registry,
                                     None,
                                     outer.as_deref(),
