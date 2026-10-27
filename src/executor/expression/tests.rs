@@ -637,10 +637,20 @@ fn a_bound_program_reads_its_columns_by_index_and_no_name() {
         })
     };
     let bound = CompileContext::bound(global_registry());
-    let program = ExprCompiler::new(&bound).compile(&column(1)).unwrap();
-    let row = Row::from_values(vec![Value::Integer(1), Value::Integer(2)]);
-    let read = ExprVM::new().execute(&program, &ExecuteContext::new(&row));
-    assert_eq!(read.unwrap(), Value::Integer(2));
+    let row = Row::from_values(
+        (0..=u16::MAX)
+            .map(|i| Value::Integer(i64::from(i)))
+            .collect(),
+    );
+    for index in [1, u16::MAX] {
+        let program = ExprCompiler::new(&bound).compile(&column(index)).unwrap();
+        let read = ExprVM::new().execute(&program, &ExecuteContext::new(&row));
+        assert_eq!(
+            read.unwrap(),
+            Value::Integer(i64::from(index)),
+            "column {index}"
+        );
+    }
     assert!(
         ExprCompiler::new(&bound)
             .compile(&Expression::Identifier(ident("a")))

@@ -5642,10 +5642,13 @@ impl PreparedProjection {
         let mut star_columns: Vec<Option<usize>> = Vec::with_capacity(stmt.columns.len());
         // Each item's rewritten form, by its position in `select_exprs`
         let mut item_rewritten: Vec<Option<&Expression>> = Vec::with_capacity(stmt.columns.len());
+        // A `*` item is read by position, under its column's name, by which
+        // an ORDER BY key finds it selected
+        let star_item = |i: usize| Expression::Identifier(ident(&columns[i], &scope.lower[i]));
         for (column, rewritten) in stmt.columns.iter().zip(rewritten[0]) {
             match column {
                 Expression::Star(_) => {
-                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)));
+                    select_exprs.extend((0..columns.len()).map(star_item));
                     star_columns.extend((0..columns.len()).map(Some));
                     item_rewritten.extend((0..columns.len()).map(|_| None));
                 }
@@ -5653,7 +5656,7 @@ impl PreparedProjection {
                     if star.qualifier.to_lowercase() != scope.tables[0].0.as_str() {
                         return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)));
                     }
-                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)));
+                    select_exprs.extend((0..columns.len()).map(star_item));
                     star_columns.extend((0..columns.len()).map(Some));
                     item_rewritten.extend((0..columns.len()).map(|_| None));
                 }
@@ -6684,10 +6687,11 @@ impl PreparedGrouped {
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
         // A group's row holds its GROUP BY items first, each holding the
-        // column it binds to when it is one, and whether it is written as that
-        // column rather than through a SELECT item. A hole reads an item
-        // holding the column it binds to: the one written as the hole is,
-        // else one written as a column, else the first
+        // column it binds to when it is one, the identity of what it groups,
+        // through an alias or a position, and whether it is written as that
+        // column. A hole reads an item holding the column it binds to: the
+        // one grouping what the hole is, else one written as a column, else
+        // the first
         let held: Vec<(Option<usize>, ExprKey, bool)> = grouping_items(stmt)
             .into_iter()
             .map(|key| {
@@ -6697,7 +6701,7 @@ impl PreparedGrouped {
                     Ok(Some((0, column))) => Some(column),
                     _ => None,
                 };
-                (column, ExprKey::of(key), item.is_none())
+                (column, ExprKey::of(read), item.is_none())
             })
             .collect();
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {

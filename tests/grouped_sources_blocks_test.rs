@@ -702,6 +702,23 @@ fn a_rolled_up_column_reads_the_cell_of_the_item_naming_it() {
             assert_eq!(got, want, "{sql}");
         }
     }
+    // A bare name reads the item grouping the expression it names, through
+    // an alias or a position, before one that names its column
+    for sets in ["ROLLUP(g, t.a)", "ROLLUP(1, t.a)"] {
+        let mut want = rows(
+            &db,
+            &format!("SELECT a AS g, COUNT(*), CASE WHEN a = 1 THEN 10 END FROM t GROUP BY {sets}"),
+        )
+        .unwrap();
+        want.sort();
+        let sql = format!(
+            "SELECT a AS g, COUNT(*), (SELECT MAX(u.x) FROM u WHERE u.k = a) FROM t \
+             GROUP BY {sets}"
+        );
+        let mut got = rows(&db, &sql).unwrap();
+        got.sort();
+        assert_eq!(got, want, "{sql}");
+    }
 }
 
 #[test]

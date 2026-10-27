@@ -189,7 +189,7 @@ pub struct CompileContext<'a> {
 
     /// A program over the prepared builder's bound columns: one below the
     /// split reads the first row, the rest the second row from the split on
-    bound: Option<u16>,
+    bound: Option<u32>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -238,7 +238,7 @@ impl<'a> CompileContext<'a> {
     /// columns of one row: no name is looked up, so one left unbound fails
     pub(crate) fn bound(functions: &'a FunctionRegistry) -> Self {
         Self {
-            bound: Some(u16::MAX),
+            bound: Some(u32::MAX),
             ..Self::new(&[], functions)
         }
     }
@@ -246,7 +246,7 @@ impl<'a> CompileContext<'a> {
     /// The same over a joined row whose second row starts at column `split`
     pub(crate) fn bound_pair(functions: &'a FunctionRegistry, split: u16) -> Self {
         Self {
-            bound: Some(split),
+            bound: Some(u32::from(split)),
             ..Self::new(&[], functions)
         }
     }
@@ -662,8 +662,10 @@ impl<'a> ExprCompiler<'a> {
             }
 
             Expression::Column(column) => match self.ctx.bound {
-                Some(split) if column.index < split => builder.emit(Op::LoadColumn(column.index)),
-                Some(split) => builder.emit(Op::LoadColumn2(column.index - split)),
+                Some(split) => match u32::from(column.index).checked_sub(split) {
+                    None => builder.emit(Op::LoadColumn(column.index)),
+                    Some(second) => builder.emit(Op::LoadColumn2(second as u16)),
+                },
                 None => {
                     return Err(CompileError::InvalidExpression(format!(
                         "bound column '{}' outside a prepared program",

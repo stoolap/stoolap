@@ -114,6 +114,24 @@ fn a_runner_binds_only_the_outputs_a_run_binds() {
 }
 
 #[test]
+fn a_star_sorted_by_its_own_column_takes_the_rows_as_a_list_of_them_does() {
+    let db = open("projection_alloc_star_order");
+    for key in ["s", "id"] {
+        let block = "WHERE id IN (SELECT id FROM t)";
+        let star = allocations(&db, &format!("SELECT * FROM t {block} ORDER BY {key}"), &[]);
+        let list = allocations(
+            &db,
+            &format!("SELECT id, s FROM t {block} ORDER BY {key}"),
+            &[],
+        );
+        assert!(
+            star <= list,
+            "SELECT * sorted by {key}: {star} allocations, {list} with its columns listed"
+        );
+    }
+}
+
+#[test]
 fn a_short_concatenation_of_many_parts_allocates_nothing_per_row() {
     let db = open("projection_alloc_parts");
     let parts = allocations(

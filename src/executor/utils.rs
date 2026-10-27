@@ -1072,6 +1072,8 @@ pub fn extract_column_name(expr: &Expression) -> Option<String> {
         Expression::QualifiedIdentifier(QualifiedIdentifier { name, .. }) => {
             Some(name.value.to_string())
         }
+        // A column the prepared builder bound in the table's own scope
+        Expression::Column(column) => Some(column.name.value.to_string()),
         _ => None,
     }
 }
