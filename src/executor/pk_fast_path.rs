@@ -464,15 +464,18 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable(epoch)
-                    if self.engine.schema_epoch() == *epoch =>
+                CompiledExecution::NotOptimizable(validity)
+                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
                 {
                     return None
                 }
                 CompiledExecution::PkLookup(lookup) => {
                     // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
                     // If epoch matches, no DDL has occurred since compilation
-                    if self.engine.schema_epoch() == lookup.cached_epoch {
+                    if lookup
+                        .validity
+                        .holds(&*self.engine, self.engine.schema_epoch())
+                    {
                         // Fast path: extract value and execute
                         let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
                         #[cfg(feature = "test-failpoints")]
@@ -560,7 +563,10 @@ impl Executor {
             CompiledExecution::NotOptimizable(_) => None,
             CompiledExecution::PkLookup(lookup) => {
                 // Fast validation using schema epoch
-                if self.engine.schema_epoch() == lookup.cached_epoch {
+                if lookup
+                    .validity
+                    .holds(&*self.engine, self.engine.schema_epoch())
+                {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
@@ -620,12 +626,17 @@ impl Executor {
         // Double-check (another thread may have compiled while we waited)
         // But also re-validate schema version to handle schema changes
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+            CompiledExecution::NotOptimizable(validity)
+                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
+            {
                 return None
             }
             CompiledExecution::PkLookup(lookup) => {
                 // Re-validate epoch: another thread may have compiled before DDL
-                if self.engine.schema_epoch() == lookup.cached_epoch {
+                if lookup
+                    .validity
+                    .holds(&*self.engine, self.engine.schema_epoch())
+                {
                     let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
                     return or_normal_path(self.execute_compiled_pk_lookup(
                         lookup,
@@ -650,6 +661,9 @@ impl Executor {
             | CompiledExecution::PreparedGrouped(_) => return None,
         }
 
+        // Read before the schema: a change in between leaves this behind
+        let validity = self.select_validity(stmt, self.engine.schema_epoch());
+
         // Do full pattern detection (same as try_fast_pk_lookup)
         let where_clause = stmt.where_clause.as_ref()?;
         let table_expr = stmt.table_expr.as_ref()?;
@@ -661,19 +675,19 @@ impl Executor {
             || stmt.with.is_some()
             || stmt.distinct
         {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
         // Quick reject: no ORDER BY
         if !stmt.order_by.is_empty() {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
         // Quick reject: LIMIT 0 or OFFSET would change the result
         if !Self::pk_fast_path_limit_ok(stmt) {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -686,7 +700,7 @@ impl Executor {
         let table_name: &str = match table_expr.as_ref() {
             Expression::TableSource(ts) if ts.as_of.is_none() => ts.name.value_lower.as_str(),
             _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -696,8 +710,6 @@ impl Executor {
         // NULL parameter this execution) must leave the compiled lookup in
         // place so later executions with an integer parameter still
         // fast-path.
-        // Read before the schema: a change in between leaves this epoch behind
-        let cached_epoch = self.engine.schema_epoch();
         let structure = self.extract_pk_lookup_structure(table_name, where_clause);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::compile_schema_read();
@@ -711,7 +723,7 @@ impl Executor {
                     column_names: column_names.clone(),
                     projection: projection.clone(),
                     pk_value_source: pk_value_source.clone(),
-                    cached_epoch,
+                    validity,
                     token,
                 };
                 *compiled_guard = CompiledExecution::PkLookup(compiled_lookup);
@@ -734,7 +746,7 @@ impl Executor {
                 ))
             }
             None => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 None
             }
         }

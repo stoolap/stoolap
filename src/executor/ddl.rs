@@ -170,15 +170,18 @@ fn constraint_expression(
 }
 
 use super::context::ExecutionContext;
+use super::query_cache::NestedPlan;
 use super::result::ExecResult;
 use super::Executor;
 
 impl Executor {
-    /// Execute a CREATE TABLE statement
+    /// Execute a CREATE TABLE statement, its AS SELECT under the plan
+    /// `plan` holds for it
     pub(crate) fn execute_create_table(
         &self,
         stmt: &CreateTableStatement,
         ctx: &ExecutionContext,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         let _ddl = self.engine.ddl_guard();
         let table_name = &stmt.table_name.value;
@@ -206,6 +209,7 @@ impl Executor {
                 select_stmt,
                 stmt.if_not_exists,
                 ctx,
+                plan.and_then(NestedPlan::source),
             );
         }
 
@@ -588,19 +592,20 @@ impl Executor {
         Ok(Box::new(ExecResult::empty()))
     }
 
-    /// Execute CREATE TABLE ... AS SELECT ...
+    /// Execute CREATE TABLE ... AS SELECT ..., the SELECT under `plan`
     fn execute_create_table_as_select(
         &self,
         table_name: &str,
         select_stmt: &SelectStatement,
         _if_not_exists: bool,
         ctx: &ExecutionContext,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         use crate::core::Row;
 
         // Execute the SELECT query to get the result
         // Use execute_select for full query processing (DISTINCT, ORDER BY, etc.)
-        let mut result = self.execute_select(select_stmt, ctx)?;
+        let mut result = self.execute_select_with_plan(select_stmt, ctx, None, plan, None)?;
         let columns: Vec<String> = result.columns().to_vec();
 
         // Materialize the result to get the rows
@@ -713,9 +718,6 @@ impl Executor {
                 self.engine.drop_table_internal(table_name)?;
             }
         }
-
-        // Invalidate query cache for this table (schema no longer exists)
-        self.query_cache.invalidate_table(table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -1304,9 +1306,6 @@ impl Executor {
         }
 
         tx.commit()?;
-
-        // Invalidate query cache for this table (schema may have changed)
-        self.query_cache.invalidate_table(table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }

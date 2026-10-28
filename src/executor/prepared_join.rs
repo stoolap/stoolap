@@ -28,6 +28,7 @@ use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
 use super::prepared_select::{JoinBlocks, PreparedGrouped};
 use super::query::JoinOutput;
+use super::query_cache::PlanValidity;
 
 /// The programs one compile builds, shared only once they are held
 pub type BuiltPrograms = SmallVec<[SharedProgram; 2]>;
@@ -190,10 +191,10 @@ impl JoinSide {
 /// Each side's columns as a join's blocks read them
 pub(crate) type JoinSides = [JoinSide; 2];
 
-/// The programs one join statement compiled, valid for one schema epoch
+/// The programs one join statement compiled, valid while its validity holds
 #[derive(Debug)]
 pub struct PreparedJoin {
-    pub cached_epoch: u64,
+    pub validity: PlanValidity,
     /// The CTEs its context bound
     pub cte_scope: CteScope,
     /// An empty list stands for a clause that leaves nothing to ask
@@ -217,9 +218,9 @@ pub struct PreparedJoin {
 }
 
 impl PreparedJoin {
-    pub fn new(cached_epoch: u64, cte_scope: CteScope) -> Self {
+    pub fn new(validity: PlanValidity, cte_scope: CteScope) -> Self {
         Self {
-            cached_epoch,
+            validity,
             cte_scope,
             programs: Shelf::new(),
             analyses: Shelf::new(),

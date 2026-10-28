@@ -68,6 +68,7 @@ pub(crate) mod expr_key;
 mod foreign_key;
 mod index_optimizer;
 mod pk_fast_path;
+mod plan_reads;
 mod prepared_join;
 mod prepared_select;
 mod projection;
@@ -1026,7 +1027,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         match statement {
             // DDL statements
-            Statement::CreateTable(stmt) => self.execute_create_table(stmt, ctx),
+            Statement::CreateTable(stmt) => self.execute_create_table(stmt, ctx, compiled),
             Statement::DropTable(stmt) => self.execute_drop_table(stmt, ctx),
             Statement::CreateIndex(stmt) => self.execute_create_index(stmt, ctx),
             Statement::DropIndex(stmt) => self.execute_drop_index(stmt, ctx),

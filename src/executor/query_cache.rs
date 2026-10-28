@@ -60,6 +60,70 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// When a plan holds: at the schema epoch it last held at, or at a later
+/// one while each table and view it read last changed when it did; a plan
+/// that does not know what it read holds at its epoch only
+#[derive(Debug)]
+pub struct PlanValidity {
+    epoch: std::sync::atomic::AtomicU64,
+    reads: Option<Arc<[(SmartString, u64)]>>,
+}
+
+impl Clone for PlanValidity {
+    fn clone(&self) -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicU64::new(self.epoch()),
+            reads: self.reads.clone(),
+        }
+    }
+}
+
+impl PlanValidity {
+    /// A plan made at `epoch` that read `reads`, each name with the epoch
+    /// of its last change, or that does not know what it read
+    pub(crate) fn new(epoch: u64, reads: Option<Arc<[(SmartString, u64)]>>) -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicU64::new(epoch),
+            reads,
+        }
+    }
+
+    /// The schema epoch the plan last held at
+    #[inline]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the plan holds at `epoch`, `engine`'s current one
+    #[inline]
+    pub(crate) fn holds<E: crate::storage::traits::Engine + ?Sized>(
+        &self,
+        engine: &E,
+        epoch: u64,
+    ) -> bool {
+        self.epoch() == epoch || self.holds_again(engine, epoch)
+    }
+
+    #[cold]
+    fn holds_again<E: crate::storage::traits::Engine + ?Sized>(
+        &self,
+        engine: &E,
+        epoch: u64,
+    ) -> bool {
+        let Some(reads) = &self.reads else {
+            return false;
+        };
+        let held = reads
+            .iter()
+            .all(|(name, at)| engine.name_epoch(name) == *at);
+        if held {
+            self.epoch
+                .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
+        }
+        held
+    }
+}
+
 /// How to extract the PK value for a compiled PK lookup
 #[derive(Debug, Clone)]
 pub enum PkValueSource {
@@ -107,8 +171,8 @@ pub struct CompiledPkLookup {
     pub projection: Option<CompactArc<[usize]>>,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
     /// The table instance and layout `schema` and `projection` describe
     pub token: LayoutToken,
 }
@@ -162,8 +226,8 @@ pub struct CompiledPkUpdate {
     pub pk_value_source: PkValueSource,
     /// Pre-compiled column assignments
     pub updates: Vec<CompiledUpdateColumn>,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
     /// The table instance and layout the column indices describe
     pub token: LayoutToken,
 }
@@ -179,8 +243,8 @@ pub struct CompiledPkDelete {
     pub pk_column_name: SmartString,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
     /// The table instance and layout `schema` describes
     pub token: LayoutToken,
 }
@@ -209,8 +273,8 @@ pub struct CompiledInsert {
     /// check SQL per row costs a tokenizer plus parser run per inserted
     /// row per constraint.
     pub(crate) compiled_checks: Arc<Vec<crate::executor::dml::CompiledCheck>>,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
     /// The table instance and layout the indices and templates describe
     pub token: LayoutToken,
     /// Whether the statement reads beyond its target, so its reads go
@@ -220,6 +284,28 @@ pub struct CompiledInsert {
     pub reads_prepared: bool,
     /// Those blocks, once prepared for the current schema
     pub(crate) prepared: Option<Arc<super::prepared_select::PreparedDml>>,
+}
+
+impl CompiledInsert {
+    /// What one execution runs from: the cached state without the names it
+    /// read, which stay with the cached one, at the epoch it holds at
+    pub(crate) fn copied(&self) -> Self {
+        Self {
+            table_name: self.table_name.clone(),
+            column_indices: Arc::clone(&self.column_indices),
+            column_types: Arc::clone(&self.column_types),
+            column_vector_dims: Arc::clone(&self.column_vector_dims),
+            column_names: Arc::clone(&self.column_names),
+            default_programs: Arc::clone(&self.default_programs),
+            default_row_template: Arc::clone(&self.default_row_template),
+            compiled_checks: Arc::clone(&self.compiled_checks),
+            validity: PlanValidity::new(self.validity.epoch(), None),
+            token: self.token,
+            reads_through_view: self.reads_through_view,
+            reads_prepared: self.reads_prepared,
+            prepared: self.prepared.clone(),
+        }
+    }
 }
 
 /// Compiled parts of an INSERT that handles conflicts (ON DUPLICATE KEY
@@ -232,8 +318,8 @@ pub struct CompiledConflictInsert {
     pub(crate) upsert: Option<Arc<super::dml::CompiledUpsert>>,
     /// Table name (already lowercased)
     pub table_name: SmartString,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
     /// Layout of the table handle these were compiled against
     pub token: LayoutToken,
 }
@@ -242,7 +328,7 @@ impl std::fmt::Debug for CompiledConflictInsert {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledConflictInsert")
             .field("table_name", &self.table_name)
-            .field("cached_epoch", &self.cached_epoch)
+            .field("validity", &self.validity)
             .finish_non_exhaustive()
     }
 }
@@ -252,7 +338,7 @@ impl std::fmt::Debug for CompiledInsert {
         f.debug_struct("CompiledInsert")
             .field("table_name", &self.table_name)
             .field("column_indices", &self.column_indices)
-            .field("cached_epoch", &self.cached_epoch)
+            .field("validity", &self.validity)
             .field("compiled_checks", &self.compiled_checks.len())
             .finish_non_exhaustive()
     }
@@ -268,8 +354,8 @@ pub struct CompiledCountDistinct {
     pub column_name: SmartString,
     /// Result column name (e.g., "COUNT(DISTINCT age)")
     pub result_column_name: String,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
 }
 
 /// Pre-compiled state for COUNT(*) queries
@@ -280,8 +366,8 @@ pub struct CompiledCountStar {
     pub table_name: SmartString,
     /// Result column name (e.g., "COUNT(*)")
     pub result_column_name: String,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
+    /// When the compiled state holds
+    pub validity: PlanValidity,
 }
 
 /// The plan of a statement, and those of the statements it runs inside
@@ -291,7 +377,7 @@ pub struct NestedPlan {
     plan: RwLock<CompiledExecution>,
     /// A SELECT's derived FROM's, then its later set operation branches',
     /// then its CTEs'; a DML statement's CTEs'; or the one statement an
-    /// INSERT or an EXPLAIN ANALYZE runs. Made when one first runs
+    /// INSERT, a CREATE TABLE or an EXPLAIN ANALYZE runs. Made when one first runs
     nested: std::sync::OnceLock<Box<[NestedPlan]>>,
 }
 
@@ -342,7 +428,7 @@ impl NestedPlan {
     }
 
     /// The plan of the one statement this statement runs: an INSERT's
-    /// SELECT or an EXPLAIN ANALYZE's statement
+    /// SELECT, a CREATE TABLE's AS SELECT or an EXPLAIN ANALYZE's statement
     pub(crate) fn source(&self) -> Option<&NestedPlan> {
         self.nested(1).first()
     }
@@ -354,8 +440,8 @@ pub enum CompiledExecution {
     /// Not analyzed yet
     #[default]
     Unknown,
-    /// Analyzed but doesn't qualify for any fast path (at the recorded schema epoch)
-    NotOptimizable(u64),
+    /// Analyzed but doesn't qualify for any fast path, while the validity holds
+    NotOptimizable(PlanValidity),
     /// PK lookup fast path (SELECT)
     PkLookup(CompiledPkLookup),
     /// PK-based UPDATE fast path

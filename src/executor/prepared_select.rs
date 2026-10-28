@@ -62,7 +62,7 @@ use super::prepared_join::{JoinSide, JoinSides};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{ColumnSource, OutputLayout};
-use super::query_cache::{CompiledExecution, NestedPlan};
+use super::query_cache::{CompiledExecution, NestedPlan, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
@@ -3142,7 +3142,7 @@ impl WhereParts {
 /// One statement shape compiled against its tables' columns
 #[derive(Debug)]
 pub struct PreparedSelect {
-    cached_epoch: u64,
+    validity: PlanValidity,
     /// The CTEs its context bound
     cte_scope: CteScope,
     /// The columns of the statement's table or derived table at preparation
@@ -6316,7 +6316,7 @@ impl PreparedSelect {
         });
         let where_ = parts.prepare(where_programs, &blocks, schema);
         Ok(Self {
-            cached_epoch: epoch,
+            validity: executor.select_validity(stmt, epoch),
             cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
@@ -6336,7 +6336,7 @@ impl PreparedSelect {
 /// run, with those clauses rewritten and each value read once a run slot
 #[derive(Debug)]
 pub struct PreparedGrouped {
-    cached_epoch: u64,
+    validity: PlanValidity,
     /// The CTEs its context bound
     cte_scope: CteScope,
     /// The table's schema the clauses were prepared over, or the columns of
@@ -6474,6 +6474,7 @@ impl PreparedGrouped {
         param_count: usize,
         epoch: u64,
     ) -> Result<Option<Self>> {
+        let validity = executor.select_validity(stmt, epoch);
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
@@ -6797,7 +6798,7 @@ impl PreparedGrouped {
             return Ok(None);
         }
         Ok(Some(Self {
-            cached_epoch: epoch,
+            validity,
             cte_scope: ctx.cte_scope(),
             schema,
             source,
@@ -6873,7 +6874,7 @@ impl Executor {
             .and_then(|slot| slot.read().ok())
             .and_then(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p)
-                    if p.cached_epoch == epoch
+                    if p.validity.holds(&*self.engine, epoch)
                         && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len() =>
                 {
@@ -6881,7 +6882,7 @@ impl Executor {
                 }
                 _ => None,
             });
-        // A table held a plan for this epoch, so no view bears its name
+        // A table held a plan that still holds, so no view took its name since
         let base_table = match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) if !ctx.has_cte_by_lower(&ts.name.value_lower) => {
                 Some(ts)
@@ -6995,13 +6996,13 @@ impl Executor {
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p) => {
-                    p.cached_epoch == self.engine.schema_epoch()
+                    p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
                 CompiledExecution::PreparedJoin(p) => {
-                    p.cached_epoch == self.engine.schema_epoch()
+                    p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.holds_grouped()
                         && ctx.outer_row().is_none()
@@ -7046,7 +7047,7 @@ impl Executor {
 /// one set of blocks
 #[derive(Debug)]
 pub struct PreparedDml {
-    cached_epoch: u64,
+    validity: PlanValidity,
     /// The CTEs its context bound
     cte_scope: CteScope,
     /// The target's columns at preparation
@@ -7137,6 +7138,25 @@ impl PreparedDml {
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
+        let targets = [schema.table_name.as_str()]
+            .into_iter()
+            .chain(conflict.map(|sites| sites.table.as_str()))
+            .chain(returning.map(|sites| sites.table))
+            .collect::<SmallVec<[&str; 3]>>();
+        let conflict_exprs = conflict.into_iter().flat_map(|sites| {
+            sites
+                .stmt
+                .update_expressions
+                .iter()
+                .chain(sites.stmt.update_where.as_deref())
+        });
+        let exprs = where_clause
+            .into_iter()
+            .chain(sets.iter().map(|(_, value)| *value))
+            .chain(values.iter().flat_map(|row| row.as_ref()))
+            .chain(conflict_exprs)
+            .chain(returning.into_iter().flat_map(|sites| sites.values));
+        let validity = executor.parts_validity(epoch, &targets, exprs);
         let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
@@ -7366,7 +7386,7 @@ impl PreparedDml {
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, schema));
         Ok(Self {
-            cached_epoch: epoch,
+            validity,
             cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
@@ -8753,7 +8773,7 @@ impl Executor {
     ) -> Result<Arc<PreparedSelect>> {
         let epoch = self.engine.schema_epoch();
         let fits = |p: &PreparedSelect| {
-            p.cached_epoch == epoch
+            p.validity.holds(&*self.engine, epoch)
                 && p.cte_scope.holds(ctx)
                 && p.blocks.param_count == ctx.params().len()
                 && (std::ptr::eq(p.columns.as_slice(), columns) || p.columns.as_slice() == columns)
@@ -8819,7 +8839,7 @@ impl Executor {
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedSelect(p) => {
-                    p.cached_epoch == self.engine.schema_epoch()
+                    p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
@@ -8839,7 +8859,7 @@ impl Executor {
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedDml(p) => {
-                    p.cached_epoch == self.engine.schema_epoch()
+                    p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
@@ -8901,7 +8921,7 @@ impl Executor {
         let conflict_columns = conflict.map(|sites| sites.schema.column_names_arc());
         let returning_columns = returning.map(|sites| sites.schema.column_names_arc());
         let fits = |p: &PreparedDml| {
-            p.cached_epoch == epoch
+            p.validity.holds(&*self.engine, epoch)
                 && p.cte_scope.holds(ctx)
                 && p.blocks.param_count == ctx.params().len()
                 && same(&p.columns, &columns)
