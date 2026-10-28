@@ -639,21 +639,14 @@ fn test_explain_composite_index_prefix() {
     let lines = get_explain_lines(&db, "EXPLAIN SELECT * FROM orders2 WHERE region = 'EU'");
     let plan = lines.join("\n");
 
-    let uses_index = lines
-        .iter()
-        .any(|l| l.contains("Composite Index Scan") || l.contains("Index Scan"));
     assert!(
-        uses_index,
+        plan.contains("IndexScan orders2")
+            && plan.contains("CompositeIndex idx_region_amount (region =)"),
         "Single prefix column should use composite index.\nFull plan:\n{}",
         plan
     );
-
-    // Should NOT be a Seq Scan
-    let has_seq_scan_with_filter = lines
-        .iter()
-        .any(|l| l.contains("Seq Scan") && !l.contains("Index"));
     assert!(
-        !has_seq_scan_with_filter,
+        !plan.contains("SeqScan"),
         "Should not fall back to Seq Scan when prefix matches composite index.\nFull plan:\n{}",
         plan
     );
@@ -685,20 +678,22 @@ fn test_explain_composite_index_trailing_range() {
     );
     let plan = lines.join("\n");
 
-    let uses_composite = lines.iter().any(|l| l.contains("Composite Index Scan"));
+    // A trailing range with no upper bound is left to the scan's filter
     assert!(
-        uses_composite,
-        "Equality prefix + trailing range should use composite index.\nFull plan:\n{}",
+        plan.contains("CompositeIndex idx_o2_region_amount (region =)"),
+        "Equality prefix should use composite index.\nFull plan:\n{}",
         plan
     );
 
-    // Both columns should appear in the Columns line
-    let has_both = lines
-        .iter()
-        .any(|l| l.contains("region") && l.contains("amount"));
+    // An upper bound puts both columns on the composite index's line
+    let plan = get_explain_lines(
+        &db,
+        "EXPLAIN SELECT * FROM o2 WHERE region = 'EU' AND amount < 700",
+    )
+    .join("\n");
     assert!(
-        has_both,
-        "Both region and amount should appear in the index scan plan.\nFull plan:\n{}",
+        plan.contains("CompositeIndex idx_o2_region_amount (region =, amount range)"),
+        "Equality prefix + trailing range should use composite index.\nFull plan:\n{}",
         plan
     );
 }
@@ -726,23 +721,18 @@ fn test_explain_index_scan_residual_filter() {
     );
     let plan = lines.join("\n");
 
-    // Should use the index for region
-    let uses_index = lines
-        .iter()
-        .any(|l| l.contains("Index Scan") || l.contains("Composite Index"));
+    // The index reads region; the scan judges its rows by day = 2 too
     assert!(
-        uses_index,
+        plan.contains("Index idx_region (region =)"),
         "Should use index scan for region.\nFull plan:\n{}",
         plan
     );
-
-    // Residual filter on day should be visible
     let has_day_filter = lines
         .iter()
-        .any(|l| l.contains("day") && l.contains("Filter"));
+        .any(|l| l.contains("IndexScan t") && l.contains("day = 2"));
     assert!(
         has_day_filter,
-        "Residual predicate 'day = 2' should appear as Filter.\nFull plan:\n{}",
+        "Residual predicate 'day = 2' should appear on the scan.\nFull plan:\n{}",
         plan
     );
 }
@@ -770,20 +760,19 @@ fn test_explain_composite_index_residual_filter() {
     );
     let plan = lines.join("\n");
 
-    let uses_composite = lines.iter().any(|l| l.contains("Composite Index Scan"));
     assert!(
-        uses_composite,
+        plan.contains("CompositeIndex idx_region_amount (region =)"),
         "Should use composite index.\nFull plan:\n{}",
         plan
     );
 
-    // Residual filter on day should be visible
+    // The scan judges its rows by the residual day = 2
     let has_day_filter = lines
         .iter()
-        .any(|l| l.contains("day") && l.contains("Filter"));
+        .any(|l| l.contains("IndexScan t2") && l.contains("day = 2"));
     assert!(
         has_day_filter,
-        "Residual predicate 'day = 2' should appear as Filter.\nFull plan:\n{}",
+        "Residual predicate 'day = 2' should appear on the scan.\nFull plan:\n{}",
         plan
     );
 }
@@ -811,20 +800,9 @@ fn test_explain_composite_index_between_trailing_range() {
     );
     let plan = lines.join("\n");
 
-    let uses_composite = lines.iter().any(|l| l.contains("Composite Index Scan"));
     assert!(
-        uses_composite,
+        plan.contains("CompositeIndex idx_metrics (region =, amount range)"),
         "BETWEEN trailing range should use composite index.\nFull plan:\n{}",
-        plan
-    );
-
-    // Both columns should appear
-    let has_both = lines
-        .iter()
-        .any(|l| l.contains("region") && l.contains("amount"));
-    assert!(
-        has_both,
-        "Both region and amount should appear in composite index scan.\nFull plan:\n{}",
         plan
     );
 
@@ -847,7 +825,7 @@ fn test_explain_composite_index_between_trailing_range() {
 }
 
 #[test]
-fn test_explain_mixed_or_hybrid_scan() {
+fn test_explain_mixed_or_seq_scan() {
     let db = Database::open("memory://explain_mixed_or").expect("db");
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, status TEXT, score INTEGER)",
@@ -869,29 +847,15 @@ fn test_explain_mixed_or_hybrid_scan() {
     );
     let plan = lines.join("\n");
 
-    // Should NOT be a Seq Scan
+    // A branch no index reads leaves the OR to the scan, which judges both
     assert!(
-        !plan.contains("Seq Scan"),
-        "Mixed OR should not fall back to Seq Scan.\nFull plan:\n{}",
-        plan
-    );
-
-    // Should show Multi-Index Scan with indexed branch
-    assert!(
-        plan.contains("Multi-Index Scan"),
-        "Mixed OR should use Multi-Index Scan.\nFull plan:\n{}",
+        plan.contains("SeqScan items") && plan.contains("score > 30"),
+        "Mixed OR should be scanned.\nFull plan:\n{}",
         plan
     );
     assert!(
-        plan.contains("idx_status"),
-        "Indexed branch should show index name.\nFull plan:\n{}",
-        plan
-    );
-
-    // Non-indexed branch should appear as Filter
-    assert!(
-        plan.contains("Filter:"),
-        "Non-indexed branch should appear as Filter.\nFull plan:\n{}",
+        !plan.contains("idx_status"),
+        "Mixed OR should read no index.\nFull plan:\n{}",
         plan
     );
 

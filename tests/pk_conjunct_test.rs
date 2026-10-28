@@ -177,7 +177,7 @@ fn explain_names_the_pk_for_a_pk_conjunct() {
         .collect();
     let plan = plan.join("\n");
     assert!(
-        plan.contains("__pk_t_id") && !plan.contains("idx_t_age"),
+        plan.contains("PkGet t id = 42") && !plan.contains("idx_t_age"),
         "{plan}"
     );
 }

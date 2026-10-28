@@ -27,7 +27,7 @@ use super::expression::{
 use super::utils::for_each_qualified_star_column;
 
 /// One output item, as its compiled program reads
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Item {
     /// The input column at this index
     Column(usize),
@@ -156,11 +156,31 @@ impl Concat {
 }
 
 /// A SELECT list over one input layout
+#[derive(Debug)]
 pub(crate) struct Projection {
     items: Vec<Item>,
+    /// The input column of each item, when every item is one
+    columns: Option<Box<[usize]>>,
 }
 
 impl Projection {
+    /// A projection of `items`
+    pub(crate) fn of(items: Vec<Item>) -> Self {
+        let columns = items
+            .iter()
+            .map(|item| match item {
+                Item::Column(index) => Some(*index),
+                _ => None,
+            })
+            .collect();
+        Self { items, columns }
+    }
+
+    /// The input column of each item, when every item is one
+    pub(crate) fn column_indices(&self) -> Option<&[usize]> {
+        self.columns.as_deref()
+    }
+
     /// The items of `expressions` over the input `columns`, a qualified star
     /// naming `table_alias`'s columns
     pub(crate) fn compile(
@@ -180,14 +200,12 @@ impl Projection {
                 expression => items.push(Item::of(compile_expression(expression, columns)?)),
             }
         }
-        Ok(Self { items })
+        Ok(Self::of(items))
     }
 
     /// The input columns at `indices`, in that order
     pub(crate) fn columns(indices: impl IntoIterator<Item = usize>) -> Self {
-        Self {
-            items: indices.into_iter().map(Item::Column).collect(),
-        }
+        Self::of(indices.into_iter().map(Item::Column).collect())
     }
 
     /// The programs bound to `params`; one that binds to a value is a
@@ -207,6 +225,7 @@ impl Projection {
             };
             *item = Item::of(bind_params(program.clone(), params));
         }
+        *self = Self::of(std::mem::take(&mut self.items));
     }
 
     /// Whether the output is the input row of `width` columns as it is
@@ -225,15 +244,16 @@ impl Projection {
     }
 
     /// Push the output values for `exec`'s row onto `out`
-    #[inline]
+    #[inline(always)]
     pub(crate) fn project_into(
         &self,
         vm: &mut ExprVM,
         exec: &ExecuteContext,
         out: &mut Row,
     ) -> Result<()> {
+        let values = out.values_mut();
         for item in &self.items {
-            out.push_inline(item.value(vm, exec)?);
+            values.push(item.value(vm, exec)?);
         }
         Ok(())
     }

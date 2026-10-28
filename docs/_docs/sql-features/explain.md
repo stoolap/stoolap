@@ -23,6 +23,8 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
+A SELECT over one table is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT, EXPLAIN ANALYZE) print the format shown in their own sections below.
+
 ### Sequential Scan
 
 When no suitable index exists:
@@ -35,14 +37,13 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: *
-  -> Seq Scan on users
+Project id, name, email
+  SeqScan users
 ```
 
 ### Primary Key Lookup
 
-When filtering by primary key:
+When filtering by primary key, the row is read by its key:
 
 ```sql
 EXPLAIN SELECT * FROM users WHERE id = 1;
@@ -52,15 +53,13 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: *
-  -> PK Lookup on users
-       id = 1
+Project id, name, email
+  PkGet users id = 1
 ```
 
 ### Index Scan
 
-When using an index for equality:
+When using an index for equality, the scan line shows the condition every row it reads is judged by, and the line under it the index that finds the rows:
 
 ```sql
 CREATE INDEX idx_category ON products(category);
@@ -71,10 +70,9 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: *
-  -> Index Scan using idx_category on products
-       Index Cond: category = Electronics
+Project id, name, category, value
+  IndexScan products (category = 'Electronics')
+    Index idx_category (category =)
 ```
 
 ### Index Range Scan
@@ -90,11 +88,40 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: *
-  -> Index Scan using idx_value on products
-       Index Cond: value > 100
+Project id, name, category, value
+  IndexScan products (value > 100)
+    Index idx_value (value range)
 ```
+
+### Several Indexes
+
+Conditions on several indexed columns joined by AND read the rows every index names; joined by OR, the rows any index names. An OR with a branch no index answers is scanned:
+
+```sql
+EXPLAIN SELECT name FROM products WHERE category = 'Electronics' AND value > 15;
+EXPLAIN SELECT * FROM products WHERE category = 'Books' OR value > 25;
+```
+
+Output:
+```
+plan
+----
+Project name
+  IndexScan products ((category = 'Electronics') AND (value > 15))
+    Intersect
+      Index idx_category (category =)
+      Index idx_value (value range)
+
+plan
+----
+Project id, name, category, value
+  IndexScan products ((category = 'Books') OR (value > 25))
+    Union
+      Index idx_category (category =)
+      Index idx_value (value range)
+```
+
+A multi-column index shows as `CompositeIndex name (a =, b range)`: equalities on its leading columns and a range, with an upper bound, on the next one.
 
 ### Hash Join
 
@@ -150,10 +177,31 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: *
-  -> Seq Scan on products
-  Order By: value DESC
+Sort value DESC
+  Project id, name, category, value
+    SeqScan products
+```
+
+Under a LIMIT, an ORDER BY of one column reads the rows in that order instead of sorting them all: through the column's index or the primary key (`IndexOrder`), from a lower bound on the primary key (`Keyset`), or by the table's top-k scan (`TopK`):
+
+```sql
+EXPLAIN SELECT * FROM products ORDER BY value DESC LIMIT 5;
+EXPLAIN SELECT * FROM products WHERE id > 1 ORDER BY id LIMIT 5;
+```
+
+Output:
+```
+plan
+----
+Limit 5
+  Project id, name, category, value
+    IndexOrder products value DESC
+
+plan
+----
+Limit 5
+  Project id, name, category, value
+    Keyset products id ASC (id > 1)
 ```
 
 ## EXPLAIN ANALYZE
@@ -198,6 +246,24 @@ If estimated rows differs significantly from actual rows:
 ## Plan Components
 
 ### Access Methods
+
+For a planned single-table SELECT:
+
+| Component | Description |
+|-----------|-------------|
+| SeqScan | Full table scan; the condition after the table name is the one each row is judged by |
+| PkGet | Reads the one row the primary key names |
+| IndexScan | Reads the rows the indexes under it name, each judged by the condition after the table name |
+| Index | One index and what it reads: an equality (`=`), an `IN` list, a `LIKE prefix` or a `range` |
+| CompositeIndex | A multi-column index: equalities on its leading columns, a range on the next one |
+| PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
+| Intersect, Union | The rows every index under it names, or any of them names |
+| IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row |
+| Filter | The part of the WHERE judged after the scan |
+| Project | The output columns |
+| Sort, Limit | The ORDER BY and the LIMIT and OFFSET |
+
+For other statements:
 
 | Component | Description |
 |-----------|-------------|

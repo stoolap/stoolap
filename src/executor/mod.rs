@@ -67,15 +67,15 @@ mod explain;
 pub(crate) mod expr_key;
 mod foreign_key;
 mod index_optimizer;
-mod pk_fast_path;
 mod plan_reads;
+pub(crate) mod planned;
 mod prepared_join;
-mod prepared_select;
-mod projection;
+pub(crate) mod prepared_select;
+pub(crate) mod projection;
 pub mod pushdown;
 mod query;
-mod query_classification;
-mod row_count;
+pub(crate) mod query_classification;
+pub(crate) mod row_count;
 mod set_ops;
 mod show;
 mod subquery;
@@ -166,6 +166,64 @@ struct ActiveTransaction {
     tables: FxHashMap<String, Box<dyn Table>>,
 }
 
+/// The session's explicit transaction, with whether one is open readable
+/// without the lock: every guard writes it back as it is released
+struct TransactionSlot {
+    slot: Mutex<Option<ActiveTransaction>>,
+    open: std::sync::atomic::AtomicBool,
+}
+
+impl TransactionSlot {
+    fn new(transaction: Option<ActiveTransaction>) -> Self {
+        Self {
+            open: std::sync::atomic::AtomicBool::new(transaction.is_some()),
+            slot: Mutex::new(transaction),
+        }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<SlotGuard<'_>> {
+        match self.slot.lock() {
+            Ok(guard) => Ok(SlotGuard {
+                guard,
+                open: &self.open,
+            }),
+            Err(poisoned) => Err(PoisonError::new(SlotGuard {
+                guard: poisoned.into_inner(),
+                open: &self.open,
+            })),
+        }
+    }
+
+    /// Whether a transaction is open, as the last released guard left it
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
+struct SlotGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<ActiveTransaction>>,
+    open: &'a std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for SlotGuard<'_> {
+    type Target = Option<ActiveTransaction>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for SlotGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.open.store(self.guard.is_some(), Ordering::Release);
+    }
+}
+
 /// The statement gate held for one entry into the executor
 enum StatementGate<'a> {
     Shared { _read: RwLockReadGuard<'a, ()> },
@@ -247,7 +305,7 @@ pub struct Executor {
     /// outside an explicit transaction, exclusive for the rest
     statement_gate: RwLock<()>,
     /// Active transaction for explicit transaction control (BEGIN/COMMIT/ROLLBACK)
-    active_transaction: Mutex<Option<ActiveTransaction>>,
+    active_transaction: TransactionSlot,
     /// Query planner for cost-based optimization (lazily initialized)
     query_planner: std::sync::OnceLock<QueryPlanner>,
     /// The memory of views this executor took, for a capture to take again
@@ -277,7 +335,7 @@ impl Executor {
             query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
-            active_transaction: Mutex::new(None),
+            active_transaction: TransactionSlot::new(None),
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
@@ -295,7 +353,7 @@ impl Executor {
             query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
-            active_transaction: Mutex::new(None),
+            active_transaction: TransactionSlot::new(None),
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
@@ -310,7 +368,7 @@ impl Executor {
             query_cache: Arc::new(QueryCache::new(cache_size)),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
-            active_transaction: Mutex::new(None),
+            active_transaction: TransactionSlot::new(None),
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
@@ -328,7 +386,7 @@ impl Executor {
             query_cache: Arc::clone(&self.query_cache),
             semantic_cache: Arc::clone(&self.semantic_cache),
             statement_gate: RwLock::new(()),
-            active_transaction: Mutex::new(Some(ActiveTransaction {
+            active_transaction: TransactionSlot::new(Some(ActiveTransaction {
                 transaction: tx,
                 tables: FxHashMap::default(),
             })),
@@ -400,12 +458,7 @@ impl Executor {
             .statement_gate
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let no_transaction = self
-            .active_transaction
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_none();
-        no_transaction.then_some(read)
+        (!self.active_transaction.is_open()).then_some(read)
     }
 
     /// Get the storage engine
@@ -478,7 +531,7 @@ impl Executor {
         // Try compiled fast paths based on statement type
         self.fast_path_until_held(&plan.statement, None, || match plan.statement.as_ref() {
             Statement::Select(stmt) => {
-                self.try_fast_pk_lookup_with_params(stmt, params, plan.compiled.slot())
+                self.run_select_plan(stmt, plan.compiled.slot(), None, params, false)
             }
             Statement::Update(stmt) => {
                 self.try_fast_pk_update_with_params(stmt, params, plan.compiled.slot())
@@ -691,7 +744,8 @@ impl Executor {
     ) -> Option<Result<Box<dyn QueryResult>>> {
         match statement {
             Statement::Select(stmt) => {
-                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, compiled, in_txn)
+                if let Some(result) =
+                    self.run_select_plan(stmt, compiled, Some(ctx), ctx.params(), in_txn)
                 {
                     return Some(result);
                 }
@@ -1041,16 +1095,23 @@ impl Executor {
             Statement::Delete(stmt) => self.execute_delete(stmt, ctx, compiled),
             Statement::Truncate(stmt) => self.execute_truncate(stmt, ctx),
 
-            // Query statements - try fast-path first for simple PK lookups
             Statement::Select(stmt) => {
-                // Fast-path for simple PK lookups (bypasses full planner);
-                // cached plans already ran the compiled probe battery.
-                if plan_classification.is_none() {
-                    if let Some(result) = self.try_fast_pk_lookup(stmt, ctx) {
+                // A statement run as a parsed tree is planned by its structure;
+                // a cached plan's statement was planned before it got here
+                let tree_plan = plan_classification
+                    .is_none()
+                    .then(|| self.query_cache.statement_plan(stmt))
+                    .flatten();
+                if let Some(plan) = &tree_plan {
+                    let in_txn = self.active_transaction.is_open();
+                    let params = ctx.params();
+                    let planned =
+                        self.run_select_plan(stmt, plan.slot(), Some(ctx), params, in_txn);
+                    if let Some(result) = planned {
                         return result;
                     }
                 }
-                // Fall back to full query execution
+                let compiled = compiled.or(tree_plan.as_deref());
                 self.execute_select_with_plan(stmt, ctx, plan_classification, compiled, counts)
             }
 

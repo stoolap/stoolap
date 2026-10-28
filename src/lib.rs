@@ -88,6 +88,7 @@ pub mod functions;
 mod heap_profile;
 pub mod optimizer;
 pub mod parser;
+pub mod planner;
 pub mod storage;
 
 #[cfg(target_arch = "wasm32")]

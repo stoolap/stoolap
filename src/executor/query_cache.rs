@@ -48,6 +48,7 @@ use crate::core::Schema;
 use crate::parser::ast::{ParamSlots, SelectStatement, Statement, WithClause};
 use crate::storage::mvcc::version_store::LayoutToken;
 
+use super::expr_key::ExprKey;
 use super::query_classification::QueryClassification;
 
 /// Convert to lowercase without allocation if already lowercase.
@@ -156,25 +157,6 @@ pub(crate) fn or_normal_path(
         Err(crate::core::Error::SchemaChanged { .. }) => None,
         result => Some(result),
     }
-}
-
-/// Pre-compiled state for PK lookup queries (SELECT * WHERE pk = value)
-#[derive(Debug, Clone)]
-pub struct CompiledPkLookup {
-    /// Table name (already lowercased)
-    pub table_name: SmartString,
-    /// Cached schema
-    pub schema: CompactArc<Schema>,
-    /// Pre-computed column names for result (CompactArc<Vec<String>> for zero-copy O(1) clone on execution)
-    pub column_names: CompactArc<Vec<String>>,
-    /// Schema column indices to return; None for `SELECT *`
-    pub projection: Option<CompactArc<[usize]>>,
-    /// How to extract the PK value
-    pub pk_value_source: PkValueSource,
-    /// When the compiled state holds
-    pub validity: PlanValidity,
-    /// The table instance and layout `schema` and `projection` describe
-    pub token: LayoutToken,
 }
 
 /// Pre-compiled update column assignment
@@ -442,8 +424,6 @@ pub enum CompiledExecution {
     Unknown,
     /// Analyzed but doesn't qualify for any fast path, while the validity holds
     NotOptimizable(PlanValidity),
-    /// PK lookup fast path (SELECT)
-    PkLookup(CompiledPkLookup),
     /// PK-based UPDATE fast path
     PkUpdate(CompiledPkUpdate),
     /// PK-based DELETE fast path
@@ -464,6 +444,8 @@ pub enum CompiledExecution {
     PreparedDml(Arc<super::prepared_select::PreparedDml>),
     /// A grouped statement whose SELECT list or HAVING subqueries run prepared
     PreparedGrouped(Arc<super::prepared_select::PreparedGrouped>),
+    /// A statement the planner planned
+    Planned(Arc<super::planned::PlannedSelect>),
 }
 
 /// Default cache size (number of cached plans)
@@ -570,16 +552,53 @@ pub struct QueryCache {
     max_size: usize,
     /// Factor to determine how many plans to prune when cache is full (0.0-1.0)
     prune_factor: f64,
+    /// The plan of each SELECT run as a parsed tree, by its structure
+    statements: parking_lot::Mutex<StatementPlans>,
+}
+
+/// The plans of SELECTs run as parsed trees: by the tree's address, with the
+/// tree they were made for, and by the tree's structure
+struct StatementPlans {
+    by_address: lru::LruCache<usize, (SelectStatement, Arc<NestedPlan>)>,
+    by_structure: lru::LruCache<ExprKey, Arc<NestedPlan>>,
 }
 
 impl QueryCache {
     /// Create a new query cache with the given maximum size
     pub fn new(max_size: usize) -> Self {
+        let capacity = std::num::NonZeroUsize::new(max_size).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             plans: RwLock::new(FxHashMap::default()),
             max_size,
             prune_factor: 0.2, // Prune 20% of entries when cache is full
+            statements: parking_lot::Mutex::new(StatementPlans {
+                by_address: lru::LruCache::new(capacity),
+                by_structure: lru::LruCache::new(capacity),
+            }),
         }
+    }
+
+    /// The plan of the SELECT `stmt` run as a parsed tree: the one made for
+    /// this tree when it is the one run here before, else the one of its
+    /// structure; None when its structure has no key
+    pub(crate) fn statement_plan(&self, stmt: &SelectStatement) -> Option<Arc<NestedPlan>> {
+        let address = std::ptr::from_ref(stmt) as usize;
+        if let Some((held, plan)) = self.statements.lock().by_address.get(&address) {
+            if held == stmt {
+                return Some(Arc::clone(plan));
+            }
+        }
+        let key = ExprKey::of_statement(stmt)?;
+        let mut plans = self.statements.lock();
+        let plan = Arc::clone(
+            plans
+                .by_structure
+                .get_or_insert(key, || Arc::new(NestedPlan::default())),
+        );
+        plans
+            .by_address
+            .put(address, (stmt.clone(), Arc::clone(&plan)));
+        Some(plan)
     }
 
     /// Create a new query cache with default size
@@ -662,6 +681,9 @@ impl QueryCache {
         if let Ok(mut plans) = self.plans.write() {
             plans.clear();
         }
+        let mut statements = self.statements.lock();
+        statements.by_address.clear();
+        statements.by_structure.clear();
     }
 
     /// Invalidate all cached plans that reference a specific table
@@ -675,9 +697,7 @@ impl QueryCache {
                 // Check if compiled lookup references this table
                 if let Ok(compiled) = plan.compiled.slot().read() {
                     match &*compiled {
-                        CompiledExecution::PkLookup(lookup)
-                            if lookup.table_name == *table_lower =>
-                        {
+                        CompiledExecution::Planned(planned) if planned.table == *table_lower => {
                             return false; // Remove this plan
                         }
                         CompiledExecution::CountDistinct(cd) if cd.table_name == *table_lower => {

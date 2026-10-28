@@ -39,7 +39,7 @@ pub mod value;
 // Re-export main types for convenience
 pub use error::{ConflictValues, Error, Result};
 pub use row::Row;
-pub use row_vec::{RowIdVec, RowVec};
+pub use row_vec::{KeyRows, RowIdVec, RowVec};
 pub use schema::{ForeignKeyConstraint, Schema, SchemaBuilder, SchemaColumn};
 pub use sum::SumAccumulator;
 pub use types::{DataType, ForeignKeyAction, IndexEntry, IndexType, IsolationLevel, Operator};

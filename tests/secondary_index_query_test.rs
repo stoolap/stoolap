@@ -929,7 +929,9 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
             INDEX_PAGES.set_budget_bytes(0);
         });
     });
-    let sql = "SELECT id FROM t WHERE k >= 0 AND k <= 1 AND ABS(id - 904) = 0 LIMIT 2";
+    // A derived table's body reads in batches; the statement's own plan streams
+    let sql =
+        "SELECT id FROM (SELECT id FROM t WHERE k >= 0 AND k <= 1 AND ABS(id - 904) = 0 LIMIT 2) s";
     let rows = ids_db(&db, sql, &[]);
     stoolap::test_failpoints::after_cold_volumes_taken(|| {});
     db.execute("PRAGMA INDEX_CACHE_MB = 16", ()).unwrap();
@@ -952,7 +954,9 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     insert(&db, 1, ROWS);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     // A hundred keys, eight hundred candidates: 3,200 bytes of positions
-    let sql = "SELECT id FROM t WHERE k >= 100 AND k <= 199 AND ABS(id + 1) > 0 LIMIT 5";
+    // A derived table's body reads by the ordered collector
+    let sql =
+        "SELECT id FROM (SELECT id FROM t WHERE k >= 100 AND k <= 199 AND ABS(id + 1) > 0 LIMIT 5) s";
     let want = expected_range(100, 199);
     let positions = 800 * std::mem::size_of::<u32>();
     INDEX_PAGES.clear();

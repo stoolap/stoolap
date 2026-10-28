@@ -164,7 +164,14 @@ impl Executor {
             Ok(Box::new(ExecutorResult::new(columns, rows)))
         } else {
             // Regular EXPLAIN: Just show the plan without executing (using inlined version if available)
-            self.explain_statement(explain_stmt, &mut plan_lines, 0);
+            let planned = match &**explain_stmt {
+                Statement::Select(select) => self.explain_plan(select, ctx),
+                _ => None,
+            };
+            match planned {
+                Some(lines) => plan_lines = lines,
+                None => self.explain_statement(explain_stmt, &mut plan_lines, 0),
+            }
 
             // Return as a single-column result
             let columns = vec!["plan".to_string()];

@@ -4741,6 +4741,12 @@ impl MVCCEngine {
         Ok(())
     }
 
+    /// Moves the schema epoch for an index created on or dropped from
+    /// `table_name`: a plan reads the table by the indexes it had
+    pub(crate) fn index_changed(&self, table_name: &str) {
+        self.ddl.changed(&[&table_name.to_lowercase()]);
+    }
+
     /// Drop a view
     pub fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
@@ -8671,21 +8677,35 @@ impl MVCCEngine {
         table_name: &str,
         row_id: i64,
         token: crate::storage::mvcc::version_store::LayoutToken,
-    ) -> Result<Option<crate::core::RowVec>> {
+    ) -> Result<Option<crate::core::KeyRows>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
         let store = self.get_version_store(table_name)?;
-        let hot = store.get_visible_versions_batch(&[row_id], (INVALID_TRANSACTION_ID + 1).into());
-        if !hot.is_empty() {
+        self.fetch_latest_row_in(table_name, &store, row_id, token)
+    }
+
+    /// [`Self::fetch_latest_row`] from `store`, the table `table_name` names
+    pub(crate) fn fetch_latest_row_in(
+        &self,
+        table_name: &str,
+        store: &Arc<VersionStore>,
+        row_id: i64,
+        token: crate::storage::mvcc::version_store::LayoutToken,
+    ) -> Result<Option<crate::core::KeyRows>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        if let Some(hot) = store.get_visible_version(row_id, (INVALID_TRANSACTION_ID + 1).into()) {
             store.check_token(token)?;
-            return Ok(Some(hot));
+            return Ok(Some(crate::core::KeyRows::One(row_id, hot.data)));
         }
         let epoch = store.publish_epoch_if_quiet();
         if epoch.is_none() {
             return Ok(None);
         }
-        self.fetch_rows_by_ids_in(table_name, &store, &[row_id], token, true, epoch)
+        let rows = self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, epoch)?;
+        Ok(rows.map(crate::core::KeyRows::Many))
     }
 
     /// The rows `row_ids` name as `view` sees them in the hot store; None

@@ -1132,10 +1132,21 @@ fn is_star_item(expr: &Expression) -> bool {
     matches!(expr, Expression::Star(_) | Expression::QualifiedStar(_))
 }
 
+/// Whether one of a WHERE's AND terms is a statement constant: only such a
+/// WHERE can be [`true_for_no_row`]
+pub(crate) fn has_constant_term(expr: &Expression) -> bool {
+    if let Expression::Infix(infix) = expr {
+        if infix.op_type == InfixOperator::And {
+            return has_constant_term(&infix.left) || has_constant_term(&infix.right);
+        }
+    }
+    statement_constant(expr, global_registry())
+}
+
 /// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
 /// constant, so no column reads as the text of its name, that evaluates to
 /// false or NULL
-fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+pub(crate) fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
     if let Expression::Infix(infix) = expr {
         if infix.op_type == InfixOperator::And {
             return true_for_no_row(&infix.left, ctx) || true_for_no_row(&infix.right, ctx);
@@ -1690,16 +1701,28 @@ impl Executor {
 
         // A statement of the prepared family runs on that path and no other
         let slot = compiled.map(NestedPlan::slot);
-        let in_family = (classification.where_has_subqueries
-            || classification.output_has_subqueries)
-            && (self.holds_prepared_select(slot, ctx)
-                || self.prepared_family(stmt, Some(ctx)).is_ok());
+        let in_family = self.holds_prepared_select(slot, ctx)
+            || ((classification.where_has_subqueries || classification.output_has_subqueries)
+                && self.prepared_family(stmt, Some(ctx)).is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
         // them as its blocks
         let grouped_family = Self::grouped_family_reach(stmt, &classification)
             && !in_family
             && (self.holds_prepared_grouped(slot, ctx)
                 || self.grouped_family(stmt, Some(ctx)).is_ok());
+
+        // A SELECT * the runner answers is kept in the semantic cache as the
+        // general path keeps it, under a stamp taken before its snapshot
+        let semantic_stamp = match (in_family, stmt.table_expr.as_deref()) {
+            (true, Some(Expression::TableSource(source)))
+                if !self.active_transaction.is_open()
+                    && Self::semantic_writable(stmt, ctx, &classification, source) =>
+            {
+                self.semantic_write_stamp(&source.name.value_lower, ctx)
+                    .map(|stamp| (source, stamp))
+            }
+            _ => None,
+        };
 
         // Correlated probes read the statement's tables through one transaction
         let snapshot_ctx;
@@ -1709,7 +1732,7 @@ impl Executor {
             || in_family
             || grouped_family)
             && ctx.statement_snapshot().is_none()
-            && self.active_transaction.lock().unwrap().is_none()
+            && !self.active_transaction.is_open()
         {
             let snapshot =
                 self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
@@ -1839,6 +1862,23 @@ impl Executor {
             };
             let (result, columns, applied, visible, layout, distinct) =
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
+            let result = match (semantic_stamp, stmt.where_clause.as_deref()) {
+                (Some((source, stamp)), Some(where_expr)) => {
+                    let rows = Self::materialize_result(result)?;
+                    let simplified;
+                    let predicate = match ctx.semantic_miss(stmt) {
+                        Some(miss) => miss.simplified.as_deref().unwrap_or(where_expr),
+                        None => {
+                            simplified = ExpressionSimplifier::new().try_simplify(where_expr);
+                            simplified.as_ref().unwrap_or(where_expr)
+                        }
+                    };
+                    let table_name = &source.name.value_lower;
+                    self.semantic_write(table_name, &columns, rows.rows(), predicate, stamp);
+                    Box::new(ExecutorResult::with_arc_columns(columns.clone(), rows))
+                }
+                _ => result,
+            };
             prepared_visible = Some(visible);
             distinct_applied = distinct;
             let shape = SelectShape {
@@ -3352,6 +3392,52 @@ impl Executor {
 
     /// The cached rows of `SELECT *` over `table_name` filtered by
     /// `where_expr` under `stamp`, with their output columns; None on a miss
+    /// Whether the semantic cache keeps the answer of `stmt`, a SELECT * read
+    /// from `source` outside an explicit transaction
+    pub(crate) fn semantic_writable(
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+        source: &SimpleTableSource,
+    ) -> bool {
+        ctx.statement_snapshot().is_none()
+            && ctx.outer_row().is_none()
+            && source.as_of.is_none()
+            && stmt.where_clause.is_some()
+            && classification.semantic_cacheable()
+    }
+
+    /// The stamp a semantic cache entry of `table_name` is written under,
+    /// taken before the rows it keeps are read, so an entry is never older
+    /// than its stamp; None while the cache cannot take one
+    pub(crate) fn semantic_write_stamp(
+        &self,
+        table_name: &str,
+        ctx: &ExecutionContext,
+    ) -> Option<super::semantic_cache::CacheStamp> {
+        self.semantic_cache_stamp(table_name, ctx.scan_view(table_name), |_| ())
+            .map(|(stamp, ())| stamp)
+    }
+
+    /// Keeps `rows`, the answer over the columns `columns` of `table_name`
+    /// to a WHERE the cache's lookup reads as `predicate`, under `stamp`
+    pub(crate) fn semantic_write<'r>(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        rows: impl Iterator<Item = &'r Row>,
+        predicate: &Expression,
+        stamp: super::semantic_cache::CacheStamp,
+    ) {
+        self.semantic_cache.insert(
+            table_name,
+            columns.to_vec(),
+            rows.cloned().collect(),
+            Some(predicate.clone()),
+            stamp,
+        );
+    }
+
     fn semantic_cache_answer(
         &self,
         table_name: &str,
@@ -3564,16 +3650,10 @@ impl Executor {
         // Taken before the transaction or snapshot the scan reads under, so
         // a cached result is never older than its stamp
         let cacheable = !in_explicit_transaction
-            && ctx.statement_snapshot().is_none()
-            && ctx.outer_row().is_none()
-            && table_source.as_of.is_none()
-            && stmt.where_clause.is_some()
-            && classification.semantic_cacheable();
-        let cache_stamp = if cacheable {
-            self.semantic_cache_stamp(table_name, ctx.scan_view(table_name), |_| ())
-                .map(|(stamp, ())| stamp)
-        } else {
-            None
+            && Self::semantic_writable(stmt, ctx, classification, table_source);
+        let cache_stamp = match cacheable {
+            true => self.semantic_write_stamp(table_name, ctx),
+            false => None,
         };
         // The statement's start looked the cache up and simplified the WHERE
         let early_miss = ctx.semantic_miss(stmt).filter(|_| cacheable);
@@ -5209,13 +5289,11 @@ impl Executor {
         // Skip caching when deferred projection is used (rows are not projected yet)
         if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && shape.deferred.is_none()) {
             if let Some(where_expr) = where_to_use {
-                // Clone rows for cache (cache needs Vec<Row>)
-                let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
-                self.semantic_cache.insert(
+                self.semantic_write(
                     table_name,
-                    all_columns.to_vec(),
-                    rows_for_cache,
-                    Some(where_expr.clone()),
+                    &all_columns,
+                    projected_rows.rows(),
+                    where_expr,
                     stamp,
                 );
             }

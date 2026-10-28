@@ -1082,8 +1082,12 @@ pub(crate) enum OrderLimitPath {
     JoinIndexSort,
     /// A CTE grouped for a join, cut to the rows the main ORDER BY keeps
     CteOrderLimitPushdown,
-    /// A prepared statement's rows read in a column's order
-    PreparedOrderedRead,
+    /// A prepared statement's rows read in the order of an index or the key
+    PreparedIndexOrdered,
+    /// A prepared statement's key rows read from the WHERE's lower bound
+    PreparedKeyset,
+    /// A prepared statement's rows read by the table's top-k scan
+    PreparedTopK,
     /// A prepared statement's top-N over source rows, keys being columns
     PreparedTopRows,
     /// A prepared statement's top-N over computed keys, items computed after
@@ -1102,7 +1106,7 @@ impl OrderLimitPath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl OrderLimitPath {
-    pub(crate) const ALL: [OrderLimitPath; 14] = [
+    pub(crate) const ALL: [OrderLimitPath; 16] = [
         OrderLimitPath::TopN,
         OrderLimitPath::ComputedKeys,
         OrderLimitPath::DeferredProjection,
@@ -1113,7 +1117,9 @@ impl OrderLimitPath {
         OrderLimitPath::KeysetPagination,
         OrderLimitPath::JoinIndexSort,
         OrderLimitPath::CteOrderLimitPushdown,
-        OrderLimitPath::PreparedOrderedRead,
+        OrderLimitPath::PreparedIndexOrdered,
+        OrderLimitPath::PreparedKeyset,
+        OrderLimitPath::PreparedTopK,
         OrderLimitPath::PreparedTopRows,
         OrderLimitPath::PreparedProjectFirst,
         OrderLimitPath::PreparedBlockCut,
@@ -1131,7 +1137,9 @@ impl OrderLimitPath {
             OrderLimitPath::KeysetPagination => "keyset_pagination",
             OrderLimitPath::JoinIndexSort => "join_index_sort",
             OrderLimitPath::CteOrderLimitPushdown => "cte_order_limit_pushdown",
-            OrderLimitPath::PreparedOrderedRead => "prepared_ordered_read",
+            OrderLimitPath::PreparedIndexOrdered => "prepared_index_ordered",
+            OrderLimitPath::PreparedKeyset => "prepared_keyset",
+            OrderLimitPath::PreparedTopK => "prepared_top_k",
             OrderLimitPath::PreparedTopRows => "prepared_top_rows",
             OrderLimitPath::PreparedProjectFirst => "prepared_project_first",
             OrderLimitPath::PreparedBlockCut => "prepared_block_cut",
@@ -1159,6 +1167,16 @@ impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> TopN<F> {
             capacity,
             offset,
         }
+    }
+
+    /// Whether `push` would keep `row`
+    #[inline]
+    pub(crate) fn admits(&self, row: &Row) -> bool {
+        self.heap.len() < self.capacity
+            || self
+                .heap
+                .peek()
+                .is_some_and(|worst| (self.compare)(row, &worst.row) == std::cmp::Ordering::Less)
     }
 
     /// Offers `row`; gives back the row the heap does not keep, `row` or

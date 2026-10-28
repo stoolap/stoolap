@@ -415,6 +415,12 @@ impl Row {
         self.storage.make_mut().push(value);
     }
 
+    /// The row's values, owned for writing, for a writer of many values
+    #[inline]
+    pub(crate) fn values_mut(&mut self) -> &mut CompactVec<Value> {
+        self.storage.make_mut()
+    }
+
     /// Pop a value from the end of the row
     #[inline]
     pub fn pop(&mut self) -> Option<Value> {
