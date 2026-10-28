@@ -22,6 +22,7 @@
 use smallvec::SmallVec;
 
 use super::ops::Op;
+use super::vm::ExprVM;
 use crate::common::CompactArc;
 use crate::core::Value;
 
@@ -44,6 +45,10 @@ pub struct Program {
 
     /// Whether this program contains subqueries
     has_subqueries: bool,
+
+    /// Whether the ops are single-op predicates joined by AND and OR, which
+    /// a filter answers without the stack
+    predicate_chain: bool,
 
     /// What binding the program to its execution's parameters reads, for a
     /// program that loads one
@@ -80,12 +85,14 @@ impl Program {
         });
 
         let binding = Binding::of(&ops, folds);
+        let predicate_chain = ExprVM::is_predicate_chain(&ops);
 
         Self {
             ops,
             needs_outer_context,
             needs_second_row,
             has_subqueries,
+            predicate_chain,
             binding,
             bound_from: None,
         }
@@ -113,12 +120,14 @@ impl Program {
         });
 
         let binding = Binding::of(&ops, Vec::new());
+        let predicate_chain = ExprVM::is_predicate_chain(&ops);
 
         Self {
             ops,
             needs_outer_context,
             needs_second_row,
             has_subqueries,
+            predicate_chain,
             binding,
             bound_from: None,
         }
@@ -442,6 +451,12 @@ impl Program {
         self.has_subqueries
     }
 
+    /// Whether a filter answers this program as a predicate chain
+    #[inline]
+    pub(crate) fn is_predicate_chain(&self) -> bool {
+        self.predicate_chain
+    }
+
     /// Get the number of operations
     #[inline]
     pub fn len(&self) -> usize {
@@ -469,6 +484,7 @@ impl Program {
         let mut folds = self.binding.take().map(|b| b.folds).unwrap_or_default();
         self.ops = Self::peephole_optimize(self.ops, &mut folds);
         self.binding = Binding::of(&self.ops, folds);
+        self.predicate_chain = ExprVM::is_predicate_chain(&self.ops);
         self
     }
 

@@ -395,6 +395,91 @@ fn test_execute_bool() {
     assert!(!vm.execute_bool(&program, &ctx));
 }
 
+#[test]
+fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
+    let columns: Vec<String> = ["i", "f", "t", "n", "b"].map(String::from).to_vec();
+    let rows = [
+        Row::from_values(vec![
+            Value::Integer(1),
+            Value::Float(2.5),
+            Value::text("abc"),
+            Value::null_unknown(),
+            Value::Boolean(true),
+        ]),
+        Row::from_values(vec![
+            Value::Integer(7),
+            Value::Float(-1.0),
+            Value::text("zz"),
+            Value::null_unknown(),
+            Value::Boolean(false),
+        ]),
+        Row::from_values(vec![Value::null_unknown(); 5]),
+        Row::from_values(vec![Value::Integer(1)]),
+    ];
+    // Each term, and whether it reads a column; constants fold, so only a
+    // chain of column terms keeps its shape
+    let terms = [
+        ("i > 1", true),
+        ("i <= 1", true),
+        ("f >= 2.5", true),
+        ("f < 0", true),
+        ("n = 1", true),
+        ("t = 'abc'", true),
+        ("t > 'b'", true),
+        ("i BETWEEN 0 AND 5", true),
+        ("i IN (1, 2)", true),
+        ("t LIKE 'a%'", true),
+        ("n IS NULL", true),
+        ("i IS NOT NULL", true),
+        ("b = true", true),
+        ("TRUE", false),
+        ("NULL", false),
+        ("0", false),
+        ("'abc'", false),
+        ("1.5", false),
+    ];
+    let mut vm = ExprVM::new();
+    for len in 1..=3u32 {
+        let combos = terms.len().pow(len) << (len - 1);
+        for mut code in 0..combos {
+            let mut predicate = String::new();
+            let mut columns_only = true;
+            for at in 0..len {
+                let (term, column) = terms[code % terms.len()];
+                code /= terms.len();
+                columns_only &= column;
+                predicate = match at {
+                    0 => term.to_string(),
+                    _ => {
+                        let connector = if code % 2 == 0 { "AND" } else { "OR" };
+                        code /= 2;
+                        format!("({predicate}) {connector} {term}")
+                    }
+                };
+            }
+            let program = super::compile_expression(&where_of(&predicate), &columns).unwrap();
+            assert!(
+                program.is_predicate_chain() || !columns_only,
+                "{predicate} is not a chain"
+            );
+            for (r, row) in rows.iter().enumerate() {
+                let ctx = ExecuteContext::new(row);
+                let expected = ExprVM::passes(&vm.execute(&program, &ctx).unwrap());
+                assert_eq!(
+                    vm.execute_bool(&program, &ctx),
+                    expected,
+                    "{predicate} on row {r}"
+                );
+                assert_eq!(
+                    vm.execute_bool_checked(&program, &ctx).unwrap(),
+                    expected,
+                    "{predicate} on row {r}, checked"
+                );
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Compiler Tests
 // ============================================================================
