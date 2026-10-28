@@ -328,21 +328,25 @@ fn a_condition_on_the_right_side_reads_the_right_side() {
 }
 
 #[test]
-fn a_side_s_subquery_errors_by_the_rule_of_its_form() {
+fn a_side_s_subquery_errors_only_for_a_row_that_reaches_it() {
     let db = Database::open("memory://join_side_blocks_errors").unwrap();
     fill(&db);
-    let compared = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
-                    WHERE l.id < 0 AND l.k = (SELECT s.a FROM s)";
-    let got = rows(&db, compared);
+    for unread in [
+        "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+         WHERE l.id < 0 AND l.k = (SELECT s.a FROM s)",
+        "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+         WHERE l.id < 0 AND l.k + 1 > (SELECT s.a FROM s)",
+    ] {
+        for _ in 0..2 {
+            assert_eq!(rows(&db, unread), Ok(Vec::new()), "no row reads the block");
+        }
+    }
+    let read = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE l.k = (SELECT s.a FROM s)";
+    let got = rows(&db, read);
     assert!(
         got.as_ref().is_err_and(|e| e.contains("more than one row")),
-        "a value a column is compared with is read before the scan: {got:?}"
+        "a row reads the block: {got:?}"
     );
-    let lazy = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
-                WHERE l.id < 0 AND l.k + 1 > (SELECT s.a FROM s)";
-    for _ in 0..2 {
-        assert_eq!(rows(&db, lazy), Ok(Vec::new()), "no row reads the block");
-    }
 }
 
 #[test]

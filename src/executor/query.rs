@@ -9661,7 +9661,7 @@ impl Executor {
         layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
     ) -> SelectResult {
         let slots_ctx;
-        let ctx = match held.reads_slots {
+        let ctx = match held.reads_run_slots() {
             true => {
                 slots_ctx = ctx
                     .with_slot_params(run.params().unwrap_or_default().iter().cloned().collect());
@@ -9711,9 +9711,9 @@ impl Executor {
         let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
             return Err(Error::internal("a grouped statement without its table"));
         };
-        // An argument read once for its call reads its run slot as a parameter
+        // A value read once for the statement reads its run slot as a parameter
         let slots_ctx;
-        let ctx = match held.reads_slots {
+        let ctx = match held.reads_run_slots() {
             true => {
                 slots_ctx = ctx
                     .with_slot_params(run.params().unwrap_or_default().iter().cloned().collect());

@@ -6696,9 +6696,6 @@ pub struct PreparedGrouped {
     where_: Option<PreparedWhere>,
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
-    /// An argument read once for its call holds a run slot, which the
-    /// statement's parameters then carry beside the blocks'
-    pub(crate) reads_slots: bool,
 }
 
 /// What a grouped statement's rows come from, which says what its blocks run
@@ -6816,7 +6813,6 @@ impl PreparedGrouped {
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
-        let written = stmt;
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -7140,7 +7136,6 @@ impl PreparedGrouped {
             holes: HoleSet { holes },
             ahead,
             where_,
-            reads_slots: constants(written, &mentions_subquery),
             classification: super::query_classification::get_classification(&stmt),
             stmt,
         }))
@@ -7149,6 +7144,12 @@ impl PreparedGrouped {
     /// Whether the table's rows pass a WHERE holding subqueries before they group
     pub(crate) fn reads_through_where(&self) -> bool {
         self.where_.is_some()
+    }
+
+    /// Whether the statement reads run slots, which its parameters then
+    /// carry beside the blocks'
+    pub(crate) fn reads_run_slots(&self) -> bool {
+        !self.blocks.run_slots.is_empty()
     }
 
     /// The columns of table `name` and each of its rows the WHERE passes,
