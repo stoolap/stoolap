@@ -77,7 +77,9 @@ use super::utils::{
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
-use crate::planner::{explain_steps, ordered_read, scan_choice, OrderedRead, ScanChoice};
+use crate::planner::{
+    ordered_read, scan_choice, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
+};
 
 /// Scopes one chain may hold: a block's own table and every enclosing one
 const MAX_SCOPES: usize = 32;
@@ -2893,9 +2895,6 @@ struct PreparedWhere {
     /// The first conjunct equating the primary key, and the WHERE without
     /// it when it has another conjunct
     point: Option<(PreparedComparison, Option<SharedProgram>)>,
-    /// How the scan finds its rows, as the plan chose for a statement whose
-    /// scan takes no set; None leaves the choice to the table
-    scan: Option<ScanChoice>,
     /// The table columns a statement without blocks reads, for a table
     /// that reads by need to leave the others out
     needed: Option<Vec<bool>>,
@@ -3158,7 +3157,6 @@ impl WhereParts {
         let pushdown = conjunction(self.pushed);
         PreparedWhere {
             point: self.point.map(|(key, _)| (key, programs.pointed)),
-            scan: None,
             needed: None,
             push: pushdown.as_ref().and_then(|p| PreparedPush::of(p, schema)),
             whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
@@ -3196,8 +3194,9 @@ pub struct PreparedSelect {
     visible: usize,
     /// Where each output column comes from, for an ORDER BY to bind by
     layout: Option<CompactArc<OutputLayout>>,
-    /// How an ORDER BY of one column under a LIMIT reads its rows in order
-    ordered: Option<OrderedRead>,
+    /// The planner's decision for a statement that asks no block and takes
+    /// no set; None leaves the table to choose how it reads
+    plan: Option<Plan>,
     /// The WHERE holds no subquery and a term that is a statement constant,
     /// which a run reads to tell whether it keeps no row
     constant_where: bool,
@@ -3215,31 +3214,31 @@ impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table`, as
     /// EXPLAIN shows it; None when the table chooses how it reads
     pub(crate) fn explain(&self, stmt: &SelectStatement, table: &str) -> Option<Vec<String>> {
-        let pushed = self.where_.pushdown.as_ref();
-        let mut access = self.where_.scan.as_ref()?.explain(table, pushed);
-        let ordered = self
-            .ordered
-            .filter(|_| stmt.limit.is_some())
-            .zip(Executor::ordered_read_column(stmt));
-        let sort = match ordered {
-            Some((read, (column, ascending, _))) => {
-                access = vec![read.explain(table, (column, ascending), pushed)];
-                None
-            }
-            None => (!stmt.order_by.is_empty()).then(|| {
-                let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
-                keys.join(", ")
-            }),
-        };
-        let filter = self.where_.conjuncts > self.where_.pushed;
-        let names = &self.output_columns[..self.visible];
-        let limit = stmt.limit.as_deref().map(Expression::to_string);
+        let plan = self
+            .plan
+            .as_ref()
+            .filter(|plan| plan.read.scan().is_some())?;
+        let sort = plan.steps.contains(&Step::Sort).then(|| {
+            let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
+            keys.join(", ")
+        });
         let offset = stmt
             .offset
             .as_deref()
             .filter(|offset| !matches!(offset, Expression::IntegerLiteral(lit) if lit.value == 0))
             .map(Expression::to_string);
-        Some(explain_steps(limit, offset, names, sort, filter, access))
+        Some(
+            plan.explain(PlanText {
+                table,
+                limit: stmt.limit.as_deref().map(Expression::to_string),
+                offset,
+                sort,
+                names: &self.output_columns[..self.visible],
+                pushed: self.where_.pushdown.as_ref(),
+                ordered: Executor::ordered_read_column(stmt)
+                    .map(|(column, ascending, _)| (column, ascending)),
+            }),
+        )
     }
 
     /// The plan's inputs, for a statement that asks no block and computes no
@@ -6627,18 +6626,19 @@ impl PreparedSelect {
             CompactArc::new(layout)
         });
         let mut where_ = parts.prepare(where_programs, &blocks, schema);
-        let mut ordered = None;
+        let mut plan = None;
         if where_.sets.is_empty() && where_.narrowing.is_none() {
             if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
+                let mut scan = None;
                 if blocks.subqueries.is_empty() {
-                    where_.scan = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
+                    scan = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
                     where_.needed = needed_columns(
                         stmt,
                         stmt.where_clause.as_deref(),
                         &schema.column_names_lower_arc(),
                     );
                 }
-                ordered = Executor::ordered_read_column(stmt)
+                let ordered = Executor::ordered_read_column(stmt)
                     .filter(|(column, ..)| stmt.limit.is_some() && schema.has_column(column))
                     .and_then(|(column, ascending, _)| {
                         ordered_read(
@@ -6650,6 +6650,25 @@ impl PreparedSelect {
                             stmt.offset.is_some(),
                         )
                     });
+                let mut steps = SmallVec::new();
+                if stmt.limit.is_some() || stmt.offset.is_some() {
+                    steps.push(Step::Limit);
+                }
+                if ordered.is_none() && !stmt.order_by.is_empty() {
+                    steps.push(Step::Sort);
+                }
+                steps.push(Step::Project);
+                if where_.conjuncts > where_.pushed {
+                    steps.push(Step::Filter);
+                }
+                let read = match ordered {
+                    Some(read) => Read::Ordered {
+                        read,
+                        otherwise: scan,
+                    },
+                    None => Read::Scan(scan),
+                };
+                plan = Some(Plan { steps, read });
             }
         }
         Ok(Self {
@@ -6664,7 +6683,7 @@ impl PreparedSelect {
             output_columns: CompactArc::new(output_columns),
             visible,
             layout,
-            ordered,
+            plan,
             constant_where: stmt
                 .where_clause
                 .as_deref()
@@ -7171,7 +7190,15 @@ impl PreparedGrouped {
             rows.push((id, row));
             true
         };
-        match run.passing_rows(where_, None, table.as_ref(), ctx, None, Take::Kept, keep)? {
+        match run.passing_rows(
+            (where_, None),
+            None,
+            table.as_ref(),
+            ctx,
+            None,
+            Take::Kept,
+            keep,
+        )? {
             Passing::Pruned | Passing::Read => Ok((table.schema().column_names_arc(), rows)),
             Passing::Answers(_) | Passing::Scan(_) | Passing::Filtered(..) => Err(Error::internal(
                 "a grouped statement read the scan's answers",
@@ -8313,7 +8340,7 @@ impl Executor {
                 .filter(|_| extra.is_none())
                 .map(|limit| limit.saturating_add(offset));
             match run.passing_rows(
-                where_,
+                (where_, None),
                 extra.as_ref(),
                 &*table,
                 ctx,
@@ -8572,10 +8599,15 @@ impl<'a> DmlRunner<'a> {
             keep(id, row);
             true
         };
-        match self
-            .runner
-            .passing_rows(where_, None, table, ctx, None, Take::Kept, &mut each)?
-        {
+        match self.runner.passing_rows(
+            (where_, None),
+            None,
+            table,
+            ctx,
+            None,
+            Take::Kept,
+            &mut each,
+        )? {
             Passing::Pruned | Passing::Read => Ok(()),
             Passing::Answers(_) | Passing::Scan(_) | Passing::Filtered(..) => Err(Error::internal(
                 "a statement without a LIMIT read the scan's answers",
@@ -9696,7 +9728,8 @@ impl Executor {
                 .is_some_and(|w| true_for_no_row(w, ctx));
         // An ORDER BY of one column under a LIMIT reads the rows it keeps in
         // order, as the plan chose
-        let ordered = match (&source, limit, prepared.ordered) {
+        let planned_order = prepared.plan.as_ref().and_then(|plan| plan.read.ordered());
+        let ordered = match (&source, limit, planned_order) {
             _ if keeps_none => None,
             (StatementSource::Table(table), Some(limit), Some(read)) => {
                 match Self::ordered_read_column(stmt) {
@@ -9803,7 +9836,10 @@ impl Executor {
             _ if keeps_none => Ok(Passing::Pruned),
             (Some(rows), _) => Ok(Passing::Answers(rows)),
             (None, StatementSource::Table(table)) => runner.passing_rows(
-                &prepared.where_,
+                (
+                    &prepared.where_,
+                    prepared.plan.as_ref().and_then(|plan| plan.read.scan()),
+                ),
                 None,
                 &*table,
                 ctx,
@@ -10868,11 +10904,12 @@ impl<'a> PreparedRunner<'a> {
     /// narrow. With a `target` and a scan that takes the whole WHERE, the
     /// scan's own answers up to it instead. The scan takes the `extra`
     /// conditions too, which `keep` still judges; as `take` asks, a scan
-    /// that takes them and the WHERE whole is handed back instead
+    /// that takes them and the WHERE whole is handed back instead. The scan
+    /// reads as the plan's `chosen` scan, or as the table chooses
     #[allow(clippy::too_many_arguments)]
     fn passing_rows(
         &self,
-        where_: &PreparedWhere,
+        (where_, chosen): (&PreparedWhere, Option<&ScanChoice>),
         extra: Option<&Expression>,
         table: &dyn Table,
         ctx: &ExecutionContext,
@@ -10922,10 +10959,7 @@ impl<'a> PreparedRunner<'a> {
                     }
                     let filter = storage_expr.as_deref();
                     // An index reads the values a failed slot does not have
-                    let scan = where_
-                        .scan
-                        .as_ref()
-                        .filter(|_| extra.is_none() && self.failed_slots.is_none());
+                    let scan = chosen.filter(|_| extra.is_none() && self.failed_slots.is_none());
                     if let Some(ScanChoice::Index(_)) = scan {
                         let enough = target.filter(|_| scanned_whole);
                         if let Some(rows) = member_rows(table, filter, target.is_some(), enough)? {

@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock, Weak};
 use crate::common::{CompactArc, SmartString};
 use crate::core::{Error, KeyRows, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
-use crate::planner::{plan_select, Access, SelectPlan};
+use crate::planner::{plan_select, Read, SelectPlan};
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::table::normalize_row_to_schema;
@@ -237,7 +237,9 @@ impl Executor {
         (in_txn, transaction): (bool, Option<u64>),
         view: Option<&StatementView>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        let Access::PkGet(key) = &planned.plan.access;
+        let Read::PkGet(key) = &planned.plan.plan.read else {
+            return None;
+        };
         let key = key.integer(params)?;
         let read = self.read_planned(planned, key, params, (in_txn, transaction), view);
         or_normal_path(read)
