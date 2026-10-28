@@ -37,7 +37,6 @@
 //! ```
 
 use crate::common::time_compat::Instant;
-use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
 use crate::common::SmartString;
@@ -50,16 +49,6 @@ use crate::storage::mvcc::version_store::LayoutToken;
 
 use super::expr_key::ExprKey;
 use super::query_classification::QueryClassification;
-
-/// Convert to lowercase without allocation if already lowercase.
-#[inline]
-fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
-    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.to_lowercase())
-    }
-}
 
 /// When a plan holds: at the schema epoch it last held at, or at a later
 /// one while each table and view it read last changed when it did; a plan
@@ -125,7 +114,7 @@ impl PlanValidity {
     }
 }
 
-/// How to extract the PK value for a compiled PK lookup
+/// How to extract the PK value for a compiled PK update or delete
 #[derive(Debug, Clone)]
 pub enum PkValueSource {
     /// Value comes from a positional parameter (0-indexed)
@@ -416,7 +405,8 @@ impl NestedPlan {
     }
 }
 
-/// Pre-compiled execution state for fast paths
+/// What a statement's slot holds: a fast path's compiled state, a planned
+/// statement or a prepared plan
 #[derive(Debug, Clone, Default)]
 pub enum CompiledExecution {
     /// Not analyzed yet
@@ -500,16 +490,12 @@ fn counts_slot(statement: &Statement) -> Option<Arc<CountsSlot>> {
 pub struct CachedQueryPlan {
     /// The parsed AST (wrapped in Arc for cheap cloning - statements are immutable)
     pub statement: Arc<Statement>,
-    /// Original query text
-    pub query_text: SmartString,
     /// Last time this plan was used (monotonic)
     pub last_used: Instant,
     /// Number of times this plan has been used
     pub usage_count: u64,
     /// The parameter slots the statement takes
     pub params: ParamSlots,
-    /// Normalized query text (cache key)
-    pub normalized_query: SmartString,
     /// Compiled execution state (lazily populated on first execution)
     pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
@@ -517,28 +503,6 @@ pub struct CachedQueryPlan {
     /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
     /// without one
     pub counts: Option<Arc<CountsSlot>>,
-}
-
-impl CachedQueryPlan {
-    /// Create a new cached query plan
-    pub fn new(
-        statement: Arc<Statement>,
-        query_text: SmartString,
-        params: ParamSlots,
-        normalized_query: SmartString,
-    ) -> Self {
-        Self {
-            counts: counts_slot(&statement),
-            statement,
-            query_text,
-            last_used: Instant::now(),
-            usage_count: 1,
-            params,
-            normalized_query,
-            compiled: Arc::new(NestedPlan::default()),
-            classification: Arc::new(std::sync::OnceLock::new()),
-        }
-    }
 }
 
 /// Query cache for parsed SQL statements
@@ -647,19 +611,14 @@ impl QueryCache {
                 self.prune_cache(&mut plans);
             }
 
-            // Insert plan into map - use normalized_key for both key and field
-            // Only clone normalized_key for the map key; move it into the plan struct
-            let key_for_insert = normalized_key.clone();
             plans.insert(
-                key_for_insert,
+                normalized_key,
                 CachedQueryPlan {
                     statement: statement.clone(),
-                    query_text: SmartString::new(query),
                     last_used: Instant::now(),
                     usage_count: 1,
                     params: params.clone(),
-                    normalized_query: normalized_key, // moved, not cloned
-                    compiled: compiled.clone(),       // Arc clone - cheap
+                    compiled: compiled.clone(), // Arc clone - cheap
                     classification: classification.clone(),
                     counts: counts.clone(),
                 },
@@ -684,42 +643,6 @@ impl QueryCache {
         let mut statements = self.statements.lock();
         statements.by_address.clear();
         statements.by_structure.clear();
-    }
-
-    /// Invalidate all cached plans that reference a specific table
-    /// Called after DDL operations (ALTER TABLE, DROP TABLE, etc.)
-    pub fn invalidate_table(&self, table_name: &str) {
-        let table_lower = to_lowercase_cow(table_name);
-        if let Ok(mut plans) = self.plans.write() {
-            // Remove plans that reference this table
-            // Check both the compiled lookup table name and query text
-            plans.retain(|_key, plan| {
-                // Check if compiled lookup references this table
-                if let Ok(compiled) = plan.compiled.slot().read() {
-                    match &*compiled {
-                        CompiledExecution::Planned(planned) if planned.table == *table_lower => {
-                            return false; // Remove this plan
-                        }
-                        CompiledExecution::CountDistinct(cd) if cd.table_name == *table_lower => {
-                            return false; // Remove this plan
-                        }
-                        CompiledExecution::CountStar(cs) if cs.table_name == *table_lower => {
-                            return false; // Remove this plan
-                        }
-                        _ => {}
-                    }
-                }
-                // Also check query text for table reference (simple heuristic)
-                let query_lower = to_lowercase_cow(&plan.query_text);
-                !query_lower.contains(&format!(" {} ", &*table_lower))
-                    && !query_lower.contains(&format!(" {}\n", &*table_lower))
-                    && !query_lower.contains(&format!(" {};", &*table_lower))
-                    && !query_lower.contains(&format!("from {}", &*table_lower))
-                    && !query_lower.contains(&format!("join {}", &*table_lower))
-                    && !query_lower.contains(&format!("into {}", &*table_lower))
-                    && !query_lower.contains(&format!("update {}", &*table_lower))
-            });
-        }
     }
 
     /// Get the number of plans in the cache
