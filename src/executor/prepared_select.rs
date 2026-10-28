@@ -18,7 +18,7 @@
 //! parameterised scan whose outer reads fill parameter slots.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -2855,6 +2855,8 @@ struct PreparedBlocks {
     slot_count: usize,
     /// Values computed once per run before the statement reads a row
     run_slots: Vec<(usize, SharedProgram)>,
+    /// The run slots whose error is raised where a row reads the slot
+    where_slots: Vec<usize>,
     /// Indexed by subquery id, nested ones included
     subqueries: Vec<PreparedSubquery>,
 }
@@ -3199,9 +3201,6 @@ pub struct PreparedSelect {
     /// The WHERE holds no subquery and a term that is a statement constant,
     /// which a run reads to tell whether it keeps no row
     constant_where: bool,
-    /// The statement prepared without the WHERE's run slots, which a run
-    /// whose slot fails runs instead, so the value fails where a row reaches it
-    unslotted: OnceLock<Arc<PreparedSelect>>,
 }
 
 /// What a plan takes of a statement prepared over one table: the primary
@@ -4158,9 +4157,9 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
-    /// A value a WHERE tests a column against is a run slot; without, it
-    /// stays in the program that reads it, read only when a row needs it
-    slots: bool,
+    /// The run slots of values a WHERE tests a column against, whose error
+    /// a run raises only where a row reads the slot
+    where_slots: Vec<usize>,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -4283,6 +4282,7 @@ impl Builder<'_> {
             param_count,
             slot_count: self.next_slot,
             run_slots,
+            where_slots: self.where_slots,
             subqueries,
         };
         Ok((blocks, holes))
@@ -6156,7 +6156,7 @@ impl PreparedProjection {
         if let Some(shared) = self.shared(run, &mut bound, None) {
             for (row_id, (id, row)) in rows.iter_mut().enumerate() {
                 let mut out = Row::with_capacity(shared.width());
-                let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
+                let exec = run.exec_over(row, &run.base);
                 shared.project_into(&mut vm, &exec, &mut out)?;
                 *row = out;
                 *id = row_id as i64;
@@ -6276,8 +6276,7 @@ impl PreparedProjection {
             let out = match &shared {
                 Some(shared) => {
                     let mut out = Row::from_values(values);
-                    let exec =
-                        ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
+                    let exec = run.exec_over(row, &run.base);
                     shared.project_into(&mut vm, &exec, &mut out)?;
                     if !whole {
                         out.values_mut().push(Value::Integer(i));
@@ -6319,8 +6318,7 @@ impl PreparedProjection {
             let Some(row) = row else {
                 return Err(Error::internal("a sorted row lost its source"));
             };
-            let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
-                .with_subquery_executor(run);
+            let exec = run.exec_over(row, &run.base).with_subquery_executor(run);
             for (position, output) in self.outputs.iter().enumerate() {
                 if let Output::Program(computed) | Output::Block(computed) = output {
                     if !read.contains(&position) {
@@ -6366,8 +6364,7 @@ impl PreparedProjection {
         mut values: Vec<Value>,
         place: i64,
     ) -> Result<Row> {
-        let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
-            .with_subquery_executor(run);
+        let exec = run.exec_over(row, &run.base).with_subquery_executor(run);
         for (position, output) in self.outputs.iter().enumerate() {
             let value = match output {
                 Output::Column(i) => row.get(*i).cloned().unwrap_or_else(Value::null_unknown),
@@ -6394,8 +6391,7 @@ impl PreparedProjection {
         }
         for (position, output) in self.outputs.iter().enumerate() {
             if let Output::AliasKey(computed, _) = output {
-                let mut exec =
-                    ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
+                let mut exec = run.exec_over(row, &run.base);
                 exec.row2 = Some(&out);
                 let key = vm.execute(Self::bound_program(run, bound, computed), &exec)?;
                 out.set(position, key)?;
@@ -6494,21 +6490,6 @@ impl PreparedSelect {
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
-        let at = (param_count, epoch);
-        Self::prepare_with(executor, ctx, stmt, schema, scope_name, at, true)
-    }
-
-    /// [`Self::prepare`], with the WHERE's run slots or, without `slots`,
-    /// each WHERE value read where a row asks it
-    fn prepare_with(
-        executor: &Executor,
-        ctx: &ExecutionContext,
-        stmt: &SelectStatement,
-        schema: &Schema,
-        scope_name: &SmartString,
-        (param_count, epoch): (usize, u64),
-        slots: bool,
-    ) -> Result<Self> {
         let registry = &executor.function_registry;
         let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
@@ -6520,7 +6501,7 @@ impl PreparedSelect {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
-            slots,
+            where_slots: Vec::new(),
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -6688,7 +6669,6 @@ impl PreparedSelect {
                 .where_clause
                 .as_deref()
                 .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w)),
-            unslotted: OnceLock::new(),
         })
     }
 }
@@ -6719,10 +6699,6 @@ pub struct PreparedGrouped {
     /// An argument read once for its call holds a run slot, which the
     /// statement's parameters then carry beside the blocks'
     pub(crate) reads_slots: bool,
-    /// Every subquery is a run slot: the statement runs as any grouped
-    /// statement does, reading them as parameters, under this plan of its
-    /// own over a table, and groups another source's rows so
-    pub(crate) runs_alone: Option<NestedPlan>,
 }
 
 /// What a grouped statement's rows come from, which says what its blocks run
@@ -6850,7 +6826,7 @@ impl PreparedGrouped {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: true,
-            slots: true,
+            where_slots: Vec::new(),
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -7142,11 +7118,6 @@ impl PreparedGrouped {
                 ..stmt
             },
         };
-        let runs_alone = (!stmt.columns.iter().any(|c| mentions_subquery(unaliased(c)))
-            && !stmt.having.as_deref().is_some_and(mentions_subquery)
-            && !grouping_items(&stmt).into_iter().any(mentions_subquery)
-            && !stmt.where_clause.as_deref().is_some_and(mentions_subquery))
-        .then(NestedPlan::default);
         // An argument read once for its call holds only run slots: one reading
         // the row is the general path's to refuse
         // The ORDER BY keys a hidden item computes count with the list
@@ -7172,7 +7143,6 @@ impl PreparedGrouped {
             reads_slots: constants(written, &mentions_subquery),
             classification: super::query_classification::get_classification(&stmt),
             stmt,
-            runs_alone,
         }))
     }
 
@@ -7397,9 +7367,7 @@ impl Executor {
             None,
             None,
         );
-        for (slot, value) in runner.run_slot_values()? {
-            runner.base[slot] = value;
-        }
+        runner.fill_run_slots()?;
         runner.read_ahead(&held.ahead, &held.holes)?;
         Ok(Some(runner))
     }
@@ -7530,7 +7498,7 @@ impl PreparedDml {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
-            slots: true,
+            where_slots: Vec::new(),
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -7914,7 +7882,7 @@ impl JoinBlocks {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
-            slots: true,
+            where_slots: Vec::new(),
         };
         // A side read as rows keeps the conditions its read asks: those
         // without a block, which the read takes, and those whose blocks bind
@@ -8266,9 +8234,7 @@ impl Executor {
         };
         let mut runner =
             PreparedRunner::new(self, blocks, holes, ctx, inner_ctx, tables, None, None);
-        for (slot, value) in runner.run_slot_values()? {
-            runner.base[slot] = value;
-        }
+        runner.fill_run_slots()?;
         runner.read_ahead(&held.ahead, holes)?;
         Ok(Some(runner))
     }
@@ -8336,7 +8302,7 @@ impl Executor {
         let mut kept = SideKeep::new(filter.as_ref(), offset, limit);
         if limit != Some(0) {
             let mut keep = |id: i64, _: u64, row: Row| kept.keep(id, row);
-            let stream = match limit.is_none() && offset == 0 {
+            let stream = match limit.is_none() && offset == 0 && run.failed_slots.is_none() {
                 true => Take::Stream,
                 false => Take::Kept,
             };
@@ -8527,9 +8493,7 @@ impl<'a> DmlRunner<'a> {
             Some(rows),
             None,
         );
-        for (slot, value) in runner.run_slot_values()? {
-            runner.base[slot] = value;
-        }
+        runner.fill_run_slots()?;
         Ok(Self { runner, prepared })
     }
 
@@ -8546,7 +8510,8 @@ impl<'a> DmlRunner<'a> {
     /// What the statement's programs read for `row`: its parameters, its
     /// run slots and its blocks
     pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
-        ExecuteContext::with_common_params(row, &self.runner.base, self.runner.transaction_id)
+        self.runner
+            .exec_over(row, &self.runner.base)
             .with_subquery_executor(&self.runner)
     }
 
@@ -8792,21 +8757,6 @@ fn mentions_subquery(expr: &Expression) -> bool {
     }
 }
 
-/// The statement a set operation's first branch prepares: the whole one
-/// reads the rest
-fn first_branch(stmt: &SelectStatement) -> std::borrow::Cow<'_, SelectStatement> {
-    match stmt.set_operations.is_empty() {
-        true => std::borrow::Cow::Borrowed(stmt),
-        false => std::borrow::Cow::Owned(SelectStatement {
-            set_operations: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            ..stmt.clone()
-        }),
-    }
-}
-
 /// The sides of the joined row `scope`, the left one its first `left_width`
 /// columns, that a subquery of `expr` reads: bit 0 the left, bit 1 the right
 fn sides_read_within(
@@ -8946,6 +8896,7 @@ impl Builder<'_> {
         );
         let binds = parts.map(|parts| !asks_per_row(&parts.clause, &self.subqueries));
         self.next_slot = next_slot;
+        self.where_slots.retain(|slot| *slot < next_slot);
         self.subqueries.truncate(blocks);
         binds
     }
@@ -9064,9 +9015,9 @@ impl Builder<'_> {
 
     /// A value a conjunct tests its column against, rewritten: one that
     /// reads no row, is more than a literal and is not volatile is a run
-    /// slot, computed once per run so the scan can take it. A `nested`
-    /// value's block stays in the row's program, run only for a row that
-    /// needs it
+    /// slot, computed once per run so the scan can take it, its error raised
+    /// where a row reads it. A `nested` value's block stays in the row's
+    /// program, run only for a row that needs it
     fn conjunct_value(
         &mut self,
         chain: &Chain<'_>,
@@ -9077,13 +9028,13 @@ impl Builder<'_> {
     ) -> Result<Expression> {
         let mut value_work = Rewritten::default();
         let rewritten = self.rewrite(chain, None, value, &mut value_work)?;
-        if self.slots
-            && !value_work.reads_row
+        if !value_work.reads_row
             && !is_leaf(value)
             && !volatile(value, &self.executor.function_registry)
             && !(nested && mentions_subquery(value))
         {
             let slot = self.slot();
+            self.where_slots.push(slot);
             run_slots.push((slot, rewritten));
             return Ok(slot_parameter(slot));
         }
@@ -9234,31 +9185,6 @@ impl Executor {
         Ok(table)
     }
 
-    /// `prepared`'s statement without the WHERE's run slots, prepared once
-    fn unslotted(
-        &self,
-        prepared: &PreparedSelect,
-        stmt: &SelectStatement,
-        schema: &Schema,
-        scope_name: &SmartString,
-        ctx: &ExecutionContext,
-    ) -> Result<Arc<PreparedSelect>> {
-        if let Some(unslotted) = prepared.unslotted.get() {
-            return Ok(Arc::clone(unslotted));
-        }
-        let at = (prepared.blocks.param_count, prepared.validity.epoch());
-        let unslotted = Arc::new(PreparedSelect::prepare_with(
-            self,
-            ctx,
-            &first_branch(stmt),
-            schema,
-            scope_name,
-            at,
-            false,
-        )?);
-        Ok(Arc::clone(prepared.unslotted.get_or_init(|| unslotted)))
-    }
-
     /// The plan's prepared statement, prepared now over the source `schema`
     /// gives when the plan holds none for this schema, these `columns` and
     /// this parameter count
@@ -9289,10 +9215,25 @@ impl Executor {
                 }
             }
         }
+        // A set operation's first branch: the whole one reads the rest
+        let branch;
+        let stmt = match stmt.set_operations.is_empty() {
+            true => stmt,
+            false => {
+                branch = SelectStatement {
+                    set_operations: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    ..stmt.clone()
+                };
+                &branch
+            }
+        };
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
             ctx,
-            &first_branch(stmt),
+            stmt,
             &schema(),
             scope_name,
             ctx.params().len(),
@@ -9718,7 +9659,6 @@ impl Executor {
             StatementSource::Values(_, values) => values.rows.len(),
             StatementSource::Cte((_, rows)) => rows.len(),
         };
-        let unslotted;
         let mut runner = PreparedRunner::new(
             self,
             &prepared.blocks,
@@ -9729,48 +9669,9 @@ impl Executor {
             Some(statement_rows),
             statement_limit,
         );
-        let failed = !prepared.blocks.run_slots.is_empty()
-            && match runner.run_slot_values() {
-                Ok(values) => {
-                    for (slot, value) in values {
-                        runner.base[slot] = value;
-                    }
-                    false
-                }
-                Err(Error::QueryCancelled) => return Err(Error::QueryCancelled),
-                Err(_) => true,
-            };
-        // A run slot that fails runs the statement with each WHERE value in
-        // the program that reads it, failing only for a row that reaches it
-        let prepared: &PreparedSelect = match failed {
-            false => &prepared,
-            true => {
-                drop(runner);
-                unslotted = self.unslotted(&prepared, stmt, &schema(), scope_name, ctx)?;
-                let inner_ctx = ctx.with_incremented_query_depth();
-                let tables =
-                    PreparedRunner::open_tables(self, &unslotted.blocks, &inner_ctx, None)?
-                        .ok_or_else(|| {
-                            Error::internal(
-                                "a table's columns changed while the statement prepared",
-                            )
-                        })?;
-                runner = PreparedRunner::new(
-                    self,
-                    &unslotted.blocks,
-                    &unslotted.holes,
-                    ctx,
-                    inner_ctx,
-                    tables,
-                    Some(statement_rows),
-                    statement_limit,
-                );
-                for (slot, value) in runner.run_slot_values()? {
-                    runner.base[slot] = value;
-                }
-                &unslotted
-            }
-        };
+        if !prepared.blocks.run_slots.is_empty() {
+            runner.fill_run_slots()?;
+        }
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
         let output_columns = CompactArc::clone(&prepared.output_columns);
         // Every value of a VALUES list is evaluated, as the general path does
@@ -9838,9 +9739,11 @@ impl Executor {
         .then(|| DistinctRows::new(prepared.visible));
         // Rows nothing sorts, counts or merges, whose output is the row or
         // columns of it, reach the caller as the scan reads them, which checks
-        // the cancel; a timed read is collected, so its deadline holds while it reads
+        // the cancel; a timed read is collected, so its deadline holds while it
+        // reads, and so is a run whose failed slot only the runner raises
         let projection = &prepared.projection;
         let flowing = !ctx.has_timeout()
+            && runner.failed_slots.is_none()
             && distinct.is_none()
             && stmt.order_by.is_empty()
             && limit.is_none()
@@ -10300,6 +10203,9 @@ pub(crate) struct PreparedRunner<'a> {
     statement_limit: Option<i64>,
     /// The statement's parameters, then its run slots; the other slots NULL
     base: ParamVec,
+    /// The WHERE's run slots whose value failed, NULL in `base`; boxed, as
+    /// a run seldom has one
+    failed_slots: Option<Box<FailedSlots>>,
     transaction_id: Option<u64>,
     /// The context the subqueries read their tables under
     ctx: ExecutionContext,
@@ -10514,6 +10420,7 @@ impl<'a> PreparedRunner<'a> {
                 })
                 .collect(),
             base,
+            failed_slots: None,
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
@@ -10525,7 +10432,7 @@ impl<'a> PreparedRunner<'a> {
     /// them for every row that asks later
     fn read_ahead(&self, ids: &[u16], holes: &HoleSet) -> Result<()> {
         let empty = Row::new();
-        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        let caller = self.exec_over(&empty, &self.base);
         for &id in ids {
             let width = self.prepared.subqueries[usize::from(id)].member_width();
             let nulls: SmallVec<[Value; 2]> = smallvec::smallvec![Value::null_unknown(); width];
@@ -10534,17 +10441,49 @@ impl<'a> PreparedRunner<'a> {
         Ok(())
     }
 
-    /// The statement's run slots, each computed once over no row
-    fn run_slot_values(&self) -> Result<Vec<(usize, Value)>> {
-        let empty = Row::new();
-        let mut vm = ExprVM::new();
-        let exec = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id)
-            .with_subquery_executor(self);
-        self.prepared
-            .run_slots
-            .iter()
-            .map(|(slot, program)| Ok((*slot, vm.execute(program, &exec)?)))
-            .collect()
+    /// The statement's run slots, each computed once over no row before the
+    /// rows. A WHERE slot's error is kept for a row that reads the slot; any
+    /// other's is the statement's
+    fn fill_run_slots(&mut self) -> Result<()> {
+        let mut computed: SmallVec<[(usize, Result<Value>); 4]> = SmallVec::new();
+        {
+            let empty = Row::new();
+            let mut vm = ExprVM::new();
+            let exec = self
+                .exec_over(&empty, &self.base)
+                .with_subquery_executor(self);
+            for (slot, program) in &self.prepared.run_slots {
+                let value = vm.execute(program, &exec);
+                let raised = value.is_err() && !self.prepared.where_slots.contains(slot);
+                computed.push((*slot, value));
+                if raised {
+                    break;
+                }
+            }
+        }
+        for (slot, value) in computed {
+            match value {
+                Ok(value) => self.base[slot] = value,
+                Err(e) if self.prepared.where_slots.contains(&slot) => {
+                    let e = deferred(e)?;
+                    self.failed_slots.get_or_insert_default().push((slot, e));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// The WHERE's run slots whose value failed in this run
+    fn slot_failures(&self) -> &[(usize, Error)] {
+        self.failed_slots.as_deref().map_or(&[], SmallVec::as_slice)
+    }
+
+    /// A context of this run over `row`, reading `params`: the statement's
+    /// or a block's, its slots numbered as the statement's
+    fn exec_over<'s>(&'s self, row: &'s Row, params: &'s [Value]) -> ExecuteContext<'s> {
+        ExecuteContext::with_common_params(row, params, self.transaction_id)
+            .with_failed(self.slot_failures())
     }
 
     /// Whether `row` passes `condition`, a program over the statement's row
@@ -10567,8 +10506,11 @@ impl<'a> PreparedRunner<'a> {
         let Some(bound) = bound else {
             return Ok(rows);
         };
+        // A filter on the pool reads no failed slot, so a run with one judges here
         #[cfg(feature = "parallel")]
-        if super::parallel::ParallelConfig::default().should_parallel_filter(rows.len()) {
+        if self.failed_slots.is_none()
+            && super::parallel::ParallelConfig::default().should_parallel_filter(rows.len())
+        {
             let mut filter = RowFilter::from_program(bound).with_context(&self.ctx);
             // The values the run computed once sit past the statement's own
             if self.base.len() > self.ctx.params().len() {
@@ -10621,8 +10563,7 @@ impl<'a> PreparedRunner<'a> {
     }
 
     fn matches(&self, vm: &mut ExprVM, condition: &SharedProgram, row: &Row) -> Result<bool> {
-        let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(row, &self.base).with_subquery_executor(self);
         vm.execute_bool_checked(condition, &exec)
     }
 
@@ -10630,8 +10571,7 @@ impl<'a> PreparedRunner<'a> {
     /// scan loop that builds the context costs a point query its codegen
     #[inline(never)]
     fn row_passes(&self, vm: &mut ExprVM, program: &WhereProgram, row: &Row) -> Result<bool> {
-        let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(row, &self.base).with_subquery_executor(self);
         self.passes(vm, program, &exec)
     }
 
@@ -10707,6 +10647,8 @@ impl<'a> PreparedRunner<'a> {
             crate::test_failpoints::where_pushdown_converted();
         }
         let (mut storage_expr, residual) = match (prepared, pushdown) {
+            // A failed slot holds NULL, which no scan may compare with
+            _ if self.failed_slots.is_some() => (None, true),
             (Some(expr), _) => (Some(expr), false),
             (None, Some(pushdown)) if self.prepared.run_slots.is_empty() => {
                 pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
@@ -10978,7 +10920,11 @@ impl<'a> PreparedRunner<'a> {
                         (storage_expr, scanned_whole, extra_whole, rest) = scan;
                     }
                     let filter = storage_expr.as_deref();
-                    let scan = where_.scan.as_ref().filter(|_| extra.is_none());
+                    // An index reads the values a failed slot does not have
+                    let scan = where_
+                        .scan
+                        .as_ref()
+                        .filter(|_| extra.is_none() && self.failed_slots.is_none());
                     if let Some(ScanChoice::Index(_)) = scan {
                         let enough = target.filter(|_| scanned_whole);
                         if let Some(rows) = member_rows(table, filter, target.is_some(), enough)? {
@@ -11168,7 +11114,7 @@ impl<'a> PreparedRunner<'a> {
             let mut failed = self.blocks[index].failed.borrow_mut();
             failed.clear();
             let empty = Row::new();
-            let exec = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+            let exec = self.exec_over(&empty, &self.base);
             for (slot, hole) in self.holes_of(index, self.holes) {
                 if !plan.keys.iter().any(|(_, key, _)| key == slot) {
                     match hole.value(&mut vm, &empty, &exec) {
@@ -11263,8 +11209,7 @@ impl<'a> PreparedRunner<'a> {
             params.clone_from(&self.blocks[parent as usize].buffer.borrow());
             failed.extend(self.blocks[parent as usize].failed.borrow().iter().cloned());
         }
-        let mut hole_ctx =
-            ExecuteContext::with_common_params(caller.row, &self.base, self.transaction_id);
+        let mut hole_ctx = self.exec_over(caller.row, &self.base);
         hole_ctx.row2 = caller.row2;
         for (slot, hole) in self.holes_of(index, site) {
             match hole.value(vm, caller.row, &hole_ctx) {
@@ -11356,9 +11301,9 @@ impl<'a> PreparedRunner<'a> {
                 self.ctx.check_cancelled()?;
             }
             if !decided {
-                let exec =
-                    ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                        .with_subquery_executor(self);
+                let exec = self
+                    .exec_over(scanner.row(), &params)
+                    .with_subquery_executor(self);
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
                         continue;
@@ -11547,8 +11492,7 @@ impl<'a> PreparedRunner<'a> {
             let outcome = if decided {
                 ExistsOutcome::Passed
             } else {
-                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                    .with_subquery_executor(self);
+                let exec = self.exec_over(row, &params).with_subquery_executor(self);
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => ExistsOutcome::Passed,
                     Ok(false) => continue,
@@ -11665,6 +11609,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         Some(&self.base)
     }
 
+    fn failed_slots(&self) -> &[(usize, Error)] {
+        self.slot_failures()
+    }
+
     fn bind_members(&self, program: &SharedProgram) -> Option<SharedProgram> {
         self.bound_program(program)
     }
@@ -11733,6 +11681,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
 
     fn params(&self) -> Option<&[Value]> {
         Some(&self.runner.base)
+    }
+
+    fn failed_slots(&self) -> &[(usize, Error)] {
+        self.runner.slot_failures()
     }
 }
 
@@ -11866,9 +11818,9 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             if let Some(filter) = filter {
-                let exec =
-                    ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                        .with_subquery_executor(self);
+                let exec = self
+                    .exec_over(scanner.row(), &params)
+                    .with_subquery_executor(self);
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
                 }
@@ -11912,8 +11864,7 @@ impl PreparedRunner<'_> {
         if value.is_some() {
             return Err(more_than_one_row());
         }
-        let exec = ExecuteContext::with_common_params(row, params, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(row, params).with_subquery_executor(self);
         *value = Some(vm.execute(projection, &exec)?);
         Ok(())
     }
@@ -11961,7 +11912,7 @@ impl PreparedRunner<'_> {
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
         let empty = Row::new();
-        let none = ExecuteContext::with_common_params(&empty, &params, self.transaction_id);
+        let none = self.exec_over(&empty, &params);
         let mut count = |program: &Option<SharedProgram>, clause| {
             program
                 .as_ref()
@@ -11998,8 +11949,7 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             let row = scanner.row();
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
@@ -12490,11 +12440,14 @@ impl PreparedRunner<'_> {
 
     /// `program` bound as [`Self::bound_program`] binds it, once the values
     /// of the uncorrelated blocks it asks are read: a side read once asks
-    /// them alike of each of its rows. None when a read fails, whose error
-    /// stays with the row that needs it
+    /// them alike of each of its rows. None when a read or a run slot failed,
+    /// whose error stays with the row that needs it
     pub(crate) fn bound_reading(&self, program: &SharedProgram) -> Option<SharedProgram> {
+        if self.failed_slots.is_some() {
+            return None;
+        }
         let empty = Row::new();
-        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        let caller = self.exec_over(&empty, &self.base);
         for op in program.ops().iter().filter(|op| self.asks_block(op)) {
             let read = match *op {
                 Op::ExecScalarSubquery(index) => self.execute_scalar(index, &caller).map(drop),
@@ -12555,10 +12508,20 @@ impl PreparedRunner<'_> {
     }
 
     /// What `op` reads in this run, when the run knows it already: a
-    /// parameter or run slot, an uncorrelated block's value or members read
+    /// parameter or run slot, an uncorrelated block's value or members read.
+    /// A slot whose value failed stays read, which raises its error
     fn known_op(&self, op: &Op) -> Option<Op> {
         match *op {
-            Op::LoadParam(slot) => self.base.get(slot as usize).cloned().map(Op::LoadConst),
+            Op::LoadParam(slot) => {
+                if self
+                    .slot_failures()
+                    .iter()
+                    .any(|(at, _)| *at == slot as usize)
+                {
+                    return None;
+                }
+                self.base.get(slot as usize).cloned().map(Op::LoadConst)
+            }
             Op::ExecScalarSubquery(index) | Op::ExecExists(index) => {
                 if !self.prepared.subqueries.get(index as usize)?.uncorrelated {
                     return None;
@@ -12576,7 +12539,7 @@ impl PreparedRunner<'_> {
     /// `program` bound to all this run knows now; one that asks no
     /// uncorrelated block binds only when that shrinks it
     fn bound_now(&self, program: &SharedProgram, asks_blocks: bool) -> SharedProgram {
-        let bound = match asks_blocks {
+        let bound = match asks_blocks || self.failed_slots.is_some() {
             true => program.bind_with(|op| self.known_op(op)),
             false => program.bind(&self.base),
         };
@@ -12738,8 +12701,7 @@ impl PreparedRunner<'_> {
         if let Some(item) = order.item {
             return Ok(Member::Value(members.read(keys.swap_remove(item))));
         }
-        let exec = ExecuteContext::with_common_params(&row, params, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(&row, params).with_subquery_executor(self);
         if order.values.is_empty() {
             return self.candidate(members, vm, &exec);
         }
@@ -12801,9 +12763,9 @@ impl PreparedRunner<'_> {
             if scanned.is_multiple_of(100) {
                 self.ctx.check_cancelled()?;
             }
-            let exec =
-                ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                    .with_subquery_executor(self);
+            let exec = self
+                .exec_over(scanner.row(), &params)
+                .with_subquery_executor(self);
             if !decided {
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
@@ -12944,8 +12906,7 @@ impl PreparedRunner<'_> {
                     _ => continue 'rows,
                 }
             }
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if let Some(candidates) = candidates.filter(|_| !decided) {
                 if !vm.execute_bool_checked(candidates, &exec)? {
                     continue;
@@ -13273,7 +13234,7 @@ impl PreparedRunner<'_> {
     /// The context a grouped block's HAVING and SELECT expression read a
     /// slot row in, with the buffer filled for the call
     fn slot_context<'r>(&'r self, slot_row: &'r Row, params: &'r [Value]) -> ExecuteContext<'r> {
-        ExecuteContext::with_common_params(slot_row, params, self.transaction_id)
+        self.exec_over(slot_row, params)
     }
 
     /// Whether a slot row passes the block's HAVING
@@ -13420,8 +13381,7 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             let row = scanner.row();
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
                 for program in sq.candidates.iter().chain(&sq.filter) {
                     if !vm.execute_bool_checked(program, &exec)? {
@@ -13571,8 +13531,7 @@ impl PreparedRunner<'_> {
                     continue 'rows;
                 }
             }
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             let fed = (|| {
                 if let (false, Some(filter)) = (decided, &sq.filter) {
                     if !vm.execute_bool_checked(filter, &exec)? {

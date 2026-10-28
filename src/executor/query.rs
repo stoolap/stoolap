@@ -9649,9 +9649,8 @@ impl Executor {
         });
     }
 
-    /// `rows` of `columns` grouped as `held` prepared them: reading its run
-    /// slots as parameters when they are all its subqueries, else asking
-    /// the `run`'s blocks
+    /// `rows` of `columns` grouped as `held` prepared them, asking the
+    /// `run`'s blocks
     fn group_held_rows(
         &self,
         held: &super::prepared_select::PreparedGrouped,
@@ -9662,7 +9661,7 @@ impl Executor {
         layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
     ) -> SelectResult {
         let slots_ctx;
-        let ctx = match held.runs_alone.is_some() || held.reads_slots {
+        let ctx = match held.reads_slots {
             true => {
                 slots_ctx = ctx
                     .with_slot_params(run.params().unwrap_or_default().iter().cloned().collect());
@@ -9670,17 +9669,13 @@ impl Executor {
             }
             false => ctx,
         };
-        let blocks: Option<&dyn SubqueryExecutor> = match held.runs_alone {
-            Some(_) => None,
-            None => Some(run),
-        };
         let (result, layout) = self.group_and_window_rows(
             &held.stmt,
             ctx,
             &held.classification,
             rows,
             columns,
-            blocks,
+            Some(run),
             layout,
         )?;
         let columns = CompactArc::new(result.columns().to_vec());
@@ -9689,8 +9684,7 @@ impl Executor {
 
     /// A grouped statement whose subqueries run as `grouped` prepared them:
     /// over a source's rows, or a table's, the general aggregation asking
-    /// the blocks of each group; over a table with every one a run slot, as
-    /// any grouped statement reading them as parameters
+    /// the blocks of each group
     fn execute_prepared_grouped(
         &self,
         grouped: super::prepared_select::GroupedRun<'_>,
@@ -9713,16 +9707,6 @@ impl Executor {
             return self.group_held_rows(held, &run, ctx, rows, &columns, |out| {
                 Self::shared_result_layout(&held.stmt, &columns, alias.as_deref(), out)
             });
-        }
-        if let Some(plan) = &held.runs_alone {
-            let params = run.params().unwrap_or_default().iter().cloned().collect();
-            let ctx = ctx.with_slot_params(params);
-            return self.execute_select_internal(
-                &held.stmt,
-                &ctx,
-                &held.classification,
-                Some(plan.slot()),
-            );
         }
         let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
             return Err(Error::internal("a grouped statement without its table"));
