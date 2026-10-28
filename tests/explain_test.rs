@@ -84,11 +84,10 @@ fn test_explain_seq_scan() {
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("Seq Scan on orders"),
-        "Expected Seq Scan, got:\n{}",
+        plan.contains("SeqScan orders") && plan.contains("amount > 50"),
+        "Expected Seq Scan with its filter, got:\n{}",
         plan
     );
-    assert!(plan.contains("Filter:"), "Expected Filter, got:\n{}", plan);
 }
 
 #[test]
@@ -100,18 +99,13 @@ fn test_explain_index_scan() {
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("Index Scan"),
-        "Expected Index Scan, got:\n{}",
+        plan.contains("IndexScan orders") && plan.contains("user_id = 1"),
+        "Expected Index Scan with its condition, got:\n{}",
         plan
     );
     assert!(
-        plan.contains("idx_user_id"),
+        plan.contains("Index idx_user_id (user_id =)"),
         "Expected idx_user_id index, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("Index Cond:"),
-        "Expected Index Cond, got:\n{}",
         plan
     );
 }
@@ -120,23 +114,21 @@ fn test_explain_index_scan() {
 fn test_explain_pk_lookup() {
     let db = setup_test_db();
 
-    // Query on primary key should show PK Lookup
     let lines = get_plan_output(&db, "EXPLAIN SELECT * FROM orders WHERE id = 5");
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("PK Lookup"),
-        "Expected PK Lookup, got:\n{}",
+        plan.contains("PkGet orders id = 5"),
+        "Expected PkGet orders id = 5, got:\n{}",
         plan
     );
-    assert!(plan.contains("id = 5"), "Expected id = 5, got:\n{}", plan);
 }
 
 #[test]
 fn test_explain_multi_index_or() {
     let db = setup_test_db();
 
-    // OR with multiple indexed columns should show Multi-Index Scan
+    // OR with multiple indexed columns should read the union of both
     let lines = get_plan_output(
         &db,
         "EXPLAIN SELECT * FROM orders WHERE user_id = 1 OR status = 'active'",
@@ -144,11 +136,12 @@ fn test_explain_multi_index_or() {
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("Multi-Index Scan"),
-        "Expected Multi-Index Scan, got:\n{}",
+        plan.contains("Union")
+            && plan.contains("Index idx_user_id (user_id =)")
+            && plan.contains("Index idx_status (status =)"),
+        "Expected a union of both indexes, got:\n{}",
         plan
     );
-    assert!(plan.contains("OR"), "Expected OR operation, got:\n{}", plan);
 }
 
 #[test]
@@ -162,10 +155,11 @@ fn test_explain_multi_index_and() {
     );
 
     let plan = lines.join("\n");
-    // Could be either Multi-Index Scan or single Index Scan depending on optimizer
     assert!(
-        plan.contains("Index Scan") || plan.contains("Multi-Index Scan"),
-        "Expected Index Scan or Multi-Index Scan, got:\n{}",
+        plan.contains("Intersect")
+            && plan.contains("Index idx_user_id (user_id =)")
+            && plan.contains("Index idx_status (status =)"),
+        "Expected an intersection of both indexes, got:\n{}",
         plan
     );
 }
@@ -179,7 +173,7 @@ fn test_explain_range_query() {
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("Index Scan"),
+        plan.contains("Index idx_user_id (user_id range)"),
         "Expected Index Scan, got:\n{}",
         plan
     );
@@ -287,7 +281,7 @@ fn test_explain_order_by() {
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("Order By:"),
+        plan.contains("Sort user_id"),
         "Expected Order By clause, got:\n{}",
         plan
     );
@@ -307,7 +301,7 @@ fn test_explain_limit() {
 
     let plan = lines.join("\n");
     assert!(
-        plan.contains("Limit:"),
+        plan.contains("Limit 5"),
         "Expected Limit clause, got:\n{}",
         plan
     );

@@ -601,6 +601,44 @@ impl IntoIterator for RowVec {
     }
 }
 
+/// The rows a read by key found: the one row, or the rows a wider read
+/// collected
+pub enum KeyRows {
+    One(i64, Row),
+    Many(RowVec),
+}
+
+impl IntoIterator for KeyRows {
+    type Item = (i64, Row);
+    type IntoIter = KeyRowsIter;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            KeyRows::One(id, row) => KeyRowsIter::One(Some((id, row))),
+            KeyRows::Many(rows) => KeyRowsIter::Many(rows.into_iter()),
+        }
+    }
+}
+
+/// The rows of a [`KeyRows`], in order
+pub enum KeyRowsIter {
+    One(Option<(i64, Row)>),
+    Many(RowVecIter),
+}
+
+impl Iterator for KeyRowsIter {
+    type Item = (i64, Row);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            KeyRowsIter::One(row) => row.take(),
+            KeyRowsIter::Many(rows) => rows.next(),
+        }
+    }
+}
+
 impl<'a> IntoIterator for &'a RowVec {
     type Item = &'a (i64, Row);
     type IntoIter = std::slice::Iter<'a, (i64, Row)>;

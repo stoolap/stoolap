@@ -214,10 +214,8 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: *
-  -> PK Lookup on users
-       id = 1
+Project id, name, email
+  PkGet users id = 1
 ```
 
 ### EXPLAIN ANALYZE

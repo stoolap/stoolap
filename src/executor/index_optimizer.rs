@@ -834,7 +834,7 @@ impl Executor {
     /// Whether an IN on `column` may be read by `in_member_rows`: a table
     /// that keeps rows outside its index, an index probed key by key on the
     /// column, and no change of the transaction's own the index would miss
-    fn in_members_eligible(table: &dyn Table, column: &str) -> bool {
+    pub(crate) fn in_members_eligible(table: &dyn Table, column: &str) -> bool {
         table.lookup_index_on_column(column).is_none()
             && !table.has_local_changes()
             && crate::executor::utils::probes_by_equality(table, column)
@@ -920,7 +920,7 @@ impl Executor {
     /// candidates under one capture, each row read and checked against the
     /// members; else with `scan` a scan with the same check, else None. The
     /// filter `remaining` gives is asked for only when the rows are read here
-    fn in_member_rows(
+    pub(crate) fn in_member_rows(
         table: &dyn Table,
         column: &str,
         members: Vec<Value>,
@@ -2218,6 +2218,52 @@ impl Executor {
         }
     }
 
+    /// The VEC_DISTANCE call a nearest-vectors search answers: the one
+    /// ascending ORDER BY key of a statement with a LIMIT, as a call, an
+    /// output alias of one, or `<=>` read as VEC_DISTANCE_L2
+    pub(crate) fn vector_distance_order(
+        stmt: &SelectStatement,
+    ) -> Option<std::borrow::Cow<'_, FunctionCall>> {
+        use std::borrow::Cow;
+        // Must have exactly 1 ORDER BY + LIMIT, ascending order
+        let [order_by] = stmt.order_by.as_slice() else {
+            return None;
+        };
+        stmt.limit.as_ref()?;
+        if !order_by.ascending || crate::core::value::nulls_first(true, order_by.nulls_first) {
+            return None; // Vector search returns closest first, NULLs last
+        }
+        // <=> is VEC_DISTANCE_L2
+        let l2 = |infix: &InfixExpression| FunctionCall {
+            token: infix.token.clone(),
+            function: "VEC_DISTANCE_L2".into(),
+            arguments: vec![(*infix.left).clone(), (*infix.right).clone()],
+            is_distinct: false,
+            order_by: Vec::new(),
+            filter: None,
+        };
+        let func_call = match &order_by.expression {
+            Expression::FunctionCall(fc) => Cow::Borrowed(fc.as_ref()),
+            Expression::Identifier(id) => {
+                match Self::find_vec_distance_alias(&id.value_lower, &stmt.columns) {
+                    Some(fc) => Cow::Borrowed(fc),
+                    None => Cow::Owned(l2(Self::find_vec_distance_infix_alias(
+                        &id.value_lower,
+                        &stmt.columns,
+                    )?)),
+                }
+            }
+            Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
+                Cow::Owned(l2(infix))
+            }
+            _ => return None,
+        };
+        let is_vec_distance = ["VEC_DISTANCE_L2", "VEC_DISTANCE_COSINE", "VEC_DISTANCE_IP"]
+            .iter()
+            .any(|name| func_call.function.eq_ignore_ascii_case(name));
+        (is_vec_distance && func_call.arguments.len() == 2).then_some(func_call)
+    }
+
     /// Vector search optimization using HNSW index or parallel brute-force
     ///
     /// For queries like:
@@ -2235,71 +2281,11 @@ impl Executor {
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        // Must have exactly 1 ORDER BY + LIMIT, ascending order
-        if stmt.order_by.len() != 1 || stmt.limit.is_none() {
+        let Some(func_call) = Self::vector_distance_order(stmt) else {
             return Ok(None);
-        }
-
-        let order_by = &stmt.order_by[0];
-        if !order_by.ascending || crate::core::value::nulls_first(true, order_by.nulls_first) {
-            return Ok(None); // Vector search returns closest first, NULLs last
-        }
-
-        // Find the VEC_DISTANCE function call — either directly in ORDER BY, via alias,
-        // or via the <=> infix operator (which is equivalent to VEC_DISTANCE_L2).
-        // For <=> operator, we synthesize an equivalent FunctionCall to reuse the same logic.
-        let synthesized_fc;
-        let func_call = match &order_by.expression {
-            Expression::FunctionCall(fc) => Some(fc.as_ref()),
-            Expression::Identifier(id) => {
-                // Look up alias in SELECT columns — try FunctionCall first, then <=> infix
-                if let Some(fc) = Self::find_vec_distance_alias(&id.value_lower, &stmt.columns) {
-                    Some(fc)
-                } else if let Some(infix) =
-                    Self::find_vec_distance_infix_alias(&id.value_lower, &stmt.columns)
-                {
-                    synthesized_fc = FunctionCall {
-                        token: infix.token.clone(),
-                        function: "VEC_DISTANCE_L2".into(),
-                        arguments: vec![(*infix.left).clone(), (*infix.right).clone()],
-                        is_distinct: false,
-                        order_by: Vec::new(),
-                        filter: None,
-                    };
-                    Some(&synthesized_fc)
-                } else {
-                    None
-                }
-            }
-            Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
-                // <=> operator is equivalent to VEC_DISTANCE_L2
-                synthesized_fc = FunctionCall {
-                    token: infix.token.clone(),
-                    function: "VEC_DISTANCE_L2".into(),
-                    arguments: vec![(*infix.left).clone(), (*infix.right).clone()],
-                    is_distinct: false,
-                    order_by: Vec::new(),
-                    filter: None,
-                };
-                Some(&synthesized_fc)
-            }
-            _ => None,
         };
-
-        let func_call = match func_call {
-            Some(fc) => fc,
-            None => return Ok(None),
-        };
-
-        // Check if it's a VEC_DISTANCE function
+        let func_call = func_call.as_ref();
         let fn_name_upper = func_call.function.to_uppercase();
-        let is_vec_distance = matches!(
-            fn_name_upper.as_str(),
-            "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
-        );
-        if !is_vec_distance || func_call.arguments.len() != 2 {
-            return Ok(None);
-        }
 
         // Extract vector column name from first argument
         let vec_col_name = match &func_call.arguments[0] {

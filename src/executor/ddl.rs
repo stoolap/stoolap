@@ -950,6 +950,7 @@ impl Executor {
             let _ = table.drop_index(index_name);
             return Err(e);
         }
+        self.engine.index_changed(table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -1003,6 +1004,7 @@ impl Executor {
         let table = tx.get_statement_table(&table_name)?;
         table.drop_index(&index_name)?;
         self.engine.discard_uncovered_side_files(&table_name);
+        self.engine.index_changed(&table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }

@@ -32,14 +32,16 @@ use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::scope::unknown_qualifier;
 use crate::parser::token::{Position, Token, TokenType};
+use crate::storage::expression::InListExpr;
 use crate::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr,
 };
 use crate::storage::mvcc::engine::ViewDefinition;
+use crate::storage::mvcc::index_plan;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{
-    CappedEqual, Engine, ProbeScratch, QueryResult, Scanner, Table, Transaction,
+    CappedEqual, Engine, ProbeScratch, QueryResult, ScanAccess, Scanner, Table, Transaction,
 };
 
 use super::aggregation::{
@@ -61,7 +63,7 @@ use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_
 use super::prepared_join::{JoinSide, JoinSides};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
-use super::query::{ColumnSource, OutputLayout};
+use super::query::{has_constant_term, true_for_no_row, ColumnSource, OutputLayout};
 use super::query_cache::{CompiledExecution, NestedPlan, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
@@ -70,11 +72,12 @@ use super::result::{
 use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name,
+    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
     order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
+use crate::planner::{explain_steps, ordered_read, scan_choice, OrderedRead, ScanChoice};
 
 /// Scopes one chain may hold: a block's own table and every enclosing one
 const MAX_SCOPES: usize = 32;
@@ -2852,6 +2855,8 @@ struct PreparedBlocks {
     slot_count: usize,
     /// Values computed once per run before the statement reads a row
     run_slots: Vec<(usize, SharedProgram)>,
+    /// The run slots whose error is raised where a row reads the slot
+    where_slots: Vec<usize>,
     /// Indexed by subquery id, nested ones included
     subqueries: Vec<PreparedSubquery>,
 }
@@ -2885,6 +2890,15 @@ struct PreparedWhere {
     /// How many conjuncts `pushdown` holds, of the WHERE's `conjuncts`
     pushed: usize,
     conjuncts: usize,
+    /// The first conjunct equating the primary key, and the WHERE without
+    /// it when it has another conjunct
+    point: Option<(PreparedComparison, Option<SharedProgram>)>,
+    /// How the scan finds its rows, as the plan chose for a statement whose
+    /// scan takes no set; None leaves the choice to the table
+    scan: Option<ScanChoice>,
+    /// The table columns a statement without blocks reads, for a table
+    /// that reads by need to leave the others out
+    needed: Option<Vec<bool>>,
 }
 
 /// A program over the statement's row, with whether a run binds it: it
@@ -2972,6 +2986,18 @@ enum SetScan {
     Program,
 }
 
+/// What a caller takes of a scan that holds the whole WHERE
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// Each row, handed to its `keep`
+    Kept,
+    /// The scan itself, its rows as they come
+    Stream,
+    /// The rows read at once, for a sort that reads every one; a scan
+    /// that reads only some columns streams instead
+    Collected,
+}
+
 /// How a prepared WHERE's rows were read
 enum Passing {
     /// The scan proves that no row passes
@@ -3002,6 +3028,9 @@ struct WhereParts {
     /// Each top-level EXISTS or IN test: its block, whether negated, the
     /// statement column an IN tests, and its conjunct's position
     set_tests: Vec<(u16, bool, Option<usize>, usize)>,
+    /// The first conjunct equating the primary key, and the clause without
+    /// it; None for the clause when it is the only conjunct
+    point: Option<(PreparedComparison, Option<Expression>)>,
     conjuncts: usize,
 }
 
@@ -3013,6 +3042,8 @@ struct WherePrograms {
     whole: SharedProgram,
     scanned: Option<SharedProgram>,
     narrowed: Vec<(SharedProgram, Option<SharedProgram>)>,
+    /// The clause without its primary key equality, when it has another
+    pointed: Option<SharedProgram>,
 }
 
 impl WhereParts {
@@ -3027,10 +3058,12 @@ impl WhereParts {
             .iter()
             .map(|(clause, scanned)| Ok((compile(clause)?, optional(scanned)?)))
             .collect::<Result<_>>()?;
+        let pointed = self.point.as_ref().and_then(|(_, rest)| rest.as_ref());
         Ok(WherePrograms {
             whole: compile(&self.clause)?,
             scanned: optional(&self.scanned)?,
             narrowed,
+            pointed: pointed.map(&compile).transpose()?,
         })
     }
 
@@ -3041,9 +3074,11 @@ impl WhereParts {
             .narrowed
             .iter()
             .flat_map(|(clause, scanned)| std::iter::once(clause).chain(scanned));
+        let pointed = self.point.iter().filter_map(|(_, rest)| rest.as_ref());
         for clause in std::iter::once(&self.clause)
             .chain(&self.scanned)
             .chain(narrowed)
+            .chain(pointed)
         {
             compare_as_scan(clause, schema, out);
         }
@@ -3122,6 +3157,9 @@ impl WhereParts {
         let pushed = self.pushed.len();
         let pushdown = conjunction(self.pushed);
         PreparedWhere {
+            point: self.point.map(|(key, _)| (key, programs.pointed)),
+            scan: None,
+            needed: None,
             push: pushdown.as_ref().and_then(|p| PreparedPush::of(p, schema)),
             whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
             scanned: programs
@@ -3158,6 +3196,90 @@ pub struct PreparedSelect {
     visible: usize,
     /// Where each output column comes from, for an ORDER BY to bind by
     layout: Option<CompactArc<OutputLayout>>,
+    /// How an ORDER BY of one column under a LIMIT reads its rows in order
+    ordered: Option<OrderedRead>,
+    /// The WHERE holds no subquery and a term that is a statement constant,
+    /// which a run reads to tell whether it keeps no row
+    constant_where: bool,
+}
+
+/// What a plan takes of a statement prepared over one table: the primary
+/// key equality of its WHERE with the rest of the WHERE, and its output
+pub struct PlanInputs {
+    pub(crate) point: Option<(PreparedComparison, Option<SharedProgram>)>,
+    pub(crate) items: Vec<Item>,
+    pub(crate) names: CompactArc<Vec<String>>,
+}
+
+impl PreparedSelect {
+    /// The plan of a statement the planner reads by a scan of `table`, as
+    /// EXPLAIN shows it; None when the table chooses how it reads
+    pub(crate) fn explain(&self, stmt: &SelectStatement, table: &str) -> Option<Vec<String>> {
+        let pushed = self.where_.pushdown.as_ref();
+        let mut access = self.where_.scan.as_ref()?.explain(table, pushed);
+        let ordered = self
+            .ordered
+            .filter(|_| stmt.limit.is_some())
+            .zip(Executor::ordered_read_column(stmt));
+        let sort = match ordered {
+            Some((read, (column, ascending, _))) => {
+                access = vec![read.explain(table, (column, ascending), pushed)];
+                None
+            }
+            None => (!stmt.order_by.is_empty()).then(|| {
+                let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
+                keys.join(", ")
+            }),
+        };
+        let filter = self.where_.conjuncts > self.where_.pushed;
+        let names = &self.output_columns[..self.visible];
+        let limit = stmt.limit.as_deref().map(Expression::to_string);
+        let offset = stmt
+            .offset
+            .as_deref()
+            .filter(|offset| !matches!(offset, Expression::IntegerLiteral(lit) if lit.value == 0))
+            .map(Expression::to_string);
+        Some(explain_steps(limit, offset, names, sort, filter, access))
+    }
+
+    /// The plan's inputs, for a statement that asks no block and computes no
+    /// sort or DISTINCT ON key
+    pub(crate) fn plan_inputs(&self) -> Option<PlanInputs> {
+        if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() {
+            return None;
+        }
+        Some(PlanInputs {
+            point: self.where_.point.clone(),
+            items: self.output_items()?,
+            names: self.output_columns.clone(),
+        })
+    }
+
+    /// Whether a run asks a block: a subquery, a run slot or a read ahead
+    fn asks_blocks(&self) -> bool {
+        !self.blocks.subqueries.is_empty()
+            || !self.blocks.run_slots.is_empty()
+            || !self.ahead.is_empty()
+    }
+
+    /// The output as items of the shared projection, for a statement that
+    /// asks no block and computes no sort or DISTINCT ON key
+    fn output_items(&self) -> Option<Vec<Item>> {
+        if self.asks_blocks() {
+            return None;
+        }
+        let items = self
+            .projection
+            .outputs
+            .iter()
+            .map(|output| match output {
+                Output::Column(index) => Some(Item::Column(*index)),
+                Output::Program(computed) => Some(computed.item.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (items.len() == self.visible).then_some(items)
+    }
 }
 
 /// A subquery over one table, prepared as its own scope: every value it
@@ -3690,8 +3812,8 @@ struct KeyedPlan {
 
 /// `column operator value` with the column resolved at preparation; only
 /// the value is bound per call
-#[derive(Debug)]
-struct PreparedComparison {
+#[derive(Debug, Clone)]
+pub struct PreparedComparison {
     column: SmartString,
     index: usize,
     data_type: DataType,
@@ -3699,7 +3821,7 @@ struct PreparedComparison {
     value: PreparedValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PreparedValue {
     Const(Value),
     /// A parameter or a slot, zero-based
@@ -3739,9 +3861,38 @@ impl PreparedComparison {
         None
     }
 
+    /// Whether it is `column = value` on the column at `index`
+    pub(crate) fn equates(&self, index: usize) -> bool {
+        self.index == index && self.operator == Operator::Eq
+    }
+
+    /// The integer this call compares against, by [`Self::value`]'s rule;
+    /// an integer is read as it is
+    pub(crate) fn integer(&self, params: &[Value]) -> Option<i64> {
+        let value = match &self.value {
+            PreparedValue::Const(value) => value,
+            PreparedValue::Slot(slot) => params.get(*slot)?,
+        };
+        match value {
+            Value::Integer(key) => Some(*key),
+            _ => match self.value(params)? {
+                Value::Integer(key) => Some(key),
+                _ => None,
+            },
+        }
+    }
+
+    /// The comparison as EXPLAIN shows it
+    pub(crate) fn describe(&self) -> String {
+        match &self.value {
+            PreparedValue::Const(value) => format!("{} = {value}", self.column),
+            PreparedValue::Slot(slot) => format!("{} = ${}", self.column, slot + 1),
+        }
+    }
+
     /// The value this call compares against, as the scan reads it, or
     /// None when the scan cannot read it by the comparison's own rule
-    fn value(&self, params: &[Value]) -> Option<Value> {
+    pub(crate) fn value(&self, params: &[Value]) -> Option<Value> {
         let value = match &self.value {
             PreparedValue::Const(value) => value.clone(),
             PreparedValue::Slot(slot) => params.get(*slot)?.clone(),
@@ -3750,12 +3901,84 @@ impl PreparedComparison {
     }
 
     /// Whether the value compared with is NULL, which equals no row
-    fn compares_null(&self, params: &[Value]) -> bool {
+    pub(crate) fn compares_null(&self, params: &[Value]) -> bool {
         match &self.value {
             PreparedValue::Const(value) => value.is_null(),
             PreparedValue::Slot(slot) => params.get(*slot).is_some_and(Value::is_null),
         }
     }
+}
+
+/// The rows the members of `filter`'s IN list name, read by the members:
+/// on the primary key, up to `target` when the list is the whole filter;
+/// on another column, under no LIMIT, by the candidates of a table that
+/// keeps rows outside its index. None when no list is read so
+fn member_rows(
+    table: &dyn Table,
+    filter: Option<&dyn StorageExpr>,
+    limited: bool,
+    target: Option<usize>,
+) -> Result<Option<RowVec>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let schema = table.schema();
+    let mut scope = SmallVec::new();
+    index_plan::conjuncts(filter, schema, &mut scope);
+    let Some((list, column)) = scope.iter().find_map(|c| {
+        let list = c.as_any().downcast_ref::<InListExpr>()?;
+        (!list.is_not()).then_some((list, list.get_column_name()?))
+    }) else {
+        return Ok(None);
+    };
+    let pk = schema.pk_column_index().map(|pk| &schema.columns[pk]);
+    match pk.filter(|pk| pk.name.eq_ignore_ascii_case(column)) {
+        Some(pk) => Executor::rows_of_members(
+            table,
+            &pk.name_lower,
+            list.get_values().iter(),
+            target.is_some(),
+            target.filter(|_| scope.len() == 1),
+        ),
+        None if !limited && Executor::in_members_eligible(table, column) => {
+            Executor::in_member_rows(
+                table,
+                column,
+                list.get_values().to_vec(),
+                || Ok(None),
+                false,
+            )
+        }
+        None => Ok(None),
+    }
+}
+
+/// The first primary key `filter`'s lower bounds on the key let through,
+/// Some(None) when none can pass; None when a conjunct is another
+/// comparison or bounds by a value that is not an integer
+fn keyset_start(schema: &Schema, filter: Option<&dyn StorageExpr>) -> Option<Option<i64>> {
+    let pk = &schema.columns[schema.pk_column_index()?];
+    let mut scope = SmallVec::new();
+    index_plan::conjuncts(filter?, schema, &mut scope);
+    let mut start = i64::MIN;
+    for conjunct in scope {
+        let (column, operator, Value::Integer(bound)) = conjunct.get_comparison_info()? else {
+            return None;
+        };
+        if !column.eq_ignore_ascii_case(&pk.name) {
+            return None;
+        }
+        let first = match operator {
+            Operator::Gte => *bound,
+            Operator::Gt => match bound.checked_add(1) {
+                Some(first) => first,
+                None => return Some(None),
+            },
+            _ => return None,
+        };
+        start = start.max(first);
+    }
+    Some(Some(start))
 }
 
 /// A statement's pushed conjuncts as comparisons, in the AND tree that
@@ -3934,6 +4157,9 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
+    /// The run slots of values a WHERE tests a column against, whose error
+    /// a run raises only where a row reads the slot
+    where_slots: Vec<usize>,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -4056,6 +4282,7 @@ impl Builder<'_> {
             param_count,
             slot_count: self.next_slot,
             run_slots,
+            where_slots: self.where_slots,
             subqueries,
         };
         Ok((blocks, holes))
@@ -5926,11 +6153,52 @@ impl PreparedProjection {
         let mut vm = ExprVM::new();
         let mut bound = self.unbound();
         // Each row's output takes its place
+        if let Some(shared) = self.shared(run, &mut bound, None) {
+            for (row_id, (id, row)) in rows.iter_mut().enumerate() {
+                let mut out = Row::with_capacity(shared.width());
+                let exec = run.exec_over(row, &run.base);
+                shared.project_into(&mut vm, &exec, &mut out)?;
+                *row = out;
+                *id = row_id as i64;
+            }
+            return Ok(rows);
+        }
         for (row_id, (id, row)) in rows.iter_mut().enumerate() {
             *row = self.project_row::<false>(&mut vm, row, run, &[], &mut bound)?;
             *id = row_id as i64;
         }
         Ok(rows)
+    }
+
+    /// The outputs as the shared projection's items, bound to `run`, when
+    /// each reads only its row and the run asks no block; an output `read`
+    /// does not hold is NULL
+    fn shared(
+        &self,
+        run: &PreparedRunner<'_>,
+        bound: &mut OutputsBound,
+        read: Option<&[usize]>,
+    ) -> Option<Projection> {
+        if self.alias_keys
+            || !run.prepared.subqueries.is_empty()
+            || !run.prepared.run_slots.is_empty()
+        {
+            return None;
+        }
+        let mut items = Vec::with_capacity(self.outputs.len());
+        for (position, output) in self.outputs.iter().enumerate() {
+            items.push(match output {
+                Output::Column(index) => Item::Column(*index),
+                Output::Program(_) if read.is_some_and(|read| !read.contains(&position)) => {
+                    Item::Constant(Value::null_unknown())
+                }
+                Output::Program(computed) | Output::Key(computed) => {
+                    Self::output_item(run, bound, computed).clone()
+                }
+                _ => return None,
+            });
+        }
+        Some(Projection::of(items))
     }
 
     /// Whether a SELECT item is computed, which the sort can leave for later
@@ -5958,7 +6226,7 @@ impl PreparedProjection {
     /// are asked of the rows returned
     fn project_first(
         &self,
-        mut rows: RowVec,
+        mut rows: SortInput<'_>,
         run: &PreparedRunner<'_>,
         order: Vec<(Option<usize>, bool, Option<bool>)>,
         limit: Option<usize>,
@@ -5976,16 +6244,27 @@ impl PreparedProjection {
         }
         let width = self.outputs.len();
         let mut vm = ExprVM::new();
-        let mut sources = Vec::with_capacity(rows.len());
         let mut top = super::result::TopN::new(
             move |a: &Row, b: &Row| Executor::compare_rows_with_indices(a, b, &order),
             limit.unwrap_or(usize::MAX),
             offset,
         );
+        // A scanned row is kept only while the sort keeps its output
+        let mut scanned: FxHashMap<i64, Row> = FxHashMap::default();
         // The storage of a row the sort does not keep holds the next row's keys
         let mut spare: Vec<Value> = Vec::new();
         let mut bound = self.unbound();
-        for (i, row) in rows.drain_rows().enumerate() {
+        // An item the sort does not read is left NULL
+        let shared = self.shared(run, &mut bound, Some(&read));
+        // Every output computed first: the sorted rows are the output, no
+        // source is looked up again, and no row carries its place
+        let whole = shared.is_some()
+            && !self.outputs.iter().enumerate().any(|(position, output)| {
+                matches!(output, Output::Program(_)) && !read.contains(&position)
+            });
+        let mut i = 0i64;
+        let copies = !whole && matches!(rows, SortInput::Scan(..));
+        run.each_row(&mut rows, &mut |row| {
             let values = match spare.capacity() {
                 0 => Vec::with_capacity(width + 1),
                 _ => {
@@ -5993,23 +6272,53 @@ impl PreparedProjection {
                     std::mem::take(&mut spare)
                 }
             };
-            let mut out =
-                self.project_into::<true>(&mut vm, &row, run, &read, &mut bound, values)?;
-            // The row's place among the sources, past the outputs
-            out.set(width, Value::Integer(i as i64))?;
-            sources.push(row);
+            // The row's place among the sources follows the outputs
+            let out = match &shared {
+                Some(shared) => {
+                    let mut out = Row::from_values(values);
+                    let exec = run.exec_over(row, &run.base);
+                    shared.project_into(&mut vm, &exec, &mut out)?;
+                    if !whole {
+                        out.values_mut().push(Value::Integer(i));
+                    }
+                    out
+                }
+                None => {
+                    self.project_into::<true>(&mut vm, row, run, &read, &mut bound, values, i)?
+                }
+            };
+            i += 1;
+            if !top.admits(&out) {
+                spare = out.into_values();
+                return Ok(());
+            }
+            if copies {
+                scanned.insert(i - 1, row.clone());
+            }
             if let Some(dropped) = top.push(out) {
+                if let Some(Value::Integer(place)) = dropped.get(width) {
+                    scanned.remove(place);
+                }
                 spare = dropped.into_values();
             }
+            Ok(())
+        })?;
+        if whole {
+            return Ok(top.into_row_vec());
         }
         let mut kept = RowVec::new();
         for mut out in top.into_rows() {
             let Some(Value::Integer(i)) = out.get(width).cloned() else {
                 return Err(Error::internal("a sorted row lost its source"));
             };
-            let row = &sources[i as usize];
-            let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
-                .with_subquery_executor(run);
+            let row = match &rows {
+                SortInput::Rows(rows) => rows.get(i as usize).map(|(_, row)| row),
+                SortInput::Scan(..) => scanned.get(&i),
+            };
+            let Some(row) = row else {
+                return Err(Error::internal("a sorted row lost its source"));
+            };
+            let exec = run.exec_over(row, &run.base).with_subquery_executor(run);
             for (position, output) in self.outputs.iter().enumerate() {
                 if let Output::Program(computed) | Output::Block(computed) = output {
                     if !read.contains(&position) {
@@ -6037,12 +6346,14 @@ impl PreparedProjection {
         bound: &mut OutputsBound,
     ) -> Result<Row> {
         let values = Vec::with_capacity(self.outputs.len() + usize::from(FIRST));
-        self.project_into::<FIRST>(vm, row, run, read, bound, values)
+        self.project_into::<FIRST>(vm, row, run, read, bound, values, 0)
     }
 
     /// [`Self::project_row`] built in `values`, an empty buffer whose room
-    /// a caller may keep across rows
+    /// a caller may keep across rows; in the `FIRST` phase `place` is the
+    /// row's place
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn project_into<const FIRST: bool>(
         &self,
         vm: &mut ExprVM,
@@ -6051,9 +6362,9 @@ impl PreparedProjection {
         read: &[usize],
         bound: &mut OutputsBound,
         mut values: Vec<Value>,
+        place: i64,
     ) -> Result<Row> {
-        let exec = ExecuteContext::with_common_params(row, &run.base, run.transaction_id)
-            .with_subquery_executor(run);
+        let exec = run.exec_over(row, &run.base).with_subquery_executor(run);
         for (position, output) in self.outputs.iter().enumerate() {
             let value = match output {
                 Output::Column(i) => row.get(*i).cloned().unwrap_or_else(Value::null_unknown),
@@ -6072,7 +6383,7 @@ impl PreparedProjection {
             values.push(value);
         }
         if FIRST {
-            values.push(Value::null_unknown());
+            values.push(Value::Integer(place));
         }
         let mut out = Row::from_values(values);
         if !self.alias_keys {
@@ -6080,8 +6391,7 @@ impl PreparedProjection {
         }
         for (position, output) in self.outputs.iter().enumerate() {
             if let Output::AliasKey(computed, _) = output {
-                let mut exec =
-                    ExecuteContext::with_common_params(row, &run.base, run.transaction_id);
+                let mut exec = run.exec_over(row, &run.base);
                 exec.row2 = Some(&out);
                 let key = vm.execute(Self::bound_program(run, bound, computed), &exec)?;
                 out.set(position, key)?;
@@ -6171,7 +6481,7 @@ type OutputsBound = SmallVec<[Option<BoundOutput>; 4]>;
 impl PreparedSelect {
     /// Prepare `stmt` over its table, named `scope_name` and holding
     /// `columns`, for executions with `param_count` positional parameters
-    fn prepare(
+    pub(super) fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
         stmt: &SelectStatement,
@@ -6191,6 +6501,7 @@ impl PreparedSelect {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            where_slots: Vec::new(),
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -6206,6 +6517,7 @@ impl PreparedSelect {
                 scanned: None,
                 narrowed: Vec::new(),
                 set_tests: Vec::new(),
+                point: None,
                 conjuncts: 0,
             },
         };
@@ -6314,7 +6626,32 @@ impl PreparedSelect {
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
         });
-        let where_ = parts.prepare(where_programs, &blocks, schema);
+        let mut where_ = parts.prepare(where_programs, &blocks, schema);
+        let mut ordered = None;
+        if where_.sets.is_empty() && where_.narrowing.is_none() {
+            if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
+                if blocks.subqueries.is_empty() {
+                    where_.scan = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
+                    where_.needed = needed_columns(
+                        stmt,
+                        stmt.where_clause.as_deref(),
+                        &schema.column_names_lower_arc(),
+                    );
+                }
+                ordered = Executor::ordered_read_column(stmt)
+                    .filter(|(column, ..)| stmt.limit.is_some() && schema.has_column(column))
+                    .and_then(|(column, ascending, _)| {
+                        ordered_read(
+                            &store,
+                            schema,
+                            (column, ascending),
+                            where_.pushdown.as_ref(),
+                            where_.pushed == where_.conjuncts,
+                            stmt.offset.is_some(),
+                        )
+                    });
+            }
+        }
         Ok(Self {
             validity: executor.select_validity(stmt, epoch),
             cte_scope: ctx.cte_scope(),
@@ -6327,6 +6664,11 @@ impl PreparedSelect {
             output_columns: CompactArc::new(output_columns),
             visible,
             layout,
+            ordered,
+            constant_where: stmt
+                .where_clause
+                .as_deref()
+                .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w)),
         })
     }
 }
@@ -6354,13 +6696,6 @@ pub struct PreparedGrouped {
     where_: Option<PreparedWhere>,
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
-    /// An argument read once for its call holds a run slot, which the
-    /// statement's parameters then carry beside the blocks'
-    pub(crate) reads_slots: bool,
-    /// Every subquery is a run slot: the statement runs as any grouped
-    /// statement does, reading them as parameters, under this plan of its
-    /// own over a table, and groups another source's rows so
-    pub(crate) runs_alone: Option<NestedPlan>,
 }
 
 /// What a grouped statement's rows come from, which says what its blocks run
@@ -6478,7 +6813,6 @@ impl PreparedGrouped {
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
-        let written = stmt;
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -6488,6 +6822,7 @@ impl PreparedGrouped {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: true,
+            where_slots: Vec::new(),
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -6779,11 +7114,6 @@ impl PreparedGrouped {
                 ..stmt
             },
         };
-        let runs_alone = (!stmt.columns.iter().any(|c| mentions_subquery(unaliased(c)))
-            && !stmt.having.as_deref().is_some_and(mentions_subquery)
-            && !grouping_items(&stmt).into_iter().any(mentions_subquery)
-            && !stmt.where_clause.as_deref().is_some_and(mentions_subquery))
-        .then(NestedPlan::default);
         // An argument read once for its call holds only run slots: one reading
         // the row is the general path's to refuse
         // The ORDER BY keys a hidden item computes count with the list
@@ -6806,16 +7136,20 @@ impl PreparedGrouped {
             holes: HoleSet { holes },
             ahead,
             where_,
-            reads_slots: constants(written, &mentions_subquery),
             classification: super::query_classification::get_classification(&stmt),
             stmt,
-            runs_alone,
         }))
     }
 
     /// Whether the table's rows pass a WHERE holding subqueries before they group
     pub(crate) fn reads_through_where(&self) -> bool {
         self.where_.is_some()
+    }
+
+    /// Whether the statement reads run slots, which its parameters then
+    /// carry beside the blocks'
+    pub(crate) fn reads_run_slots(&self) -> bool {
+        !self.blocks.run_slots.is_empty()
     }
 
     /// The columns of table `name` and each of its rows the WHERE passes,
@@ -6837,7 +7171,7 @@ impl PreparedGrouped {
             rows.push((id, row));
             true
         };
-        match run.passing_rows(where_, None, table.as_ref(), ctx, None, false, keep)? {
+        match run.passing_rows(where_, None, table.as_ref(), ctx, None, Take::Kept, keep)? {
             Passing::Pruned | Passing::Read => Ok((table.schema().column_names_arc(), rows)),
             Passing::Answers(_) | Passing::Scan(_) | Passing::Filtered(..) => Err(Error::internal(
                 "a grouped statement read the scan's answers",
@@ -7034,9 +7368,7 @@ impl Executor {
             None,
             None,
         );
-        for (slot, value) in runner.run_slot_values()? {
-            runner.base[slot] = value;
-        }
+        runner.fill_run_slots()?;
         runner.read_ahead(&held.ahead, &held.holes)?;
         Ok(Some(runner))
     }
@@ -7167,6 +7499,7 @@ impl PreparedDml {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            where_slots: Vec::new(),
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -7550,6 +7883,7 @@ impl JoinBlocks {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            where_slots: Vec::new(),
         };
         // A side read as rows keeps the conditions its read asks: those
         // without a block, which the read takes, and those whose blocks bind
@@ -7901,9 +8235,7 @@ impl Executor {
         };
         let mut runner =
             PreparedRunner::new(self, blocks, holes, ctx, inner_ctx, tables, None, None);
-        for (slot, value) in runner.run_slot_values()? {
-            runner.base[slot] = value;
-        }
+        runner.fill_run_slots()?;
         runner.read_ahead(&held.ahead, holes)?;
         Ok(Some(runner))
     }
@@ -7971,7 +8303,10 @@ impl Executor {
         let mut kept = SideKeep::new(filter.as_ref(), offset, limit);
         if limit != Some(0) {
             let mut keep = |id: i64, _: u64, row: Row| kept.keep(id, row);
-            let stream = limit.is_none() && offset == 0;
+            let stream = match limit.is_none() && offset == 0 && run.failed_slots.is_none() {
+                true => Take::Stream,
+                false => Take::Kept,
+            };
             // The scan's own answers stop at the rows wanted, which the extra
             // conditions would thin after the count
             let target = limit
@@ -8159,9 +8494,7 @@ impl<'a> DmlRunner<'a> {
             Some(rows),
             None,
         );
-        for (slot, value) in runner.run_slot_values()? {
-            runner.base[slot] = value;
-        }
+        runner.fill_run_slots()?;
         Ok(Self { runner, prepared })
     }
 
@@ -8178,7 +8511,8 @@ impl<'a> DmlRunner<'a> {
     /// What the statement's programs read for `row`: its parameters, its
     /// run slots and its blocks
     pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
-        ExecuteContext::with_common_params(row, &self.runner.base, self.runner.transaction_id)
+        self.runner
+            .exec_over(row, &self.runner.base)
             .with_subquery_executor(&self.runner)
     }
 
@@ -8240,7 +8574,7 @@ impl<'a> DmlRunner<'a> {
         };
         match self
             .runner
-            .passing_rows(where_, None, table, ctx, None, false, &mut each)?
+            .passing_rows(where_, None, table, ctx, None, Take::Kept, &mut each)?
         {
             Passing::Pruned | Passing::Read => Ok(()),
             Passing::Answers(_) | Passing::Scan(_) | Passing::Filtered(..) => Err(Error::internal(
@@ -8470,7 +8804,7 @@ impl Builder<'_> {
         let mut pushed = Vec::new();
         let mut set_tests = Vec::new();
         for (at, part) in parts.into_iter().enumerate() {
-            let part = self.statement_conjunct(chain, part, work, run_slots)?;
+            let part = self.statement_conjunct(chain, part, false, work, run_slots)?;
             let scanned =
                 !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema);
             if scanned {
@@ -8524,12 +8858,21 @@ impl Builder<'_> {
                 (rest(&|i, _| i != at), scanned)
             })
             .collect();
+        let point = match schema.primary_key_indices() {
+            [pk] => rewritten.iter().enumerate().find_map(|(at, (part, _))| {
+                let key = PreparedComparison::from_conjunct(part, schema)
+                    .filter(|key| key.equates(*pk))?;
+                Some((key, (conjuncts > 1).then(|| rest(&|i, _| i != at))))
+            }),
+            _ => None,
+        };
         Ok(WhereParts {
             clause,
             pushed,
             scanned,
             narrowed,
             set_tests,
+            point,
             conjuncts,
         })
     }
@@ -8554,46 +8897,103 @@ impl Builder<'_> {
         );
         let binds = parts.map(|parts| !asks_per_row(&parts.clause, &self.subqueries));
         self.next_slot = next_slot;
+        self.where_slots.retain(|slot| *slot < next_slot);
         self.subqueries.truncate(blocks);
         binds
     }
 
-    /// A top-level conjunct of the statement's WHERE. The value a column
-    /// is compared with becomes a run slot when it reads no row, so the
-    /// scan can take the comparison; it may read uncorrelated subqueries
+    /// A top-level conjunct of the statement's WHERE, or with `nested` a
+    /// test under one. The value a column is compared with becomes a run
+    /// slot when it reads no row, so the scan can take the comparison; at
+    /// the top it may read uncorrelated subqueries
     fn statement_conjunct(
         &mut self,
         chain: &Chain<'_>,
         conjunct: &Expression,
+        nested: bool,
         work: &mut Rewritten,
         run_slots: &mut Vec<(usize, Expression)>,
     ) -> Result<Expression> {
-        let Expression::Infix(infix) = conjunct else {
-            return self.rewrite(chain, None, conjunct, work);
+        let is_column = |expr: &Expression| -> Result<bool> {
+            Ok(matches!(chain.resolve(expr)?, Some((0, _))))
         };
-        if !is_comparison(infix.op_type) {
-            return self.rewrite(chain, None, conjunct, work);
-        }
-        let column_left = matches!(chain.resolve(&infix.left)?, Some((0, _)));
-        let column_right = matches!(chain.resolve(&infix.right)?, Some((0, _)));
+        let infix = match conjunct {
+            // The tests under an OR, and the conjunctions under it, take
+            // their values as a top-level test does
+            Expression::Infix(infix)
+                if matches!(infix.op_type, InfixOperator::And | InfixOperator::Or) =>
+            {
+                let left = self.statement_conjunct(chain, &infix.left, true, work, run_slots)?;
+                let right = self.statement_conjunct(chain, &infix.right, true, work, run_slots)?;
+                return Ok(Expression::Infix(InfixExpression {
+                    token: infix.token.clone(),
+                    left: Box::new(left),
+                    operator: infix.operator.clone(),
+                    op_type: infix.op_type,
+                    right: Box::new(right),
+                }));
+            }
+            Expression::Infix(infix) if is_comparison(infix.op_type) => infix,
+            // A list's members and a range's bounds are values as a
+            // comparison's is
+            Expression::In(list) if !list.not && is_column(&list.left)? => {
+                let members = match list.right.as_ref() {
+                    Expression::List(l) => &l.elements,
+                    Expression::ExpressionList(l) => &l.expressions,
+                    _ => return self.rewrite(chain, None, conjunct, work),
+                };
+                let mut values = Vec::with_capacity(members.len());
+                for member in members {
+                    values.push(self.conjunct_value(chain, member, nested, work, run_slots)?);
+                }
+                let right = match list.right.as_ref() {
+                    Expression::List(l) => Expression::List(Box::new(ListExpression {
+                        token: l.token.clone(),
+                        elements: values,
+                    })),
+                    _ => Expression::ExpressionList(Box::new(ExpressionList {
+                        token: list.token.clone(),
+                        expressions: values,
+                    })),
+                };
+                return Ok(Expression::In(InExpression {
+                    token: list.token.clone(),
+                    left: Box::new(self.rewrite(chain, None, &list.left, work)?),
+                    right: Box::new(right),
+                    not: false,
+                }));
+            }
+            Expression::Between(between) if is_column(&between.expr)? => {
+                return Ok(Expression::Between(BetweenExpression {
+                    token: between.token.clone(),
+                    expr: Box::new(self.rewrite(chain, None, &between.expr, work)?),
+                    lower: Box::new(self.conjunct_value(
+                        chain,
+                        &between.lower,
+                        nested,
+                        work,
+                        run_slots,
+                    )?),
+                    upper: Box::new(self.conjunct_value(
+                        chain,
+                        &between.upper,
+                        nested,
+                        work,
+                        run_slots,
+                    )?),
+                    not: between.not,
+                }));
+            }
+            _ => return self.rewrite(chain, None, conjunct, work),
+        };
+        let column_left = is_column(&infix.left)?;
+        let column_right = is_column(&infix.right)?;
         let value = match (column_left, column_right) {
             (true, false) => &infix.right,
             (false, true) => &infix.left,
             _ => return self.rewrite(chain, None, conjunct, work),
         };
-        let mut value_work = Rewritten::default();
-        let rewritten_value = self.rewrite(chain, None, value, &mut value_work)?;
-        let value = if !value_work.reads_row
-            && !is_leaf(value)
-            && !volatile(value, &self.executor.function_registry)
-        {
-            let slot = self.slot();
-            run_slots.push((slot, rewritten_value));
-            slot_parameter(slot)
-        } else {
-            work.reads_row |= value_work.reads_row;
-            rewritten_value
-        };
+        let value = self.conjunct_value(chain, value, nested, work, run_slots)?;
         let column = if column_left {
             &infix.left
         } else {
@@ -8612,6 +9012,35 @@ impl Builder<'_> {
             op_type: infix.op_type,
             right: Box::new(right),
         }))
+    }
+
+    /// A value a conjunct tests its column against, rewritten: one that
+    /// reads no row, is more than a literal and is not volatile is a run
+    /// slot, computed once per run so the scan can take it, its error raised
+    /// where a row reads it. A `nested` value's block stays in the row's
+    /// program, run only for a row that needs it
+    fn conjunct_value(
+        &mut self,
+        chain: &Chain<'_>,
+        value: &Expression,
+        nested: bool,
+        work: &mut Rewritten,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<Expression> {
+        let mut value_work = Rewritten::default();
+        let rewritten = self.rewrite(chain, None, value, &mut value_work)?;
+        if !value_work.reads_row
+            && !is_leaf(value)
+            && !volatile(value, &self.executor.function_registry)
+            && !(nested && mentions_subquery(value))
+        {
+            let slot = self.slot();
+            self.where_slots.push(slot);
+            run_slots.push((slot, rewritten));
+            return Ok(slot_parameter(slot));
+        }
+        work.reads_row |= value_work.reads_row;
+        Ok(rewritten)
     }
 }
 
@@ -8718,7 +9147,7 @@ impl Executor {
     /// `name` as this statement reads it: through `through`, the statement's
     /// own transaction, else the explicit transaction, else the statement's
     /// snapshot, each at the statement's view
-    fn prepared_table(
+    pub(crate) fn prepared_table(
         &self,
         name: &str,
         ctx: &ExecutionContext,
@@ -9136,6 +9565,7 @@ impl Executor {
                     &[],
                     &mut outputs,
                     values,
+                    0,
                 )?;
                 if !distinct.is_new(&out) {
                     values = out.into_values();
@@ -9241,10 +9671,7 @@ impl Executor {
             statement_limit,
         );
         if !prepared.blocks.run_slots.is_empty() {
-            let values = runner.run_slot_values()?;
-            for (slot, value) in values {
-                runner.base[slot] = value;
-            }
+            runner.fill_run_slots()?;
         }
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
         let output_columns = CompactArc::clone(&prepared.output_columns);
@@ -9260,22 +9687,37 @@ impl Executor {
             rows.push((scanned as i64, row));
             target.is_none_or(|target| rows.len() < target)
         };
+        // A WHERE that keeps no row reads no row
+        let keeps_none = prepared.constant_where
+            && ctx.outer_row().is_none()
+            && stmt
+                .where_clause
+                .as_deref()
+                .is_some_and(|w| true_for_no_row(w, ctx));
         // An ORDER BY of one column under a LIMIT reads the rows it keeps in
-        // order, through the column's index or the table's top-k scan
-        let ordered = match (&source, limit) {
-            (StatementSource::Table(table), Some(limit)) => match Self::ordered_read_column(stmt) {
-                Some(key) => {
-                    runner.ordered_rows(&prepared.where_, &**table, ctx, key, limit, offset)?
+        // order, as the plan chose
+        let ordered = match (&source, limit, prepared.ordered) {
+            _ if keeps_none => None,
+            (StatementSource::Table(table), Some(limit), Some(read)) => {
+                match Self::ordered_read_column(stmt) {
+                    Some(key) => runner.ordered_rows(
+                        &prepared.where_,
+                        read,
+                        &**table,
+                        ctx,
+                        key,
+                        limit,
+                        offset,
+                    )?,
+                    None => None,
                 }
-                None => None,
-            },
+            }
             _ => None,
         };
         let read_in_order = ordered.is_some();
         if read_in_order {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_ordered_read();
-            super::result::OrderLimitPath::PreparedOrderedRead.taken();
         }
         // A DISTINCT whose output asks no block keeps the first row of each
         // value as the scan passes it; one that does is told its rows first.
@@ -9298,15 +9740,67 @@ impl Executor {
         .then(|| DistinctRows::new(prepared.visible));
         // Rows nothing sorts, counts or merges, whose output is the row or
         // columns of it, reach the caller as the scan reads them, which checks
-        // the cancel; a timed read is collected, so its deadline holds while it reads
+        // the cancel; a timed read is collected, so its deadline holds while it
+        // reads, and so is a run whose failed slot only the runner raises
         let projection = &prepared.projection;
-        let flows = !ctx.has_timeout()
+        let flowing = !ctx.has_timeout()
+            && runner.failed_slots.is_none()
             && distinct.is_none()
             && stmt.order_by.is_empty()
             && limit.is_none()
-            && offset == 0
-            && (projection.whole_row || projection.columns.is_some());
+            && offset == 0;
+        // Computed items that ask no block flow through the shared projection
+        let items = (flowing && !projection.whole_row && projection.columns.is_none())
+            .then(|| prepared.output_items())
+            .flatten();
+        let flows =
+            flowing && (projection.whole_row || projection.columns.is_some() || items.is_some());
+        // With an ORDER BY a SELECT item is computed for the rows LIMIT and
+        // OFFSET keep, once the sort chose them by the columns the general
+        // sort reads
+        let order = (!read_in_order
+            && !stmt.order_by.is_empty()
+            && (limit.is_some() || projection.defers() && offset > 0))
+            .then(|| {
+                let layout = prepared.layout.as_deref();
+                let (mapped, _) = self.order_by_columns(stmt, &output_columns, layout, false);
+                mapped
+                    .into_iter()
+                    .zip(&stmt.order_by)
+                    .map(|(column, ob)| column.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten();
+        // Keys that are source columns choose the rows before any is projected
+        let source_column =
+            |column: Option<usize>| column.and_then(|c| projection.source_column(c));
+        let source_order = limit
+            .and(order.as_ref())
+            .filter(|order| {
+                order
+                    .iter()
+                    .all(|&(column, ..)| source_column(column).is_some())
+            })
+            .map(|order| {
+                order
+                    .iter()
+                    .map(|&(column, ascending, nulls_first)| {
+                        (source_column(column), ascending, nulls_first)
+                    })
+                    .collect::<Vec<_>>()
+            });
+        // A sort cut by a LIMIT over rows asking no block takes the scan's
+        // rows as they come, copying only the ones it keeps
+        let sorts =
+            order.is_some() && limit.is_some() && distinct.is_none() && !prepared.asks_blocks();
+        // A whole sort reads every row the WHERE passes at once
+        let sorts_all = !sorts
+            && !read_in_order
+            && !stmt.order_by.is_empty()
+            && distinct.is_none()
+            && !prepared.asks_blocks();
         let read = match (ordered, source) {
+            _ if keeps_none => Ok(Passing::Pruned),
             (Some(rows), _) => Ok(Passing::Answers(rows)),
             (None, StatementSource::Table(table)) => runner.passing_rows(
                 &prepared.where_,
@@ -9314,7 +9808,11 @@ impl Executor {
                 &*table,
                 ctx,
                 target,
-                distinct.is_some() || flows,
+                match (sorts || sorts_all, distinct.is_some() || flows) {
+                    (true, _) => Take::Collected,
+                    (false, true) => Take::Stream,
+                    (false, false) => Take::Kept,
+                },
                 &mut keep,
             ),
             (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
@@ -9372,6 +9870,11 @@ impl Executor {
                         Projection::columns(columns.iter().copied()),
                         output_columns.to_vec(),
                     ));
+                } else if let Some(items) = items {
+                    rows = Box::new(
+                        ProjectionResult::new(rows, Projection::of(items), output_columns.to_vec())
+                            .with_context(ctx),
+                    );
                 }
                 return Ok((
                     rows,
@@ -9400,6 +9903,7 @@ impl Executor {
                 true,
             ))
         };
+        let mut scanned = None;
         let mut rows = match read? {
             Passing::Pruned => {
                 let result = ExecutorResult::with_arc_columns(
@@ -9417,8 +9921,16 @@ impl Executor {
             }
             Passing::Answers(answers) => answers,
             Passing::Read => kept.unwrap_or_else(|| RowVec::with_capacity(64)),
-            Passing::Scan(scan) => return streamed(scan, None),
+            Passing::Scan(scan) if sorts_all => runner.drain(scan, None)?,
+            Passing::Filtered(scan, bound) if sorts_all || sorts => {
+                runner.drain(scan, Some(bound))?
+            }
             Passing::Filtered(scan, bound) => return streamed(scan, Some(bound)),
+            Passing::Scan(scan) if !sorts => return streamed(scan, None),
+            Passing::Scan(scan) => {
+                scanned = Some(SortInput::Scan(scan));
+                RowVec::new()
+            }
         };
         // Without an ORDER BY the rows LIMIT and OFFSET keep are the ones the
         // output is computed for, whether or not the read stopped early
@@ -9428,39 +9940,11 @@ impl Executor {
             rows = rows.into_iter().skip(offset).take(keep).collect();
         }
         limit_applied |= read_in_order;
-        // With an ORDER BY a SELECT item is computed for the rows LIMIT and
-        // OFFSET keep, once the sort chose them by the columns the general
-        // sort reads
-        let projection = &prepared.projection;
-        let order = (!read_in_order
-            && !stmt.order_by.is_empty()
-            && (limit.is_some() || projection.defers() && offset > 0))
-            .then(|| {
-                let layout = prepared.layout.as_deref();
-                let (mapped, _) = self.order_by_columns(stmt, &output_columns, layout, false);
-                mapped
-                    .into_iter()
-                    .zip(&stmt.order_by)
-                    .map(|(column, ob)| column.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
-                    .collect::<Option<Vec<_>>>()
-            })
-            .flatten();
-        // Keys that are source columns choose the rows before any is projected
-        let source = |column: Option<usize>| column.and_then(|c| projection.source_column(c));
-        let source_order = limit
-            .and(order.as_ref())
-            .filter(|order| order.iter().all(|&(column, ..)| source(column).is_some()))
-            .map(|order| {
-                order
-                    .iter()
-                    .map(|&(column, ascending, nulls_first)| {
-                        (source(column), ascending, nulls_first)
-                    })
-                    .collect::<Vec<_>>()
-            });
         if let (Some(source_order), Some(limit)) = (source_order, limit) {
             super::result::OrderLimitPath::PreparedTopRows.taken();
-            rows = top_rows(rows, source_order, limit, offset);
+            let input = scanned.take().unwrap_or(SortInput::Rows(&rows));
+            let top = top_rows(&runner, input, source_order, limit, offset)?;
+            rows = top;
             limit_applied = true;
         }
         #[cfg(feature = "test-failpoints")]
@@ -9471,10 +9955,12 @@ impl Executor {
             Some(order) => {
                 super::result::OrderLimitPath::PreparedProjectFirst.taken();
                 limit_applied = true;
-                projection.project_first(rows, &runner, order, limit, offset)?
+                let input = scanned.take().unwrap_or(SortInput::Rows(&rows));
+                projection.project_first(input, &runner, order, limit, offset)?
             }
             None => projection.project(rows, &runner)?,
         };
+        debug_assert!(scanned.is_none(), "a scan for the sort was not read");
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), rows);
         Ok((
             Box::new(result),
@@ -9487,23 +9973,34 @@ impl Executor {
     }
 }
 
+/// The rows a sort reads: collected, or a scan that took the whole WHERE
+enum SortInput<'a> {
+    Rows(&'a RowVec),
+    Scan(Box<dyn Scanner>),
+}
+
 /// The rows past `offset`, at most `limit`, in `order` over their own
-/// columns: the general sort's top-N, so ties keep the rows it keeps
+/// columns: the general sort's top-N, so ties keep the rows it keeps. A row
+/// is copied only when the sort keeps it
 fn top_rows(
-    rows: RowVec,
+    runner: &PreparedRunner<'_>,
+    mut rows: SortInput<'_>,
     order: Vec<(Option<usize>, bool, Option<bool>)>,
     limit: usize,
     offset: usize,
-) -> RowVec {
+) -> Result<RowVec> {
     let mut top = super::result::TopN::new(
         move |a: &Row, b: &Row| Executor::compare_rows_with_indices(a, b, &order),
         limit,
         offset,
     );
-    for (_, row) in rows {
-        top.push(row);
-    }
-    (0i64..).zip(top.into_rows()).collect()
+    runner.each_row(&mut rows, &mut |row| {
+        if top.admits(row) {
+            top.push(row.clone());
+        }
+        Ok(())
+    })?;
+    Ok((0i64..).zip(top.into_rows()).collect())
 }
 
 /// A row a source hands the runner: its own, or one it lends, copied only
@@ -9707,6 +10204,9 @@ pub(crate) struct PreparedRunner<'a> {
     statement_limit: Option<i64>,
     /// The statement's parameters, then its run slots; the other slots NULL
     base: ParamVec,
+    /// The WHERE's run slots whose value failed, NULL in `base`; boxed, as
+    /// a run seldom has one
+    failed_slots: Option<Box<FailedSlots>>,
     transaction_id: Option<u64>,
     /// The context the subqueries read their tables under
     ctx: ExecutionContext,
@@ -9921,6 +10421,7 @@ impl<'a> PreparedRunner<'a> {
                 })
                 .collect(),
             base,
+            failed_slots: None,
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
@@ -9932,7 +10433,7 @@ impl<'a> PreparedRunner<'a> {
     /// them for every row that asks later
     fn read_ahead(&self, ids: &[u16], holes: &HoleSet) -> Result<()> {
         let empty = Row::new();
-        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        let caller = self.exec_over(&empty, &self.base);
         for &id in ids {
             let width = self.prepared.subqueries[usize::from(id)].member_width();
             let nulls: SmallVec<[Value; 2]> = smallvec::smallvec![Value::null_unknown(); width];
@@ -9941,23 +10442,129 @@ impl<'a> PreparedRunner<'a> {
         Ok(())
     }
 
-    /// The statement's run slots, each computed once over no row
-    fn run_slot_values(&self) -> Result<Vec<(usize, Value)>> {
-        let empty = Row::new();
-        let mut vm = ExprVM::new();
-        let exec = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id)
-            .with_subquery_executor(self);
-        self.prepared
-            .run_slots
-            .iter()
-            .map(|(slot, program)| Ok((*slot, vm.execute(program, &exec)?)))
-            .collect()
+    /// The statement's run slots, each computed once over no row before the
+    /// rows. A WHERE slot's error is kept for a row that reads the slot; any
+    /// other's is the statement's
+    fn fill_run_slots(&mut self) -> Result<()> {
+        let mut computed: SmallVec<[(usize, Result<Value>); 4]> = SmallVec::new();
+        {
+            let empty = Row::new();
+            let mut vm = ExprVM::new();
+            let exec = self
+                .exec_over(&empty, &self.base)
+                .with_subquery_executor(self);
+            for (slot, program) in &self.prepared.run_slots {
+                let value = vm.execute(program, &exec);
+                let raised = value.is_err() && !self.prepared.where_slots.contains(slot);
+                computed.push((*slot, value));
+                if raised {
+                    break;
+                }
+            }
+        }
+        for (slot, value) in computed {
+            match value {
+                Ok(value) => self.base[slot] = value,
+                Err(e) if self.prepared.where_slots.contains(&slot) => {
+                    let e = deferred(e)?;
+                    self.failed_slots.get_or_insert_default().push((slot, e));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// The WHERE's run slots whose value failed in this run
+    fn slot_failures(&self) -> &[(usize, Error)] {
+        self.failed_slots.as_deref().map_or(&[], SmallVec::as_slice)
+    }
+
+    /// A context of this run over `row`, reading `params`: the statement's
+    /// or a block's, its slots numbered as the statement's
+    fn exec_over<'s>(&'s self, row: &'s Row, params: &'s [Value]) -> ExecuteContext<'s> {
+        ExecuteContext::with_common_params(row, params, self.transaction_id)
+            .with_failed(self.slot_failures())
     }
 
     /// Whether `row` passes `condition`, a program over the statement's row
+    /// The rows of `scan` that `bound` passes, the cancel checked every
+    /// hundred rows read; as many rows as the parallel filter takes are
+    /// judged on the thread pool, as the general path judges them
+    fn drain(&self, mut scan: Box<dyn Scanner>, bound: Option<SharedProgram>) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(scan.estimated_count().unwrap_or(64));
+        let mut read = 0u64;
+        while scan.next() {
+            read += 1;
+            if read.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            rows.push((scan.current_row_id(), scan.take_row()));
+        }
+        if let Some(err) = scan.err() {
+            return Err(err.clone());
+        }
+        let Some(bound) = bound else {
+            return Ok(rows);
+        };
+        // A filter on the pool reads no failed slot, so a run with one judges here
+        #[cfg(feature = "parallel")]
+        if self.failed_slots.is_none()
+            && super::parallel::ParallelConfig::default().should_parallel_filter(rows.len())
+        {
+            let mut filter = RowFilter::from_program(bound).with_context(&self.ctx);
+            // The values the run computed once sit past the statement's own
+            if self.base.len() > self.ctx.params().len() {
+                filter = filter.with_params(CompactArc::new(self.base.clone()));
+            }
+            return super::parallel::filter_in_parallel(rows, &filter);
+        }
+        let mut vm = ExprVM::new();
+        let mut failed = None;
+        // No row is judged after the first error
+        rows.retain(|(_, row)| {
+            failed.is_none()
+                && match self.matches(&mut vm, &bound, row) {
+                    Ok(keep) => keep,
+                    Err(e) => {
+                        failed = Some(e);
+                        false
+                    }
+                }
+        });
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(rows),
+        }
+    }
+
+    /// Hand `each` every row of `rows`, a scan's checking the cancel every
+    /// hundred rows read
+    fn each_row(
+        &self,
+        rows: &mut SortInput<'_>,
+        each: &mut dyn FnMut(&Row) -> Result<()>,
+    ) -> Result<()> {
+        let scan = match rows {
+            SortInput::Rows(rows) => return rows.iter().try_for_each(|(_, row)| each(row)),
+            SortInput::Scan(scan) => scan,
+        };
+        let mut read = 0u64;
+        while scan.next() {
+            read += 1;
+            if read.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            each(scan.row())?;
+        }
+        match scan.err() {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn matches(&self, vm: &mut ExprVM, condition: &SharedProgram, row: &Row) -> Result<bool> {
-        let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(row, &self.base).with_subquery_executor(self);
         vm.execute_bool_checked(condition, &exec)
     }
 
@@ -9965,8 +10572,7 @@ impl<'a> PreparedRunner<'a> {
     /// scan loop that builds the context costs a point query its codegen
     #[inline(never)]
     fn row_passes(&self, vm: &mut ExprVM, program: &WhereProgram, row: &Row) -> Result<bool> {
-        let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(row, &self.base).with_subquery_executor(self);
         self.passes(vm, program, &exec)
     }
 
@@ -10042,6 +10648,8 @@ impl<'a> PreparedRunner<'a> {
             crate::test_failpoints::where_pushdown_converted();
         }
         let (mut storage_expr, residual) = match (prepared, pushdown) {
+            // A failed slot holds NULL, which no scan may compare with
+            _ if self.failed_slots.is_some() => (None, true),
             (Some(expr), _) => (Some(expr), false),
             (None, Some(pushdown)) if self.prepared.run_slots.is_empty() => {
                 pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
@@ -10198,22 +10806,20 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// The rows of `table` an ORDER BY of `column` keeps past `offset`, at
-    /// most `limit`, read in order as the general path reads them: through
-    /// the column's index without a filter, else the table's top-k scan.
-    /// None when the scan does not take the whole WHERE, the WHERE narrows
-    /// the rows by a set, or the table cannot read them in order
+    /// most `limit`, read in order by `read`, the table's top-k scan when
+    /// the walk declines. None when the scan does not take the whole WHERE
+    /// or the table cannot read them in order
+    #[allow(clippy::too_many_arguments)]
     fn ordered_rows(
         &self,
         where_: &PreparedWhere,
+        read: OrderedRead,
         table: &dyn Table,
         ctx: &ExecutionContext,
         (column, ascending, nulls_first): (&str, bool, Option<bool>),
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
-        if where_.narrowing.is_some() || where_.narrowing_set.is_some() {
-            return Ok(None);
-        }
         let Some((storage_expr, scanned_whole, ..)) =
             self.where_scan(where_, None, None, table, ctx)?
         else {
@@ -10222,22 +10828,37 @@ impl<'a> PreparedRunner<'a> {
         if !scanned_whole {
             return Ok(None);
         }
-        if storage_expr.is_none() {
-            let nulls_first = crate::core::value::nulls_first(ascending, nulls_first);
-            let rows = table.collect_rows_ordered_by_index(
-                column,
-                ascending,
-                nulls_first,
-                limit,
-                offset,
-            )?;
-            if rows.is_some() {
-                return Ok(rows);
+        let walked = match read {
+            OrderedRead::Index => {
+                let nulls_first = crate::core::value::nulls_first(ascending, nulls_first);
+                table.collect_rows_ordered_by_index(
+                    column,
+                    ascending,
+                    nulls_first,
+                    limit,
+                    offset,
+                )?
             }
+            OrderedRead::Keyset => match keyset_start(table.schema(), storage_expr.as_deref()) {
+                Some(Some(start)) => table.collect_rows_pk_keyset(None, Some(start), true, limit),
+                Some(None) => Some(RowVec::new()),
+                None => None,
+            },
+            OrderedRead::TopK => None,
+        };
+        if walked.is_some() {
+            match read {
+                OrderedRead::Index => super::result::OrderLimitPath::PreparedIndexOrdered.taken(),
+                _ => super::result::OrderLimitPath::PreparedKeyset.taken(),
+            }
+            return Ok(walked);
         }
         let rows = table.scan_top_k(storage_expr.as_deref(), column, ascending, limit, offset)?;
         // A read that checks for no cancel is the statement's all the same
         ctx.check_cancelled()?;
+        if rows.is_some() {
+            super::result::OrderLimitPath::PreparedTopK.taken();
+        }
         Ok(rows)
     }
 
@@ -10246,7 +10867,7 @@ impl<'a> PreparedRunner<'a> {
     /// rows its narrowing names, or a scan the conjuncts without a subquery
     /// narrow. With a `target` and a scan that takes the whole WHERE, the
     /// scan's own answers up to it instead. The scan takes the `extra`
-    /// conditions too, which `keep` still judges; with `stream`, a scan
+    /// conditions too, which `keep` still judges; as `take` asks, a scan
     /// that takes them and the WHERE whole is handed back instead
     #[allow(clippy::too_many_arguments)]
     fn passing_rows(
@@ -10256,9 +10877,10 @@ impl<'a> PreparedRunner<'a> {
         table: &dyn Table,
         ctx: &ExecutionContext,
         target: Option<usize>,
-        stream: bool,
+        take: Take,
         mut keep: impl FnMut(i64, u64, Row) -> bool,
     ) -> Result<Passing> {
+        let stream = take != Take::Kept;
         let Some((mut storage_expr, mut scanned_whole, mut extra_whole, mut rest)) =
             self.where_scan(where_, extra, None, table, ctx)?
         else {
@@ -10290,7 +10912,7 @@ impl<'a> PreparedRunner<'a> {
                     let whole = where_.narrowing.is_some_and(|n| n.whole);
                     (Some(candidates.into_iter()), None, true, settled && whole)
                 }
-                None => {
+                None => 'read: {
                     if let Some(slot) = where_.narrowing_set {
                         let Some(scan) = self.where_scan(where_, extra, Some(slot), table, ctx)?
                         else {
@@ -10298,20 +10920,58 @@ impl<'a> PreparedRunner<'a> {
                         };
                         (storage_expr, scanned_whole, extra_whole, rest) = scan;
                     }
+                    let filter = storage_expr.as_deref();
+                    // An index reads the values a failed slot does not have
+                    let scan = where_
+                        .scan
+                        .as_ref()
+                        .filter(|_| extra.is_none() && self.failed_slots.is_none());
+                    if let Some(ScanChoice::Index(_)) = scan {
+                        let enough = target.filter(|_| scanned_whole);
+                        if let Some(rows) = member_rows(table, filter, target.is_some(), enough)? {
+                            break 'read (Some(rows.into_iter()), None, true, scanned_whole);
+                        }
+                    }
+                    let access = match scan {
+                        Some(ScanChoice::Index(plan)) => Some(ScanAccess::Index(plan)),
+                        Some(ScanChoice::Seq) => Some(ScanAccess::Seq),
+                        None => None,
+                    };
                     match target.filter(|_| scanned_whole) {
                         Some(target) => {
-                            let answers = table.collect_rows_with_limit_unordered(
-                                storage_expr.as_deref(),
-                                target,
-                                0,
-                            )?;
+                            let answers = match access {
+                                Some(access) => table.collect_access_rows_with_limit_unordered(
+                                    access, filter, target, 0,
+                                )?,
+                                None => {
+                                    table.collect_rows_with_limit_unordered(filter, target, 0)?
+                                }
+                            };
                             // A read that checks for no cancel is the statement's all the same
                             ctx.check_cancelled()?;
                             return Ok(Passing::Answers(answers));
                         }
                         None => {
+                            let needed = where_
+                                .needed
+                                .as_deref()
+                                .filter(|_| extra.is_none() && table.narrows_scans());
+                            if take == Take::Collected
+                                && scanned_whole
+                                && extra_whole
+                                && needed.is_none()
+                                && !matches!(access, Some(ScanAccess::Index(_)))
+                            {
+                                return Ok(Passing::Answers(table.collect_all_rows(filter)?));
+                            }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();
-                            let scan = table.scan(&all, storage_expr.as_deref())?;
+                            let scan = match (access, needed) {
+                                (Some(access), _) => {
+                                    table.scan_access(access, &all, needed, filter)?
+                                }
+                                (None, Some(needed)) => table.scan_needed(&all, needed, filter)?,
+                                (None, None) => table.scan(&all, filter)?,
+                            };
                             if stream && scanned_whole && extra_whole {
                                 return Ok(Passing::Scan(scan));
                             }
@@ -10455,7 +11115,7 @@ impl<'a> PreparedRunner<'a> {
             let mut failed = self.blocks[index].failed.borrow_mut();
             failed.clear();
             let empty = Row::new();
-            let exec = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+            let exec = self.exec_over(&empty, &self.base);
             for (slot, hole) in self.holes_of(index, self.holes) {
                 if !plan.keys.iter().any(|(_, key, _)| key == slot) {
                     match hole.value(&mut vm, &empty, &exec) {
@@ -10550,8 +11210,7 @@ impl<'a> PreparedRunner<'a> {
             params.clone_from(&self.blocks[parent as usize].buffer.borrow());
             failed.extend(self.blocks[parent as usize].failed.borrow().iter().cloned());
         }
-        let mut hole_ctx =
-            ExecuteContext::with_common_params(caller.row, &self.base, self.transaction_id);
+        let mut hole_ctx = self.exec_over(caller.row, &self.base);
         hole_ctx.row2 = caller.row2;
         for (slot, hole) in self.holes_of(index, site) {
             match hole.value(vm, caller.row, &hole_ctx) {
@@ -10643,9 +11302,9 @@ impl<'a> PreparedRunner<'a> {
                 self.ctx.check_cancelled()?;
             }
             if !decided {
-                let exec =
-                    ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                        .with_subquery_executor(self);
+                let exec = self
+                    .exec_over(scanner.row(), &params)
+                    .with_subquery_executor(self);
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
                         continue;
@@ -10834,8 +11493,7 @@ impl<'a> PreparedRunner<'a> {
             let outcome = if decided {
                 ExistsOutcome::Passed
             } else {
-                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                    .with_subquery_executor(self);
+                let exec = self.exec_over(row, &params).with_subquery_executor(self);
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => ExistsOutcome::Passed,
                     Ok(false) => continue,
@@ -10952,6 +11610,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         Some(&self.base)
     }
 
+    fn failed_slots(&self) -> &[(usize, Error)] {
+        self.slot_failures()
+    }
+
     fn bind_members(&self, program: &SharedProgram) -> Option<SharedProgram> {
         self.bound_program(program)
     }
@@ -11020,6 +11682,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
 
     fn params(&self) -> Option<&[Value]> {
         Some(&self.runner.base)
+    }
+
+    fn failed_slots(&self) -> &[(usize, Error)] {
+        self.runner.slot_failures()
     }
 }
 
@@ -11153,9 +11819,9 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             if let Some(filter) = filter {
-                let exec =
-                    ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                        .with_subquery_executor(self);
+                let exec = self
+                    .exec_over(scanner.row(), &params)
+                    .with_subquery_executor(self);
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
                 }
@@ -11199,8 +11865,7 @@ impl PreparedRunner<'_> {
         if value.is_some() {
             return Err(more_than_one_row());
         }
-        let exec = ExecuteContext::with_common_params(row, params, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(row, params).with_subquery_executor(self);
         *value = Some(vm.execute(projection, &exec)?);
         Ok(())
     }
@@ -11248,7 +11913,7 @@ impl PreparedRunner<'_> {
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
         let empty = Row::new();
-        let none = ExecuteContext::with_common_params(&empty, &params, self.transaction_id);
+        let none = self.exec_over(&empty, &params);
         let mut count = |program: &Option<SharedProgram>, clause| {
             program
                 .as_ref()
@@ -11285,8 +11950,7 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             let row = scanner.row();
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
@@ -11777,11 +12441,14 @@ impl PreparedRunner<'_> {
 
     /// `program` bound as [`Self::bound_program`] binds it, once the values
     /// of the uncorrelated blocks it asks are read: a side read once asks
-    /// them alike of each of its rows. None when a read fails, whose error
-    /// stays with the row that needs it
+    /// them alike of each of its rows. None when a read or a run slot failed,
+    /// whose error stays with the row that needs it
     pub(crate) fn bound_reading(&self, program: &SharedProgram) -> Option<SharedProgram> {
+        if self.failed_slots.is_some() {
+            return None;
+        }
         let empty = Row::new();
-        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        let caller = self.exec_over(&empty, &self.base);
         for op in program.ops().iter().filter(|op| self.asks_block(op)) {
             let read = match *op {
                 Op::ExecScalarSubquery(index) => self.execute_scalar(index, &caller).map(drop),
@@ -11842,10 +12509,20 @@ impl PreparedRunner<'_> {
     }
 
     /// What `op` reads in this run, when the run knows it already: a
-    /// parameter or run slot, an uncorrelated block's value or members read
+    /// parameter or run slot, an uncorrelated block's value or members read.
+    /// A slot whose value failed stays read, which raises its error
     fn known_op(&self, op: &Op) -> Option<Op> {
         match *op {
-            Op::LoadParam(slot) => self.base.get(slot as usize).cloned().map(Op::LoadConst),
+            Op::LoadParam(slot) => {
+                if self
+                    .slot_failures()
+                    .iter()
+                    .any(|(at, _)| *at == slot as usize)
+                {
+                    return None;
+                }
+                self.base.get(slot as usize).cloned().map(Op::LoadConst)
+            }
             Op::ExecScalarSubquery(index) | Op::ExecExists(index) => {
                 if !self.prepared.subqueries.get(index as usize)?.uncorrelated {
                     return None;
@@ -11863,7 +12540,7 @@ impl PreparedRunner<'_> {
     /// `program` bound to all this run knows now; one that asks no
     /// uncorrelated block binds only when that shrinks it
     fn bound_now(&self, program: &SharedProgram, asks_blocks: bool) -> SharedProgram {
-        let bound = match asks_blocks {
+        let bound = match asks_blocks || self.failed_slots.is_some() {
             true => program.bind_with(|op| self.known_op(op)),
             false => program.bind(&self.base),
         };
@@ -12025,8 +12702,7 @@ impl PreparedRunner<'_> {
         if let Some(item) = order.item {
             return Ok(Member::Value(members.read(keys.swap_remove(item))));
         }
-        let exec = ExecuteContext::with_common_params(&row, params, self.transaction_id)
-            .with_subquery_executor(self);
+        let exec = self.exec_over(&row, params).with_subquery_executor(self);
         if order.values.is_empty() {
             return self.candidate(members, vm, &exec);
         }
@@ -12088,9 +12764,9 @@ impl PreparedRunner<'_> {
             if scanned.is_multiple_of(100) {
                 self.ctx.check_cancelled()?;
             }
-            let exec =
-                ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
-                    .with_subquery_executor(self);
+            let exec = self
+                .exec_over(scanner.row(), &params)
+                .with_subquery_executor(self);
             if !decided {
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
@@ -12231,8 +12907,7 @@ impl PreparedRunner<'_> {
                     _ => continue 'rows,
                 }
             }
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if let Some(candidates) = candidates.filter(|_| !decided) {
                 if !vm.execute_bool_checked(candidates, &exec)? {
                     continue;
@@ -12560,7 +13235,7 @@ impl PreparedRunner<'_> {
     /// The context a grouped block's HAVING and SELECT expression read a
     /// slot row in, with the buffer filled for the call
     fn slot_context<'r>(&'r self, slot_row: &'r Row, params: &'r [Value]) -> ExecuteContext<'r> {
-        ExecuteContext::with_common_params(slot_row, params, self.transaction_id)
+        self.exec_over(slot_row, params)
     }
 
     /// Whether a slot row passes the block's HAVING
@@ -12707,8 +13382,7 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             let row = scanner.row();
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
                 for program in sq.candidates.iter().chain(&sq.filter) {
                     if !vm.execute_bool_checked(program, &exec)? {
@@ -12858,8 +13532,7 @@ impl PreparedRunner<'_> {
                     continue 'rows;
                 }
             }
-            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
-                .with_subquery_executor(self);
+            let exec = self.exec_over(row, &params).with_subquery_executor(self);
             let fed = (|| {
                 if let (false, Some(filter)) = (decided, &sq.filter) {
                     if !vm.execute_bool_checked(filter, &exec)? {

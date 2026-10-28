@@ -266,6 +266,10 @@ pub struct ExecuteContext<'a> {
 
     /// Current transaction ID (for CURRENT_TRANSACTION_ID())
     pub transaction_id: Option<u64>,
+
+    /// Slots whose value failed to compute, each NULL in `params`; reading
+    /// one raises its error
+    pub failed: &'a [(usize, Error)],
 }
 
 impl<'a> ExecuteContext<'a> {
@@ -279,6 +283,7 @@ impl<'a> ExecuteContext<'a> {
             params: &[],
             subquery_executor: None,
             transaction_id: None,
+            failed: &[],
         }
     }
 
@@ -297,6 +302,7 @@ impl<'a> ExecuteContext<'a> {
             params,
             subquery_executor: None,
             transaction_id,
+            failed: &[],
         }
     }
 
@@ -309,6 +315,7 @@ impl<'a> ExecuteContext<'a> {
             params: &[],
             subquery_executor: None,
             transaction_id: None,
+            failed: &[],
         }
     }
 
@@ -330,19 +337,41 @@ impl<'a> ExecuteContext<'a> {
         self
     }
 
-    /// Add subquery executor
-    pub fn with_subquery_executor(mut self, executor: &'a dyn SubqueryExecutor) -> Self {
-        self.subquery_executor = Some(executor);
+    /// Add the slots whose value failed to compute
+    pub fn with_failed(mut self, failed: &'a [(usize, Error)]) -> Self {
+        self.failed = failed;
         self
     }
 
-    /// Parameter slot `index`, zero-based; a slot without a value is an error
+    /// Add subquery executor, with the slots whose value failed in its run
+    pub fn with_subquery_executor(mut self, executor: &'a dyn SubqueryExecutor) -> Self {
+        self.subquery_executor = Some(executor);
+        self.failed = executor.failed_slots();
+        self
+    }
+
+    /// Parameter slot `index`, zero-based; a slot without a value, or one
+    /// whose value failed to compute, is an error
     #[inline]
     pub fn param_ref(&self, index: usize) -> Result<&'a Value> {
-        self.params
+        let value = self
+            .params
             .get(index)
-            .ok_or_else(|| missing_parameter(index, self.params.len()))
+            .ok_or_else(|| missing_parameter(index, self.params.len()))?;
+        if value.is_null() && !self.failed.is_empty() {
+            return failed_slot(self.failed, index).map_or(Ok(value), Err);
+        }
+        Ok(value)
     }
+}
+
+/// The error slot `index` failed with, if it failed
+#[cold]
+fn failed_slot(failed: &[(usize, Error)], index: usize) -> Option<Error> {
+    failed
+        .iter()
+        .find(|(slot, _)| *slot == index)
+        .map(|(_, e)| e.clone())
 }
 
 #[cold]
@@ -403,6 +432,12 @@ pub trait SubqueryExecutor {
     /// caller's own parameters are all there are
     fn params(&self) -> Option<&[Value]> {
         None
+    }
+
+    /// The slots of [`Self::params`] whose value failed to compute in this
+    /// run, each with its error, which a read of the slot raises
+    fn failed_slots(&self) -> &[(usize, Error)] {
+        &[]
     }
 
     /// `program` with every block it tests members of read once and tested

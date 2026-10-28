@@ -131,7 +131,7 @@ fn a_hot_point_read_after_the_change_takes_the_arena_row_in_the_new_type() {
     assert_eq!(rows(&db, "SELECT k FROM t WHERE id = 1"), ["Text(\"7\")"]);
     let paths = fp::take_read_paths();
     assert!(
-        paths.contains(&"vs.get_visible_versions_batch.arena_probe"),
+        paths.contains(&"vs.get_visible_version.arena_probe"),
         "the point read took another path: {paths:?}"
     );
 }
