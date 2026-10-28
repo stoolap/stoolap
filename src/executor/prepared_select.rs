@@ -9241,10 +9241,13 @@ impl Executor {
         };
         if let Some(slot) = compiled.filter(|_| !fresh) {
             if let Ok(guard) = slot.read() {
-                if let CompiledExecution::PreparedSelect(p) = &*guard {
-                    if fits(p) {
-                        return Ok(Arc::clone(p));
-                    }
+                let held = match &*guard {
+                    CompiledExecution::PreparedSelect(p) => Some(p),
+                    CompiledExecution::Planned(planned) => Some(&planned.prepared),
+                    _ => None,
+                };
+                if let Some(p) = held.filter(|p| fits(p)) {
+                    return Ok(Arc::clone(p));
                 }
             }
         }
@@ -9290,7 +9293,8 @@ impl Executor {
     }
 
     /// Whether the plan holds a statement prepared for the current schema,
-    /// which puts the statement in the family without classifying it again
+    /// which puts the statement in the family without classifying it again;
+    /// a key read's plan holds the statement its declined runs read
     pub(crate) fn holds_prepared_select(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
@@ -9298,14 +9302,16 @@ impl Executor {
     ) -> bool {
         compiled
             .and_then(|slot| slot.read().ok())
-            .is_some_and(|guard| match &*guard {
-                CompiledExecution::PreparedSelect(p) => {
-                    p.validity.holds(&*self.engine, self.engine.schema_epoch())
-                        && p.cte_scope.holds(ctx)
-                        && p.blocks.param_count == ctx.params().len()
-                        && ctx.outer_row().is_none()
-                }
-                _ => false,
+            .is_some_and(|guard| {
+                let p = match &*guard {
+                    CompiledExecution::PreparedSelect(p) => p,
+                    CompiledExecution::Planned(planned) => &planned.prepared,
+                    _ => return false,
+                };
+                p.validity.holds(&*self.engine, self.engine.schema_epoch())
+                    && p.cte_scope.holds(ctx)
+                    && p.blocks.param_count == ctx.params().len()
+                    && ctx.outer_row().is_none()
             })
     }
 
