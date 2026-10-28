@@ -2134,7 +2134,7 @@ impl ExprVM {
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_ne_f64(*v, *val)),
                 cell => Self::fused_cell(op, cell),
             },
-            Op::IsNullColumn(idx) => Some(ctx.row.get(*idx as usize).is_some_and(|v| v.is_null())),
+            Op::IsNullColumn(idx) => Some(ctx.row.get(*idx as usize).is_none_or(|v| v.is_null())),
             Op::IsNotNullColumn(idx) => {
                 Some(ctx.row.get(*idx as usize).is_some_and(|v| !v.is_null()))
             }
