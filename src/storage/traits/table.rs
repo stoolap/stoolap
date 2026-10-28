@@ -23,8 +23,19 @@ use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value
 use crate::functions::aggregate::GroupedAggregates;
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::mvcc::index_plan::IndexPlan;
 use crate::storage::mvcc::version_store::{AggregateOp, LayoutToken};
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
+
+/// How a scan finds its rows, as the statement's plan chose it
+#[derive(Clone, Copy)]
+pub enum ScanAccess<'a> {
+    /// Every row
+    Seq,
+    /// The rows the plan's indexes give, their values read from the scan's
+    /// condition
+    Index(&'a IndexPlan),
+}
 
 /// Describes the access method that will be used for a table scan
 ///
@@ -629,6 +640,23 @@ pub trait Table: Send + Sync {
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>>;
 
+    /// `scan` reading the rows `access` finds, each kept only when
+    /// `where_expr` holds for it, `scan_needed` when `needed` marks the
+    /// columns read; a table that cannot read by the access chooses its own
+    fn scan_access(
+        &self,
+        access: ScanAccess<'_>,
+        column_indices: &[usize],
+        needed: Option<&[bool]>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        let _ = access;
+        match needed {
+            Some(needed) => self.scan_needed(column_indices, needed, where_expr),
+            None => self.scan(column_indices, where_expr),
+        }
+    }
+
     /// Whether a scan can leave the columns the caller does not read
     /// unmaterialized: see `scan_needed`
     fn narrows_scans(&self) -> bool {
@@ -659,6 +687,16 @@ pub trait Table: Send + Sync {
     /// # Returns
     /// Cached row vector - returns to cache on drop for reuse
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec>;
+
+    /// `collect_all_rows` reading the rows `access` finds
+    fn collect_access_rows(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<RowVec> {
+        let _ = access;
+        self.collect_all_rows(where_expr)
+    }
 
     /// Collects rows with an optional limit (LIMIT pushdown optimization)
     ///
@@ -705,6 +743,18 @@ pub trait Table: Send + Sync {
     ) -> Result<RowVec> {
         // Default implementation: delegate to ordered version
         self.collect_rows_with_limit(where_expr, limit, offset)
+    }
+
+    /// `collect_rows_with_limit_unordered` reading the rows `access` finds
+    fn collect_access_rows_with_limit_unordered(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let _ = access;
+        self.collect_rows_with_limit_unordered(where_expr, limit, offset)
     }
 
     /// Collects all rows WITHOUT guaranteeing deterministic order.

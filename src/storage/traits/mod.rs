@@ -36,5 +36,7 @@ pub use engine::Engine;
 pub use index_trait::{CappedEqual, Index, RemovalBuffers};
 pub use result::{EmptyResult, MemoryResult, QueryResult};
 pub use scanner::{EmptyScanner, Scanner, VecScanner};
-pub use table::{CapturedGroups, ColdChange, PlannedUpdate, ProbeScratch, ScanPlan, Table};
+pub use table::{
+    CapturedGroups, ColdChange, PlannedUpdate, ProbeScratch, ScanAccess, ScanPlan, Table,
+};
 pub use transaction::{TemporalType, Transaction};
