@@ -36,7 +36,9 @@ use std::sync::Arc;
 use super::context::ExecutionContext;
 use super::expression::CompiledEvaluator;
 use super::pushdown;
-use super::query_cache::{CompiledConflictInsert, CompiledExecution, CompiledInsert, NestedPlan};
+use super::query_cache::{
+    CompiledConflictInsert, CompiledExecution, CompiledInsert, NestedPlan, PlanValidity,
+};
 use super::result::{ExecResult, ExecutorResult};
 use super::utils::{dummy_token_clone, qualified};
 use super::Executor;
@@ -300,15 +302,17 @@ struct InsertPlan<'a> {
     upsert: Option<Arc<CompiledUpsert>>,
     cache: Option<&'a RwLock<CompiledExecution>>,
     table_name: &'a str,
-    epoch: u64,
+    /// When what this compiled holds; None for what the cache held already
+    validity: Option<PlanValidity>,
     token: LayoutToken,
 }
 
 impl<'a> InsertPlan<'a> {
+    /// `epoch` read before the table was opened
     fn new(
         cache: Option<&'a RwLock<CompiledExecution>>,
         table_name: &'a str,
-        epoch: u64,
+        (executor, epoch): (&Executor, u64),
         token: LayoutToken,
         schema: &Schema,
         stmt: &InsertStatement,
@@ -316,7 +320,7 @@ impl<'a> InsertPlan<'a> {
     ) -> Result<Self> {
         let cached = cache.and_then(|cache| match &*cache.read().ok()? {
             CompiledExecution::ConflictInsert(plan)
-                if plan.cached_epoch == epoch
+                if plan.validity.holds(&*executor.engine, epoch)
                     && plan.token == token
                     && *plan.table_name == *table_name =>
             {
@@ -351,7 +355,7 @@ impl<'a> InsertPlan<'a> {
             upsert,
             cache,
             table_name,
-            epoch,
+            validity: (!hit && cache.is_some()).then(|| executor.insert_validity(stmt, epoch)),
             token,
         };
         if !hit {
@@ -371,12 +375,15 @@ impl<'a> InsertPlan<'a> {
     }
 
     fn store(&self) {
+        let Some(validity) = &self.validity else {
+            return;
+        };
         if let Some(Ok(mut slot)) = self.cache.map(|cache| cache.write()) {
             *slot = CompiledExecution::ConflictInsert(CompiledConflictInsert {
                 checks: Arc::clone(&self.checks),
                 upsert: self.upsert.clone(),
                 table_name: SmartString::new(self.table_name),
-                cached_epoch: self.epoch,
+                validity: validity.clone(),
                 token: self.token,
             });
         }
@@ -788,6 +795,8 @@ impl Executor {
 
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
+        // Read before the table: a change since leaves a plan made now behind
+        let plan_epoch = self.engine.schema_epoch();
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
@@ -947,7 +956,7 @@ impl Executor {
             insert_plan = InsertPlan::new(
                 plan_cache.filter(|_| stmt.on_duplicate || stmt.do_nothing),
                 table_name,
-                self.engine.schema_epoch(),
+                (self, plan_epoch),
                 table.layout_token(),
                 schema,
                 stmt,
@@ -1721,9 +1730,10 @@ impl Executor {
         let current_epoch = self.engine.schema_epoch();
         let cached_insert = match &*compiled_cache.read().unwrap() {
             CompiledExecution::Insert(cached)
-                if cached.cached_epoch == current_epoch && *cached.table_name == *table_name =>
+                if cached.validity.holds(&*self.engine, current_epoch)
+                    && *cached.table_name == *table_name =>
             {
-                Some(cached.clone())
+                Some(cached.copied())
             }
             _ => None,
         };
@@ -1815,7 +1825,7 @@ impl Executor {
             default_row_template,
             compiled_checks,
         ) = if let Some(cached) = cached_insert
-            .filter(|cached| cached.token == token && cached.cached_epoch == opened_epoch)
+            .filter(|cached| cached.token == token && cached.validity.epoch() == opened_epoch)
         {
             // Use cached values (Arc clone is cheap)
             (
@@ -1896,7 +1906,7 @@ impl Executor {
                 default_programs: Arc::new(default_programs.clone()),
                 default_row_template: Arc::new(default_row_template.clone()),
                 compiled_checks: Arc::new(compiled_checks.clone()),
-                cached_epoch: current_epoch,
+                validity: self.insert_validity(stmt, current_epoch),
                 token,
                 reads_through_view,
                 reads_prepared,

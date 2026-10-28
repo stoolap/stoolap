@@ -3953,14 +3953,14 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable(epoch)
-                    if self.engine.schema_epoch() == *epoch =>
+                CompiledExecution::NotOptimizable(validity)
+                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
                 {
                     return None
                 }
                 CompiledExecution::CountDistinct(cd) => {
                     // Fast path: validate epoch and execute directly
-                    if self.engine.schema_epoch() == cd.cached_epoch {
+                    if cd.validity.holds(&*self.engine, self.engine.schema_epoch()) {
                         return self.execute_compiled_count_distinct(cd).transpose();
                     }
                     // Schema changed - fall through to recompile
@@ -4035,11 +4035,13 @@ impl Executor {
 
         // Double-check (another thread may have compiled while we waited)
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+            CompiledExecution::NotOptimizable(validity)
+                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
+            {
                 return None
             }
             CompiledExecution::CountDistinct(cd) => {
-                if self.engine.schema_epoch() == cd.cached_epoch {
+                if cd.validity.holds(&*self.engine, self.engine.schema_epoch()) {
                     return self.execute_compiled_count_distinct(cd).transpose();
                 }
                 // Schema changed, continue to recompile
@@ -4047,6 +4049,8 @@ impl Executor {
             CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
         }
+
+        let validity = self.select_validity(stmt, self.engine.schema_epoch());
 
         // Pattern detection: SELECT COUNT(DISTINCT col) FROM table
         // Must have:
@@ -4056,7 +4060,7 @@ impl Executor {
         // - Single table source (no joins)
 
         if stmt.columns.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -4070,7 +4074,7 @@ impl Executor {
             || stmt.with.is_some()
             || !stmt.set_operations.is_empty()
         {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -4079,7 +4083,7 @@ impl Executor {
             Expression::FunctionCall(func) => {
                 // Must be COUNT function
                 if func.function.to_uppercase() != "COUNT" {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
                 // Must be DISTINCT - if not, don't mark as NotOptimizable
@@ -4090,7 +4094,7 @@ impl Executor {
                 if func.arguments.len() != 1
                     || !Modifiers::of_call(func).within(Modifiers::DISTINCT)
                 {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
                 // Get column name from argument
@@ -4099,8 +4103,7 @@ impl Executor {
                         (ident.value.to_lowercase(), item_name(&stmt.columns[0]))
                     }
                     _ => {
-                        *compiled_guard =
-                            CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
                         return None;
                     }
                 };
@@ -4112,8 +4115,7 @@ impl Executor {
                     Expression::FunctionCall(func) => {
                         // Must be COUNT function
                         if func.function.to_uppercase() != "COUNT" {
-                            *compiled_guard =
-                                CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
                             return None;
                         }
                         // Must be DISTINCT - if not, don't mark as NotOptimizable
@@ -4124,29 +4126,26 @@ impl Executor {
                         if func.arguments.len() != 1
                             || !Modifiers::of_call(func).within(Modifiers::DISTINCT)
                         {
-                            *compiled_guard =
-                                CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
                             return None;
                         }
                         let col = match &func.arguments[0] {
                             Expression::Identifier(ident) => ident.value.to_lowercase(),
                             _ => {
-                                *compiled_guard =
-                                    CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                                 return None;
                             }
                         };
                         (col, aliased.alias.value.to_string())
                     }
                     _ => {
-                        *compiled_guard =
-                            CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
                         return None;
                     }
                 }
             }
             _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4155,13 +4154,13 @@ impl Executor {
         let table_name = match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 if ts.as_of.is_some() {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
                 ts.name.value_lower.clone()
             }
             _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4170,7 +4169,7 @@ impl Executor {
         let tx = match self.begin_transaction() {
             Ok(tx) => tx,
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4182,7 +4181,7 @@ impl Executor {
         ) {
             Ok(t) => t,
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4193,7 +4192,7 @@ impl Executor {
             // An index that cannot answer for this statement may for the next
             Ok(None) if table.get_index_on_column(&column_name).is_some() => return None,
             Ok(None) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
             Err(error) => return Some(Err(error)),
@@ -4204,7 +4203,7 @@ impl Executor {
             table_name: SmartString::new(&table_name),
             column_name: SmartString::new(&column_name),
             result_column_name: result_column_name.clone(),
-            cached_epoch: self.engine.schema_epoch(),
+            validity,
         };
         *compiled_guard = CompiledExecution::CountDistinct(compiled_cd);
         drop(compiled_guard);
@@ -4252,14 +4251,14 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable(epoch)
-                    if self.engine.schema_epoch() == *epoch =>
+                CompiledExecution::NotOptimizable(validity)
+                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
                 {
                     return None
                 }
                 CompiledExecution::CountStar(cs) => {
                     // Fast path: validate epoch and execute directly
-                    if self.engine.schema_epoch() == cs.cached_epoch {
+                    if cs.validity.holds(&*self.engine, self.engine.schema_epoch()) {
                         return Some(self.execute_compiled_count_star(cs));
                     }
                     // Schema changed - fall through to recompile
@@ -4332,11 +4331,13 @@ impl Executor {
 
         // Double-check (another thread may have compiled while we waited)
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+            CompiledExecution::NotOptimizable(validity)
+                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
+            {
                 return None
             }
             CompiledExecution::CountStar(cs) => {
-                if self.engine.schema_epoch() == cs.cached_epoch {
+                if cs.validity.holds(&*self.engine, self.engine.schema_epoch()) {
                     return Some(self.execute_compiled_count_star(cs));
                 }
                 // Schema changed, continue to recompile
@@ -4344,6 +4345,8 @@ impl Executor {
             CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
         }
+
+        let validity = self.select_validity(stmt, self.engine.schema_epoch());
 
         // Pattern detection: SELECT COUNT(*) FROM table
         // Must have:
@@ -4353,7 +4356,7 @@ impl Executor {
         // - Single table source (no joins)
 
         if stmt.columns.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -4367,7 +4370,7 @@ impl Executor {
             || stmt.with.is_some()
             || !stmt.set_operations.is_empty()
         {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -4376,7 +4379,7 @@ impl Executor {
             Expression::FunctionCall(func) => {
                 // Must be COUNT function
                 if func.function.to_uppercase() != "COUNT" {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
                 // Must NOT be DISTINCT - if DISTINCT, don't mark as NotOptimizable
@@ -4386,7 +4389,7 @@ impl Executor {
                 }
                 // No other modifier; the argument's shape is checked below
                 if !Modifiers::of_call(func).within(Modifiers::EXPRESSION) {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
                 // Must be COUNT(*) or COUNT(1)
@@ -4403,23 +4406,19 @@ impl Executor {
                                 if lit.value == 1 {
                                     item_name(&stmt.columns[0])
                                 } else {
-                                    *compiled_guard = CompiledExecution::NotOptimizable(
-                                        self.engine.schema_epoch(),
-                                    );
+                                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                                     return None;
                                 }
                             }
                             _ => {
                                 // COUNT(col) without DISTINCT - not our fast path
-                                *compiled_guard =
-                                    CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                                 return None;
                             }
                         }
                     }
                     _ => {
-                        *compiled_guard =
-                            CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
                         return None;
                     }
                 }
@@ -4430,8 +4429,7 @@ impl Executor {
                     Expression::FunctionCall(func) => {
                         // Must be COUNT function
                         if func.function.to_uppercase() != "COUNT" {
-                            *compiled_guard =
-                                CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
                             return None;
                         }
                         // Must NOT be DISTINCT - if DISTINCT, don't mark as NotOptimizable
@@ -4441,8 +4439,7 @@ impl Executor {
                         }
                         // No other modifier; the argument's shape is checked below
                         if !Modifiers::of_call(func).within(Modifiers::EXPRESSION) {
-                            *compiled_guard =
-                                CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
                             return None;
                         }
                         match func.arguments.len() {
@@ -4453,34 +4450,28 @@ impl Executor {
                                     aliased.alias.value.to_string()
                                 }
                                 Expression::IntegerLiteral(_) => {
-                                    *compiled_guard = CompiledExecution::NotOptimizable(
-                                        self.engine.schema_epoch(),
-                                    );
+                                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                                     return None;
                                 }
                                 _ => {
-                                    *compiled_guard = CompiledExecution::NotOptimizable(
-                                        self.engine.schema_epoch(),
-                                    );
+                                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                                     return None;
                                 }
                             },
                             _ => {
-                                *compiled_guard =
-                                    CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                                 return None;
                             }
                         }
                     }
                     _ => {
-                        *compiled_guard =
-                            CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
                         return None;
                     }
                 }
             }
             _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4489,13 +4480,13 @@ impl Executor {
         let table_name = match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 if ts.as_of.is_some() {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
                 ts.name.value_lower.clone()
             }
             _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4504,7 +4495,7 @@ impl Executor {
         let tx = match self.begin_transaction() {
             Ok(tx) => tx,
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4513,7 +4504,7 @@ impl Executor {
         let table = match tx.get_read_table_at(&table_name, view.as_ref(), TableUse::Read) {
             Ok(t) => t,
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -4533,7 +4524,7 @@ impl Executor {
         let compiled_cs = CompiledCountStar {
             table_name: SmartString::new(&table_name),
             result_column_name: result_column_name.clone(),
-            cached_epoch: self.engine.schema_epoch(),
+            validity,
         };
         *compiled_guard = CompiledExecution::CountStar(compiled_cs);
         drop(compiled_guard);

@@ -196,6 +196,33 @@ fn registry_as_visibility_checker(
     Arc::clone(registry) as Arc<dyn VisibilityChecker>
 }
 
+/// The tables `schema`, the schema of `table`, references by foreign key and
+/// the tables in `schemas` whose foreign keys reference `table`, lower case
+fn fk_neighbors(
+    schemas: &FxHashMap<String, CompactArc<Schema>>,
+    schema: Option<&Schema>,
+    table: &str,
+) -> Vec<String> {
+    let parents = schema
+        .into_iter()
+        .flat_map(|schema| &schema.foreign_keys)
+        .map(|fk| fk.referenced_table.to_lowercase());
+    let children = schemas
+        .iter()
+        .filter(|(name, schema)| {
+            name.as_str() != table
+                && schema
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.referenced_table.eq_ignore_ascii_case(table))
+        })
+        .map(|(name, _)| name.clone());
+    let mut names: Vec<String> = parents.chain(children).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// Remove FK constraints referencing `parent_table_lower` from all child schemas.
 /// Updates both the schemas map and each affected VersionStore's schema.
 /// Caller must hold schemas as write-locked and version_stores as read-locked.
@@ -629,6 +656,54 @@ struct DdlShared {
     /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
     /// Used for fast cache invalidation without HashMap lookup
     schema_epoch: AtomicU64,
+    /// The epoch of the last change to each table or view, by lower-case
+    /// name; a name absent last changed at or before `name_floor`
+    name_epochs: parking_lot::RwLock<FxHashMap<String, u64>>,
+    /// The epoch at which every name last changed together, by an open or
+    /// a restore
+    name_floor: AtomicU64,
+}
+
+impl DdlShared {
+    /// Moves the schema epoch for a change to the tables or views `names`,
+    /// lower case, which take the new epoch as their own
+    fn changed(&self, names: &[&str]) {
+        let mut epochs = self.name_epochs.write();
+        let epoch = self.schema_epoch.fetch_add(1, Ordering::Release) + 1;
+        for name in names {
+            match epochs.get_mut(*name) {
+                Some(at) => *at = epoch,
+                None => {
+                    epochs.insert(name.to_string(), epoch);
+                }
+            }
+        }
+    }
+
+    /// Moves the schema epoch for a change to `table`, lower case, and to the
+    /// tables its foreign keys reference or that reference it in `schemas`,
+    /// whose constraints the change may alter
+    fn changed_table(&self, schemas: &FxHashMap<String, CompactArc<Schema>>, table: &str) {
+        let mut names = fk_neighbors(schemas, schemas.get(table).map(|s| &**s), table);
+        names.push(table.to_string());
+        self.changed(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    /// Moves the schema epoch to at least `epoch` for a change to every name
+    fn changed_all(&self, epoch: u64) {
+        let mut epochs = self.name_epochs.write();
+        let previous = self.schema_epoch.fetch_max(epoch, Ordering::AcqRel);
+        self.name_floor
+            .store(previous.max(epoch), Ordering::Release);
+        epochs.clear();
+    }
+
+    /// The epoch of the last change to the table or view `name`, lower case
+    fn name_epoch(&self, name: &str) -> u64 {
+        let epochs = self.name_epochs.read();
+        let floor = self.name_floor.load(Ordering::Acquire);
+        epochs.get(name).map_or(floor, |&at| at.max(floor))
+    }
 }
 
 /// `hot_max_rows` / `hot_max_bytes` mirrored from the config so the commit
@@ -883,8 +958,8 @@ fn refresh_schema(
 
     // Update the engine's schema cache
     let mut schemas = schemas.write().unwrap();
-    schemas.insert(table_name_lower, vs_schema);
-    ddl.schema_epoch.fetch_add(1, Ordering::Release);
+    schemas.insert(table_name_lower.clone(), vs_schema);
+    ddl.changed_table(&schemas, &table_name_lower);
     // The epoch moves under the same lock the schema does, so a reader
     // holding it sees the two together
     drop(schemas);
@@ -942,6 +1017,8 @@ impl MVCCEngine {
             ddl: Arc::new(DdlShared {
                 serial: parking_lot::Mutex::new(()),
                 schema_epoch: AtomicU64::new(0),
+                name_epochs: parking_lot::RwLock::new(FxHashMap::default()),
+                name_floor: AtomicU64::new(0),
             }),
             instance: NEXT_ENGINE_INSTANCE.fetch_add(1, Ordering::Relaxed),
             stats_epoch: AtomicU64::new(0),
@@ -1013,9 +1090,7 @@ impl MVCCEngine {
                     mgrs.values().map(|mgr| mgr.max_schema_version()).max()
                 };
                 if let Some(persisted) = persisted {
-                    self.ddl
-                        .schema_epoch
-                        .fetch_max(persisted + 1, Ordering::AcqRel);
+                    self.ddl.changed_all(persisted + 1);
                 }
 
                 // Legacy snapshots: only used when volumes/ does NOT exist.
@@ -3326,7 +3401,10 @@ impl MVCCEngine {
         )?;
 
         // Increment schema epoch for cache invalidation
-        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+        self.ddl.changed_table(
+            &self.schemas.read().unwrap(),
+            &return_schema.table_name.to_lowercase(),
+        );
 
         Ok(return_schema)
     }
@@ -3344,18 +3422,20 @@ impl MVCCEngine {
         // Atomically remove schema AND strip FK references under single write lock.
         // This prevents a race where find_referencing_fks reads stale state between
         // schema removal and FK stripping.
-        {
+        let mut neighbors = {
             let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&table_name) {
                 return Err(Error::TableNotFound(table_name.to_string()));
             }
-            schemas.remove(&table_name);
+            let removed = schemas.remove(&table_name);
+            let neighbors = fk_neighbors(&schemas, removed.as_deref(), &table_name);
 
             // Strip FK constraints from child tables that referenced the dropped table.
             // Done under the same schemas write lock for atomicity.
             let version_stores = self.version_stores.read().unwrap();
             strip_fk_references(&mut schemas, &version_stores, &table_name);
-        }
+            neighbors
+        };
 
         // Close and remove version store
         {
@@ -3391,7 +3471,9 @@ impl MVCCEngine {
         }
 
         // Increment schema epoch for cache invalidation
-        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+        neighbors.push(table_name);
+        self.ddl
+            .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
 
         Ok(())
     }
@@ -3472,8 +3554,8 @@ impl MVCCEngine {
             };
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
-                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+                schemas.insert(table_name_lower.clone(), schema);
+                self.ddl.changed_table(&schemas, &table_name_lower);
             }
         }
 
@@ -3585,8 +3667,8 @@ impl MVCCEngine {
             };
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
-                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+                schemas.insert(table_name_lower.clone(), schema);
+                self.ddl.changed_table(&schemas, &table_name_lower);
             }
         }
 
@@ -4189,7 +4271,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower.clone(), schema);
-                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.changed_table(&schemas, &table_name_lower);
             }
         }
 
@@ -4406,7 +4488,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower.clone(), schema);
-                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.changed_table(&schemas, &table_name_lower);
             }
         }
 
@@ -4647,7 +4729,7 @@ impl MVCCEngine {
         }
         views.insert(name_lower.clone(), Arc::clone(&view_def));
         // A plan reading a view of this name prepares again
-        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+        self.ddl.changed(&[&name_lower]);
 
         // Release the lock before recording to WAL
         drop(views);
@@ -4676,7 +4758,7 @@ impl MVCCEngine {
             }
             return Err(Error::ViewNotFound(name.to_string()));
         }
-        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+        self.ddl.changed(&[&name_lower]);
 
         // Release the lock before recording to WAL
         drop(views);
@@ -5813,8 +5895,7 @@ impl MVCCEngine {
 
         // Increment schema epoch to invalidate all caches
         self.ddl
-            .schema_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .changed_all(self.ddl.schema_epoch.load(Ordering::Acquire) + 1);
 
         // Re-record DDL to WAL so table schemas survive WAL truncation
         if let Err(e) = self.rerecord_ddl_to_wal() {
@@ -8147,6 +8228,10 @@ impl Engine for MVCCEngine {
         self.ddl.schema_epoch.load(Ordering::Acquire)
     }
 
+    fn name_epoch(&self, name: &str) -> u64 {
+        self.ddl.name_epoch(name)
+    }
+
     fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -9310,14 +9395,16 @@ impl TransactionEngineOperations for EngineOperations {
         let _destruction = self.registry.begin_destruction();
 
         // Remove schema and clean up FK references in child tables
-        {
+        let mut neighbors = {
             let mut schemas = self.schemas().write().unwrap();
-            if schemas.remove(&table_name_lower).is_none() {
+            let Some(removed) = schemas.remove(&table_name_lower) else {
                 return Err(Error::TableNotFound(table_name_lower.to_string()));
-            }
+            };
+            let neighbors = fk_neighbors(&schemas, Some(&removed), &table_name_lower);
             let version_stores = self.version_stores().read().unwrap();
             strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
-        }
+            neighbors
+        };
         // Close and remove version store
         {
             let mut stores = self.version_stores().write().unwrap();
@@ -9359,6 +9446,9 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
 
+        neighbors.push(table_name_lower);
+        self.ddl
+            .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
         Ok(())
     }
 
@@ -9489,7 +9579,17 @@ impl TransactionEngineOperations for EngineOperations {
         }
 
         // Increment schema epoch for cache invalidation
-        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
+        let schemas = self.schemas().read().unwrap();
+        let mut names = fk_neighbors(
+            &schemas,
+            schemas.get(&new_name_lower).map(|s| &**s),
+            &old_name_lower,
+        );
+        names.extend(fk_neighbors(&schemas, None, &new_name_lower));
+        names.push(old_name_lower);
+        names.push(new_name_lower);
+        self.ddl
+            .changed(&names.iter().map(String::as_str).collect::<Vec<_>>());
 
         Ok(())
     }

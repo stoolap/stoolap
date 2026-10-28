@@ -92,6 +92,10 @@ pub trait Engine: Send + Sync {
     /// cache invalidation without HashMap lookup (~1ns vs ~7ns).
     fn schema_epoch(&self) -> u64;
 
+    /// The schema epoch of the last change to the table or view `name`,
+    /// lower case: its creation, a change of its columns or its drop
+    fn name_epoch(&self, name: &str) -> u64;
+
     /// Lists all indexes for a table
     ///
     /// Returns a map from index name to index type string.

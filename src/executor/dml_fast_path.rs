@@ -66,14 +66,17 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable(epoch)
-                    if self.engine.schema_epoch() == *epoch =>
+                CompiledExecution::NotOptimizable(validity)
+                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
                 {
                     return None
                 }
                 CompiledExecution::PkUpdate(update) => {
                     // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
-                    if self.engine.schema_epoch() == update.cached_epoch {
+                    if update
+                        .validity
+                        .holds(&*self.engine, self.engine.schema_epoch())
+                    {
                         // Fast path: extract PK value and execute
                         let pk_value =
                             self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
@@ -108,14 +111,17 @@ impl Executor {
                 Err(_) => return None,
             };
             match &*compiled_guard {
-                CompiledExecution::NotOptimizable(epoch)
-                    if self.engine.schema_epoch() == *epoch =>
+                CompiledExecution::NotOptimizable(validity)
+                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
                 {
                     return None
                 }
                 CompiledExecution::PkDelete(delete) => {
                     // Fast validation using schema epoch (~1ns vs ~7ns for HashMap lookup)
-                    if self.engine.schema_epoch() == delete.cached_epoch {
+                    if delete
+                        .validity
+                        .holds(&*self.engine, self.engine.schema_epoch())
+                    {
                         // Fast path: extract PK value and execute
                         let pk_value =
                             self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
@@ -271,7 +277,10 @@ impl Executor {
             CompiledExecution::NotOptimizable(_) => None,
             CompiledExecution::PkUpdate(update) => {
                 // Fast validation using schema epoch
-                if self.engine.schema_epoch() == update.cached_epoch {
+                if update
+                    .validity
+                    .holds(&*self.engine, self.engine.schema_epoch())
+                {
                     let pk_value =
                         Self::extract_pk_value_from_params(&update.pk_value_source, params)?;
                     // Extract update values
@@ -335,7 +344,10 @@ impl Executor {
             CompiledExecution::NotOptimizable(_) => None,
             CompiledExecution::PkDelete(delete) => {
                 // Fast validation using schema epoch
-                if self.engine.schema_epoch() == delete.cached_epoch {
+                if delete
+                    .validity
+                    .holds(&*self.engine, self.engine.schema_epoch())
+                {
                     let pk_value =
                         Self::extract_pk_value_from_params(&delete.pk_value_source, params)?;
                     // Clone only what we need (cheap: SmartString + Arc)
@@ -611,11 +623,15 @@ impl Executor {
 
         // Double-check after acquiring lock
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+            CompiledExecution::NotOptimizable(validity)
+                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
+            {
                 return None
             }
             CompiledExecution::PkUpdate(update)
-                if self.engine.schema_epoch() == update.cached_epoch =>
+                if update
+                    .validity
+                    .holds(&*self.engine, self.engine.schema_epoch()) =>
             {
                 let pk_value = self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
                 return self.execute_compiled_pk_update(update, pk_value, ctx, in_txn);
@@ -626,20 +642,21 @@ impl Executor {
             _ => return None,
         }
 
+        // Read before the schema: a change in between leaves this behind
+        let validity = self.update_validity(stmt, self.engine.schema_epoch());
+
         // Validate pattern
         let where_clause = stmt.where_clause.as_ref()?;
         if !stmt.returning.is_empty() || stmt.with.is_some() {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
         let table_name = &stmt.table_name.value_lower;
-        // Read before the schema: a change in between leaves this epoch behind
-        let cached_epoch = self.engine.schema_epoch();
         let (schema, token) = match self.engine.get_version_store(table_name) {
             Ok(store) => store.schema_and_token(),
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
@@ -648,7 +665,7 @@ impl Executor {
 
         let pk_indices = schema.primary_key_indices();
         if pk_indices.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
         let pk_idx = pk_indices[0];
@@ -673,7 +690,7 @@ impl Executor {
         if !schema.foreign_keys.is_empty()
             || !super::foreign_key::find_referencing_fks(&self.engine, table_name).is_empty()
         {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -694,7 +711,7 @@ impl Executor {
                 Err(_) => true,
             };
             if checked {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         }
@@ -704,7 +721,7 @@ impl Executor {
             match self.extract_pk_equality_value(where_clause, pk_column, ctx) {
                 Some(v) => v,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
             };
@@ -717,7 +734,7 @@ impl Executor {
             let col_idx = match col_map.get(col_lower.as_str()) {
                 Some(&idx) => idx,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
             };
@@ -726,7 +743,7 @@ impl Executor {
             let value_source = match self.extract_value_source(expr, schema.column_names_owned()) {
                 Some(s) => s,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
             };
@@ -746,7 +763,7 @@ impl Executor {
             pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
             updates: compiled_updates,
-            cached_epoch,
+            validity,
             token,
         };
 
@@ -773,11 +790,15 @@ impl Executor {
 
         // Double-check after acquiring lock
         match &*compiled_guard {
-            CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
+            CompiledExecution::NotOptimizable(validity)
+                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
+            {
                 return None
             }
             CompiledExecution::PkDelete(delete)
-                if self.engine.schema_epoch() == delete.cached_epoch =>
+                if delete
+                    .validity
+                    .holds(&*self.engine, self.engine.schema_epoch()) =>
             {
                 let pk_value = self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
                 return or_normal_path(self.execute_compiled_pk_delete(delete, pk_value, in_txn));
@@ -788,27 +809,28 @@ impl Executor {
             _ => return None,
         }
 
+        // Read before the schema: a change in between leaves this behind
+        let validity = self.delete_validity(stmt, self.engine.schema_epoch());
+
         // Validate pattern
         let where_clause = stmt.where_clause.as_ref()?;
         if !stmt.returning.is_empty() || stmt.with.is_some() {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
         let table_name = &stmt.table_name.value_lower;
-        // Read before the schema: a change in between leaves this epoch behind
-        let cached_epoch = self.engine.schema_epoch();
         let (schema, token) = match self.engine.get_version_store(table_name) {
             Ok(store) => store.schema_and_token(),
             Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                *compiled_guard = CompiledExecution::NotOptimizable(validity);
                 return None;
             }
         };
 
         let pk_indices = schema.primary_key_indices();
         if pk_indices.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
         let pk_idx = pk_indices[0];
@@ -816,7 +838,7 @@ impl Executor {
 
         // Bail if this table is referenced by child tables (FK enforcement needed)
         if !super::foreign_key::find_referencing_fks(&self.engine, table_name).is_empty() {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            *compiled_guard = CompiledExecution::NotOptimizable(validity);
             return None;
         }
 
@@ -825,7 +847,7 @@ impl Executor {
             match self.extract_pk_equality_value(where_clause, pk_column, ctx) {
                 Some(v) => v,
                 None => {
-                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
                     return None;
                 }
             };
@@ -836,7 +858,7 @@ impl Executor {
             schema: CompactArc::new((*schema).clone()),
             pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
-            cached_epoch,
+            validity,
             token,
         };
 

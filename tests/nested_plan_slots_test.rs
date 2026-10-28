@@ -208,6 +208,21 @@ fn a_join_a_statement_runs_as_a_part_runs_as_blocks_and_run_again_compiles_nothi
 }
 
 #[test]
+fn create_table_as_a_join_runs_it_as_blocks_and_made_again_compiles_nothing() {
+    let _guard = serial();
+    let db = setup("create_table_as");
+    let create = format!("CREATE TABLE c AS {JOIN}");
+    let hit = hits();
+    db.execute(&create, ()).unwrap();
+    assert_eq!(hits(), hit, "ran a general path mechanism");
+    assert_eq!(rows(&db, "SELECT * FROM c"), rows(&db, JOIN));
+    db.execute("DROP TABLE c", ()).unwrap();
+    let before = compiles();
+    db.execute(&create, ()).unwrap();
+    assert_eq!(compiles(), before, "made again, it compiles nothing");
+}
+
+#[test]
 fn a_nested_join_over_a_table_made_again_reads_its_columns_as_they_now_are() {
     let _guard = serial();
     let mut wrong = Vec::new();
