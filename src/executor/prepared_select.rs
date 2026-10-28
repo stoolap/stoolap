@@ -18,7 +18,7 @@
 //! parameterised scan whose outer reads fill parameter slots.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -3199,6 +3199,9 @@ pub struct PreparedSelect {
     /// The WHERE holds no subquery and a term that is a statement constant,
     /// which a run reads to tell whether it keeps no row
     constant_where: bool,
+    /// The statement prepared without the WHERE's run slots, which a run
+    /// whose slot fails runs instead, so the value fails where a row reaches it
+    unslotted: OnceLock<Arc<PreparedSelect>>,
 }
 
 /// What a plan takes of a statement prepared over one table: the primary
@@ -4155,6 +4158,9 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
+    /// A value a WHERE tests a column against is a run slot; without, it
+    /// stays in the program that reads it, read only when a row needs it
+    slots: bool,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -6488,6 +6494,21 @@ impl PreparedSelect {
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
+        let at = (param_count, epoch);
+        Self::prepare_with(executor, ctx, stmt, schema, scope_name, at, true)
+    }
+
+    /// [`Self::prepare`], with the WHERE's run slots or, without `slots`,
+    /// each WHERE value read where a row asks it
+    fn prepare_with(
+        executor: &Executor,
+        ctx: &ExecutionContext,
+        stmt: &SelectStatement,
+        schema: &Schema,
+        scope_name: &SmartString,
+        (param_count, epoch): (usize, u64),
+        slots: bool,
+    ) -> Result<Self> {
         let registry = &executor.function_registry;
         let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
@@ -6499,6 +6520,7 @@ impl PreparedSelect {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            slots,
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -6666,6 +6688,7 @@ impl PreparedSelect {
                 .where_clause
                 .as_deref()
                 .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w)),
+            unslotted: OnceLock::new(),
         })
     }
 }
@@ -6827,6 +6850,7 @@ impl PreparedGrouped {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: true,
+            slots: true,
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -7506,6 +7530,7 @@ impl PreparedDml {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            slots: true,
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -7889,6 +7914,7 @@ impl JoinBlocks {
             subqueries: Vec::new(),
             max_param: 0,
             keeps_holes: false,
+            slots: true,
         };
         // A side read as rows keeps the conditions its read asks: those
         // without a block, which the read takes, and those whose blocks bind
@@ -8766,18 +8792,18 @@ fn mentions_subquery(expr: &Expression) -> bool {
     }
 }
 
-/// Whether `expr` reads a statement parameter
-fn mentions_parameter(expr: &Expression) -> bool {
-    match expr {
-        Expression::Parameter(_) => true,
-        other => {
-            let mut found = false;
-            let _ = for_each_child(other, &mut |child| {
-                found |= mentions_parameter(child);
-                Ok(())
-            });
-            found
-        }
+/// The statement a set operation's first branch prepares: the whole one
+/// reads the rest
+fn first_branch(stmt: &SelectStatement) -> std::borrow::Cow<'_, SelectStatement> {
+    match stmt.set_operations.is_empty() {
+        true => std::borrow::Cow::Borrowed(stmt),
+        false => std::borrow::Cow::Owned(SelectStatement {
+            set_operations: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            ..stmt.clone()
+        }),
     }
 }
 
@@ -9038,10 +9064,9 @@ impl Builder<'_> {
 
     /// A value a conjunct tests its column against, rewritten: one that
     /// reads no row, is more than a literal and is not volatile is a run
-    /// slot, computed once per run so the scan can take it. A value of
-    /// literals alone whose computation fails stays in the row's program,
-    /// raised only for a row that reaches it; so does a `nested` value's
-    /// block, which runs only for a row that needs it
+    /// slot, computed once per run so the scan can take it. A `nested`
+    /// value's block stays in the row's program, run only for a row that
+    /// needs it
     fn conjunct_value(
         &mut self,
         chain: &Chain<'_>,
@@ -9052,17 +9077,11 @@ impl Builder<'_> {
     ) -> Result<Expression> {
         let mut value_work = Rewritten::default();
         let rewritten = self.rewrite(chain, None, value, &mut value_work)?;
-        let computes = || match mentions_subquery(value) {
-            true => !nested,
-            false => {
-                mentions_parameter(value)
-                    || super::expression::evaluate_once(value, Some(self.ctx)).is_ok()
-            }
-        };
-        if !value_work.reads_row
+        if self.slots
+            && !value_work.reads_row
             && !is_leaf(value)
             && !volatile(value, &self.executor.function_registry)
-            && computes()
+            && !(nested && mentions_subquery(value))
         {
             let slot = self.slot();
             run_slots.push((slot, rewritten));
@@ -9215,6 +9234,31 @@ impl Executor {
         Ok(table)
     }
 
+    /// `prepared`'s statement without the WHERE's run slots, prepared once
+    fn unslotted(
+        &self,
+        prepared: &PreparedSelect,
+        stmt: &SelectStatement,
+        schema: &Schema,
+        scope_name: &SmartString,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<PreparedSelect>> {
+        if let Some(unslotted) = prepared.unslotted.get() {
+            return Ok(Arc::clone(unslotted));
+        }
+        let at = (prepared.blocks.param_count, prepared.validity.epoch());
+        let unslotted = Arc::new(PreparedSelect::prepare_with(
+            self,
+            ctx,
+            &first_branch(stmt),
+            schema,
+            scope_name,
+            at,
+            false,
+        )?);
+        Ok(Arc::clone(prepared.unslotted.get_or_init(|| unslotted)))
+    }
+
     /// The plan's prepared statement, prepared now over the source `schema`
     /// gives when the plan holds none for this schema, these `columns` and
     /// this parameter count
@@ -9245,25 +9289,10 @@ impl Executor {
                 }
             }
         }
-        // A set operation's first branch: the whole one reads the rest
-        let branch;
-        let stmt = match stmt.set_operations.is_empty() {
-            true => stmt,
-            false => {
-                branch = SelectStatement {
-                    set_operations: Vec::new(),
-                    order_by: Vec::new(),
-                    limit: None,
-                    offset: None,
-                    ..stmt.clone()
-                };
-                &branch
-            }
-        };
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
             ctx,
-            stmt,
+            &first_branch(stmt),
             &schema(),
             scope_name,
             ctx.params().len(),
@@ -9689,6 +9718,7 @@ impl Executor {
             StatementSource::Values(_, values) => values.rows.len(),
             StatementSource::Cte((_, rows)) => rows.len(),
         };
+        let unslotted;
         let mut runner = PreparedRunner::new(
             self,
             &prepared.blocks,
@@ -9699,12 +9729,48 @@ impl Executor {
             Some(statement_rows),
             statement_limit,
         );
-        if !prepared.blocks.run_slots.is_empty() {
-            let values = runner.run_slot_values()?;
-            for (slot, value) in values {
-                runner.base[slot] = value;
+        let failed = !prepared.blocks.run_slots.is_empty()
+            && match runner.run_slot_values() {
+                Ok(values) => {
+                    for (slot, value) in values {
+                        runner.base[slot] = value;
+                    }
+                    false
+                }
+                Err(Error::QueryCancelled) => return Err(Error::QueryCancelled),
+                Err(_) => true,
+            };
+        // A run slot that fails runs the statement with each WHERE value in
+        // the program that reads it, failing only for a row that reaches it
+        let prepared: &PreparedSelect = match failed {
+            false => &prepared,
+            true => {
+                drop(runner);
+                unslotted = self.unslotted(&prepared, stmt, &schema(), scope_name, ctx)?;
+                let inner_ctx = ctx.with_incremented_query_depth();
+                let tables =
+                    PreparedRunner::open_tables(self, &unslotted.blocks, &inner_ctx, None)?
+                        .ok_or_else(|| {
+                            Error::internal(
+                                "a table's columns changed while the statement prepared",
+                            )
+                        })?;
+                runner = PreparedRunner::new(
+                    self,
+                    &unslotted.blocks,
+                    &unslotted.holes,
+                    ctx,
+                    inner_ctx,
+                    tables,
+                    Some(statement_rows),
+                    statement_limit,
+                );
+                for (slot, value) in runner.run_slot_values()? {
+                    runner.base[slot] = value;
+                }
+                &unslotted
             }
-        }
+        };
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
         let output_columns = CompactArc::clone(&prepared.output_columns);
         // Every value of a VALUES list is evaluated, as the general path does

@@ -144,6 +144,44 @@ fn a_failing_value_fails_only_for_a_row_that_reaches_it() {
 }
 
 #[test]
+fn a_failing_parameter_or_subquery_fails_only_where_a_row_reaches_it() {
+    let db = table("planned_failing_parameter");
+    db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
+    let answer = |sql: &str| {
+        db.query(sql, ("a",))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map(|rows| rows.len())
+    };
+    for (sql, want) in [
+        ("SELECT id FROM t WHERE FALSE AND id IN (ABS($1))", 0),
+        ("SELECT id FROM t WHERE v > 0 OR v = ABS($1)", 3),
+        (
+            "SELECT id FROM t WHERE id > 100 AND v BETWEEN ABS($1) AND 3",
+            0,
+        ),
+        (
+            "SELECT id FROM t WHERE id > 100 AND v = (SELECT v FROM t)",
+            0,
+        ),
+        (
+            "SELECT id FROM t WHERE id > 100 AND v IN ((SELECT v FROM t), 2)",
+            0,
+        ),
+    ] {
+        for run in 0..2 {
+            assert_eq!(answer(sql).ok(), Some(want), "{sql}, run {run}");
+        }
+    }
+    for sql in [
+        "SELECT id FROM t WHERE v = ABS($1)",
+        "SELECT id FROM t WHERE v < 0 OR v = ABS($1)",
+        "SELECT id FROM t WHERE v = (SELECT v FROM t)",
+    ] {
+        assert!(answer(sql).is_err(), "{sql} reached its value and answered");
+    }
+}
+
+#[test]
 fn computed_values_under_an_or_are_read_by_the_index() {
     let db = table("planned_computed_or");
     db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
