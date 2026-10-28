@@ -49,15 +49,6 @@ impl<'a> Stack<'a> {
         Self(SmallVec::new())
     }
 
-    /// Room for `depth` values, taken on the heap only past the inline
-    /// capacity; done in place, since moving a stack copies its inline buffer
-    #[inline(always)]
-    fn reserve(&mut self, depth: usize) {
-        if depth > STACK_INLINE_CAPACITY {
-            self.0.reserve_exact(depth);
-        }
-    }
-
     #[inline]
     fn push(&mut self, value: Value) {
         self.0.push(Cow::Owned(value));
@@ -569,7 +560,6 @@ impl ExprVM {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::program_ran(program);
         let mut stack = Stack::new();
-        stack.reserve(program.max_stack_depth());
 
         let ops = program.ops();
         if ops.is_empty() {

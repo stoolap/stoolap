@@ -75,3 +75,12 @@ fn an_in_list_of_columns_runs_without_allocating() {
     let predicate = format!("c0 IN ({})", members.join(", "));
     assert_eq!(runs(&predicate), 0, "{predicate}");
 }
+
+#[test]
+fn a_case_of_many_arms_runs_without_allocating() {
+    let arms: Vec<String> = (1..=16)
+        .map(|i| format!("WHEN c0 = {i} THEN {i}"))
+        .collect();
+    let predicate = format!("CASE {} ELSE 0 END = 0", arms.join(" "));
+    assert_eq!(runs(&predicate), 0, "{predicate}");
+}

@@ -36,9 +36,6 @@ pub struct Program {
     /// The operation sequence
     ops: Vec<Op>,
 
-    /// Maximum stack depth needed (for pre-allocation)
-    max_stack_depth: usize,
-
     /// Whether this program needs outer row context (correlated subquery)
     needs_outer_context: bool,
 
@@ -69,7 +66,6 @@ impl Program {
         // Apply peephole optimizations
         let ops = Self::peephole_optimize(ops, &mut folds);
 
-        let max_stack_depth = Self::compute_stack_depth(&ops);
         let needs_outer_context = ops.iter().any(|op| matches!(op, Op::LoadOuterColumn(_)));
         let needs_second_row = ops.iter().any(|op| matches!(op, Op::LoadColumn2(_)));
         let has_subqueries = ops.iter().any(|op| {
@@ -87,7 +83,6 @@ impl Program {
 
         Self {
             ops,
-            max_stack_depth,
             needs_outer_context,
             needs_second_row,
             has_subqueries,
@@ -104,7 +99,6 @@ impl Program {
     /// Create a new program without peephole optimization.
     /// Use this for testing or when optimization is not desired.
     pub fn new_unoptimized(ops: Vec<Op>) -> Self {
-        let max_stack_depth = Self::compute_stack_depth(&ops);
         let needs_outer_context = ops.iter().any(|op| matches!(op, Op::LoadOuterColumn(_)));
         let needs_second_row = ops.iter().any(|op| matches!(op, Op::LoadColumn2(_)));
         let has_subqueries = ops.iter().any(|op| {
@@ -122,7 +116,6 @@ impl Program {
 
         Self {
             ops,
-            max_stack_depth,
             needs_outer_context,
             needs_second_row,
             has_subqueries,
@@ -431,12 +424,6 @@ impl Program {
         &self.ops
     }
 
-    /// Get the maximum stack depth needed
-    #[inline]
-    pub fn max_stack_depth(&self) -> usize {
-        self.max_stack_depth
-    }
-
     /// Check if this program needs outer row context
     #[inline]
     pub fn needs_outer_context(&self) -> bool {
@@ -467,169 +454,6 @@ impl Program {
         self.ops.is_empty()
     }
 
-    /// Compute the maximum stack depth needed for a sequence of operations
-    fn compute_stack_depth(ops: &[Op]) -> usize {
-        let mut depth: i32 = 0;
-        let mut max_depth: i32 = 0;
-
-        for op in ops {
-            // Calculate stack effect of each operation
-            let effect = match op {
-                // Push operations (+1)
-                Op::LoadColumn(_)
-                | Op::LoadColumn2(_)
-                | Op::LoadOuterColumn(_)
-                | Op::LoadConst(_)
-                | Op::LoadParam(_)
-                | Op::LoadNull(_)
-                | Op::LoadAggregateResult(_)
-                | Op::LoadTransactionId
-                | Op::Dup
-                // Fused compare ops: push 1 (load + compare in single op)
-                | Op::EqColumnConst(_, _)
-                | Op::NeColumnConst(_, _)
-                | Op::LtColumnConst(_, _)
-                | Op::LeColumnConst(_, _)
-                | Op::GtColumnConst(_, _)
-                | Op::GeColumnConst(_, _)
-                // More fused ops: push 1
-                | Op::IsNullColumn(_)
-                | Op::IsNotNullColumn(_)
-                | Op::LikeColumn(_, _)
-                | Op::InSetColumn(_, _)
-                | Op::BetweenColumnConst(_, _, _)
-                // A subquery's value or existence: push 1
-                | Op::ExecScalarSubquery(_)
-                | Op::ExecExists(_) => 1,
-
-                // Pop 2, push 1 (-1)
-                Op::Eq
-                | Op::Ne
-                | Op::Lt
-                | Op::Le
-                | Op::Gt
-                | Op::Ge
-                | Op::IsDistinctFrom
-                | Op::IsNotDistinctFrom
-                | Op::AndFinalize
-                | Op::OrFinalize
-                | Op::Add
-                | Op::Sub
-                | Op::Mul
-                | Op::Div
-                | Op::Mod
-                | Op::BitAnd
-                | Op::BitOr
-                | Op::BitXor
-                | Op::Shl
-                | Op::Shr
-                | Op::Concat
-                | Op::Xor
-                | Op::NullIf
-                | Op::CaseCompare => -1,
-
-                // Pop 3, push 1 (-2)
-                Op::Between | Op::NotBetween | Op::LikeDynamicEscapeExpr(_) => -2,
-                // Pop the value and its items, push 1
-                Op::InList(count) => -i32::try_from(*count).unwrap_or(i32::MAX),
-                // Pop the factors (and the timestamp), push 1
-                Op::ScaleInterval(_, count) => 1 - i32::from(*count),
-                Op::TimestampAddScaledInterval(_, _, count) => -i32::from(*count),
-
-                // Dynamic pattern ops: Pop 2, push 1 (-1)
-                Op::LikeDynamic(_)
-                | Op::LikeDynamicEscape(_, _)
-                | Op::GlobDynamic
-                | Op::RegexpDynamic
-                // JSON/Timestamp binary ops: Pop 2, push 1 (-1)
-                | Op::JsonAccess
-                | Op::JsonAccessText
-                | Op::TimestampAddInterval
-                | Op::TimestampSubInterval
-                | Op::TimestampDiff
-                | Op::TimestampAddDays
-                | Op::TimestampSubDays
-                | Op::VectorDistanceL2
-                | Op::VectorDistanceCosine
-                | Op::VectorDistanceIP => -1,
-
-                // Transform (0) - pop 1, push 1
-                Op::IsNull
-                | Op::IsNotNull
-                | Op::IsTrue
-                | Op::IsNotTrue
-                | Op::IsFalse
-                | Op::IsNotFalse
-                | Op::Not
-                | Op::Neg
-                | Op::BitNot
-                | Op::Like(_)
-                | Op::LikeEscape(_, _)
-                | Op::Glob(_)
-                | Op::Regexp(_)
-                | Op::InSet(_)
-                | Op::NotInSet(_)
-                | Op::QuantifiedSet(_)
-                | Op::Cast(_)
-                | Op::ReadAsColumn(_)
-                | Op::TruncateToDate
-                | Op::ExecInSubquery(_)
-                | Op::ExecQuantified(_, _, _)
-                | Op::NativeFn1(_) => 0,
-
-                // Multi-column IN: pop N, push 1
-                Op::InTupleSet { tuple_size, .. } => 1 - (*tuple_size as i32),
-                // Two rows: pop 2N, push 1
-                Op::CompareRows(_, width) | Op::RowsDistinct(_, width) => 1 - 2 * i32::from(*width),
-                // A row tested against a block: pop N, push 1
-                Op::ExecRowMembers(_, width) => 1 - i32::from(*width),
-                // A row and its list: pop N (K + 1), push 1
-                Op::InRows(width, count) => {
-                    let values = u64::from(*width) * (u64::from(*count) + 1);
-                    1 - i32::try_from(values).unwrap_or(i32::MAX)
-                }
-
-                // Pop only (-1)
-                Op::Pop => -1,
-
-                // Conditionals (no change to depth calculation)
-                Op::And(_) | Op::Or(_) => 0,
-
-                // Function calls: pop N, push 1
-                Op::CallScalar { arg_count, .. } => 1 - (*arg_count as i32),
-                Op::Coalesce(n) | Op::Greatest(n) | Op::Least(n) | Op::ConcatN(n) => {
-                    1 - (*n as i32)
-                }
-
-                // Control flow (no stack effect for depth calculation)
-                Op::Jump(_)
-                | Op::JumpIfTrue(_)
-                | Op::JumpIfFalse(_)
-                | Op::JumpIfNull(_)
-                | Op::JumpIfNotNull(_)
-                | Op::PopJumpIfTrue(_)
-                | Op::PopJumpIfFalse(_)
-                | Op::Swap
-                | Op::Nop
-                | Op::Return
-                | Op::ReturnTrue
-                | Op::ReturnFalse
-                | Op::ReturnNull(_)
-                | Op::CaseStart
-                | Op::CaseWhen(_)
-                | Op::CaseThen(_)
-                | Op::CaseElse
-                | Op::CaseEnd => 0,
-            };
-
-            depth += effect;
-            max_depth = max_depth.max(depth);
-        }
-
-        // Ensure at least 1 for safety
-        (max_depth as usize).max(1)
-    }
-
     /// Disassemble the program for debugging
     pub fn disassemble(&self) -> String {
         let mut result = String::new();
@@ -645,8 +469,6 @@ impl Program {
         let mut folds = self.binding.take().map(|b| b.folds).unwrap_or_default();
         self.ops = Self::peephole_optimize(self.ops, &mut folds);
         self.binding = Binding::of(&self.ops, folds);
-        // Recalculate metadata after optimization
-        self.max_stack_depth = Self::compute_stack_depth(&self.ops);
         self
     }
 
@@ -867,7 +689,6 @@ impl std::fmt::Debug for Program {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Program")
             .field("ops_count", &self.ops.len())
-            .field("max_stack_depth", &self.max_stack_depth)
             .field("needs_outer_context", &self.needs_outer_context)
             .field("needs_second_row", &self.needs_second_row)
             .field("has_subqueries", &self.has_subqueries)
@@ -1026,69 +847,6 @@ mod tests {
         let prog = Program::always_false();
         assert_eq!(prog.len(), 1);
         assert!(matches!(prog.ops()[0], Op::ReturnFalse));
-    }
-
-    // =========================================================================
-    // Stack depth calculation
-    // =========================================================================
-
-    #[test]
-    fn test_stack_depth_simple() {
-        // LoadConst pushes 1, Return pops and returns
-        let prog = Program::new_unoptimized(vec![Op::LoadConst(Value::Integer(1)), Op::Return]);
-        assert_eq!(prog.max_stack_depth(), 1);
-    }
-
-    #[test]
-    fn test_stack_depth_binary_op() {
-        // LoadConst (+1), LoadConst (+1), Add (-1) = max 2
-        let prog = Program::new_unoptimized(vec![
-            Op::LoadConst(Value::Integer(1)),
-            Op::LoadConst(Value::Integer(2)),
-            Op::Add,
-            Op::Return,
-        ]);
-        assert_eq!(prog.max_stack_depth(), 2);
-    }
-
-    #[test]
-    fn test_stack_depth_nested() {
-        // (1 + 2) * (3 + 4)
-        // Load 1, Load 2, Add, Load 3, Load 4, Add, Mul
-        let prog = Program::new_unoptimized(vec![
-            Op::LoadConst(Value::Integer(1)),
-            Op::LoadConst(Value::Integer(2)),
-            Op::Add,
-            Op::LoadConst(Value::Integer(3)),
-            Op::LoadConst(Value::Integer(4)),
-            Op::Add,
-            Op::Mul,
-            Op::Return,
-        ]);
-        // Stack trace: 1, 2, 1, 2, 3, 2, 1
-        // Max is 3 (after loading 3rd value before second add)
-        assert!(prog.max_stack_depth() >= 2);
-    }
-
-    #[test]
-    fn test_stack_depth_fused_ops() {
-        // Fused ops push 1
-        let prog =
-            Program::new_unoptimized(vec![Op::EqColumnConst(0, Value::Integer(5)), Op::Return]);
-        assert_eq!(prog.max_stack_depth(), 1);
-    }
-
-    #[test]
-    fn test_stack_depth_between() {
-        // Between pops 3, pushes 1
-        let prog = Program::new_unoptimized(vec![
-            Op::LoadColumn(0),
-            Op::LoadConst(Value::Integer(1)),
-            Op::LoadConst(Value::Integer(10)),
-            Op::Between,
-            Op::Return,
-        ]);
-        assert_eq!(prog.max_stack_depth(), 3);
     }
 
     // =========================================================================
@@ -1262,8 +1020,7 @@ mod tests {
     fn test_builder_default() {
         let builder: ProgramBuilder = Default::default();
         let prog = builder.build();
-        // Empty program still has max_stack_depth of 1
-        assert_eq!(prog.max_stack_depth(), 1);
+        assert!(prog.is_empty());
     }
 
     // =========================================================================
@@ -1298,7 +1055,6 @@ mod tests {
         let debug_str = format!("{:?}", prog);
         assert!(debug_str.contains("Program"));
         assert!(debug_str.contains("ops_count"));
-        assert!(debug_str.contains("max_stack_depth"));
     }
 
     #[test]
