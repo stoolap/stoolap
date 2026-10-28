@@ -215,7 +215,7 @@ pub(crate) fn eval_default_slot(
 ) -> Result<Value> {
     Ok(match program {
         Some((Ok(program), target)) => vm
-            .execute_cow(program, exec_ctx)?
+            .execute(program, exec_ctx)?
             .try_into_coerce_to_type(*target)?,
         Some((Err(e), _)) => return Err(e.clone()),
         None => template_val.clone(),
@@ -468,7 +468,7 @@ pub(crate) fn run_check(
     check: &CompiledCheck,
     row: &Row,
 ) -> Result<()> {
-    let result = vm.execute_cow(&check.program, &super::expression::ExecuteContext::new(row))?;
+    let result = vm.execute(&check.program, &super::expression::ExecuteContext::new(row))?;
     let passes = match &result {
         Value::Boolean(b) => *b,
         Value::Null(_) => true,
@@ -728,7 +728,7 @@ impl Executor {
                     crate::test_failpoints::prepared_dml_site_ran(
                         crate::test_failpoints::PreparedDmlSite::InsertValues,
                     );
-                    answers.push(((row, at), vm.execute_cow(program, &exec)?));
+                    answers.push(((row, at), vm.execute(program, &exec)?));
                 }
             }
         }
@@ -1385,7 +1385,7 @@ impl Executor {
                     } else {
                         // Fall back to VM for complex expressions (Parameters, functions, etc.)
                         let program = compile_expression(expr, &[])?;
-                        vm.execute_cow(&program, &base_exec_ctx)?
+                        vm.execute(&program, &base_exec_ctx)?
                     };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
@@ -1593,7 +1593,7 @@ impl Executor {
                     } else {
                         // Fall back to VM for complex expressions (Parameters, functions, etc.)
                         let program = compile_expression(expr, &[])?;
-                        vm.execute_cow(&program, &base_exec_ctx)?
+                        vm.execute(&program, &base_exec_ctx)?
                     };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
@@ -2120,7 +2120,7 @@ impl Executor {
                             } else {
                                 // Fall back to VM evaluation for complex expressions
                                 let program = compile_expression(expr, &[])?;
-                                vm.execute_cow(&program, &base_exec_ctx)?
+                                vm.execute(&program, &base_exec_ctx)?
                             };
 
                             let target_type = column_types[value_pos];
@@ -3133,7 +3133,7 @@ impl Executor {
                                 crate::test_failpoints::PreparedDmlSite::UpdateSet,
                             );
                         }
-                        let v = vm.execute_cow(program, &exec_ctx)?;
+                        let v = vm.execute(program, &exec_ctx)?;
                         let coerced = v.coerce_to_type(*col_type);
                         validate_coercion(
                             &v,
@@ -4203,7 +4203,7 @@ impl Executor {
                 let mut updates = Vec::with_capacity(effective.compiled_updates.len());
                 for (idx, col_type, vec_dims, program) in &effective.compiled_updates {
                     let coerced = vm
-                        .execute_cow(program, &exec_ctx)?
+                        .execute(program, &exec_ctx)?
                         .try_into_coerce_to_type(*col_type)?;
                     // Validate vector dimensions
                     if *col_type == DataType::Vector && *vec_dims > 0 {
@@ -4436,7 +4436,7 @@ impl Executor {
                 let exec_ctx = run.context(&row);
                 let mut row_values = Vec::with_capacity(programs.len());
                 for program in &mut bound {
-                    row_values.push(vm.execute_cow(run.current(program), &exec_ctx)?);
+                    row_values.push(vm.execute(run.current(program), &exec_ctx)?);
                 }
                 result_rows.push((row_id as i64, Row::from_values(row_values)));
             }
@@ -4481,7 +4481,7 @@ impl Executor {
             let mut row_values = Vec::with_capacity(compiled_exprs.len());
             for program in &compiled_exprs {
                 // CRITICAL: Propagate errors instead of silently returning NULL
-                let value = vm.execute_cow(program, &exec_ctx)?;
+                let value = vm.execute(program, &exec_ctx)?;
                 row_values.push(value);
             }
             result_rows.push((row_id as i64, Row::from_values(row_values)));

@@ -826,7 +826,7 @@ impl CallInputs {
     ) -> Result<()> {
         if let Some(filter) = &self.filter {
             let vm = vm.get_or_insert_with(ExprVM::new);
-            if !matches!(vm.execute_cow(filter, row)?, Value::Boolean(true)) {
+            if !matches!(vm.execute(filter, row)?, Value::Boolean(true)) {
                 return Ok(());
             }
         }
@@ -834,7 +834,7 @@ impl CallInputs {
         let value = match &self.argument {
             Some(program) => {
                 let vm = vm.get_or_insert_with(ExprVM::new);
-                argument = vm.execute_cow(program, row).map_err(|e| {
+                argument = vm.execute(program, row).map_err(|e| {
                     crate::core::Error::expression_evaluation(format!(
                         "{}({}): {}",
                         agg.name, agg.column, e
@@ -851,7 +851,7 @@ impl CallInputs {
             let vm = vm.get_or_insert_with(ExprVM::new);
             let mut keys = Vec::with_capacity(self.order.len());
             for program in &self.order {
-                keys.push(vm.execute_cow(program, row)?);
+                keys.push(vm.execute(program, row)?);
             }
             state.accumulate_with_sort_key(value, keys);
         } else {
@@ -1063,7 +1063,7 @@ impl<'a> RowFeed<'a> {
                 KeyItem::Program(program) => state
                     .vm
                     .get_or_insert_with(ExprVM::new)
-                    .execute_cow(program, exec)?,
+                    .execute(program, exec)?,
                 KeyItem::Null => Value::null_unknown(),
             };
             state.key.push(value);
@@ -1953,9 +1953,7 @@ impl Executor {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
                     ColumnSource::Expression(_) => match &source_programs[src_idx] {
-                        Some(p) => {
-                            vm.execute_cow(p, &with_blocks(slot_context(&row, ctx), blocks))?
-                        }
+                        Some(p) => vm.execute(p, &with_blocks(slot_context(&row, ctx), blocks))?,
                         None => Value::null_unknown(),
                     },
                     ColumnSource::CorrelatedExpression(expr) => {
@@ -1993,7 +1991,7 @@ impl Executor {
                                     false,
                                     None,
                                 )?;
-                                vm.execute_cow(&program, &slot_context(&row, &correlated_ctx))
+                                vm.execute(&program, &slot_context(&row, &correlated_ctx))
                             });
 
                         // Take back map for reuse
