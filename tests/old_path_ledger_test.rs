@@ -358,6 +358,17 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "join_inside_a_cte_its_limit_cuts",
+        "WITH c (a, n) AS (SELECT t.a, COUNT(*) FROM t JOIN u ON u.id = t.id \
+         WHERE t.b > (SELECT MIN(x) FROM u) GROUP BY t.a) \
+         SELECT c.a, u.x FROM c LEFT JOIN u ON u.id = c.a AND u.x < (SELECT MAX(x) FROM u) \
+         ORDER BY c.a LIMIT 2",
+        "WITH c (a, n) AS (SELECT t.a, COUNT(*) FROM t JOIN u ON u.id = t.id \
+         WHERE t.b > 1 GROUP BY t.a) \
+         SELECT c.a, u.x FROM c LEFT JOIN u ON u.id = c.a AND u.x < 3 ORDER BY c.a LIMIT 2",
+        Prepared,
+    ),
+    (
         "join_with_a_subquery_in_its_select_list",
         "SELECT t.id, (SELECT MAX(x) FROM u) FROM t JOIN u v ON v.id = t.a",
         "SELECT t.id, 3 FROM t JOIN u v ON v.id = t.a",
