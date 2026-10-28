@@ -362,10 +362,14 @@ impl<'a> ExecuteContext<'a> {
     }
 }
 
-/// `value`, slot `index`'s, or the error the slot failed with
+/// `value`, slot `index`'s, or the error the slot failed with; a failed
+/// slot holds NULL, so a value that is not NULL never searches `failed`
 #[cold]
 #[inline(never)]
 fn read_failed<'a>(failed: &[(usize, Error)], index: usize, value: &'a Value) -> Result<&'a Value> {
+    if !value.is_null() {
+        return Ok(value);
+    }
     match failed.iter().find(|(slot, _)| *slot == index) {
         Some((_, e)) => Err(e.clone()),
         None => Ok(value),
