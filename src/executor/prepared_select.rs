@@ -63,7 +63,9 @@ use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_
 use super::prepared_join::{JoinSide, JoinSides};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
-use super::query::{has_constant_term, true_for_no_row, ColumnSource, OutputLayout};
+use super::query::{
+    any_constant_term, has_constant_term, true_for_no_row, ColumnSource, OutputLayout,
+};
 use super::query_cache::{CompiledExecution, NestedPlan, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
@@ -3175,6 +3177,9 @@ impl WhereParts {
     }
 }
 
+/// ORDER BY keys as output columns, each with its direction and NULLS order
+type OrderKeys = Vec<(Option<usize>, bool, Option<bool>)>;
+
 /// One statement shape compiled against its tables' columns
 #[derive(Debug)]
 pub struct PreparedSelect {
@@ -3194,6 +3199,9 @@ pub struct PreparedSelect {
     visible: usize,
     /// Where each output column comes from, for an ORDER BY to bind by
     layout: Option<CompactArc<OutputLayout>>,
+    /// Each ORDER BY key as the output column it sorts by, with its
+    /// direction and NULLS order; None when a key is no output column
+    order_keys: Option<OrderKeys>,
     /// The planner's decision for a statement that asks no block and takes
     /// no set; None leaves the table to choose how it reads
     plan: Option<Plan>,
@@ -3218,10 +3226,22 @@ impl PreparedSelect {
             .plan
             .as_ref()
             .filter(|plan| plan.read.scan().is_some())?;
-        let sort = plan.steps.contains(&Step::Sort).then(|| {
+        let keys = (!stmt.order_by.is_empty()).then(|| {
             let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
             keys.join(", ")
         });
+        let empty_unless = stmt
+            .where_clause
+            .as_deref()
+            .filter(|_| self.constant_where)
+            .map(|where_clause| {
+                let mut terms = Vec::new();
+                any_constant_term(where_clause, &mut |term| {
+                    terms.push(term.to_string());
+                    false
+                });
+                terms.join(" AND ")
+            });
         let offset = stmt
             .offset
             .as_deref()
@@ -3232,11 +3252,12 @@ impl PreparedSelect {
                 table,
                 limit: stmt.limit.as_deref().map(Expression::to_string),
                 offset,
-                sort,
+                keys,
                 names: &self.output_columns[..self.visible],
                 pushed: self.where_.pushdown.as_ref(),
                 ordered: Executor::ordered_read_column(stmt)
                     .map(|(column, ascending, _)| (column, ascending)),
+                empty_unless,
             }),
         )
     }
@@ -6625,6 +6646,22 @@ impl PreparedSelect {
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
         });
+        // Each ORDER BY key as the output column it sorts by, when every key is one
+        let order_keys = (!stmt.order_by.is_empty())
+            .then(|| {
+                let (mapped, _) =
+                    executor.order_by_columns(stmt, &output_columns, layout.as_deref(), false);
+                mapped
+                    .into_iter()
+                    .zip(&stmt.order_by)
+                    .map(|(column, ob)| column.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten();
+        let sort = match stmt.limit.is_some() && order_keys.is_some() {
+            true => Step::TopN,
+            false => Step::Sort,
+        };
         let mut where_ = parts.prepare(where_programs, &blocks, schema);
         let mut plan = None;
         if where_.sets.is_empty() && where_.narrowing.is_none() {
@@ -6655,7 +6692,7 @@ impl PreparedSelect {
                     steps.push(Step::Limit);
                 }
                 if ordered.is_none() && !stmt.order_by.is_empty() {
-                    steps.push(Step::Sort);
+                    steps.push(sort);
                 }
                 steps.push(Step::Project);
                 if where_.conjuncts > where_.pushed {
@@ -6665,6 +6702,7 @@ impl PreparedSelect {
                     Some(read) => Read::Ordered {
                         read,
                         otherwise: scan,
+                        sort,
                     },
                     None => Read::Scan(scan),
                 };
@@ -6683,6 +6721,7 @@ impl PreparedSelect {
             output_columns: CompactArc::new(output_columns),
             visible,
             layout,
+            order_keys,
             plan,
             constant_where: stmt
                 .where_clause
@@ -9800,15 +9839,7 @@ impl Executor {
         let order = (!read_in_order
             && !stmt.order_by.is_empty()
             && (limit.is_some() || projection.defers() && offset > 0))
-            .then(|| {
-                let layout = prepared.layout.as_deref();
-                let (mapped, _) = self.order_by_columns(stmt, &output_columns, layout, false);
-                mapped
-                    .into_iter()
-                    .zip(&stmt.order_by)
-                    .map(|(column, ob)| column.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
-                    .collect::<Option<Vec<_>>>()
-            })
+            .then(|| prepared.order_keys.clone())
             .flatten();
         // Keys that are source columns choose the rows before any is projected
         let source_column =

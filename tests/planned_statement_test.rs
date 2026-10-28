@@ -182,13 +182,57 @@ fn a_failing_parameter_or_subquery_fails_only_where_a_row_reaches_it() {
 }
 
 #[test]
+fn explain_names_each_read_a_run_may_take() {
+    let db = table("planned_explain_branches");
+    let explain = |sql: &str| -> Vec<String> {
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect()
+    };
+    for (sql, plan) in [
+        (
+            "SELECT id FROM t ORDER BY v LIMIT 2",
+            vec![
+                "Limit 2",
+                "  Project id",
+                "    TopK t v ASC",
+                "    else TopN v ASC",
+                "      SeqScan t",
+            ],
+        ),
+        (
+            "SELECT id FROM t ORDER BY v",
+            vec!["Sort v ASC", "  Project id", "    SeqScan t"],
+        ),
+        (
+            "SELECT id FROM t WHERE 1 = 0 AND v > 1",
+            vec![
+                "Project id",
+                "  Empty unless (1 = 0)",
+                "  else SeqScan t ((1 = 0) AND (v > 1))",
+            ],
+        ),
+    ] {
+        assert_eq!(explain(sql), plan, "{sql}");
+    }
+}
+
+#[test]
 fn a_count_read_per_run_takes_the_ordered_read() {
     let db = table("planned_count_per_run");
     for (sql, want, plan) in [
         (
             "SELECT id FROM t ORDER BY id LIMIT $1",
             vec![1, 2],
-            vec!["Limit $1", "  Project id", "    IndexOrder t id ASC"],
+            vec![
+                "Limit $1",
+                "  Project id",
+                "    IndexOrder t id ASC",
+                "    else TopK t id ASC",
+                "    else TopN id ASC",
+                "      SeqScan t",
+            ],
         ),
         (
             "SELECT id FROM t ORDER BY id DESC LIMIT (SELECT 1) OFFSET $1",
@@ -197,6 +241,9 @@ fn a_count_read_per_run_takes_the_ordered_read() {
                 "Limit (SELECT 1) offset $1",
                 "  Project id",
                 "    IndexOrder t id DESC",
+                "    else TopK t id DESC",
+                "    else TopN id DESC",
+                "      SeqScan t",
             ],
         ),
     ] {

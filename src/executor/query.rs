@@ -1132,31 +1132,35 @@ fn is_star_item(expr: &Expression) -> bool {
     matches!(expr, Expression::Star(_) | Expression::QualifiedStar(_))
 }
 
+/// Whether `each` holds for one of a WHERE's AND terms that is a statement
+/// constant, so no column reads as the text of its name; asked in order
+pub(crate) fn any_constant_term<'e>(
+    expr: &'e Expression,
+    each: &mut impl FnMut(&'e Expression) -> bool,
+) -> bool {
+    if let Expression::Infix(infix) = expr {
+        if infix.op_type == InfixOperator::And {
+            return any_constant_term(&infix.left, each) || any_constant_term(&infix.right, each);
+        }
+    }
+    statement_constant(expr, global_registry()) && each(expr)
+}
+
 /// Whether one of a WHERE's AND terms is a statement constant: only such a
 /// WHERE can be [`true_for_no_row`]
 pub(crate) fn has_constant_term(expr: &Expression) -> bool {
-    if let Expression::Infix(infix) = expr {
-        if infix.op_type == InfixOperator::And {
-            return has_constant_term(&infix.left) || has_constant_term(&infix.right);
-        }
-    }
-    statement_constant(expr, global_registry())
+    any_constant_term(expr, &mut |_| true)
 }
 
-/// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
-/// constant, so no column reads as the text of its name, that evaluates to
-/// false or NULL
+/// Whether a WHERE `expr` keeps no row: one of its constant AND terms
+/// evaluates to false or NULL
 pub(crate) fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
-    if let Expression::Infix(infix) = expr {
-        if infix.op_type == InfixOperator::And {
-            return true_for_no_row(&infix.left, ctx) || true_for_no_row(&infix.right, ctx);
-        }
-    }
-    statement_constant(expr, global_registry())
-        && matches!(
-            super::expression::evaluate_once(expr, Some(ctx)),
+    any_constant_term(expr, &mut |term| {
+        matches!(
+            super::expression::evaluate_once(term, Some(ctx)),
             Ok(Value::Boolean(false) | Value::Null(_))
         )
+    })
 }
 
 /// The side an index join probes, given what the right table offers

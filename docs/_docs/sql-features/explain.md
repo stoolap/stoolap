@@ -182,7 +182,7 @@ Sort value DESC
     SeqScan products
 ```
 
-Under a LIMIT, an ORDER BY of one column reads the rows in that order instead of sorting them all: through the column's index or the primary key (`IndexOrder`), from a lower bound on the primary key (`Keyset`), or by the table's top-k scan (`TopK`):
+Under a LIMIT, an ORDER BY of one column reads the rows in that order instead of sorting them all: through the column's index or the primary key (`IndexOrder`), from a lower bound on the primary key (`Keyset`), or by the table's top-k scan (`TopK`). A run the table cannot answer that way takes the next line after `else`: the top-k scan, then a `TopN` over the read beneath it, which keeps only the rows the LIMIT keeps:
 
 ```sql
 EXPLAIN SELECT * FROM products ORDER BY value DESC LIMIT 5;
@@ -196,12 +196,19 @@ plan
 Limit 5
   Project id, name, category, value
     IndexOrder products value DESC
+    else TopK products value DESC
+    else TopN value DESC
+      SeqScan products
 
 plan
 ----
 Limit 5
   Project id, name, category, value
     Keyset products id ASC (id > 1)
+    else TopK products id ASC (id > 1)
+    else TopN id ASC
+      IndexScan products (id > 1)
+        Index __pk_products_id (id range)
 ```
 
 A LIMIT or OFFSET given as a parameter or a subquery is read on each run and takes the same plan; EXPLAIN shows it as written:
@@ -217,6 +224,25 @@ plan
 Limit $1
   Project id, name, category, value
     IndexOrder products value DESC
+    else TopK products value DESC
+    else TopN value DESC
+      SeqScan products
+```
+
+A WHERE with a term that reads no column, such as a parameter or a literal comparison, reads no row on a run where that term is not true:
+
+```sql
+EXPLAIN SELECT * FROM products WHERE 1 = 0 AND value > 15;
+```
+
+Output:
+```
+plan
+----
+Project id, name, category, value
+  Empty unless (1 = 0)
+  else IndexScan products ((1 = 0) AND (value > 15))
+    Index idx_value (value range)
 ```
 
 ## EXPLAIN ANALYZE
@@ -274,9 +300,13 @@ For a planned single-table SELECT:
 | PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
 | Intersect, Union | The rows every index under it names, or any of them names |
 | IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row |
+| Empty unless | The WHERE's terms that read no column; a run where they are not true reads no row |
+| else | The read a run takes when the table cannot answer the line above it |
 | Filter | The part of the WHERE judged after the scan |
 | Project | The output columns |
-| Sort, Limit | The ORDER BY and the LIMIT and OFFSET |
+| TopN | The ORDER BY under a LIMIT, keeping only the rows the LIMIT keeps |
+| Sort | The ORDER BY over every row |
+| Limit | The LIMIT and OFFSET |
 
 For other statements:
 
