@@ -119,3 +119,44 @@ fn computed_members_and_bounds_are_read_by_the_index() {
         );
     }
 }
+
+#[test]
+fn a_failing_value_fails_only_for_a_row_that_reaches_it() {
+    let db = table("planned_failing_value");
+    db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE FALSE AND id IN (ABS('a'))",
+        "SELECT id FROM t WHERE FALSE AND v BETWEEN ABS('a') AND 3",
+        "SELECT id FROM t WHERE id > 100 AND v = ABS('a')",
+        "SELECT id FROM t WHERE id > 100 AND (v = 3 OR v IN (ABS('a')))",
+    ] {
+        assert_eq!(ids(&db, sql), Vec::<i64>::new(), "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM t WHERE v = ABS('a')",
+        "SELECT id FROM t WHERE v IN (1, ABS('a'))",
+    ] {
+        let answer = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+        assert!(answer.is_err(), "{sql} reached its value and answered");
+    }
+}
+
+#[test]
+fn computed_values_under_an_or_are_read_by_the_index() {
+    let db = table("planned_computed_or");
+    db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
+    let sql = "SELECT id FROM t WHERE v IN (0 + 1, 1 + 1) OR v = 3";
+    assert_eq!(ids(&db, sql), [1, 2, 3]);
+    let plan: Vec<String> = db
+        .query(&format!("EXPLAIN {sql}"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect();
+    assert!(
+        plan.iter().any(|line| line.trim_start() == "Union"),
+        "{sql} reads no index union:\n{}",
+        plan.join("\n")
+    );
+}

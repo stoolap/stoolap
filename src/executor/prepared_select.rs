@@ -8766,6 +8766,21 @@ fn mentions_subquery(expr: &Expression) -> bool {
     }
 }
 
+/// Whether `expr` reads a statement parameter
+fn mentions_parameter(expr: &Expression) -> bool {
+    match expr {
+        Expression::Parameter(_) => true,
+        other => {
+            let mut found = false;
+            let _ = for_each_child(other, &mut |child| {
+                found |= mentions_parameter(child);
+                Ok(())
+            });
+            found
+        }
+    }
+}
+
 /// The sides of the joined row `scope`, the left one its first `left_width`
 /// columns, that a subquery of `expr` reads: bit 0 the left, bit 1 the right
 fn sides_read_within(
@@ -8812,7 +8827,7 @@ impl Builder<'_> {
         let mut pushed = Vec::new();
         let mut set_tests = Vec::new();
         for (at, part) in parts.into_iter().enumerate() {
-            let part = self.statement_conjunct(chain, part, work, run_slots)?;
+            let part = self.statement_conjunct(chain, part, false, work, run_slots)?;
             let scanned =
                 !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema);
             if scanned {
@@ -8909,13 +8924,15 @@ impl Builder<'_> {
         binds
     }
 
-    /// A top-level conjunct of the statement's WHERE. The value a column
-    /// is compared with becomes a run slot when it reads no row, so the
-    /// scan can take the comparison; it may read uncorrelated subqueries
+    /// A top-level conjunct of the statement's WHERE, or with `nested` a
+    /// test under one. The value a column is compared with becomes a run
+    /// slot when it reads no row, so the scan can take the comparison; at
+    /// the top it may read uncorrelated subqueries
     fn statement_conjunct(
         &mut self,
         chain: &Chain<'_>,
         conjunct: &Expression,
+        nested: bool,
         work: &mut Rewritten,
         run_slots: &mut Vec<(usize, Expression)>,
     ) -> Result<Expression> {
@@ -8923,6 +8940,21 @@ impl Builder<'_> {
             Ok(matches!(chain.resolve(expr)?, Some((0, _))))
         };
         let infix = match conjunct {
+            // The tests under an OR, and the conjunctions under it, take
+            // their values as a top-level test does
+            Expression::Infix(infix)
+                if matches!(infix.op_type, InfixOperator::And | InfixOperator::Or) =>
+            {
+                let left = self.statement_conjunct(chain, &infix.left, true, work, run_slots)?;
+                let right = self.statement_conjunct(chain, &infix.right, true, work, run_slots)?;
+                return Ok(Expression::Infix(InfixExpression {
+                    token: infix.token.clone(),
+                    left: Box::new(left),
+                    operator: infix.operator.clone(),
+                    op_type: infix.op_type,
+                    right: Box::new(right),
+                }));
+            }
             Expression::Infix(infix) if is_comparison(infix.op_type) => infix,
             // A list's members and a range's bounds are values as a
             // comparison's is
@@ -8934,7 +8966,7 @@ impl Builder<'_> {
                 };
                 let mut values = Vec::with_capacity(members.len());
                 for member in members {
-                    values.push(self.conjunct_value(chain, member, work, run_slots)?);
+                    values.push(self.conjunct_value(chain, member, nested, work, run_slots)?);
                 }
                 let right = match list.right.as_ref() {
                     Expression::List(l) => Expression::List(Box::new(ListExpression {
@@ -8957,8 +8989,20 @@ impl Builder<'_> {
                 return Ok(Expression::Between(BetweenExpression {
                     token: between.token.clone(),
                     expr: Box::new(self.rewrite(chain, None, &between.expr, work)?),
-                    lower: Box::new(self.conjunct_value(chain, &between.lower, work, run_slots)?),
-                    upper: Box::new(self.conjunct_value(chain, &between.upper, work, run_slots)?),
+                    lower: Box::new(self.conjunct_value(
+                        chain,
+                        &between.lower,
+                        nested,
+                        work,
+                        run_slots,
+                    )?),
+                    upper: Box::new(self.conjunct_value(
+                        chain,
+                        &between.upper,
+                        nested,
+                        work,
+                        run_slots,
+                    )?),
                     not: between.not,
                 }));
             }
@@ -8971,7 +9015,7 @@ impl Builder<'_> {
             (false, true) => &infix.left,
             _ => return self.rewrite(chain, None, conjunct, work),
         };
-        let value = self.conjunct_value(chain, value, work, run_slots)?;
+        let value = self.conjunct_value(chain, value, nested, work, run_slots)?;
         let column = if column_left {
             &infix.left
         } else {
@@ -8994,19 +9038,31 @@ impl Builder<'_> {
 
     /// A value a conjunct tests its column against, rewritten: one that
     /// reads no row, is more than a literal and is not volatile is a run
-    /// slot, computed once per run so the scan can take it
+    /// slot, computed once per run so the scan can take it. A value of
+    /// literals alone whose computation fails stays in the row's program,
+    /// raised only for a row that reaches it; so does a `nested` value's
+    /// block, which runs only for a row that needs it
     fn conjunct_value(
         &mut self,
         chain: &Chain<'_>,
         value: &Expression,
+        nested: bool,
         work: &mut Rewritten,
         run_slots: &mut Vec<(usize, Expression)>,
     ) -> Result<Expression> {
         let mut value_work = Rewritten::default();
         let rewritten = self.rewrite(chain, None, value, &mut value_work)?;
+        let computes = || match mentions_subquery(value) {
+            true => !nested,
+            false => {
+                mentions_parameter(value)
+                    || super::expression::evaluate_once(value, Some(self.ctx)).is_ok()
+            }
+        };
         if !value_work.reads_row
             && !is_leaf(value)
             && !volatile(value, &self.executor.function_registry)
+            && computes()
         {
             let slot = self.slot();
             run_slots.push((slot, rewritten));
