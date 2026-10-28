@@ -27,18 +27,118 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan, IndexTerm, Term};
 use crate::storage::mvcc::VersionStore;
 use smallvec::SmallVec;
 
-/// How a plan finds its rows
+/// What the planner decided for one statement: its steps, outermost first,
+/// over its read of the table. EXPLAIN prints it and nothing else
 #[derive(Debug)]
-pub enum Access {
+pub struct Plan {
+    pub steps: SmallVec<[Step; 4]>,
+    pub read: Read,
+}
+
+/// A step over the rows of the one below it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The LIMIT and OFFSET
+    Limit,
+    /// The ORDER BY over every row
+    Sort,
+    Project,
+    /// The WHERE's conjuncts the read did not take
+    Filter,
+}
+
+/// How a plan reads its table; a scan without a choice is the table's to
+/// choose, as for a statement whose WHERE asks a block
+#[derive(Debug)]
+pub enum Read {
     /// The row the primary key equality names
     PkGet(PreparedComparison),
+    /// A scan, through the indexes the choice reads
+    Scan(Option<ScanChoice>),
+    /// The rows in ORDER BY order, or `otherwise` when the table declines
+    Ordered {
+        read: OrderedRead,
+        otherwise: Option<ScanChoice>,
+    },
+}
+
+impl Read {
+    /// The scan the plan chose, the fallback of an ordered read; None for a
+    /// key read or a scan the table chooses
+    pub fn scan(&self) -> Option<&ScanChoice> {
+        match self {
+            Self::PkGet(_) => None,
+            Self::Scan(scan)
+            | Self::Ordered {
+                otherwise: scan, ..
+            } => scan.as_ref(),
+        }
+    }
+
+    /// The ordered read, for a plan that reads in ORDER BY order
+    pub fn ordered(&self) -> Option<OrderedRead> {
+        match self {
+            Self::Ordered { read, .. } => Some(*read),
+            _ => None,
+        }
+    }
+}
+
+/// What EXPLAIN names a plan's steps and read by, as its statement writes them
+pub struct PlanText<'a> {
+    pub table: &'a str,
+    pub limit: Option<String>,
+    pub offset: Option<String>,
+    pub sort: Option<String>,
+    pub names: &'a [String],
+    /// The conjuncts the read takes
+    pub pushed: Option<&'a Expression>,
+    /// The ORDER BY column and direction of an ordered read
+    pub ordered: Option<(&'a str, bool)>,
+}
+
+impl Plan {
+    /// The plan as EXPLAIN shows it: each step indented under the one it
+    /// feeds, the read last
+    pub fn explain(&self, text: PlanText<'_>) -> Vec<String> {
+        let mut lines = Vec::new();
+        for step in &self.steps {
+            let line = match step {
+                Step::Limit => match (&text.limit, &text.offset) {
+                    (None, None) => continue,
+                    (Some(limit), None) => format!("Limit {limit}"),
+                    (None, Some(offset)) => format!("Offset {offset}"),
+                    (Some(limit), Some(offset)) => format!("Limit {limit} offset {offset}"),
+                },
+                Step::Sort => match &text.sort {
+                    Some(keys) => format!("Sort {keys}"),
+                    None => continue,
+                },
+                Step::Project => format!("Project {}", text.names.join(", ")),
+                Step::Filter => "Filter".to_string(),
+            };
+            lines.push(format!("{}{line}", "  ".repeat(lines.len())));
+        }
+        let read = match (&self.read, text.ordered) {
+            (Read::PkGet(key), _) => vec![format!("PkGet {} {}", text.table, key.describe())],
+            (Read::Ordered { read, .. }, Some(column)) => {
+                vec![read.explain(text.table, column, text.pushed)]
+            }
+            (read, _) => read
+                .scan()
+                .map_or_else(Vec::new, |scan| scan.explain(text.table, text.pushed)),
+        };
+        let depth = "  ".repeat(lines.len());
+        lines.extend(read.into_iter().map(|line| format!("{depth}{line}")));
+        lines
+    }
 }
 
 /// A single-table SELECT: its access, the WHERE over the rows it reads, the
 /// output and the rows it skips and keeps
 #[derive(Debug)]
 pub struct SelectPlan {
-    pub(crate) access: Access,
+    pub(crate) plan: Plan,
     pub(crate) filter: Option<SharedProgram>,
     pub(crate) projection: Projection,
     /// Whether the output row is the table row as it is
@@ -51,54 +151,16 @@ pub struct SelectPlan {
 impl SelectPlan {
     /// The plan as EXPLAIN shows it, outermost step first
     pub fn explain(&self, table: &str) -> Vec<String> {
-        let access = match &self.access {
-            Access::PkGet(key) => vec![format!("PkGet {table} {}", key.describe())],
-        };
-        explain_steps(
-            self.limit.map(|limit| limit.to_string()),
-            (self.offset > 0).then(|| self.offset.to_string()),
-            &self.names,
-            None,
-            self.filter.is_some(),
-            access,
-        )
+        self.plan.explain(PlanText {
+            table,
+            limit: self.limit.map(|limit| limit.to_string()),
+            offset: (self.offset > 0).then(|| self.offset.to_string()),
+            sort: None,
+            names: &self.names,
+            pushed: None,
+            ordered: None,
+        })
     }
-}
-
-/// A single-table plan's steps as EXPLAIN shows them, outermost first, each
-/// indented under the one it feeds; a LIMIT or OFFSET as its count reads
-pub fn explain_steps(
-    limit: Option<String>,
-    offset: Option<String>,
-    names: &[String],
-    sort: Option<String>,
-    filter: bool,
-    access: Vec<String>,
-) -> Vec<String> {
-    let mut steps = Vec::new();
-    match (limit, offset) {
-        (None, None) => {}
-        (Some(limit), None) => steps.push(format!("Limit {limit}")),
-        (None, Some(offset)) => steps.push(format!("Offset {offset}")),
-        (Some(limit), Some(offset)) => steps.push(format!("Limit {limit} offset {offset}")),
-    }
-    steps.extend(sort.map(|keys| format!("Sort {keys}")));
-    steps.push(format!("Project {}", names.join(", ")));
-    if filter {
-        steps.push("Filter".to_string());
-    }
-    let depth = steps.len();
-    let mut lines: Vec<String> = steps
-        .into_iter()
-        .enumerate()
-        .map(|(depth, step)| format!("{}{step}", "  ".repeat(depth)))
-        .collect();
-    lines.extend(
-        access
-            .into_iter()
-            .map(|line| format!("{}{line}", "  ".repeat(depth))),
-    );
-    lines
 }
 
 /// How a table's scan finds the rows the conjuncts it takes keep
@@ -309,8 +371,19 @@ pub fn plan_select(
 ) -> Option<SelectPlan> {
     let (key, filter) = inputs.point?;
     let projection = Projection::of(inputs.items);
+    let mut steps = SmallVec::new();
+    if limit.is_some() || offset > 0 {
+        steps.push(Step::Limit);
+    }
+    steps.push(Step::Project);
+    if filter.is_some() {
+        steps.push(Step::Filter);
+    }
     Some(SelectPlan {
-        access: Access::PkGet(key),
+        plan: Plan {
+            steps,
+            read: Read::PkGet(key),
+        },
         filter,
         whole_row: projection.is_columns_in_order(schema.columns.len()),
         projection,
