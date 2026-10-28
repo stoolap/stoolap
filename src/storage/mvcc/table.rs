@@ -2104,6 +2104,10 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        // The merge below checks the limit after taking a row
+        if limit == 0 {
+            return Ok(RowVec::new());
+        }
         let schema = &self.cached_schema;
         let txn_versions = self.local();
 

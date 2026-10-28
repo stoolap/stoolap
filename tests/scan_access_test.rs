@@ -162,7 +162,7 @@ fn assert_alike(db: &Database, what: &str) {
             "{what}: collected by index for {filter:?}"
         );
         for access in [ScanAccess::Index(&plan), ScanAccess::Seq] {
-            for limit in [3, expected.len() + 5] {
+            for limit in [0, 3, expected.len() + 5] {
                 let rows = table
                     .collect_access_rows_with_limit_unordered(
                         access,
