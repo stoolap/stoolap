@@ -18,6 +18,7 @@
 //!
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 use crate::common::{CompactArc, I64Set};
@@ -25,9 +26,10 @@ use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
 use crate::storage::expression::logical::OrExpr;
-use crate::storage::expression::{passes, Expression};
+use crate::storage::expression::{passes, ConstBoolExpr, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
+use crate::storage::mvcc::index_plan::{self, IndexPlan, Read};
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
@@ -36,7 +38,9 @@ use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
-use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanPlan, Scanner, Table};
+use crate::storage::traits::{
+    Index, PlannedUpdate, QueryResult, ScanAccess, ScanPlan, Scanner, Table,
+};
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 use crate::storage::MemoryResult;
 
@@ -744,12 +748,32 @@ impl MVCCTable {
     /// commit the view does not see took out added back from the history.
     /// Every caller reads the rows through the view and applies `expr` again
     fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
+        let plan = index_plan::decide(&self.version_store, &self.cached_schema, expr)?;
+        self.read_indexes(&plan, expr)
+    }
+
+    /// The ids `access` reads, its values taken from `filter`; None for a
+    /// scan of every row
+    fn access_ids(
+        &self,
+        access: ScanAccess<'_>,
+        filter: Option<&dyn Expression>,
+    ) -> Option<RowIdVec> {
+        match (access, filter) {
+            (ScanAccess::Index(plan), Some(filter)) => self.read_indexes(plan, filter),
+            _ => None,
+        }
+    }
+
+    /// The ids `plan` reads for `expr`, under the guard `try_index_lookup`
+    /// describes
+    fn read_indexes(&self, plan: &IndexPlan, expr: &dyn Expression) -> Option<RowIdVec> {
         let Some(view) = self.view.as_ref() else {
-            return self.index_lookup(expr, None);
+            return self.read_plan(plan, expr, None);
         };
         let epoch = self.committed_candidate_epoch()?;
         let history = HistoryProbe::new(&self.version_store, view);
-        let row_ids = self.index_lookup(expr, Some(&history))?;
+        let row_ids = self.read_plan(plan, expr, Some(&history))?;
         if history.declined() || self.committed_candidate_epoch() != Some(epoch) {
             return None;
         }
@@ -773,688 +797,453 @@ impl MVCCTable {
         Some((index, Value::text(&prefix), Value::text(&end)))
     }
 
-    fn index_lookup(
+    /// The ids `plan` reads for `expr`, each read taking its values from
+    /// `expr`'s conjuncts; None when a read the answer needs cannot answer,
+    /// which leaves the rows to the scan
+    fn read_plan(
         &self,
+        plan: &IndexPlan,
         expr: &dyn Expression,
         history: Option<&HistoryProbe<'_>>,
     ) -> Option<RowIdVec> {
+        let mut scope = SmallVec::new();
+        index_plan::conjuncts(expr, &self.cached_schema, &mut scope);
+        self.read_scope(plan, &scope, history)
+    }
+
+    fn read_scope(
+        &self,
+        plan: &IndexPlan,
+        scope: &[&dyn Expression],
+        history: Option<&HistoryProbe<'_>>,
+    ) -> Option<RowIdVec> {
         use crate::core::Operator;
-        use crate::storage::index::intersect_sorted_ids;
-
-        // First, try simple comparison on a single column
-        if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-            // Skip index for boolean equality - low cardinality (2 values) means ~50% selectivity
-            // which makes full scan faster than index lookup + row fetch
-            if matches!(value, Value::Boolean(_)) && matches!(operator, Operator::Eq | Operator::Ne)
-            {
-                return None;
+        let schema = &*self.cached_schema;
+        match plan {
+            IndexPlan::Key => {
+                let pk = &schema.columns[schema.pk_column_index()?].name;
+                let id = scope.iter().find_map(|c| match c.get_comparison_info() {
+                    Some((column, Operator::Eq, Value::Integer(id)))
+                        if column.eq_ignore_ascii_case(pk) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })?;
+                let mut row_ids = RowIdVec::new();
+                row_ids.push(id);
+                Some(row_ids)
             }
-
-            if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                let row_ids = self.query_index_with_operator(&*index, operator, value, history);
+            // A member that is not an integer leaves the list to the scan
+            IndexPlan::Keys => {
+                let pk = &schema.columns[schema.pk_column_index()?].name;
+                let list = scope.iter().find_map(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::storage::expression::InListExpr>()
+                        .filter(|list| {
+                            !list.is_not()
+                                && list
+                                    .get_column_name()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk))
+                        })
+                })?;
+                let mut row_ids = RowIdVec::with_capacity(list.get_values().len());
+                for value in list.get_values() {
+                    match value {
+                        Value::Integer(id) => row_ids.push(*id),
+                        Value::Null(_) => {}
+                        _ => return None,
+                    }
+                }
+                row_ids.sort_unstable();
+                row_ids.dedup();
+                Some(row_ids)
+            }
+            IndexPlan::Read { index, read } => {
+                let row_ids = self.read_column(&**index, *read, scope, history);
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::hot_index_ids_add(
                     row_ids.as_ref().map_or(0, |ids| ids.len()),
                 );
-                return row_ids;
+                row_ids
             }
+            IndexPlan::Prefix {
+                index,
+                equal,
+                ranged,
+            } => {
+                let row_ids = self.read_prefix(&**index, *equal, *ranged, scope, history);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::hot_index_ids_add(
+                    row_ids.as_ref().map_or(0, |ids| ids.len()),
+                );
+                row_ids
+            }
+            IndexPlan::Intersect(reads) => {
+                let answers: Vec<RowIdVec> = reads
+                    .iter()
+                    .filter_map(|read| self.read_scope(read, scope, history))
+                    .collect();
+                (!answers.is_empty()).then(|| intersect_ids(answers))
+            }
+            // Any OR of the scope the reads answer, operand by operand
+            IndexPlan::Union(reads) => scope
+                .iter()
+                .filter(|c| c.get_or_operands().is_some())
+                .find_map(|&or| {
+                    let mut operands = SmallVec::new();
+                    index_plan::disjuncts(or, schema, &mut operands);
+                    if operands.len() != reads.len() {
+                        return None;
+                    }
+                    let answers: Option<Vec<RowIdVec>> = reads
+                        .iter()
+                        .zip(&operands)
+                        .map(|(read, &operand)| {
+                            let mut scope = SmallVec::new();
+                            index_plan::conjuncts(operand, schema, &mut scope);
+                            self.read_scope(read, &scope, history)
+                        })
+                        .collect();
+                    answers.map(union_ids)
+                }),
         }
+    }
 
-        // OPTIMIZATION: Handle OR expressions with HYBRID index optimization
-        // For (indexed_col = 'a' OR non_indexed_col = 'b'):
-        // - Use index for indexed_col operands
-        // - Return None only if ALL operands are non-indexed (full scan needed)
-        // - If at least one operand uses index but others don't, we still return
-        //   the indexed row_ids (the executor will handle memory filtering for others)
-        if let Some(or_operands) = expr.get_or_operands() {
-            let mut indexed_row_ids: Vec<RowIdVec> = Vec::with_capacity(or_operands.len());
-            let mut has_unindexed_operand = false;
-
-            for operand in or_operands {
-                // Recursively try index lookup for each OR operand
-                if let Some(row_ids) = self.try_index_lookup(operand.as_ref()) {
-                    indexed_row_ids.push(row_ids);
-                } else {
-                    // This operand can't use an index
-                    has_unindexed_operand = true;
-                }
+    /// The ids `index` gives for its column's conjuncts in `scope`, read as
+    /// `read` says
+    fn read_column(
+        &self,
+        index: &dyn Index,
+        read: Read,
+        scope: &[&dyn Expression],
+        history: Option<&HistoryProbe<'_>>,
+    ) -> Option<RowIdVec> {
+        use crate::core::Operator;
+        let column = index.column_names()[0].as_str();
+        let named = |name: &str| name.eq_ignore_ascii_case(column);
+        match read {
+            Read::Equal => {
+                let value = scope.iter().find_map(|c| match c.get_comparison_info() {
+                    Some((name, Operator::Eq, value)) if named(name) => Some(value),
+                    _ => None,
+                })?;
+                self.query_index_with_operator(index, Operator::Eq, value, history)
             }
-
-            // HYBRID OPTIMIZATION: If some operands use indexes but not all,
-            // we can't use pure index lookup (would miss rows from unindexed operands).
-            // For now, fall back to full scan - the memory filter will handle it.
-            // Future: Could return indexed row_ids + flag for partial optimization
-            if has_unindexed_operand || indexed_row_ids.is_empty() {
-                return None;
-            }
-
-            // All operands indexed - return the union of all row IDs
-            if indexed_row_ids.len() == 1 {
-                return Some(indexed_row_ids.into_iter().next().unwrap());
-            }
-
-            // Bitset union: build a bitset for deduplication, collect unique row IDs
-            // Cap at 131072 words (~1MB) to prevent OOM with large/sparse row IDs.
-            // Negative row IDs (from user-specified PKs) cannot use the bitset path
-            // because `id as usize` wraps to a huge value.
-            const MAX_BITSET_WORDS: usize = 131_072;
-            let mut max_id = 0i64;
-            let mut min_id = 0i64;
-            for ids in &indexed_row_ids {
-                for &id in ids.iter() {
-                    if id > max_id {
-                        max_id = id;
-                    }
-                    if id < min_id {
-                        min_id = id;
-                    }
+            Read::In => {
+                let list = scope.iter().find_map(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::storage::expression::InListExpr>()
+                        .filter(|list| !list.is_not() && list.get_column_name().is_some_and(named))
+                })?;
+                let values = list.get_values();
+                let mut row_ids = index.get_row_ids_in(values);
+                let probed = row_ids.len();
+                if let Some(history) = history {
+                    history.add_to(
+                        index,
+                        &|key| values.iter().any(|value| first_equals(key, value)),
+                        &mut |row_id| row_ids.push(row_id),
+                    );
                 }
+                // The index names each row once; a row kept in the
+                // history may be named again, and the rows keep their order
+                if row_ids.len() > probed {
+                    let mut seen =
+                        FxHashSet::with_capacity_and_hasher(row_ids.len(), Default::default());
+                    row_ids.retain(|id| seen.insert(*id));
+                }
+                Some(row_ids)
             }
-            let num_words = (max_id as usize / 64) + 1;
-            let total_len: usize = indexed_row_ids.iter().map(|v| v.len()).sum();
-            if min_id >= 0 && num_words <= MAX_BITSET_WORDS {
-                // Fast bitset path
-                let mut bits = vec![0u64; num_words];
-                let mut result = RowIdVec::with_capacity(total_len);
-                for ids in &indexed_row_ids {
-                    for &id in ids.iter() {
-                        let idx = id as usize;
-                        let word = idx / 64;
-                        let mask = 1u64 << (idx % 64);
-                        if (bits[word] & mask) == 0 {
-                            bits[word] |= mask;
-                            result.push(id);
-                        }
-                    }
+            Read::LikePrefix => {
+                let prefix = scope.iter().find_map(|c| match c.get_like_prefix_info() {
+                    Some((name, prefix, false)) if named(name) => Some(prefix),
+                    _ => None,
+                })?;
+                let end = crate::core::pattern::Pattern::prefix_range_end(&prefix)?;
+                let (min, max) = (Value::text(&prefix), Value::text(&end));
+                let entries = index
+                    .find_range(
+                        std::slice::from_ref(&min),
+                        std::slice::from_ref(&max),
+                        true,
+                        false,
+                    )
+                    .ok()?;
+                let mut row_ids = RowIdVec::with_capacity(entries.len());
+                for entry in entries {
+                    row_ids.push(entry.row_id);
                 }
-                return Some(result);
-            } else {
-                // Fallback: I64Set-based union for large/sparse row IDs
-                let mut seen = I64Set::with_capacity(total_len);
-                let mut has_i64_min = false;
-                let mut result = RowIdVec::with_capacity(total_len);
-                for ids in &indexed_row_ids {
-                    for &id in ids.iter() {
-                        if id == i64::MIN {
-                            if !has_i64_min {
-                                has_i64_min = true;
-                                result.push(id);
-                            }
-                        } else if seen.insert(id) {
-                            result.push(id);
-                        }
-                    }
+                if let Some(history) = history {
+                    history.merge(index, &mut row_ids, &|key| {
+                        key.first().is_some_and(|first| {
+                            within(first, Some((&min, true)), Some((&max, false)))
+                        })
+                    });
                 }
-                return Some(result);
+                Some(row_ids)
             }
-        }
-
-        if let Some(id) = expr
-            .get_and_operands()
-            .and_then(|_| pk_conjunct_id(expr, &self.cached_schema))
-        {
-            let mut row_ids = RowIdVec::new();
-            row_ids.push(id);
-            return Some(row_ids);
-        }
-
-        // OPTIMIZATION: Detect BETWEEN/range pattern (col >= X AND col <= Y) for single range scan
-        // This avoids two separate index scans + sort + intersection
-        if let Some(and_operands) = expr.get_and_operands() {
-            // Check for range pattern: exactly 2 comparisons on the same indexed column
-            if and_operands.len() == 2 {
-                if let (Some((col1, op1, val1)), Some((col2, op2, val2))) = (
-                    and_operands[0].get_comparison_info(),
-                    and_operands[1].get_comparison_info(),
-                ) {
-                    // Same column?
-                    if col1 == col2 {
-                        // Check for range pattern: one lower bound + one upper bound
-                        let (lower_op, lower_val, upper_op, upper_val) = match (op1, op2) {
-                            (Operator::Gt | Operator::Gte, Operator::Lt | Operator::Lte) => {
-                                (op1, val1, op2, val2)
-                            }
-                            (Operator::Lt | Operator::Lte, Operator::Gt | Operator::Gte) => {
-                                (op2, val2, op1, val1)
-                            }
-                            _ => (Operator::Eq, val1, Operator::Eq, val2), // Not a range
-                        };
-
-                        // If we have a valid range pattern, use single range scan
-                        if matches!(lower_op, Operator::Gt | Operator::Gte)
-                            && matches!(upper_op, Operator::Lt | Operator::Lte)
-                        {
-                            if let Some(index) = self.version_store.get_index_by_column(col1) {
-                                // Only B-tree and PrimaryKey indexes support range queries
-                                // Hash and Bitmap indexes return empty for range queries,
-                                // which would incorrectly indicate "no matches" instead of
-                                // "can't handle this query"
-                                if !matches!(
-                                    index.index_type(),
-                                    IndexType::BTree | IndexType::PrimaryKey
-                                ) {
-                                    return None; // Fall back to full scan
-                                }
-                                let min_inclusive = matches!(lower_op, Operator::Gte);
-                                let max_inclusive = matches!(upper_op, Operator::Lte);
-                                let mut row_ids = index.get_row_ids_in_range(
-                                    std::slice::from_ref(lower_val),
-                                    std::slice::from_ref(upper_val),
-                                    min_inclusive,
-                                    max_inclusive,
-                                );
-                                if let Some(history) = history {
-                                    history.merge(&*index, &mut row_ids, &|key| {
-                                        key.first().is_some_and(|first| {
-                                            within(
-                                                first,
-                                                Some((lower_val, min_inclusive)),
-                                                Some((upper_val, max_inclusive)),
-                                            )
-                                        })
-                                    });
-                                }
-                                // Return result even if empty - we successfully used the index
-                                // Empty result is valid (no rows match the range)
-                                return Some(row_ids);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // OPTIMIZATION: Handle AND expressions with recursive index lookup
-        // For '(col1 IN (...)) AND (col2 IN (...))', process each operand and intersect results
-        // This is critical for semi-join optimization where we combine right_filter with IN clause
-        if let Some(and_operands) = expr.get_and_operands() {
-            let mut indexed_row_ids: Vec<RowIdVec> = Vec::with_capacity(and_operands.len());
-
-            for operand in and_operands {
-                // Recursively try index lookup for each AND operand
-                // OPTIMIZATION: Don't sort here - defer sorting until we know intersection is needed
-                if let Some(row_ids) = self.try_index_lookup(operand.as_ref()) {
-                    indexed_row_ids.push(row_ids);
-                }
-                // If an operand can't use an index, we'll still proceed with available indexes
-                // and the executor will handle memory filtering for the rest
-            }
-
-            // If at least one operand used an index, intersect and return the most restrictive result
-            // The executor will handle memory filtering for operands without index support
-            if !indexed_row_ids.is_empty() {
-                if indexed_row_ids.len() == 1 {
-                    // OPTIMIZATION: Single operand - no intersection needed
-                    return Some(indexed_row_ids.into_iter().next().unwrap());
-                }
-
-                // Bitset intersection: build a bitset from the larger list for O(1) lookups,
-                // then retain only matching elements from the smaller list.
-                // Cap at MAX_BITSET_WORDS (~1MB) to prevent OOM with large/sparse row IDs.
-                // Negative row IDs skip the bitset path (id as usize wraps).
-                const MAX_BITSET_WORDS: usize = 131_072;
-                indexed_row_ids.sort_by_key(|v| v.len());
-                let mut result = indexed_row_ids.swap_remove(0); // smallest
-                for other in &indexed_row_ids {
-                    let mut max_id = 0i64;
-                    let mut min_id = 0i64;
-                    for &id in other.iter() {
-                        if id > max_id {
-                            max_id = id;
-                        }
-                        if id < min_id {
-                            min_id = id;
-                        }
-                    }
-                    let num_words = (max_id as usize / 64) + 1;
-                    if min_id >= 0 && num_words <= MAX_BITSET_WORDS {
-                        // Fast bitset path
-                        let mut bits = vec![0u64; num_words];
-                        for &id in other.iter() {
-                            let idx = id as usize;
-                            bits[idx / 64] |= 1u64 << (idx % 64);
-                        }
-                        result.retain(|id| {
-                            let idx = *id as usize;
-                            idx < num_words * 64 && (bits[idx / 64] & (1u64 << (idx % 64))) != 0
-                        });
-                    } else {
-                        // Fallback: I64Set-based intersection for large/sparse row IDs
-                        let mut set = I64Set::with_capacity(other.len());
-                        let mut has_i64_min = false;
-                        for &id in other.iter() {
-                            if id == i64::MIN {
-                                has_i64_min = true;
-                            } else {
-                                set.insert(id);
-                            }
-                        }
-                        result.retain(|id| {
-                            if *id == i64::MIN {
-                                has_i64_min
-                            } else {
-                                set.contains(*id)
-                            }
-                        });
-                    }
-                    if result.is_empty() {
-                        return Some(RowIdVec::new());
-                    }
-                }
-                return Some(result);
-            }
-
-            // No operands could use indexes - fall through to other strategies
-            // Note: We don't return None here because the subsequent code might
-            // still be able to extract simple comparisons from the AND expression
-        }
-
-        // OPTIMIZATION: Handle IN list expressions with direct index lookup
-        // For 'col IN (a, b, c)', use get_row_ids_in for efficient multi-value lookup
-        if let Some(in_list) = expr
-            .as_any()
-            .downcast_ref::<crate::storage::expression::InListExpr>()
-        {
-            // Only handle positive IN (not NOT IN)
-            if !in_list.is_not() {
-                if let Some(col_name) = in_list.get_column_name() {
-                    if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                        // Use the efficient get_row_ids_in method
-                        let values = in_list.get_values();
-                        let mut row_ids = index.get_row_ids_in(values);
-                        let probed = row_ids.len();
-                        if let Some(history) = history {
-                            history.add_to(
-                                &*index,
-                                &|key| values.iter().any(|value| first_equals(key, value)),
-                                &mut |row_id| row_ids.push(row_id),
-                            );
-                        }
-                        // The index names each row once; a row kept in the
-                        // history may be named again, and the rows keep their order
-                        if row_ids.len() > probed {
-                            let mut seen = FxHashSet::with_capacity_and_hasher(
-                                row_ids.len(),
-                                Default::default(),
-                            );
-                            row_ids.retain(|id| seen.insert(*id));
-                        }
-                        return Some(row_ids);
-                    }
-                }
-            }
-        }
-
-        // OPTIMIZATION: Handle LIKE prefix patterns with index range scan
-        // For 'name LIKE 'John%'', use index range scan from 'John' to 'Joho'
-        if expr.get_like_prefix_info().is_some() {
-            // NOT LIKE, a column that is not TEXT, or a prefix with no
-            // range end reads no index
-            let (index, min_value, max_value) = self.like_prefix_range(expr)?;
-            {
-                // Use index range query
-                if let Ok(entries) = index.find_range(
-                    std::slice::from_ref(&min_value),
-                    std::slice::from_ref(&max_value),
-                    true,  // include min
-                    false, // exclude max
-                ) {
-                    let mut row_ids = RowIdVec::with_capacity(entries.len());
-                    for entry in entries {
-                        row_ids.push(entry.row_id);
-                    }
+            Read::Range => match column_bounds(column, scope) {
+                (Some((min, min_inclusive)), Some((max, max_inclusive))) => {
+                    let mut row_ids = index.get_row_ids_in_range(
+                        std::slice::from_ref(min),
+                        std::slice::from_ref(max),
+                        min_inclusive,
+                        max_inclusive,
+                    );
                     if let Some(history) = history {
-                        history.merge(&*index, &mut row_ids, &|key| {
+                        history.merge(index, &mut row_ids, &|key| {
                             key.first().is_some_and(|first| {
-                                within(first, Some((&min_value, true)), Some((&max_value, false)))
+                                within(
+                                    first,
+                                    Some((min, min_inclusive)),
+                                    Some((max, max_inclusive)),
+                                )
                             })
                         });
                     }
-                    return Some(row_ids);
+                    Some(row_ids)
                 }
-            }
-        }
-
-        // Try to extract comparisons from AND expressions
-        let comparisons = expr.collect_comparisons();
-        if comparisons.is_empty() {
-            return None;
-        }
-
-        // Group comparisons by column name
-        let mut column_comparisons: FxHashMap<&str, Vec<(Operator, &Value)>> = FxHashMap::default();
-        for (col_name, op, val) in &comparisons {
-            column_comparisons
-                .entry(*col_name)
-                .or_default()
-                .push((*op, *val));
-        }
-
-        // OPTIMIZATION: Try multi-column index first
-        // Collect columns that have equality predicates (can be used with multi-column index)
-        let eq_columns: Vec<&str> = column_comparisons
-            .iter()
-            .filter_map(|(col_name, ops)| {
-                // Check if this column has an equality predicate
-                if ops.iter().any(|(op, _)| matches!(op, Operator::Eq)) {
-                    Some(*col_name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Try to find a multi-column index that covers these equality columns (prefix rule)
-        if !eq_columns.is_empty() {
-            if let Some((multi_idx, matched_count)) =
-                self.version_store.get_multi_column_index(&eq_columns)
-            {
-                // Build the values array in index column order
-                let index_columns = multi_idx.column_names();
-                let mut values: Vec<Value> = Vec::with_capacity(matched_count);
-                let mut all_columns_matched = true;
-
-                for idx_col in index_columns.iter().take(matched_count) {
-                    if let Some(ops) = column_comparisons.get(idx_col.as_str()) {
-                        // Find the equality value for this column
-                        if let Some((_, val)) =
-                            ops.iter().find(|(op, _)| matches!(op, Operator::Eq))
-                        {
-                            values.push((*val).clone());
-                        } else {
-                            all_columns_matched = false;
-                            break;
-                        }
+                (Some((value, inclusive)), None) => {
+                    let operator = if inclusive {
+                        Operator::Gte
                     } else {
-                        all_columns_matched = false;
-                        break;
-                    }
-                }
-
-                // If we matched all columns in the prefix, use the multi-column index
-                if all_columns_matched && values.len() == matched_count {
-                    // Check if the next index column has range predicates — use
-                    // BTree range scan instead of hash prefix lookup for better selectivity
-                    let trailing_range = if matched_count < index_columns.len() {
-                        let next_col = &index_columns[matched_count];
-                        column_comparisons.get(next_col.as_str()).and_then(|ops| {
-                            // Collect range bounds for this column
-                            let mut min_val: Option<(&Value, bool)> = None;
-                            let mut max_val: Option<(&Value, bool)> = None;
-                            for (op, val) in ops {
-                                match op {
-                                    Operator::Gt => {
-                                        min_val = Some((*val, false));
-                                    }
-                                    Operator::Gte => {
-                                        min_val = Some((*val, true));
-                                    }
-                                    Operator::Lt => {
-                                        max_val = Some((*val, false));
-                                    }
-                                    Operator::Lte => {
-                                        max_val = Some((*val, true));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            // Need an upper bound for a valid BTree range scan.
-                            // Lower-bound-only (b > 10) builds min_key=[prefix, 10]
-                            // but max_key=[prefix] which is SHORTER, and CompositeKey
-                            // ordering makes shorter keys less — creating an inverted
-                            // range that panics in BTreeMap::range.
-                            // Upper-bound-only (b < 10) is safe: min_key=[prefix] <
-                            // max_key=[prefix, 10].
-                            if max_val.is_some() {
-                                Some((min_val, max_val))
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
+                        Operator::Gt
                     };
-
-                    let row_ids = if let Some((min_bound, max_bound)) = trailing_range {
-                        // Build composite min/max keys for BTree range scan
-                        let mut min_key = values.clone();
-                        let mut max_key = values.clone();
-                        let (min_inclusive, max_inclusive) = match (min_bound, max_bound) {
-                            (Some((min_v, min_inc)), Some((max_v, max_inc))) => {
-                                min_key.push(min_v.clone());
-                                max_key.push(max_v.clone());
-                                (min_inc, max_inc)
-                            }
-                            // Lower-bound-only is filtered out above (inverted range)
-                            (Some(_), None) => unreachable!(),
-                            (None, Some((max_v, max_inc))) => {
-                                // min_key stays as equality prefix
-                                max_key.push(max_v.clone());
-                                (true, max_inc)
-                            }
-                            (None, None) => unreachable!(),
-                        };
-                        if let Ok(entries) =
-                            multi_idx.find_range(&min_key, &max_key, min_inclusive, max_inclusive)
-                        {
-                            let mut ids = RowIdVec::with_capacity(entries.len());
-                            for entry in entries {
-                                ids.push(entry.row_id);
-                            }
-                            ids
-                        } else {
-                            multi_idx.get_row_ids_equal(&values)
-                        }
+                    self.query_index_with_operator(index, operator, value, history)
+                }
+                (None, Some((value, inclusive))) => {
+                    let operator = if inclusive {
+                        Operator::Lte
                     } else {
-                        multi_idx.get_row_ids_equal(&values)
+                        Operator::Lt
                     };
-                    // The prefix's removed rows cover the trailing range's too
-                    let mut row_ids = row_ids;
-                    if let Some(history) = history {
-                        history.merge(&*multi_idx, &mut row_ids, &|key| starts_with(key, &values));
-                    }
-
-                    if !row_ids.is_empty() {
-                        // Multi-column index gave us results - check if we need to apply
-                        // additional filters for columns not covered by the index
-                        let mut covered_columns: FxHashSet<&str> = index_columns
-                            .iter()
-                            .take(matched_count)
-                            .map(|s| s.as_str())
-                            .collect();
-                        // The trailing range column is also covered if used
-                        if trailing_range.is_some() && matched_count < index_columns.len() {
-                            covered_columns.insert(index_columns[matched_count].as_str());
-                        }
-
-                        // Check if there are non-covered columns with predicates
-                        let uncovered_columns: Vec<&str> = column_comparisons
-                            .keys()
-                            .filter(|c| !covered_columns.contains(*c))
-                            .copied()
-                            .collect();
-
-                        if uncovered_columns.is_empty() {
-                            // All predicate columns are covered by multi-column index
-                            return Some(row_ids);
-                        }
-                        // There are uncovered columns - continue to check single-column indexes
-                        // and intersect with multi-column index results
-                        let mut all_row_ids: Vec<RowIdVec> = vec![row_ids];
-
-                        // Check single-column indexes for uncovered columns
-                        for col_name in uncovered_columns {
-                            if let Some(single_idx) =
-                                self.version_store.get_index_by_column(col_name)
-                            {
-                                if let Some(ops) = column_comparisons.get(col_name) {
-                                    // Try equality first
-                                    if let Some((_, val)) =
-                                        ops.iter().find(|(op, _)| matches!(op, Operator::Eq))
-                                    {
-                                        let mut ids =
-                                            single_idx.get_row_ids_equal(std::slice::from_ref(val));
-                                        if let Some(history) = history {
-                                            history.merge(&*single_idx, &mut ids, &|key| {
-                                                first_equals(key, val)
-                                            });
-                                        }
-                                        if ids.is_empty() {
-                                            return Some(RowIdVec::new());
-                                        }
-                                        // Don't sort yet - only sort when intersection is needed
-                                        all_row_ids.push(ids);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Intersect all results
-                        if all_row_ids.len() == 1 {
-                            return Some(all_row_ids.into_iter().next().unwrap());
-                        }
-                        // An index's equality ids come in id order; a range on
-                        // the multi-column index gives its ids in key order
-                        let mut result = all_row_ids.swap_remove(0);
-                        if trailing_range.is_some() {
-                            result.sort_unstable();
-                        }
-                        for other in &all_row_ids {
-                            result = intersect_sorted_ids(&result, other);
-                            if result.is_empty() {
-                                return Some(RowIdVec::new());
-                            }
-                        }
-                        return Some(result);
-                    }
+                    self.query_index_with_operator(index, operator, value, history)
                 }
-            }
+                (None, None) => None,
+            },
         }
-
-        // Fall back to single-column index strategy
-        // Collect row IDs from all indexed columns
-        let mut all_row_ids: Vec<RowIdVec> = Vec::new();
-
-        for (col_name, ops) in &column_comparisons {
-            if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                // Check for range pattern: col >= min AND col <= max
-                let mut min_val: Option<(&Value, bool)> = None; // (value, inclusive)
-                let mut max_val: Option<(&Value, bool)> = None;
-                let mut eq_val: Option<&Value> = None;
-
-                for (op, val) in ops {
-                    match op {
-                        Operator::Eq => eq_val = Some(val),
-                        Operator::Gt => min_val = Some((val, false)),
-                        Operator::Gte => min_val = Some((val, true)),
-                        Operator::Lt => max_val = Some((val, false)),
-                        Operator::Lte => max_val = Some((val, true)),
-                        _ => {}
-                    }
-                }
-
-                // Equality takes precedence - but skip boolean (low cardinality)
-                if let Some(val) = eq_val {
-                    // Skip boolean equality - ~50% selectivity makes full scan faster
-                    if matches!(val, Value::Boolean(_)) {
-                        continue;
-                    }
-                    // OPTIMIZATION: Use from_ref to avoid clone
-                    let mut row_ids = index.get_row_ids_equal(std::slice::from_ref(val));
-                    if let Some(history) = history {
-                        history.merge(&*index, &mut row_ids, &|key| first_equals(key, val));
-                    }
-                    if row_ids.is_empty() {
-                        // If any index returns empty, the AND result is empty
-                        return Some(RowIdVec::new());
-                    }
-                    // Don't sort yet - only sort when intersection is needed
-                    all_row_ids.push(row_ids);
-                    continue;
-                }
-
-                // Range query - but skip Hash and Bitmap indexes (they don't support range queries)
-                if min_val.is_some() || max_val.is_some() {
-                    // They answer a range with no ids, which reads as no
-                    // match: skip them and let the query fall back to a scan
-                    if matches!(index.index_type(), IndexType::Hash | IndexType::Bitmap) {
-                        continue;
-                    }
-
-                    let mut row_ids =
-                        if let (Some((min, min_inc)), Some((max, max_inc))) = (min_val, max_val) {
-                            // OPTIMIZATION: Use from_ref to avoid clone
-                            index.get_row_ids_in_range(
-                                std::slice::from_ref(min),
-                                std::slice::from_ref(max),
-                                min_inc,
-                                max_inc,
-                            )
-                        } else if let Some((val, inclusive)) = min_val {
-                            let op = if inclusive {
-                                Operator::Gte
-                            } else {
-                                Operator::Gt
-                            };
-                            self.query_index_with_operator(&*index, op, val, None)
-                                .unwrap_or_default()
-                        } else if let Some((val, inclusive)) = max_val {
-                            let op = if inclusive {
-                                Operator::Lte
-                            } else {
-                                Operator::Lt
-                            };
-                            self.query_index_with_operator(&*index, op, val, None)
-                                .unwrap_or_default()
-                        } else {
-                            RowIdVec::new()
-                        };
-                    if let Some(history) = history {
-                        history.merge(&*index, &mut row_ids, &|key| {
-                            key.first()
-                                .is_some_and(|first| within(first, min_val, max_val))
-                        });
-                    }
-
-                    if row_ids.is_empty() {
-                        // If any index returns empty, the AND result is empty
-                        return Some(RowIdVec::new());
-                    }
-                    // Don't sort yet - only sort when intersection is needed
-                    all_row_ids.push(row_ids);
-                }
-            }
-        }
-
-        // If we have no indexed results, return None
-        if all_row_ids.is_empty() {
-            return None;
-        }
-
-        // If we have only one index, return its results (no sort needed)
-        if all_row_ids.len() == 1 {
-            return Some(all_row_ids.into_iter().next().unwrap());
-        }
-
-        // Range query results from BTree are in VALUE order, not row_id order.
-        // intersect_sorted_ids requires row_id-sorted input (uses binary_search).
-        // Sort all sets before intersection.
-        for ids in &mut all_row_ids {
-            ids.sort_unstable();
-        }
-
-        // Intersect all row ID sets for multi-column filtering
-        let mut result = all_row_ids.swap_remove(0);
-        for other in &all_row_ids {
-            result = intersect_sorted_ids(&result, other);
-            if result.is_empty() {
-                return Some(RowIdVec::new());
-            }
-        }
-
-        Some(result)
     }
 
+    /// The ids a multi-column index gives for equalities on its first
+    /// `equal` columns and, when `ranged`, the bounds on the next one; an
+    /// empty answer only while it holds every key the statement sees
+    fn read_prefix(
+        &self,
+        index: &dyn Index,
+        equal: usize,
+        ranged: bool,
+        scope: &[&dyn Expression],
+        history: Option<&HistoryProbe<'_>>,
+    ) -> Option<RowIdVec> {
+        use crate::core::Operator;
+        let columns = index.column_names();
+        let mut values: Vec<Value> = Vec::with_capacity(equal + 1);
+        for column in &columns[..equal] {
+            let value = scope.iter().find_map(|c| match c.get_comparison_info() {
+                Some((name, Operator::Eq, value)) if name.eq_ignore_ascii_case(column) => {
+                    Some(value)
+                }
+                _ => None,
+            })?;
+            values.push(value.clone());
+        }
+        let quiet = self.committed_candidate_epoch();
+        let bounds = match ranged {
+            true => column_bounds(&columns[equal], scope),
+            false => (None, None),
+        };
+        let mut row_ids = match bounds {
+            (lower, Some((max, max_inclusive))) => {
+                let mut min_key = values.clone();
+                let mut max_key = values.clone();
+                let min_inclusive = match lower {
+                    Some((min, inclusive)) => {
+                        min_key.push(min.clone());
+                        inclusive
+                    }
+                    None => true,
+                };
+                max_key.push(max.clone());
+                match index.find_range(&min_key, &max_key, min_inclusive, max_inclusive) {
+                    Ok(entries) => entries.into_iter().map(|entry| entry.row_id).collect(),
+                    Err(_) => index.get_row_ids_equal(&values),
+                }
+            }
+            _ => index.get_row_ids_equal(&values),
+        };
+        // The prefix's removed rows cover the trailing range's too
+        if let Some(history) = history {
+            history.merge(index, &mut row_ids, &|key| starts_with(key, &values));
+        }
+        (!row_ids.is_empty() || self.settled(quiet)).then_some(row_ids)
+    }
+
+    /// Whether an empty index answer read since `quiet` means no row: the
+    /// index carried every key the statement can see, as
+    /// `query_index_with_operator` explains
+    fn settled(&self, quiet: Option<u64>) -> bool {
+        quiet.is_some()
+            && self.committed_candidate_epoch() == quiet
+            && !self.local().has_local_changes()
+    }
+}
+
+/// The bounds `scope`'s comparisons and BETWEENs set on `column`, the last
+/// one on each side kept
+fn column_bounds<'a>(column: &str, scope: &[&'a dyn Expression]) -> (KeyBound<'a>, KeyBound<'a>) {
+    use crate::core::Operator;
+    let mut bounds = (None, None);
+    let mut bound = |operator: Operator, value: &'a Value| match operator {
+        Operator::Gt => bounds.0 = Some((value, false)),
+        Operator::Gte => bounds.0 = Some((value, true)),
+        Operator::Lt => bounds.1 = Some((value, false)),
+        Operator::Lte => bounds.1 = Some((value, true)),
+        _ => {}
+    };
+    for &conjunct in scope {
+        if let Some((name, operator, value)) = conjunct.get_comparison_info() {
+            if name.eq_ignore_ascii_case(column) {
+                bound(operator, value);
+            }
+        } else if let Some(between) = conjunct
+            .as_any()
+            .downcast_ref::<crate::storage::expression::BetweenExpr>()
+            .filter(|b| {
+                b.get_column_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
+            })
+        {
+            for (_, operator, value) in between.collect_comparisons() {
+                bound(operator, value);
+            }
+        }
+    }
+    bounds
+}
+
+/// The ids every answer names
+fn intersect_ids(mut answers: Vec<RowIdVec>) -> RowIdVec {
+    if answers.len() == 1 {
+        return answers.swap_remove(0);
+    }
+    // Bitset intersection: build a bitset from the larger list for O(1) lookups,
+    // then retain only matching elements from the smaller list.
+    // Cap at MAX_BITSET_WORDS (~1MB) to prevent OOM with large/sparse row IDs.
+    // Negative row IDs skip the bitset path (id as usize wraps).
+    const MAX_BITSET_WORDS: usize = 131_072;
+    answers.sort_by_key(|v| v.len());
+    let mut result = answers.swap_remove(0); // smallest
+    for other in &answers {
+        let mut max_id = 0i64;
+        let mut min_id = 0i64;
+        for &id in other.iter() {
+            if id > max_id {
+                max_id = id;
+            }
+            if id < min_id {
+                min_id = id;
+            }
+        }
+        let num_words = (max_id as usize / 64) + 1;
+        if min_id >= 0 && num_words <= MAX_BITSET_WORDS {
+            // Fast bitset path
+            let mut bits = vec![0u64; num_words];
+            for &id in other.iter() {
+                let idx = id as usize;
+                bits[idx / 64] |= 1u64 << (idx % 64);
+            }
+            result.retain(|id| {
+                let idx = *id as usize;
+                idx < num_words * 64 && (bits[idx / 64] & (1u64 << (idx % 64))) != 0
+            });
+        } else {
+            // Fallback: I64Set-based intersection for large/sparse row IDs
+            let mut set = I64Set::with_capacity(other.len());
+            let mut has_i64_min = false;
+            for &id in other.iter() {
+                if id == i64::MIN {
+                    has_i64_min = true;
+                } else {
+                    set.insert(id);
+                }
+            }
+            result.retain(|id| {
+                if *id == i64::MIN {
+                    has_i64_min
+                } else {
+                    set.contains(*id)
+                }
+            });
+        }
+        if result.is_empty() {
+            break;
+        }
+    }
+    result
+}
+
+/// The ids any answer names, each once
+fn union_ids(answers: Vec<RowIdVec>) -> RowIdVec {
+    let mut answers = answers;
+    if answers.len() == 1 {
+        return answers.swap_remove(0);
+    }
+    // Bitset union: build a bitset for deduplication, collect unique row IDs
+    // Cap at 131072 words (~1MB) to prevent OOM with large/sparse row IDs.
+    // Negative row IDs (from user-specified PKs) cannot use the bitset path
+    // because `id as usize` wraps to a huge value.
+    const MAX_BITSET_WORDS: usize = 131_072;
+    let mut max_id = 0i64;
+    let mut min_id = 0i64;
+    for ids in &answers {
+        for &id in ids.iter() {
+            if id > max_id {
+                max_id = id;
+            }
+            if id < min_id {
+                min_id = id;
+            }
+        }
+    }
+    let num_words = (max_id as usize / 64) + 1;
+    let total_len: usize = answers.iter().map(|v| v.len()).sum();
+    let mut result = RowIdVec::with_capacity(total_len);
+    if min_id >= 0 && num_words <= MAX_BITSET_WORDS {
+        // Fast bitset path
+        let mut bits = vec![0u64; num_words];
+        for ids in &answers {
+            for &id in ids.iter() {
+                let idx = id as usize;
+                let word = idx / 64;
+                let mask = 1u64 << (idx % 64);
+                if (bits[word] & mask) == 0 {
+                    bits[word] |= mask;
+                    result.push(id);
+                }
+            }
+        }
+    } else {
+        // Fallback: I64Set-based union for large/sparse row IDs
+        let mut seen = I64Set::with_capacity(total_len);
+        let mut has_i64_min = false;
+        for ids in &answers {
+            for &id in ids.iter() {
+                if id == i64::MIN {
+                    if !has_i64_min {
+                        has_i64_min = true;
+                        result.push(id);
+                    }
+                } else if seen.insert(id) {
+                    result.push(id);
+                }
+            }
+        }
+    }
+    result
+}
+
+impl MVCCTable {
     /// Query an index with a specific operator
     /// Returns a pooled RowIdVec for efficient memory reuse.
     fn query_index_with_operator(
@@ -2299,63 +2088,27 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        let schema = &self.cached_schema;
-
-        // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
-        // This is O(1) and skips all scanning
         if let Some(expr) = filter {
-            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
-                // Direct O(1) lookup by primary key
-                let txn_versions = self.local();
-                // Check local versions first via get_local_version (preserves
-                // delete signal). txn_versions.get() swallows deletes as None,
-                // which would cause a fallback to the committed store and miss
-                // uncommitted deletes in the current transaction.
-                let row = if let Some(local) = txn_versions.get_local_version(pk_id) {
-                    if local.is_deleted() {
-                        None // Locally deleted in this transaction
-                    } else {
-                        Some((pk_id, local.data.clone()))
-                    }
-                } else if let Some(version) =
-                    self.version_store.get_visible_version(pk_id, self.reader())
-                {
-                    if !version.is_deleted() {
-                        Some((pk_id, version.data.clone()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                return Ok(match row {
-                    Some((row_id, r)) if offset == 0 && limit >= 1 => {
-                        let mut rv = RowVec::with_capacity(1);
-                        rv.push((row_id, self.normalize_row_to_schema(r, schema)));
-                        rv
-                    }
-                    _ => RowVec::new(),
-                });
-            }
-
-            // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
-            // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
-            if let Some(row_ids) = self.try_index_lookup(expr) {
-                if let Some(result) =
-                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)?
-                {
-                    return Ok(result);
-                }
-                // Has local changes - fall through to full path
-            }
-
-            // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
-            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset)? {
-                return Ok(result);
+            if let Some(rows) = self.keyed_rows_with_limit(expr, limit, offset)? {
+                return Ok(rows);
             }
         }
+        self.visible_rows_with_limit(filter, limit, offset)
+    }
 
+    /// Up to `limit` visible rows past `offset` that `filter` keeps, in row
+    /// order, read without the indexes
+    fn visible_rows_with_limit(
+        &self,
+        filter: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        // The merge below checks the limit after taking a row
+        if limit == 0 {
+            return Ok(RowVec::new());
+        }
+        let schema = &self.cached_schema;
         let txn_versions = self.local();
 
         // Check if we have local versions (uncommitted changes in this transaction)
@@ -2462,63 +2215,97 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        if let Some(expr) = filter {
+            if let Some(rows) = self.keyed_rows_with_limit(expr, limit, offset)? {
+                return Ok(rows);
+            }
+        }
+        self.limited_rows_unordered(filter, limit, offset)
+    }
+
+    /// Up to `limit` rows past `offset` of those `expr` names by the
+    /// primary key or the indexes, that it keeps; None when neither names them
+    fn keyed_rows_with_limit(
+        &self,
+        expr: &dyn Expression,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
         // This is O(1) and skips all scanning
-        if let Some(expr) = filter {
-            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
-                // Direct O(1) lookup by primary key
-                let txn_versions = self.local();
-                // Check local versions first via get_local_version (preserves
-                // delete signal). txn_versions.get() swallows deletes as None,
-                // which would cause a fallback to the committed store and miss
-                // uncommitted deletes in the current transaction.
-                let row = if let Some(local) = txn_versions.get_local_version(pk_id) {
-                    if local.is_deleted() {
-                        None // Locally deleted in this transaction
-                    } else {
-                        Some((pk_id, local.data.clone()))
-                    }
-                } else if let Some(version) =
-                    self.version_store.get_visible_version(pk_id, self.reader())
-                {
-                    if !version.is_deleted() {
-                        Some((pk_id, version.data.clone()))
-                    } else {
-                        None
-                    }
+        if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
+            // Direct O(1) lookup by primary key
+            let txn_versions = self.local();
+            // Check local versions first via get_local_version (preserves
+            // delete signal). txn_versions.get() swallows deletes as None,
+            // which would cause a fallback to the committed store and miss
+            // uncommitted deletes in the current transaction.
+            let row = if let Some(local) = txn_versions.get_local_version(pk_id) {
+                if local.is_deleted() {
+                    None // Locally deleted in this transaction
+                } else {
+                    Some((pk_id, local.data.clone()))
+                }
+            } else if let Some(version) =
+                self.version_store.get_visible_version(pk_id, self.reader())
+            {
+                if !version.is_deleted() {
+                    Some((pk_id, version.data.clone()))
                 } else {
                     None
-                };
-
-                return Ok(match row {
-                    Some((row_id, r)) if offset == 0 && limit >= 1 => {
-                        let mut rv = RowVec::with_capacity(1);
-                        rv.push((row_id, self.normalize_row_to_schema(r, schema)));
-                        rv
-                    }
-                    _ => RowVec::new(),
-                });
-            }
-
-            // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
-            // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
-            if let Some(row_ids) = self.try_index_lookup(expr) {
-                if let Some(result) =
-                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)?
-                {
-                    return Ok(result);
                 }
-                // Has local changes - fall through to full path
-            }
+            } else {
+                None
+            };
 
-            // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
-            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset)? {
-                return Ok(result);
-            }
+            return Ok(Some(match row {
+                Some((row_id, r)) if offset == 0 && limit >= 1 => {
+                    let mut rv = RowVec::with_capacity(1);
+                    rv.push((row_id, self.normalize_row_to_schema(r, schema)));
+                    rv
+                }
+                _ => RowVec::new(),
+            }));
         }
 
+        // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
+        // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
+        let row_ids = self.try_index_lookup(expr);
+        if let Some(result) = self.index_rows_with_limit(row_ids, expr, limit, offset)? {
+            return Ok(Some(result));
+        }
+
+        // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
+        self.try_mixed_or_fetch(expr, schema, limit, offset)
+    }
+
+    /// Up to `limit` rows past `offset` of those the indexes gave, `row_ids`,
+    /// that `filter` keeps; None when the indexes did not answer or the
+    /// transaction has changes of its own
+    fn index_rows_with_limit(
+        &self,
+        row_ids: Option<RowIdVec>,
+        filter: &dyn Expression,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        let Some(row_ids) = row_ids else {
+            return Ok(None);
+        };
+        self.try_fetch_from_index(row_ids, filter, &self.cached_schema, limit, offset)
+    }
+
+    /// Up to `limit` visible rows past `offset` that `filter` keeps, read
+    /// in no order and stopping once that many are read
+    fn limited_rows_unordered(
+        &self,
+        filter: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let schema = &self.cached_schema;
         let txn_versions = self.local();
 
         // Check if we have local versions (uncommitted changes in this transaction)
@@ -2550,10 +2337,10 @@ impl MVCCTable {
         }
 
         // Has local versions - use same path as ordered (local changes are rare)
-        // Early termination is already implemented in collect_visible_rows_with_limit
+        // Early termination is already implemented in visible_rows_with_limit
         // when there are local changes
         drop(txn_versions);
-        self.collect_visible_rows_with_limit(filter, limit, offset)
+        self.visible_rows_with_limit(filter, limit, offset)
     }
 
     /// The version read for a row read from the transaction's own
@@ -3076,6 +2863,62 @@ impl MVCCTable {
     /// Scans that walked every visible row instead of probing an index
     pub(crate) fn full_scans(&self) -> u64 {
         self.full_scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl MVCCTable {
+    /// The rows the indexes gave, `row_ids`, this transaction's own rows
+    /// among them, that `filter` keeps; None when the indexes did not answer
+    fn index_rows(
+        &self,
+        row_ids: Option<RowIdVec>,
+        filter: Option<&dyn Expression>,
+    ) -> Result<Option<RowVec>> {
+        let Some(mut row_ids) = row_ids else {
+            return Ok(None);
+        };
+        row_ids.extend(self.local_ids_missing_from(&row_ids));
+        let rows = match filter {
+            Some(filter) => self.fetch_rows_by_ids(&row_ids, filter)?,
+            None => self.fetch_rows_by_ids(&row_ids, &ConstBoolExpr::true_expr())?,
+        };
+        Ok(Some(rows))
+    }
+
+    /// Every visible row `where_expr` keeps, read through the statement's
+    /// view when it has one
+    fn scan_every(
+        &self,
+        schema: CompactArc<Schema>,
+        column_indices: &[usize],
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
+        #[cfg(test)]
+        self.full_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Through a statement view the rows read later are the ones read now
+        let shared = !self.local().has_local_changes();
+        if let Some(view) = self.view.as_ref().filter(|_| shared) {
+            let Some(rows) = self.version_store.hot_rows() else {
+                return Ok(Box::new(MVCCScanner::empty(column_indices.to_vec())));
+            };
+            self.check_read()?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_scan_checked();
+            return Ok(Box::new(HotScanner::new(
+                rows,
+                self.reader(),
+                view.clone(),
+                where_expr,
+                schema,
+                column_indices,
+            )));
+        }
+        let rows = self.collect_visible_rows(where_expr)?;
+        self.check_read()?;
+        let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
+        Ok(Box::new(scanner))
     }
 }
 
@@ -3720,41 +3563,40 @@ impl Table for MVCCTable {
             }
 
             // Try index lookup for non-PK columns
-            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
-                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
-                // Use index-based scan - much more efficient
-                let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr)?;
+            if let Some(rows) = self.index_rows(self.try_index_lookup(expr), Some(expr))? {
                 let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
                 return Ok(Box::new(scanner));
             }
         }
+        self.scan_every(schema, column_indices, where_expr)
+    }
 
-        // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
-        #[cfg(test)]
-        self.full_scans
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Through a statement view the rows read later are the ones read now
-        let shared = !self.local().has_local_changes();
-        if let Some(view) = self.view.as_ref().filter(|_| shared) {
-            let Some(rows) = self.version_store.hot_rows() else {
-                return Ok(Box::new(MVCCScanner::empty(column_indices.to_vec())));
-            };
-            self.check_read()?;
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::hot_scan_checked();
-            return Ok(Box::new(HotScanner::new(
-                rows,
-                self.reader(),
-                view.clone(),
-                where_expr,
-                schema,
-                column_indices,
-            )));
+    fn scan_access(
+        &self,
+        access: ScanAccess<'_>,
+        column_indices: &[usize],
+        _needed: Option<&[bool]>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        let schema = self.cached_schema.clone();
+        let row_ids = self.access_ids(access, where_expr);
+        if let Some(rows) = self.index_rows(row_ids, where_expr)? {
+            let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
+            return Ok(Box::new(scanner));
         }
-        let rows = self.collect_visible_rows(where_expr)?;
-        self.check_read()?;
-        let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
-        Ok(Box::new(scanner))
+        self.scan_every(schema, column_indices, where_expr)
+    }
+
+    fn collect_access_rows(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<RowVec> {
+        let row_ids = self.access_ids(access, where_expr);
+        if let Some(rows) = self.index_rows(row_ids, where_expr)? {
+            return Ok(rows);
+        }
+        self.collect_all_rows(where_expr)
     }
 
     /// Answered by walking a multi-column index whose leading columns the
@@ -3918,6 +3760,28 @@ impl Table for MVCCTable {
     ) -> Result<RowVec> {
         // Use the optimized unordered version with true early termination
         let rows = self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset)?;
+        self.check_read()?;
+        Ok(rows)
+    }
+
+    fn collect_access_rows_with_limit_unordered(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let indexed = match where_expr {
+            Some(filter) => {
+                let row_ids = self.access_ids(access, where_expr);
+                self.index_rows_with_limit(row_ids, filter, limit, offset)?
+            }
+            None => None,
+        };
+        let rows = match indexed {
+            Some(rows) => rows,
+            None => self.limited_rows_unordered(where_expr, limit, offset)?,
+        };
         self.check_read()?;
         Ok(rows)
     }

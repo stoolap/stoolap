@@ -43,7 +43,7 @@ use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
     aggregate_row, grouped_aggregates, AggregateOp, LayoutToken,
 };
-use crate::storage::traits::table::ScanPlan;
+use crate::storage::traits::table::{ScanAccess, ScanPlan};
 use crate::storage::traits::{
     CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
 };
@@ -451,6 +451,252 @@ pub struct SegmentedTable {
 }
 
 impl SegmentedTable {
+    /// Up to `limit` visible rows past `offset` that `where_expr` keeps, the
+    /// hot ones first, read by `access` when the statement's plan chose one
+    fn limited_cold_and_hot_unordered(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+        access: Option<ScanAccess<'_>>,
+    ) -> Result<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.collect_rows_with_limit_unordered");
+        let hot_rows = |hot: &dyn Table, target: usize, offset: usize| match access {
+            Some(access) => {
+                hot.collect_access_rows_with_limit_unordered(access, where_expr, target, offset)
+            }
+            None => hot.collect_rows_with_limit_unordered(where_expr, target, offset),
+        };
+        if let Some(result) = self.unsealed(|hot| hot_rows(hot, limit, offset)) {
+            return result;
+        }
+
+        let target = limit + offset;
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
+
+        // The hot rows are read before the cold view is taken, so a seal
+        // landing between them would show its rows twice
+        self.settled_across_seals(|| {
+            // Unordered: hot rows first with early termination.
+            // Only scan up to `target` hot rows — avoids O(hot_rows) for small LIMITs.
+            let hot_rows = hot_rows(&*self.hot, target, 0)?;
+            if hot_rows.len() >= target {
+                return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
+            }
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::hot_rows_taken();
+
+            // Need cold rows. Build hot_skip and scan with early termination.
+            // Optimization: avoid materializing rows that fall within the offset.
+            // Hot rows already collected cover some of the offset+limit range.
+            // For the cold scan, track a skip counter to avoid get_row() for offset rows.
+            let hot_count = hot_rows.len();
+            let cold_skip = offset.saturating_sub(hot_count);
+            let mut result: RowVec = if hot_count > offset {
+                hot_rows.into_iter().skip(offset).collect()
+            } else {
+                RowVec::new()
+            };
+            let remaining = limit.saturating_sub(result.len()) + cold_skip;
+
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            let view = self.segment_mgr.cold_snapshot();
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_volumes_taken();
+            let tombstones_arc = &view.ts;
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            let mut collected = 0usize;
+            let mut cold_skipped = 0usize;
+
+            // Zone-map + bloom filter setup for pruning.
+            let comparisons = where_expr
+                .map(|e| e.collect_comparisons())
+                .unwrap_or_default();
+            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+            let ask = if comparisons.is_empty() {
+                None
+            } else {
+                self.side_ask(&comparisons)
+            };
+            let unique_keys = self.unique_keys_for(&comparisons)?;
+
+            'outer: for (seg_id, cs) in view.volumes() {
+                let vol = &cs.volume;
+                // Zone-map pruning: skip entire volume if no rows can match.
+                let pruned = if !comparisons.is_empty() {
+                    let (skip, _, _) =
+                        Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    skip
+                } else {
+                    false
+                };
+
+                if pruned {
+                    continue;
+                }
+                // A built unique index, then the side file, are probed before
+                // the volume's data is touched
+                let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
+                    UniqueDecision::Empty => continue,
+                    UniqueDecision::Positions(positions) => (None, Some(positions)),
+                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
+                        SideDecision::Empty => continue,
+                        SideDecision::Walk(plan) => (start_walk(&plan)?, None),
+                        SideDecision::Scan => (None, None),
+                    },
+                };
+
+                // Load cold volume on demand after pruning.
+                let loaded;
+                let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    if walk.is_some() {
+                        super::secondary::READS.count(&super::secondary::READS.reloads, 1);
+                    }
+                    loaded = match self.load_volume_of_view(&view, seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    &loaded
+                } else {
+                    vol.mark_accessed();
+                    vol
+                };
+
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                let row_ids = vol.row_ids()?;
+                let indexed = walk.is_some();
+                let mut served = 0u64;
+                let mut plain = 0usize;
+                // The walk or the positions name the rows; else every position in turn
+                let mut next_position = move || -> Result<Option<usize>> {
+                    if let Some(walk) = walk.as_mut() {
+                        walk.next_position().map_err(|error| {
+                            crate::core::Error::internal(format!("side index read failed: {error}"))
+                        })
+                    } else if let Some(positions) = positions.as_ref() {
+                        let next = positions.get(plain).copied();
+                        plain += 1;
+                        Ok(next)
+                    } else if plain < row_ids.len() {
+                        plain += 1;
+                        Ok(Some(plain - 1))
+                    } else {
+                        Ok(None)
+                    }
+                };
+
+                while let Some(i) = next_position()? {
+                    let row_id = row_ids[i];
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(tombstones_arc, row_id) || hot_skip.contains(&row_id)
+                    {
+                        continue;
+                    }
+                    // For rows with a WHERE clause, we must evaluate the filter
+                    // even during the skip phase to get correct offset counting.
+                    if where_expr.is_some() {
+                        let row = reader.row(i, &cs.mapping)?;
+                        if let Some(expr) = where_expr {
+                            if !passes(expr, fallible, &row)? {
+                                continue;
+                            }
+                        }
+                        // Skip without storing if still in offset range
+                        if cold_skipped < cold_skip {
+                            cold_skipped += 1;
+                        } else {
+                            result.push((row_id, row));
+                        }
+                    } else {
+                        // No WHERE: skip without materializing the row
+                        if cold_skipped < cold_skip {
+                            cold_skipped += 1;
+                        } else {
+                            let row = reader.row(i, &cs.mapping)?;
+                            result.push((row_id, row));
+                        }
+                    }
+                    if indexed {
+                        served += 1;
+                    }
+                    collected += 1;
+                    if collected >= remaining {
+                        super::secondary::READS.count(&super::secondary::READS.rows, served);
+                        break 'outer;
+                    }
+                }
+                super::secondary::READS.count(&super::secondary::READS.rows, served);
+            }
+
+            Ok(result)
+        })
+    }
+
+    /// The hot rows `where_expr` keeps, read by `access` when the
+    /// statement's plan chose one
+    fn hot_rows(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        access: Option<ScanAccess<'_>>,
+    ) -> Result<RowVec> {
+        match access {
+            Some(access) => self.hot.collect_access_rows(access, where_expr),
+            None => self.hot.collect_all_rows(where_expr),
+        }
+    }
+
+    /// Every visible row `where_expr` keeps, the cold ones and the hot ones,
+    /// the hot ones read by `access` when the statement's plan chose one
+    fn collect_cold_and_hot(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        access: Option<ScanAccess<'_>>,
+    ) -> Result<RowVec> {
+        if let Some(result) = self.unsealed(|hot| match access {
+            Some(access) => hot.collect_access_rows(access, where_expr),
+            None => hot.collect_all_rows(where_expr),
+        }) {
+            return result;
+        }
+
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            // Scan hot FIRST to get a consistent snapshot. The skip set is
+            // derived from actual hot results, not a separate B-tree read.
+            // This prevents the race where remove_moved_rows runs between
+            // building the skip set and scanning hot.
+            let hot_rows = self.hot_rows(where_expr, access)?;
+
+            let mut skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            for &(id, _) in &hot_rows {
+                skip.insert(id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+
+            let Some(mut all_rows) = self.collect_cold_rows(where_expr, skip, generation)? else {
+                return Ok(None);
+            };
+            for entry in hot_rows {
+                all_rows.push(entry);
+            }
+            Ok(Some(all_rows))
+        })
+    }
+
     /// Create a segmented table from a hot buffer and a segment manager.
     pub fn new(hot: Box<dyn Table>, segment_mgr: Arc<SegmentManager>) -> Self {
         let schema_generation = segment_mgr.schema_generation();
@@ -2685,10 +2931,15 @@ impl SegmentedTable {
         column_indices: &[usize],
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
+        access: Option<ScanAccess<'_>>,
     ) -> Result<Box<dyn Scanner>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_cold_and_hot");
-        if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
+        let unsealed = self.unsealed(|hot| match access {
+            Some(access) => hot.scan_access(access, column_indices, None, where_expr),
+            None => hot.scan(column_indices, where_expr),
+        });
+        if let Some(result) = unsealed {
             return result;
         }
         self.across_seals(|generation| {
@@ -2699,7 +2950,7 @@ impl SegmentedTable {
             // The skip set for cold scanners is derived from these actual results,
             // preventing the race where remove_moved_rows runs between building
             // the skip set and hot scanner execution (which would lose rows).
-            let hot_rows = self.hot.collect_all_rows(where_expr)?;
+            let hot_rows = self.hot_rows(where_expr, access)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -4123,7 +4374,17 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, None, where_expr)
+        self.scan_cold_and_hot(column_indices, None, where_expr, None)
+    }
+
+    fn scan_access(
+        &self,
+        access: ScanAccess<'_>,
+        column_indices: &[usize],
+        needed: Option<&[bool]>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        self.scan_cold_and_hot(column_indices, needed, where_expr, Some(access))
     }
 
     fn narrows_scans(&self) -> bool {
@@ -4136,39 +4397,19 @@ impl Table for SegmentedTable {
         needed: &[bool],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, Some(needed), where_expr)
+        self.scan_cold_and_hot(column_indices, Some(needed), where_expr, None)
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
-        if let Some(result) = self.unsealed(|hot| hot.collect_all_rows(where_expr)) {
-            return result;
-        }
+        self.collect_cold_and_hot(where_expr, None)
+    }
 
-        self.across_seals(|generation| {
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::merged_read_began();
-            // Scan hot FIRST to get a consistent snapshot. The skip set is
-            // derived from actual hot results, not a separate B-tree read.
-            // This prevents the race where remove_moved_rows runs between
-            // building the skip set and scanning hot.
-            let hot_rows = self.hot.collect_all_rows(where_expr)?;
-
-            let mut skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-            for &(id, _) in &hot_rows {
-                skip.insert(id);
-            }
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
-
-            let Some(mut all_rows) = self.collect_cold_rows(where_expr, skip, generation)? else {
-                return Ok(None);
-            };
-            for entry in hot_rows {
-                all_rows.push(entry);
-            }
-            Ok(Some(all_rows))
-        })
+    fn collect_access_rows(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<RowVec> {
+        self.collect_cold_and_hot(where_expr, Some(access))
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
@@ -4529,185 +4770,17 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::note_read("seg.collect_rows_with_limit_unordered");
-        if let Some(result) =
-            self.unsealed(|hot| hot.collect_rows_with_limit_unordered(where_expr, limit, offset))
-        {
-            return result;
-        }
+        self.limited_cold_and_hot_unordered(where_expr, limit, offset, None)
+    }
 
-        let target = limit + offset;
-        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
-
-        // The hot rows are read before the cold view is taken, so a seal
-        // landing between them would show its rows twice
-        self.settled_across_seals(|| {
-            // Unordered: hot rows first with early termination.
-            // Only scan up to `target` hot rows — avoids O(hot_rows) for small LIMITs.
-            let hot_rows = self
-                .hot
-                .collect_rows_with_limit_unordered(where_expr, target, 0)?;
-            if hot_rows.len() >= target {
-                return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
-            }
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::hot_rows_taken();
-
-            // Need cold rows. Build hot_skip and scan with early termination.
-            // Optimization: avoid materializing rows that fall within the offset.
-            // Hot rows already collected cover some of the offset+limit range.
-            // For the cold scan, track a skip counter to avoid get_row() for offset rows.
-            let hot_count = hot_rows.len();
-            let cold_skip = offset.saturating_sub(hot_count);
-            let mut result: RowVec = if hot_count > offset {
-                hot_rows.into_iter().skip(offset).collect()
-            } else {
-                RowVec::new()
-            };
-            let remaining = limit.saturating_sub(result.len()) + cold_skip;
-
-            self.segment_mgr
-                .check_schema_generation(self.schema_generation)?;
-            let view = self.segment_mgr.cold_snapshot();
-            self.segment_mgr
-                .check_schema_generation(self.schema_generation)?;
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::cold_volumes_taken();
-            let tombstones_arc = &view.ts;
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-            let mut collected = 0usize;
-            let mut cold_skipped = 0usize;
-
-            // Zone-map + bloom filter setup for pruning.
-            let comparisons = where_expr
-                .map(|e| e.collect_comparisons())
-                .unwrap_or_default();
-            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let ask = if comparisons.is_empty() {
-                None
-            } else {
-                self.side_ask(&comparisons)
-            };
-            let unique_keys = self.unique_keys_for(&comparisons)?;
-
-            'outer: for (seg_id, cs) in view.volumes() {
-                let vol = &cs.volume;
-                // Zone-map pruning: skip entire volume if no rows can match.
-                let pruned = if !comparisons.is_empty() {
-                    let (skip, _, _) =
-                        Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
-                    skip
-                } else {
-                    false
-                };
-
-                if pruned {
-                    continue;
-                }
-                // A built unique index, then the side file, are probed before
-                // the volume's data is touched
-                let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
-                    UniqueDecision::Empty => continue,
-                    UniqueDecision::Positions(positions) => (None, Some(positions)),
-                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
-                        SideDecision::Empty => continue,
-                        SideDecision::Walk(plan) => (start_walk(&plan)?, None),
-                        SideDecision::Scan => (None, None),
-                    },
-                };
-
-                // Load cold volume on demand after pruning.
-                let loaded;
-                let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                    if walk.is_some() {
-                        super::secondary::READS.count(&super::secondary::READS.reloads, 1);
-                    }
-                    loaded = match self.load_volume_of_view(&view, seg_id)? {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    &loaded
-                } else {
-                    vol.mark_accessed();
-                    vol
-                };
-
-                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-                let row_ids = vol.row_ids()?;
-                let indexed = walk.is_some();
-                let mut served = 0u64;
-                let mut plain = 0usize;
-                // The walk or the positions name the rows; else every position in turn
-                let mut next_position = move || -> Result<Option<usize>> {
-                    if let Some(walk) = walk.as_mut() {
-                        walk.next_position().map_err(|error| {
-                            crate::core::Error::internal(format!("side index read failed: {error}"))
-                        })
-                    } else if let Some(positions) = positions.as_ref() {
-                        let next = positions.get(plain).copied();
-                        plain += 1;
-                        Ok(next)
-                    } else if plain < row_ids.len() {
-                        plain += 1;
-                        Ok(Some(plain - 1))
-                    } else {
-                        Ok(None)
-                    }
-                };
-
-                while let Some(i) = next_position()? {
-                    let row_id = row_ids[i];
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if self.is_row_tombstoned(tombstones_arc, row_id) || hot_skip.contains(&row_id)
-                    {
-                        continue;
-                    }
-                    // For rows with a WHERE clause, we must evaluate the filter
-                    // even during the skip phase to get correct offset counting.
-                    if where_expr.is_some() {
-                        let row = reader.row(i, &cs.mapping)?;
-                        if let Some(expr) = where_expr {
-                            if !passes(expr, fallible, &row)? {
-                                continue;
-                            }
-                        }
-                        // Skip without storing if still in offset range
-                        if cold_skipped < cold_skip {
-                            cold_skipped += 1;
-                        } else {
-                            result.push((row_id, row));
-                        }
-                    } else {
-                        // No WHERE: skip without materializing the row
-                        if cold_skipped < cold_skip {
-                            cold_skipped += 1;
-                        } else {
-                            let row = reader.row(i, &cs.mapping)?;
-                            result.push((row_id, row));
-                        }
-                    }
-                    if indexed {
-                        served += 1;
-                    }
-                    collected += 1;
-                    if collected >= remaining {
-                        super::secondary::READS.count(&super::secondary::READS.rows, served);
-                        break 'outer;
-                    }
-                }
-                super::secondary::READS.count(&super::secondary::READS.rows, served);
-            }
-
-            Ok(result)
-        })
+    fn collect_access_rows_with_limit_unordered(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        self.limited_cold_and_hot_unordered(where_expr, limit, offset, Some(access))
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
