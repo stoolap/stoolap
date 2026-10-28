@@ -50,6 +50,13 @@ const READS: &[&str] = &[
      AND id > (SELECT MIN(id) - 2 FROM u)",
 ];
 
+// Every test here builds plans, which the compile counters count process-wide
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn ids(db: &Database, sql: &str, prepared: bool) -> Result<Vec<i64>, String> {
     let rows = match prepared {
         true => db
@@ -84,6 +91,7 @@ fn open(name: &str, sealed: bool, dir: &tempfile::TempDir) -> Database {
 
 #[test]
 fn a_view_reads_its_own_tables_under_a_cte_of_the_same_name() {
+    let _serial = serial();
     let mut wrong = Vec::new();
     for sealed in [false, true] {
         for prepared in [false, true] {
@@ -160,6 +168,7 @@ fn executor_ids(
 
 #[test]
 fn a_statement_in_a_context_bringing_ctes_keeps_its_text_s_plan_apart() {
+    let _serial = serial();
     let texts = [
         "SELECT id FROM t WHERE id IN (SELECT id FROM u)",
         "SELECT id FROM u WHERE id = 2",
@@ -217,6 +226,7 @@ fn a_statement_in_a_context_bringing_ctes_keeps_its_text_s_plan_apart() {
 
 #[test]
 fn a_join_on_subquery_runs_as_its_blocks_in_a_context_bringing_ctes() {
+    let _serial = serial();
     let engine = MVCCEngine::in_memory();
     engine.open_engine().unwrap();
     let executor = Executor::new(Arc::new(engine));
@@ -239,6 +249,7 @@ fn a_join_on_subquery_runs_as_its_blocks_in_a_context_bringing_ctes() {
 
 #[test]
 fn a_cte_of_the_same_name_with_other_columns_gets_its_own_plan() {
+    let _serial = serial();
     let engine = MVCCEngine::in_memory();
     engine.open_engine().unwrap();
     let executor = Executor::new(Arc::new(engine));
@@ -295,6 +306,7 @@ fn id_ctes_context(ctes: &[(&str, i64)]) -> ExecutionContext {
 
 #[test]
 fn ctes_are_told_apart_by_their_names_not_a_number_made_of_them() {
+    let _serial = serial();
     /// With the column id, FxHash gives this name the value it gives u
     const TWIN: &str = "jjs6mwdf4v\"m/`r@";
     /// With the column id, FxHash gives this name and u values summing to 0
@@ -342,6 +354,7 @@ fn ctes_are_told_apart_by_their_names_not_a_number_made_of_them() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
+    let _serial = serial();
     use stoolap::test_failpoints::{bridge_compiles, program_compiles};
     let engine = MVCCEngine::in_memory();
     engine.open_engine().unwrap();

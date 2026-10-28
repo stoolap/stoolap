@@ -57,6 +57,13 @@ const READS: &[(&str, &str)] = &[
     ("plain", "SELECT * FROM u"),
 ];
 
+// Every test here builds plans, which the compile counters count process-wide
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn open(name: &str) -> Database {
     let db = Database::open(&format!("memory://plan_validity_{name}")).unwrap();
     for sql in SETUP {
@@ -145,6 +152,7 @@ const CHANGES: &[(&str, &[&str])] = &[
 
 #[test]
 fn a_plan_answers_as_a_new_one_after_a_change_to_what_it_reads() {
+    let _serial = serial();
     let mut wrong = Vec::new();
     for (change_index, (change, statements)) in CHANGES.iter().enumerate() {
         let db = open(&format!("changed_{change_index}"));
@@ -201,6 +209,7 @@ const WRITES: &[(&str, &str, &str)] = &[
 
 #[test]
 fn a_write_plan_writes_as_a_new_one_after_a_change_to_its_target() {
+    let _serial = serial();
     let mut wrong = Vec::new();
     for (change_index, (change, statements)) in CHANGES.iter().enumerate() {
         for (write_index, (name, write, read)) in WRITES.iter().enumerate() {
@@ -238,6 +247,7 @@ fn a_write_plan_writes_as_a_new_one_after_a_change_to_its_target() {
 
 #[test]
 fn a_parent_s_compiled_writes_keep_a_foreign_key_made_after_them() {
+    let _serial = serial();
     let db = Database::open("memory://plan_validity_foreign_key").unwrap();
     for sql in [
         "CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER)",
@@ -277,9 +287,6 @@ mod held {
         after_compiled_epoch_checked, bridge_compiles, prepared_dml_built, prepared_selects_built,
         program_compiles,
     };
-
-    // The compile counters are process-wide
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn compiles() -> [usize; 4] {
         [
@@ -342,7 +349,7 @@ mod held {
 
     #[test]
     fn a_plan_holds_across_a_change_to_what_it_does_not_read() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let mut wrong = Vec::new();
         for (index, (name, statements, read)) in SHAPES.iter().enumerate() {
             let db = open(&format!("held_{index}"));
@@ -375,7 +382,7 @@ mod held {
 
     #[test]
     fn a_compiled_pk_lookup_holds_across_a_change_to_another_table() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let db = open("held_pk_lookup");
         let lookup = "SELECT * FROM u WHERE id = $1";
         for id in [1, 2] {
