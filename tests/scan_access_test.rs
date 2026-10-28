@@ -199,6 +199,16 @@ fn assert_alike(db: &Database, what: &str) {
         assert_eq!(read(), before, "{what}: a scan of every row read an index");
         drop(
             table
+                .collect_access_rows_with_limit_unordered(ScanAccess::Seq, Some(&condition), 3, 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            read(),
+            before,
+            "{what}: a limited scan of every row read an index"
+        );
+        drop(
+            table
                 .scan_access(ScanAccess::Index(&plan), &columns, None, Some(&condition))
                 .unwrap(),
         );
@@ -227,4 +237,54 @@ fn an_index_access_reads_the_rows_a_chosen_scan_reads_sealed() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     change(&db);
     assert_alike(&db, "sealed");
+}
+
+/// The ids `sql` gives, sorted
+fn ids(db: &Database, sql: &str) -> Vec<i64> {
+    let mut ids: Vec<i64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn a_range_after_a_multi_column_prefix_keeps_the_rows_at_its_bounds() {
+    let db = Database::open("memory://scan_access_prefix_range").unwrap();
+    for table in ["t", "plain"] {
+        db.execute(
+            &format!(
+                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)"
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!(
+                "INSERT INTO {table} VALUES (1, 1, 5, 0), (2, 1, 10, 0), (3, 1, 3, 7), \
+                 (4, 2, 5, 0), (5, 1, 11, 1), (6, 0, 5, 0)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("CREATE INDEX t_abc ON t(a, b, c)", ()).unwrap();
+    for condition in [
+        "a = 1 AND b < 10",
+        "a = 1 AND b <= 10",
+        "a = 1 AND b > 3 AND b < 10",
+        "a = 1 AND b >= 3 AND b <= 10",
+        "a = 1 AND b > 3 AND b <= 11",
+    ] {
+        for tail in ["", " LIMIT 10"] {
+            let sql = format!("SELECT id FROM {{t}} WHERE {condition}{tail}");
+            assert_eq!(
+                ids(&db, &sql.replace("{t}", "t")),
+                ids(&db, &sql.replace("{t}", "plain")),
+                "{sql}"
+            );
+        }
+    }
 }

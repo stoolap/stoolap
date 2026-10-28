@@ -378,7 +378,8 @@ fn decide_scope<T: IndexTerm + ?Sized>(
 
 /// The multi-column index `equal`'s columns lead, with how many it reads by
 /// equality and whether it reads the next column's range, when it reads at
-/// least `least` columns. A range needs an upper bound
+/// least `least` columns. A range needs an upper bound, and the next column
+/// must be the index's last: a bound shorter than the keys cuts them wrongly
 fn composite(
     store: &VersionStore,
     asked: &[Asked<'_>],
@@ -389,10 +390,10 @@ fn composite(
         return None;
     }
     let (index, matched) = store.get_multi_column_index(equal)?;
-    let ranged = index.column_names().get(matched).is_some_and(|next| {
-        asked
+    let columns = index.column_names();
+    let ranged = matched + 1 == columns.len()
+        && asked
             .iter()
-            .any(|a| a.upper && a.column.eq_ignore_ascii_case(next))
-    });
+            .any(|a| a.upper && a.column.eq_ignore_ascii_case(&columns[matched]));
     (matched + ranged as usize >= least).then_some((index, (matched, ranged)))
 }

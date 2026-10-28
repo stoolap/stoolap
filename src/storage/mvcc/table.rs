@@ -2088,13 +2088,23 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        let schema = &self.cached_schema;
         if let Some(expr) = filter {
             if let Some(rows) = self.keyed_rows_with_limit(expr, limit, offset)? {
                 return Ok(rows);
             }
         }
+        self.visible_rows_with_limit(filter, limit, offset)
+    }
 
+    /// Up to `limit` visible rows past `offset` that `filter` keeps, in row
+    /// order, read without the indexes
+    fn visible_rows_with_limit(
+        &self,
+        filter: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let schema = &self.cached_schema;
         let txn_versions = self.local();
 
         // Check if we have local versions (uncommitted changes in this transaction)
@@ -2323,10 +2333,10 @@ impl MVCCTable {
         }
 
         // Has local versions - use same path as ordered (local changes are rare)
-        // Early termination is already implemented in collect_visible_rows_with_limit
+        // Early termination is already implemented in visible_rows_with_limit
         // when there are local changes
         drop(txn_versions);
-        self.collect_visible_rows_with_limit(filter, limit, offset)
+        self.visible_rows_with_limit(filter, limit, offset)
     }
 
     /// The version read for a row read from the transaction's own
