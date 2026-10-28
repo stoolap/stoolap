@@ -411,8 +411,14 @@ fn an_aggregate_beside_an_uncorrelated_value_answers_as_its_literal_twin() {
     let db = Database::open("memory://grouped_output_value_twin").unwrap();
     fill(&db);
     for (sql, twin) in [
-        ("SELECT COUNT(*) + (SELECT 1) FROM t", "SELECT COUNT(*) + 1 FROM t"),
-        ("SELECT SUM(b) + (SELECT 1) FROM t", "SELECT SUM(b) + 1 FROM t"),
+        (
+            "SELECT COUNT(*) + (SELECT 1) FROM t",
+            "SELECT COUNT(*) + 1 FROM t",
+        ),
+        (
+            "SELECT SUM(b) + (SELECT 1) FROM t",
+            "SELECT SUM(b) + 1 FROM t",
+        ),
         (
             "SELECT COUNT(*) + (SELECT 1) FROM t WHERE a > (SELECT 4)",
             "SELECT COUNT(*) + 1 FROM t WHERE a > 4",
