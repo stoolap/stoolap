@@ -182,6 +182,40 @@ fn a_failing_parameter_or_subquery_fails_only_where_a_row_reaches_it() {
 }
 
 #[test]
+fn a_count_read_per_run_takes_the_ordered_read() {
+    let db = table("planned_count_per_run");
+    for (sql, want, plan) in [
+        (
+            "SELECT id FROM t ORDER BY id LIMIT $1",
+            vec![1, 2],
+            vec!["Limit $1", "  Project id", "    IndexOrder t id ASC"],
+        ),
+        (
+            "SELECT id FROM t ORDER BY id DESC LIMIT (SELECT 1) OFFSET $1",
+            vec![1],
+            vec![
+                "Limit (SELECT 1) offset $1",
+                "  Project id",
+                "    IndexOrder t id DESC",
+            ],
+        ),
+    ] {
+        let got: Vec<i64> = db
+            .query(sql, (2,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(got, want, "{sql}");
+        let lines: Vec<String> = db
+            .query(&format!("EXPLAIN {sql}"), (2,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(lines, plan, "{sql}");
+    }
+}
+
+#[test]
 fn computed_values_under_an_or_are_read_by_the_index() {
     let db = table("planned_computed_or");
     db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();

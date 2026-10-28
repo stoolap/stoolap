@@ -204,6 +204,21 @@ Limit 5
     Keyset products id ASC (id > 1)
 ```
 
+A LIMIT or OFFSET given as a parameter or a subquery is read on each run and takes the same plan; EXPLAIN shows it as written:
+
+```sql
+EXPLAIN SELECT * FROM products ORDER BY value DESC LIMIT $1;
+```
+
+Output:
+```
+plan
+----
+Limit $1
+  Project id, name, category, value
+    IndexOrder products value DESC
+```
+
 ## EXPLAIN ANALYZE
 
 Executes the query and shows actual runtime statistics.

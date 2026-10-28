@@ -55,8 +55,8 @@ impl SelectPlan {
             Access::PkGet(key) => vec![format!("PkGet {table} {}", key.describe())],
         };
         explain_steps(
-            self.limit,
-            self.offset,
+            self.limit.map(|limit| limit.to_string()),
+            (self.offset > 0).then(|| self.offset.to_string()),
             &self.names,
             None,
             self.filter.is_some(),
@@ -66,10 +66,10 @@ impl SelectPlan {
 }
 
 /// A single-table plan's steps as EXPLAIN shows them, outermost first, each
-/// indented under the one it feeds
+/// indented under the one it feeds; a LIMIT or OFFSET as its count reads
 pub fn explain_steps(
-    limit: Option<usize>,
-    offset: usize,
+    limit: Option<String>,
+    offset: Option<String>,
     names: &[String],
     sort: Option<String>,
     filter: bool,
@@ -77,10 +77,10 @@ pub fn explain_steps(
 ) -> Vec<String> {
     let mut steps = Vec::new();
     match (limit, offset) {
-        (None, 0) => {}
-        (Some(limit), 0) => steps.push(format!("Limit {limit}")),
-        (None, offset) => steps.push(format!("Offset {offset}")),
-        (Some(limit), offset) => steps.push(format!("Limit {limit} offset {offset}")),
+        (None, None) => {}
+        (Some(limit), None) => steps.push(format!("Limit {limit}")),
+        (None, Some(offset)) => steps.push(format!("Offset {offset}")),
+        (Some(limit), Some(offset)) => steps.push(format!("Limit {limit} offset {offset}")),
     }
     steps.extend(sort.map(|keys| format!("Sort {keys}")));
     steps.push(format!("Project {}", names.join(", ")));

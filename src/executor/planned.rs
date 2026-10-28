@@ -114,7 +114,6 @@ impl Executor {
         {
             return None;
         }
-        let counts = static_row_counts(stmt)?;
         let Expression::TableSource(ts) = stmt.table_expr.as_deref()? else {
             return None;
         };
@@ -132,10 +131,13 @@ impl Executor {
         let param_count = ctx.params().len();
         let prepared =
             PreparedSelect::prepare(self, ctx, stmt, &schema, scope, param_count, epoch).ok();
-        let plan = prepared
-            .as_ref()
-            .and_then(PreparedSelect::plan_inputs)
-            .and_then(|inputs| plan_select(inputs, &schema, counts.offset, counts.limit));
+        // A LIMIT or OFFSET read per run leaves the statement to the runner
+        let plan = static_row_counts(stmt).and_then(|counts| {
+            prepared
+                .as_ref()
+                .and_then(PreparedSelect::plan_inputs)
+                .and_then(|inputs| plan_select(inputs, &schema, counts.offset, counts.limit))
+        });
         let mut slot = compiled.write().ok()?;
         let open = matches!(
             &*slot,
@@ -186,8 +188,7 @@ impl Executor {
         let Expression::TableSource(source) = stmt.table_expr.as_deref()? else {
             return None;
         };
-        let counts = static_row_counts(stmt)?;
-        prepared.explain(stmt, &source.name.value_lower, counts.offset, counts.limit)
+        prepared.explain(stmt, &source.name.value_lower)
     }
 
     /// `stmt` run by the plan `compiled` holds, planned now in `ctx` when it

@@ -3215,18 +3215,12 @@ pub struct PlanInputs {
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table`, as
     /// EXPLAIN shows it; None when the table chooses how it reads
-    pub(crate) fn explain(
-        &self,
-        stmt: &SelectStatement,
-        table: &str,
-        offset: usize,
-        limit: Option<usize>,
-    ) -> Option<Vec<String>> {
+    pub(crate) fn explain(&self, stmt: &SelectStatement, table: &str) -> Option<Vec<String>> {
         let pushed = self.where_.pushdown.as_ref();
         let mut access = self.where_.scan.as_ref()?.explain(table, pushed);
         let ordered = self
             .ordered
-            .filter(|_| limit.is_some())
+            .filter(|_| stmt.limit.is_some())
             .zip(Executor::ordered_read_column(stmt));
         let sort = match ordered {
             Some((read, (column, ascending, _))) => {
@@ -3240,6 +3234,12 @@ impl PreparedSelect {
         };
         let filter = self.where_.conjuncts > self.where_.pushed;
         let names = &self.output_columns[..self.visible];
+        let limit = stmt.limit.as_deref().map(Expression::to_string);
+        let offset = stmt
+            .offset
+            .as_deref()
+            .filter(|offset| !matches!(offset, Expression::IntegerLiteral(lit) if lit.value == 0))
+            .map(Expression::to_string);
         Some(explain_steps(limit, offset, names, sort, filter, access))
     }
 
