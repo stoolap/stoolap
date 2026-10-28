@@ -39,8 +39,108 @@ use crate::executor::context::KeptMembers;
 use crate::functions::scalar::extreme_position;
 use std::cmp::Ordering;
 
-/// Stack value that can be borrowed (from row/constants) or owned (from operations)
-type StackValue<'a> = Cow<'a, Value>;
+/// The VM's value stack for one run: a value loaded from the row, the
+/// program's constants or the parameters is borrowed, a computed one owned
+struct Stack<'a>(SmallVec<[Cow<'a, Value>; STACK_INLINE_CAPACITY]>);
+
+impl<'a> Stack<'a> {
+    #[inline(always)]
+    fn new() -> Self {
+        Self(SmallVec::new())
+    }
+
+    /// Room for `depth` values, taken on the heap only past the inline
+    /// capacity; done in place, since moving a stack copies its inline buffer
+    #[inline(always)]
+    fn reserve(&mut self, depth: usize) {
+        if depth > STACK_INLINE_CAPACITY {
+            self.0.reserve_exact(depth);
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, value: Value) {
+        self.0.push(Cow::Owned(value));
+    }
+
+    #[inline]
+    fn push_ref(&mut self, value: &'a Value) {
+        self.0.push(Cow::Borrowed(value));
+    }
+
+    #[inline]
+    fn push_cow(&mut self, value: Cow<'a, Value>) {
+        self.0.push(value);
+    }
+
+    /// The values from `start` to the top replaced by the one at `kept`,
+    /// or by NULL when there is none
+    #[inline]
+    fn take_one(&mut self, start: usize, kept: Option<usize>) {
+        let value = match kept {
+            Some(at) => self.0.swap_remove(at),
+            None => Cow::Borrowed(&NULL_VALUE),
+        };
+        self.0.truncate(start);
+        self.0.push(value);
+    }
+
+    /// The top value, NULL when the stack is empty
+    #[inline]
+    fn pop(&mut self) -> Cow<'a, Value> {
+        self.0.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE))
+    }
+
+    #[inline]
+    fn last(&self) -> Option<&Value> {
+        self.0.last().map(|v| &**v)
+    }
+
+    #[inline]
+    fn last_mut(&mut self) -> Option<&mut Value> {
+        self.0.last_mut().map(Cow::to_mut)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+
+    #[inline]
+    fn swap(&mut self, a: usize, b: usize) {
+        self.0.swap(a, b);
+    }
+
+    /// The top value pushed again; nothing on an empty stack
+    #[inline]
+    fn dup(&mut self) {
+        if let Some(top) = self.0.last().cloned() {
+            self.0.push(top);
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The values from `start` to the top
+    #[inline]
+    fn from(&self, start: usize) -> &[Cow<'a, Value>] {
+        &self.0[start..]
+    }
+
+    /// The values from `start` to the top, taken off the stack
+    #[inline]
+    fn drain(&mut self, start: usize) -> impl Iterator<Item = Value> + use<'_, 'a> {
+        self.0.drain(start..).map(Cow::into_owned)
+    }
+}
 
 /// A predicate's result as a value: None is UNKNOWN, a boolean NULL
 #[inline]
@@ -145,8 +245,9 @@ fn between_cell(value: &Value, low: &Value, high: &Value) -> Option<bool> {
 }
 
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
-/// Most expressions need 4-8 stack slots, so 8 covers the common case.
-pub(super) const STACK_INLINE_CAPACITY: usize = 16;
+/// Most expressions need 4-8 stack slots; a deeper one, a long concatenation
+/// or a call with many arguments, still runs without allocating
+const STACK_INLINE_CAPACITY: usize = 32;
 
 /// Execution context for the VM
 ///
@@ -333,10 +434,6 @@ fn no_subquery_executor() -> crate::core::Error {
 const ARGS_BUFFER_CAPACITY: usize = 8;
 
 pub struct ExprVM {
-    /// Evaluation stack (reused between executions)
-    /// Uses SmallVec to avoid heap allocation for simple expressions (stack depth <= 16)
-    stack: SmallVec<[Value; STACK_INLINE_CAPACITY]>,
-
     /// Reusable buffer for function arguments (avoids allocation per call)
     /// Uses SmallVec to avoid heap allocation for functions with <= 8 args
     args_buffer: SmallVec<[Value; ARGS_BUFFER_CAPACITY]>,
@@ -358,11 +455,10 @@ pub struct ExprVM {
 }
 
 impl ExprVM {
-    /// Create a new VM with default stack capacity
-    /// Uses inline storage for up to 16 stack values and 8 args (no heap allocation)
+    /// Create a new VM
+    /// Uses inline storage for up to 8 args (no heap allocation)
     pub fn new() -> Self {
         Self {
-            stack: SmallVec::new(),
             args_buffer: SmallVec::new(),
             cached_like: None,
             cached_glob: None,
@@ -371,10 +467,24 @@ impl ExprVM {
         }
     }
 
-    /// Drop every value a run left behind, its stack, arguments and cached
+    /// The values from `start` to the top taken off `stack` into the
+    /// arguments buffer, for an op that reads them as one slice; the caller
+    /// gives the buffer back
+    #[inline]
+    fn take_values(
+        &mut self,
+        stack: &mut Stack<'_>,
+        start: usize,
+    ) -> SmallVec<[Value; ARGS_BUFFER_CAPACITY]> {
+        let mut values = std::mem::take(&mut self.args_buffer);
+        values.clear();
+        values.extend(stack.drain(start));
+        values
+    }
+
+    /// Drop every value a run left behind, its arguments and cached
     /// patterns, keeping the buffers' capacity
     pub(crate) fn release_values(&mut self) {
-        self.stack.clear();
         self.args_buffer.clear();
         self.cached_like = None;
         self.cached_glob = None;
@@ -450,15 +560,16 @@ impl ExprVM {
         Ok(Value::Boolean(matched))
     }
 
-    pub fn execute(&mut self, program: &Program, ctx: &ExecuteContext) -> Result<Value> {
+    /// The value `program` computes over `ctx`'s row
+    pub fn execute<'a>(
+        &mut self,
+        program: &'a Program,
+        ctx: &'a ExecuteContext<'a>,
+    ) -> Result<Value> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::program_ran(program);
-        // Ensure stack has enough capacity
-        if self.stack.capacity() < program.max_stack_depth() {
-            self.stack
-                .reserve(program.max_stack_depth() - self.stack.capacity());
-        }
-        self.stack.clear();
+        let mut stack = Stack::new();
+        stack.reserve(program.max_stack_depth());
 
         let ops = program.ops();
         if ops.is_empty() {
@@ -478,69 +589,34 @@ impl ExprVM {
                 // LOAD OPERATIONS
                 // =============================================================
                 Op::LoadColumn(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .row
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown);
-                    self.stack.push(value);
+                    stack.push_ref(ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE));
                     pc += 1;
                 }
 
                 Op::LoadColumn2(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .row2
-                        .and_then(|r| r.get(idx).cloned())
-                        .unwrap_or_else(Value::null_unknown);
-                    self.stack.push(value);
-                    pc += 1;
-                }
-
-                Op::LoadOuterColumn(name) => {
-                    let value = ctx
-                        .outer_row
-                        .and_then(|r| r.get(name.as_ref()).cloned())
-                        .unwrap_or_else(Value::null_unknown);
-                    self.stack.push(value);
+                    let value = ctx.row2.and_then(|r| r.get(*idx as usize));
+                    stack.push_ref(value.unwrap_or(&NULL_VALUE));
                     pc += 1;
                 }
 
                 Op::LoadConst(value) => {
-                    self.stack.push(value.clone());
+                    stack.push_ref(value);
                     pc += 1;
                 }
 
                 Op::LoadParam(idx) => {
-                    self.stack.push(ctx.param_ref(*idx as usize)?.clone());
+                    stack.push_ref(ctx.param_ref(*idx as usize)?);
                     pc += 1;
                 }
 
                 Op::LoadNull(dt) => {
-                    self.stack.push(Value::Null(*dt));
+                    stack.push(Value::Null(*dt));
                     pc += 1;
                 }
 
                 Op::LoadAggregateResult(idx) => {
                     // Aggregate results are stored in the row at specific indices
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .row
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown);
-                    self.stack.push(value);
-                    pc += 1;
-                }
-
-                Op::LoadTransactionId => {
-                    // Load current transaction ID, or NULL if not in a transaction
-                    let value = match ctx.transaction_id {
-                        Some(txn_id) => Value::Integer(txn_id as i64),
-                        None => Value::null_unknown(),
-                    };
-                    self.stack.push(value);
+                    stack.push_ref(ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE));
                     pc += 1;
                 }
 
@@ -548,24 +624,24 @@ impl ExprVM {
                 // COMPARISON OPERATIONS
                 // =============================================================
                 Op::Eq => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(sql_eq(&a, &b)));
+                    let b = stack.pop();
+                    let a = stack.pop();
+                    stack.push(truth(sql_eq(&a, &b)));
                     pc += 1;
                 }
 
                 Op::Ne => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(sql_eq(&a, &b).map(|eq| !eq)));
+                    let b = stack.pop();
+                    let a = stack.pop();
+                    stack.push(truth(sql_eq(&a, &b).map(|eq| !eq)));
                     pc += 1;
                 }
 
                 Op::Lt => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     // Fast path for integer/float comparisons
-                    let result = match (&a, &b) {
+                    let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_lt(*x, *y)),
                         (Value::Integer(x), Value::Float(y)) => {
@@ -576,15 +652,15 @@ impl ExprVM {
                         }
                         _ => self.compare_values(&a, &b, std::cmp::Ordering::Less),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Le => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     // Fast path for integer/float comparisons
-                    let result = match (&a, &b) {
+                    let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_le(*x, *y)),
                         (Value::Integer(x), Value::Float(y)) => {
@@ -595,15 +671,15 @@ impl ExprVM {
                         }
                         _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Less),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Gt => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     // Fast path for integer/float comparisons
-                    let result = match (&a, &b) {
+                    let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_gt(*x, *y)),
                         (Value::Integer(x), Value::Float(y)) => {
@@ -614,15 +690,15 @@ impl ExprVM {
                         }
                         _ => self.compare_values(&a, &b, std::cmp::Ordering::Greater),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Ge => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     // Fast path for integer/float comparisons
-                    let result = match (&a, &b) {
+                    let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_ge(*x, *y)),
                         (Value::Integer(x), Value::Float(y)) => {
@@ -633,51 +709,19 @@ impl ExprVM {
                         }
                         _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Greater),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::IsNull => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(Value::Boolean(v.is_null()));
+                    let v = stack.pop();
+                    stack.push(Value::Boolean(v.is_null()));
                     pc += 1;
                 }
 
                 Op::IsNotNull => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(Value::Boolean(!v.is_null()));
-                    pc += 1;
-                }
-
-                Op::IsDistinctFrom => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(Value::Boolean(sql_distinct(&a, &b)));
-                    pc += 1;
-                }
-
-                Op::IsNotDistinctFrom => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(Value::Boolean(!sql_distinct(&a, &b)));
-                    pc += 1;
-                }
-
-                Op::CompareRows(op, width) => {
-                    let start = self.stack.len().saturating_sub(2 * *width as usize);
-                    let (a, b) = self.stack[start..].split_at(*width as usize);
-                    let result = truth(op.compare_rows(a, b));
-                    self.stack.truncate(start);
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::RowsDistinct(negated, width) => {
-                    let start = self.stack.len().saturating_sub(2 * *width as usize);
-                    let (a, b) = self.stack[start..].split_at(*width as usize);
-                    let result = Value::Boolean(sql_rows_distinct(a, b) != *negated);
-                    self.stack.truncate(start);
-                    self.stack.push(result);
+                    let v = stack.pop();
+                    stack.push(Value::Boolean(!v.is_null()));
                     pc += 1;
                 }
 
@@ -696,7 +740,7 @@ impl ExprVM {
                         Value::Float(v) => Self::eq_float(col_val, *v),
                         _ => truth(sql_eq(col_val, val)),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -711,7 +755,7 @@ impl ExprVM {
                         Value::Float(v) => Self::ne_float(col_val, *v),
                         _ => truth(sql_eq(col_val, val).map(|eq| !eq)),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -726,7 +770,7 @@ impl ExprVM {
                         Value::Float(threshold) => Self::lt_float(col_val, *threshold),
                         _ => self.compare_values(col_val, val, std::cmp::Ordering::Less),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -741,7 +785,7 @@ impl ExprVM {
                         Value::Float(threshold) => Self::le_float(col_val, *threshold),
                         _ => self.compare_values_or_equal(col_val, val, std::cmp::Ordering::Less),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -756,7 +800,7 @@ impl ExprVM {
                         Value::Float(threshold) => Self::gt_float(col_val, *threshold),
                         _ => self.compare_values(col_val, val, std::cmp::Ordering::Greater),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -773,7 +817,7 @@ impl ExprVM {
                             self.compare_values_or_equal(col_val, val, std::cmp::Ordering::Greater)
                         }
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -782,7 +826,7 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    self.stack.push(Value::Boolean(col_val.is_null()));
+                    stack.push(Value::Boolean(col_val.is_null()));
                     pc += 1;
                 }
 
@@ -791,7 +835,7 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    self.stack.push(Value::Boolean(!col_val.is_null()));
+                    stack.push(Value::Boolean(!col_val.is_null()));
                     pc += 1;
                 }
 
@@ -800,7 +844,7 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    self.stack.push(pattern_match(col_val, pattern));
+                    stack.push(pattern_match(col_val, pattern));
                     pc += 1;
                 }
 
@@ -809,7 +853,7 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    self.stack.push(truth(set.contains(col_val)));
+                    stack.push(truth(set.contains(col_val)));
                     pc += 1;
                 }
 
@@ -834,7 +878,7 @@ impl ExprVM {
                         }
                         _ => truth(between_cell(col_val, low, high)),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -843,7 +887,7 @@ impl ExprVM {
                 // =============================================================
                 Op::And(jump_target) => {
                     // Short-circuit AND: if top is false, jump
-                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     match top {
                         Value::Boolean(false) => {
                             // Result is false, jump to target
@@ -862,7 +906,7 @@ impl ExprVM {
 
                 Op::Or(jump_target) => {
                     // Short-circuit OR: if top is true, jump
-                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     match top {
                         Value::Boolean(true) => {
                             // Result is true, jump to target
@@ -880,42 +924,31 @@ impl ExprVM {
                 }
 
                 Op::AndFinalize => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(Self::and(&a, &b));
+                    let b = stack.pop();
+                    let a = stack.pop();
+                    stack.push(Self::and(&a, &b));
                     pc += 1;
                 }
 
                 Op::OrFinalize => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
                         (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
                         (Some(false), Some(false)) => Value::Boolean(false),
                         _ => Value::Null(DataType::Boolean),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Not => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let v = stack.pop();
                     let result = match Self::to_tribool(&v) {
                         Some(b) => Value::Boolean(!b),
                         None => Value::Null(DataType::Boolean),
                     };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::Xor => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
-                        (Some(a), Some(b)) => Value::Boolean(a ^ b),
-                        _ => Value::Null(DataType::Boolean),
-                    };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -923,132 +956,42 @@ impl ExprVM {
                 // ARITHMETIC OPERATIONS
                 // =============================================================
                 Op::Add => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = Self::add_op(&a, &b)?;
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Sub => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = self.sub_op(&a, &b)?;
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Mul => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = Self::mul_op(&a, &b)?;
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Div => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = Self::div_op(&a, &b)?;
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Mod => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = Self::mod_op(&a, &b)?;
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::Neg => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match v {
-                        Value::Integer(i) => Value::Integer(integer_neg(i)?),
-                        Value::Float(f) => Value::Float(-f),
-                        Value::Null(dt) => Value::Null(dt),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                // =============================================================
-                // BITWISE OPERATIONS (inlined for performance)
-                // =============================================================
-                Op::BitAnd => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&a, &b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Integer(x & y),
-                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::BitOr => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&a, &b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Integer(x | y),
-                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::BitXor => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&a, &b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Integer(x ^ y),
-                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::BitNot => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match v {
-                        Value::Integer(i) => Value::Integer(!i),
-                        Value::Null(dt) => Value::Null(dt),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::Shl => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&a, &b) {
-                        (Value::Integer(x), Value::Integer(y)) => {
-                            integer_op(IntegerOp::Shl, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
-                        }
-                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::Shr => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&a, &b) {
-                        (Value::Integer(x), Value::Integer(y)) => {
-                            integer_op(IntegerOp::Shr, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
-                        }
-                        _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
-                        _ => Value::Null(DataType::Null),
-                    };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -1056,211 +999,24 @@ impl ExprVM {
                 // STRING OPERATIONS
                 // =============================================================
                 Op::Concat => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(concat_text([&a, &b].into_iter()));
+                    let b = stack.pop();
+                    let a = stack.pop();
+                    stack.push(concat_text([&*a, &*b].into_iter()));
                     pc += 1;
                 }
 
                 Op::ConcatN(n) => {
-                    let start = self.stack.len().saturating_sub(*n as usize);
-                    let result = concat_text(self.stack[start..].iter());
-                    self.stack.truncate(start);
-                    self.stack.push(result);
+                    let start = stack.len().saturating_sub(*n as usize);
+                    let result = concat_text(stack.from(start).iter().map(|v| &**v));
+                    stack.truncate(start);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Like(pattern) | Op::Glob(pattern) | Op::LikeEscape(pattern, _) => {
                     // An ESCAPE is already part of the compiled pattern
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(pattern_match(&v, pattern));
-                    pc += 1;
-                }
-
-                Op::Regexp(regex) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(regexp_match(&v, regex));
-                    pc += 1;
-                }
-
-                Op::LikeDynamic(case_insensitive) => {
-                    // Parameters are constant per query, so the compiled
-                    // pattern is cached rather than rebuilt per row
-                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result =
-                        self.like_dynamic_escape(&text_val, &pattern_val, *case_insensitive, None);
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::LikeDynamicEscape(case_insensitive, escape_char) => {
-                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let escape = Some(*escape_char);
-                    let result = self.like_dynamic_escape(
-                        &text_val,
-                        &pattern_val,
-                        *case_insensitive,
-                        escape,
-                    );
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::LikeDynamicEscapeExpr(case_insensitive) => {
-                    let escape_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &escape_val {
-                        Value::Text(escape) => self.like_dynamic_escape(
-                            &text_val,
-                            &pattern_val,
-                            *case_insensitive,
-                            escape.chars().next(),
-                        ),
-                        Value::Null(_) => Value::Null(DataType::Boolean),
-                        _ => {
-                            return Err(crate::core::Error::invalid_argument(
-                                "ESCAPE must be a single-character string",
-                            ))
-                        }
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::GlobDynamic => {
-                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.glob_dynamic(&text_val, &pattern_val);
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::RegexpDynamic => {
-                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.regexp_dynamic(&text_val, &pattern_val)?;
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                // =============================================================
-                // JSON OPERATIONS
-                // =============================================================
-                Op::JsonAccess => {
-                    let key = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let json_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.json_access(&json_val, &key, false);
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::JsonAccessText => {
-                    let key = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let json_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.json_access(&json_val, &key, true);
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                // =============================================================
-                // TIMESTAMP OPERATIONS
-                // =============================================================
-                Op::TimestampAddInterval => {
-                    let interval = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::timestamp_add_interval(&ts, &interval, false)?;
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::TimestampSubInterval => {
-                    let interval = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::timestamp_add_interval(&ts, &interval, true)?;
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::TimestampDiff => {
-                    let ts2 = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let ts1 = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&ts1, &ts2) {
-                        (Value::Timestamp(t1), Value::Timestamp(t2)) => {
-                            let duration = t1.signed_duration_since(*t2);
-                            Value::Text(SmartString::from_string(
-                                self.format_duration_as_interval(duration),
-                            ))
-                        }
-                        _ if ts1.is_null() || ts2.is_null() => Value::Null(DataType::Text),
-                        _ => Value::Null(DataType::Text),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::TimestampAddDays => {
-                    let days = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&ts, &days) {
-                        (Value::Timestamp(t), Value::Integer(d)) => {
-                            Self::timestamp_add_days(*t, *d, false)?
-                        }
-                        _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
-                        _ => Value::Null(DataType::Timestamp),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::TimestampSubDays => {
-                    let days = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&ts, &days) {
-                        (Value::Timestamp(t), Value::Integer(d)) => {
-                            Self::timestamp_add_days(*t, *d, true)?
-                        }
-                        _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
-                        _ => Value::Null(DataType::Timestamp),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::ScaleInterval(step, count) => {
-                    let result = match self.pop_interval_multiplier(*count)? {
-                        Some(k) => Value::Text(SmartString::from_string(Self::interval_text(
-                            *step,
-                            Self::scale_interval(*step, k)?,
-                        ))),
-                        None => Value::Null(DataType::Text),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::TimestampAddScaledInterval(step, subtract, count) => {
-                    let k = self.pop_interval_multiplier(*count)?;
-                    let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &ts {
-                        Value::Timestamp(t) => match k {
-                            Some(k) => {
-                                let interval = Self::scale_interval(*step, k)?;
-                                Value::Timestamp(interval::shift(*t, interval, *subtract)?)
-                            }
-                            None => Value::Null(DataType::Timestamp),
-                        },
-                        _ if ts.is_null() => Value::Null(DataType::Timestamp),
-                        _ => {
-                            return Err(crate::core::Error::Type(format!(
-                                "cannot add an INTERVAL to {:?}",
-                                ts.data_type()
-                            )))
-                        }
-                    };
-                    self.stack.push(result);
+                    let v = stack.pop();
+                    stack.push(pattern_match(&v, pattern));
                     pc += 1;
                 }
 
@@ -1268,197 +1024,14 @@ impl ExprVM {
                 // SET OPERATIONS
                 // =============================================================
                 Op::InSet(set) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(set.contains(&v)));
-                    pc += 1;
-                }
-
-                Op::InList(count) => {
-                    let start = self.stack.len().saturating_sub(*count as usize);
-                    let items: Vec<Value> = self.stack.drain(start..).collect();
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // value = item OR value = item ..., with OR's UNKNOWN
-                    let mut result = Some(false);
-                    for item in &items {
-                        match sql_eq(&v, item) {
-                            Some(true) => {
-                                result = Some(true);
-                                break;
-                            }
-                            Some(false) => {}
-                            None => result = None,
-                        }
-                    }
-                    self.stack.push(truth(result));
+                    let v = stack.pop();
+                    stack.push(truth(set.contains(&v)));
                     pc += 1;
                 }
 
                 Op::NotInSet(set) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(set.contains(&v).map(|found| !found)));
-                    pc += 1;
-                }
-
-                Op::QuantifiedSet(set) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(set.answer(&v)));
-                    pc += 1;
-                }
-
-                Op::Between => {
-                    let high = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let low = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-
-                    // Fast path for integer/float comparisons
-                    let result = match (&val, &low, &high) {
-                        (Value::Integer(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v >= *lo && *v <= *hi)
-                        }
-                        (Value::Float(v), Value::Float(lo), Value::Float(hi)) => {
-                            Value::Boolean(f64_ge(*v, *lo) && f64_le(*v, *hi))
-                        }
-                        (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
-                        }
-                        (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
-                        }
-                        (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(
-                                crate::core::value::i64_le_f64(*lo, *v)
-                                    && crate::core::value::i64_ge_f64(*hi, *v),
-                            )
-                        }
-                        (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => Value::Boolean(
-                            crate::core::value::i64_le_f64(*lo, *v) && f64_le(*v, *hi),
-                        ),
-                        (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => Value::Boolean(
-                            f64_ge(*v, *lo) && crate::core::value::i64_ge_f64(*hi, *v),
-                        ),
-                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
-                            crate::core::value::i64_ge_f64(*v, *lo)
-                                && crate::core::value::i64_le_f64(*v, *hi),
-                        ),
-                        _ => truth(between_cell(&val, &low, &high)),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::NotBetween => {
-                    let high = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let low = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-
-                    // Fast path for integer/float comparisons
-                    let result = match (&val, &low, &high) {
-                        (Value::Integer(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v < *lo || *v > *hi)
-                        }
-                        (Value::Float(v), Value::Float(lo), Value::Float(hi)) => {
-                            Value::Boolean(f64_lt(*v, *lo) || f64_gt(*v, *hi))
-                        }
-                        (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean(*v < *lo || crate::core::value::i64_gt_f64(*v, *hi))
-                        }
-                        (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean(crate::core::value::i64_lt_f64(*v, *lo) || *v > *hi)
-                        }
-                        (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(
-                                crate::core::value::i64_gt_f64(*lo, *v)
-                                    || crate::core::value::i64_lt_f64(*hi, *v),
-                            )
-                        }
-                        (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => Value::Boolean(
-                            crate::core::value::i64_gt_f64(*lo, *v) || f64_gt(*v, *hi),
-                        ),
-                        (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => Value::Boolean(
-                            f64_lt(*v, *lo) || crate::core::value::i64_lt_f64(*hi, *v),
-                        ),
-                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
-                            crate::core::value::i64_lt_f64(*v, *lo)
-                                || crate::core::value::i64_gt_f64(*v, *hi),
-                        ),
-                        _ => truth(between_cell(&val, &low, &high).map(|inside| !inside)),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::InTupleSet {
-                    tuple_size,
-                    values,
-                    negated,
-                } => {
-                    let tuple_size = *tuple_size as usize;
-                    let start = self.stack.len().saturating_sub(tuple_size);
-
-                    let found = row_in(&self.stack[start..], values.iter().map(Vec::as_slice));
-                    self.stack.truncate(start);
-                    let result = if *negated { found.map(|f| !f) } else { found };
-                    self.stack.push(truth(result));
-                    pc += 1;
-                }
-
-                Op::InRows(width, count) => {
-                    let width = *width as usize;
-                    let start = self
-                        .stack
-                        .len()
-                        .saturating_sub(width.saturating_mul(*count as usize + 1));
-                    let (row, list) = self.stack[start..].split_at(width);
-                    let result = truth(row_in(row, list.chunks_exact(width)));
-                    self.stack.truncate(start);
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                // =============================================================
-                // BOOLEAN CHECKS
-                // =============================================================
-                Op::IsTrue => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match v {
-                        Value::Boolean(b) => Value::Boolean(b),
-                        Value::Null(_) => Value::Boolean(false),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::IsNotTrue => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match v {
-                        Value::Boolean(b) => Value::Boolean(!b),
-                        Value::Null(_) => Value::Boolean(true),
-                        _ => Value::Boolean(true),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::IsFalse => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match v {
-                        Value::Boolean(b) => Value::Boolean(!b),
-                        Value::Null(_) => Value::Boolean(false),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::IsNotFalse => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match v {
-                        Value::Boolean(b) => Value::Boolean(b),
-                        Value::Null(_) => Value::Boolean(true),
-                        _ => Value::Boolean(true),
-                    };
-                    self.stack.push(result);
+                    let v = stack.pop();
+                    stack.push(truth(set.contains(&v).map(|found| !found)));
                     pc += 1;
                 }
 
@@ -1467,93 +1040,58 @@ impl ExprVM {
                 // =============================================================
                 Op::CallScalar { func, arg_count } => {
                     let arg_count = *arg_count as usize;
-                    let start = self.stack.len().saturating_sub(arg_count);
+                    let start = stack.len().saturating_sub(arg_count);
 
                     // Reuse args_buffer to avoid allocation
                     self.args_buffer.clear();
-                    self.args_buffer.extend(self.stack.drain(start..));
+                    self.args_buffer.extend(stack.drain(start));
 
                     let result = func.evaluate(&self.args_buffer)?;
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
                 Op::Coalesce(n) => {
                     let n = *n as usize;
-                    let start = self.stack.len().saturating_sub(n);
+                    let start = stack.len().saturating_sub(n);
 
                     // Find first non-null using slice iteration (no intermediate buffer)
-                    let result_idx = self.stack[start..]
+                    let result_idx = stack
+                        .from(start)
                         .iter()
                         .position(|v| !v.is_null())
                         .map(|i| start + i);
-
-                    let result = if let Some(idx) = result_idx {
-                        // Swap the result to end, pop it, then truncate the rest
-                        let last = self.stack.len() - 1;
-                        self.stack.swap(idx, last);
-                        let result = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                        self.stack.truncate(start);
-                        result
-                    } else {
-                        self.stack.truncate(start);
-                        Value::null_unknown()
-                    };
-                    self.stack.push(result);
+                    stack.take_one(start, result_idx);
                     pc += 1;
                 }
 
                 Op::NullIf => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let b = stack.pop();
+                    let a = stack.pop();
                     let result = if sql_eq(&a, &b) == Some(true) {
-                        Value::null_unknown()
+                        Cow::Borrowed(&NULL_VALUE)
                     } else {
                         a
                     };
-                    self.stack.push(result);
+                    stack.push_cow(result);
                     pc += 1;
                 }
 
                 Op::Greatest(n) => {
                     let n = *n as usize;
-                    let start = self.stack.len().saturating_sub(n);
-                    let max_idx = extreme_position(&self.stack[start..], Ordering::Greater)
-                        .map(|i| start + i);
-
-                    let result = if let Some(idx) = max_idx {
-                        // Swap the result to end, pop it, then truncate the rest
-                        let last = self.stack.len() - 1;
-                        self.stack.swap(idx, last);
-                        let result = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                        self.stack.truncate(start);
-                        result
-                    } else {
-                        self.stack.truncate(start);
-                        Value::null_unknown()
-                    };
-                    self.stack.push(result);
+                    let start = stack.len().saturating_sub(n);
+                    let max_idx =
+                        extreme_position(stack.from(start), Ordering::Greater).map(|i| start + i);
+                    stack.take_one(start, max_idx);
                     pc += 1;
                 }
 
                 Op::Least(n) => {
                     let n = *n as usize;
-                    let start = self.stack.len().saturating_sub(n);
+                    let start = stack.len().saturating_sub(n);
                     let min_idx =
-                        extreme_position(&self.stack[start..], Ordering::Less).map(|i| start + i);
-
-                    let result = if let Some(idx) = min_idx {
-                        // Swap the result to end, pop it, then truncate the rest
-                        let last = self.stack.len() - 1;
-                        self.stack.swap(idx, last);
-                        let result = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                        self.stack.truncate(start);
-                        result
-                    } else {
-                        self.stack.truncate(start);
-                        Value::null_unknown()
-                    };
-                    self.stack.push(result);
+                        extreme_position(stack.from(start), Ordering::Less).map(|i| start + i);
+                    stack.take_one(start, min_idx);
                     pc += 1;
                 }
 
@@ -1562,7 +1100,7 @@ impl ExprVM {
                 // In-place mutation - no pop/push overhead
                 // =============================================================
                 Op::NativeFn1(func) => {
-                    if let Some(v) = self.stack.last_mut() {
+                    if let Some(v) = stack.last_mut() {
                         func(v);
                     }
                     pc += 1;
@@ -1572,58 +1110,9 @@ impl ExprVM {
                 // TYPE OPERATIONS
                 // =============================================================
                 Op::Cast(target_type) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let v = stack.pop();
                     let result = v.try_coerce_to_type(*target_type)?;
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::ReadAsColumn(column_type) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack
-                        .push(crate::executor::pushdown::read_as_column(*column_type, v));
-                    pc += 1;
-                }
-
-                Op::TruncateToDate => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &v {
-                        Value::Timestamp(t) => {
-                            use chrono::{Datelike, TimeZone, Utc};
-                            let truncated = Utc
-                                .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
-                                .single()
-                                .unwrap_or(*t);
-                            Value::Timestamp(truncated)
-                        }
-                        Value::Text(s) => match crate::core::parse_timestamp(s) {
-                            Ok(t) => {
-                                use chrono::{Datelike, TimeZone, Utc};
-                                let truncated = Utc
-                                    .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
-                                    .single()
-                                    .unwrap_or(t);
-                                Value::Timestamp(truncated)
-                            }
-                            Err(_) => Value::Null(DataType::Timestamp),
-                        },
-                        Value::Integer(i) => {
-                            use chrono::{Datelike, TimeZone, Utc};
-                            match Utc.timestamp_opt(*i, 0) {
-                                chrono::LocalResult::Single(t) => {
-                                    let truncated = Utc
-                                        .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
-                                        .single()
-                                        .unwrap_or(t);
-                                    Value::Timestamp(truncated)
-                                }
-                                _ => Value::Null(DataType::Timestamp),
-                            }
-                        }
-                        Value::Null(_) => Value::Null(DataType::Timestamp),
-                        _ => Value::Null(DataType::Timestamp),
-                    };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -1636,7 +1125,7 @@ impl ExprVM {
                 }
 
                 Op::CaseWhen(next_branch) => {
-                    let cond = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let cond = stack.pop();
                     if !Self::to_bool(&cond) {
                         pc = *next_branch as usize;
                     } else {
@@ -1660,13 +1149,13 @@ impl ExprVM {
                 }
 
                 Op::CaseCompare => {
-                    let when_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let when_val = stack.pop();
                     // Use reference to avoid clone - case_val stays on stack for next comparison
-                    let result = match self.stack.last() {
+                    let result = match stack.last() {
                         Some(case_val) => Value::Boolean(sql_eq(case_val, &when_val) == Some(true)),
                         _ => Value::Boolean(false),
                     };
-                    self.stack.push(result);
+                    stack.push(result);
                     pc += 1;
                 }
 
@@ -1678,7 +1167,7 @@ impl ExprVM {
                 }
 
                 Op::JumpIfTrue(target) => {
-                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     if Self::to_bool(top) {
                         pc = *target as usize;
                     } else {
@@ -1687,7 +1176,7 @@ impl ExprVM {
                 }
 
                 Op::JumpIfFalse(target) => {
-                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     if !Self::to_bool(top) {
                         pc = *target as usize;
                     } else {
@@ -1696,7 +1185,7 @@ impl ExprVM {
                 }
 
                 Op::JumpIfNull(target) => {
-                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     if top.is_null() {
                         pc = *target as usize;
                     } else {
@@ -1705,7 +1194,7 @@ impl ExprVM {
                 }
 
                 Op::JumpIfNotNull(target) => {
-                    let top = self.stack.last().unwrap_or(&Value::Null(DataType::Boolean));
+                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     if !top.is_null() {
                         pc = *target as usize;
                     } else {
@@ -1714,7 +1203,7 @@ impl ExprVM {
                 }
 
                 Op::PopJumpIfTrue(target) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let v = stack.pop();
                     if Self::to_bool(&v) {
                         pc = *target as usize;
                     } else {
@@ -1723,7 +1212,7 @@ impl ExprVM {
                 }
 
                 Op::PopJumpIfFalse(target) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let v = stack.pop();
                     if !Self::to_bool(&v) {
                         pc = *target as usize;
                     } else {
@@ -1731,70 +1220,10 @@ impl ExprVM {
                     }
                 }
 
-                Op::Dup => {
-                    if let Some(v) = self.stack.last().cloned() {
-                        self.stack.push(v);
-                    }
-                    pc += 1;
-                }
-
                 Op::Pop => {
                     // Use truncate instead of pop to drop in-place without copying value out
-                    let new_len = self.stack.len().saturating_sub(1);
-                    self.stack.truncate(new_len);
-                    pc += 1;
-                }
-
-                Op::Swap => {
-                    let len = self.stack.len();
-                    if len >= 2 {
-                        self.stack.swap(len - 1, len - 2);
-                    }
-                    pc += 1;
-                }
-
-                // =============================================================
-                // SUBQUERY OPERATIONS
-                // =============================================================
-                Op::ExecScalarSubquery(idx) => {
-                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-                    self.stack.push(executor.execute_scalar(*idx, ctx)?);
-                    pc += 1;
-                }
-
-                Op::ExecExists(idx) => {
-                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-                    let exists = executor.execute_exists(*idx, ctx)?;
-                    self.stack.push(Value::Boolean(exists));
-                    pc += 1;
-                }
-
-                // The block decides: a NULL value over no rows is FALSE, not UNKNOWN
-                Op::ExecInSubquery(idx) => {
-                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let answer = match executor.kept_members(*idx) {
-                        Some(kept) => kept.answer(&v)?,
-                        None => executor.execute_in(*idx, &v, ctx)?,
-                    };
-                    self.stack.push(truth(answer));
-                    pc += 1;
-                }
-
-                // As IN: a NULL value over no rows is FALSE for ANY and TRUE for ALL
-                Op::ExecQuantified(idx, compare_op, all) => {
-                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let answer = match executor.kept_members(*idx) {
-                        Some(kept) => kept.answer(&v)?,
-                        None => executor.execute_quantified(*idx, &v, *compare_op, *all, ctx)?,
-                    };
-                    self.stack.push(truth(answer));
-                    pc += 1;
-                }
-
-                Op::ExecRowMembers(idx, width) => {
-                    self.row_members(*idx, *width, ctx)?;
+                    let new_len = stack.len().saturating_sub(1);
+                    stack.truncate(new_len);
                     pc += 1;
                 }
 
@@ -1810,646 +1239,712 @@ impl ExprVM {
                 }
 
                 Op::ReturnTrue => {
-                    self.stack.clear();
-                    self.stack.push(Value::Boolean(true));
+                    stack.clear();
+                    stack.push(Value::Boolean(true));
                     break;
                 }
 
                 Op::ReturnFalse => {
-                    self.stack.clear();
-                    self.stack.push(Value::Boolean(false));
+                    stack.clear();
+                    stack.push(Value::Boolean(false));
                     break;
                 }
 
                 Op::ReturnNull(dt) => {
-                    self.stack.clear();
-                    self.stack.push(Value::Null(*dt));
+                    stack.clear();
+                    stack.push(Value::Null(*dt));
                     break;
                 }
 
-                // =============================================================
-                // VECTOR DISTANCE OPERATIONS
-                // =============================================================
-                Op::VectorDistanceL2 => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let mut buf_a = Vec::new();
-                    let mut buf_b = Vec::new();
-                    match (
-                        extract_vector_bytes(&a, &mut buf_a),
-                        extract_vector_bytes(&b, &mut buf_b),
-                    ) {
-                        (Some(ba), Some(bb)) if ba.len() == bb.len() => {
-                            self.stack.push(Value::Float(
-                                crate::functions::scalar::vector::l2_distance_bytes(ba, bb),
-                            ));
-                        }
-                        _ => {
-                            self.stack.push(Value::null_unknown());
-                        }
-                    }
-                    pc += 1;
-                }
-
-                Op::VectorDistanceCosine => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let mut buf_a = Vec::new();
-                    let mut buf_b = Vec::new();
-                    match (
-                        extract_vector_bytes(&a, &mut buf_a),
-                        extract_vector_bytes(&b, &mut buf_b),
-                    ) {
-                        (Some(ba), Some(bb)) if ba.len() == bb.len() => {
-                            self.stack.push(Value::Float(
-                                crate::functions::scalar::vector::cosine_distance_bytes(ba, bb),
-                            ));
-                        }
-                        _ => {
-                            self.stack.push(Value::null_unknown());
-                        }
-                    }
-                    pc += 1;
-                }
-
-                Op::VectorDistanceIP => {
-                    let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let mut buf_a = Vec::new();
-                    let mut buf_b = Vec::new();
-                    match (
-                        extract_vector_bytes(&a, &mut buf_a),
-                        extract_vector_bytes(&b, &mut buf_b),
-                    ) {
-                        (Some(ba), Some(bb)) if ba.len() == bb.len() => {
-                            self.stack.push(Value::Float(
-                                crate::functions::scalar::vector::ip_distance_bytes(ba, bb),
-                            ));
-                        }
-                        _ => {
-                            self.stack.push(Value::null_unknown());
-                        }
-                    }
+                op @ (Op::LoadOuterColumn(_)
+                | Op::LoadTransactionId
+                | Op::IsDistinctFrom
+                | Op::IsNotDistinctFrom
+                | Op::CompareRows(..)
+                | Op::RowsDistinct(..)
+                | Op::Xor
+                | Op::Neg
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::BitNot
+                | Op::Shl
+                | Op::Shr
+                | Op::Regexp(_)
+                | Op::LikeDynamic(_)
+                | Op::LikeDynamicEscape(..)
+                | Op::LikeDynamicEscapeExpr(_)
+                | Op::GlobDynamic
+                | Op::RegexpDynamic
+                | Op::JsonAccess
+                | Op::JsonAccessText
+                | Op::TimestampAddInterval
+                | Op::TimestampSubInterval
+                | Op::TimestampDiff
+                | Op::TimestampAddDays
+                | Op::TimestampSubDays
+                | Op::ScaleInterval(..)
+                | Op::TimestampAddScaledInterval(..)
+                | Op::TruncateToDate
+                | Op::InList(_)
+                | Op::QuantifiedSet(_)
+                | Op::Between
+                | Op::NotBetween
+                | Op::InTupleSet { .. }
+                | Op::InRows(..)
+                | Op::IsTrue
+                | Op::IsNotTrue
+                | Op::IsFalse
+                | Op::IsNotFalse
+                | Op::ReadAsColumn(_)
+                | Op::Dup
+                | Op::Swap
+                | Op::ExecScalarSubquery(_)
+                | Op::ExecExists(_)
+                | Op::ExecInSubquery(_)
+                | Op::ExecQuantified(..)
+                | Op::ExecRowMembers(..)
+                | Op::VectorDistanceL2
+                | Op::VectorDistanceCosine
+                | Op::VectorDistanceIP) => {
+                    self.execute_rare(op, &mut stack, ctx)?;
                     pc += 1;
                 }
             }
         }
 
         // Return top of stack or NULL
-        Ok(self.stack.pop().unwrap_or_else(Value::null_unknown))
+        Ok(stack.pop().into_owned())
     }
 
-    /// Execute a program using borrowed values where possible (Cow-based stack)
-    ///
-    /// This version avoids cloning values from the row when possible.
-    /// Values are only cloned when they need to be modified or passed to functions.
-    #[inline]
-    pub fn execute_cow<'a>(
+    /// The ops a run seldom meets, kept out of [`Self::execute`]'s op loop
+    /// so that loop stays small; none of them jumps
+    #[inline(never)]
+    fn execute_rare<'a>(
         &mut self,
-        program: &'a Program,
+        op: &'a Op,
+        stack: &mut Stack<'a>,
         ctx: &'a ExecuteContext<'a>,
-    ) -> Result<Value> {
-        // A program with any op this loop does not handle goes straight
-        // to the owned VM, instead of bailing mid-program and paying the
-        // already-executed prefix twice
-        if !program.cow_supported() {
-            return self.execute(program, ctx);
-        }
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::program_ran(program);
-
-        // Local stack with borrowed values - lifetime tied to this execution
-        let mut stack: SmallVec<[StackValue<'a>; STACK_INLINE_CAPACITY]> = SmallVec::new();
-
-        let ops = program.ops();
-        if ops.is_empty() {
-            return Ok(NULL_VALUE.clone());
-        }
-
-        let mut pc: usize = 0;
-
-        loop {
-            if pc >= ops.len() {
-                break;
+    ) -> Result<()> {
+        match op {
+            Op::LoadOuterColumn(name) => {
+                let value = ctx.outer_row.and_then(|r| r.get(name.as_ref()));
+                stack.push_ref(value.unwrap_or(&NULL_VALUE));
             }
 
-            match &ops[pc] {
-                // LOAD OPERATIONS - borrow instead of clone
-                Op::LoadColumn(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .row
-                        .get(idx)
-                        .map(Cow::Borrowed)
-                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
-                    stack.push(value);
-                    pc += 1;
-                }
+            Op::LoadTransactionId => {
+                // Load current transaction ID, or NULL if not in a transaction
+                let value = match ctx.transaction_id {
+                    Some(txn_id) => Value::Integer(txn_id as i64),
+                    None => Value::null_unknown(),
+                };
+                stack.push(value);
+            }
 
-                Op::LoadColumn2(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .row2
-                        .and_then(|r| r.get(idx))
-                        .map(Cow::Borrowed)
-                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
-                    stack.push(value);
-                    pc += 1;
-                }
+            Op::IsDistinctFrom => {
+                let b = stack.pop();
+                let a = stack.pop();
+                stack.push(Value::Boolean(sql_distinct(&a, &b)));
+            }
 
-                Op::LoadConst(value) => {
-                    stack.push(Cow::Borrowed(value));
-                    pc += 1;
-                }
+            Op::IsNotDistinctFrom => {
+                let b = stack.pop();
+                let a = stack.pop();
+                stack.push(Value::Boolean(!sql_distinct(&a, &b)));
+            }
 
-                Op::LoadParam(idx) => {
-                    stack.push(Cow::Borrowed(ctx.param_ref(*idx as usize)?));
-                    pc += 1;
-                }
+            Op::CompareRows(op, width) => {
+                let start = stack.len().saturating_sub(2 * *width as usize);
+                let values = self.take_values(stack, start);
+                let (a, b) = values.split_at(*width as usize);
+                let result = truth(op.compare_rows(a, b));
+                self.args_buffer = values;
+                stack.push(result);
+            }
 
-                Op::LoadNull(dt) => {
-                    stack.push(Cow::Owned(Value::Null(*dt)));
-                    pc += 1;
-                }
+            Op::RowsDistinct(negated, width) => {
+                let start = stack.len().saturating_sub(2 * *width as usize);
+                let values = self.take_values(stack, start);
+                let (a, b) = values.split_at(*width as usize);
+                let result = Value::Boolean(sql_rows_distinct(a, b) != *negated);
+                self.args_buffer = values;
+                stack.push(result);
+            }
 
-                Op::LoadAggregateResult(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .row
-                        .get(idx)
-                        .map(Cow::Borrowed)
-                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
-                    stack.push(value);
-                    pc += 1;
-                }
+            Op::Xor => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
+                    (Some(a), Some(b)) => Value::Boolean(a ^ b),
+                    _ => Value::Null(DataType::Boolean),
+                };
+                stack.push(result);
+            }
 
-                // COMPARISON OPERATIONS - work with references
-                Op::Eq => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(truth(sql_eq(&a, &b))));
-                    pc += 1;
-                }
+            Op::Neg => {
+                let result = match &*stack.pop() {
+                    Value::Integer(i) => Value::Integer(integer_neg(*i)?),
+                    Value::Float(f) => Value::Float(-f),
+                    Value::Null(dt) => Value::Null(*dt),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::Ne => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(truth(sql_eq(&a, &b).map(|eq| !eq))));
-                    pc += 1;
-                }
+            // =================================================================
+            // BITWISE OPERATIONS
+            // =================================================================
+            Op::BitAnd => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let result = match (&*a, &*b) {
+                    (Value::Integer(x), Value::Integer(y)) => Value::Integer(x & y),
+                    _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::Lt => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match (&*a, &*b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
-                        (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_lt(*x, *y)),
-                        (Value::Integer(x), Value::Float(y)) => {
-                            Value::Boolean(crate::core::value::i64_lt_f64(*x, *y))
-                        }
-                        (Value::Float(x), Value::Integer(y)) => {
-                            Value::Boolean(crate::core::value::i64_gt_f64(*y, *x))
-                        }
-                        _ => self.compare_values(&a, &b, std::cmp::Ordering::Less),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::BitOr => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let result = match (&*a, &*b) {
+                    (Value::Integer(x), Value::Integer(y)) => Value::Integer(x | y),
+                    _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::Le => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match (&*a, &*b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
-                        (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_le(*x, *y)),
-                        (Value::Integer(x), Value::Float(y)) => {
-                            Value::Boolean(crate::core::value::i64_le_f64(*x, *y))
-                        }
-                        (Value::Float(x), Value::Integer(y)) => {
-                            Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
-                        }
-                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Less),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::BitXor => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let result = match (&*a, &*b) {
+                    (Value::Integer(x), Value::Integer(y)) => Value::Integer(x ^ y),
+                    _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::Gt => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match (&*a, &*b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
-                        (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_gt(*x, *y)),
-                        (Value::Integer(x), Value::Float(y)) => {
-                            Value::Boolean(crate::core::value::i64_gt_f64(*x, *y))
-                        }
-                        (Value::Float(x), Value::Integer(y)) => {
-                            Value::Boolean(crate::core::value::i64_lt_f64(*y, *x))
-                        }
-                        _ => self.compare_values(&a, &b, std::cmp::Ordering::Greater),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::BitNot => {
+                let result = match &*stack.pop() {
+                    Value::Integer(i) => Value::Integer(!i),
+                    Value::Null(dt) => Value::Null(*dt),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::Ge => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match (&*a, &*b) {
-                        (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
-                        (Value::Float(x), Value::Float(y)) => Value::Boolean(f64_ge(*x, *y)),
-                        (Value::Integer(x), Value::Float(y)) => {
-                            Value::Boolean(crate::core::value::i64_ge_f64(*x, *y))
-                        }
-                        (Value::Float(x), Value::Integer(y)) => {
-                            Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
-                        }
-                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Greater),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
-
-                Op::IsNull => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Value::Boolean(v.is_null())));
-                    pc += 1;
-                }
-
-                Op::IsNotNull => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Value::Boolean(!v.is_null())));
-                    pc += 1;
-                }
-
-                // LOGICAL OPERATIONS
-                Op::And(jump_target) => {
-                    let top = stack.last().map(|v| &**v).unwrap_or(&NULL_VALUE);
-                    match top {
-                        Value::Boolean(false) => pc = *jump_target as usize,
-                        Value::Null(_) => pc += 1,
-                        _ => pc += 1,
+            Op::Shl => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let result = match (&*a, &*b) {
+                    (Value::Integer(x), Value::Integer(y)) => {
+                        integer_op(IntegerOp::Shl, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
                     }
-                }
+                    _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::Or(jump_target) => {
-                    let top = stack.last().map(|v| &**v).unwrap_or(&NULL_VALUE);
-                    match top {
-                        Value::Boolean(true) => pc = *jump_target as usize,
-                        Value::Null(_) => pc += 1,
-                        _ => pc += 1,
+            Op::Shr => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let result = match (&*a, &*b) {
+                    (Value::Integer(x), Value::Integer(y)) => {
+                        integer_op(IntegerOp::Shr, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
                     }
-                }
+                    _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
+                    _ => Value::Null(DataType::Null),
+                };
+                stack.push(result);
+            }
 
-                Op::AndFinalize => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Self::and(&a, &b)));
-                    pc += 1;
-                }
+            // =================================================================
+            // PATTERNS READ AT RUN TIME
+            // =================================================================
+            Op::Regexp(regex) => {
+                let v = stack.pop();
+                stack.push(regexp_match(&v, regex));
+            }
 
-                Op::OrFinalize => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
-                        (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
-                        (Some(false), Some(false)) => Value::Boolean(false),
-                        _ => Value::Null(DataType::Boolean),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::LikeDynamic(case_insensitive) => {
+                // Parameters are constant per query, so the compiled
+                // pattern is cached rather than rebuilt per row
+                let pattern_val = stack.pop();
+                let text_val = stack.pop();
+                let result =
+                    self.like_dynamic_escape(&text_val, &pattern_val, *case_insensitive, None);
+                stack.push(result);
+            }
 
-                Op::Not => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match Self::to_tribool(&v) {
-                        Some(b) => Value::Boolean(!b),
-                        None => Value::Null(DataType::Boolean),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::LikeDynamicEscape(case_insensitive, escape_char) => {
+                let pattern_val = stack.pop();
+                let text_val = stack.pop();
+                let escape = Some(*escape_char);
+                let result =
+                    self.like_dynamic_escape(&text_val, &pattern_val, *case_insensitive, escape);
+                stack.push(result);
+            }
 
-                // FUNCTION CALLS - need to convert to owned
-                Op::CallScalar { func, arg_count } => {
-                    let arg_count = *arg_count as usize;
-                    let start = stack.len().saturating_sub(arg_count);
-
-                    // Convert Cow values to owned for function call
-                    self.args_buffer.clear();
-                    for cow_val in stack.drain(start..) {
-                        self.args_buffer.push(cow_val.into_owned());
+            Op::LikeDynamicEscapeExpr(case_insensitive) => {
+                let escape_val = stack.pop();
+                let pattern_val = stack.pop();
+                let text_val = stack.pop();
+                let result = match &*escape_val {
+                    Value::Text(escape) => self.like_dynamic_escape(
+                        &text_val,
+                        &pattern_val,
+                        *case_insensitive,
+                        escape.chars().next(),
+                    ),
+                    Value::Null(_) => Value::Null(DataType::Boolean),
+                    _ => {
+                        return Err(crate::core::Error::invalid_argument(
+                            "ESCAPE must be a single-character string",
+                        ))
                     }
+                };
+                stack.push(result);
+            }
 
-                    let result = func.evaluate(&self.args_buffer)?;
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::GlobDynamic => {
+                let pattern_val = stack.pop();
+                let text_val = stack.pop();
+                let result = self.glob_dynamic(&text_val, &pattern_val);
+                stack.push(result);
+            }
 
-                // FUSED OPERATIONS (already optimized, no stack involvement)
-                Op::GtColumnConst(idx, val) => {
-                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
-                    let result = match val {
-                        Value::Integer(threshold) => Self::gt_int(col_val, *threshold),
-                        Value::Float(threshold) => Self::gt_float(col_val, *threshold),
-                        _ => self.compare_values(col_val, val, std::cmp::Ordering::Greater),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::RegexpDynamic => {
+                let pattern_val = stack.pop();
+                let text_val = stack.pop();
+                let result = self.regexp_dynamic(&text_val, &pattern_val)?;
+                stack.push(result);
+            }
 
-                Op::LtColumnConst(idx, val) => {
-                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
-                    let result = match val {
-                        Value::Integer(threshold) => Self::lt_int(col_val, *threshold),
-                        Value::Float(threshold) => Self::lt_float(col_val, *threshold),
-                        _ => self.compare_values(col_val, val, std::cmp::Ordering::Less),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            // =================================================================
+            // JSON OPERATIONS
+            // =================================================================
+            Op::JsonAccess => {
+                let key = stack.pop();
+                let json_val = stack.pop();
+                let result = self.json_access(&json_val, &key, false);
+                stack.push(result);
+            }
 
-                Op::EqColumnConst(idx, val) => {
-                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
-                    let result = match val {
-                        Value::Integer(v) => Self::eq_int(col_val, *v),
-                        Value::Float(v) => Self::eq_float(col_val, *v),
-                        _ => truth(sql_eq(col_val, val)),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::JsonAccessText => {
+                let key = stack.pop();
+                let json_val = stack.pop();
+                let result = self.json_access(&json_val, &key, true);
+                stack.push(result);
+            }
 
-                // COALESCE - return first non-null value
-                Op::Coalesce(n) => {
-                    let n = *n as usize;
-                    let start = stack.len().saturating_sub(n);
+            // =================================================================
+            // TIMESTAMP OPERATIONS
+            // =================================================================
+            Op::TimestampAddInterval => {
+                let interval = stack.pop();
+                let ts = stack.pop();
+                let result = Self::timestamp_add_interval(&ts, &interval, false)?;
+                stack.push(result);
+            }
 
-                    // Find first non-null value index
-                    let result_idx = stack[start..]
-                        .iter()
-                        .position(|v| !v.is_null())
-                        .map(|i| start + i);
+            Op::TimestampSubInterval => {
+                let interval = stack.pop();
+                let ts = stack.pop();
+                let result = Self::timestamp_add_interval(&ts, &interval, true)?;
+                stack.push(result);
+            }
 
-                    let result = if let Some(idx) = result_idx {
-                        // Move the result out, swap to end, pop, then truncate
-                        let last = stack.len() - 1;
-                        stack.swap(idx, last);
-                        // pop() should always succeed since we found an index
-                        stack.pop().expect("stack underflow in COALESCE")
-                    } else {
-                        Cow::Borrowed(&NULL_VALUE)
-                    };
-                    stack.truncate(start);
-                    stack.push(result);
-                    pc += 1;
-                }
+            Op::TimestampDiff => {
+                let ts2 = stack.pop();
+                let ts1 = stack.pop();
+                let result = match (&*ts1, &*ts2) {
+                    (Value::Timestamp(t1), Value::Timestamp(t2)) => {
+                        let duration = t1.signed_duration_since(*t2);
+                        Value::Text(SmartString::from_string(
+                            self.format_duration_as_interval(duration),
+                        ))
+                    }
+                    _ if ts1.is_null() || ts2.is_null() => Value::Null(DataType::Text),
+                    _ => Value::Null(DataType::Text),
+                };
+                stack.push(result);
+            }
 
-                // NULLIF - return NULL if both args are equal
-                Op::NullIf => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = if sql_eq(&a, &b) == Some(true) {
-                        Cow::Borrowed(&NULL_VALUE)
-                    } else {
-                        a
-                    };
-                    stack.push(result);
-                    pc += 1;
-                }
+            Op::TimestampAddDays => {
+                let days = stack.pop();
+                let ts = stack.pop();
+                let result = match (&*ts, &*days) {
+                    (Value::Timestamp(t), Value::Integer(d)) => {
+                        Self::timestamp_add_days(*t, *d, false)?
+                    }
+                    _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
+                    _ => Value::Null(DataType::Timestamp),
+                };
+                stack.push(result);
+            }
 
-                // GREATEST - return maximum non-null value
-                Op::Greatest(n) => {
-                    let n = *n as usize;
-                    let start = stack.len().saturating_sub(n);
-                    let max_idx =
-                        extreme_position(&stack[start..], Ordering::Greater).map(|i| start + i);
+            Op::TimestampSubDays => {
+                let days = stack.pop();
+                let ts = stack.pop();
+                let result = match (&*ts, &*days) {
+                    (Value::Timestamp(t), Value::Integer(d)) => {
+                        Self::timestamp_add_days(*t, *d, true)?
+                    }
+                    _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
+                    _ => Value::Null(DataType::Timestamp),
+                };
+                stack.push(result);
+            }
 
-                    let result = if let Some(idx) = max_idx {
-                        let last = stack.len() - 1;
-                        stack.swap(idx, last);
-                        stack.pop().expect("stack underflow in GREATEST")
-                    } else {
-                        Cow::Borrowed(&NULL_VALUE)
-                    };
-                    stack.truncate(start);
-                    stack.push(result);
-                    pc += 1;
-                }
+            Op::ScaleInterval(step, count) => {
+                let result = match Self::pop_interval_multiplier(stack, *count)? {
+                    Some(k) => Value::Text(SmartString::from_string(Self::interval_text(
+                        *step,
+                        Self::scale_interval(*step, k)?,
+                    ))),
+                    None => Value::Null(DataType::Text),
+                };
+                stack.push(result);
+            }
 
-                // LEAST - return minimum non-null value
-                Op::Least(n) => {
-                    let n = *n as usize;
-                    let start = stack.len().saturating_sub(n);
-                    let min_idx =
-                        extreme_position(&stack[start..], Ordering::Less).map(|i| start + i);
-
-                    let result = if let Some(idx) = min_idx {
-                        let last = stack.len() - 1;
-                        stack.swap(idx, last);
-                        stack.pop().expect("stack underflow in LEAST")
-                    } else {
-                        Cow::Borrowed(&NULL_VALUE)
-                    };
-                    stack.truncate(start);
-                    stack.push(result);
-                    pc += 1;
-                }
-
-                // JUMP/CONTROL FLOW for short-circuit evaluation (used by COALESCE)
-                Op::JumpIfNotNull(target) => {
-                    if let Some(top) = stack.last() {
-                        if !top.is_null() {
-                            pc = *target as usize;
-                            continue;
+            Op::TimestampAddScaledInterval(step, subtract, count) => {
+                let k = Self::pop_interval_multiplier(stack, *count)?;
+                let ts = stack.pop();
+                let result = match &*ts {
+                    Value::Timestamp(t) => match k {
+                        Some(k) => {
+                            let interval = Self::scale_interval(*step, k)?;
+                            Value::Timestamp(interval::shift(*t, interval, *subtract)?)
                         }
+                        None => Value::Null(DataType::Timestamp),
+                    },
+                    _ if ts.is_null() => Value::Null(DataType::Timestamp),
+                    _ => {
+                        return Err(crate::core::Error::Type(format!(
+                            "cannot add an INTERVAL to {:?}",
+                            ts.data_type()
+                        )))
                     }
-                    pc += 1;
-                }
+                };
+                stack.push(result);
+            }
 
-                Op::Pop => {
-                    // Use truncate instead of pop to drop in-place without copying value out
-                    let new_len = stack.len().saturating_sub(1);
-                    stack.truncate(new_len);
-                    pc += 1;
-                }
-
-                Op::Jump(target) => {
-                    pc = *target as usize;
-                }
-
-                Op::JumpIfTrue(target) => {
-                    if let Some(top) = stack.last() {
-                        if Self::to_bool(top) {
-                            pc = *target as usize;
-                            continue;
+            Op::TruncateToDate => {
+                let v = stack.pop();
+                let result = match &*v {
+                    Value::Timestamp(t) => {
+                        use chrono::{Datelike, TimeZone, Utc};
+                        let truncated = Utc
+                            .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
+                            .single()
+                            .unwrap_or(*t);
+                        Value::Timestamp(truncated)
+                    }
+                    Value::Text(s) => match crate::core::parse_timestamp(s) {
+                        Ok(t) => {
+                            use chrono::{Datelike, TimeZone, Utc};
+                            let truncated = Utc
+                                .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
+                                .single()
+                                .unwrap_or(t);
+                            Value::Timestamp(truncated)
+                        }
+                        Err(_) => Value::Null(DataType::Timestamp),
+                    },
+                    Value::Integer(i) => {
+                        use chrono::{Datelike, TimeZone, Utc};
+                        match Utc.timestamp_opt(*i, 0) {
+                            chrono::LocalResult::Single(t) => {
+                                let truncated = Utc
+                                    .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
+                                    .single()
+                                    .unwrap_or(t);
+                                Value::Timestamp(truncated)
+                            }
+                            _ => Value::Null(DataType::Timestamp),
                         }
                     }
-                    pc += 1;
-                }
+                    Value::Null(_) => Value::Null(DataType::Timestamp),
+                    _ => Value::Null(DataType::Timestamp),
+                };
+                stack.push(result);
+            }
 
-                Op::JumpIfFalse(target) => {
-                    if let Some(top) = stack.last() {
-                        if !Self::to_bool(top) {
-                            pc = *target as usize;
-                            continue;
+            // =================================================================
+            // SET AND RANGE OPERATIONS OVER STACK VALUES
+            // =================================================================
+            Op::InList(count) => {
+                let start = stack.len().saturating_sub(*count as usize);
+                let items = self.take_values(stack, start);
+                let v = stack.pop();
+                // value = item OR value = item ..., with OR's UNKNOWN
+                let mut result = Some(false);
+                for item in &items {
+                    match sql_eq(&v, item) {
+                        Some(true) => {
+                            result = Some(true);
+                            break;
                         }
-                    } else {
-                        // Empty stack → treat as NULL → falsy → jump
-                        pc = *target as usize;
-                        continue;
-                    }
-                    pc += 1;
-                }
-
-                Op::JumpIfNull(target) => {
-                    if let Some(top) = stack.last() {
-                        if top.is_null() {
-                            pc = *target as usize;
-                            continue;
-                        }
-                    }
-                    pc += 1;
-                }
-
-                Op::PopJumpIfFalse(target) => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    if !Self::to_bool(&v) {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
+                        Some(false) => {}
+                        None => result = None,
                     }
                 }
+                self.args_buffer = items;
+                stack.push(truth(result));
+            }
 
-                Op::PopJumpIfTrue(target) => {
-                    let v = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    if Self::to_bool(&v) {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
+            Op::QuantifiedSet(set) => {
+                let v = stack.pop();
+                stack.push(truth(set.answer(&v)));
+            }
+
+            Op::Between => {
+                let high = stack.pop();
+                let low = stack.pop();
+                let val = stack.pop();
+
+                // Fast path for integer/float comparisons
+                let result = match (&*val, &*low, &*high) {
+                    (Value::Integer(v), Value::Integer(lo), Value::Integer(hi)) => {
+                        Value::Boolean(*v >= *lo && *v <= *hi)
                     }
-                }
-
-                Op::Nop => {
-                    pc += 1;
-                }
-
-                // STRING CONCATENATION
-                Op::Add => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Self::add_op(&a, &b)?));
-                    pc += 1;
-                }
-
-                Op::Sub => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(self.sub_op(&a, &b)?));
-                    pc += 1;
-                }
-
-                Op::Mul => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Self::mul_op(&a, &b)?));
-                    pc += 1;
-                }
-
-                Op::Div => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Self::div_op(&a, &b)?));
-                    pc += 1;
-                }
-
-                Op::Mod => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(Self::mod_op(&a, &b)?));
-                    pc += 1;
-                }
-
-                Op::Concat => {
-                    let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    stack.push(Cow::Owned(concat_text([&*a, &*b].into_iter())));
-                    pc += 1;
-                }
-
-                // Multi-value string concatenation (optimized for chained ||)
-                Op::ConcatN(n) => {
-                    let start = stack.len().saturating_sub(*n as usize);
-                    let result = concat_text(stack[start..].iter().map(|v| &**v));
-                    stack.truncate(start);
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
-
-                // CASE expression operations
-                Op::CaseStart => {
-                    // Marker only, no operation
-                    pc += 1;
-                }
-
-                Op::CaseWhen(next_branch) => {
-                    let cond = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    if !Self::to_bool(&cond) {
-                        pc = *next_branch as usize;
-                    } else {
-                        pc += 1;
+                    (Value::Float(v), Value::Float(lo), Value::Float(hi)) => {
+                        Value::Boolean(f64_ge(*v, *lo) && f64_le(*v, *hi))
                     }
-                }
+                    (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
+                        Value::Boolean(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
+                    }
+                    (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
+                        Value::Boolean(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
+                    }
+                    (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => Value::Boolean(
+                        crate::core::value::i64_le_f64(*lo, *v)
+                            && crate::core::value::i64_ge_f64(*hi, *v),
+                    ),
+                    (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
+                        Value::Boolean(crate::core::value::i64_le_f64(*lo, *v) && f64_le(*v, *hi))
+                    }
+                    (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
+                        Value::Boolean(f64_ge(*v, *lo) && crate::core::value::i64_ge_f64(*hi, *v))
+                    }
+                    (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
+                        crate::core::value::i64_ge_f64(*v, *lo)
+                            && crate::core::value::i64_le_f64(*v, *hi),
+                    ),
+                    _ => truth(between_cell(&val, &low, &high)),
+                };
+                stack.push(result);
+            }
 
-                Op::CaseThen(end_pos) => {
-                    // Result is on stack, jump to end
-                    pc = *end_pos as usize;
-                }
+            Op::NotBetween => {
+                let high = stack.pop();
+                let low = stack.pop();
+                let val = stack.pop();
 
-                Op::CaseElse => {
-                    // Marker only
-                    pc += 1;
-                }
+                // Fast path for integer/float comparisons
+                let result = match (&*val, &*low, &*high) {
+                    (Value::Integer(v), Value::Integer(lo), Value::Integer(hi)) => {
+                        Value::Boolean(*v < *lo || *v > *hi)
+                    }
+                    (Value::Float(v), Value::Float(lo), Value::Float(hi)) => {
+                        Value::Boolean(f64_lt(*v, *lo) || f64_gt(*v, *hi))
+                    }
+                    (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
+                        Value::Boolean(*v < *lo || crate::core::value::i64_gt_f64(*v, *hi))
+                    }
+                    (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
+                        Value::Boolean(crate::core::value::i64_lt_f64(*v, *lo) || *v > *hi)
+                    }
+                    (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => Value::Boolean(
+                        crate::core::value::i64_gt_f64(*lo, *v)
+                            || crate::core::value::i64_lt_f64(*hi, *v),
+                    ),
+                    (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
+                        Value::Boolean(crate::core::value::i64_gt_f64(*lo, *v) || f64_gt(*v, *hi))
+                    }
+                    (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
+                        Value::Boolean(f64_lt(*v, *lo) || crate::core::value::i64_lt_f64(*hi, *v))
+                    }
+                    (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
+                        crate::core::value::i64_lt_f64(*v, *lo)
+                            || crate::core::value::i64_gt_f64(*v, *hi),
+                    ),
+                    _ => truth(between_cell(&val, &low, &high).map(|inside| !inside)),
+                };
+                stack.push(result);
+            }
 
-                Op::CaseEnd => {
-                    // Marker only
-                    pc += 1;
-                }
+            Op::InTupleSet {
+                tuple_size,
+                values,
+                negated,
+            } => {
+                let start = stack.len().saturating_sub(*tuple_size as usize);
+                let row = self.take_values(stack, start);
+                let found = row_in(&row, values.iter().map(Vec::as_slice));
+                self.args_buffer = row;
+                let result = if *negated { found.map(|f| !f) } else { found };
+                stack.push(truth(result));
+            }
 
-                Op::CaseCompare => {
-                    let when_val = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    // Use reference to avoid clone - case_val stays on stack for next comparison
-                    let result = match stack.last() {
-                        Some(case_val) => Value::Boolean(sql_eq(case_val, &when_val) == Some(true)),
-                        _ => Value::Boolean(false),
-                    };
-                    stack.push(Cow::Owned(result));
-                    pc += 1;
-                }
+            Op::InRows(width, count) => {
+                let width = *width as usize;
+                let start = stack
+                    .len()
+                    .saturating_sub(width.saturating_mul(*count as usize + 1));
+                let values = self.take_values(stack, start);
+                let (row, list) = values.split_at(width);
+                let result = truth(row_in(row, list.chunks_exact(width)));
+                self.args_buffer = values;
+                stack.push(result);
+            }
 
-                Op::Return => break,
-                Op::ReturnTrue => {
-                    return Ok(Value::Boolean(true));
-                }
-                Op::ReturnFalse => {
-                    return Ok(Value::Boolean(false));
-                }
-                Op::ReturnNull(dt) => {
-                    return Ok(Value::Null(*dt));
-                }
+            // =================================================================
+            // BOOLEAN CHECKS
+            // =================================================================
+            Op::IsTrue => {
+                let result = matches!(&*stack.pop(), Value::Boolean(true));
+                stack.push(Value::Boolean(result));
+            }
 
-                // For any unhandled operation, fall back to the regular execute
-                _ => {
-                    return self.execute(program, ctx);
+            Op::IsNotTrue => {
+                let result = !matches!(&*stack.pop(), Value::Boolean(true));
+                stack.push(Value::Boolean(result));
+            }
+
+            Op::IsFalse => {
+                let result = matches!(&*stack.pop(), Value::Boolean(false));
+                stack.push(Value::Boolean(result));
+            }
+
+            Op::IsNotFalse => {
+                let result = !matches!(&*stack.pop(), Value::Boolean(false));
+                stack.push(Value::Boolean(result));
+            }
+
+            Op::ReadAsColumn(column_type) => {
+                let v = stack.pop().into_owned();
+                stack.push(crate::executor::pushdown::read_as_column(*column_type, v));
+            }
+
+            Op::Dup => stack.dup(),
+
+            Op::Swap => {
+                let len = stack.len();
+                if len >= 2 {
+                    stack.swap(len - 1, len - 2);
                 }
             }
-        }
 
-        // Return top of stack or NULL
-        Ok(stack
-            .pop()
-            .map(Cow::into_owned)
-            .unwrap_or_else(Value::null_unknown))
+            // =================================================================
+            // SUBQUERY OPERATIONS
+            // =================================================================
+            Op::ExecScalarSubquery(idx) => {
+                let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+                stack.push(executor.execute_scalar(*idx, ctx)?);
+            }
+
+            Op::ExecExists(idx) => {
+                let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+                let exists = executor.execute_exists(*idx, ctx)?;
+                stack.push(Value::Boolean(exists));
+            }
+
+            // The block decides: a NULL value over no rows is FALSE, not UNKNOWN
+            Op::ExecInSubquery(idx) => {
+                let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+                let v = stack.pop();
+                let answer = match executor.kept_members(*idx) {
+                    Some(kept) => kept.answer(&v)?,
+                    None => executor.execute_in(*idx, &v, ctx)?,
+                };
+                stack.push(truth(answer));
+            }
+
+            // As IN: a NULL value over no rows is FALSE for ANY and TRUE for ALL
+            Op::ExecQuantified(idx, compare_op, all) => {
+                let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+                let v = stack.pop();
+                let answer = match executor.kept_members(*idx) {
+                    Some(kept) => kept.answer(&v)?,
+                    None => executor.execute_quantified(*idx, &v, *compare_op, *all, ctx)?,
+                };
+                stack.push(truth(answer));
+            }
+
+            Op::ExecRowMembers(idx, width) => self.row_members(stack, *idx, *width, ctx)?,
+
+            // =================================================================
+            // VECTOR DISTANCE OPERATIONS
+            // =================================================================
+            Op::VectorDistanceL2 => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let mut buf_a = Vec::new();
+                let mut buf_b = Vec::new();
+                match (
+                    extract_vector_bytes(&a, &mut buf_a),
+                    extract_vector_bytes(&b, &mut buf_b),
+                ) {
+                    (Some(ba), Some(bb)) if ba.len() == bb.len() => {
+                        stack.push(Value::Float(
+                            crate::functions::scalar::vector::l2_distance_bytes(ba, bb),
+                        ));
+                    }
+                    _ => {
+                        stack.push(Value::null_unknown());
+                    }
+                }
+            }
+
+            Op::VectorDistanceCosine => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let mut buf_a = Vec::new();
+                let mut buf_b = Vec::new();
+                match (
+                    extract_vector_bytes(&a, &mut buf_a),
+                    extract_vector_bytes(&b, &mut buf_b),
+                ) {
+                    (Some(ba), Some(bb)) if ba.len() == bb.len() => {
+                        stack.push(Value::Float(
+                            crate::functions::scalar::vector::cosine_distance_bytes(ba, bb),
+                        ));
+                    }
+                    _ => {
+                        stack.push(Value::null_unknown());
+                    }
+                }
+            }
+
+            Op::VectorDistanceIP => {
+                let b = stack.pop();
+                let a = stack.pop();
+                let mut buf_a = Vec::new();
+                let mut buf_b = Vec::new();
+                match (
+                    extract_vector_bytes(&a, &mut buf_a),
+                    extract_vector_bytes(&b, &mut buf_b),
+                ) {
+                    (Some(ba), Some(bb)) if ba.len() == bb.len() => {
+                        stack.push(Value::Float(
+                            crate::functions::scalar::vector::ip_distance_bytes(ba, bb),
+                        ));
+                    }
+                    _ => {
+                        stack.push(Value::null_unknown());
+                    }
+                }
+            }
+
+            // The op loop answers every other op itself
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Execute and return boolean result (for WHERE clauses)
@@ -2501,8 +1996,8 @@ impl ExprVM {
             }
         }
 
-        // General path: full VM execution with Cow-based stack (avoids cloning)
-        match self.execute_cow(program, ctx) {
+        // General path: full VM execution
+        match self.execute(program, ctx) {
             Ok(Value::Boolean(b)) => b,
             Ok(Value::Integer(i)) => i != 0,
             Ok(_) => false,
@@ -2579,7 +2074,7 @@ impl ExprVM {
         }
 
         // General path: full VM execution
-        self.execute_cow(program, ctx).map(|v| Self::passes(&v))
+        self.execute(program, ctx).map(|v| Self::passes(&v))
     }
 
     /// Whether a filter's value keeps its row: TRUE or a non-zero integer
@@ -2919,16 +2414,24 @@ impl ExprVM {
     /// The top `width` values tested against block `index`'s members,
     /// replaced by the answer
     #[inline(never)]
-    fn row_members(&mut self, index: u16, width: u16, ctx: &ExecuteContext) -> Result<()> {
+    fn row_members(
+        &mut self,
+        stack: &mut Stack<'_>,
+        index: u16,
+        width: u16,
+        ctx: &ExecuteContext,
+    ) -> Result<()> {
         let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-        let start = self.stack.len().saturating_sub(width as usize);
-        let row = &self.stack[start..];
+        let start = stack.len().saturating_sub(width as usize);
+        let mut row = std::mem::take(&mut self.args_buffer);
+        row.clear();
+        row.extend(stack.drain(start));
         let answer = match executor.kept_members(index) {
-            Some(kept) => kept.answer_row(row)?,
-            None => executor.execute_row_members(index, row, ctx)?,
+            Some(kept) => kept.answer_row(&row),
+            None => executor.execute_row_members(index, &row, ctx),
         };
-        self.stack.truncate(start);
-        self.stack.push(truth(answer));
+        self.args_buffer = row;
+        stack.push(truth(answer?));
         Ok(())
     }
 
@@ -3390,13 +2893,13 @@ impl ExprVM {
     /// the order they were pushed; None when one is NULL. Every one is
     /// checked, NULL or not
     fn pop_interval_multiplier(
-        &mut self,
+        stack: &mut Stack<'_>,
         count: u8,
     ) -> Result<Option<std::result::Result<i64, f64>>> {
         let as_f64 = |k: std::result::Result<i64, f64>| k.map_or_else(|f| f, |i| i as f64);
-        let start = self.stack.len().saturating_sub(usize::from(count));
+        let start = stack.len().saturating_sub(usize::from(count));
         let mut product = Some(Ok(1i64));
-        for n in &self.stack[start..] {
+        for n in stack.from(start) {
             product = match (product, Self::interval_multiplier(n)?) {
                 (None, _) | (_, None) => None,
                 (Some(Ok(a)), Some(Ok(b))) => Some(Ok(a.checked_mul(b).ok_or_else(|| {
@@ -3407,7 +2910,7 @@ impl ExprVM {
                 (Some(a), Some(b)) => Some(Err(as_f64(a) * as_f64(b))),
             };
         }
-        self.stack.truncate(start);
+        stack.truncate(start);
         Ok(product)
     }
 
@@ -3663,13 +3166,13 @@ mod tests {
     #[test]
     fn test_vm_new() {
         let vm = ExprVM::new();
-        assert_eq!(vm.stack.len(), 0);
+        assert_eq!(vm.args_buffer.len(), 0);
     }
 
     #[test]
     fn test_vm_default() {
         let vm = ExprVM::default();
-        assert_eq!(vm.stack.len(), 0);
+        assert_eq!(vm.args_buffer.len(), 0);
     }
 
     // =========================================================================
@@ -3738,8 +3241,7 @@ mod tests {
         let row = Row::new();
         let params = [Value::Integer(1)];
         let ctx = ExecuteContext::new(&row).with_params(&params);
-        assert!(vm.execute(&program, &ctx).is_err(), "execute");
-        assert!(vm.execute_cow(&program, &ctx).is_err(), "execute_cow");
+        assert!(vm.execute(&program, &ctx).is_err());
     }
 
     #[test]
@@ -5399,6 +4901,6 @@ mod tests {
         vm.execute(&program, &ExecuteContext::new(&row)).unwrap();
         assert!(!vm.args_buffer.is_empty(), "a call keeps its arguments");
         vm.release_values();
-        assert!(vm.args_buffer.is_empty() && vm.stack.is_empty());
+        assert!(vm.args_buffer.is_empty());
     }
 }

@@ -434,7 +434,7 @@ impl Executor {
                         }
                     }
                     for (idx, program, col_type, vector_dims) in expr_updates {
-                        let value = vm.execute_cow(program, &exec_ctx)?;
+                        let value = vm.execute(program, &exec_ctx)?;
                         let coerced = value.coerce_to_type(*col_type);
                         super::dml::validate_coercion(
                             &value,

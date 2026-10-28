@@ -131,7 +131,7 @@ impl<'a> RowPrograms<'a> {
     #[inline]
     fn eval(&mut self, row: &Row) -> Result<Value> {
         let exec = with_blocks(slot_context(row, self.ctx), self.blocks);
-        self.vm.execute_cow(&self.programs[0], &exec)
+        self.vm.execute(&self.programs[0], &exec)
     }
 
     /// Each program's value for `row`, in order, into `out`
@@ -140,7 +140,7 @@ impl<'a> RowPrograms<'a> {
         let exec = with_blocks(slot_context(row, self.ctx), self.blocks);
         out.clear();
         for program in &self.programs {
-            out.push(self.vm.execute_cow(program, &exec)?);
+            out.push(self.vm.execute(program, &exec)?);
         }
         Ok(())
     }

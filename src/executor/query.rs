@@ -1510,7 +1510,7 @@ impl Executor {
         let mut counts = smallvec::SmallVec::new();
         for (((count, clause), key), programs) in clauses.iter().zip(keys).zip(run.values()) {
             if let (Some(count), Some(key), Some(Some(program))) = (count, key, programs.first()) {
-                let value = vm.execute_cow(program, &exec)?;
+                let value = vm.execute(program, &exec)?;
                 counts.push(super::context::ReadCount {
                     clause,
                     address: *count as *const Expression as usize,
@@ -6916,7 +6916,7 @@ impl Executor {
                                 let exec = super::expression::execute_context(row, Some(ctx));
                                 let mut keys = Vec::with_capacity(programs.len());
                                 for p in programs {
-                                    keys.push(vm.execute_cow(p, &exec).ok()?);
+                                    keys.push(vm.execute(p, &exec).ok()?);
                                 }
                                 sort_keys.push(keys);
                             }
@@ -11199,7 +11199,7 @@ impl Executor {
                         }
                         ExprAction::Concat(concat) => values.push(concat.value(&vm_ctx)?),
                         ExprAction::Compiled(program) => {
-                            let value = vm.execute_cow(program, &vm_ctx)?;
+                            let value = vm.execute(program, &vm_ctx)?;
                             values.push(value);
                         }
                     }
@@ -11740,7 +11740,7 @@ impl Executor {
                     Ok(ItemSource::Column(idx)) => {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
-                    Ok(ItemSource::Program(program)) => vm.execute_cow(program, &exec)?,
+                    Ok(ItemSource::Program(program)) => vm.execute(program, &exec)?,
                     Err(e) => return Err(e.clone()),
                 });
             }

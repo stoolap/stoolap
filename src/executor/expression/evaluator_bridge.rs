@@ -911,7 +911,7 @@ impl ExpressionEval {
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
-        self.vm.execute_cow(&self.program, &ctx)
+        self.vm.execute(&self.program, &ctx)
     }
 
     /// Evaluate as boolean (for WHERE/HAVING), returning an evaluation error.
@@ -943,7 +943,7 @@ impl ExpressionEval {
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
-        self.vm.execute_cow(&self.program, &ctx)
+        self.vm.execute(&self.program, &ctx)
     }
 }
 
@@ -1529,7 +1529,7 @@ impl<'a> CompiledEvaluator<'a> {
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         // Execute
-        self.vm.execute_cow(&program, &ctx)
+        self.vm.execute(&program, &ctx)
     }
 
     /// Compile and cache an expression, returning the shared program for
@@ -1550,7 +1550,7 @@ impl<'a> CompiledEvaluator<'a> {
             ctx = ctx.with_outer_row(outer);
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
-        self.vm.execute_cow(program, &ctx)
+        self.vm.execute(program, &ctx)
     }
 
     /// Evaluate an expression as a boolean (for WHERE/HAVING clauses)

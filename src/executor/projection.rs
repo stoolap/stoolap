@@ -69,7 +69,7 @@ impl Item {
             Item::Constant(value) => value.clone(),
             Item::Param(slot) => exec.param_ref(*slot)?.clone(),
             Item::Concat(concat) => concat.value(exec)?,
-            Item::Program(program) => vm.execute_cow(program, exec)?,
+            Item::Program(program) => vm.execute(program, exec)?,
         })
     }
 }

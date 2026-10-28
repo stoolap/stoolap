@@ -573,52 +573,6 @@ fn test_a_block_outside_a_prepared_plan_does_not_compile() {
 }
 
 #[test]
-fn arithmetic_answers_alike_on_the_borrowing_and_the_owned_vm() {
-    let epoch = chrono::DateTime::from_timestamp(86_400 * 30, 0).unwrap();
-    let values = [
-        Value::Integer(7),
-        Value::Integer(-3),
-        Value::Integer(0),
-        Value::Integer(i64::MAX),
-        Value::Float(2.5),
-        Value::Null(crate::core::DataType::Integer),
-        Value::Timestamp(epoch),
-        Value::Text(SmartString::from("1 day")),
-    ];
-    let mut vm = ExprVM::new();
-    for op in [Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod] {
-        let program = Program::new(vec![Op::LoadColumn(0), Op::LoadColumn(1), op, Op::Return]);
-        assert!(program.cow_supported(), "{program:?}");
-        for a in &values {
-            for b in &values {
-                let row = Row::from_values(vec![a.clone(), b.clone()]);
-                let ctx = ExecuteContext::new(&row);
-                let owned = format!("{:?}", vm.execute(&program, &ctx));
-                let borrowed = format!("{:?}", vm.execute_cow(&program, &ctx));
-                assert_eq!(borrowed, owned, "{program:?} over {a:?} and {b:?}");
-            }
-        }
-    }
-}
-
-#[test]
-fn a_program_deeper_than_the_inline_stack_runs_owned() {
-    let mut ops = Vec::new();
-    for i in 0..17 {
-        ops.extend([Op::LoadColumn(0), Op::LoadConst(Value::Integer(i)), Op::Add]);
-    }
-    ops.extend([Op::Greatest(17), Op::Return]);
-    assert!(!Program::new(ops).cow_supported(), "17 values on the stack");
-    let shallow = Program::new(vec![
-        Op::LoadColumn(0),
-        Op::LoadConst(Value::Integer(1)),
-        Op::Add,
-        Op::Return,
-    ]);
-    assert!(shallow.cow_supported(), "two values on the stack");
-}
-
-#[test]
 fn a_bound_program_reads_its_columns_by_index_and_no_name() {
     use crate::functions::registry::global_registry;
     use crate::parser::ast::{ColumnRef, Identifier};

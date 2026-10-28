@@ -957,7 +957,7 @@ impl Executor {
                         values.push(row.get(*idx).cloned().unwrap_or_else(Value::null_unknown));
                     }
                     CompiledColumn::Compiled(program) => {
-                        values.push(vm.execute_cow(program, &exec_ctx)?);
+                        values.push(vm.execute(program, &exec_ctx)?);
                     }
                 }
             }
