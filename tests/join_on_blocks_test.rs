@@ -674,7 +674,7 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
     let _turn = turn();
     let db = Database::open("memory://join_on_blocks_explain_sites").unwrap();
     fill(&db);
-    db.execute("CREATE TABLE tgt (id INTEGER PRIMARY KEY, k INTEGER)", ())
+    db.execute("CREATE TABLE tgt (id INTEGER, k INTEGER)", ())
         .unwrap();
     let join = "SELECT l.id, r.k FROM l JOIN r ON l.id = r.id \
                 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
@@ -745,8 +745,71 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         }
     }
     let insert = format!("INSERT INTO tgt {join}");
-    if lines(&insert) != [outside] {
+    if lines(&insert) != [yes] {
         wrong.push(format!("{insert}: {:?}", lines(&insert)));
     }
+    let ran = db.execute(&insert, ()).and_then(|_| {
+        let compiles = (bridge_compiles(), program_compiles());
+        db.execute(&insert, ())?;
+        Ok((bridge_compiles(), program_compiles()) == compiles)
+    });
+    if ran.as_ref().map_err(|e| e.to_string()) != Ok(&true) {
+        wrong.push(format!(
+            "{insert}: says yes, run again it compiled ({ran:?})"
+        ));
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn explain_analyze_says_whether_the_statement_it_ran_held_a_plan() {
+    use std::sync::Arc;
+    use stoolap::executor::{ExecutionContext, Executor};
+    use stoolap::storage::mvcc::engine::MVCCEngine;
+    let _turn = turn();
+    let engine = MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
+    let executor = Executor::new(Arc::new(engine));
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE dst (id INTEGER)",
+        "INSERT INTO l VALUES (1), (2), (3)",
+        "INSERT INTO r VALUES (1), (2)",
+        "INSERT INTO s VALUES (2)",
+    ] {
+        executor.execute(sql).unwrap();
+    }
+    let sql = "EXPLAIN ANALYZE INSERT INTO dst SELECT l.id FROM l JOIN r ON l.id = r.id \
+               WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
+    let prepared = |result: stoolap::Result<Box<dyn stoolap::storage::traits::QueryResult>>| {
+        let mut result = result.unwrap();
+        let mut lines = Vec::new();
+        while result.next() {
+            if let Some(stoolap::core::Value::Text(line)) = result.row().get(0) {
+                if line.trim().starts_with("Prepared:") {
+                    lines.push(line.trim().to_string());
+                }
+            }
+        }
+        lines
+    };
+    let program = stoolap::parser::Parser::new(sql).parse_program().unwrap();
+    assert_eq!(
+        prepared(executor.execute(sql)),
+        ["Prepared: yes"],
+        "run with its cached plan"
+    );
+    let none = ["Prepared: no (a join in a SELECT that holds no plan)"];
+    assert_eq!(
+        prepared(executor.execute_program(&program)),
+        none,
+        "run as a program"
+    );
+    assert_eq!(
+        prepared(executor.execute_statement(&program.statements[0], &ExecutionContext::new())),
+        none,
+        "run as a parsed statement"
+    );
 }

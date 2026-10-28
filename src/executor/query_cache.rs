@@ -45,7 +45,7 @@ use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
 use crate::core::Schema;
-use crate::parser::ast::{ParamSlots, SelectStatement, Statement};
+use crate::parser::ast::{ParamSlots, SelectStatement, Statement, WithClause};
 use crate::storage::mvcc::version_store::LayoutToken;
 
 use super::query_classification::QueryClassification;
@@ -289,8 +289,9 @@ pub struct CompiledCountStar {
 #[derive(Debug, Default)]
 pub struct NestedPlan {
     plan: RwLock<CompiledExecution>,
-    /// Its derived FROM's, then its later set operation branches', then its
-    /// CTEs', made when one first runs
+    /// A SELECT's derived FROM's, then its later set operation branches',
+    /// then its CTEs'; a DML statement's CTEs'; or the one statement an
+    /// INSERT or an EXPLAIN ANALYZE runs. Made when one first runs
     nested: std::sync::OnceLock<Box<[NestedPlan]>>,
 }
 
@@ -300,29 +301,50 @@ impl NestedPlan {
         &self.plan
     }
 
-    /// The plans nested in this one, `stmt`'s being the plan this is
-    fn nested(&self, stmt: &SelectStatement) -> &[NestedPlan] {
-        self.nested.get_or_init(|| {
-            let ctes = stmt.with.as_ref().map_or(0, |with| with.ctes.len());
-            (0..1 + stmt.set_operations.len() + ctes)
-                .map(|_| NestedPlan::default())
-                .collect()
-        })
+    /// The `count` plans nested in this one
+    fn nested(&self, count: usize) -> &[NestedPlan] {
+        self.nested
+            .get_or_init(|| (0..count).map(|_| NestedPlan::default()).collect())
+    }
+
+    /// The plans nested in `stmt`'s, this being that plan
+    fn of_select(&self, stmt: &SelectStatement) -> &[NestedPlan] {
+        let ctes = stmt.with.as_ref().map_or(0, |with| with.ctes.len());
+        self.nested(1 + stmt.set_operations.len() + ctes)
     }
 
     /// The plan of `stmt`'s derived FROM
     pub(crate) fn from(&self, stmt: &SelectStatement) -> Option<&NestedPlan> {
-        self.nested(stmt).first()
+        self.of_select(stmt).first()
     }
 
     /// The plan of `stmt`'s set operation branch at `index`
     pub(crate) fn branch(&self, stmt: &SelectStatement, index: usize) -> Option<&NestedPlan> {
-        self.nested(stmt).get(1 + index)
+        self.branches(stmt).get(index)
     }
 
-    /// The plan of the body of `stmt`'s CTE at `index`
-    pub(crate) fn cte(&self, stmt: &SelectStatement, index: usize) -> Option<&NestedPlan> {
-        self.nested(stmt).get(1 + stmt.set_operations.len() + index)
+    /// The plans of `stmt`'s set operation branches past the first, in order
+    pub(crate) fn branches(&self, stmt: &SelectStatement) -> &[NestedPlan] {
+        let nested = self.of_select(stmt);
+        nested.get(1..1 + stmt.set_operations.len()).unwrap_or(&[])
+    }
+
+    /// The plans of the bodies of `stmt`'s CTEs, in order
+    pub(crate) fn ctes(&self, stmt: &SelectStatement) -> &[NestedPlan] {
+        let nested = self.of_select(stmt);
+        nested.get(1 + stmt.set_operations.len()..).unwrap_or(&[])
+    }
+
+    /// The plans of the bodies of `with`'s CTEs, `with` being a DML
+    /// statement's and this its plan
+    pub(crate) fn dml_ctes(&self, with: &WithClause) -> &[NestedPlan] {
+        self.nested(with.ctes.len())
+    }
+
+    /// The plan of the one statement this statement runs: an INSERT's
+    /// SELECT or an EXPLAIN ANALYZE's statement
+    pub(crate) fn source(&self) -> Option<&NestedPlan> {
+        self.nested(1).first()
     }
 }
 

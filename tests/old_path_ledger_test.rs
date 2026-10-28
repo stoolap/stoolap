@@ -502,6 +502,25 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
          ON d.id = t.id WHERE t.b > 1",
         Prepared,
     ),
+    (
+        "join_as_the_first_member_of_a_recursive_cte",
+        "WITH RECURSIVE r(id, x) AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u) UNION ALL SELECT id + 10, x FROM r WHERE id < 10) \
+         SELECT r.id FROM r WHERE r.id > (SELECT MIN(x) FROM u)",
+        "WITH RECURSIVE r(id, x) AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3 \
+         UNION ALL SELECT id + 10, x FROM r WHERE id < 10) SELECT r.id FROM r WHERE r.id > 1",
+        Prepared,
+    ),
+    (
+        "join_as_the_recursive_member_of_a_recursive_cte",
+        "WITH RECURSIVE r(id, x) AS (SELECT id, x FROM u WHERE id = 1 UNION ALL \
+         SELECT u.id, u.x FROM r JOIN u ON u.id = r.id + 1 WHERE u.x > (SELECT MIN(x) FROM u)) \
+         SELECT r.id, r.x FROM r WHERE r.id > (SELECT MIN(x) FROM u) - 1",
+        "WITH RECURSIVE r(id, x) AS (SELECT id, x FROM u WHERE id = 1 UNION ALL \
+         SELECT u.id, u.x FROM r JOIN u ON u.id = r.id + 1 WHERE u.x > 1) \
+         SELECT r.id, r.x FROM r WHERE r.id > 0",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
@@ -537,7 +556,21 @@ const WRITES: &[(&str, &str, &str, Path)] = &[
         "INSERT INTO t SELECT t.id + 10, u.x, t.b FROM t JOIN u ON u.id = t.a \
          WHERE t.b > (SELECT MAX(x) FROM u)",
         "INSERT INTO t SELECT t.id + 10, u.x, t.b FROM t JOIN u ON u.id = t.a WHERE t.b > 3",
-        Old("#717: no parent plan"),
+        Prepared,
+    ),
+    (
+        "update_with_a_cte_of_a_join",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) UPDATE t SET b = 0 WHERE id IN (SELECT id FROM c)",
+        "UPDATE t SET b = 0 WHERE id IN (1, 2, 4, 5)",
+        Prepared,
+    ),
+    (
+        "delete_with_a_cte_of_a_join",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) DELETE FROM t WHERE id IN (SELECT id FROM c) AND a = 2",
+        "DELETE FROM t WHERE id IN (2, 5)",
+        Prepared,
     ),
 ];
 

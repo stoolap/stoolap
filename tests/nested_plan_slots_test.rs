@@ -88,6 +88,35 @@ const SHAPES: &[(&str, &str)] = &[
         "set operation branch",
         "SELECT id, x FROM u WHERE id > (SELECT 0) UNION {j}",
     ),
+    (
+        "recursive CTE's first member",
+        "WITH RECURSIVE r(id, x) AS ({j} UNION ALL \
+         SELECT r.id + 10, u.x FROM r JOIN u ON u.id = r.x WHERE r.id < (SELECT 10)) \
+         SELECT r.id FROM r WHERE r.id > (SELECT MIN(x) FROM u) - 1",
+    ),
+    (
+        "recursive CTE's recursive member",
+        "WITH RECURSIVE r(id, x) AS (SELECT id, x FROM u WHERE id = (SELECT 1) UNION ALL \
+         SELECT u.id, u.x FROM r JOIN u ON u.id = r.id + 1 WHERE u.x > (SELECT MIN(x) FROM u) - 1) \
+         SELECT r.id, r.x FROM r WHERE r.id > (SELECT MIN(x) FROM u) - 1",
+    ),
+];
+
+/// Each statement that runs `{j}` as a part, the statement after it
+/// reading what it left
+const STATEMENTS: &[(&str, &str, &str)] = &[
+    ("INSERT ... SELECT", "INSERT INTO w {j}", "SELECT * FROM w"),
+    (
+        "UPDATE's CTE",
+        "WITH c AS ({j}) UPDATE t SET b = b + 1 WHERE id IN (SELECT id FROM c)",
+        "SELECT * FROM t",
+    ),
+    (
+        "DELETE's CTE",
+        "WITH c AS ({j}) DELETE FROM w WHERE id IN (SELECT id FROM c) AND x > 2",
+        "SELECT * FROM w",
+    ),
+    ("EXPLAIN ANALYZE", "EXPLAIN ANALYZE {j}", "SELECT * FROM t"),
 ];
 
 fn setup(name: &str) -> Database {
@@ -97,6 +126,7 @@ fn setup(name: &str) -> Database {
         "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
         "INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 0, 30), (4, 1, 40), (5, 2, 50), (6, 0, 60)",
         "INSERT INTO u VALUES (1, 1), (2, 2), (3, 3)",
+        "CREATE TABLE w (id INTEGER, x INTEGER)",
         &format!("CREATE VIEW vj AS {JOIN}"),
     ] {
         db.execute(sql, ()).unwrap();
@@ -141,6 +171,34 @@ fn a_nested_join_runs_as_blocks_and_run_again_compiles_nothing() {
         if compiles() != before || again != first {
             wrong.push(format!(
                 "{name}: run again compiled {:?} -> {:?}, gave {first:?} then {again:?}",
+                before,
+                compiles()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_join_a_statement_runs_as_a_part_runs_as_blocks_and_run_again_compiles_nothing() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for (index, (name, statement, read)) in STATEMENTS.iter().enumerate() {
+        let db = setup(&format!("statement_{index}"));
+        let sql = statement.replace("{j}", JOIN);
+        let hit = hits();
+        db.execute(&sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let first = rows(&db, read);
+        let before = compiles();
+        db.execute(&sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        if hits() != hit {
+            wrong.push(format!("{name}: ran a general path mechanism"));
+        }
+        if compiles() != before {
+            wrong.push(format!(
+                "{name}: run again compiled {:?} -> {:?}, left {first:?}",
                 before,
                 compiles()
             ));
