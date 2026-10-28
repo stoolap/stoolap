@@ -479,6 +479,13 @@ fn write_statement(stmt: &SelectStatement, hasher: &mut KeyHasher) {
             }
             column => write_expr(column, hasher),
         }
+        // A kept plan keeps its output's names, which keep the spelling
+        if hasher.exact {
+            match super::utils::item_spelled_name(column) {
+                Some(name) => hasher.text(name),
+                None => hasher.text(&super::utils::expression_to_string(column)),
+            }
+        }
     }
     hasher.flag(stmt.with.is_some());
     if let Some(with) = &stmt.with {

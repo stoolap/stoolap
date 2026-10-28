@@ -1860,6 +1860,14 @@ impl Executor {
                 (true, true) => (None, 0),
                 (true, false) => (limit, offset),
             };
+            // An answer kept for the cache is the WHERE's whole one, read
+            // only over a table small enough for the cache to take it; the
+            // caller then skips the OFFSET's rows
+            let semantic_stamp = semantic_stamp.filter(|(source, _)| {
+                self.prepared_table(&source.name.value_lower, ctx, None)
+                    .is_ok_and(|table| Self::semantic_rows_fit(&*table))
+            });
+            let offset = if semantic_stamp.is_some() { 0 } else { offset };
             let (result, columns, applied, visible, layout, distinct) =
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
             let result = match (semantic_stamp, stmt.where_clause.as_deref()) {
@@ -3407,6 +3415,13 @@ impl Executor {
             && classification.semantic_cacheable()
     }
 
+    /// Whether `table`'s rows may fit a semantic cache entry, so collecting
+    /// an answer over it for the cache can pay off; an upper bound, so a
+    /// larger table's answers stream
+    pub(crate) fn semantic_rows_fit(table: &dyn crate::storage::traits::Table) -> bool {
+        table.row_count_hint() <= super::semantic_cache::DEFAULT_MAX_CACHED_ROWS
+    }
+
     /// The stamp a semantic cache entry of `table_name` is written under,
     /// taken before the rows it keeps are read, so an entry is never older
     /// than its stamp; None while the cache cannot take one
@@ -4280,10 +4295,7 @@ impl Executor {
         // OPTIMIZATION: Use row_count_hint() which is O(1) instead of row_count() which
         // is O(n) with visibility checks. The hint returns an upper bound (versions.len())
         // which is safe for this decision - if hint > threshold, actual count is also large.
-        let should_disable_streaming_for_cache = cache_eligible && {
-            let table_row_count = table.row_count_hint();
-            table_row_count <= super::semantic_cache::DEFAULT_MAX_CACHED_ROWS
-        };
+        let should_disable_streaming_for_cache = cache_eligible && Self::semantic_rows_fit(&*table);
 
         let can_use_streaming = !classification.has_order_by
             && !classification.has_group_by

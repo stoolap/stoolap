@@ -27,7 +27,7 @@ use crate::storage::mvcc::version_store::{LayoutToken, VersionStore};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
-use super::context::ExecutionContext;
+use super::context::{CteScope, ExecutionContext};
 use super::expression::{ExecuteContext, ExprVM};
 use super::prepared_select::PreparedSelect;
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution, PlanValidity};
@@ -44,6 +44,9 @@ pub struct PlannedSelect {
     schema: CompactArc<Schema>,
     token: LayoutToken,
     pub(crate) validity: PlanValidity,
+    /// The CTEs of the context it was planned in, none of which names its
+    /// table; a context of others may hide the table
+    cte_scope: CteScope,
     /// The table's store, without keeping a dropped table's rows alive
     store: Weak<VersionStore>,
 }
@@ -63,7 +66,10 @@ impl Executor {
         {
             let held = compiled.read().ok()?;
             match &*held {
-                CompiledExecution::Planned(p) if p.validity.holds(&*self.engine, epoch) => {
+                CompiledExecution::Planned(p)
+                    if p.validity.holds(&*self.engine, epoch)
+                        && ctx.is_none_or(|ctx| p.cte_scope.holds(ctx)) =>
+                {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::compiled_epoch_checked();
                     return Some(run(p));
@@ -153,6 +159,7 @@ impl Executor {
             schema,
             token,
             validity,
+            cte_scope: ctx.cte_scope(),
             store: Arc::downgrade(&store),
         });
         if open {
@@ -194,9 +201,10 @@ impl Executor {
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         self.with_planned(stmt, compiled, ctx, |planned| {
-            if let Some(ctx) = ctx.filter(|_| in_txn) {
-                // The normal path arms a timeout and refuses a cancelled statement
-                if ctx.has_timeout() {
+            if let Some(ctx) = ctx {
+                // In a transaction the normal path arms a timeout; every
+                // statement refuses a cancel
+                if in_txn && ctx.has_timeout() {
                     return None;
                 }
                 if let Err(e) = ctx.check_cancelled() {
@@ -206,23 +214,32 @@ impl Executor {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::pk_lookup_resolved();
             let view = ctx.and_then(ExecutionContext::statement_view);
-            self.run_planned(planned, params, in_txn, view)
+            // CURRENT_TRANSACTION_ID() reads the open transaction's id
+            let transaction = match ctx.and_then(ExecutionContext::transaction_id) {
+                Some(id) => Some(id),
+                None if in_txn => self.active_txn_id().map(|id| id as u64),
+                None => None,
+            };
+            self.run_planned(planned, params, (in_txn, transaction), view)
         })
         .flatten()
     }
 
-    /// `planned`'s rows for `params`; None when this execution's key is not
-    /// one its access reads, which the regular path answers
+    /// `planned`'s rows for `params`, in the open transaction `in_txn` says
+    /// and with the transaction id its programs read; None when this
+    /// execution's key is not one its access reads, which the regular path
+    /// answers
     pub(crate) fn run_planned(
         &self,
         planned: &PlannedSelect,
         params: &[Value],
-        in_txn: bool,
+        (in_txn, transaction): (bool, Option<u64>),
         view: Option<&StatementView>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         let Access::PkGet(key) = &planned.plan.access;
         let key = key.integer(params)?;
-        or_normal_path(self.read_planned(planned, key, params, in_txn, view))
+        let read = self.read_planned(planned, key, params, (in_txn, transaction), view);
+        or_normal_path(read)
     }
 
     fn read_planned(
@@ -230,7 +247,7 @@ impl Executor {
         planned: &PlannedSelect,
         key: i64,
         params: &[Value],
-        in_txn: bool,
+        (in_txn, transaction): (bool, Option<u64>),
         view: Option<&StatementView>,
     ) -> Result<Box<dyn QueryResult>> {
         let plan = &planned.plan;
@@ -248,7 +265,7 @@ impl Executor {
         for (id, row) in rows {
             let row = normalize_row_to_schema(row, &planned.schema);
             if let Some(filter) = &plan.filter {
-                let exec = ExecuteContext::new(&row).with_params(params);
+                let exec = ExecuteContext::with_common_params(&row, params, transaction);
                 let vm = vm.get_or_insert_with(ExprVM::new);
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
@@ -272,7 +289,7 @@ impl Executor {
                 out.push((id, Row::from_values(values.collect())));
                 continue;
             }
-            let exec = ExecuteContext::new(&row).with_params(params);
+            let exec = ExecuteContext::with_common_params(&row, params, transaction);
             let mut projected = Row::with_capacity(plan.projection.width());
             let vm = vm.get_or_insert_with(ExprVM::new);
             plan.projection.project_into(vm, &exec, &mut projected)?;
@@ -393,6 +410,42 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::Executor;
+
+    #[test]
+    fn a_cte_naming_the_table_hides_it_from_a_kept_plan() {
+        use crate::core::{Row, RowVec, Value};
+        use crate::executor::context::ExecutionContext;
+        use crate::storage::mvcc::engine::MVCCEngine;
+        use std::sync::Arc;
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let executor = Executor::new(Arc::new(engine));
+        let run = |sql: &str, ctx: &ExecutionContext| {
+            let statement = crate::parser::parse_sql(sql).unwrap().remove(0);
+            executor.execute_statement(&statement, ctx).unwrap()
+        };
+        let plain = ExecutionContext::new();
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY)", &plain);
+        run("INSERT INTO t VALUES (1)", &plain);
+        let statement = crate::parser::parse_sql("SELECT id + 0 FROM t WHERE id = 1")
+            .unwrap()
+            .remove(0);
+        let count = |ctx: &ExecutionContext| {
+            let mut rows = executor.execute_statement(&statement, ctx).unwrap();
+            let mut count = 0;
+            while rows.next() {
+                count += 1;
+            }
+            count
+        };
+        assert_eq!(count(&plain), 1, "the table's row");
+        let mut ctes = crate::executor::cte::CteRegistry::new();
+        let mut rows = RowVec::new();
+        rows.push((0, Row::from_values(vec![Value::Integer(2)])));
+        ctes.store("t", vec!["id".to_string()], rows);
+        let shadowed = ExecutionContext::new().with_cte_data(ctes.data());
+        assert_eq!(count(&shadowed), 0, "the plan read the table the CTE hides");
+    }
 
     #[test]
     fn lossless_float_key_boundaries() {

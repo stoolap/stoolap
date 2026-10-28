@@ -8919,32 +8919,59 @@ impl Builder<'_> {
         work: &mut Rewritten,
         run_slots: &mut Vec<(usize, Expression)>,
     ) -> Result<Expression> {
-        let Expression::Infix(infix) = conjunct else {
-            return self.rewrite(chain, None, conjunct, work);
+        let is_column = |expr: &Expression| -> Result<bool> {
+            Ok(matches!(chain.resolve(expr)?, Some((0, _))))
         };
-        if !is_comparison(infix.op_type) {
-            return self.rewrite(chain, None, conjunct, work);
-        }
-        let column_left = matches!(chain.resolve(&infix.left)?, Some((0, _)));
-        let column_right = matches!(chain.resolve(&infix.right)?, Some((0, _)));
+        let infix = match conjunct {
+            Expression::Infix(infix) if is_comparison(infix.op_type) => infix,
+            // A list's members and a range's bounds are values as a
+            // comparison's is
+            Expression::In(list) if !list.not && is_column(&list.left)? => {
+                let members = match list.right.as_ref() {
+                    Expression::List(l) => &l.elements,
+                    Expression::ExpressionList(l) => &l.expressions,
+                    _ => return self.rewrite(chain, None, conjunct, work),
+                };
+                let mut values = Vec::with_capacity(members.len());
+                for member in members {
+                    values.push(self.conjunct_value(chain, member, work, run_slots)?);
+                }
+                let right = match list.right.as_ref() {
+                    Expression::List(l) => Expression::List(Box::new(ListExpression {
+                        token: l.token.clone(),
+                        elements: values,
+                    })),
+                    _ => Expression::ExpressionList(Box::new(ExpressionList {
+                        token: list.token.clone(),
+                        expressions: values,
+                    })),
+                };
+                return Ok(Expression::In(InExpression {
+                    token: list.token.clone(),
+                    left: Box::new(self.rewrite(chain, None, &list.left, work)?),
+                    right: Box::new(right),
+                    not: false,
+                }));
+            }
+            Expression::Between(between) if is_column(&between.expr)? => {
+                return Ok(Expression::Between(BetweenExpression {
+                    token: between.token.clone(),
+                    expr: Box::new(self.rewrite(chain, None, &between.expr, work)?),
+                    lower: Box::new(self.conjunct_value(chain, &between.lower, work, run_slots)?),
+                    upper: Box::new(self.conjunct_value(chain, &between.upper, work, run_slots)?),
+                    not: between.not,
+                }));
+            }
+            _ => return self.rewrite(chain, None, conjunct, work),
+        };
+        let column_left = is_column(&infix.left)?;
+        let column_right = is_column(&infix.right)?;
         let value = match (column_left, column_right) {
             (true, false) => &infix.right,
             (false, true) => &infix.left,
             _ => return self.rewrite(chain, None, conjunct, work),
         };
-        let mut value_work = Rewritten::default();
-        let rewritten_value = self.rewrite(chain, None, value, &mut value_work)?;
-        let value = if !value_work.reads_row
-            && !is_leaf(value)
-            && !volatile(value, &self.executor.function_registry)
-        {
-            let slot = self.slot();
-            run_slots.push((slot, rewritten_value));
-            slot_parameter(slot)
-        } else {
-            work.reads_row |= value_work.reads_row;
-            rewritten_value
-        };
+        let value = self.conjunct_value(chain, value, work, run_slots)?;
         let column = if column_left {
             &infix.left
         } else {
@@ -8963,6 +8990,30 @@ impl Builder<'_> {
             op_type: infix.op_type,
             right: Box::new(right),
         }))
+    }
+
+    /// A value a conjunct tests its column against, rewritten: one that
+    /// reads no row, is more than a literal and is not volatile is a run
+    /// slot, computed once per run so the scan can take it
+    fn conjunct_value(
+        &mut self,
+        chain: &Chain<'_>,
+        value: &Expression,
+        work: &mut Rewritten,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<Expression> {
+        let mut value_work = Rewritten::default();
+        let rewritten = self.rewrite(chain, None, value, &mut value_work)?;
+        if !value_work.reads_row
+            && !is_leaf(value)
+            && !volatile(value, &self.executor.function_registry)
+        {
+            let slot = self.slot();
+            run_slots.push((slot, rewritten));
+            return Ok(slot_parameter(slot));
+        }
+        work.reads_row |= value_work.reads_row;
+        Ok(rewritten)
     }
 }
 
@@ -9069,7 +9120,7 @@ impl Executor {
     /// `name` as this statement reads it: through `through`, the statement's
     /// own transaction, else the explicit transaction, else the statement's
     /// snapshot, each at the statement's view
-    fn prepared_table(
+    pub(crate) fn prepared_table(
         &self,
         name: &str,
         ctx: &ExecutionContext,
