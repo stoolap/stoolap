@@ -354,24 +354,22 @@ impl<'a> ExecuteContext<'a> {
     /// whose value failed to compute, is an error
     #[inline]
     pub fn param_ref(&self, index: usize) -> Result<&'a Value> {
-        let value = self
-            .params
-            .get(index)
-            .ok_or_else(|| missing_parameter(index, self.params.len()))?;
-        if value.is_null() && !self.failed.is_empty() {
-            return failed_slot(self.failed, index).map_or(Ok(value), Err);
+        match self.params.get(index) {
+            Some(value) if self.failed.is_empty() => Ok(value),
+            Some(value) => read_failed(self.failed, index, value),
+            None => Err(missing_parameter(index, self.params.len())),
         }
-        Ok(value)
     }
 }
 
-/// The error slot `index` failed with, if it failed
+/// `value`, slot `index`'s, or the error the slot failed with
 #[cold]
-fn failed_slot(failed: &[(usize, Error)], index: usize) -> Option<Error> {
-    failed
-        .iter()
-        .find(|(slot, _)| *slot == index)
-        .map(|(_, e)| e.clone())
+#[inline(never)]
+fn read_failed<'a>(failed: &[(usize, Error)], index: usize, value: &'a Value) -> Result<&'a Value> {
+    match failed.iter().find(|(slot, _)| *slot == index) {
+        Some((_, e)) => Err(e.clone()),
+        None => Ok(value),
+    }
 }
 
 #[cold]
