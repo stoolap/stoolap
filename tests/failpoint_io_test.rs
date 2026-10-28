@@ -576,47 +576,76 @@ fn test_snapshot_sync_fail_during_finalize() {
 // Snapshot Rename Failpoint Tests
 // ============================================================================
 
+/// The backup snapshot files under `dir`, temp files included
+fn snapshot_files(dir: &std::path::Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(dir.join("snapshots"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .flat_map(|table| {
+            std::fs::read_dir(table.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .map(|file| file.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("snapshot-"))
+        .collect();
+    files.sort();
+    files
+}
+
 #[test]
-fn test_snapshot_rename_fail_atomicity() {
+fn a_failed_snapshot_rename_takes_back_the_files_renamed_before_it() {
     let _guard = failpoint_guard();
     let dir = tempdir().unwrap();
     let path = format!("file://{}", dir.path().display());
 
     {
         let db = Database::open(&path).expect("Failed to open database");
-        db.execute(
-            "CREATE TABLE fp_rename (id INTEGER PRIMARY KEY, val INTEGER)",
-            (),
-        )
-        .expect("CREATE should succeed");
-
-        for i in 0..10 {
+        for table in ["fp_rename_a", "fp_rename_b"] {
             db.execute(
-                &format!("INSERT INTO fp_rename VALUES ({}, {})", i, i * 100),
+                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, val INTEGER)"),
                 (),
             )
-            .expect("INSERT should succeed");
+            .unwrap();
+            db.execute(
+                &format!(
+                    "INSERT INTO {table} SELECT g.value, g.value * 100 FROM generate_series(0, 9) g"
+                ),
+                (),
+            )
+            .unwrap();
         }
 
-        // Arm rename failpoint
-        test_failpoints::SNAPSHOT_RENAME_FAIL.store(true, Ordering::Release);
-        let _ = db.execute("VACUUM", ());
-        test_failpoints::SNAPSHOT_RENAME_FAIL.store(false, Ordering::Release);
+        // The first table's file is renamed into place, the second's fails
+        test_failpoints::SNAPSHOT_RENAMES_BEFORE_FAIL.store(2, Ordering::Release);
+        assert!(
+            db.execute("PRAGMA SNAPSHOT", ()).is_err(),
+            "the snapshot reports its failed rename"
+        );
+        assert_eq!(
+            snapshot_files(dir.path()),
+            Vec::<String>::new(),
+            "no file of the failed snapshot stays, renamed or temp"
+        );
 
-        // Data should still be correct
         let sum: f64 = db
-            .query_one("SELECT SUM(val) FROM fp_rename", ())
-            .expect("SUM should work");
+            .query_one("SELECT SUM(val) FROM fp_rename_a", ())
+            .unwrap();
         assert_eq!(sum, 4500.0);
+        db.execute("PRAGMA SNAPSHOT", ())
+            .expect("a snapshot after the failed one succeeds");
+        assert_eq!(snapshot_files(dir.path()).len(), 2, "one file per table");
     }
 
-    // Reopen and verify
-    {
-        let db = Database::open(&path).expect("Recovery should succeed");
+    let db = Database::open(&path).expect("Recovery should succeed");
+    for table in ["fp_rename_a", "fp_rename_b"] {
         let count: i64 = db
-            .query_one("SELECT COUNT(*) FROM fp_rename", ())
-            .expect("COUNT should work");
-        assert_eq!(count, 10, "All rows should survive failed snapshot rename");
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .unwrap();
+        assert_eq!(count, 10, "{table} keeps its rows");
     }
 }
 
@@ -757,7 +786,6 @@ fn test_failpoint_does_not_corrupt_existing_data() {
             &test_failpoints::WAL_SYNC_FAIL,
             &test_failpoints::SNAPSHOT_WRITE_FAIL,
             &test_failpoints::SNAPSHOT_SYNC_FAIL,
-            &test_failpoints::SNAPSHOT_RENAME_FAIL,
             &test_failpoints::CHECKPOINT_WRITE_FAIL,
         ];
 

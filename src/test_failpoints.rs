@@ -41,8 +41,10 @@ pub static SNAPSHOT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail snapshot `finalize()` sync with an I/O error
 pub static SNAPSHOT_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
-/// Fail atomic rename in `create_snapshot()` phase
-pub static SNAPSHOT_RENAME_FAIL: AtomicBool = AtomicBool::new(false);
+/// The n-th file a backup snapshot renames into place fails to rename;
+/// zero leaves the renames alone
+pub static SNAPSHOT_RENAMES_BEFORE_FAIL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Fail checkpoint metadata write
 pub static CHECKPOINT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
@@ -58,12 +60,21 @@ pub static MANIFEST_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 pub static RETYPE_READS_BEFORE_FAIL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+pub(crate) fn retype_read_fails() -> bool {
+    counted_down(&RETYPE_READS_BEFORE_FAIL)
+}
+
+pub(crate) fn snapshot_rename_fails() -> bool {
+    counted_down(&SNAPSHOT_RENAMES_BEFORE_FAIL)
+}
+
+/// Whether this call is the one `counter` counts down to, zero for none
 // fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
 #[allow(deprecated)]
-pub(crate) fn retype_read_fails() -> bool {
+fn counted_down(counter: &std::sync::atomic::AtomicUsize) -> bool {
     use std::sync::atomic::Ordering::AcqRel;
     let mut fails = false;
-    let _ = RETYPE_READS_BEFORE_FAIL.fetch_update(
+    let _ = counter.fetch_update(
         AcqRel,
         std::sync::atomic::Ordering::Acquire,
         |left| match left {
@@ -2186,8 +2197,8 @@ thread_local! {
     static PK_LOOKUP_RESOLVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
-/// Run once on this thread when its next uncached PK lookup has resolved
-/// positions from the schema and has not yet read the row
+/// Run once on this thread when its next planned key read has passed its
+/// checks and has not yet read the row
 pub fn after_pk_lookup_resolved(hook: impl FnOnce() + 'static) {
     PK_LOOKUP_RESOLVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -2258,8 +2269,8 @@ thread_local! {
     static COMPILED_EPOCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
-/// Run once on this thread when its next compiled PK statement has passed
-/// its schema epoch check and has not yet opened its table
+/// Run once on this thread when its next held plan or compiled PK update or
+/// delete has passed its validity check and has not yet opened its table
 pub fn after_compiled_epoch_checked(hook: impl FnOnce() + 'static) {
     COMPILED_EPOCH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -3269,7 +3280,7 @@ pub fn reset_all() {
     WAL_SCAN_READ_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
     SNAPSHOT_SYNC_FAIL.store(false, Release);
-    SNAPSHOT_RENAME_FAIL.store(false, Release);
+    SNAPSHOT_RENAMES_BEFORE_FAIL.store(0, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     RETIRED_WAL_SYNC_FAIL.store(false, Release);
     MANIFEST_WRITE_FAIL.store(false, Release);

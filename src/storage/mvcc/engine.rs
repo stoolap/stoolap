@@ -440,6 +440,18 @@ fn read_snapshot_metadata(path: &std::path::Path) -> u64 {
     u64::from_le_bytes(data[8..16].try_into().unwrap())
 }
 
+/// Rename a backup snapshot's written temp file into place
+fn rename_snapshot(
+    temp_path: &std::path::Path,
+    final_path: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-failpoints"))]
+    if crate::test_failpoints::snapshot_rename_fails() {
+        return Err(std::io::Error::other("failpoint: snapshot rename"));
+    }
+    std::fs::rename(temp_path, final_path)
+}
+
 /// Write binary snapshot metadata (atomic via temp file + rename)
 fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     use std::io::Write;
@@ -5162,7 +5174,7 @@ impl MVCCEngine {
             let mut dirs_to_sync: FxHashSet<std::path::PathBuf> = FxHashSet::default();
 
             for (temp_path, final_path, table_name) in &pending_snapshots {
-                if let Err(e) = std::fs::rename(temp_path, final_path) {
+                if let Err(e) = rename_snapshot(temp_path, final_path) {
                     eprintln!(
                         "Warning: Failed to rename snapshot for {}: {}",
                         table_name, e
