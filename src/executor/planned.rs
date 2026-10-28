@@ -81,9 +81,15 @@ impl Executor {
                 {
                     return None
                 }
+                // The runner reads a statement prepared for the tables as they are
+                CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
+                    return None
+                }
+                // One prepared for tables since changed is planned again
                 CompiledExecution::Unknown
                 | CompiledExecution::Planned(_)
-                | CompiledExecution::NotOptimizable(_) => {}
+                | CompiledExecution::NotOptimizable(_)
+                | CompiledExecution::PreparedSelect(_) => {}
                 _ => return None,
             }
         }
@@ -147,6 +153,7 @@ impl Executor {
             CompiledExecution::Unknown
                 | CompiledExecution::Planned(_)
                 | CompiledExecution::NotOptimizable(_)
+                | CompiledExecution::PreparedSelect(_)
         );
         let (Some(plan), Some(prepared)) = (plan, prepared.clone()) else {
             if open {

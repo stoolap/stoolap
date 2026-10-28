@@ -3183,7 +3183,7 @@ type OrderKeys = Vec<(Option<usize>, bool, Option<bool>)>;
 /// One statement shape compiled against its tables' columns
 #[derive(Debug)]
 pub struct PreparedSelect {
-    validity: PlanValidity,
+    pub(crate) validity: PlanValidity,
     /// The CTEs its context bound
     cte_scope: CteScope,
     /// The columns of the statement's table or derived table at preparation

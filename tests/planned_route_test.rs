@@ -46,3 +46,37 @@ fn a_declined_key_read_runs_on_the_runner() {
         "a key the read declines is the runner's, not the general path's"
     );
 }
+
+#[test]
+fn a_statement_planned_before_a_table_change_is_planned_again() {
+    let db = Database::open("memory://planned_route_stale").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE INDEX t_a ON t(a)",
+        "INSERT INTO t VALUES (1, 3), (2, 2), (3, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let statement = db.prepare("SELECT id FROM t ORDER BY a LIMIT 2").unwrap();
+    let run = || {
+        let ran = Rc::new(Cell::new(false));
+        let seen = Rc::clone(&ran);
+        after_prepared_plan_taken(move || seen.set(true));
+        let ids: Vec<i64> = statement
+            .query(())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        (ids, ran.get())
+    };
+    assert_eq!(run(), (vec![3, 2], true), "before the change");
+    for change in [
+        "ALTER TABLE t ADD COLUMN c INTEGER",
+        "CREATE INDEX t_c ON t(c)",
+    ] {
+        db.execute(change, ()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(run(), (vec![3, 2], true), "after {change}");
+        }
+    }
+}
