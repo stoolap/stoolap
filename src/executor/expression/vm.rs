@@ -1945,45 +1945,8 @@ impl ExprVM {
     pub fn execute_bool(&mut self, program: &Program, ctx: &ExecuteContext) -> bool {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::program_ran(program);
-        let ops = program.ops();
-
-        // Fast path: Single comparison + Return (most common filter)
-        // Pattern: [GtColumnConst(idx, val), Return]
-        if ops.len() == 2 {
-            if let Op::Return = &ops[1] {
-                if Self::is_single_op_predicate(&ops[0]) {
-                    return Self::eval_single_op_bool(&ops[0], ctx);
-                }
-            }
-        }
-
-        // Fast path: Two comparisons with AND (range filter)
-        // Pattern: [Compare1, And(_), Compare2, AndFinalize, Return]
-        if ops.len() == 5
-            && Self::is_single_op_predicate(&ops[0])
-            && Self::is_single_op_predicate(&ops[2])
-        {
-            if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
-                let a = Self::eval_single_op_tribool(&ops[0], ctx);
-                // Short-circuit: if first is false, result is false
-                if a == Some(false) {
-                    return false;
-                }
-                let b = Self::eval_single_op_tribool(&ops[2], ctx);
-                // AND logic: true && true = true, anything else = false (for boolean result)
-                return a == Some(true) && b == Some(true);
-            }
-            // Pattern: [Compare1, Or(_), Compare2, OrFinalize, Return]
-            if let (Op::Or(_), Op::OrFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
-                let a = Self::eval_single_op_tribool(&ops[0], ctx);
-                // Short-circuit: if first is true, result is true
-                if a == Some(true) {
-                    return true;
-                }
-                let b = Self::eval_single_op_tribool(&ops[2], ctx);
-                // OR logic: true || anything = true, false || true = true
-                return a == Some(true) || b == Some(true);
-            }
+        if program.is_predicate_chain() {
+            return Self::chain(program.ops(), ctx) == Some(true);
         }
 
         // General path: full VM execution
@@ -2029,38 +1992,8 @@ impl ExprVM {
     ) -> crate::core::Result<bool> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::program_ran(program);
-        let ops = program.ops();
-
-        // Fast path: Single comparison + Return (most common filter)
-        if ops.len() == 2 {
-            if let Op::Return = &ops[1] {
-                if Self::is_single_op_predicate(&ops[0]) {
-                    return Ok(Self::eval_single_op_bool(&ops[0], ctx));
-                }
-            }
-        }
-
-        // Fast path: Two comparisons with AND/OR
-        if ops.len() == 5
-            && Self::is_single_op_predicate(&ops[0])
-            && Self::is_single_op_predicate(&ops[2])
-        {
-            if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
-                let a = Self::eval_single_op_tribool(&ops[0], ctx);
-                if a == Some(false) {
-                    return Ok(false);
-                }
-                let b = Self::eval_single_op_tribool(&ops[2], ctx);
-                return Ok(a == Some(true) && b == Some(true));
-            }
-            if let (Op::Or(_), Op::OrFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
-                let a = Self::eval_single_op_tribool(&ops[0], ctx);
-                if a == Some(true) {
-                    return Ok(true);
-                }
-                let b = Self::eval_single_op_tribool(&ops[2], ctx);
-                return Ok(a == Some(true) || b == Some(true));
-            }
+        if program.is_predicate_chain() {
+            return Ok(Self::chain(program.ops(), ctx) == Some(true));
         }
 
         // General path: full VM execution
@@ -2076,11 +2009,9 @@ impl ExprVM {
         }
     }
 
-    /// The ops the two single-op paths below answer for themselves. They
-    /// report a NULL as false, which is what a filter wants, so an op they
-    /// do not know has to go to the full VM rather than be read the same
-    /// way: a bare column load is a value to be read as a condition, not a
-    /// comparison that came out unknown.
+    /// The ops `eval_single_op_tribool` answers as the full VM does. A bare
+    /// column load, or a constant that is not a truth value, is a value to be
+    /// read as a condition, so it goes to the full VM.
     #[inline]
     fn is_single_op_predicate(op: &Op) -> bool {
         matches!(
@@ -2096,136 +2027,51 @@ impl ExprVM {
                 | Op::BetweenColumnConst(..)
                 | Op::InSetColumn(..)
                 | Op::LikeColumn(..)
-                | Op::LoadConst(..)
+                | Op::LoadConst(Value::Boolean(_) | Value::Integer(_) | Value::Null(_))
         )
     }
 
-    /// Evaluate a single comparison op and return bool (for fast path)
+    /// Whether `ops` are single-op predicates joined left to right by AND
+    /// and OR, each connector jumping just past its finalize
+    pub(super) fn is_predicate_chain(ops: &[Op]) -> bool {
+        let [first, steps @ .., Op::Return] = ops else {
+            return false;
+        };
+        let (steps, rest) = steps.as_chunks::<3>();
+        Self::is_single_op_predicate(first)
+            && rest.is_empty()
+            && steps.iter().enumerate().all(|(k, step)| {
+                matches!(step,
+                    [Op::And(to), p, Op::AndFinalize] | [Op::Or(to), p, Op::OrFinalize]
+                        if usize::from(*to) == 3 * k + 4 && Self::is_single_op_predicate(p))
+            })
+    }
+
+    /// A predicate chain's value as a truth value, None for UNKNOWN; a term
+    /// the value so far settles is not evaluated
     #[inline]
-    fn eval_single_op_bool(op: &Op, ctx: &ExecuteContext) -> bool {
-        match op {
-            Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Integer(v)) => *v > *threshold,
-                Some(Value::Float(v)) => crate::core::value::i64_lt_f64(*threshold, *v),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Float(v)) => f64_gt(*v, *threshold),
-                Some(Value::Integer(v)) => crate::core::value::i64_gt_f64(*v, *threshold),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Integer(v)) => *v < *threshold,
-                Some(Value::Float(v)) => crate::core::value::i64_gt_f64(*threshold, *v),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Float(v)) => f64_lt(*v, *threshold),
-                Some(Value::Integer(v)) => crate::core::value::i64_lt_f64(*v, *threshold),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Integer(v)) => *v >= *threshold,
-                Some(Value::Float(v)) => crate::core::value::i64_le_f64(*threshold, *v),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Float(v)) => f64_ge(*v, *threshold),
-                Some(Value::Integer(v)) => crate::core::value::i64_ge_f64(*v, *threshold),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Integer(v)) => *v <= *threshold,
-                Some(Value::Float(v)) => crate::core::value::i64_ge_f64(*threshold, *v),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Float(v)) => f64_le(*v, *threshold),
-                Some(Value::Integer(v)) => crate::core::value::i64_le_f64(*v, *threshold),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Integer(v)) => *v == *val,
-                Some(Value::Float(v)) => crate::core::value::i64_eq_f64(*val, *v),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Float(v)) => f64_eq(*v, *val),
-                Some(Value::Integer(v)) => crate::core::value::i64_eq_f64(*v, *val),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Integer(v)) => *v != *val,
-                Some(Value::Float(v)) => crate::core::value::i64_ne_f64(*val, *v),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
-                Some(Value::Float(v)) => f64_ne(*v, *val),
-                Some(Value::Integer(v)) => crate::core::value::i64_ne_f64(*v, *val),
-                cell => Self::fused_cell(op, cell) == Some(true),
-            },
-            Op::IsNullColumn(idx) => ctx.row.get(*idx as usize).is_some_and(|v| v.is_null()),
-            Op::IsNotNullColumn(idx) => ctx.row.get(*idx as usize).is_some_and(|v| !v.is_null()),
-            Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Integer(hi)) => {
-                match ctx.row.get(*idx as usize) {
-                    Some(Value::Integer(v)) => *v >= *lo && *v <= *hi,
-                    Some(Value::Float(v)) => {
-                        crate::core::value::i64_le_f64(*lo, *v)
-                            && crate::core::value::i64_ge_f64(*hi, *v)
-                    }
-                    cell => Self::fused_cell(op, cell) == Some(true),
-                }
-            }
-            Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
-                match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => f64_ge(*v, *lo) && f64_le(*v, *hi),
-                    Some(Value::Integer(v)) => {
-                        crate::core::value::i64_ge_f64(*v, *lo)
-                            && crate::core::value::i64_le_f64(*v, *hi)
-                    }
-                    cell => Self::fused_cell(op, cell) == Some(true),
-                }
-            }
-            Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
-                match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => {
-                        crate::core::value::i64_le_f64(*lo, *v) && f64_le(*v, *hi)
-                    }
-                    Some(Value::Integer(v)) => *v >= *lo && crate::core::value::i64_le_f64(*v, *hi),
-                    cell => Self::fused_cell(op, cell) == Some(true),
-                }
-            }
-            Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
-                match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => {
-                        f64_ge(*v, *lo) && crate::core::value::i64_ge_f64(*hi, *v)
-                    }
-                    Some(Value::Integer(v)) => crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi,
-                    cell => Self::fused_cell(op, cell) == Some(true),
-                }
-            }
-            Op::BetweenColumnConst(idx, _, _) => {
-                Self::fused_cell(op, ctx.row.get(*idx as usize)) == Some(true)
-            }
-            Op::InSetColumn(idx, set) => ctx
-                .row
-                .get(*idx as usize)
-                .is_some_and(|v| set.contains(v) == Some(true)),
-            // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
-            // A NULL is UNKNOWN, which is not true
-            Op::LikeColumn(idx, pattern) => ctx
-                .row
-                .get(*idx as usize)
-                .and_then(|value| pattern.matches_value(value))
-                .unwrap_or(false),
-            // For other ops, fall back to tribool and convert
-            _ => Self::eval_single_op_tribool(op, ctx) == Some(true),
+    fn chain(ops: &[Op], ctx: &ExecuteContext) -> Option<bool> {
+        let (first, steps) = ops.split_first()?;
+        let mut acc = Self::eval_single_op_tribool(first, ctx);
+        for [connector, predicate, _] in steps.as_chunks::<3>().0 {
+            acc = match (connector, acc) {
+                (Op::And(_), Some(false)) | (Op::Or(_), Some(true)) => acc,
+                (Op::And(_), _) => match Self::eval_single_op_tribool(predicate, ctx) {
+                    Some(true) => acc,
+                    other => other,
+                },
+                _ => match Self::eval_single_op_tribool(predicate, ctx) {
+                    Some(false) => acc,
+                    other => other,
+                },
+            };
         }
+        acc
     }
 
     /// Evaluate a single comparison op and return Option<bool> (tribool)
     /// None = NULL, Some(true) = true, Some(false) = false
-    #[inline]
+    #[inline(always)]
     fn eval_single_op_tribool(op: &Op, ctx: &ExecuteContext) -> Option<bool> {
         match op {
             Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {

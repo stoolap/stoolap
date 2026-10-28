@@ -395,6 +395,81 @@ fn test_execute_bool() {
     assert!(!vm.execute_bool(&program, &ctx));
 }
 
+#[test]
+fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
+    let columns: Vec<String> = ["i", "f", "t", "n", "b"].map(String::from).to_vec();
+    let rows = [
+        Row::from_values(vec![
+            Value::Integer(1),
+            Value::Float(2.5),
+            Value::text("abc"),
+            Value::null_unknown(),
+            Value::Boolean(true),
+        ]),
+        Row::from_values(vec![
+            Value::Integer(7),
+            Value::Float(-1.0),
+            Value::text("zz"),
+            Value::null_unknown(),
+            Value::Boolean(false),
+        ]),
+        Row::from_values(vec![Value::null_unknown(); 5]),
+    ];
+    let terms = [
+        "i > 1",
+        "i <= 1",
+        "f >= 2.5",
+        "f < 0",
+        "n = 1",
+        "t = 'abc'",
+        "t > 'b'",
+        "i BETWEEN 0 AND 5",
+        "i IN (1, 2)",
+        "t LIKE 'a%'",
+        "n IS NULL",
+        "i IS NOT NULL",
+        "b = true",
+        "TRUE",
+        "NULL",
+        "0",
+        "'abc'",
+        "1.5",
+    ];
+    let mut vm = ExprVM::new();
+    let mut chains = 0;
+    for len in 1..=3u32 {
+        let combos = terms.len().pow(len) << (len - 1);
+        for mut code in 0..combos {
+            let mut predicate = String::new();
+            for at in 0..len {
+                if at > 0 {
+                    predicate.push_str(if code % 2 == 0 { " AND " } else { " OR " });
+                    code /= 2;
+                }
+                predicate.push_str(terms[code % terms.len()]);
+                code /= terms.len();
+            }
+            let program = super::compile_expression(&where_of(&predicate), &columns).unwrap();
+            chains += usize::from(program.is_predicate_chain());
+            for (r, row) in rows.iter().enumerate() {
+                let ctx = ExecuteContext::new(row);
+                let expected = ExprVM::passes(&vm.execute(&program, &ctx).unwrap());
+                assert_eq!(
+                    vm.execute_bool(&program, &ctx),
+                    expected,
+                    "{predicate} on row {r}"
+                );
+                assert_eq!(
+                    vm.execute_bool_checked(&program, &ctx).unwrap(),
+                    expected,
+                    "{predicate} on row {r}, checked"
+                );
+            }
+        }
+    }
+    assert!(chains > 0, "no program ran as a chain");
+}
+
 // ============================================================================
 // Compiler Tests
 // ============================================================================
