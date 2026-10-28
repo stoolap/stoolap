@@ -6033,7 +6033,7 @@ impl Executor {
         } else {
             self.get_semijoin_reduction_limit(
                 &join_type,
-                stmt,
+                (stmt, Some(ctx)),
                 left_alias.as_deref(),
                 left_table,
                 &join_source.condition,
@@ -13644,14 +13644,17 @@ impl Executor {
     /// LIMIT and OFFSET of a GROUP BY + LIMIT join as (initial left chunk, rows
     /// expected after OFFSET). The first chunk is doubled for an INNER JOIN,
     /// where a left row without a match forms no group, and doubled again
-    /// under HAVING, which drops groups after the fact
+    /// under HAVING, which drops groups after the fact. The counts are read
+    /// with `ctx`'s parameters; without `ctx` only a written count is read
     fn semijoin_caps(
         stmt: &SelectStatement,
         is_inner: bool,
+        ctx: Option<&ExecutionContext>,
     ) -> Option<(usize, usize, usize, usize)> {
-        // The plan is made without the statement's parameters: a count that
-        // is not a literal keeps the reduction off
-        let counts = static_row_counts(stmt)?;
+        let counts = match ctx {
+            Some(ctx) => row_counts(stmt, ctx).ok()?,
+            None => static_row_counts(stmt)?,
+        };
         let (limit, offset) = (counts.limit.filter(|limit| *limit > 0)?, counts.offset);
         let want = limit.saturating_add(offset);
         let mut cap = want;
@@ -13675,11 +13678,12 @@ impl Executor {
     ///
     /// The first left chunk is the limit, doubled for an INNER JOIN since some
     /// left rows may not have matches and doubled again under HAVING; the join
-    /// reruns with twice the chunk when the result stops short.
+    /// reruns with twice the chunk when the result stops short. `ctx` gives
+    /// the statement's parameters when it runs; EXPLAIN gives none.
     fn get_semijoin_reduction_limit(
         &self,
         join_type: &str,
-        stmt: &SelectStatement,
+        (stmt, ctx): (&SelectStatement, Option<&ExecutionContext>),
         left_alias: Option<&str>,
         left_table: Option<&str>,
         join_condition: &Option<Box<Expression>>,
@@ -13711,7 +13715,7 @@ impl Executor {
         if classification.has_window_functions || stmt.distinct || !stmt.distinct_on.is_empty() {
             return None;
         }
-        let (cap, want, offset, limit) = Self::semijoin_caps(stmt, is_inner)?;
+        let (cap, want, offset, limit) = Self::semijoin_caps(stmt, is_inner, ctx)?;
         // Each group must come from one left row, or a partial chunk would
         // give partial aggregates: GROUP BY has to cover the left primary key
         let left_alias = left_alias?;
@@ -13961,7 +13965,7 @@ impl Executor {
         if self
             .get_semijoin_reduction_limit(
                 &join_type,
-                stmt,
+                (stmt, None),
                 get_table_alias_from_expr(&join.left).as_deref(),
                 left_table,
                 &join.condition,

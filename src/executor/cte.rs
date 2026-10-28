@@ -269,8 +269,8 @@ impl Executor {
     }
 
     /// Run the CTEs of a WITH clause in order and store each result, so
-    /// the statement that follows, a SELECT or a DML, can read them; a body
-    /// not cut by a LIMIT runs under its own plan in `plans`, when it holds one
+    /// the statement that follows, a SELECT or a DML, can read them; each
+    /// body runs under its own plan in `plans`, when it holds one
     pub(crate) fn materialize_ctes(
         &self,
         with_clause: &WithClause,
@@ -308,7 +308,7 @@ impl Executor {
                 )?
             } else if let Some(hint) = pushdown_hint {
                 // Execute CTE with pushed-down LIMIT and optional ORDER BY
-                self.execute_cte_query_with_hint(&cte.query, ctx, &mut cte_registry, hint)?
+                self.execute_cte_query_with_hint(&cte.query, plan, ctx, &mut cte_registry, hint)?
             } else {
                 self.execute_cte_query(&cte.query, plan, ctx, &mut cte_registry)?
             };
@@ -1786,10 +1786,12 @@ impl Executor {
         result
     }
 
-    /// Execute a CTE query with pushed-down LIMIT and optional ORDER BY.
+    /// Execute a CTE query with pushed-down LIMIT and optional ORDER BY,
+    /// under `plan` when it holds one and the query runs blocks with it
     fn execute_cte_query_with_hint(
         &self,
         stmt: &SelectStatement,
+        plan: Option<&NestedPlan>,
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
         hint: &CtePushdownHint,
@@ -1803,20 +1805,44 @@ impl Executor {
             modified_stmt.order_by = hint.order_by.clone();
         }
 
-        // Push LIMIT if CTE doesn't already have one
+        // Push LIMIT if CTE doesn't already have one: under a plan as a
+        // parameter past the statement's own, so every cut runs one shape
+        let plan = plan.filter(|_| Self::body_runs_blocks(stmt));
+        let mut cut_ctx = None;
         if modified_stmt.limit.is_none() {
-            modified_stmt.limit = Some(Box::new(Expression::IntegerLiteral(IntegerLiteral {
-                token: Token::new(
-                    TokenType::Integer,
-                    hint.limit.to_string(),
-                    Position::new(0, 0, 0),
-                ),
-                value: hint.limit as i64,
-            })));
+            let limit = match plan {
+                Some(_) => {
+                    let cut = cut_ctx.insert(ctx.clone());
+                    cut.add_param(Value::Integer(hint.limit as i64));
+                    super::dml::answer_parameter(cut.params().len())
+                }
+                None => Expression::IntegerLiteral(IntegerLiteral {
+                    token: Token::new(
+                        TokenType::Integer,
+                        hint.limit.to_string(),
+                        Position::new(0, 0, 0),
+                    ),
+                    value: hint.limit as i64,
+                }),
+            };
+            modified_stmt.limit = Some(Box::new(limit));
         }
 
         // Execute with the pushed optimizations
-        self.execute_cte_query(&modified_stmt, None, ctx, cte_registry)
+        let ctx = cut_ctx.as_ref().unwrap_or(ctx);
+        self.execute_cte_query(&modified_stmt, plan, ctx, cte_registry)
+    }
+
+    /// Whether the CTE body `stmt` holds a subquery its plan runs as a block
+    fn body_runs_blocks(stmt: &SelectStatement) -> bool {
+        let classification = get_classification(stmt);
+        classification.where_has_subqueries
+            || classification.output_has_subqueries
+            || classification.grouped_has_subqueries
+            || matches!(
+                stmt.table_expr.as_deref(),
+                Some(Expression::JoinSource(join)) if Self::ons_hold_subqueries(join)
+            )
     }
 }
 

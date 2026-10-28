@@ -77,9 +77,10 @@ impl Drop for StatementRollback<'_> {
     }
 }
 
-/// The parameter reading a VALUES answer from `slot`, one past the slots of
-/// the statement's own values, so no parameter of the statement reads it
-fn answer_parameter(slot: usize) -> Expression {
+/// The parameter reading a value the executor adds from `slot`, one past the
+/// slots of the statement's own values, so no parameter of the statement
+/// reads it: a VALUES answer, a CTE's pushed LIMIT
+pub(crate) fn answer_parameter(slot: usize) -> Expression {
     let spelled = SmartString::from(format!("${slot}"));
     Expression::Parameter(Parameter {
         token: crate::parser::token::Token::new(

@@ -100,6 +100,20 @@ const SHAPES: &[(&str, &str)] = &[
          SELECT u.id, u.x FROM r JOIN u ON u.id = r.id + 1 WHERE u.x > (SELECT MIN(x) FROM u) - 1) \
          SELECT r.id, r.x FROM r WHERE r.id > (SELECT MIN(x) FROM u) - 1",
     ),
+    (
+        "CTE its LIMIT cuts, kept by a LEFT JOIN",
+        "WITH c (a, n) AS (SELECT t.a, COUNT(*) FROM t JOIN u ON u.id = t.id \
+         WHERE t.b > (SELECT MIN(x) FROM u) GROUP BY t.a) \
+         SELECT c.a, u.x FROM c LEFT JOIN u ON u.id = c.a AND u.x < (SELECT MAX(x) FROM u) \
+         ORDER BY c.a LIMIT 2",
+    ),
+    (
+        "CTE its LIMIT cuts and grows under an INNER JOIN",
+        "WITH c (a, n) AS (SELECT t.a, COUNT(*) FROM t JOIN u ON u.id = t.id \
+         WHERE t.b > (SELECT MIN(x) FROM u) GROUP BY t.a) \
+         SELECT c.a, u.x FROM c JOIN u ON u.id = c.a AND u.x >= (SELECT MIN(x) FROM u) \
+         ORDER BY c.a LIMIT 1",
+    ),
 ];
 
 /// Each statement that runs `{j}` as a part, the statement after it
