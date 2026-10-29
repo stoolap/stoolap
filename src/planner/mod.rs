@@ -47,6 +47,10 @@ pub enum Step {
     TopN,
     /// The ORDER BY over every row
     Sort,
+    /// The first row of each DISTINCT ON key, over the sorted rows
+    DistinctOn,
+    /// The first row of each output value
+    Distinct,
     Project,
     /// The WHERE's conjuncts the read did not take
     Filter,
@@ -70,6 +74,12 @@ pub enum Read {
     /// The rows of what the FROM names in place of a table, each judged by
     /// the whole WHERE: its line as EXPLAIN names it
     Source(String),
+    /// The distinct values of the column, lowercase, the table keeps in its
+    /// index or volumes; `otherwise` when it keeps none
+    DistinctValues {
+        column: SmartString,
+        otherwise: Box<Read>,
+    },
 }
 
 impl Read {
@@ -78,6 +88,7 @@ impl Read {
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
             Self::PkGet(key) => key.otherwise.scan(),
+            Self::DistinctValues { otherwise, .. } => otherwise.scan(),
             Self::Source(_) => None,
             Self::Scan(scan)
             | Self::Ordered {
@@ -91,6 +102,15 @@ impl Read {
         match self {
             Self::Ordered { read, .. } => Some(*read),
             Self::PkGet(key) => key.otherwise.ordered(),
+            Self::DistinctValues { otherwise, .. } => otherwise.ordered(),
+            _ => None,
+        }
+    }
+
+    /// The column whose distinct values the plan reads
+    pub fn distinct_values(&self) -> Option<&str> {
+        match self {
+            Self::DistinctValues { column, .. } => Some(column),
             _ => None,
         }
     }
@@ -125,6 +145,8 @@ pub struct PlanText<'a> {
     pub offset: Option<String>,
     /// The ORDER BY keys
     pub keys: Option<String>,
+    /// The DISTINCT ON keys
+    pub distinct_on: Option<String>,
     pub names: &'a [String],
     /// The conjuncts the read takes
     pub pushed: Option<&'a Expression>,
@@ -140,22 +162,28 @@ impl Plan {
     /// The plan as EXPLAIN shows it: each step indented under the one it
     /// feeds, then the read, a run's alternative reads each after `else`
     pub fn explain(&self, text: PlanText<'_>) -> Vec<String> {
-        let mut lines = Vec::new();
-        for step in &self.steps {
-            let Some(line) = step_line(*step, &text) else {
-                continue;
-            };
-            lines.push(format!("{}{line}", "  ".repeat(lines.len())));
-        }
         let mut read = Vec::new();
         if let Some(terms) = &text.empty_unless {
             alternative(&mut read, format!("Empty unless {terms}"));
         }
         read_lines(&self.read, &text, &mut read);
-        let depth = "  ".repeat(lines.len());
-        lines.extend(read.into_iter().map(|line| format!("{depth}{line}")));
-        lines
+        steps_over(&self.steps, &text, read)
     }
+}
+
+/// `steps` as EXPLAIN shows them, each indented under the one it feeds,
+/// over `below`, the lines of what the innermost reads
+pub fn steps_over(steps: &[Step], text: &PlanText<'_>, below: Vec<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for step in steps {
+        let Some(line) = step_line(*step, text) else {
+            continue;
+        };
+        lines.push(format!("{}{line}", "  ".repeat(lines.len())));
+    }
+    let depth = "  ".repeat(lines.len());
+    lines.extend(below.into_iter().map(|line| format!("{depth}{line}")));
+    lines
 }
 
 /// `line` after the reads before it, as the one a run takes when they decline
@@ -178,6 +206,10 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
                 format!("PkGet {} {}", text.table, key.key.describe()),
             );
             read_lines(&key.otherwise, text, lines);
+        }
+        (Read::DistinctValues { column, otherwise }, _) => {
+            alternative(lines, format!("DistinctValues {} ({column})", text.table));
+            read_lines(otherwise, text, lines);
         }
         (
             Read::Ordered {
@@ -231,6 +263,8 @@ fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
         },
         Step::TopN => format!("TopN {}", text.keys.as_deref()?),
         Step::Sort => format!("Sort {}", text.keys.as_deref()?),
+        Step::DistinctOn => format!("DistinctOn {}", text.distinct_on.as_deref()?),
+        Step::Distinct => "Distinct".to_string(),
         Step::Project => format!("Project {}", text.names.join(", ")),
         Step::Filter => "Filter".to_string(),
     })

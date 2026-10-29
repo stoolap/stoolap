@@ -1864,7 +1864,7 @@ impl Executor {
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let mut distinct_applied = false;
-        let (mut result, columns, limit_offset_applied, shape) = if in_family {
+        let executed = if in_family {
             // DISTINCT reads every row before a LIMIT counts them; a set
             // operation's branch takes the bound its whole one allows
             let (limit, offset) = match (stmt.set_operations.is_empty(), stmt.distinct) {
@@ -1913,6 +1913,31 @@ impl Executor {
             let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, branch_classification, compiled)?
         };
+        self.finish_select(
+            (stmt, ctx, &classification, compiled),
+            (executed, prepared_visible, distinct_applied),
+            (limit, offset, set_limit),
+            (written_items, hidden_keys, hidden_windows),
+        )
+    }
+
+    /// `stmt`'s rows from what its executor gave, `executed`, with the
+    /// output columns a prepared statement shows and whether it applied the
+    /// DISTINCT: its DISTINCT, set operations, ORDER BY, DISTINCT ON and
+    /// LIMIT, each unless the executor applied it, and only its own columns
+    fn finish_select(
+        &self,
+        (stmt, ctx, classification, compiled): (
+            &SelectStatement,
+            &ExecutionContext,
+            &QueryClassification,
+            Option<&NestedPlan>,
+        ),
+        (executed, prepared_visible, distinct_applied): (SelectOutput, Option<usize>, bool),
+        (limit, offset, set_limit): (Option<usize>, usize, Option<usize>),
+        (written_items, hidden_keys, hidden_windows): (usize, usize, usize),
+    ) -> Result<Box<dyn QueryResult>> {
+        let (mut result, columns, limit_offset_applied, shape) = executed;
         let SelectShape {
             deferred: deferred_projection,
             layout,
@@ -3310,16 +3335,7 @@ impl Executor {
             return Ok(None);
         }
 
-        // Try to get distinct values from the index
-        let distinct_values = match table.get_partition_values(&column_name)? {
-            Some(values) => Some(values),
-            None => match table.schema().column_index_map().get(&column_name) {
-                Some(&col_idx) => table.compute_distinct_values(col_idx)?,
-                None => None,
-            },
-        };
-
-        if let Some(distinct_values) = distinct_values {
+        if let Some(distinct_values) = Self::distinct_column_values(table, &column_name)? {
             // Build output column name (use alias if present)
             let output_name = match &stmt.columns[0] {
                 Expression::Aliased(aliased) => aliased.alias.value.to_string(),
@@ -3340,6 +3356,25 @@ impl Executor {
         }
 
         Ok(None)
+    }
+
+    /// The distinct values of `column`, lowercase, the table keeps in its
+    /// index or volumes; None when it keeps none
+    pub(crate) fn distinct_column_values(
+        table: &dyn crate::storage::traits::Table,
+        column: &str,
+    ) -> Result<Option<Vec<Value>>> {
+        let values = match table.get_partition_values(column)? {
+            Some(values) => Some(values),
+            None => match table.schema().column_index_map().get(column) {
+                Some(&col_idx) => table.compute_distinct_values(col_idx)?,
+                None => None,
+            },
+        };
+        if values.is_some() {
+            super::result::DistinctPath::Values.taken();
+        }
+        Ok(values)
     }
 
     /// The semantic cache answer to a read committed autocommit `SELECT *`
