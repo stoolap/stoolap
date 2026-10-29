@@ -456,6 +456,7 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
+use super::planned_aggregate::{bounds, AggregateRead};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
@@ -3848,19 +3849,21 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
-            // One row from the source the rule picks
-            if let Some(result) =
-                self.global_aggregate(table.as_ref(), stmt, classification, ctx, blocks)?
-            {
-                let columns = CompactArc::new(result.columns().to_vec());
-                let shape = shape_of(&columns);
-                return Ok((result, columns, false, shape));
-            }
-
-            // The groups from the source the rule picks
-            if let Some(result) =
-                self.grouped_aggregate(table.as_ref(), stmt, classification, ctx, &all_columns)?
-            {
+            // One row or the groups, from the source the rules pick
+            let indexed = |column: &str| bounds(table.get_index_on_column(column));
+            let plan =
+                self.aggregate_read_plan(stmt, classification, ctx, table.schema(), indexed)?;
+            let result = match &plan {
+                Some(plan) if matches!(plan.read, AggregateRead::Global { .. }) => {
+                    let run = (classification.as_ref(), plan);
+                    self.global_aggregate(table.as_ref(), stmt, run, ctx, blocks)?
+                }
+                Some(plan) => {
+                    self.grouped_aggregate(table.as_ref(), stmt, plan, ctx, &all_columns)?
+                }
+                None => None,
+            };
+            if let Some(result) = result {
                 let columns = CompactArc::new(result.columns().to_vec());
                 let shape = shape_of(&columns);
                 return Ok((result, columns, false, shape));
@@ -3892,49 +3895,21 @@ impl Executor {
         // Exclude aliases that shadow real table columns (WHERE references columns, not aliases).
         let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(&all_columns));
 
-        // Substitute column aliases in WHERE clause if any - avoid clone when no substitution needed
-        let resolved_where_clause: Option<Box<Expression>> = if !alias_map.is_empty() {
-            stmt.where_clause
-                .as_ref()
-                .map(|where_expr| Box::new(Self::substitute_aliases(where_expr, &alias_map)))
-        } else {
-            None // Will use stmt.where_clause directly via reference when possible
-        };
-
         // Note: Projection pushdown was found to be SLOWER due to extra allocations
         // We now always fetch all columns and project in the executor
         let _ = needs_all_columns; // Silence unused warning - kept for documentation
 
-        // Try to build a storage expression for WHERE clause pushdown
-        // This enables index usage and avoids full table scans
-        // Use resolved_where_clause if we had alias substitutions, otherwise use original
-        let where_to_use: Option<&Expression> = resolved_where_clause
+        // The WHERE the scan pushes down, which the statement's start may have
+        // simplified already
+        let early = early_miss.filter(|_| alias_map.is_empty() && stmt.where_clause.is_some());
+        let rewritten_where = match early {
+            Some(_) => None,
+            None => Self::scan_where(stmt, &alias_map),
+        };
+        let where_to_use: Option<&Expression> = rewritten_where
             .as_deref()
+            .or_else(|| early.and_then(|miss| miss.simplified.as_deref()))
             .or(stmt.where_clause.as_deref());
-
-        // Apply expression simplification for constant folding and boolean optimization
-        // This can eliminate redundant comparisons (e.g., 1=1 -> true, true AND x -> x)
-        // Uses try_simplify() to avoid cloning expressions that can't be simplified (like EXISTS)
-        let (simplified_where, where_to_use): (Option<Expression>, Option<&Expression>) =
-            if let (Some(miss), Some(where_expr), None) =
-                (early_miss, where_to_use, &resolved_where_clause)
-            {
-                (None, Some(miss.simplified.as_deref().unwrap_or(where_expr)))
-            } else if let Some(where_expr) = where_to_use {
-                let mut simplifier = ExpressionSimplifier::new();
-                // try_simplify returns None if no changes, avoiding unnecessary cloning
-                if let Some(simplified) = simplifier.try_simplify(where_expr) {
-                    (Some(simplified), None) // Will be fixed up below
-                } else {
-                    // No simplification happened, use original (no clone occurred)
-                    (None, Some(where_expr))
-                }
-            } else {
-                (None, None)
-            };
-
-        // If we simplified, borrow from the simplified version
-        let where_to_use: Option<&Expression> = where_to_use.or(simplified_where.as_ref());
 
         // Check if this query might reference outer columns (correlated)
         let has_outer_context = ctx.outer_row().is_some();
@@ -13542,6 +13517,25 @@ impl Executor {
         let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
 
         Ok((projected, output_columns))
+    }
+
+    /// The WHERE a table scan reads `stmt`'s rows by when resolving the
+    /// SELECT aliases of `aliases` it names, then simplifying, changes it;
+    /// None when the scan reads the WHERE as written. Inlined into the table
+    /// scan, it costs that scan's loop more per row
+    #[inline(never)]
+    pub(crate) fn scan_where(
+        stmt: &SelectStatement,
+        aliases: &FxHashMap<String, &Expression>,
+    ) -> Option<Box<Expression>> {
+        let where_clause = stmt.where_clause.as_deref()?;
+        let resolved =
+            (!aliases.is_empty()).then(|| Self::substitute_aliases(where_clause, aliases));
+        let read = resolved.as_ref().unwrap_or(where_clause);
+        ExpressionSimplifier::new()
+            .try_simplify(read)
+            .or(resolved)
+            .map(Box::new)
     }
 
     /// Build a map of column aliases to their underlying expressions from SELECT columns

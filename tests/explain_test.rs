@@ -311,17 +311,20 @@ fn test_explain_limit() {
 fn test_explain_group_by() {
     let db = setup_test_db();
 
-    // Query with GROUP BY should show Group clause
     let lines = get_plan_output(
         &db,
         "EXPLAIN SELECT user_id, COUNT(*) FROM orders GROUP BY user_id",
     );
 
-    let plan = lines.join("\n");
-    assert!(
-        plan.contains("Group By:"),
-        "Expected Group By clause, got:\n{}",
-        plan
+    assert_eq!(
+        lines,
+        [
+            "Aggregate user_id, COUNT(*) by user_id",
+            "  StorageGrouped orders (user_id)",
+            "  else SortedStream orders (user_id)",
+            "  else SeqScan orders",
+        ],
+        "the groups and each read a run may take"
     );
 }
 

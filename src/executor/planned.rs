@@ -173,7 +173,7 @@ impl Executor {
             return Some(self.explain_set_operations(stmt, first, ctx));
         }
         self.explain_over_source(stmt, ctx)
-            .or_else(|| self.explain_global(stmt, ctx))
+            .or_else(|| self.explain_aggregate(stmt, ctx))
     }
 
     /// `stmt`'s plan over `first`, its first branch's: each set operation
@@ -201,7 +201,15 @@ impl Executor {
                 )
                 .collect();
         }
-        let mut steps = SmallVec::<[Step; 2]>::new();
+        let steps = Self::finishing_steps(stmt, &[]);
+        steps_over(&steps, &Self::finishing_text(stmt, ""), lines)
+    }
+
+    /// The steps the statement's own clauses take over its executor's rows,
+    /// outermost first: its LIMIT, its ORDER BY, cut by the LIMIT or whole,
+    /// then `inner`
+    pub(super) fn finishing_steps(stmt: &SelectStatement, inner: &[Step]) -> SmallVec<[Step; 4]> {
+        let mut steps = SmallVec::new();
         if stmt.limit.is_some() || stmt.offset.is_some() {
             steps.push(Step::Limit);
         }
@@ -210,9 +218,15 @@ impl Executor {
             (false, true) => steps.push(Step::TopN),
             (false, false) => steps.push(Step::Sort),
         }
+        steps.extend_from_slice(inner);
+        steps
+    }
+
+    /// What EXPLAIN names [`Self::finishing_steps`] by, over `table`
+    pub(super) fn finishing_text<'a>(stmt: &SelectStatement, table: &'a str) -> PlanText<'a> {
         let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
-        let text = PlanText {
-            table: "",
+        PlanText {
+            table,
             limit: stmt.limit.as_deref().map(Expression::to_string),
             offset: stmt
                 .offset
@@ -221,13 +235,13 @@ impl Executor {
                 .map(Expression::to_string),
             keys: Some(keys.join(", ")),
             distinct_on: None,
+            having: stmt.having.as_deref().map(Expression::to_string),
             names: &[],
             pushed: None,
             ordered: None,
             empty_unless: None,
             body: Vec::new(),
-        };
-        steps_over(&steps, &text, lines)
+        }
     }
 
     /// `stmt` run by the plan `compiled` holds, planned now in `ctx` when it

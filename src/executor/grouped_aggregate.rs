@@ -15,7 +15,7 @@
 //! A statement that groups one table by one column without WHERE: the one
 //! rule that says where its groups come from, and the run of that source
 
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::traits::{QueryResult, Table};
@@ -23,6 +23,7 @@ use crate::storage::traits::{QueryResult, Table};
 use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateFunction};
 use super::context::ExecutionContext;
 use super::expression::ExprVM;
+use super::planned_aggregate::{AggregatePlan, AggregateRead};
 use super::query_classification::QueryClassification;
 use super::row_count::rows_needed;
 use super::Executor;
@@ -105,22 +106,17 @@ impl Executor {
             && (counts || stmt.limit.is_some())
     }
 
-    /// `stmt`'s groups over `table` when it groups the table by one column
-    /// without WHERE, from the source the rule picks; None for the hash
-    /// grouping, which the scan does. Inlined into the table scan, it costs
-    /// that scan's loop more per row
-    #[inline(never)]
-    pub(crate) fn grouped_aggregate(
+    /// The plan of `stmt` when it groups one table of `schema` by one column
+    /// without WHERE and the rule picks a source other than the hash
+    /// grouping, which the scan does
+    pub(super) fn grouped_read_plan(
         &self,
-        table: &dyn Table,
         stmt: &SelectStatement,
         classification: &QueryClassification,
         ctx: &ExecutionContext,
-        all_columns: &[String],
-    ) -> Result<Option<Box<dyn QueryResult>>> {
-        if !classification.has_group_by
-            || classification.has_where
-            || classification.has_window_functions
+        schema: &Schema,
+    ) -> Result<Option<AggregatePlan>> {
+        if classification.has_where
             || stmt.group_by.columns.len() != 1
             || !matches!(stmt.group_by.modifier, GroupByModifier::None)
         {
@@ -129,9 +125,10 @@ impl Executor {
         let Some((group, false)) = self.single_group_column(stmt)? else {
             return Ok(None);
         };
-        let Some(group_index) = all_columns
+        let Some(group_index) = schema
+            .columns
             .iter()
-            .position(|c| c.eq_ignore_ascii_case(&group))
+            .position(|c| c.name.eq_ignore_ascii_case(&group))
         else {
             return Ok(None);
         };
@@ -161,28 +158,58 @@ impl Executor {
         if source == GroupedSource::Hash {
             return Ok(None);
         }
-        let columns = Self::call_columns(&aggregations, all_columns);
+        // A table that declines its own grouping is walked by its index when
+        // the walk may read the groups
+        let walks = source == GroupedSource::SortedStream
+            || Self::sorts_groups(stmt, classification, &aggregations, grouped_names);
+        Ok(Some(AggregatePlan {
+            aggregations,
+            plain,
+            read: AggregateRead::Grouped {
+                source,
+                group: (group, group_index),
+                walks,
+            },
+        }))
+    }
+
+    /// `stmt`'s groups over `table` from the source `plan` holds; None for
+    /// the hash grouping, which the scan does. Inlined into the table scan,
+    /// it costs that scan's loop more per row
+    #[inline(never)]
+    pub(crate) fn grouped_aggregate(
+        &self,
+        table: &dyn Table,
+        stmt: &SelectStatement,
+        plan: &AggregatePlan,
+        ctx: &ExecutionContext,
+        all_columns: &[String],
+    ) -> Result<Option<Box<dyn QueryResult>>> {
+        let AggregateRead::Grouped {
+            source,
+            group: (group, group_index),
+            walks,
+        } = &plan.read
+        else {
+            return Ok(None);
+        };
+        let (aggregations, group_index) = (&plan.aggregations, *group_index);
+        let columns = Self::call_columns(aggregations, all_columns);
         let stored = match source {
             GroupedSource::Storage => {
-                Self::stored_groups(table, group_index, &aggregations, &columns)?
+                Self::stored_groups(table, group_index, aggregations, &columns)?
             }
             GroupedSource::SortedStream | GroupedSource::Hash => None,
         };
-        // A table that declines its own grouping is walked by its index when
-        // the walk may read the groups
-        let sorted = || {
-            source == GroupedSource::SortedStream
-                || Self::sorts_groups(stmt, classification, &aggregations, grouped_names)
-        };
         let rows = match stored {
             Some(rows) => (AggregatePath::StorageGrouped, rows),
-            None if sorted() => {
+            None if *walks => {
                 let group = (group.as_str(), group_index);
                 match self.sorted_groups(
                     table,
                     stmt,
                     group,
-                    &aggregations,
+                    aggregations,
                     &columns,
                     all_columns,
                     ctx,
@@ -200,7 +227,7 @@ impl Executor {
         let slots = AggregateSlots {
             stmt,
             written_stmt: stmt,
-            aggregations: &aggregations,
+            aggregations,
             group_by_count: 1,
             source_columns: all_columns,
             blocks: None,
