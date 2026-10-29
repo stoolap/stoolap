@@ -662,12 +662,6 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
              LIMIT 1 + 0) ORDER BY id",
             vec![2],
         ),
-        // The inner DISTINCT ON reads u.z, the alias, not a column of u
-        (
-            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
-             ORDER BY (SELECT DISTINCT ON (u.z) u.x) DESC LIMIT 1 + 0) ORDER BY id",
-            vec![2],
-        ),
         // The same key one statement deeper, in a block a computed LIMIT sends
         (
             "SELECT id FROM t WHERE a IN (SELECT (SELECT x AS z FROM u \
@@ -700,5 +694,122 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
             .map(|row| row.unwrap().get::<i64>(0).unwrap())
             .collect();
         assert_eq!(ids, want, "{sql}");
+    }
+}
+
+/// The same rows hot in memory and sealed into a volume
+fn alias_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
+    let open = |dsn: &str, dir: tempfile::TempDir, seal: bool| {
+        let db = Database::open(dsn).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+            "CREATE TABLE v (id INTEGER PRIMARY KEY, y INTEGER)",
+            "INSERT INTO t VALUES (1, 1), (2, 2), (3, 7), (4, 0)",
+            "INSERT INTO u VALUES (1, 1), (2, 2), (3, 2), (4, 5)",
+            "INSERT INTO v VALUES (1, 1), (2, 3)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if seal {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        (db, dir)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    [
+        open(
+            &format!("memory://{name}"),
+            tempfile::tempdir().unwrap(),
+            false,
+        ),
+        open(&sealed, dir, true),
+    ]
+}
+
+#[test]
+fn a_block_key_that_chooses_no_row_is_never_computed() {
+    for (db, _dir) in alias_tables("block_order_limit_unchosen_never_computed") {
+        for (sql, want) in [
+            // z * 9223372036854775807 overflows for z = 2
+            (
+                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+                 GROUP BY x ORDER BY z * 9223372036854775807) ORDER BY id",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+                 GROUP BY ROLLUP (x) ORDER BY z * 9223372036854775807) ORDER BY id",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u WHERE u.id <= t.id \
+                 UNION SELECT 0 ORDER BY z * 9223372036854775807) ORDER BY id",
+                vec![1, 2, 4],
+            ),
+            // (SELECT y FROM v) gives two rows
+            (
+                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+                 ORDER BY (SELECT y FROM v)) ORDER BY id",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
+                 WHERE u.id <= t.id ORDER BY (SELECT y FROM v)) ORDER BY id",
+                vec![1],
+            ),
+        ] {
+            let ids: Vec<i64> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                .collect();
+            assert_eq!(ids, want, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn a_block_s_select_alias_is_read_bare_inside_its_subqueries() {
+    for (db, _dir) in alias_tables("block_order_limit_bare_alias") {
+        for (sql, want) in [
+            (
+                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+                 GROUP BY ROLLUP (x) ORDER BY (SELECT z)) ORDER BY id",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
+                 WHERE u.id <= t.id HAVING (SELECT z) > 0) ORDER BY id",
+                vec![1],
+            ),
+        ] {
+            let ids: Vec<i64> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                .collect();
+            assert_eq!(ids, want, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn a_qualified_name_reads_its_table_s_column_never_a_select_alias() {
+    for (db, _dir) in alias_tables("block_order_limit_qualified_alias") {
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+             HAVING (SELECT u.z) > 0 ORDER BY z LIMIT 1) ORDER BY id",
+            "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+             GROUP BY ROLLUP (x) HAVING (SELECT u.z) > 0) ORDER BY id",
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT DISTINCT ON (u.z) u.x) DESC LIMIT 1 + 0) ORDER BY id",
+        ] {
+            assert_eq!(error(&db, sql), "column 'u.z' not found", "{sql}");
+        }
     }
 }

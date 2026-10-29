@@ -534,9 +534,6 @@ impl<'a> Family<'a> {
             }
         }
         let registry = &self.executor.function_registry;
-        if statement_order_holding_subquery(sq, counts_rows, registry) {
-            return Err("a subquery block's ORDER BY or DISTINCT ON key holding a subquery");
-        }
         if statement_form_block(sq, counts_rows, false, registry) {
             return self.derived(sq);
         }
@@ -571,10 +568,7 @@ impl<'a> Family<'a> {
         if !exists && sq.order_by.iter().any(position) {
             return Err("an ORDER BY position in a subquery block");
         }
-        // Keys that choose no row are bound but never computed
-        let chooses =
-            !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
-        if !chooses
+        if !order_chooses(sq, exists)
             && sq
                 .order_by
                 .iter()
@@ -782,89 +776,10 @@ fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
         || !sq.window_defs.is_empty()
 }
 
-/// A block a statement would run only for its ORDER BY or DISTINCT ON, one
-/// of whose keys holds a subquery: a statement's walk binds that subquery
-/// against the block's sources alone, and computes a key that chooses no row
-fn statement_order_holding_subquery(
-    sq: &SelectStatement,
-    counts_rows: bool,
-    registry: &FunctionRegistry,
-) -> bool {
-    !clause_block(sq, counts_rows) && statement_order(sq, registry) && key_subquery_anywhere(sq)
-}
-
-/// Whether an ORDER BY or DISTINCT ON key of `sq`, or of a statement inside
-/// it at any depth (a subquery in any clause a statement's walk binds, a
-/// named window's among them, a derived table, a set operation branch),
-/// holds a subquery
-fn key_subquery_anywhere(sq: &SelectStatement) -> bool {
-    let keys = || {
-        sq.order_by
-            .iter()
-            .map(|ob| &ob.expression)
-            .chain(&sq.distinct_on)
-    };
-    if keys().any(mentions_subquery) {
-        return true;
-    }
-    // Every clause a statement's walk binds
-    let mut nested = Vec::new();
-    let grouping_sets: &[Vec<Expression>] = match &sq.group_by.modifier {
-        GroupByModifier::GroupingSets(sets) => sets,
-        _ => &[],
-    };
-    let windows = sq.window_defs.iter().flat_map(|def| {
-        def.partition_by
-            .iter()
-            .chain(def.order_by.iter().map(|ob| &ob.expression))
-            .chain(def.frame.iter().flat_map(WindowFrame::offsets))
-    });
-    let clauses = sq
-        .columns
-        .iter()
-        .chain(sq.where_clause.as_deref())
-        .chain(sq.having.as_deref())
-        .chain(&sq.group_by.columns)
-        .chain(grouping_sets.iter().flatten())
-        .chain(windows)
-        .chain(sq.limit.as_deref())
-        .chain(sq.offset.as_deref())
-        .chain(keys());
-    for expr in clauses {
-        nested_statements(expr, &mut nested);
-    }
-    source_statements(sq.table_expr.as_deref(), &mut nested);
-    nested.extend(sq.set_operations.iter().map(|op| &*op.right));
-    nested.into_iter().any(key_subquery_anywhere)
-}
-
-/// The statements a FROM source holds: derived tables, and the subqueries
-/// of its join conditions, VALUES rows and table function arguments
-fn source_statements<'e>(source: Option<&'e Expression>, out: &mut Vec<&'e SelectStatement>) {
-    match source {
-        Some(Expression::SubquerySource(derived)) => out.push(&derived.subquery),
-        Some(Expression::JoinSource(join)) => {
-            source_statements(Some(&join.left), out);
-            source_statements(Some(&join.right), out);
-            if let Some(condition) = join.condition.as_deref() {
-                nested_statements(condition, out);
-            }
-        }
-        Some(Expression::ValuesSource(values)) => {
-            values
-                .rows
-                .iter()
-                .flatten()
-                .for_each(|e| nested_statements(e, out));
-        }
-        Some(Expression::FunctionTableSource(function)) => {
-            function
-                .arguments
-                .iter()
-                .for_each(|e| nested_statements(e, out));
-        }
-        _ => {}
-    }
+/// Whether a block's ORDER BY chooses a row: a LIMIT, an OFFSET or a
+/// DISTINCT ON reads it, outside an EXISTS; one that does not is never computed
+fn order_chooses(sq: &SelectStatement, exists: bool) -> bool {
+    !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty())
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
@@ -1604,9 +1519,27 @@ struct StatementWalk<'w> {
     /// Whether a view whose query only its run can name may run here; an
     /// EXPLAIN runs nothing
     runs: bool,
+    /// The SELECT aliases of the statements around the one walked, which a
+    /// bare name its scopes lack reads as the general binder does
+    visible: Vec<SmartString>,
 }
 
 impl StatementWalk<'_> {
+    /// The subquery `sq` of a clause walked at `level`, which sees that
+    /// level's SELECT aliases besides its scopes
+    fn nested(
+        &mut self,
+        sq: &SelectStatement,
+        level: &Level<'_>,
+        check: Check,
+    ) -> Result<SelectStatement> {
+        let mark = self.visible.len();
+        self.visible.extend(level.aliases.iter().cloned());
+        let walked = self.statement(sq, &level.scopes, level.inside, check);
+        self.visible.truncate(mark);
+        Ok(walked?.0)
+    }
+
     /// Each subquery of `expr`, walked over the scopes `enclosing`
     fn subqueries_of(&mut self, expr: &Expression, enclosing: &[&ScopeTable]) -> Result<()> {
         let block = |walk: &mut Self, sq: &SelectStatement| {
@@ -1913,7 +1846,8 @@ impl StatementWalk<'_> {
                         Some(depth) => self.outer(expr, depth, index),
                         None => Ok(expr.clone()),
                     },
-                    Err(e) if level.check => Err(e),
+                    // An alias of a statement around it, read at its run
+                    Err(e) if level.check && !self.visible.contains(&id.value_lower) => Err(e),
                     _ => Ok(expr.clone()),
                 }
             }
@@ -1945,29 +1879,15 @@ impl StatementWalk<'_> {
             }
             Expression::ScalarSubquery(sq) => Ok(Expression::ScalarSubquery(ScalarSubquery {
                 token: sq.token.clone(),
-                subquery: Box::new(
-                    self.statement(&sq.subquery, &level.scopes, level.inside, nested(false))?
-                        .0,
-                ),
+                subquery: Box::new(self.nested(&sq.subquery, level, nested(false))?),
             })),
             Expression::Exists(exists) => Ok(Expression::Exists(ExistsExpression {
                 token: exists.token.clone(),
-                subquery: Box::new(
-                    self.statement(&exists.subquery, &level.scopes, level.inside, nested(true))?
-                        .0,
-                ),
+                subquery: Box::new(self.nested(&exists.subquery, level, nested(true))?),
             })),
             Expression::AllAny(all_any) => Ok(Expression::AllAny(AllAnyExpression {
                 left: Box::new(self.expr(&all_any.left, level)?),
-                subquery: Box::new(
-                    self.statement(
-                        &all_any.subquery,
-                        &level.scopes,
-                        level.inside,
-                        nested(false),
-                    )?
-                    .0,
-                ),
+                subquery: Box::new(self.nested(&all_any.subquery, level, nested(false))?),
                 ..all_any.clone()
             })),
             Expression::Aliased(aliased) => Ok(Expression::Aliased(AliasedExpression {
@@ -4655,6 +4575,7 @@ impl Builder<'_> {
                 Reach::Param(_) => Ok(None),
             },
             runs: true,
+            visible: Vec::new(),
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
@@ -4815,6 +4736,7 @@ impl Builder<'_> {
                 }
             },
             runs: true,
+            visible: Vec::new(),
         }
         .statement(sq, outer, 0, Check::All)?;
         self.max_param = self.max_param.max(max_param);
@@ -4835,6 +4757,11 @@ impl Builder<'_> {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
                 existence(executor, statement, &own.lower, ctx)?
             }
+            // An ORDER BY that chooses no row is bound above, never computed
+            false if !order_chooses(sq, matches!(form, Form::Exists(_))) => SelectStatement {
+                order_by: Vec::new(),
+                ..statement
+            },
             false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
@@ -8529,6 +8456,7 @@ impl Executor {
             ctx,
             on: &mut on,
             runs,
+            visible: Vec::new(),
         };
         let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
         let name = scope.tables.first().map(|(name, _)| name.as_str());
@@ -8569,6 +8497,7 @@ impl Executor {
                         ctx: &ctx,
                         on: &mut on,
                         runs,
+                        visible: Vec::new(),
                     };
                     named(walk.statement(query, &[], 0, Check::Off)?.1)?
                 }
@@ -9172,6 +9101,7 @@ fn sides_read_within(
         ctx,
         on: &mut on,
         runs: true,
+        visible: Vec::new(),
     };
     walk.subqueries_of(expr, &[scope])?;
     Ok(read)
@@ -9646,6 +9576,7 @@ impl Executor {
             ctx,
             on: &mut |_| Ok(None),
             runs: false,
+            visible: Vec::new(),
         }
         .statement(stmt, &[], 0, Check::Off)?;
         named(names)
