@@ -813,10 +813,22 @@ fn explain_analyze_says_whether_the_statement_it_ran_held_a_plan() {
         format!("({body}) d"),
         format!("l AS o JOIN ({body}) d ON d.id = o.id"),
     ] {
+        let sql = format!("EXPLAIN ANALYZE SELECT d.id FROM {from}");
         assert_eq!(
-            prepared(executor.execute(&format!("EXPLAIN ANALYZE SELECT d.id FROM {from}"))),
+            prepared(executor.execute(&sql)),
             ["Prepared: yes"],
             "{from}: run under the statement's cached plan"
+        );
+        let program = stoolap::parser::Parser::new(&sql).parse_program().unwrap();
+        assert_eq!(
+            prepared(executor.execute_program(&program)),
+            ["Prepared: yes"],
+            "{from}: run as a program"
+        );
+        assert_eq!(
+            prepared(executor.execute_statement(&program.statements[0], &ExecutionContext::new())),
+            ["Prepared: yes"],
+            "{from}: run as a parsed statement"
         );
     }
     let none = ["Prepared: no (a join in a SELECT that holds no plan)"];

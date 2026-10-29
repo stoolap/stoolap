@@ -139,13 +139,17 @@ impl Executor {
                 }
             }
 
+            // A SELECT run as a parsed tree held the plan its structure keys
+            let held = plan.is_some()
+                || matches!(&*stmt.statement, Statement::Select(select)
+                    if self.query_cache.statement_plan(select).is_some());
             // Generate plan with actual statistics (using inlined version if available)
             self.explain_statement_with_stats(
                 explain_stmt,
                 &mut plan_lines,
                 0,
                 (row_count, &time_str),
-                plan.is_some(),
+                held,
             );
 
             // Return the plan as a result
