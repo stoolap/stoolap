@@ -271,6 +271,74 @@ pub(crate) fn pk_conjunct_id(expr: &dyn Expression, schema: &Schema) -> Option<i
     }
 }
 
+/// How an UPDATE or DELETE reaches the hot rows its WHERE names
+pub(crate) enum WriteAccess {
+    /// The row the primary key equality, the whole WHERE, names
+    Key(i64),
+    /// Every key of a bounded primary key range, the whole WHERE
+    KeyRange(i64, i64),
+    /// The rows an index plan gives, each judged by the WHERE again
+    Index(IndexPlan),
+    /// Every row
+    Scan,
+}
+
+/// The access to the hot rows of a table of `schema`, whose indexes `store`
+/// holds, that `where_expr` names: the one rule every write follows
+#[inline(always)]
+pub(crate) fn write_access(
+    store: &VersionStore,
+    schema: &Schema,
+    where_expr: Option<&dyn Expression>,
+) -> WriteAccess {
+    let Some(expr) = where_expr else {
+        return WriteAccess::Scan;
+    };
+    if let Some(key) = pk_equality_id(expr, schema) {
+        return WriteAccess::Key(key);
+    }
+    if let Some((low, high)) = key_range(expr, schema) {
+        return WriteAccess::KeyRange(low, high);
+    }
+    match index_plan::decide(store, schema, expr) {
+        Some(plan) => WriteAccess::Index(plan),
+        None => WriteAccess::Scan,
+    }
+}
+
+/// The bounds of an AND of comparisons on the primary key alone (WHERE
+/// id >= X AND id < Y), whose keys are row ids; None when a comparison is
+/// on another column, or the range is too wide to list
+fn key_range(expr: &dyn Expression, schema: &Schema) -> Option<(i64, i64)> {
+    let &[pk] = schema.primary_key_indices() else {
+        return None;
+    };
+    let pk_col_name = &schema.columns[pk].name;
+    expr.get_and_operands()?;
+    let mut leaves = Vec::new();
+    if !collect_conjuncts(expr, &mut leaves)
+        || !leaves
+            .iter()
+            .all(|(column, _, _)| column.eq_ignore_ascii_case(pk_col_name))
+    {
+        return None;
+    }
+    let (start, end) = match resolve_all(
+        Domain::Integer,
+        leaves.iter().map(|(_, op, value)| (*op, *value)),
+    ) {
+        Resolved::Key(k) => (k, k),
+        Resolved::Range(low, high) => (low, high),
+        // No key: a range that lists none
+        Resolved::Empty => (1, 0),
+        Resolved::Fallback => return None,
+    };
+    // A wider range is left to the indexes, so its keys are never all listed
+    const MAX_PK_RANGE_SIZE: i64 = 100_000;
+    let range_size = end.saturating_sub(start).saturating_add(1);
+    (range_size <= MAX_PK_RANGE_SIZE).then_some((start, end))
+}
+
 /// `row` as a row of `schema` after ALTER TABLE ADD or DROP COLUMN: the
 /// default value, or NULL, for a column it lacks; one past the schema's
 /// last column dropped
@@ -593,52 +661,6 @@ impl MVCCTable {
     /// Returns Some(row_id) if the expression is a simple equality on the PK column
     fn try_pk_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<i64> {
         pk_equality_id(expr, schema)
-    }
-
-    /// The row ids of an AND of comparisons on the primary key alone (WHERE
-    /// id >= X AND id < Y), pooled; None when a comparison is on another
-    /// column or the keys cannot answer it
-    fn try_pk_range_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
-        // Get PK column info
-        let pk_indices = schema.primary_key_indices();
-        if pk_indices.len() != 1 {
-            return None;
-        }
-        let pk_col_name = &schema.columns[pk_indices[0]].name;
-
-        expr.get_and_operands()?;
-        let mut leaves = Vec::new();
-        if !collect_conjuncts(expr, &mut leaves)
-            || !leaves
-                .iter()
-                .all(|(column, _, _)| column.eq_ignore_ascii_case(pk_col_name))
-        {
-            return None;
-        }
-        let (start, end) = match resolve_all(
-            Domain::Integer,
-            leaves.iter().map(|(_, op, value)| (*op, *value)),
-        ) {
-            Resolved::Key(k) => (k, k),
-            Resolved::Range(low, high) => (low, high),
-            Resolved::Empty => return Some(RowIdVec::new()),
-            Resolved::Fallback => return None,
-        };
-
-        // SAFETY: Limit range size to prevent memory explosion
-        // For ranges larger than threshold, return None to fall back to index/full scan
-        const MAX_PK_RANGE_SIZE: i64 = 100_000;
-        let range_size = end.saturating_sub(start).saturating_add(1);
-        if range_size > MAX_PK_RANGE_SIZE {
-            return None; // Fall back to index scan or full scan
-        }
-
-        // Generate row_ids directly (no index needed - PK IS the row_id)
-        let mut row_ids = RowIdVec::with_capacity(range_size as usize);
-        for id in start..=end {
-            row_ids.push(id);
-        }
-        Some(row_ids)
     }
 
     /// Try to use an index to filter row IDs
@@ -2392,8 +2414,9 @@ impl MVCCTable {
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         if let Some(expr) = where_expr {
-            // Fast path: primary key equality (WHERE id = X)
-            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
+            let access = write_access(&self.version_store, schema, Some(expr));
+            // The row the key names
+            if let WriteAccess::Key(pk_id) = access {
                 if skipped(pk_id) {
                     return Ok(());
                 }
@@ -2419,14 +2442,15 @@ impl MVCCTable {
                 return Ok(());
             }
 
-            // Fast path: primary key range (WHERE id >= X AND id < Y)
-            if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
-                plan.hot.reserve_exact(pk_range_ids.len());
-                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
+            // Every key of the range: a row's id is its key
+            if let WriteAccess::KeyRange(low, high) = access {
+                let keys = usize::try_from(high.saturating_sub(low).saturating_add(1)).unwrap_or(0);
+                plan.hot.reserve_exact(keys);
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(keys);
                 {
                     let txn_versions = self.local();
                     self.check_read()?;
-                    for row_id in pk_range_ids {
+                    for row_id in low..=high {
                         if skipped(row_id) {
                             continue;
                         }
@@ -2456,8 +2480,12 @@ impl MVCCTable {
                 return Ok(());
             }
 
-            // Index lookup for non-PK columns
-            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
+            // The rows the indexes give, unless they cannot answer for the read
+            let indexed = match &access {
+                WriteAccess::Index(index) => self.read_indexes(index, expr),
+                _ => None,
+            };
+            if let Some(mut filtered_row_ids) = indexed {
                 filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
                 plan.hot.reserve_exact(filtered_row_ids.len());
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
@@ -3267,9 +3295,9 @@ impl Table for MVCCTable {
         let schema = &self.cached_schema;
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
-        // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
         if let Some(expr) = where_expr {
-            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
+            let access = write_access(&self.version_store, schema, Some(expr));
+            if let WriteAccess::Key(pk_id) = access {
                 // Direct O(1) lookup by primary key
                 // Use get_local_version to preserve delete signal. txn_versions.get()
                 // swallows deletes as None, causing fallback to committed store and
@@ -3311,20 +3339,20 @@ impl Table for MVCCTable {
                 return Ok(0);
             }
 
-            // Fast path: PK range lookup (WHERE id >= X AND id < Y)
-            // PK IS the row_id, so we can generate the range directly
-            if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
+            // Every key of the range: PK IS the row_id
+            if let WriteAccess::KeyRange(low, high) = access {
+                let keys = usize::try_from(high.saturating_sub(low).saturating_add(1)).unwrap_or(0);
                 // OPTIMIZATION: Track original versions to avoid redundant lookups
-                let mut local_rows = RowVec::with_capacity(pk_range_ids.len() / 4);
+                let mut local_rows = RowVec::with_capacity(keys / 4);
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-                    Vec::with_capacity(pk_range_ids.len());
+                    Vec::with_capacity(keys);
 
                 // Step 1: Check local versions first (single lock acquisition)
                 // Use get_local_version to distinguish "no local version" from "locally deleted"
-                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(keys);
                 {
                     let txn_versions = self.local();
-                    for row_id in pk_range_ids {
+                    for row_id in low..=high {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
                                 local_rows.push((row_id, local.data.clone()));
@@ -3360,8 +3388,12 @@ impl Table for MVCCTable {
                 return Ok(delete_count);
             }
 
-            // Try index lookup for non-PK columns
-            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
+            // The rows the indexes give, unless they cannot answer for the read
+            let indexed = match &access {
+                WriteAccess::Index(index) => self.read_indexes(index, expr),
+                _ => None,
+            };
+            if let Some(mut filtered_row_ids) = indexed {
                 filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
