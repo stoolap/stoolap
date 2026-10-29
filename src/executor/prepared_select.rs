@@ -4272,8 +4272,9 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
-    /// The run slots of values a WHERE tests a column against, whose error
-    /// a run raises only where a row reads the slot
+    /// The run slots of values a WHERE tests a column against, or a named
+    /// window's parts hold, whose error a run raises only where a row reads
+    /// the slot
     where_slots: Vec<usize>,
 }
 
@@ -7102,18 +7103,28 @@ impl PreparedGrouped {
         // above, and so is every item of rows that do not group; any other
         // for each group
         let groups = grouped_block(stmt);
-        let mut output = |expr: &Expression, key: Option<&Expression>| -> Result<Expression> {
-            if let Some(rewritten) = key {
-                return Ok(rewritten.clone());
-            }
-            if !groups {
-                return input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr);
-            }
-            let read = read_inputs(expr, &items, &mut |call| {
-                input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
-            })?;
-            rewrite(&mut builder, &chain, &mut run_slots, &read)
-        };
+        // `deferred`: the run slots it adds raise their error only where a
+        // row reads them
+        let mut output =
+            |expr: &Expression, key: Option<&Expression>, deferred: bool| -> Result<Expression> {
+                if let Some(rewritten) = key {
+                    return Ok(rewritten.clone());
+                }
+                let first = run_slots.len();
+                let rewritten = if !groups {
+                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?
+                } else {
+                    let read = read_inputs(expr, &items, &mut |call| {
+                        input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
+                    })?;
+                    rewrite(&mut builder, &chain, &mut run_slots, &read)?
+                };
+                if deferred {
+                    let added = run_slots[first..].iter().map(|(slot, _)| *slot);
+                    builder.where_slots.extend(added);
+                }
+                Ok(rewritten)
+            };
         // An item holding a subquery keeps the name it is written under
         let mut columns = Vec::with_capacity(stmt.columns.len());
         for (column, key) in stmt.columns.iter().zip(&grouped) {
@@ -7122,14 +7133,14 @@ impl PreparedGrouped {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
-                    expression: Box::new(output(&aliased.expression, key)?),
+                    expression: Box::new(output(&aliased.expression, key, false)?),
                     alias: aliased.alias.clone(),
                 }),
                 column => {
                     let name = item_name(column);
                     Expression::Aliased(AliasedExpression {
                         token: Token::new(TokenType::Identifier, &name, Position::default()),
-                        expression: Box::new(output(column, key)?),
+                        expression: Box::new(output(column, key, false)?),
                         alias: Identifier::new(
                             Token::new(TokenType::Identifier, &name, Position::default()),
                             &name,
@@ -7139,7 +7150,7 @@ impl PreparedGrouped {
             });
         }
         let having = match (&opened_having, stmt.having.as_deref()) {
-            (Some(opened), _) => Some(Box::new(output(opened, None)?)),
+            (Some(opened), _) => Some(Box::new(output(opened, None, false)?)),
             (None, other) => other.map(|having| Box::new(having.clone())),
         };
         // An ORDER BY key holding a subquery is computed for each group into a
@@ -7161,7 +7172,7 @@ impl PreparedGrouped {
             {
                 columns.push(Expression::Aliased(AliasedExpression {
                     token,
-                    expression: Box::new(output(&ob.expression, None)?),
+                    expression: Box::new(output(&ob.expression, None, false)?),
                     alias: column.clone(),
                 }));
             }
@@ -7177,7 +7188,7 @@ impl PreparedGrouped {
                 .chain(def.order_by.iter_mut().map(|ob| &mut ob.expression))
                 .chain(def.frame.iter_mut().flat_map(WindowFrame::offsets_mut));
             for expr in keys.filter(|expr| mentions_subquery(expr)) {
-                *expr = output(expr, None)?;
+                *expr = output(expr, None, true)?;
             }
         }
         let blocks_read = builder.subqueries.len();
@@ -7517,6 +7528,10 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return false;
+        }
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| match &*guard {
@@ -9688,6 +9703,10 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return false;
+        }
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| {

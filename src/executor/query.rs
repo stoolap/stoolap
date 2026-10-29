@@ -5354,6 +5354,10 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<std::sync::Arc<PreparedJoin>> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return None;
+        }
         let epoch = self.engine.schema_epoch();
         let current = |guard: &CompiledExecution| match guard {
             CompiledExecution::PreparedJoin(held)

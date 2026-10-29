@@ -979,13 +979,15 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
         hash_expression_structure(having, hasher);
     }
 
-    // Hash the named windows' parts, which grouped_has_subqueries reads
-    for def in &stmt.window_defs {
+    // Hash the named windows' parts the OVERs read, which
+    // grouped_has_subqueries reads: which ones depends on each OVER
+    let windows = super::Executor::used_window_defs(stmt);
+    for def in &windows {
         def.partition_by.len().hash(hasher);
         def.order_by.len().hash(hasher);
-        def.frame.is_some().hash(hasher);
+        def.frame.as_ref().map(|f| f.offsets().count()).hash(hasher);
     }
-    for item in window_def_items(&stmt.window_defs) {
+    for item in window_def_items(&windows) {
         hash_expression_structure(item, hasher);
     }
 

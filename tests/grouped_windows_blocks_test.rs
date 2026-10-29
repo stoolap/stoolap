@@ -568,3 +568,34 @@ fn a_part_of_a_named_window_no_over_reads_is_never_read() {
         assert_eq!(rows(&db, sql), Ok(want), "{sql}");
     }
 }
+
+#[test]
+fn a_statement_differing_only_in_the_window_its_over_names_classifies_alone() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_named_key").unwrap();
+    fill(&db);
+    let window = "WINDOW w AS (ORDER BY t.id ROWS BETWEEN (SELECT 1) PRECEDING AND CURRENT ROW)";
+    let unread = format!("SELECT t.id, SUM(t.b) OVER () FROM t {window} ORDER BY t.id");
+    let read = format!("SELECT t.id, SUM(t.b) OVER w FROM t {window} ORDER BY t.id");
+    let twin =
+        "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                FROM t ORDER BY t.id";
+    assert!(rows(&db, &unread).is_ok(), "{unread}");
+    assert_eq!(rows(&db, &read), rows(&db, twin), "{read}");
+}
+
+#[test]
+fn a_named_window_over_no_row_reads_none_of_its_parts() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_named_empty").unwrap();
+    fill(&db);
+    // (SELECT u.x FROM u) gives many rows: reading it is an error
+    for sql in [
+        "SELECT t.id, SUM(t.b) OVER w FROM t WHERE t.id < 0 \
+         WINDOW w AS (ORDER BY t.id ROWS BETWEEN (SELECT u.x FROM u) PRECEDING AND CURRENT ROW)",
+        "SELECT t.id, SUM(t.b) OVER w FROM t WHERE t.id < 0 \
+         WINDOW w AS (PARTITION BY t.a > (SELECT u.x FROM u))",
+    ] {
+        assert_eq!(rows(&db, sql), Ok(Vec::new()), "{sql}");
+    }
+}

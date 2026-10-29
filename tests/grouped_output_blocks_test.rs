@@ -941,3 +941,21 @@ fn a_having_name_reads_the_alias_the_grouped_path_reads() {
     );
     assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
 }
+
+#[test]
+fn a_recorded_answer_s_reference_reads_a_prepared_view_on_the_general_path() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_reference_view").unwrap();
+    fill(&db);
+    db.execute(
+        "CREATE VIEW vm AS SELECT a, (SELECT MAX(u.x) FROM u) AS m FROM t",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT m, COUNT(*) FROM vm GROUP BY m ORDER BY m";
+    let twin = oracle::general_twin(sql);
+    let want = rows(&db, sql);
+    // The view's statement holds its prepared plan by now
+    assert_eq!(rows(&db, &twin), want, "{twin}");
+    assert_eq!(oracle::on_general_path(sql, || rows(&db, &twin)), want);
+}

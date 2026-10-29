@@ -1884,9 +1884,9 @@ pub fn general_path_total() -> usize {
         .sum()
 }
 
-/// Refuse every prepared family, so that a statement and the statements
-/// inside it run on the general path: a recorded answer's reference reads
-/// them there
+/// Refuse every prepared SELECT family and the plans they hold, so that a
+/// statement and the statements inside it run on the general path: a
+/// recorded answer's reference reads them there
 pub static PREPARED_FAMILIES_OFF: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn prepared_families_off() -> bool {
