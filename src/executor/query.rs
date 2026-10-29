@@ -379,6 +379,8 @@ type ReadSchema = (LayoutToken, CompactArc<Schema>);
 struct SideRead<'a> {
     filter: Option<&'a Expression>,
     run: Option<(StatementRun<'a>, usize)>,
+    /// The join's plan of the side, when the side runs as a statement
+    plan: Option<&'a NestedPlan>,
     /// A side that is a join keeps both columns of a pair it merges
     apart: bool,
 }
@@ -1643,7 +1645,7 @@ impl Executor {
                 && !grouped()
                 && !self.join_keeps_plan(stmt, with)
             {
-                return self.execute_select_with_ctes(stmt, ctx);
+                return self.execute_select_with_ctes(stmt, ctx, compiled);
             }
             if let Some(inlined) = self.try_inline_ctes(stmt, with) {
                 return self.execute_select_with_plan(&inlined, ctx, None, compiled, None);
@@ -1902,7 +1904,7 @@ impl Executor {
         } else if let Some(grouped) = grouped {
             self.execute_prepared_grouped(grouped, branch, ctx)?
         } else {
-            let compiled = slot.filter(|_| !folded_select);
+            let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, branch_classification, compiled)?
         };
         let SelectShape {
@@ -2607,7 +2609,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&NestedPlan>,
     ) -> SelectResult {
         // Get table source
         let table_expr = match &stmt.table_expr {
@@ -2641,10 +2643,12 @@ impl Executor {
                 self.execute_simple_table_scan(table_source, stmt, ctx, classification, None, None)
             }
             Expression::JoinSource(join_source) => {
-                self.execute_join_source(join_source, stmt, ctx, classification, compiled, false)
+                let slot = compiled.map(NestedPlan::slot);
+                self.execute_join_source(join_source, stmt, ctx, classification, slot, false)
             }
             Expression::SubquerySource(subquery_source) => {
-                self.execute_subquery_source(subquery_source, stmt, ctx, classification)
+                let plan = compiled.and_then(|plan| plan.from(stmt));
+                self.execute_subquery_source(subquery_source, stmt, ctx, classification, plan)
             }
             Expression::ValuesSource(values_source) => {
                 self.execute_values_source(values_source, stmt, ctx, classification)
@@ -5934,7 +5938,7 @@ impl Executor {
             .as_ref()
             .filter(|_| Self::grouped_family_reach(stmt, classification))
             .cloned();
-        let prepared = plan.filter(|_| {
+        let prepared = plan.as_deref().filter(|_| {
             processed_on.is_none()
                 && ((!classification.where_has_subqueries && !on_subqueries) || blocks_where)
         });
@@ -6005,7 +6009,7 @@ impl Executor {
         // The statement's blocks, and the one run of them every site calls
         let blocks = match blocks_where {
             true => self.statement_blocks(
-                prepared.as_deref(),
+                prepared,
                 stmt,
                 (join_source, join_type.as_str()),
                 cross_filter.as_ref(),
@@ -6080,6 +6084,7 @@ impl Executor {
                 false => left_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 0)),
+            plan: plan.as_deref().map(|plan| plan.side_plan(0)),
             apart,
         };
         let right_read = SideRead {
@@ -6088,6 +6093,7 @@ impl Executor {
                 false => right_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 1)),
+            plan: plan.as_deref().map(|plan| plan.side_plan(1)),
             apart,
         };
         let where_blocks = statement_run.map(|run| run.site(false));
@@ -6175,7 +6181,7 @@ impl Executor {
                 left_read,
                 right_filter.as_ref(),
                 cross_filter.as_ref(),
-                prepared.as_deref(),
+                prepared,
                 &plan,
             )? {
                 return Ok(result);
@@ -6762,7 +6768,7 @@ impl Executor {
                     let mut cross_row_filter = match cross_filter {
                         Some(ref cross) => Some(JoinedWhere::new(
                             self.join_where(
-                                prepared.as_deref(),
+                                prepared,
                                 WhereSite::IndexJoin,
                                 stmt,
                                 cross,
@@ -7101,7 +7107,7 @@ impl Executor {
                         None
                     } else {
                         self.held_join_output(
-                            prepared.as_deref(),
+                            prepared,
                             stmt,
                             &all_columns,
                             order_limit_applied,
@@ -7444,7 +7450,7 @@ impl Executor {
                         ctx,
                         pre_built_hash_table,
                         cross_key,
-                        prepared: prepared.as_deref(),
+                        prepared,
                         blocks: statement_run,
                     };
 
@@ -7455,7 +7461,7 @@ impl Executor {
                     let (all_cols, joined_rows) =
                         merged_side_rows(stmt, merging, all_cols, join_result.rows);
                     let held = self.held_join_output(
-                        prepared.as_deref(),
+                        prepared,
                         stmt,
                         &all_cols,
                         false,
@@ -7623,7 +7629,7 @@ impl Executor {
             ctx,
             left_schema: self.base_table_side_schema(&join_source.left, CteNames::Context(ctx)),
             right_schema: self.base_table_side_schema(&join_source.right, CteNames::Context(ctx)),
-            prepared: prepared.as_deref(),
+            prepared,
             blocks: statement_run,
         };
 
@@ -7709,7 +7715,7 @@ impl Executor {
                 // Its subqueries run as the plan's blocks, or were folded
                 // before the filters were split
                 let program = self.join_where(
-                    prepared.as_deref(),
+                    prepared,
                     WhereSite::AfterJoin,
                     stmt,
                     &where_expr,
@@ -7755,7 +7761,7 @@ impl Executor {
         }
 
         let held = self.held_join_output(
-            prepared.as_deref(),
+            prepared,
             stmt,
             &final_columns,
             false,
@@ -7869,13 +7875,15 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
+        plan: Option<&NestedPlan>,
     ) -> SelectResult {
         // classification is passed from caller for the outer stmt
         // Note: The inner subquery will get its own classification via execute_select
 
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
-        let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
+        let body = &subquery_source.subquery;
+        let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan, None)?;
         let columns = result.columns().to_vec();
 
         // OPTIMIZATION: For simple GROUP BY aggregation without WHERE clause, try streaming
@@ -7903,7 +7911,7 @@ impl Executor {
             }
             // Streaming not applicable - need to re-execute the subquery
             // (the streaming function consumed the result iterator)
-            let result = self.execute_select(&subquery_source.subquery, &subquery_ctx)?;
+            let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan, None)?;
 
             // Fall through to materialization path
             let mut rows = RowVec::new();
@@ -9177,23 +9185,19 @@ impl Executor {
         // A joined side runs as a join of its own, under the plan it holds,
         // both columns of a pair it merges kept as the blocks read them
         let nested = match (rows, expr) {
-            (Some((run, index)), Expression::JoinSource(join)) => Some((
-                join,
-                run.blocks.nested[index].as_ref().map(NestedPlan::slot),
-            )),
-            (None, Expression::JoinSource(join)) if side.apart => Some((join, None)),
+            (Some(_), Expression::JoinSource(join)) => Some((join, true)),
+            (None, Expression::JoinSource(join)) => Some((join, side.apart)),
             _ => None,
         };
-        // A derived table read as rows runs under the plan it holds
-        let derived = match (rows, expr) {
-            (Some((run, index)), Expression::SubquerySource(ss)) => {
-                Some((ss, run.blocks.nested[index].as_ref()))
-            }
+        // A derived table runs under the plan it holds
+        let derived = match expr {
+            Expression::SubquerySource(ss) => Some((ss, side.plan)),
             _ => None,
         };
         let fetched = match (nested, derived) {
-            (Some((join, compiled)), _) => {
-                let (result, columns) = self.joined_side_rows(join, ctx, compiled, true)?;
+            (Some((join, apart)), _) => {
+                let compiled = side.plan.map(NestedPlan::slot);
+                let (result, columns) = self.joined_side_rows(join, ctx, compiled, apart)?;
                 (result, columns, false, None)
             }
             (None, Some((ss, plan))) => {

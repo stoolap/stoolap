@@ -199,11 +199,12 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         // Get the WITH clause
         let with_clause = match &stmt.with {
             Some(with) => with,
-            None => return self.execute_select(stmt, ctx),
+            None => return self.execute_select_with_plan(stmt, ctx, None, plan, None),
         };
 
         // CTE INLINING OPTIMIZATION:
@@ -213,11 +214,11 @@ impl Executor {
         // This is similar to PostgreSQL 12+'s CTE inlining behavior
         if let Some(inlined_stmt) = self.try_inline_ctes(stmt, with_clause) {
             // Execute the rewritten query (without WITH clause or with fewer CTEs)
-            return self.execute_select(&inlined_stmt, ctx);
+            return self.execute_select_with_plan(&inlined_stmt, ctx, None, plan, None);
         }
 
-        self.run_over_cut_ctes(stmt, with_clause, None, ctx, |cte_registry| {
-            self.execute_main_query_with_ctes(stmt, ctx, cte_registry)
+        self.run_over_cut_ctes(stmt, with_clause, plan, ctx, |cte_registry| {
+            self.execute_main_query_with_ctes(stmt, ctx, cte_registry, plan)
         })
     }
 
@@ -560,6 +561,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         // Create a context with CTE data so subqueries can access CTEs
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
@@ -606,7 +608,7 @@ impl Executor {
             prepared: None,
         };
 
-        self.execute_select(&stmt_without_with, &ctx_with_ctes)
+        self.execute_select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan, None)
     }
 
     /// Execute a query on CTE result data

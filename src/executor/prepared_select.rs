@@ -7835,10 +7835,9 @@ pub(crate) struct JoinBlocks {
     fitted: [std::sync::OnceLock<CompactArc<Schema>>; 2],
     /// Whether each side is read whole as rows, not scanned as a table
     pub(crate) rows_sides: [bool; 2],
-    /// The plan of a side that is itself a join, which runs its ON's
-    /// subqueries as its own blocks, or of a derived table's statement read
-    /// as rows; None for a side scanned as a table
-    pub(crate) nested: [Option<NestedPlan>; 2],
+    /// Whether a side runs as a statement of its own: a join, which runs
+    /// its ON's subqueries as its own blocks, or a derived table read as rows
+    pub(crate) nested: [bool; 2],
     /// The conditions on a side asked of the joined row with the WHERE's
     /// others there: one on a side read as rows that asks a block of each
     /// row, or one whose subquery reads the other side
@@ -7902,8 +7901,8 @@ impl JoinBlocks {
         // A joined side's rows hold its tables' columns in turn, each named
         // by its table and its own name
         let fits = |c: &SchemaColumn, n: &String| match self.nested[side] {
-            Some(_) => bare_name(n).eq_ignore_ascii_case(&c.name),
-            None => c.name == *n,
+            true => bare_name(n).eq_ignore_ascii_case(&c.name),
+            false => c.name == *n,
         };
         if prepared.len() == columns.len() && prepared.iter().zip(columns).all(|(c, n)| fits(c, n))
         {
@@ -8152,7 +8151,7 @@ impl JoinBlocks {
             rows_sides,
             nested: sides
                 .each_ref()
-                .map(|side| (side.leaves.len() > 1 || side.rows).then(NestedPlan::default)),
+                .map(|side| side.leaves.len() > 1 || side.rows),
             moved,
             select,
             order_by,

@@ -313,8 +313,9 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
         "the blocks ask a correlated WHERE of the index join's rows: {}",
         plan(correlated)
     );
-    let per_row = "SELECT * FROM (SELECT u.id, o.id FROM users u INNER JOIN orders o \
-        ON u.id = o.user_id WHERE EXISTS (SELECT 1 FROM flags f WHERE f.uid = u.id) LIMIT 1) AS general";
+    let per_row = "SELECT COUNT(*) OVER w, (SELECT 0) FROM (SELECT u.id, o.id FROM users u \
+        INNER JOIN orders o ON u.id = o.user_id WHERE EXISTS (SELECT 1 FROM flags f \
+        WHERE f.uid = u.id) LIMIT 1) AS general WINDOW w AS ()";
     assert!(
         !plan(per_row).contains("Index Nested Loop"),
         "a correlated WHERE outside the blocks keeps the index join out: {}",

@@ -455,7 +455,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT * FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
          WHERE t.b > (SELECT MAX(x) FROM u)) AS d",
         "SELECT * FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d",
-        Old("7b: parent on the general path"),
+        Prepared,
     ),
     (
         "join_inside_a_derived_table_of_a_prepared_statement",
@@ -488,7 +488,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
          WHERE t.b > (SELECT MAX(x) FROM u)) SELECT * FROM c",
         "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) SELECT * FROM c",
-        Old("7b: parent on the general path"),
+        Prepared,
     ),
     (
         "join_inside_a_cte_of_a_prepared_statement",
@@ -530,6 +530,44 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "WITH RECURSIVE r(id, x) AS (SELECT id, x FROM u WHERE id = 1 UNION ALL \
          SELECT u.id, u.x FROM r JOIN u ON u.id = r.id + 1 WHERE u.x > 1) \
          SELECT r.id, r.x FROM r WHERE r.id > 0",
+        Prepared,
+    ),
+    (
+        "join_inside_a_derived_table_of_an_aggregate",
+        "SELECT COUNT(*) FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d",
+        "SELECT COUNT(*) FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d",
+        Prepared,
+    ),
+    (
+        "join_inside_a_derived_table_of_a_distinct",
+        "SELECT DISTINCT d.x FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d",
+        "SELECT DISTINCT d.x FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d",
+        Prepared,
+    ),
+    (
+        "join_inside_a_derived_join_side",
+        "SELECT t.id FROM t JOIN (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d ON d.id = t.id",
+        "SELECT t.id FROM t JOIN (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d \
+         ON d.id = t.id",
+        Prepared,
+    ),
+    (
+        "join_inside_a_derived_table_in_a_joined_side",
+        "SELECT d.id FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d JOIN t ON t.id = d.id JOIN u ON u.id = t.a",
+        "SELECT d.id FROM (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) AS d \
+         JOIN t ON t.id = d.id JOIN u ON u.id = t.a",
+        Prepared,
+    ),
+    (
+        "join_inside_a_cte_read_twice",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) SELECT c.id FROM c JOIN c AS e ON e.id = c.id",
+        "WITH c AS (SELECT t.id, u.x FROM t JOIN u ON u.id = t.a WHERE t.b > 3) \
+         SELECT c.id FROM c JOIN c AS e ON e.id = c.id",
         Prepared,
     ),
 ];

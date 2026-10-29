@@ -655,8 +655,8 @@ impl Executor {
     }
 
     /// Generate EXPLAIN output for a SELECT statement; `own` when it holds a
-    /// plan: the statement's own, an INSERT's source, a branch of one that
-    /// does, or a derived FROM or join side of one the runner runs
+    /// plan: the statement's own, an INSERT's source, or a branch, a derived
+    /// FROM or a join side of one that does
     fn explain_select(
         &self,
         select: &SelectStatement,
@@ -706,9 +706,13 @@ impl Executor {
         let on_subqueries = join.is_some_and(Self::ons_hold_subqueries);
         let classification = get_classification(select);
         let grouped_output = Self::grouped_family_reach(select, &classification);
-        // A derived FROM or join side holds a plan in that of a statement the
-        // runner runs
-        let mut from_plan = false;
+        let grouped = grouped_output.then(|| self.grouped_family(select, None));
+        // A derived FROM or join side holds a plan in its statement's, which
+        // one reading its SELECT list's subqueries first outside the grouped
+        // family does not keep
+        let folded = Self::folds_select_subqueries(select, &classification)
+            && !matches!(grouped, Some(Ok(())));
+        let from_plan = own && !folded;
         if on_subqueries
             || classification.output_has_subqueries
             || grouped_output
@@ -717,16 +721,13 @@ impl Executor {
                 .as_deref()
                 .is_some_and(Self::has_subqueries)
         {
-            let prepared = match join {
-                _ if grouped_output => self.grouped_family(select, None),
-                Some(join) => self.join_prepared(select, join, own, select.with.as_ref()),
-                None => self.prepared_family(select, None),
+            let prepared = match (grouped, join) {
+                (Some(grouped), _) => grouped,
+                (None, Some(join)) => self.join_prepared(select, join, own, select.with.as_ref()),
+                (None, None) => self.prepared_family(select, None),
             };
             match prepared {
-                Ok(()) => {
-                    from_plan = own;
-                    lines.push(format!("{}  Prepared: yes", prefix))
-                }
+                Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),
                 Err(reason) => lines.push(format!("{}  Prepared: no ({})", prefix, reason)),
             }
         }
@@ -1035,17 +1036,6 @@ impl Executor {
                 if let Some(ref jf) = join_filter {
                     lines.push(format!("{}   Join Filter: {}", prefix, jf));
                 }
-                // A side that is a join holds a plan its sides' do only when
-                // it runs its own blocks, as the statement it runs as decides
-                // with the statement's CTEs named
-                let side_plan = |side: &Expression| match side {
-                    Expression::JoinSource(inner) => {
-                        let statement = Self::joined_side_statement(inner);
-                        let held = self.join_prepared(&statement, inner, from_plan, with);
-                        (held.is_ok(), with)
-                    }
-                    _ => (from_plan, with),
-                };
                 self.explain_table_expr_inner(
                     &join.left,
                     left_where.as_ref(),
@@ -1054,7 +1044,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
-                    side_plan(&join.left),
+                    (from_plan, with),
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -1064,7 +1054,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
-                    side_plan(&join.right),
+                    (from_plan, with),
                 );
             }
             Expression::CteReference(cte_ref) => {
