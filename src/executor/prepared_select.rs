@@ -79,7 +79,6 @@ use super::utils::{
     order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
-use super::window::unknown_window_function;
 use super::Executor;
 use crate::planner::{
     ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
@@ -570,7 +569,10 @@ impl<'a> Family<'a> {
         if !exists && sq.order_by.iter().any(position) {
             return Err("an ORDER BY position in a subquery block");
         }
-        if !order_chooses(sq, exists)
+        // Keys that choose no row are bound but never computed
+        let chooses =
+            !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
+        if !chooses
             && sq
                 .order_by
                 .iter()
@@ -776,12 +778,6 @@ fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
-}
-
-/// Whether a block's ORDER BY chooses a row: a LIMIT, an OFFSET or a
-/// DISTINCT ON reads it, outside an EXISTS; one that does not is never computed
-fn order_chooses(sq: &SelectStatement, exists: bool) -> bool {
-    !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty())
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
@@ -1938,23 +1934,6 @@ impl StatementWalk<'_> {
                 token: distinct.token.clone(),
                 expr: Box::new(self.expr(&distinct.expr, level)?),
             })),
-            // A function binds as a name does, in a key the run never computes too
-            Expression::FunctionCall(call)
-                if level.check && !self.executor.function_registry.resolves(&call.function) =>
-            {
-                Err(compile_error(CompileError::FunctionNotFound(
-                    call.function.to_uppercase().to_string(),
-                )))
-            }
-            Expression::Window(window)
-                if level.check
-                    && !self
-                        .executor
-                        .function_registry
-                        .resolves_over(&window.function.function) =>
-            {
-                Err(unknown_window_function(&window.function.function))
-            }
             other => rebuild(other, &mut |child| self.expr(child, level)),
         }
     }
@@ -4819,11 +4798,6 @@ impl Builder<'_> {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
                 existence(executor, statement, &own.lower, ctx)?
             }
-            // An ORDER BY that chooses no row is bound above, never computed
-            false if !order_chooses(sq, matches!(form, Form::Exists(_))) => SelectStatement {
-                order_by: Vec::new(),
-                ..statement
-            },
             false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);

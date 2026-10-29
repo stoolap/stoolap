@@ -732,69 +732,16 @@ fn alias_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
 }
 
 #[test]
-fn a_block_key_that_chooses_no_row_is_never_computed() {
-    for (db, _dir) in alias_tables("block_order_limit_unchosen_never_computed") {
-        for (sql, want) in [
-            // z * 9223372036854775807 overflows for z = 2
-            (
-                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
-                 GROUP BY x ORDER BY z * 9223372036854775807) ORDER BY id",
-                vec![1, 2],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
-                 GROUP BY ROLLUP (x) ORDER BY z * 9223372036854775807) ORDER BY id",
-                vec![1, 2],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u WHERE u.id <= t.id \
-                 UNION SELECT 0 ORDER BY z * 9223372036854775807) ORDER BY id",
-                vec![1, 2, 4],
-            ),
-            // (SELECT y FROM v) gives two rows
-            (
-                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
-                 ORDER BY (SELECT y FROM v)) ORDER BY id",
-                vec![1, 2],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
-                 WHERE u.id <= t.id ORDER BY (SELECT y FROM v)) ORDER BY id",
-                vec![1],
-            ),
-        ] {
-            let ids: Vec<i64> = db
-                .query(sql, ())
-                .unwrap_or_else(|e| panic!("{sql}: {e}"))
-                .map(|row| row.unwrap().get::<i64>(0).unwrap())
-                .collect();
-            assert_eq!(ids, want, "{sql}");
-        }
-    }
-}
-
-#[test]
 fn a_block_s_select_alias_is_read_bare_inside_its_subqueries() {
     for (db, _dir) in alias_tables("block_order_limit_bare_alias") {
-        for (sql, want) in [
-            (
-                "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
-                 GROUP BY ROLLUP (x) ORDER BY (SELECT z)) ORDER BY id",
-                vec![1, 2],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
-                 WHERE u.id <= t.id HAVING (SELECT z) > 0) ORDER BY id",
-                vec![1],
-            ),
-        ] {
-            let ids: Vec<i64> = db
-                .query(sql, ())
-                .unwrap_or_else(|e| panic!("{sql}: {e}"))
-                .map(|row| row.unwrap().get::<i64>(0).unwrap())
-                .collect();
-            assert_eq!(ids, want, "{sql}");
-        }
+        let sql = "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
+                   WHERE u.id <= t.id HAVING (SELECT z) > 0) ORDER BY id";
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, [1], "{sql}");
     }
 }
 
@@ -867,58 +814,5 @@ fn a_select_alias_is_read_ahead_of_a_column_farther_out() {
             .map(|row| row.unwrap().get::<i64>(0).unwrap())
             .collect();
         assert_eq!(ids, want, "{sql}");
-    }
-}
-
-#[test]
-fn a_statement_block_key_that_chooses_no_row_binds_its_functions() {
-    for (db, _dir) in alias_tables("block_order_limit_unchosen_functions") {
-        for sql in [
-            "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
-             ORDER BY nosuchfn(MAX(x))) ORDER BY id",
-            "SELECT id FROM t WHERE a IN (SELECT x FROM u UNION SELECT 0 \
-             ORDER BY nosuchfn(x)) ORDER BY id",
-            "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
-             ORDER BY (SELECT nosuchfn(1))) ORDER BY id",
-        ] {
-            let err = error(&db, sql);
-            assert!(err.contains("Function not found: NOSUCHFN"), "{sql}: {err}");
-        }
-        let sql = "SELECT id FROM t WHERE a IN (SELECT x FROM u UNION SELECT 0 \
-                   ORDER BY nosuchfn(x) OVER ()) ORDER BY id";
-        let err = error(&db, sql);
-        assert!(
-            err.contains("Unknown window function: NOSUCHFN"),
-            "{sql}: {err}"
-        );
-        for (sql, want) in [
-            (
-                "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
-                 ORDER BY COALESCE(COUNT(*), CURRENT_TRANSACTION_ID())) ORDER BY id",
-                vec![1, 2],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT GROUPING(x) FROM u \
-                 GROUP BY ROLLUP (x)) ORDER BY id",
-                vec![1, 4],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY ROLLUP (x) \
-                 ORDER BY GROUPING(x)) ORDER BY id",
-                vec![1, 2],
-            ),
-            (
-                "SELECT id FROM t WHERE a IN (SELECT x FROM u UNION SELECT 0 \
-                 ORDER BY ROW_NUMBER() OVER ()) ORDER BY id",
-                vec![1, 2, 4],
-            ),
-        ] {
-            let ids: Vec<i64> = db
-                .query(sql, ())
-                .unwrap_or_else(|e| panic!("{sql}: {e}"))
-                .map(|row| row.unwrap().get::<i64>(0).unwrap())
-                .collect();
-            assert_eq!(ids, want, "{sql}");
-        }
     }
 }

@@ -30,10 +30,6 @@ const SCALAR: usize = 0;
 const AGGREGATE: usize = 1;
 const WINDOW: usize = 2;
 
-/// The functions the engine reads itself, which no kind here holds: the
-/// transaction id the compiler reads, GROUPING a grouped SELECT reads
-const ENGINE_FUNCTIONS: [&str; 2] = ["CURRENT_TRANSACTION_ID", "GROUPING"];
-
 /// Get the global function registry
 #[inline]
 pub fn global_registry() -> &'static FunctionRegistry {
@@ -482,23 +478,6 @@ impl FunctionRegistry {
     /// Check if a function exists
     pub fn exists(&self, name: &str) -> bool {
         self.is_aggregate(name) || self.is_scalar(name) || self.is_window(name) || self.is_tvf(name)
-    }
-
-    /// Whether a call of `name` in an expression resolves: a scalar, an
-    /// aggregate, a window function, or one the engine reads itself
-    pub fn resolves(&self, name: &str) -> bool {
-        self.is_scalar(name)
-            || self.is_aggregate(name)
-            || self.is_window(name)
-            || ENGINE_FUNCTIONS
-                .iter()
-                .any(|engine| name.eq_ignore_ascii_case(engine))
-    }
-
-    /// Whether a call of `name` with OVER resolves: a window function, or an
-    /// aggregate over the window's frame
-    pub fn resolves_over(&self, name: &str) -> bool {
-        self.is_aggregate(name) || self.is_window(name)
     }
 
     /// Get function info by name
