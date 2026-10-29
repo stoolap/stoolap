@@ -511,22 +511,30 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if !block_clauses(sq) {
-            return Err("a subquery block with a clause outside the family");
+        if sq.with.is_some() {
+            return Err("a subquery block with its own WITH");
         }
-        if sq.columns.len() != width {
-            return Err(match width {
-                1 => "a subquery block without exactly one SELECT expression",
-                _ => "a subquery block selecting another number of values than its row holds",
-            });
+        // A set operation's every branch gives the block's row
+        let branches = std::iter::once(sq).chain(sq.set_operations.iter().map(|op| &*op.right));
+        for branch in branches {
+            if branch.columns.len() != width {
+                return Err(match width {
+                    1 => "a subquery block without exactly one SELECT expression",
+                    _ => "a subquery block selecting another number of values than its row holds",
+                });
+            }
+            if branch
+                .columns
+                .iter()
+                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            {
+                return Err("a subquery block selecting *");
+            }
         }
-        let columns = || sq.columns.iter().map(unaliased);
-        if columns().any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_))) {
-            return Err("a subquery block selecting *");
-        }
-        if windowed_block(sq) {
+        if statement_form_block(sq) {
             return self.derived(sq);
         }
+        let columns = || sq.columns.iter().map(unaliased);
         self.order(sq, scopes, false)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
@@ -681,10 +689,10 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if !block_clauses(sq) {
-            return Err("a subquery block with a clause outside the family");
+        if sq.with.is_some() {
+            return Err("a subquery block with its own WITH");
         }
-        if windowed_block(sq) {
+        if statement_form_block(sq) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -776,6 +784,16 @@ fn windowed_block(sq: &SelectStatement) -> bool {
         .any(QueryClassification::expression_has_window_function)
 }
 
+/// A block that runs as one statement: a windowed one, or one holding a
+/// set operation, a DISTINCT, grouping sets or a WINDOW clause
+fn statement_form_block(sq: &SelectStatement) -> bool {
+    windowed_block(sq)
+        || !sq.set_operations.is_empty()
+        || (sq.distinct && sq.distinct_on.is_empty())
+        || matches!(sq.group_by.modifier, GroupByModifier::GroupingSets(_))
+        || !sq.window_defs.is_empty()
+}
+
 /// What a block's SELECT list may hold
 fn list_site(sq: &SelectStatement) -> Site {
     if grouped_block(sq) {
@@ -849,20 +867,6 @@ fn plain_statement(stmt: &SelectStatement) -> bool {
         && stmt.window_defs.is_empty()
         && stmt.group_by.columns.is_empty()
         && stmt.having.is_none()
-}
-
-/// No WITH, set operation, DISTINCT, grouping set or WINDOW
-fn block_clauses(stmt: &SelectStatement) -> bool {
-    stmt.with.is_none() && statement_clauses(stmt)
-}
-
-/// No set operation, DISTINCT, grouping set or WINDOW; a DISTINCT ON is not
-/// a DISTINCT
-fn statement_clauses(stmt: &SelectStatement) -> bool {
-    stmt.set_operations.is_empty()
-        && (!stmt.distinct || !stmt.distinct_on.is_empty())
-        && matches!(stmt.group_by.modifier, GroupByModifier::None)
-        && stmt.window_defs.is_empty()
 }
 
 fn unaliased(expr: &Expression) -> &Expression {
@@ -4637,9 +4641,11 @@ impl Builder<'_> {
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
         // An EXISTS runs without its ORDER BY, which is still bound; one whose
-        // rows its items choose, by a window or a DISTINCT ON, runs as written
-        let dropped =
-            matches!(form, Form::Exists(_)) && !windowed_block(sq) && sq.distinct_on.is_empty();
+        // rows its items choose, by a window, a DISTINCT ON or the clauses of
+        // a statement block, runs as written
+        let dropped = matches!(form, Form::Exists(_))
+            && !statement_form_block(sq)
+            && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
@@ -5113,7 +5119,7 @@ impl Builder<'_> {
         parent: Option<u16>,
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
-        if windowed_block(sq) {
+        if statement_form_block(sq) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities

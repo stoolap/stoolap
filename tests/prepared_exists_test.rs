@@ -159,15 +159,10 @@ fn test_exists_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.k = t.k) FROM t WHERE EXISTS (SELECT 1 FROM u)",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k ORDER BY 1)",
         "SELECT id FROM t WHERE EXISTS (SELECT (u.k, u.id) IN (SELECT k, id FROM w) AS x FROM u WHERE x)",
+        "SELECT id FROM t WHERE EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
-    let sql = "SELECT id FROM t WHERE EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
-    assert_eq!(
-        prepared_line(&db, sql),
-        "Prepared: no (a subquery block with a clause outside the family)",
-        "{sql}"
-    );
 }
 
 #[test]
@@ -700,11 +695,11 @@ fn test_an_in_family_statement_never_reaches_the_general_path() {
             assert_eq!(general_hits(), before, "{sql} under {strategy:?}");
         }
     }
-    // The same NOT EXISTS with an inner DISTINCT takes the anti-join
-    let before = general_path_hits(GeneralPath::AntiJoin);
-    let old = "SELECT id FROM t WHERE NOT EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
-    assert_eq!(ids(&db, old).len(), 2);
-    assert!(general_path_hits(GeneralPath::AntiJoin) > before, "{old}");
+    // The same NOT EXISTS with an inner DISTINCT runs its block as a statement
+    let before = general_hits();
+    let distinct = "SELECT id FROM t WHERE NOT EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
+    assert_eq!(ids(&db, distinct).len(), 2);
+    assert_eq!(general_hits(), before, "{distinct}");
 }
 
 #[test]

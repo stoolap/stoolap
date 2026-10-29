@@ -235,3 +235,32 @@ fn a_limit_subquery_sees_what_its_transaction_wrote() {
     tx.rollback().unwrap();
     assert_eq!(got.map(|r| r.len()), Ok(3));
 }
+
+#[test]
+fn a_set_operation_block_keeps_its_order_by_s_null_placement() {
+    let db = Database::open("memory://limit_subquery_set_operation_nulls").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 0), (5, 1), (6, 2), (7, 3), (8, 0)",
+        "INSERT INTO u VALUES (1, 1, 1), (2, 2, 2), (3, 0, 3), (4, 1, 4), (5, 2, 5), (6, 0, NULL)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let block = "SELECT x FROM u WHERE id = t.id UNION SELECT y FROM u WHERE id = t.id \
+                 ORDER BY 1 DESC LIMIT 1";
+    // DESC sorts NULL first, as the block run alone does: row 6 keeps NULL
+    let alone: Vec<Option<i64>> = db
+        .query(&block.replace("t.id", "6"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+        .collect();
+    assert_eq!(alone, [None]);
+    let sql = format!("SELECT id FROM t WHERE a NOT IN ({block}) ORDER BY id");
+    let ids: Vec<i64> = db
+        .query(&sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids, [4, 5, 7, 8], "{sql}");
+}
