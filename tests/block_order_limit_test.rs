@@ -280,18 +280,17 @@ fn exists_and_member_blocks_answer_from_the_rows_kept() {
 fn a_cut_block_outside_the_family_says_why() {
     let _guard = serial();
     let db = setup("block_order_refused");
+    // A grouped block with ORDER BY and LIMIT runs as a statement block
+    let grouped = scalar("SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1");
+    assert_eq!(prepared_line(&db, &grouped), "Prepared: yes", "{grouped}");
     for (block, reason) in [
-        (
-            "SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",
-            "a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET",
-        ),
         (
             "SELECT x FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",
             "an ORDER BY position in a subquery block",
         ),
         (
             "SELECT x FROM u WHERE u.k = t.id ORDER BY x LIMIT t.a",
-            "a subquery block's LIMIT or OFFSET that is not a literal or a parameter",
+            "a derived table's LIMIT or OFFSET naming a column",
         ),
     ] {
         let sql = scalar(block);
@@ -388,11 +387,14 @@ fn a_key_that_is_the_select_item_answers_with_the_value_it_sorted() {
             "{sql} sorts by the value it answers"
         );
     }
-    let refused = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r + 0 LIMIT 1) FROM t";
-    assert_eq!(
-        prepared_line(&db, refused),
-        "Prepared: no (an ORDER BY expression reading a volatile SELECT alias)"
-    );
+    // A key computed from a volatile alias runs as a statement block
+    let statement = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r + 0 LIMIT 1) FROM t";
+    assert_eq!(prepared_line(&db, statement), "Prepared: yes");
+    let found = db
+        .query(statement, ())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>();
+    assert_eq!(found.unwrap().len(), 4);
 }
 
 #[test]
@@ -457,12 +459,15 @@ fn a_row_block_key_that_is_a_value_answers_with_the_value_it_sorted() {
             "{sql}: one run, one draw per inner row and none for the answer"
         );
     }
-    let refused =
+    // A key computed from a volatile alias runs as a statement block
+    let statement =
         "SELECT (0.5, 0) < (SELECT RANDOM() AS r, 0 FROM u ORDER BY r + 0 LIMIT 1) FROM t";
-    assert_eq!(
-        prepared_line(&db, refused),
-        "Prepared: no (an ORDER BY expression reading a volatile SELECT alias)"
-    );
+    assert_eq!(prepared_line(&db, statement), "Prepared: yes");
+    let found = db
+        .query(statement, ())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>();
+    assert_eq!(found.unwrap().len(), 4);
 }
 
 #[test]
@@ -607,5 +612,207 @@ fn a_block_in_a_key_that_chooses_no_row_is_not_kept_to_run() {
             )
         };
         assert_eq!(blocks(&sql("k")), blocks(&sql("x")), "{from}");
+    }
+}
+
+#[test]
+fn a_grouped_distinct_on_block_keeps_a_group_whose_aggregate_is_null() {
+    let db = Database::open("memory://block_order_limit_grouped_distinct_on_null").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 0), (5, 1), (6, 2), (7, 3), (8, 0)",
+        "INSERT INTO u VALUES (1, 1, 1), (2, 2, 2), (3, 0, 3), (4, 1, 4), (5, 2, 5), (6, 0, NULL)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Row 6's block has one group, whose MAX(y) is NULL: NOT IN over it is unknown
+    let sql = "SELECT id FROM t WHERE a NOT IN (SELECT DISTINCT ON (x) MAX(y) FROM u \
+               WHERE id = t.id GROUP BY x ORDER BY x) ORDER BY id";
+    let ids: Vec<i64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids, [4, 5, 7, 8], "{sql}");
+}
+
+#[test]
+fn a_block_key_s_subquery_answers_whatever_it_reads() {
+    let db = Database::open("memory://block_order_limit_unchosen_alias").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE v (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 7)",
+        "INSERT INTO u VALUES (1, 1), (2, 2)",
+        "INSERT INTO v VALUES (1), (2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for (sql, want) in [
+        // The key reads the SELECT alias z inside its subquery
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u ORDER BY (SELECT z + u.x)) \
+             ORDER BY id",
+            vec![1, 2],
+        ),
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u ORDER BY (SELECT z + u.x) DESC \
+             LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        // The same key one statement deeper, in a block a computed LIMIT sends
+        (
+            "SELECT id FROM t WHERE a IN (SELECT (SELECT x AS z FROM u \
+             ORDER BY (SELECT z + u.x) DESC LIMIT 1 + 0) FROM v LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        // The same key inside a named window of a derived table
+        (
+            "SELECT id FROM t WHERE a IN (SELECT r FROM (SELECT RANK() OVER w AS r FROM v \
+             WINDOW w AS (ORDER BY (SELECT x AS z FROM u ORDER BY (SELECT z + u.x) DESC \
+             LIMIT 1 + 0))) d LIMIT 1 + 0) ORDER BY id",
+            vec![1],
+        ),
+        // An EXISTS computes no key: u.id * 9223372036854775807 overflows for 2
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
+             GROUP BY u.id ORDER BY u.id * 9223372036854775807) ORDER BY id",
+            vec![1, 2],
+        ),
+        // An EXISTS orders no row: (SELECT id FROM v), two rows, is never read
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
+             GROUP BY u.id ORDER BY (SELECT id FROM v)) ORDER BY id",
+            vec![1, 2],
+        ),
+    ] {
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, want, "{sql}");
+    }
+}
+
+/// The same rows hot in memory and sealed into a volume
+fn alias_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
+    let open = |dsn: &str, dir: tempfile::TempDir, seal: bool| {
+        let db = Database::open(dsn).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+            "CREATE TABLE v (id INTEGER PRIMARY KEY, y INTEGER)",
+            "INSERT INTO t VALUES (1, 1), (2, 2), (3, 7), (4, 0)",
+            "INSERT INTO u VALUES (1, 1), (2, 2), (3, 2), (4, 5)",
+            "INSERT INTO v VALUES (1, 1), (2, 3)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if seal {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        (db, dir)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    [
+        open(
+            &format!("memory://{name}"),
+            tempfile::tempdir().unwrap(),
+            false,
+        ),
+        open(&sealed, dir, true),
+    ]
+}
+
+#[test]
+fn a_block_s_select_alias_is_read_bare_inside_its_subqueries() {
+    for (db, _dir) in alias_tables("block_order_limit_bare_alias") {
+        let sql = "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
+                   WHERE u.id <= t.id HAVING (SELECT z) > 0) ORDER BY id";
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, [1], "{sql}");
+    }
+}
+
+#[test]
+fn a_qualified_name_reads_its_table_s_column_never_a_select_alias() {
+    for (db, _dir) in alias_tables("block_order_limit_qualified_alias") {
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+             HAVING (SELECT u.z) > 0 ORDER BY z LIMIT 1) ORDER BY id",
+            "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u WHERE u.id <= t.id \
+             GROUP BY ROLLUP (x) HAVING (SELECT u.z) > 0) ORDER BY id",
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT DISTINCT ON (u.z) u.x) DESC LIMIT 1 + 0) ORDER BY id",
+        ] {
+            assert_eq!(error(&db, sql), "column 'u.z' not found", "{sql}");
+        }
+    }
+}
+
+#[test]
+fn a_select_alias_is_read_ahead_of_a_column_farther_out() {
+    let db = Database::open("memory://block_order_limit_alias_ahead").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, z INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO t VALUES (1, 1, -1), (2, 2, -1)",
+        "INSERT INTO u VALUES (1, 1), (2, 2)",
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, z INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, z INTEGER)",
+        "INSERT INTO v VALUES (1, 1)",
+        "INSERT INTO w VALUES (1, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // The alias does not answer for a name two nearer sources have
+    for sql in [
+        "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u GROUP BY x \
+         ORDER BY (SELECT z FROM v CROSS JOIN w)) ORDER BY id",
+        "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u GROUP BY x \
+         ORDER BY (SELECT z FROM v CROSS JOIN w) LIMIT 1 + 0) ORDER BY id",
+    ] {
+        assert_eq!(
+            error(&db, sql),
+            "invalid argument: column reference 'z' is ambiguous",
+            "{sql}"
+        );
+    }
+    for (sql, want) in [
+        // z is the block's alias x, not t.z
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT z * u.x) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT (SELECT z * u.x)) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        // Without the alias, z is t.z
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS q FROM u \
+             ORDER BY (SELECT z * u.x) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![1],
+        ),
+    ] {
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, want, "{sql}");
     }
 }

@@ -534,7 +534,8 @@ impl<'a> Family<'a> {
                 return Err("a subquery block selecting *");
             }
         }
-        if statement_form_block(sq, counts_rows) {
+        let registry = &self.executor.function_registry;
+        if statement_form_block(sq, counts_rows, false, registry) {
             return self.derived(sq);
         }
         let columns = || sq.columns.iter().map(unaliased);
@@ -553,76 +554,39 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// A block's DISTINCT ON, ORDER BY, LIMIT and OFFSET: its counts literals
-    /// or parameters, its keys values over its row and the enclosing ones; a
-    /// block that groups holds none of them
+    /// A block's DISTINCT ON and ORDER BY keys, values over its row and the
+    /// enclosing ones: no ORDER BY position (an EXISTS checks its own where
+    /// it is bound) and no subquery in a key that chooses no row; one only a
+    /// statement reads (`statement_order`) runs as a statement block instead
     fn order(
         &self,
         sq: &'a SelectStatement,
         scopes: usize,
         exists: bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        if sq.order_by.is_empty()
-            && sq.distinct_on.is_empty()
-            && sq.limit.is_none()
-            && sq.offset.is_none()
-        {
-            return Ok(());
-        }
-        if grouped_block(sq) {
-            return Err("a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET");
-        }
-        let counts = [sq.limit.as_deref(), sq.offset.as_deref()];
-        if counts.into_iter().flatten().any(|count| {
-            !matches!(
-                count,
-                Expression::IntegerLiteral(_) | Expression::Parameter(_)
-            )
-        }) {
-            return Err("a subquery block's LIMIT or OFFSET that is not a literal or a parameter");
+        let position =
+            |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
+        if !exists && sq.order_by.iter().any(position) {
+            return Err("an ORDER BY position in a subquery block");
         }
         // Keys that choose no row are bound but never computed
         let chooses =
             !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
-        let volatile_aliases: SmallVec<[&str; 1]> = sq
-            .columns
-            .iter()
-            .filter_map(|column| match column {
-                Expression::Aliased(item)
-                    if volatile(&item.expression, &self.executor.function_registry) =>
-                {
-                    Some(item.alias.value_lower.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        let reads_volatile_alias =
-            |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
-        let mut found = false;
-        for ob in &sq.order_by {
-            let key = &ob.expression;
-            // An EXISTS block checks its positions where it is bound
-            if matches!(key, Expression::IntegerLiteral(_)) && !exists {
-                return Err("an ORDER BY position in a subquery block");
-            }
-            if !chooses && mentions_subquery(key) {
-                return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
-            }
-            if !order_by_names_an_alias(key, sq) && reads_volatile_alias(key) {
-                return Err("an ORDER BY expression reading a volatile SELECT alias");
-            }
-            self.expression(key, scopes, Site::Values, &mut found)?;
+        if !chooses
+            && sq
+                .order_by
+                .iter()
+                .any(|ob| mentions_subquery(&ob.expression))
+        {
+            return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
         }
-        for key in &sq.distinct_on {
-            if matches!(key, Expression::IntegerLiteral(_)) {
-                return Err("a DISTINCT ON position in a subquery block");
-            }
-            if mentions_subquery(key) {
-                return Err("a subquery block's DISTINCT ON key holding a subquery");
-            }
-            if reads_volatile_alias(key) {
-                return Err("a DISTINCT ON key reading a volatile SELECT alias");
-            }
+        let mut found = false;
+        let keys = sq
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .chain(&sq.distinct_on);
+        for key in keys {
             self.expression(key, scopes, Site::Values, &mut found)?;
         }
         Ok(())
@@ -695,7 +659,11 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        if statement_form_block(sq, false) {
+        // An EXISTS runs the clauses only a statement reads as main does
+        if !clause_block(sq, false) && statement_order(sq, &self.executor.function_registry) {
+            return Err("an EXISTS block whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads");
+        }
+        if clause_block(sq, false) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -787,17 +755,77 @@ fn windowed_block(sq: &SelectStatement) -> bool {
         .any(QueryClassification::expression_has_window_function)
 }
 
-/// A block that runs as one statement: a windowed one, or one holding a
-/// set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a DISTINCT
-/// that changes its answer, which it does only where something counts its
-/// rows: a value block (`counts_rows`), a LIMIT or an OFFSET
-fn statement_form_block(sq: &SelectStatement, counts_rows: bool) -> bool {
+/// A block that runs as one statement: one `clause_block` names, or, but
+/// for an EXISTS (`exists`), whose ORDER BY chooses no row, one whose
+/// ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads
+fn statement_form_block(
+    sq: &SelectStatement,
+    counts_rows: bool,
+    exists: bool,
+    registry: &FunctionRegistry,
+) -> bool {
+    clause_block(sq, counts_rows) || (!exists && statement_order(sq, registry))
+}
+
+/// A block a statement runs for its clauses: a windowed one, or one holding
+/// a set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a
+/// DISTINCT that changes its answer, which it does only where something
+/// counts its rows: a value block (`counts_rows`), a LIMIT or an OFFSET
+fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
         || !sq.set_operations.is_empty()
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
+}
+
+/// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
+/// any of them on a grouped block, a count not a literal or a parameter, a
+/// DISTINCT ON position or key holding a subquery, or a key reading a
+/// volatile SELECT alias
+fn statement_order(sq: &SelectStatement, registry: &FunctionRegistry) -> bool {
+    if sq.order_by.is_empty()
+        && sq.distinct_on.is_empty()
+        && sq.limit.is_none()
+        && sq.offset.is_none()
+    {
+        return false;
+    }
+    if grouped_block(sq) {
+        return true;
+    }
+    let counts = [sq.limit.as_deref(), sq.offset.as_deref()];
+    let literal = |count: &Expression| {
+        matches!(
+            count,
+            Expression::IntegerLiteral(_) | Expression::Parameter(_)
+        )
+    };
+    if !counts.into_iter().flatten().all(literal) {
+        return true;
+    }
+    let volatile_aliases: SmallVec<[&str; 1]> = sq
+        .columns
+        .iter()
+        .filter_map(|column| match column {
+            Expression::Aliased(item) if volatile(&item.expression, registry) => {
+                Some(item.alias.value_lower.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let reads_volatile_alias =
+        |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
+    let position = |key: &Expression| matches!(key, Expression::IntegerLiteral(_));
+    sq.order_by
+        .iter()
+        .map(|ob| &ob.expression)
+        .any(|key| !order_by_names_an_alias(key, sq) && reads_volatile_alias(key))
+        || sq
+            .distinct_on
+            .iter()
+            .any(|key| position(key) || mentions_subquery(key) || reads_volatile_alias(key))
 }
 
 /// What a block's SELECT list may hold
@@ -1512,9 +1540,30 @@ struct StatementWalk<'w> {
     /// Whether a view whose query only its run can name may run here; an
     /// EXPLAIN runs nothing
     runs: bool,
+    /// The SELECT aliases of the statements around the one walked, each with
+    /// the scope count of its statement, which a bare name reads ahead of a
+    /// column of a scope farther out, as the general binder does
+    visible: Vec<(SmartString, usize)>,
 }
 
 impl StatementWalk<'_> {
+    /// The subquery `sq` of a clause walked at `level`, which sees that
+    /// level's SELECT aliases besides its scopes
+    fn nested(
+        &mut self,
+        sq: &SelectStatement,
+        level: &Level<'_>,
+        check: Check,
+    ) -> Result<SelectStatement> {
+        let mark = self.visible.len();
+        let owner = level.scopes.len();
+        self.visible
+            .extend(level.aliases.iter().map(|alias| (alias.clone(), owner)));
+        let walked = self.statement(sq, &level.scopes, level.inside, check);
+        self.visible.truncate(mark);
+        Ok(walked?.0)
+    }
+
     /// Each subquery of `expr`, walked over the scopes `enclosing`
     fn subqueries_of(&mut self, expr: &Expression, enclosing: &[&ScopeTable]) -> Result<()> {
         let block = |walk: &mut Self, sq: &SelectStatement| {
@@ -1816,11 +1865,24 @@ impl StatementWalk<'_> {
                 if level.aliases.contains(&id.value_lower) {
                     return Ok(expr.clone());
                 }
-                match chain.bare(id) {
+                // The scope of the nearest statement around it with that alias;
+                // only a column of a scope up to it comes before the alias
+                let alias = self
+                    .visible
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| *name == id.value_lower)
+                    .and_then(|(_, owner)| level.scopes.len().checked_sub(*owner));
+                let near = Chain {
+                    scopes: alias.map_or(&level.scopes[..], |at| &level.scopes[..=at]),
+                };
+                match near.bare(id) {
                     Ok(Some((depth, index))) => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
                         None => Ok(expr.clone()),
                     },
+                    // An alias of a statement around it is read at its run
+                    Err(Error::ColumnNotFound(_)) if alias.is_some() => Ok(expr.clone()),
                     Err(e) if level.check => Err(e),
                     _ => Ok(expr.clone()),
                 }
@@ -1853,29 +1915,15 @@ impl StatementWalk<'_> {
             }
             Expression::ScalarSubquery(sq) => Ok(Expression::ScalarSubquery(ScalarSubquery {
                 token: sq.token.clone(),
-                subquery: Box::new(
-                    self.statement(&sq.subquery, &level.scopes, level.inside, nested(false))?
-                        .0,
-                ),
+                subquery: Box::new(self.nested(&sq.subquery, level, nested(false))?),
             })),
             Expression::Exists(exists) => Ok(Expression::Exists(ExistsExpression {
                 token: exists.token.clone(),
-                subquery: Box::new(
-                    self.statement(&exists.subquery, &level.scopes, level.inside, nested(true))?
-                        .0,
-                ),
+                subquery: Box::new(self.nested(&exists.subquery, level, nested(true))?),
             })),
             Expression::AllAny(all_any) => Ok(Expression::AllAny(AllAnyExpression {
                 left: Box::new(self.expr(&all_any.left, level)?),
-                subquery: Box::new(
-                    self.statement(
-                        &all_any.subquery,
-                        &level.scopes,
-                        level.inside,
-                        nested(false),
-                    )?
-                    .0,
-                ),
+                subquery: Box::new(self.nested(&all_any.subquery, level, nested(false))?),
                 ..all_any.clone()
             })),
             Expression::Aliased(aliased) => Ok(Expression::Aliased(AliasedExpression {
@@ -4569,6 +4617,7 @@ impl Builder<'_> {
                 Reach::Param(_) => Ok(None),
             },
             runs: true,
+            visible: Vec::new(),
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
@@ -4703,7 +4752,7 @@ impl Builder<'_> {
         // rows its items choose, by a window, a DISTINCT ON or the clauses of
         // a statement block, runs as written
         let dropped = matches!(form, Form::Exists(_))
-            && !statement_form_block(sq, false)
+            && !clause_block(sq, false)
             && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
@@ -4729,6 +4778,7 @@ impl Builder<'_> {
                 }
             },
             runs: true,
+            visible: Vec::new(),
         }
         .statement(sq, outer, 0, Check::All)?;
         self.max_param = self.max_param.max(max_param);
@@ -5188,7 +5238,9 @@ impl Builder<'_> {
                     ..
                 }
         );
-        if statement_form_block(sq, counts_rows) {
+        let exists = matches!(form, Form::Exists(_));
+        let registry = &self.executor.function_registry;
+        if statement_form_block(sq, counts_rows, exists, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities
@@ -8465,6 +8517,7 @@ impl Executor {
             ctx,
             on: &mut on,
             runs,
+            visible: Vec::new(),
         };
         let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
         let name = scope.tables.first().map(|(name, _)| name.as_str());
@@ -8505,6 +8558,7 @@ impl Executor {
                         ctx: &ctx,
                         on: &mut on,
                         runs,
+                        visible: Vec::new(),
                     };
                     named(walk.statement(query, &[], 0, Check::Off)?.1)?
                 }
@@ -9108,6 +9162,7 @@ fn sides_read_within(
         ctx,
         on: &mut on,
         runs: true,
+        visible: Vec::new(),
     };
     walk.subqueries_of(expr, &[scope])?;
     Ok(read)
@@ -9586,6 +9641,7 @@ impl Executor {
             ctx,
             on: &mut |_| Ok(None),
             runs: false,
+            visible: Vec::new(),
         }
         .statement(stmt, &[], 0, Check::Off)?;
         named(names)

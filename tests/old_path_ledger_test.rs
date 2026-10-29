@@ -664,6 +664,18 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT id FROM t WHERE a IN (1, 2, 3) OR a + 2 IN (1, 2, 3)",
         Old("7b Phase 3: a statement block's own statement runs on the general executor"),
     ),
+    (
+        "scalar_grouped_block_with_order_and_limit",
+        "SELECT id, (SELECT COUNT(*) FROM u GROUP BY x ORDER BY COUNT(*) DESC, x LIMIT 1) FROM t",
+        "SELECT id, 1 FROM t",
+        Prepared,
+    ),
+    (
+        "in_block_with_a_computed_limit",
+        "SELECT id FROM t WHERE a IN (SELECT x FROM u ORDER BY x DESC LIMIT 1 + 0)",
+        "SELECT id FROM t WHERE a IN (3)",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
