@@ -12899,6 +12899,21 @@ impl PreparedRunner<'_> {
             }
             return Ok(value.unwrap_or_else(Value::null_unknown));
         }
+        // A block without FROM reads one row without columns, opening no scan
+        if self.tables[index].is_none() {
+            let row = Row::new();
+            let passes = match &sq.filter {
+                Some(filter) => {
+                    let exec = self.exec_over(&row, &params).with_subquery_executor(self);
+                    vm.execute_bool_checked(filter, &exec)?
+                }
+                None => true,
+            };
+            if passes {
+                self.take_one(&mut vm, projection, &row, &params, &mut value)?;
+            }
+            return Ok(value.unwrap_or_else(Value::null_unknown));
+        }
         // The scanner keeps what it needs of the expression, so the next
         // call may rebind it once this scan is set up
         let pushed = self.bind_pushdown(index, &params);

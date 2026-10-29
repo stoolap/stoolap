@@ -132,6 +132,17 @@ fn a_star_sorted_by_its_own_column_takes_the_rows_as_a_list_of_them_does() {
 }
 
 #[test]
+fn a_block_without_from_reads_its_one_row_without_a_scan() {
+    let db = open("projection_alloc_fromless_block");
+    let block = allocations(&db, "SELECT id, (SELECT id + 0) FROM t", &[]);
+    let plain = allocations(&db, "SELECT id, id + 0 FROM t", &[]);
+    assert!(
+        block < plain + ROWS / 2,
+        "{block} allocations reading a block without FROM per row, {plain} for its expression"
+    );
+}
+
+#[test]
 fn a_short_concatenation_of_many_parts_allocates_nothing_per_row() {
     let db = open("projection_alloc_parts");
     let parts = allocations(
