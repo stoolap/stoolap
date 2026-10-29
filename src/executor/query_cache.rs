@@ -315,32 +315,6 @@ impl std::fmt::Debug for CompiledInsert {
     }
 }
 
-/// Pre-compiled state for COUNT(DISTINCT col) queries
-/// Caches table/column info to avoid re-parsing aggregation on every execution
-#[derive(Debug, Clone)]
-pub struct CompiledCountDistinct {
-    /// Table name (already lowercased)
-    pub table_name: SmartString,
-    /// Column name to count distinct values from (lowercased)
-    pub column_name: SmartString,
-    /// Result column name (e.g., "COUNT(DISTINCT age)")
-    pub result_column_name: String,
-    /// When the compiled state holds
-    pub validity: PlanValidity,
-}
-
-/// Pre-compiled state for COUNT(*) queries
-/// Caches table info to avoid re-parsing on every execution
-#[derive(Debug, Clone)]
-pub struct CompiledCountStar {
-    /// Table name (already lowercased)
-    pub table_name: SmartString,
-    /// Result column name (e.g., "COUNT(*)")
-    pub result_column_name: String,
-    /// When the compiled state holds
-    pub validity: PlanValidity,
-}
-
 /// The plan of a statement, and those of the statements it runs inside
 /// itself, each held in the plan of the one that runs it and dropped with it
 #[derive(Debug, Default)]
@@ -422,10 +396,9 @@ pub enum CompiledExecution {
     Insert(CompiledInsert),
     /// Compiled INSERT with conflict handling
     ConflictInsert(CompiledConflictInsert),
-    /// COUNT(DISTINCT col) fast path
-    CountDistinct(CompiledCountDistinct),
-    /// COUNT(*) fast path
-    CountStar(CompiledCountStar),
+    /// A statement without WHERE whose one row is counts the table keeps or
+    /// an index's bound
+    GlobalAggregate(Arc<super::planned_aggregate::PlannedAggregate>),
     /// The programs a join statement compiles (general SELECT path)
     PreparedJoin(Arc<super::prepared_join::PreparedJoin>),
     /// A statement of the prepared family (general SELECT path)

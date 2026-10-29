@@ -190,6 +190,40 @@ fn a_commit_between_the_hot_and_the_sealed_read_leaves_the_view_answer() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+#[test]
+fn a_planned_count_or_bound_answers_one_committed_state() {
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT COUNT(*) FROM t",
+        "SELECT COUNT(DISTINCT k), COUNT(*) FROM t",
+        "SELECT MIN(k) FROM t",
+        "SELECT MAX(k) FROM t",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(dir.path());
+        setup(&db, true);
+        // The first run plans the statement, which the next runs read by
+        let before = answer(&db, sql);
+        let committed = Rc::new(Cell::new(false));
+        let (other, flag) = (db.clone(), Rc::clone(&committed));
+        stoolap::test_failpoints::between_hot_and_cold_reads(move || {
+            other
+                .execute("DELETE FROM t WHERE id IN (1, 5)", ())
+                .unwrap();
+            flag.set(true);
+        });
+        let seen = answer(&db, sql);
+        assert!(committed.get(), "{sql}: the commit did not land inside");
+        let after = answer(&db, sql);
+        if seen != before && seen != after {
+            wrong.push(format!(
+                "{sql}: {seen:?}, before {before:?}, after {after:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
     db.query(sql, ())
         .unwrap()
