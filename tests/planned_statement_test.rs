@@ -144,6 +144,57 @@ fn a_failing_value_fails_only_for_a_row_that_reaches_it() {
 }
 
 #[test]
+fn a_source_row_past_the_limit_is_never_computed() {
+    let db = table("planned_source_row_past_limit");
+    let fails_at_3 = "CASE WHEN id = 3 THEN ABS('a') ELSE id END";
+    db.execute(
+        &format!("CREATE VIEW w AS SELECT id, {fails_at_3} AS q FROM t"),
+        (),
+    )
+    .unwrap();
+    let all = db
+        .query("SELECT id, q FROM w", ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+    assert!(all.is_err(), "the view's third row computed its value");
+    for sql in [
+        "SELECT id FROM w LIMIT 1".to_string(),
+        format!("SELECT id FROM (SELECT id, {fails_at_3} AS q FROM t) AS d LIMIT 1"),
+        "SELECT id, q FROM w LIMIT 2".to_string(),
+    ] {
+        let answer = db
+            .query(&sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+        assert!(answer.is_ok(), "{sql}: {:?}", answer.err());
+    }
+}
+
+#[test]
+fn a_cte_answers_alike_whether_or_not_it_hides_a_view() {
+    let db = table("planned_cte_hides_view");
+    let fails_at_3 = "CASE WHEN i = 3 THEN ABS('a') ELSE i END";
+    let statements = [
+        format!("WITH c(i) AS (SELECT id FROM t) SELECT {fails_at_3} FROM c LIMIT 1"),
+        format!("WITH c AS (SELECT id AS i FROM t) SELECT {fails_at_3} FROM c LIMIT 1"),
+    ];
+    let read = |sql: &str| {
+        db.query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map(|rows| rows.len())
+            .map_err(|e| e.to_string())
+    };
+    let alone: Vec<_> = statements.iter().map(|sql| read(sql)).collect();
+    db.execute("CREATE VIEW c AS SELECT 0 AS i", ()).unwrap();
+    for (sql, alone) in statements.iter().zip(alone) {
+        assert_eq!(read(sql), alone, "{sql}: a view the CTE hides changed it");
+        assert_eq!(
+            alone,
+            Ok(1),
+            "{sql}: a row past the LIMIT computed its value"
+        );
+    }
+}
+
+#[test]
 fn a_failing_parameter_or_subquery_fails_only_where_a_row_reaches_it() {
     let db = table("planned_failing_parameter");
     db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
@@ -222,6 +273,95 @@ fn explain_names_each_read_a_run_may_take() {
                 "  else SeqScan t ((1 = 0) AND (v > 1))",
             ],
         ),
+    ] {
+        assert_eq!(explain(sql), plan, "{sql}");
+    }
+}
+
+#[test]
+fn explain_names_the_source_a_statement_reads() {
+    let db = table("planned_explain_sources");
+    db.execute("CREATE VIEW w AS SELECT id, v FROM t", ())
+        .unwrap();
+    let explain = |sql: &str| -> Vec<String> {
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect()
+    };
+    for (sql, plan) in [
+        (
+            "SELECT a FROM (SELECT id AS a, v FROM t) d WHERE v > 1 ORDER BY a LIMIT 2",
+            vec![
+                "Limit 2",
+                "  TopN a ASC",
+                "    Project a",
+                "      Derived d (v > 1)",
+                "        SELECT",
+                "          Columns: id AS a, v",
+                "          -> Seq Scan on t",
+            ],
+        ),
+        (
+            "SELECT id FROM w WHERE v > 1 ORDER BY v DESC",
+            vec![
+                "Sort v DESC",
+                "  Project id",
+                "    View w (v > 1)",
+                "      SELECT",
+                "        Columns: id, v",
+                "        -> Seq Scan on t",
+            ],
+        ),
+        (
+            "WITH c AS (SELECT id, v FROM t) SELECT id FROM c WHERE v = 2",
+            vec![
+                "Project id",
+                "  Derived c (v = 2)",
+                "    SELECT",
+                "      Columns: id, v",
+                "      -> Seq Scan on t",
+            ],
+        ),
+        (
+            "WITH c (i, x) AS (SELECT id, v FROM t) SELECT i FROM c WHERE x = 2",
+            vec![
+                "Project i",
+                "  Cte c (x = 2)",
+                "    SELECT",
+                "      Columns: id, v",
+                "      -> Seq Scan on t",
+            ],
+        ),
+        (
+            "SELECT b FROM (SELECT x AS b FROM (VALUES (1), (2)) AS z(x) WHERE x > 1) d",
+            vec![
+                "Project b",
+                "  Derived d",
+                "    Project b",
+                "      Values z (x > 1)",
+            ],
+        ),
+        (
+            "SELECT x FROM (VALUES (1), (2)) AS z(x) ORDER BY x LIMIT 1",
+            vec!["Limit 1", "  TopN x ASC", "    Project x", "      Values z"],
+        ),
+        (
+            "SELECT value FROM generate_series(1, 5) WHERE value > 2",
+            vec!["Project value", "  Function generate_series (value > 2)"],
+        ),
+        (
+            "SELECT id FROM (SELECT id, v FROM t WHERE id = 2) t WHERE v = 2",
+            vec![
+                "Project id",
+                "  Derived t (v = 2)",
+                "    SELECT",
+                "      Columns: id, v",
+                "      -> PK Lookup on t",
+                "           id = 2",
+            ],
+        ),
+        ("SELECT 1 + 1", vec!["Project 1 + 1", "  OneRow"]),
     ] {
         assert_eq!(explain(sql), plan, "{sql}");
     }

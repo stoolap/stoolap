@@ -1642,8 +1642,11 @@ impl Executor {
             if !self.holds_prepared_select(slot, ctx)
                 && !self.holds_prepared_grouped(slot, ctx)
                 && self.prepared_family(stmt, Some(ctx)).is_err()
+                && !(slot.is_some()
+                    && self.reads_source(stmt, ctx)
+                    && self.planned_family(stmt, Some(ctx)).is_ok())
                 && !grouped()
-                && !self.join_keeps_plan(stmt, with)
+                && !self.join_keeps_plan(stmt, with, true)
             {
                 return self.execute_select_with_ctes(stmt, ctx, compiled);
             }
@@ -1705,11 +1708,15 @@ impl Executor {
             None => get_classification(stmt),
         };
 
-        // A statement of the prepared family runs on that path and no other
+        // A statement of the prepared family runs on that path and no other,
+        // and so does one over a single source with a plan slot to keep
         let slot = compiled.map(NestedPlan::slot);
         let in_family = self.holds_prepared_select(slot, ctx)
             || ((classification.where_has_subqueries || classification.output_has_subqueries)
-                && self.prepared_family(stmt, Some(ctx)).is_ok());
+                && self.prepared_family(stmt, Some(ctx)).is_ok())
+            || (slot.is_some()
+                && self.reads_source(stmt, ctx)
+                && self.planned_family(stmt, Some(ctx)).is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
         // them as its blocks
         let grouped_family = Self::grouped_family_reach(stmt, &classification)
@@ -5429,8 +5436,14 @@ impl Executor {
 
     /// Whether a join with a subquery in a clause keeps its plan, its CTEs
     /// bound or inlined, so its blocks may run; a join with a CTE not named
-    /// before it runs stays there
-    pub(crate) fn join_keeps_plan(&self, stmt: &SelectStatement, with: &WithClause) -> bool {
+    /// before it runs stays there; a view only its run names runs when the
+    /// caller `runs`
+    pub(crate) fn join_keeps_plan(
+        &self,
+        stmt: &SelectStatement,
+        with: &WithClause,
+        runs: bool,
+    ) -> bool {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return false;
         };
@@ -5438,26 +5451,28 @@ impl Executor {
         (classification.where_has_subqueries
             || classification.output_has_subqueries
             || Self::ons_hold_subqueries(join))
-            && self.named_ctes(with).is_ok()
+            && self.named_ctes(with, runs).is_ok()
     }
 
     /// Each side's columns as the join's blocks read them, a base table's
     /// schema or the names a FROM gives any other source, and whether it is
     /// read as rows; a side that is a join, read as rows, has its tables'
     /// columns side by side. None when a table is read with AS OF or a source
-    /// is not named without reading it
+    /// is not named without reading it; a view only its run names runs when
+    /// the caller `runs`
     pub(crate) fn join_side_schemas(
         &self,
         join_source: &JoinTableSource,
         ctx: &ExecutionContext,
+        runs: bool,
     ) -> Option<JoinSides> {
         Some([
-            self.join_side(&join_source.left, ctx)?,
-            self.join_side(&join_source.right, ctx)?,
+            self.join_side(&join_source.left, ctx, runs)?,
+            self.join_side(&join_source.right, ctx, runs)?,
         ])
     }
 
-    fn join_side(&self, expr: &Expression, ctx: &ExecutionContext) -> Option<JoinSide> {
+    fn join_side(&self, expr: &Expression, ctx: &ExecutionContext, runs: bool) -> Option<JoinSide> {
         match expr {
             Expression::TableSource(ts) if ts.as_of.is_some() => None,
             Expression::TableSource(_)
@@ -5468,7 +5483,7 @@ impl Executor {
                 let (schema, rows) = match self.base_table_side_schema(expr, CteNames::Context(ctx))
                 {
                     Some(schema) => (schema, false),
-                    None => (self.join_side_schema(expr, ctx).ok()?, true),
+                    None => (self.join_side_schema(expr, ctx, runs).ok()?, true),
                 };
                 Some(JoinSide {
                     leaves: smallvec::smallvec![(name, schema)],
@@ -5480,7 +5495,7 @@ impl Executor {
             Expression::JoinSource(join) => {
                 let mut leaves = smallvec::SmallVec::new();
                 for side in [&join.left, &join.right] {
-                    let side = self.join_side(side, ctx)?;
+                    let side = self.join_side(side, ctx, runs)?;
                     if side.leaves.iter().any(|(name, _)| name.is_empty()) {
                         return None;
                     }
@@ -5904,7 +5919,7 @@ impl Executor {
             || Self::ons_hold_subqueries(join_source)
             || classification.output_has_subqueries;
         let block_sides = plan.as_ref().filter(|_| asks_blocks).and_then(|plan| {
-            plan.sides(|| self.join_side_schemas(join_source, ctx))
+            plan.sides(|| self.join_side_schemas(join_source, ctx, true))
                 .cloned()
         });
         let blocks_where = asks_blocks
@@ -8128,20 +8143,24 @@ impl Executor {
             .put(view_query, stmt_arc, ParamSlots::default()))
     }
 
+    /// Refuse a view read one view too deep, before its nesting overflows the stack
+    pub(super) fn check_view_depth(ctx: &ExecutionContext) -> Result<()> {
+        if ctx.view_depth() >= MAX_VIEW_DEPTH {
+            return Err(Error::InvalidArgument(format!(
+                "Maximum view nesting depth ({}) exceeded",
+                MAX_VIEW_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
     /// The rows of a view's own query, one view deeper than `ctx`
     pub(super) fn execute_view_body(
         &self,
         view_def: &ViewDefinition,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        // Check view depth to prevent stack overflow from deeply nested views
-        let depth = ctx.view_depth();
-        if depth >= MAX_VIEW_DEPTH {
-            return Err(Error::InvalidArgument(format!(
-                "Maximum view nesting depth ({}) exceeded",
-                MAX_VIEW_DEPTH
-            )));
-        }
+        Self::check_view_depth(ctx)?;
 
         // Parse the view's query using cache (an Arc clone of its plan, no clone)
         let view_plan = self.parse_view_statement(&view_def.query)?;

@@ -576,7 +576,12 @@ impl Executor {
     }
 
     /// Generate EXPLAIN output for a statement
-    fn explain_statement(&self, stmt: &Statement, lines: &mut Vec<String>, indent: usize) {
+    pub(super) fn explain_statement(
+        &self,
+        stmt: &Statement,
+        lines: &mut Vec<String>,
+        indent: usize,
+    ) {
         let prefix = "  ".repeat(indent);
 
         match stmt {
@@ -635,8 +640,8 @@ impl Executor {
         // A join with CTEs keeps its plan as execution keeps it, its CTE
         // sides named by their bodies
         let ctx = match with {
-            Some(with) if self.join_keeps_plan(select, with) => {
-                self.named_ctes(with).map_err(|_| "a WITH clause")?
+            Some(with) if self.join_keeps_plan(select, with, false) => {
+                self.named_ctes(with, false).map_err(|_| "a WITH clause")?
             }
             Some(_) => return Err("a WITH clause"),
             None => ExecutionContext::new(),
@@ -644,7 +649,8 @@ impl Executor {
         if Self::folds_select_subqueries(select, &get_classification(select)) {
             return Err("a grouped SELECT list whose subqueries are read first");
         }
-        let sides = self.join_side_schemas(join, &ctx);
+        // EXPLAIN runs no view to name it
+        let sides = self.join_side_schemas(join, &ctx, false);
         self.join_blocks_family(
             select,
             join,

@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT, set operations, a WHERE or select list with a subquery, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -126,6 +126,29 @@ Project id, name, category, value
 ```
 
 A multi-column index shows as `CompositeIndex name (a =, b range)`: equalities on its leading columns and a range, with an upper bound, on the next one.
+
+### Views, CTEs and Derived Tables
+
+A statement over a view, a CTE, a derived table, a VALUES list or a table function reads the rows its source gives and judges each by the whole WHERE, shown after the source's name. The plan of the statement the rows come from is indented under it, in the format of the path that runs it:
+
+```sql
+EXPLAIN SELECT name FROM (SELECT id, name, value FROM products) p WHERE value > 15 ORDER BY name LIMIT 2;
+```
+
+Output:
+```
+plan
+----
+Limit 2
+  TopN name ASC
+    Project name
+      Derived p (value > 15)
+        SELECT
+          Columns: id, name, value
+          -> Seq Scan on products
+```
+
+A CTE read once, with no column list, runs as a derived table and shows as one. Any other CTE runs before the statement and shows as `Cte`, with its query's plan under it.
 
 ### Hash Join
 
@@ -304,6 +327,9 @@ For a planned single-table SELECT:
 | PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
 | Intersect, Union | The rows every index under it names, or any of them names |
 | IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row |
+| Derived, View, Cte | The rows of a derived table, a view or a CTE, each judged by the condition after its name; the plan of its query is under it |
+| Values, Function | The rows of a VALUES list or a table function, each judged by the condition after its name |
+| OneRow | The one row a SELECT without FROM reads |
 | Empty unless | The WHERE's terms that read no column; a run where they are not true reads no row |
 | else | The read a run takes when the table cannot answer the line above it |
 | Filter | The part of the WHERE judged after the scan |

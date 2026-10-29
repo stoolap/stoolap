@@ -1077,7 +1077,7 @@ fn test_generate_series_where_float_predicate_no_miscompile() {
 #[test]
 fn test_generate_series_order_by_case_expression() {
     let db = create_test_db("order_by_case");
-    let values = collect_i64(
+    let mut values = collect_i64(
         &db,
         "SELECT value + 1 AS x \
          FROM generate_series(1, 5) AS g(value) \
@@ -1085,7 +1085,8 @@ fn test_generate_series_order_by_case_expression() {
          LIMIT 2",
     );
     // CASE sorts: values 4,5 get sort key 0 (first), values 1,2,3 get sort key 1
-    // So first 2 rows are value 4,5 → x = 5,6
+    // So first 2 rows are value 4,5 → x = 5,6, tied on the key in no set order
+    values.sort_unstable();
     assert_eq!(values, vec![5, 6]);
 }
 

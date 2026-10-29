@@ -195,13 +195,13 @@ impl Executor {
         if let Some(lines) = self.with_planned(stmt, &slot, Some(ctx), key_read) {
             return Some(lines);
         }
-        let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? else {
-            return None;
-        };
-        let Expression::TableSource(source) = stmt.table_expr.as_deref()? else {
-            return None;
-        };
-        prepared.explain(stmt, &source.name.value_lower)
+        if let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? {
+            let Some(Expression::TableSource(source)) = stmt.table_expr.as_deref() else {
+                return None;
+            };
+            return prepared.explain(stmt, &source.name.value_lower, Vec::new());
+        }
+        self.explain_over_source(stmt, ctx)
     }
 
     /// `stmt` run by the plan `compiled` holds, planned now in `ctx` when it
