@@ -689,6 +689,12 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT t.b AS z, u.x FROM t JOIN u ON u.id = t.a ORDER BY z DESC",
         Prepared,
     ),
+    (
+        "grouped_order_by_subquery_reading_an_alias",
+        "SELECT a, MAX(b) AS z FROM t GROUP BY a ORDER BY (SELECT z) DESC",
+        "SELECT a, MAX(b) AS z FROM t GROUP BY a ORDER BY z DESC",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
