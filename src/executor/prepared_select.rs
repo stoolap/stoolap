@@ -9329,15 +9329,66 @@ fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<E
 /// as the part after a dotted name's last dot or as the column of a qualified
 /// name, passes `matches`
 fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
-    let statement = |sq: &SelectStatement| {
-        sq.columns
+    // Every clause of a statement, its sources, branches and CTEs among them
+    fn statement(sq: &SelectStatement, matches: &impl Fn(&str) -> bool) -> bool {
+        let grouping_sets: &[Vec<Expression>] = match &sq.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => sets,
+            _ => &[],
+        };
+        let windows = sq.window_defs.iter().flat_map(|def| {
+            def.partition_by
+                .iter()
+                .chain(def.order_by.iter().map(|o| &o.expression))
+                .chain(def.frame.iter().flat_map(WindowFrame::offsets))
+        });
+        let mut clauses = sq
+            .columns
             .iter()
             .chain(sq.where_clause.as_deref())
             .chain(sq.having.as_deref())
             .chain(&sq.group_by.columns)
+            .chain(grouping_sets.iter().flatten())
             .chain(sq.order_by.iter().map(|o| &o.expression))
-            .any(|e| names_anywhere(e, matches))
-    };
+            .chain(&sq.distinct_on)
+            .chain(sq.limit.as_deref())
+            .chain(sq.offset.as_deref())
+            .chain(windows);
+        clauses.any(|e| names_anywhere(e, matches))
+            || sq.table_expr.as_deref().is_some_and(|s| source(s, matches))
+            || sq
+                .set_operations
+                .iter()
+                .any(|op| statement(&op.right, matches))
+            || sq
+                .with
+                .iter()
+                .flat_map(|with| &with.ctes)
+                .any(|cte| statement(&cte.query, matches))
+    }
+    fn source(from: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
+        match from {
+            Expression::SubquerySource(derived) => statement(&derived.subquery, matches),
+            Expression::JoinSource(join) => {
+                source(&join.left, matches)
+                    || source(&join.right, matches)
+                    || join
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| names_anywhere(c, matches))
+            }
+            Expression::ValuesSource(values) => values
+                .rows
+                .iter()
+                .flatten()
+                .any(|e| names_anywhere(e, matches)),
+            Expression::FunctionTableSource(function) => function
+                .arguments
+                .iter()
+                .any(|e| names_anywhere(e, matches)),
+            _ => false,
+        }
+    }
+    let statement = |sq: &SelectStatement| statement(sq, matches);
     match expr {
         Expression::Identifier(id) => {
             matches(&id.value_lower)

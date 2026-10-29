@@ -792,6 +792,19 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
              ORDER BY (SELECT MIN(u.x) FROM u) + g",
             "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
         ),
+        // A nested statement's DISTINCT ON reads the volatile alias too
+        (
+            "SELECT DISTINCT ON ((SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
+             FROM u ORDER BY u.x LIMIT 1 OFFSET 1)) a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
+             ORDER BY a",
+            "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
+        ),
+        (
+            "SELECT a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
+             ORDER BY (SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
+             FROM u ORDER BY u.x LIMIT 1 OFFSET 1), 1",
+            "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
+        ),
         (
             "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
             "a subquery outside WHERE and the subquery blocks",
