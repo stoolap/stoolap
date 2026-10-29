@@ -456,6 +456,7 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
+use super::planned_aggregate::{bounds, AggregateRead};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
@@ -3848,19 +3849,21 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
-            // One row from the source the rule picks
-            if let Some(result) =
-                self.global_aggregate(table.as_ref(), stmt, classification, ctx, blocks)?
-            {
-                let columns = CompactArc::new(result.columns().to_vec());
-                let shape = shape_of(&columns);
-                return Ok((result, columns, false, shape));
-            }
-
-            // The groups from the source the rule picks
-            if let Some(result) =
-                self.grouped_aggregate(table.as_ref(), stmt, classification, ctx, &all_columns)?
-            {
+            // One row or the groups, from the source the rules pick
+            let indexed = |column: &str| bounds(table.get_index_on_column(column));
+            let plan =
+                self.aggregate_read_plan(stmt, classification, ctx, table.schema(), indexed)?;
+            let result = match &plan {
+                Some(plan) if matches!(plan.read, AggregateRead::Global { .. }) => {
+                    let run = (classification.as_ref(), plan);
+                    self.global_aggregate(table.as_ref(), stmt, run, ctx, blocks)?
+                }
+                Some(plan) => {
+                    self.grouped_aggregate(table.as_ref(), stmt, plan, ctx, &all_columns)?
+                }
+                None => None,
+            };
+            if let Some(result) = result {
                 let columns = CompactArc::new(result.columns().to_vec());
                 let shape = shape_of(&columns);
                 return Ok((result, columns, false, shape));
