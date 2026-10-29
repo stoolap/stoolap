@@ -612,6 +612,58 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
          GROUP BY d.id) SELECT c.id FROM c LEFT JOIN u ON u.id = c.id LIMIT 1",
         Prepared,
     ),
+    (
+        "in_block_with_distinct",
+        "SELECT id FROM t WHERE a IN (SELECT DISTINCT x FROM u)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
+    (
+        "in_block_with_union",
+        "SELECT id FROM t WHERE a IN (SELECT x FROM u WHERE x < 2 UNION SELECT x FROM u WHERE x > 2)",
+        "SELECT id FROM t WHERE a IN (1, 3)",
+        Prepared,
+    ),
+    (
+        "not_in_block_with_except",
+        "SELECT id FROM t WHERE a NOT IN (SELECT x FROM u EXCEPT SELECT 1)",
+        "SELECT id FROM t WHERE a NOT IN (2, 3)",
+        Prepared,
+    ),
+    (
+        "scalar_block_with_intersect",
+        "SELECT id, (SELECT x FROM u INTERSECT SELECT 2) FROM t",
+        "SELECT id, 2 FROM t",
+        Prepared,
+    ),
+    (
+        "scalar_block_with_grouping_sets",
+        "SELECT id, (SELECT COUNT(*) FROM u GROUP BY GROUPING SETS ((x), ()) \
+         ORDER BY 1 DESC LIMIT 1) FROM t",
+        "SELECT id, 3 FROM t",
+        Prepared,
+    ),
+    (
+        "scalar_block_with_window_clause",
+        "SELECT id, (SELECT SUM(x) OVER w FROM u WINDOW w AS (ORDER BY id) \
+         ORDER BY 1 DESC LIMIT 1) FROM t",
+        "SELECT id, 6 FROM t",
+        Prepared,
+    ),
+    (
+        "correlated_exists_block_with_union",
+        "SELECT id FROM t WHERE EXISTS (SELECT x FROM u WHERE x = t.a \
+         UNION SELECT x FROM u WHERE x = t.a)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
+    (
+        "correlated_exists_block_with_union_over_a_computed_key",
+        "SELECT id FROM t WHERE EXISTS (SELECT x FROM u WHERE x = t.a \
+         UNION SELECT x FROM u WHERE x = t.a + 2)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3) OR a + 2 IN (1, 2, 3)",
+        Old("7b Phase 3: a statement block's own statement runs on the general executor"),
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order

@@ -25,7 +25,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
     before_prepared_exists, force_exists_strategy, general_path_hits, prepared_exists_counts,
-    prepared_rows_narrowed, subquery_cache_hits, GeneralPath,
+    prepared_rows_narrowed, prepared_strategy_runs, subquery_cache_hits, GeneralPath,
+    PreparedStrategy,
 };
 use stoolap::Database;
 
@@ -159,15 +160,10 @@ fn test_exists_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.k = t.k) FROM t WHERE EXISTS (SELECT 1 FROM u)",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k ORDER BY 1)",
         "SELECT id FROM t WHERE EXISTS (SELECT (u.k, u.id) IN (SELECT k, id FROM w) AS x FROM u WHERE x)",
+        "SELECT id FROM t WHERE EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
-    let sql = "SELECT id FROM t WHERE EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
-    assert_eq!(
-        prepared_line(&db, sql),
-        "Prepared: no (a subquery block with a clause outside the family)",
-        "{sql}"
-    );
 }
 
 #[test]
@@ -700,11 +696,11 @@ fn test_an_in_family_statement_never_reaches_the_general_path() {
             assert_eq!(general_hits(), before, "{sql} under {strategy:?}");
         }
     }
-    // The same NOT EXISTS with an inner DISTINCT takes the anti-join
-    let before = general_path_hits(GeneralPath::AntiJoin);
-    let old = "SELECT id FROM t WHERE NOT EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
-    assert_eq!(ids(&db, old).len(), 2);
-    assert!(general_path_hits(GeneralPath::AntiJoin) > before, "{old}");
+    // The same NOT EXISTS with an inner DISTINCT runs its block as a statement
+    let before = general_hits();
+    let distinct = "SELECT id FROM t WHERE NOT EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)";
+    assert_eq!(ids(&db, distinct).len(), 2);
+    assert_eq!(general_hits(), before, "{distinct}");
 }
 
 #[test]
@@ -822,5 +818,35 @@ fn test_a_failed_value_raises_only_where_it_is_read() {
         // A FALSE first ends it before the failed slot
         let first = "SELECT id FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v < 0 AND u.v > $1 * 9223372036854775807)";
         assert_eq!(rows(first), Ok(vec![]), "{first} under {strategy:?}");
+    }
+}
+
+#[test]
+fn test_a_distinct_no_count_reads_runs_as_its_block_without_it() {
+    let _guard = serial();
+    let db = setup("distinct");
+    for (sql, plain) in [
+        (
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)",
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        ),
+        // Its items are never computed: k = 2 would overflow
+        (
+            "SELECT id FROM t WHERE EXISTS \
+             (SELECT DISTINCT u.k * 9223372036854775807 FROM u WHERE u.k = t.k)",
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        ),
+        (
+            "SELECT id FROM t WHERE t.k IN (SELECT DISTINCT u.k FROM u WHERE u.v > 1)",
+            "SELECT id FROM t WHERE t.k IN (SELECT u.k FROM u WHERE u.v > 1)",
+        ),
+    ] {
+        let runs = prepared_strategy_runs(PreparedStrategy::BlockStatement);
+        assert_eq!(ids(&db, sql), ids(&db, plain), "{sql}");
+        assert_eq!(
+            prepared_strategy_runs(PreparedStrategy::BlockStatement),
+            runs,
+            "{sql} ran its block as a statement"
+        );
     }
 }
