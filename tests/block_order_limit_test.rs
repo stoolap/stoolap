@@ -674,6 +674,13 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
              ORDER BY (SELECT z + u.x) DESC LIMIT 1 + 0) FROM v LIMIT 1 + 0) ORDER BY id",
             vec![2],
         ),
+        // The same key inside a named window of a derived table
+        (
+            "SELECT id FROM t WHERE a IN (SELECT r FROM (SELECT RANK() OVER w AS r FROM v \
+             WINDOW w AS (ORDER BY (SELECT x AS z FROM u ORDER BY (SELECT z + u.x) DESC \
+             LIMIT 1 + 0))) d LIMIT 1 + 0) ORDER BY id",
+            vec![1],
+        ),
         // An EXISTS computes no key: u.id * 9223372036854775807 overflows for 2
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \

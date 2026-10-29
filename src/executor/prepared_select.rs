@@ -794,7 +794,8 @@ fn statement_order_holding_subquery(
 }
 
 /// Whether an ORDER BY or DISTINCT ON key of `sq`, or of a statement inside
-/// it at any depth (a subquery, a derived table, a set operation branch),
+/// it at any depth (a subquery in any clause a statement's walk binds, a
+/// named window's among them, a derived table, a set operation branch),
 /// holds a subquery
 fn key_subquery_anywhere(sq: &SelectStatement) -> bool {
     let keys = || {
@@ -806,13 +807,28 @@ fn key_subquery_anywhere(sq: &SelectStatement) -> bool {
     if keys().any(mentions_subquery) {
         return true;
     }
+    // Every clause a statement's walk binds
     let mut nested = Vec::new();
+    let grouping_sets: &[Vec<Expression>] = match &sq.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets,
+        _ => &[],
+    };
+    let windows = sq.window_defs.iter().flat_map(|def| {
+        def.partition_by
+            .iter()
+            .chain(def.order_by.iter().map(|ob| &ob.expression))
+            .chain(def.frame.iter().flat_map(WindowFrame::offsets))
+    });
     let clauses = sq
         .columns
         .iter()
         .chain(sq.where_clause.as_deref())
         .chain(sq.having.as_deref())
         .chain(&sq.group_by.columns)
+        .chain(grouping_sets.iter().flatten())
+        .chain(windows)
+        .chain(sq.limit.as_deref())
+        .chain(sq.offset.as_deref())
         .chain(keys());
     for expr in clauses {
         nested_statements(expr, &mut nested);
