@@ -453,6 +453,56 @@ fn explain_names_each_read_a_run_may_take() {
 }
 
 #[test]
+fn explain_names_the_row_a_key_write_reads() {
+    let db = table("planned_key_writes");
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER REFERENCES p(id))",
+        (),
+    )
+    .unwrap();
+    let explain = |sql: &str| -> Vec<String> {
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect()
+    };
+    for (sql, plan) in [
+        (
+            "UPDATE t SET v = v + 1 WHERE id = $1",
+            vec![
+                "Update t SET v = (v + 1)",
+                "  PkGet t id = $1",
+                "  else IndexScan t (id = $1)",
+                "    PkKey",
+            ],
+        ),
+        (
+            "DELETE FROM t WHERE 2 = id",
+            vec![
+                "Delete t",
+                "  PkGet t id = 2",
+                "  else IndexScan t (2 = id)",
+                "    PkKey",
+            ],
+        ),
+        // A key write the general path runs: a parent's delete keeps its
+        // children's keys
+        (
+            "DELETE FROM p WHERE id = 1",
+            vec!["DELETE FROM p", "  Filter: (id = 1)"],
+        ),
+        (
+            "UPDATE t SET v = 1 WHERE id = 1 RETURNING v",
+            vec!["UPDATE t", "  Set: 1 column(s)", "  Filter: (id = 1)"],
+        ),
+    ] {
+        assert_eq!(explain(sql), plan, "{sql}");
+    }
+}
+
+#[test]
 fn a_declined_filtered_aggregate_reads_by_the_where_its_scan_reads() {
     let db = table("planned_filtered_aggregate_scan");
     db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();

@@ -62,7 +62,6 @@ mod copy;
 mod cte;
 mod ddl;
 mod dml;
-mod dml_fast_path;
 mod explain;
 pub(crate) mod expr_key;
 mod foreign_key;
@@ -71,6 +70,7 @@ mod index_optimizer;
 mod plan_reads;
 pub(crate) mod planned;
 pub(crate) mod planned_aggregate;
+pub(crate) mod planned_dml;
 mod prepared_join;
 pub(crate) mod prepared_select;
 pub(crate) mod projection;
@@ -108,6 +108,7 @@ use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use planned_dml::DmlStatement;
 
 #[cfg(any(test, feature = "test-failpoints"))]
 pub(crate) use aggregation::AggregatePath;
@@ -517,10 +518,12 @@ impl Executor {
                 self.run_select_plan(stmt, plan.compiled.slot(), None, params, false)
             }
             Statement::Update(stmt) => {
-                self.try_fast_pk_update_with_params(stmt, params, plan.compiled.slot())
+                let stmt = DmlStatement::Update(stmt);
+                self.run_dml_plan(stmt, plan.compiled.slot(), None, params, false)
             }
             Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_with_params(stmt, params, plan.compiled.slot())
+                let stmt = DmlStatement::Delete(stmt);
+                self.run_dml_plan(stmt, plan.compiled.slot(), None, params, false)
             }
             _ => None,
         })
@@ -740,10 +743,12 @@ impl Executor {
                 self.run_planned_aggregate(stmt, compiled, ctx)
             }
             Statement::Update(stmt) => {
-                self.try_fast_pk_update_compiled(stmt, ctx, compiled, in_txn)
+                let stmt = DmlStatement::Update(stmt);
+                self.run_dml_plan(stmt, compiled, Some(ctx), ctx.params(), in_txn)
             }
             Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_compiled(stmt, ctx, compiled, in_txn)
+                let stmt = DmlStatement::Delete(stmt);
+                self.run_dml_plan(stmt, compiled, Some(ctx), ctx.params(), in_txn)
             }
             _ => None,
         }

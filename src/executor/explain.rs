@@ -28,6 +28,7 @@ use crate::storage::traits::{Engine, QueryResult, ScanPlan};
 use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
+use super::planned_dml::DmlStatement;
 use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
 use super::prepared_select::OutOfFamily;
 use super::pushdown;
@@ -170,6 +171,8 @@ impl Executor {
             // Regular EXPLAIN: Just show the plan without executing (using inlined version if available)
             let planned = match &**explain_stmt {
                 Statement::Select(select) => self.explain_plan(select, ctx),
+                Statement::Update(update) => self.explain_dml(DmlStatement::Update(update)),
+                Statement::Delete(delete) => self.explain_dml(DmlStatement::Delete(delete)),
                 _ => None,
             };
             match planned {
