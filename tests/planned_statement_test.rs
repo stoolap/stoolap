@@ -375,6 +375,16 @@ fn explain_names_each_read_a_run_may_take() {
             ],
         ),
         (
+            "SELECT DISTINCT ON (v) id, v FROM t ORDER BY v, id LIMIT 1",
+            vec![
+                "Limit 1",
+                "  DistinctOn v",
+                "    Sort v ASC, id ASC",
+                "      Project id, v",
+                "        SeqScan t",
+            ],
+        ),
+        (
             "SELECT id FROM t WHERE v > 1 UNION ALL SELECT id FROM t ORDER BY id LIMIT 2",
             vec![
                 "Limit 2",

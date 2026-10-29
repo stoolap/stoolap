@@ -6834,7 +6834,10 @@ impl PreparedSelect {
                     .collect::<Option<Vec<_>>>()
             })
             .flatten();
-        let sort = match stmt.limit.is_some() && order_keys.is_some() {
+        // A DISTINCT ON keeps a row per key of every sorted row, and only then
+        // the LIMIT's
+        let sort = match stmt.limit.is_some() && order_keys.is_some() && stmt.distinct_on.is_empty()
+        {
             true => Step::TopN,
             false => Step::Sort,
         };
