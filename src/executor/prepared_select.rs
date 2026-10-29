@@ -907,6 +907,10 @@ impl Executor {
         ctx: Option<&ExecutionContext>,
         needs_subquery: bool,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
@@ -1007,6 +1011,10 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
@@ -1061,6 +1069,7 @@ impl Executor {
         // A GROUP BY item naming a SELECT alias or position groups that item
         self.parse_group_by(stmt, &[])
             .map_err(|_| "a GROUP BY position outside the SELECT list")?;
+        let windows = Executor::used_window_defs(stmt);
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
@@ -1083,7 +1092,7 @@ impl Executor {
         } else {
             Site::Subqueries
         };
-        for def in &stmt.window_defs {
+        for def in &windows {
             let window = (&def.partition_by[..], &def.order_by[..], &def.frame);
             family.window(window, 1, over, &mut found)?;
         }
@@ -7158,8 +7167,9 @@ impl PreparedGrouped {
             }
             ob.expression = Expression::Identifier(column);
         }
-        // A named window's keys and frame offsets are rewritten as an OVER's own
-        let mut window_defs = stmt.window_defs.clone();
+        // A named window's keys and frame offsets an OVER reads are rewritten
+        // as an OVER's own; the parts none reads are left out
+        let mut window_defs = Executor::used_window_defs(stmt);
         for def in &mut window_defs {
             let keys = def
                 .partition_by
@@ -8300,6 +8310,10 @@ impl Executor {
         &self,
         clause: &Expression,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),

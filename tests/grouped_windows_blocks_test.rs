@@ -537,3 +537,34 @@ fn an_item_holding_a_subquery_keeps_the_name_it_is_written_under() {
         assert_eq!(db.query(sql, ()).unwrap().columns(), names, "{sql}");
     }
 }
+
+#[test]
+fn a_part_of_a_named_window_no_over_reads_is_never_read() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_unread").unwrap();
+    fill(&db);
+    // (SELECT u.x FROM u) gives many rows: reading it is an error
+    for (sql, twin) in [
+        (
+            "SELECT COUNT(*), (SELECT MAX(u.x) FROM u) FROM t \
+             WINDOW w AS (ORDER BY (SELECT u.x FROM u))",
+            "SELECT COUNT(*), (SELECT MAX(u.x) FROM u) FROM t",
+        ),
+        (
+            "SELECT t.id, SUM(t.b) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             (SELECT MAX(u.x) FROM u) FROM t WINDOW w AS (ORDER BY t.id \
+             ROWS BETWEEN (SELECT u.x FROM u) PRECEDING AND CURRENT ROW) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             (SELECT MAX(u.x) FROM u) FROM t ORDER BY t.id",
+        ),
+        (
+            "SELECT t.id, SUM(t.b) OVER (w ORDER BY t.id), (SELECT MAX(u.x) FROM u) FROM t \
+             WINDOW w AS (PARTITION BY t.a ORDER BY (SELECT u.x FROM u)) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER (PARTITION BY t.a ORDER BY t.id), \
+             (SELECT MAX(u.x) FROM u) FROM t ORDER BY t.id",
+        ),
+    ] {
+        let want = rows(&db, twin).unwrap_or_else(|e| panic!("{twin}: {e}"));
+        assert_eq!(rows(&db, sql), Ok(want), "{sql}");
+    }
+}

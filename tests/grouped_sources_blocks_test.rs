@@ -340,7 +340,8 @@ fn every_source_answers_a_grouped_statement_as_its_table_does() {
                 .iter()
                 .find(|(site, _)| *site == over_t)
                 .map_or(over_t.as_str(), |(_, form)| form);
-            let general = || rows(&db, &oracle::general_twin(form));
+            let general =
+                || oracle::on_general_path(form, || rows(&db, &oracle::general_twin(form)));
             wrong.extend(oracle::check_confirmed(
                 &RECORDED_SITES,
                 &over_t,

@@ -1876,6 +1876,23 @@ pub(crate) fn general_path_reached(path: GeneralPath) {
     GENERAL_PATH_HITS[path as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How often any general path mechanism ran, so far
+pub fn general_path_total() -> usize {
+    GENERAL_PATH_HITS
+        .iter()
+        .map(|hits| hits.load(std::sync::atomic::Ordering::Relaxed))
+        .sum()
+}
+
+/// Refuse every prepared family, so that a statement and the statements
+/// inside it run on the general path: a recorded answer's reference reads
+/// them there
+pub static PREPARED_FAMILIES_OFF: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn prepared_families_off() -> bool {
+    PREPARED_FAMILIES_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 type HookSlot = RefCell<Option<Box<dyn FnOnce()>>>;
 
 fn run_hook(slot: &'static std::thread::LocalKey<HookSlot>) {

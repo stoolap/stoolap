@@ -322,7 +322,7 @@ fn confirmed(
     sql: &str,
 ) -> Result<Vec<String>, String> {
     let got = rows(db, sql);
-    let general = || rows(db, &oracle::general_twin(sql));
+    let general = || oracle::on_general_path(sql, || rows(db, &oracle::general_twin(sql)));
     if let Some(why) = oracle::check_confirmed(answers, key, &got, general) {
         panic!("{why}");
     }
@@ -364,7 +364,7 @@ fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
             };
             wrong.extend(
                 oracle::check_confirmed(&RECORDED, sql, &first, || {
-                    rows(&db, &oracle::general_twin(&general))
+                    oracle::on_general_path(&general, || rows(&db, &oracle::general_twin(&general)))
                 })
                 .map(|why| format!("sealed {sealed}: {why}")),
             );
@@ -408,6 +408,7 @@ fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
 
 #[test]
 fn an_aggregate_beside_an_uncorrelated_value_answers_as_its_literal_twin() {
+    let _guard = serial();
     let db = Database::open("memory://grouped_output_value_twin").unwrap();
     fill(&db);
     for (sql, twin) in [
@@ -454,7 +455,9 @@ fn a_grouped_statement_reads_its_input_rows_subqueries_through_its_blocks() {
             let want = rows(&db, reference);
             wrong.extend(
                 oracle::check_confirmed(&RECORDED_INPUT, reference, &want, || {
-                    rows(&db, &oracle::general_twin(reference))
+                    oracle::on_general_path(reference, || {
+                        rows(&db, &oracle::general_twin(reference))
+                    })
                 })
                 .map(|why| format!("sealed {sealed}: {why}")),
             );
@@ -824,7 +827,7 @@ fn a_grouped_statement_keyed_by_an_item_holding_a_subquery_groups_by_it() {
             got.as_ref().is_ok_and(|rows| rows.len() == 2),
             "{sql}: {got:?}"
         );
-        let general = || sorted(&oracle::general_twin(sql));
+        let general = || oracle::on_general_path(sql, || sorted(&oracle::general_twin(sql)));
         assert_eq!(
             oracle::check_confirmed(&RECORDED_KEYED, sql, &got, general),
             None

@@ -70,9 +70,11 @@ const ROWS: &str = "SELECT id, k, x, s FROM t ORDER BY id";
 /// The rows of `sql` on the general path, each operand of a UNION ALL apart
 fn general_table(db: &Database, sql: &str) -> Vec<String> {
     let operands = sql.split(" UNION ALL ");
-    operands
-        .flat_map(|operand| table(db, &oracle::general_twin(operand)))
-        .collect()
+    oracle::on_general_path(sql, || {
+        operands
+            .flat_map(|operand| table(db, &oracle::general_twin(operand)))
+            .collect()
+    })
 }
 
 /// Each statement with a SELECT of the rows it leaves:

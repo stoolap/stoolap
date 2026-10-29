@@ -1205,6 +1205,40 @@ pub struct WindowExpression {
 }
 
 impl WindowExpression {
+    /// The PARTITION BY, ORDER BY and frame the window runs with: a named
+    /// window's partition, and its ORDER BY and frame where the OVER gives
+    /// none of its own; None when it names no window of `defs`
+    pub fn resolved<'a>(
+        &'a self,
+        defs: &'a [WindowDefinition],
+    ) -> Option<(
+        &'a [Expression],
+        &'a [OrderByExpression],
+        Option<&'a WindowFrame>,
+    )> {
+        if self.window_ref.is_none() {
+            return Some((&self.partition_by, &self.order_by, self.frame.as_ref()));
+        }
+        let (_, def) = self.named(defs)?;
+        let order_by = match self.order_by.is_empty() {
+            true => &def.order_by,
+            false => &self.order_by,
+        };
+        Some((
+            &def.partition_by,
+            order_by,
+            self.frame.as_ref().or(def.frame.as_ref()),
+        ))
+    }
+
+    /// The window of `defs` its OVER names, and where it stands
+    pub fn named<'a>(&self, defs: &'a [WindowDefinition]) -> Option<(usize, &'a WindowDefinition)> {
+        let name = self.window_ref.as_deref()?;
+        defs.iter()
+            .enumerate()
+            .find(|(_, def)| def.name.eq_ignore_ascii_case(name))
+    }
+
     /// The offsets of the frame's bounds
     pub fn frame_offsets(&self) -> impl Iterator<Item = &Expression> {
         self.frame
