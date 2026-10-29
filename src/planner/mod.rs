@@ -15,15 +15,18 @@
 //! How a statement runs, decided once over the statement as the runner bound
 //! it: the access that finds its rows and the steps over them
 
-use crate::common::CompactArc;
+use std::sync::Weak;
+
+use crate::common::{CompactArc, SmartString};
 use crate::core::pattern::Pattern;
 use crate::core::{Operator, Schema};
 use crate::executor::expression::SharedProgram;
-use crate::executor::prepared_select::{PlanInputs, PreparedComparison};
+use crate::executor::prepared_select::PreparedComparison;
 use crate::executor::projection::Projection;
 use crate::executor::utils::{extract_literal_value, flip_operator, infix_to_operator};
 use crate::parser::ast::{Expression, InfixOperator};
 use crate::storage::mvcc::index_plan::{self, IndexPlan, IndexTerm, Term};
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::VersionStore;
 use smallvec::SmallVec;
 
@@ -54,7 +57,7 @@ pub enum Step {
 #[derive(Debug)]
 pub enum Read {
     /// The row the primary key equality names
-    PkGet(PreparedComparison),
+    PkGet(KeyRead),
     /// A scan, through the indexes the choice reads
     Scan(Option<ScanChoice>),
     /// The rows in ORDER BY order. When the table declines the read, its
@@ -70,11 +73,12 @@ pub enum Read {
 }
 
 impl Read {
-    /// The scan the plan chose, the fallback of an ordered read; None for a
-    /// key read or a scan the table chooses
+    /// The scan the plan chose, the fallback of an ordered read or of a key
+    /// read; None for a scan the table chooses
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
-            Self::PkGet(_) | Self::Source(_) => None,
+            Self::PkGet(key) => key.otherwise.scan(),
+            Self::Source(_) => None,
             Self::Scan(scan)
             | Self::Ordered {
                 otherwise: scan, ..
@@ -86,9 +90,32 @@ impl Read {
     pub fn ordered(&self) -> Option<OrderedRead> {
         match self {
             Self::Ordered { read, .. } => Some(*read),
+            Self::PkGet(key) => key.otherwise.ordered(),
             _ => None,
         }
     }
+}
+
+/// The read of the row a primary key equality names, and what a run keeps
+/// of it
+#[derive(Debug)]
+pub struct KeyRead {
+    pub(crate) key: PreparedComparison,
+    /// The read of a run whose key names no row id
+    pub(crate) otherwise: Box<Read>,
+    /// The WHERE's other conjuncts
+    pub(crate) filter: Option<SharedProgram>,
+    pub(crate) projection: Projection,
+    /// Whether the output row is the table row as it is
+    pub(crate) whole_row: bool,
+    pub(crate) names: CompactArc<Vec<String>>,
+    pub(crate) offset: usize,
+    pub(crate) limit: Option<usize>,
+    pub(crate) table: SmartString,
+    pub(crate) schema: CompactArc<Schema>,
+    pub(crate) token: LayoutToken,
+    /// The table's store, without keeping a dropped table's rows alive
+    pub(crate) store: Weak<VersionStore>,
 }
 
 /// What EXPLAIN names a plan's steps and read by, as its statement writes them
@@ -105,8 +132,6 @@ pub struct PlanText<'a> {
     pub ordered: Option<(&'a str, bool)>,
     /// The WHERE's constant terms, whose run reads no row unless they hold
     pub empty_unless: Option<String>,
-    /// The read a run takes when a key read declines it
-    pub otherwise: Vec<String>,
     /// The plan of the statement a source's rows come from
     pub body: Vec<String>,
 }
@@ -123,71 +148,75 @@ impl Plan {
             lines.push(format!("{}{line}", "  ".repeat(lines.len())));
         }
         let mut read = Vec::new();
-        let alternative = |read: &mut Vec<String>, line: String| match read.is_empty() {
-            true => read.push(line),
-            false => read.push(format!("else {line}")),
-        };
         if let Some(terms) = &text.empty_unless {
             alternative(&mut read, format!("Empty unless {terms}"));
         }
-        let scan = |scan: Option<&ScanChoice>| {
-            scan.map_or_else(Vec::new, |scan| scan.explain(text.table, text.pushed))
-        };
-        match (&self.read, text.ordered) {
-            (Read::PkGet(key), _) => {
-                alternative(
-                    &mut read,
-                    format!("PkGet {} {}", text.table, key.describe()),
-                );
-                for (at, line) in text.otherwise.iter().enumerate() {
-                    match at {
-                        0 => alternative(&mut read, line.clone()),
-                        _ => read.push(line.clone()),
-                    }
-                }
-            }
-            (
-                Read::Ordered {
-                    read: ordered,
-                    otherwise,
-                    sort,
-                },
-                Some(column),
-            ) => {
-                alternative(&mut read, ordered.explain(text.table, column, text.pushed));
-                if *ordered != OrderedRead::TopK {
-                    let top = OrderedRead::TopK.explain(text.table, column, text.pushed);
-                    alternative(&mut read, top);
-                }
-                if let Some(line) = step_line(*sort, &text) {
-                    alternative(&mut read, line);
-                }
-                read.extend(
-                    scan(otherwise.as_ref())
-                        .into_iter()
-                        .map(|l| format!("  {l}")),
-                );
-            }
-            (Read::Source(source), _) => {
-                let line = match text.pushed {
-                    Some(pushed) => format!("{source} {pushed}"),
-                    None => source.clone(),
-                };
-                alternative(&mut read, line);
-                read.extend(text.body.iter().map(|l| format!("  {l}")));
-            }
-            (other, _) => {
-                for (at, line) in scan(other.scan()).into_iter().enumerate() {
-                    match at {
-                        0 => alternative(&mut read, line),
-                        _ => read.push(line),
-                    }
-                }
-            }
-        }
+        read_lines(&self.read, &text, &mut read);
         let depth = "  ".repeat(lines.len());
         lines.extend(read.into_iter().map(|line| format!("{depth}{line}")));
         lines
+    }
+}
+
+/// `line` after the reads before it, as the one a run takes when they decline
+fn alternative(read: &mut Vec<String>, line: String) {
+    match read.is_empty() {
+        true => read.push(line),
+        false => read.push(format!("else {line}")),
+    }
+}
+
+/// `read` as EXPLAIN shows it, after the reads in `lines`
+fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
+    let scan = |scan: Option<&ScanChoice>| {
+        scan.map_or_else(Vec::new, |scan| scan.explain(text.table, text.pushed))
+    };
+    match (read, text.ordered) {
+        (Read::PkGet(key), _) => {
+            alternative(
+                lines,
+                format!("PkGet {} {}", text.table, key.key.describe()),
+            );
+            read_lines(&key.otherwise, text, lines);
+        }
+        (
+            Read::Ordered {
+                read: ordered,
+                otherwise,
+                sort,
+            },
+            Some(column),
+        ) => {
+            alternative(lines, ordered.explain(text.table, column, text.pushed));
+            if *ordered != OrderedRead::TopK {
+                let top = OrderedRead::TopK.explain(text.table, column, text.pushed);
+                alternative(lines, top);
+            }
+            if let Some(line) = step_line(*sort, text) {
+                alternative(lines, line);
+            }
+            lines.extend(
+                scan(otherwise.as_ref())
+                    .into_iter()
+                    .map(|l| format!("  {l}")),
+            );
+        }
+        (Read::Source(source), _) => {
+            let line = match text.pushed {
+                Some(pushed) => format!("{source} {pushed}"),
+                None => source.clone(),
+            };
+            alternative(lines, line);
+            lines.extend(text.body.iter().map(|l| format!("  {l}")));
+        }
+        (other, _) => {
+            for (at, line) in scan(other.scan()).into_iter().enumerate() {
+                match at {
+                    0 => alternative(lines, line),
+                    _ => lines.push(line),
+                }
+            }
+        }
     }
 }
 
@@ -205,39 +234,6 @@ fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
         Step::Project => format!("Project {}", text.names.join(", ")),
         Step::Filter => "Filter".to_string(),
     })
-}
-
-/// A single-table SELECT: its access, the WHERE over the rows it reads, the
-/// output and the rows it skips and keeps
-#[derive(Debug)]
-pub struct SelectPlan {
-    pub(crate) plan: Plan,
-    pub(crate) filter: Option<SharedProgram>,
-    pub(crate) projection: Projection,
-    /// Whether the output row is the table row as it is
-    pub(crate) whole_row: bool,
-    pub(crate) names: CompactArc<Vec<String>>,
-    pub(crate) offset: usize,
-    pub(crate) limit: Option<usize>,
-}
-
-impl SelectPlan {
-    /// The plan as EXPLAIN shows it, outermost step first, with `otherwise`,
-    /// the read a run the key read declines takes
-    pub fn explain(&self, table: &str, otherwise: Vec<String>) -> Vec<String> {
-        self.plan.explain(PlanText {
-            table,
-            limit: self.limit.map(|limit| limit.to_string()),
-            offset: (self.offset > 0).then(|| self.offset.to_string()),
-            keys: None,
-            names: &self.names,
-            pushed: None,
-            ordered: None,
-            empty_unless: None,
-            otherwise,
-            body: Vec::new(),
-        })
-    }
 }
 
 /// How a table's scan finds the rows the conjuncts it takes keep
@@ -435,37 +431,4 @@ impl IndexTerm for Expression {
             }
         }
     }
-}
-
-/// The plan of a statement over a table of `schema` from what its
-/// preparation bound, skipping `offset` rows and keeping `limit`; None for a
-/// statement the planner does not plan yet
-pub fn plan_select(
-    inputs: PlanInputs,
-    schema: &Schema,
-    offset: usize,
-    limit: Option<usize>,
-) -> Option<SelectPlan> {
-    let (key, filter) = inputs.point?;
-    let projection = Projection::of(inputs.items);
-    let mut steps = SmallVec::new();
-    if limit.is_some() || offset > 0 {
-        steps.push(Step::Limit);
-    }
-    steps.push(Step::Project);
-    if filter.is_some() {
-        steps.push(Step::Filter);
-    }
-    Some(SelectPlan {
-        plan: Plan {
-            steps,
-            read: Read::PkGet(key),
-        },
-        filter,
-        whole_row: projection.is_columns_in_order(schema.columns.len()),
-        projection,
-        names: inputs.names,
-        offset,
-        limit,
-    })
 }

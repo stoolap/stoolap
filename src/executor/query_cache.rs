@@ -407,8 +407,6 @@ pub enum CompiledExecution {
     PreparedDml(Arc<super::prepared_select::PreparedDml>),
     /// A grouped statement whose SELECT list or HAVING subqueries run prepared
     PreparedGrouped(Arc<super::prepared_select::PreparedGrouped>),
-    /// A statement the planner planned
-    Planned(Arc<super::planned::PlannedSelect>),
 }
 
 /// Default cache size (number of cached plans)

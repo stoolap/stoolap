@@ -16,10 +16,9 @@
 
 use std::sync::{Arc, RwLock, Weak};
 
-use crate::common::{CompactArc, SmartString};
-use crate::core::{Error, KeyRows, Result, Row, RowVec, Schema, Value};
+use crate::core::{Error, KeyRows, Result, Row, RowVec, Value};
 use crate::parser::ast::{Expression, SelectStatement};
-use crate::planner::{plan_select, Read, SelectPlan};
+use crate::planner::KeyRead;
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::table::normalize_row_to_schema;
@@ -27,73 +26,55 @@ use crate::storage::mvcc::version_store::{LayoutToken, VersionStore};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
-use super::context::{CteScope, ExecutionContext};
+use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
 use super::prepared_select::PreparedSelect;
-use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution, PlanValidity};
+use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::row_count::static_row_counts;
 use super::Executor;
 
-/// A plan over the table it was planned for
-#[derive(Debug)]
-pub struct PlannedSelect {
-    pub(crate) plan: SelectPlan,
-    /// The statement as the runner reads it, for a run the key read declines
-    pub(crate) prepared: Arc<PreparedSelect>,
-    pub(crate) table: SmartString,
-    schema: CompactArc<Schema>,
-    token: LayoutToken,
-    pub(crate) validity: PlanValidity,
-    /// The CTEs of the context it was planned in, none of which names its
-    /// table; a context of others may hide the table
-    cte_scope: CteScope,
-    /// The table's store, without keeping a dropped table's rows alive
-    store: Weak<VersionStore>,
-}
-
 impl Executor {
-    /// `run` over the plan `compiled` holds for `stmt`, planned now in `ctx`
-    /// when it holds none yet; None for a statement the planner does not
-    /// plan, or that it has not planned and `ctx` is not given for
+    /// `run` over the plan `compiled` holds for `stmt` when it reads a key,
+    /// planned now in `ctx` when it holds none yet; None for a statement
+    /// whose plan reads no key, or that is not planned and `ctx` is not
+    /// given for
     pub(crate) fn with_planned<R>(
         &self,
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
         ctx: Option<&ExecutionContext>,
-        run: impl FnOnce(&PlannedSelect) -> R,
+        run: impl FnOnce(&PreparedSelect) -> R,
     ) -> Option<R> {
         let epoch = self.engine.schema_epoch();
         {
             let held = compiled.read().ok()?;
             match &*held {
-                CompiledExecution::Planned(p)
-                    if p.validity.holds(&*self.engine, epoch)
-                        && ctx.is_none_or(|ctx| p.cte_scope.holds(ctx)) =>
-                {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::compiled_epoch_checked();
-                    return Some(run(p));
+                CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
+                    // The runner reads a statement prepared for the tables as they are
+                    p.key_read()?;
+                    // A context of other CTEs than it was planned in may hide its table
+                    if ctx.is_none_or(|ctx| p.cte_scope.holds(ctx)) {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::compiled_epoch_checked();
+                        return Some(run(p));
+                    }
                 }
                 CompiledExecution::NotOptimizable(validity)
                     if validity.holds(&*self.engine, epoch) =>
                 {
                     return None
                 }
-                // The runner reads a statement prepared for the tables as they are
-                CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
-                    return None
-                }
                 // One prepared for tables since changed is planned again
                 CompiledExecution::Unknown
-                | CompiledExecution::Planned(_)
                 | CompiledExecution::NotOptimizable(_)
                 | CompiledExecution::PreparedSelect(_) => {}
                 _ => return None,
             }
         }
         let planned = self.plan_into(stmt, compiled, ctx?, epoch)?;
+        planned.key_read()?;
         Some(run(&planned))
     }
 
@@ -105,7 +86,7 @@ impl Executor {
         compiled: &RwLock<CompiledExecution>,
         ctx: &ExecutionContext,
         epoch: u64,
-    ) -> Option<Arc<PlannedSelect>> {
+    ) -> Option<Arc<PreparedSelect>> {
         let shape = get_classification(stmt);
         if shape.has_aggregation
             || shape.has_window_functions
@@ -139,46 +120,30 @@ impl Executor {
         let param_count = ctx.params().len();
         let prepared = PreparedSelect::prepare(self, ctx, stmt, &schema, scope, param_count, epoch)
             .ok()
-            .map(Arc::new);
-        // A LIMIT or OFFSET read per run leaves the statement to the runner
-        let plan = static_row_counts(stmt).and_then(|counts| {
-            prepared
-                .as_deref()
-                .and_then(PreparedSelect::plan_inputs)
-                .and_then(|inputs| plan_select(inputs, &schema, counts.offset, counts.limit))
-        });
+            .map(|mut prepared| {
+                // A LIMIT or OFFSET read per run leaves the statement to a scan
+                if let Some(counts) = static_row_counts(stmt) {
+                    prepared.read_by_key(
+                        (table.clone(), &store),
+                        (schema, token),
+                        (counts.offset, counts.limit),
+                    );
+                }
+                Arc::new(prepared)
+            });
         let mut slot = compiled.write().ok()?;
-        let open = matches!(
+        if matches!(
             &*slot,
             CompiledExecution::Unknown
-                | CompiledExecution::Planned(_)
                 | CompiledExecution::NotOptimizable(_)
                 | CompiledExecution::PreparedSelect(_)
-        );
-        let (Some(plan), Some(prepared)) = (plan, prepared.clone()) else {
-            if open {
-                // A statement read by a scan runs on the runner
-                *slot = match prepared {
-                    Some(prepared) => CompiledExecution::PreparedSelect(prepared),
-                    None => CompiledExecution::NotOptimizable(validity),
-                };
-            }
-            return None;
-        };
-        let planned = Arc::new(PlannedSelect {
-            plan,
-            prepared,
-            table: table.clone(),
-            schema,
-            token,
-            validity,
-            cte_scope: ctx.cte_scope(),
-            store: Arc::downgrade(&store),
-        });
-        if open {
-            *slot = CompiledExecution::Planned(Arc::clone(&planned));
+        ) {
+            *slot = match &prepared {
+                Some(prepared) => CompiledExecution::PreparedSelect(Arc::clone(prepared)),
+                None => CompiledExecution::NotOptimizable(validity),
+            };
         }
-        Some(planned)
+        prepared
     }
 
     /// The plan the planner makes of `stmt` in `ctx`, as EXPLAIN shows it;
@@ -189,12 +154,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         let slot = RwLock::new(CompiledExecution::Unknown);
-        // A run the key read declines reads as the runner's plan does
-        let key_read =
-            |p: &PlannedSelect| p.plan.explain(&p.table, p.prepared.explain_read(&p.table));
-        if let Some(lines) = self.with_planned(stmt, &slot, Some(ctx), key_read) {
-            return Some(lines);
-        }
+        self.with_planned(stmt, &slot, Some(ctx), |_| ());
         if let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? {
             let Some(Expression::TableSource(source)) = stmt.table_expr.as_deref() else {
                 return None;
@@ -240,47 +200,39 @@ impl Executor {
         .flatten()
     }
 
-    /// `planned`'s rows for `params`, in the open transaction `in_txn` says
-    /// and with the transaction id its programs read; None when this
-    /// execution's key is not one its access reads, which the regular path
-    /// answers
+    /// The rows of `planned`'s key read for `params`, in the open
+    /// transaction `in_txn` says and with the transaction id its programs
+    /// read; None when this execution's key names no row id, which the
+    /// plan's other read answers
     pub(crate) fn run_planned(
         &self,
-        planned: &PlannedSelect,
+        planned: &PreparedSelect,
         params: &[Value],
-        (in_txn, transaction): (bool, Option<u64>),
+        run: (bool, Option<u64>),
         view: Option<&StatementView>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        let Read::PkGet(key) = &planned.plan.plan.read else {
-            return None;
-        };
-        let key = key.integer(params)?;
-        let read = self.read_planned(planned, key, params, (in_txn, transaction), view);
-        or_normal_path(read)
+        // Read through the statement, and `read_planned` inlined: a key read
+        // borrowed as an argument has its fields loaded ahead of every row
+        let plan = planned.key_read()?;
+        let key = plan.key.integer(params)?;
+        or_normal_path(self.read_planned(plan, key, params, run, view))
     }
 
+    #[inline(always)]
     fn read_planned(
         &self,
-        planned: &PlannedSelect,
+        plan: &KeyRead,
         key: i64,
         params: &[Value],
         (in_txn, transaction): (bool, Option<u64>),
         view: Option<&StatementView>,
     ) -> Result<Box<dyn QueryResult>> {
-        let plan = &planned.plan;
-        let rows = self.fetch_pk_row(
-            &planned.table,
-            key,
-            planned.token,
-            in_txn,
-            view,
-            &planned.store,
-        )?;
+        let rows = self.fetch_pk_row(&plan.table, key, plan.token, in_txn, view, &plan.store)?;
         let mut vm: Option<ExprVM> = None;
         let mut out = RowVec::with_capacity(1);
         let mut passed = 0;
         for (id, row) in rows {
-            let row = normalize_row_to_schema(row, &planned.schema);
+            let row = normalize_row_to_schema(row, &plan.schema);
             if let Some(filter) = &plan.filter {
                 let exec = ExecuteContext::with_common_params(&row, params, transaction);
                 let vm = vm.get_or_insert_with(ExprVM::new);

@@ -335,6 +335,18 @@ fn explain_names_each_read_a_run_may_take() {
             ],
         ),
         (
+            "SELECT v FROM t WHERE id = 1 ORDER BY v LIMIT 1",
+            vec![
+                "Limit 1",
+                "  Project v",
+                "    PkGet t id = 1",
+                "    else TopK t v ASC (id = 1)",
+                "    else TopN v ASC",
+                "      IndexScan t (id = 1)",
+                "        PkKey",
+            ],
+        ),
+        (
             "SELECT id FROM t WHERE 1 = 0 AND v > 1",
             vec![
                 "Project id",

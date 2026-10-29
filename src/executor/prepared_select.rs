@@ -80,8 +80,9 @@ use super::utils::{
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
 use crate::planner::{
-    ordered_read, scan_choice, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
+    ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
 };
+use crate::storage::mvcc::VersionStore;
 
 /// Scopes one chain may hold: a block's own table and every enclosing one
 const MAX_SCOPES: usize = 32;
@@ -3269,7 +3270,7 @@ type OrderKeys = Vec<(Option<usize>, bool, Option<bool>)>;
 pub struct PreparedSelect {
     pub(crate) validity: PlanValidity,
     /// The CTEs its context bound
-    cte_scope: CteScope,
+    pub(crate) cte_scope: CteScope,
     /// The columns of the statement's table or derived table at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
@@ -3294,14 +3295,6 @@ pub struct PreparedSelect {
     constant_where: bool,
 }
 
-/// What a plan takes of a statement prepared over one table: the primary
-/// key equality of its WHERE with the rest of the WHERE, and its output
-pub struct PlanInputs {
-    pub(crate) point: Option<(PreparedComparison, Option<SharedProgram>)>,
-    pub(crate) items: Vec<Item>,
-    pub(crate) names: CompactArc<Vec<String>>,
-}
-
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table` or
     /// over a source whose statement's plan is `body`, as EXPLAIN shows it;
@@ -3312,10 +3305,9 @@ impl PreparedSelect {
         table: &str,
         body: Vec<String>,
     ) -> Option<Vec<String>> {
-        let plan = self
-            .plan
-            .as_ref()
-            .filter(|plan| plan.read.scan().is_some() || matches!(plan.read, Read::Source(_)))?;
+        let plan = self.plan.as_ref().filter(|plan| {
+            plan.read.scan().is_some() || matches!(plan.read, Read::Source(_) | Read::PkGet(_))
+        })?;
         // A source's rows are each judged by the whole WHERE
         let pushed = match plan.read {
             Read::Source(_) => stmt.where_clause.as_deref(),
@@ -3325,10 +3317,11 @@ impl PreparedSelect {
             let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
             keys.join(", ")
         });
+        // A key read judges each row by the whole WHERE
         let empty_unless = stmt
             .where_clause
             .as_deref()
-            .filter(|_| self.constant_where)
+            .filter(|_| self.constant_where && !matches!(plan.read, Read::PkGet(_)))
             .map(|where_clause| {
                 let mut terms = Vec::new();
                 any_constant_term(where_clause, &mut |term| {
@@ -3353,32 +3346,64 @@ impl PreparedSelect {
                 ordered: Executor::ordered_read_column(stmt)
                     .map(|(column, ascending, _)| (column, ascending)),
                 empty_unless,
-                otherwise: Vec::new(),
                 body,
             }),
         )
     }
 
-    /// The read of `table` the plan chose, as EXPLAIN shows it; none when the
-    /// table chooses
-    pub(crate) fn explain_read(&self, table: &str) -> Vec<String> {
-        let scan = self.plan.as_ref().and_then(|plan| plan.read.scan());
-        scan.map_or_else(Vec::new, |scan| {
-            scan.explain(table, self.where_.pushdown.as_ref())
-        })
+    /// Reads the statement's row by its primary key equality, skipping
+    /// `offset` rows and keeping `limit`, for a statement that asks no block,
+    /// takes no set and computes no sort or DISTINCT ON key; a run whose key
+    /// names no row id reads as the plan did
+    pub(crate) fn read_by_key(
+        &mut self,
+        (table, store): (SmartString, &Arc<VersionStore>),
+        (schema, token): (CompactArc<Schema>, LayoutToken),
+        (offset, limit): (usize, Option<usize>),
+    ) {
+        if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() {
+            return;
+        }
+        let (Some((key, filter)), Some(items)) = (self.where_.point.clone(), self.output_items())
+        else {
+            return;
+        };
+        let projection = Projection::of(items);
+        let mut steps = SmallVec::new();
+        if limit.is_some() || offset > 0 {
+            steps.push(Step::Limit);
+        }
+        steps.push(Step::Project);
+        if filter.is_some() {
+            steps.push(Step::Filter);
+        }
+        let otherwise = Box::new(self.plan.take().map_or(Read::Scan(None), |plan| plan.read));
+        let read = KeyRead {
+            key,
+            otherwise,
+            filter,
+            whole_row: projection.is_columns_in_order(schema.columns.len()),
+            projection,
+            names: CompactArc::clone(&self.output_columns),
+            offset,
+            limit,
+            table,
+            schema,
+            token,
+            store: Arc::downgrade(store),
+        };
+        self.plan = Some(Plan {
+            steps,
+            read: Read::PkGet(read),
+        });
     }
 
-    /// The plan's inputs, for a statement that asks no block and computes no
-    /// sort or DISTINCT ON key
-    pub(crate) fn plan_inputs(&self) -> Option<PlanInputs> {
-        if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() {
-            return None;
+    /// The key read the plan chose
+    pub(crate) fn key_read(&self) -> Option<&KeyRead> {
+        match self.plan.as_ref().map(|plan| &plan.read) {
+            Some(Read::PkGet(read)) => Some(read),
+            _ => None,
         }
-        Some(PlanInputs {
-            point: self.where_.point.clone(),
-            items: self.output_items()?,
-            names: self.output_columns.clone(),
-        })
     }
 
     /// Whether a run asks a block: a subquery, a run slot or a read ahead
@@ -9674,7 +9699,6 @@ impl Executor {
             if let Ok(guard) = slot.read() {
                 let held = match &*guard {
                     CompiledExecution::PreparedSelect(p) => Some(p),
-                    CompiledExecution::Planned(planned) => Some(&planned.prepared),
                     _ => None,
                 };
                 if let Some(p) = held.filter(|p| fits(p)) {
@@ -9710,12 +9734,13 @@ impl Executor {
         crate::test_failpoints::prepared_select_built();
         if let Some(slot) = compiled {
             if let Ok(mut guard) = slot.write() {
-                if matches!(
-                    &*guard,
-                    CompiledExecution::Unknown
-                        | CompiledExecution::NotOptimizable(_)
-                        | CompiledExecution::PreparedSelect(_)
-                ) {
+                // A key read's plan is the planner's to replace
+                let open = match &*guard {
+                    CompiledExecution::Unknown | CompiledExecution::NotOptimizable(_) => true,
+                    CompiledExecution::PreparedSelect(p) => p.key_read().is_none(),
+                    _ => false,
+                };
+                if open {
                     *guard = CompiledExecution::PreparedSelect(Arc::clone(&prepared));
                 }
             }
@@ -9724,8 +9749,7 @@ impl Executor {
     }
 
     /// Whether the plan holds a statement prepared for the current schema,
-    /// which puts the statement in the family without classifying it again;
-    /// a key read's plan holds the statement its declined runs read
+    /// which puts the statement in the family without classifying it again
     pub(crate) fn holds_prepared_select(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
@@ -9738,10 +9762,8 @@ impl Executor {
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| {
-                let p = match &*guard {
-                    CompiledExecution::PreparedSelect(p) => p,
-                    CompiledExecution::Planned(planned) => &planned.prepared,
-                    _ => return false,
+                let CompiledExecution::PreparedSelect(p) = &*guard else {
+                    return false;
                 };
                 p.validity.holds(&*self.engine, self.engine.schema_epoch())
                     && p.cte_scope.holds(ctx)
