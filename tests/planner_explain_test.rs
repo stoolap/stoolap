@@ -93,6 +93,52 @@ fn explain_shows_the_access_the_run_takes() {
 }
 
 #[test]
+fn explain_shows_the_source_a_global_aggregate_reads() {
+    let db = table("planner_explain_global");
+    for (sql, plan, path) in [
+        (
+            "SELECT COUNT(*) FROM t",
+            vec!["Aggregate COUNT(*)", "  Stats t", "  else SeqScan t"],
+            "stats",
+        ),
+        (
+            "SELECT COUNT(DISTINCT name) AS n, SUM(balance) FROM t",
+            vec!["Aggregate n, SUM(balance)", "  Stats t", "  else SeqScan t"],
+            "stats",
+        ),
+        (
+            "SELECT MAX(id) FROM t",
+            vec![
+                "Aggregate MAX(id)",
+                "  IndexBound t (id)",
+                "  else Stats t",
+                "  else SeqScan t",
+            ],
+            "index_bound",
+        ),
+        // A hash index keeps no order to give a bound
+        (
+            "SELECT MIN(name) FROM t",
+            vec!["Aggregate MIN(name)", "  Stats t", "  else SeqScan t"],
+            "stats",
+        ),
+    ] {
+        let lines: Vec<String> = db
+            .query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(lines, plan, "{sql}");
+        // The run that plans, then a run of the plan
+        for run in ["planning", "planned"] {
+            fp::reset_aggregate_paths();
+            db.query(sql, ()).unwrap().for_each(drop);
+            assert_eq!(fp::aggregate_paths_taken(), [path], "{sql}, the {run} run");
+        }
+    }
+}
+
+#[test]
 fn an_index_created_after_a_plan_is_read_by_its_next_run() {
     let db = table("planner_explain_new_index");
     let sql = "SELECT * FROM t WHERE balance > 400";

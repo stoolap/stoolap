@@ -29,7 +29,6 @@ use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::aggregation::Modifiers;
 use super::context::{cache_in_subquery, get_cached_in_subquery_set, ExecutionContext};
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
@@ -99,97 +98,6 @@ enum VectorProjectionSlot {
 }
 
 impl Executor {
-    /// Try to optimize simple MIN/MAX aggregates using index
-    ///
-    /// For queries like `SELECT MIN(col) FROM table` or `SELECT MAX(col) FROM table`
-    /// without WHERE or GROUP BY, use the index's O(1) min/max lookup instead of O(n) scan.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn try_min_max_index_optimization(
-        &self,
-        stmt: &SelectStatement,
-        table: &dyn Table,
-        _all_columns: &[String],
-    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        // Only optimize single MIN or MAX without DISTINCT
-        if stmt.columns.len() != 1 {
-            return Ok(None);
-        }
-
-        let col_expr = &stmt.columns[0];
-
-        // Extract function info (handle aliased case too)
-        let func = match col_expr {
-            Expression::FunctionCall(func) => func,
-            Expression::Aliased(aliased) => {
-                if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    func
-                } else {
-                    return Ok(None);
-                }
-            }
-            _ => return Ok(None),
-        };
-
-        // Check if it's MIN or MAX
-        // OPTIMIZATION: func.function is already uppercase from parsing
-        if func.function != "MIN" && func.function != "MAX" {
-            return Ok(None);
-        }
-
-        // The index answers a plain call: no DISTINCT, FILTER or other modifier
-        if !Modifiers::of_call(func).within(Modifiers::NONE) {
-            return Ok(None);
-        }
-
-        // Extract column name
-        if func.arguments.is_empty() {
-            return Ok(None);
-        }
-
-        let column_name = match &func.arguments[0] {
-            Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-            _ => return Ok(None),
-        };
-
-        // The index knows nothing of this transaction's own writes, and holds
-        // what the statement sees only while the table vouches for it
-        if table.has_local_changes() {
-            return Ok(None);
-        }
-        let Some(epoch) = table.index_view_epoch() else {
-            return Ok(None);
-        };
-
-        // Try to get value from index
-        let value = if func.function == "MIN" {
-            table.get_index_min_value(&column_name)
-        } else {
-            table.get_index_max_value(&column_name)
-        };
-        if table.index_view_epoch() != Some(epoch) {
-            return Ok(None);
-        }
-
-        if let Some(val) = value {
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::min_max_index_answered();
-            super::aggregation::AggregatePath::IndexMinMax.taken();
-            // Build result - wrap columns in CompactArc once for zero-copy sharing
-            let col_name = super::utils::item_name(col_expr);
-            let columns = CompactArc::new(vec![col_name]);
-            let mut rows = RowVec::with_capacity(1);
-            rows.push((0, Row::from_values(vec![val])));
-            let result: Box<dyn QueryResult> = Box::new(ExecutorResult::with_arc_columns(
-                CompactArc::clone(&columns),
-                rows,
-            ));
-            return Ok(Some((result, columns)));
-        }
-
-        Ok(None)
-    }
-
     /// The one table column `stmt`'s ORDER BY sorts by, as written, with its
     /// direction and NULLS clause: what an index-ordered or a top-k read
     /// answers; None for any other ORDER BY

@@ -202,6 +202,7 @@ impl Executor {
             return prepared.explain(stmt, &source.name.value_lower, Vec::new());
         }
         self.explain_over_source(stmt, ctx)
+            .or_else(|| self.explain_global(stmt, ctx))
     }
 
     /// `stmt` run by the plan `compiled` holds, planned now in `ctx` when it

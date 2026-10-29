@@ -575,10 +575,11 @@ fn a_statement_with_expressions_decodes_only_the_columns_it_names() {
     let rows = expect("SELECT id * 2 AS d FROM t WHERE k = 2 ORDER BY d DESC", 2);
     assert_eq!(rows.len(), 21);
     assert_eq!(rows[0][0], "124");
-    // An uncorrelated subquery in the SELECT list is read as a value
+    // An uncorrelated subquery in the SELECT list is read as a value, and
+    // the count beside it takes the volume's arrays as it does alone
     let rows = expect(
         "SELECT COUNT(*), (SELECT MAX(k) FROM t) FROM t WHERE k >= 1",
-        1,
+        0,
     );
     assert_eq!(rows[0], vec!["43".to_string(), "2".to_string()]);
     // A correlated subquery in the filter reads every column

@@ -69,6 +69,7 @@ mod foreign_key;
 mod index_optimizer;
 mod plan_reads;
 pub(crate) mod planned;
+pub(crate) mod planned_aggregate;
 mod prepared_join;
 pub(crate) mod prepared_select;
 pub(crate) mod projection;
@@ -729,15 +730,12 @@ impl Executor {
                 {
                     return Some(result);
                 }
-                // The counts read committed state: a view the context holds
-                // is read through by the regular path
+                // The aggregate plan reads committed state: a view the context
+                // holds is read through by the regular path
                 if in_txn || ctx.statement_view().is_some() {
                     return None;
                 }
-                if let Some(result) = self.try_fast_count_distinct_compiled(stmt, compiled) {
-                    return Some(result);
-                }
-                self.try_fast_count_star_compiled(stmt, compiled)
+                self.run_planned_aggregate(stmt, compiled, ctx)
             }
             Statement::Update(stmt) => {
                 self.try_fast_pk_update_compiled(stmt, ctx, compiled, in_txn)

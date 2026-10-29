@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT, set operations, a WHERE or select list with a subquery, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT, set operations, a WHERE or select list with a subquery, an aggregate with a WHERE, or one its table's stats cannot answer, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -126,6 +126,31 @@ Project id, name, category, value
 ```
 
 A multi-column index shows as `CompositeIndex name (a =, b range)`: equalities on its leading columns and a range, with an upper bound, on the next one.
+
+### Aggregates Over One Table
+
+COUNT, SUM, AVG, MIN and MAX over a whole table, with no WHERE or GROUP BY, are answered from what the table keeps without reading its rows: its row count, an index's count of distinct values, a column's sum and bounds (`Stats`). A single MIN or MAX of a column with a B-tree index, or of the primary key, reads the index's first or last key (`IndexBound`). A run the table cannot answer that way takes the line after `else`, down to reading every row:
+
+```sql
+EXPLAIN SELECT COUNT(*), SUM(value) FROM products;
+EXPLAIN SELECT MAX(id) FROM products;
+```
+
+Output:
+```
+plan
+----
+Aggregate COUNT(*), SUM(value)
+  Stats products
+  else SeqScan products
+
+plan
+----
+Aggregate MAX(id)
+  IndexBound products (id)
+  else Stats products
+  else SeqScan products
+```
 
 ### Views, CTEs and Derived Tables
 
@@ -330,6 +355,9 @@ For a planned single-table SELECT:
 | Derived, View, Cte | The rows of a derived table, a view or a CTE, each judged by the condition after its name; the plan of its query is under it |
 | Values, Function | The rows of a VALUES list or a table function, each judged by the condition after its name |
 | OneRow | The one row a SELECT without FROM reads |
+| Aggregate | The one row of COUNT, SUM, AVG, MIN and MAX over a table, from the line under it |
+| Stats | Those values from what the table keeps: row count, distinct count, column sum and bounds |
+| IndexBound | A MIN or MAX from the first or last key of the column's index |
 | Empty unless | The WHERE's terms that read no column; a run where they are not true reads no row |
 | else | The read a run takes when the table cannot answer the line above it |
 | Filter | The part of the WHERE judged after the scan |

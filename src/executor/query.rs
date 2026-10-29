@@ -3814,40 +3814,13 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
-            // MIN or MAX of an indexed column alone, with no WHERE or GROUP BY,
-            // reads the index's bound instead of every row
-            if !classification.has_where && !classification.has_group_by && stmt.having.is_none() {
-                if let Some((result, columns)) =
-                    self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
-                {
-                    let shape = shape_of(&columns);
-                    return Ok((result, columns, false, shape));
-                }
-            }
-
-            // First try global aggregation pushdown (no GROUP BY, no WHERE)
+            // One row from the source the rule picks
             if let Some(result) =
-                self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
+                self.global_aggregate(table.as_ref(), stmt, classification, ctx, blocks)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
                 let shape = shape_of(&columns);
                 return Ok((result, columns, false, shape));
-            }
-
-            // Try filtered aggregation pushdown (WHERE + aggregates, no GROUP BY)
-            // Pushes both the filter and aggregation into the storage layer
-            if classification.has_where {
-                if let Some(result) = self.try_filtered_aggregation_pushdown(
-                    table.as_ref(),
-                    stmt,
-                    ctx,
-                    classification,
-                    &all_columns,
-                )? {
-                    let columns = CompactArc::new(result.columns().to_vec());
-                    let shape = shape_of(&columns);
-                    return Ok((result, columns, false, shape));
-                }
             }
 
             // Try storage-level GROUP BY aggregation (no WHERE clause)
@@ -3865,16 +3838,6 @@ impl Executor {
                     let shape = shape_of(&columns);
                     return Ok((result, columns, false, shape));
                 }
-            }
-
-            // Try streaming aggregation for expressions like AVG(col) * 100
-            // This avoids collecting all rows by streaming through a scanner
-            if let Some(result) =
-                self.try_streaming_global_aggregation(table.as_ref(), stmt, ctx, classification)?
-            {
-                let columns = CompactArc::new(result.columns().to_vec());
-                let shape = shape_of(&columns);
-                return Ok((result, columns, false, shape));
             }
         }
 
@@ -14796,6 +14759,7 @@ impl Executor {
             group_by_count: 1,
             source_columns: all_columns,
             blocks: None,
+            alone: None,
         };
         let result = self.finish_aggregation(
             crate::executor::AggregatePath::StreamingGroupBy,

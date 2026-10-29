@@ -20,8 +20,6 @@
 //! - Grouped aggregation: `SELECT category, SUM(amount) FROM sales GROUP BY category`
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
-use std::sync::RwLock;
-
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -33,14 +31,12 @@ use crate::functions::aggregate::{
     AggregateState, CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
 };
 use crate::parser::ast::*;
-use crate::storage::traits::transaction::{StatementTable, TableUse};
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{ExprVM, SubqueryExecutor};
 use super::query::order_by_inputs;
-use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{
@@ -58,19 +54,17 @@ pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregatePath {
     General,
-    Pushdown,
-    FilteredPushdown,
-    StreamingGlobal,
-    StreamingGlobalScan,
+    /// One row from what the table keeps: counts, distinct counts, sums, bounds
+    Stats,
+    /// One row the table computes over the rows the WHERE passes
+    StorageFiltered,
+    /// One row fed by every row of the table
+    GlobalScan,
     StorageGrouped,
     StreamingGroupBy,
     StreamingDerivedTable,
-    /// MIN or MAX read from an index
-    IndexMinMax,
-    /// COUNT(*) answered by a cached plan before planning
-    CompiledCountStar,
-    /// COUNT(DISTINCT col) answered by a cached plan from the column's index
-    CompiledCountDistinct,
+    /// MIN or MAX read from an index's end
+    IndexBound,
     /// A prepared subquery block that aggregates, per call or by key
     PreparedBlock,
     /// A prepared block's COUNT(*) of one indexed key, counted from the index
@@ -89,18 +83,15 @@ impl AggregatePath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl AggregatePath {
-    pub(crate) const ALL: [AggregatePath; 13] = [
+    pub(crate) const ALL: [AggregatePath; 10] = [
         AggregatePath::General,
-        AggregatePath::Pushdown,
-        AggregatePath::FilteredPushdown,
-        AggregatePath::StreamingGlobal,
-        AggregatePath::StreamingGlobalScan,
+        AggregatePath::Stats,
+        AggregatePath::StorageFiltered,
+        AggregatePath::GlobalScan,
         AggregatePath::StorageGrouped,
         AggregatePath::StreamingGroupBy,
         AggregatePath::StreamingDerivedTable,
-        AggregatePath::IndexMinMax,
-        AggregatePath::CompiledCountStar,
-        AggregatePath::CompiledCountDistinct,
+        AggregatePath::IndexBound,
         AggregatePath::PreparedBlock,
         AggregatePath::IndexCount,
     ];
@@ -108,16 +99,13 @@ impl AggregatePath {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             AggregatePath::General => "general",
-            AggregatePath::Pushdown => "pushdown",
-            AggregatePath::FilteredPushdown => "filtered_pushdown",
-            AggregatePath::StreamingGlobal => "streaming_global",
-            AggregatePath::StreamingGlobalScan => "streaming_global_scan",
+            AggregatePath::Stats => "stats",
+            AggregatePath::StorageFiltered => "storage_filtered",
+            AggregatePath::GlobalScan => "global_scan",
             AggregatePath::StorageGrouped => "storage_grouped",
             AggregatePath::StreamingGroupBy => "streaming_group_by",
             AggregatePath::StreamingDerivedTable => "streaming_derived_table",
-            AggregatePath::IndexMinMax => "index_min_max",
-            AggregatePath::CompiledCountStar => "compiled_count_star",
-            AggregatePath::CompiledCountDistinct => "compiled_count_distinct",
+            AggregatePath::IndexBound => "index_bound",
             AggregatePath::PreparedBlock => "prepared_block",
             AggregatePath::IndexCount => "index_count",
         }
@@ -137,6 +125,9 @@ pub(crate) struct AggregateSlots<'a> {
     pub source_columns: &'a [String],
     /// The statement's blocks, which answer its SELECT list's subqueries
     pub blocks: Option<&'a dyn SubqueryExecutor>,
+    /// The output names a plan found for a SELECT list of nothing but the
+    /// one row's calls, see [`Executor::calls_alone`]
+    pub alone: Option<&'a CompactArc<Vec<String>>>,
 }
 
 /// A program over aggregate slot rows: `aliases` read a group item or
@@ -580,6 +571,19 @@ impl SqlAggregateFunction {
     /// Whether a path implementing `supported` may answer this call
     pub(crate) fn answered_with(&self, supported: Modifiers) -> bool {
         self.modifiers().within(supported)
+    }
+
+    /// Whether this is a COUNT of every row: COUNT(*), or a COUNT of a
+    /// constant that is never NULL
+    pub(crate) fn counts_rows(&self) -> bool {
+        self.name == "COUNT"
+            && self.answered_with(Modifiers::EXPRESSION)
+            && match &self.expression {
+                None => self.column == "*",
+                Some(Expression::IntegerLiteral(_) | Expression::FloatLiteral(_)) => true,
+                Some(Expression::StringLiteral(_) | Expression::BooleanLiteral(_)) => true,
+                Some(_) => false,
+            }
     }
 
     /// The running state of this call, see [`Executor::aggregate_state`]
@@ -1404,11 +1408,36 @@ impl Executor {
                 group_by_count: group_by_columns.len(),
                 source_columns: base_columns,
                 blocks,
+                alone: None,
             },
             ctx,
             having_columns,
             having_rows,
         )
+    }
+
+    /// The output names of `stmt` when its SELECT list is nothing but its
+    /// one row's calls, in their order, with no HAVING or ORDER BY: that row
+    /// is its output as it stands
+    pub(crate) fn calls_alone(
+        stmt: &SelectStatement,
+        aggregations: &[SqlAggregateFunction],
+    ) -> Option<Vec<String>> {
+        // Each item is its own slot's call: a slot another clause added, or
+        // one the parse shared between items, moves the others
+        let alone = stmt.having.is_none()
+            && stmt.order_by.is_empty()
+            && stmt.columns.len() == aggregations.len()
+            && aggregations.iter().all(|agg| !agg.hidden)
+            && stmt.columns.iter().zip(aggregations).all(|(column, agg)| {
+                let call = match column {
+                    Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                    other => other,
+                };
+                matches!(call, Expression::FunctionCall(f)
+                    if is_aggregate_function(&f.function) && ExprKey::of_call(f) == agg.key)
+            });
+        alone.then(|| stmt.columns.iter().map(item_name).collect())
     }
 
     /// The one end of every aggregate path: `slot_rows` hold the group
@@ -1430,7 +1459,21 @@ impl Executor {
             group_by_count,
             source_columns,
             blocks,
+            alone,
         } = slots;
+
+        // A SELECT list of nothing but its calls is the row of their values
+        if let Some(names) = alone {
+            return Ok(Box::new(ExecutorResult::with_arc_columns(
+                CompactArc::clone(names),
+                having_rows,
+            )));
+        }
+        if group_by_count == 0 && std::ptr::eq(stmt, written_stmt) {
+            if let Some(names) = Self::calls_alone(stmt, aggregations) {
+                return Ok(Box::new(ExecutorResult::new(names, having_rows)));
+            }
+        }
 
         // ORDER BY may name a grouped column the SELECT list drops. Capture
         // those columns before projection consumes the aggregate rows; they
@@ -3100,505 +3143,33 @@ impl Executor {
         )))
     }
 
-    /// Check if an expression is a PURE aggregate function call.
-    ///
-    /// Returns true only for:
-    /// - `COUNT(*)`, `SUM(col)`, `MIN(col)`, `MAX(col)`, `AVG(col)` directly
-    /// - Same with alias: `COUNT(*) AS cnt`
-    ///
-    /// Returns false for:
-    /// - `SUM(col) + 10` (wrapped in Infix)
-    /// - `-SUM(col)` (wrapped in Prefix)
-    /// - `col * 2` (not an aggregate)
-    fn is_pure_aggregate_expression(expr: &Expression) -> bool {
-        match expr {
-            Expression::FunctionCall(func) => {
-                // Check if it's an aggregate function
-                matches!(
-                    func.function.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
-                )
-            }
-            Expression::Aliased(aliased) => {
-                // Check the inner expression
-                Self::is_pure_aggregate_expression(&aliased.expression)
-            }
-            _ => false,
-        }
-    }
-
-    /// Try to compute aggregates directly on the table without materializing rows.
-    ///
-    /// This is the "deferred aggregation" optimization for simple queries like:
-    /// - `SELECT COUNT(*) FROM table`
-    /// - `SELECT SUM(col), MIN(col), MAX(col) FROM table`
-    ///
-    /// Returns None if the optimization cannot be applied.
-    /// Returns Some(result) if the aggregates were computed directly.
-    ///
-    /// # Eligibility
-    /// - No WHERE clause (or simplified to nothing)
-    /// - No GROUP BY clause
-    /// - No HAVING clause
-    /// - No window functions
-    /// - Simple column aggregates only (no expressions like SUM(a+b))
-    /// - No DISTINCT
-    /// - No ORDER BY on aggregates (like STRING_AGG with ORDER BY)
-    /// - No FILTER clause on aggregates
-    pub(crate) fn try_aggregation_pushdown(
+    /// The one group of `aggregations`, every row of `table` fed to it; the
+    /// statement's `blocks` answer what the calls ask of each row
+    pub(super) fn global_scan_rows(
         &self,
-        table: &dyn crate::storage::traits::Table,
-        stmt: &SelectStatement,
-        ctx: &super::context::ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
-        // classification is passed from caller to avoid redundant cache lookups
-        if Self::aggregates_hold_subquery(stmt) {
-            return Ok(None);
-        }
-
-        // Quick eligibility checks using cached classification
-        if classification.has_where {
-            return Ok(None);
-        }
-        if classification.has_group_by {
-            return Ok(None);
-        }
-        if classification.has_having {
-            return Ok(None);
-        }
-        if classification.has_window_functions {
-            return Ok(None);
-        }
-
-        // CRITICAL: Check that each column expression is a PURE aggregate function
-        // We cannot pushdown expressions like SUM(val) + 10, -SUM(val), etc.
-        // Only handle direct function calls: SUM(val), COUNT(*), MAX(val), etc.
-        for col in &stmt.columns {
-            if !Self::is_pure_aggregate_expression(col) {
-                return Ok(None);
-            }
-        }
-
-        // Parse aggregations
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
-
-        // Must have only aggregations, no regular columns
-        if !non_agg_columns.is_empty() {
-            return Ok(None);
-        }
-        if aggregations.is_empty() {
-            return Ok(None);
-        }
-
-        // Plain aggregates only; COUNT(DISTINCT col) is answered from its index
-        for agg in &aggregations {
-            let supported = if agg.name == "COUNT" {
-                Modifiers::DISTINCT
-            } else {
-                Modifiers::NONE
-            };
-            if !agg.answered_with(supported) {
-                return Ok(None);
-            }
-            // Only support COUNT, SUM, MIN, MAX, AVG
-            match agg.name.as_str() {
-                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
-                _ => return Ok(None),
-            }
-        }
-
-        // Build column index map using schema's cached lowercase column names
-        let schema_lower = table.schema().column_names_lower_arc();
-        let col_index_map: StringMap<usize> = schema_lower
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.clone(), i))
-            .collect();
-
-        let Some(result_values) =
-            Self::global_values_from_table(table, &aggregations, &col_index_map)?
-        else {
-            return Ok(None);
-        };
-        let result_columns = aggregations
-            .iter()
-            .map(|agg| agg.get_column_name())
-            .collect();
-
-        let row = Row::from_compact_vec(result_values);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, row));
-        let slots = AggregateSlots {
-            stmt,
-            written_stmt: stmt,
-            aggregations: &aggregations,
-            group_by_count: 0,
-            source_columns: &table.schema().column_names_arc(),
-            blocks: None,
-        };
-        self.finish_aggregation(AggregatePath::Pushdown, slots, ctx, result_columns, rows)
-            .map(Some)
-    }
-
-    /// The value of every call answered from the table without reading its
-    /// rows: COUNT(*) from the row count, COUNT(DISTINCT) from an index,
-    /// SUM, AVG, MIN and MAX from the column; None when one call cannot be
-    fn global_values_from_table(
         table: &dyn crate::storage::traits::Table,
         aggregations: &[SqlAggregateFunction],
-        col_index_map: &StringMap<usize>,
-    ) -> Result<Option<CompactVec<Value>>> {
-        let mut values = CompactVec::with_capacity(aggregations.len());
-        for agg in aggregations {
-            let column = Self::lookup_column_index(&agg.column_lower, col_index_map);
-            let value = match (agg.name.as_str(), column) {
-                ("COUNT", _) if agg.distinct => table
-                    .get_partition_count(&agg.column_lower)?
-                    .map(|count| Value::Integer(count as i64)),
-                ("COUNT", _) if agg.column == "*" => {
-                    Some(Value::Integer(table.row_count()? as i64))
-                }
-                ("SUM", Some(idx)) => table.sum_column(idx)?.map(|sum| sum.sum()).transpose()?,
-                ("AVG", Some(idx)) => table.avg_column(idx)?.map(|sum| sum.avg()),
-                ("MIN", Some(idx)) => table
-                    .min_column(idx)?
-                    .map(|min| min.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))),
-                ("MAX", Some(idx)) => table
-                    .max_column(idx)?
-                    .map(|max| max.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))),
-                _ => None,
-            };
-            match value {
-                Some(value) => values.push(value),
-                None => return Ok(None),
-            }
-        }
-        Ok(Some(values))
-    }
-
-    /// Try to push filtered aggregation (WHERE + aggregates) directly to the storage layer.
-    ///
-    /// This handles queries like:
-    /// - `SELECT COUNT(*) FROM orders WHERE status = 'shipped'`
-    /// - `SELECT SUM(amount), AVG(amount) FROM sales WHERE region = 'US'`
-    ///
-    /// The WHERE clause is converted to a storage expression and passed alongside the
-    /// aggregate operations to `Table::compute_filtered_aggregates`, which can scan and
-    /// aggregate in a single pass without materializing Row objects in the executor.
-    ///
-    /// # Eligibility
-    /// - Must have WHERE and aggregation, no HAVING/window functions/joins/GROUP BY
-    /// - No DISTINCT aggregates, no subqueries or parameters in WHERE
-    /// - All SELECT columns must be pure aggregate function calls
-    ///
-    /// # Returns
-    /// - `Ok(Some(result))` if the pushdown was applied
-    /// - `Ok(None)` if the query is not eligible (falls through to next path)
-    pub(crate) fn try_filtered_aggregation_pushdown(
-        &self,
-        table: &dyn crate::storage::traits::Table,
-        stmt: &SelectStatement,
-        ctx: &super::context::ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-        columns: &[String],
-    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
-        use crate::storage::mvcc::version_store::AggregateOp;
-
-        if Self::aggregates_hold_subquery(stmt) {
-            return Ok(None);
-        }
-
-        // --- Eligibility checks ---
-
-        if !classification.has_where {
-            return Ok(None);
-        }
-        if !classification.has_aggregation {
-            return Ok(None);
-        }
-        if classification.has_having {
-            return Ok(None);
-        }
-        if classification.has_window_functions {
-            return Ok(None);
-        }
-        if classification.has_joins {
-            return Ok(None);
-        }
-        if classification.has_group_by {
-            return Ok(None);
-        }
-        // Parameters are not yet resolved in storage expressions
-        if classification.where_has_parameters {
-            return Ok(None);
-        }
-        // Subqueries in WHERE cannot be pushed to storage
-        if classification.where_has_subqueries {
-            return Ok(None);
-        }
-
-        // All SELECT columns must be pure aggregate function calls
-        for col in &stmt.columns {
-            if !Self::is_pure_aggregate_expression(col) {
-                return Ok(None);
-            }
-        }
-
-        // Parse aggregations to validate and extract details
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
-
-        // Must have only aggregations, no regular columns
-        if !non_agg_columns.is_empty() || aggregations.is_empty() {
-            return Ok(None);
-        }
-
-        // Plain aggregates only
-        for agg in &aggregations {
-            if !agg.answered_with(Modifiers::NONE) {
-                return Ok(None);
-            }
-            match agg.name.as_str() {
-                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
-                _ => return Ok(None),
-            }
-        }
-
-        // --- Convert WHERE clause to storage expression ---
-
-        let where_expr = match stmt.where_clause.as_ref() {
-            Some(expr) => expr,
-            None => return Ok(None),
-        };
-
-        let schema = table.schema();
-        let (storage_expr, needs_memory_filter) =
-            super::pushdown::try_pushdown(where_expr, schema, Some(ctx));
-
-        // Bail when the WHERE clause is only partially pushed to storage.
-        // The residual predicate would be ignored, producing wrong aggregates.
-        if needs_memory_filter {
-            return Ok(None);
-        }
-
-        let storage_expr = match storage_expr {
-            Some(expr) => expr,
-            None => return Ok(None), // Cannot convert WHERE to storage expression
-        };
-
-        // --- Build (AggregateOp, column_index) pairs ---
-
-        let col_map: FxHashMap<&str, usize> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.as_str(), i))
-            .collect();
-
-        let mut agg_ops: Vec<(AggregateOp, usize)> = Vec::with_capacity(aggregations.len());
-        let mut result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
-
-        for agg in &aggregations {
-            result_columns.push(agg.get_column_name());
-
-            let (op, col_idx) = match agg.name.as_str() {
-                "COUNT" => {
-                    if agg.column == "*" {
-                        (AggregateOp::CountStar, 0)
-                    } else if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
-                        (AggregateOp::Count, idx)
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                "SUM" => {
-                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
-                        (AggregateOp::Sum, idx)
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                "AVG" => {
-                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
-                        (AggregateOp::Avg, idx)
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                "MIN" => {
-                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
-                        (AggregateOp::Min, idx)
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                "MAX" => {
-                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
-                        (AggregateOp::Max, idx)
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                _ => return Ok(None),
-            };
-            agg_ops.push((op, col_idx));
-        }
-
-        // --- Call storage-level filtered aggregation ---
-
-        let values = match table.compute_filtered_aggregates(&agg_ops, storage_expr.as_ref())? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        // --- Build result ---
-
-        let mut result_values: CompactVec<Value> = CompactVec::with_capacity(values.len());
-        for v in values {
-            result_values.push(v);
-        }
-        let row = Row::from_compact_vec(result_values);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, row));
-        let slots = AggregateSlots {
-            stmt,
-            written_stmt: stmt,
-            aggregations: &aggregations,
-            group_by_count: 0,
-            source_columns: columns,
-            blocks: None,
-        };
-        self.finish_aggregation(
-            AggregatePath::FilteredPushdown,
-            slots,
-            ctx,
-            result_columns,
-            rows,
-        )
-        .map(Some)
-    }
-
-    /// Try to compute global aggregates using streaming (no row materialization).
-    ///
-    /// This is a fallback for queries that can't use direct aggregation pushdown,
-    /// but can still avoid collecting all rows by streaming through a scanner.
-    ///
-    /// Examples of eligible queries:
-    /// - `SELECT AVG(col) * 100 FROM table`  (expression wrapping aggregate)
-    /// - `SELECT SUM(col), COUNT(*) FROM table`  (multiple simple aggregates)
-    ///
-    /// # Returns
-    /// - `Some(result)` if streaming aggregation was used
-    /// - `None` if the query is not eligible for streaming
-    pub(crate) fn try_streaming_global_aggregation(
-        &self,
-        table: &dyn crate::storage::traits::Table,
-        stmt: &SelectStatement,
-        ctx: &super::context::ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
-        // Quick eligibility checks using cached classification
-        if classification.has_where || Self::aggregates_hold_subquery(stmt) {
-            return Ok(None);
-        }
-        if classification.has_group_by {
-            return Ok(None);
-        }
-        if classification.has_having {
-            return Ok(None);
-        }
-        if classification.has_window_functions {
-            return Ok(None);
-        }
-        if classification.has_order_by {
-            return Ok(None);
-        }
-        if classification.has_limit {
-            return Ok(None);
-        }
-
-        // Parse aggregations - allow non-pure expressions (like AVG(col) * 100)
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
-
-        // Must have only aggregations, no regular columns
-        if !non_agg_columns.is_empty() {
-            return Ok(None);
-        }
-        if aggregations.is_empty() {
-            return Ok(None);
-        }
-
-        // Plain aggregates only, and COUNT(DISTINCT col)
-        for agg in &aggregations {
-            let supported = if agg.name == "COUNT" {
-                Modifiers::DISTINCT
-            } else {
-                Modifiers::NONE
-            };
-            if !agg.answered_with(supported) {
-                return Ok(None);
-            }
-            // Only support COUNT, SUM, MIN, MAX, AVG for streaming
-            match agg.name.as_str() {
-                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
-                _ => return Ok(None),
-            }
-        }
-
-        // Build column index map using schema's cached lowercase column names
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<RowVec> {
         let schema_lower = table.schema().column_names_lower_arc();
         let col_index_map: StringMap<usize> = schema_lower
             .iter()
             .enumerate()
             .map(|(i, c)| (c.clone(), i))
             .collect();
-
-        // FAST PATH: every call answered from the table without reading rows
-        let plain = aggregations
-            .iter()
-            .all(|agg| agg.answered_with(Modifiers::NONE));
-        if plain {
-            if let Some(values) =
-                Self::global_values_from_table(table, &aggregations, &col_index_map)?
-            {
-                let agg_result_columns = aggregations
-                    .iter()
-                    .map(|agg| agg.get_column_name())
-                    .collect();
-                let mut agg_rows = RowVec::with_capacity(1);
-                agg_rows.push((0, Row::from_compact_vec(values)));
-                let slots = AggregateSlots {
-                    stmt,
-                    written_stmt: stmt,
-                    aggregations: &aggregations,
-                    group_by_count: 0,
-                    source_columns: &table.schema().column_names_arc(),
-                    blocks: None,
-                };
-                return self
-                    .finish_aggregation(
-                        AggregatePath::StreamingGlobal,
-                        slots,
-                        ctx,
-                        agg_result_columns,
-                        agg_rows,
-                    )
-                    .map(Some);
-            }
-        }
-
-        // Otherwise the one group of the grouped path, fed by a scan
-        let mut groups = GroupedAggregates::global(self.call_templates(&aggregations)?);
+        let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
         let feed = RowFeed::new(
-            &aggregations,
+            aggregations,
             &[],
             None,
             &schema_lower,
             &col_index_map,
             ctx,
-            None,
+            blocks,
         )?;
         let mut state = FeedState::default();
-        let reads = RowReads::of(ctx, None);
+        let reads = RowReads::of(ctx, blocks);
         let mut scanner = table.scan(&[], None)?;
         while scanner.next() {
             feed.run_one(&mut groups, scanner.row(), &reads, &mut state)?;
@@ -3607,28 +3178,7 @@ impl Executor {
             return Err(e.clone());
         }
         scanner.close()?;
-
-        let agg_result_columns: Vec<String> = aggregations
-            .iter()
-            .map(|agg| agg.get_column_name())
-            .collect();
-        let agg_rows = groups.into_rows()?;
-        let slots = AggregateSlots {
-            stmt,
-            written_stmt: stmt,
-            aggregations: &aggregations,
-            group_by_count: 0,
-            source_columns: &table.schema().column_names_arc(),
-            blocks: None,
-        };
-        self.finish_aggregation(
-            AggregatePath::StreamingGlobalScan,
-            slots,
-            ctx,
-            agg_result_columns,
-            agg_rows,
-        )
-        .map(Some)
+        groups.into_rows()
     }
 
     /// Try streaming aggregation for derived tables (FROM subqueries).
@@ -3769,6 +3319,7 @@ impl Executor {
             group_by_count: 1,
             source_columns: &source_columns,
             blocks: None,
+            alone: None,
         };
         self.finish_aggregation(
             AggregatePath::StreamingDerivedTable,
@@ -3912,6 +3463,7 @@ impl Executor {
             group_by_count: group_by_indices.len(),
             source_columns: all_columns,
             blocks: None,
+            alone: None,
         };
         Some(self.finish_aggregation(
             AggregatePath::StorageGrouped,
@@ -3920,625 +3472,6 @@ impl Executor {
             slot_columns,
             rows,
         ))
-    }
-
-    /// Try fast COUNT(DISTINCT col) using compiled cache
-    ///
-    /// This is a compiled fast path for simple `SELECT COUNT(DISTINCT col) FROM table` queries.
-    /// On first execution, it analyzes and compiles the query pattern.
-    /// On subsequent executions, it skips parsing and directly fetches the distinct count.
-    ///
-    /// # Arguments
-    /// * `stmt` - The SELECT statement
-    /// * `compiled` - The compiled execution state (shared via RwLock)
-    ///
-    /// # Returns
-    /// * `Some(Ok(result))` - Query succeeded via fast path
-    /// * `Some(Err(e))` - Query failed
-    /// * `None` - Query doesn't qualify for this fast path (use normal path)
-    pub(crate) fn try_fast_count_distinct_compiled(
-        &self,
-        stmt: &SelectStatement,
-        compiled: &RwLock<CompiledExecution>,
-    ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
-        // is active; this path reads committed state only.
-
-        // Try read lock first - check if already compiled
-        {
-            let compiled_guard = match compiled.read() {
-                Ok(guard) => guard,
-                Err(_) => return None,
-            };
-            match &*compiled_guard {
-                CompiledExecution::NotOptimizable(validity)
-                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
-                {
-                    return None
-                }
-                CompiledExecution::CountDistinct(cd) => {
-                    // Fast path: validate epoch and execute directly
-                    if cd.validity.holds(&*self.engine, self.engine.schema_epoch()) {
-                        return self.execute_compiled_count_distinct(cd).transpose();
-                    }
-                    // Schema changed - fall through to recompile
-                }
-                CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - fall through to recompile
-                // Other variants - not a COUNT DISTINCT query
-                _ => return None,
-            }
-        }
-
-        // First execution or schema changed - compile and cache (write lock)
-        self.compile_and_execute_count_distinct(stmt, compiled)
-    }
-
-    /// Execute using pre-compiled COUNT(DISTINCT col) info; None when the
-    /// index cannot answer for this statement and the regular path does
-    fn execute_compiled_count_distinct(
-        &self,
-        cd: &CompiledCountDistinct,
-    ) -> Result<Option<Box<dyn QueryResult>>> {
-        // Under read committed the table's own distinct count is the latest
-        // committed one: it answers only when no commit published across its
-        // reads. Else the count is read through a view
-        let quiet_count = || -> Result<Option<usize>> {
-            let tx = self.begin_transaction()?;
-            let table = tx.get_read_table_at(&cd.table_name, None, TableUse::Read)?;
-            table.get_partition_count(&cd.column_name)
-        };
-        let read_committed = self.isolation_level() == crate::core::IsolationLevel::ReadCommitted;
-        let count = match read_committed.then(quiet_count).transpose()?.flatten() {
-            Some(count) => count,
-            None => {
-                let view = self.autocommit_view();
-                let tx = self.begin_transaction()?;
-                let table = tx.get_read_table_at(&cd.table_name, view.as_ref(), TableUse::Read)?;
-                let Some(count) = table.get_partition_count(&cd.column_name)? else {
-                    return Ok(None);
-                };
-                view.as_ref()
-                    .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)?;
-                count
-            }
-        };
-
-        // Build result
-        let mut result_values = CompactVec::with_capacity(1);
-        result_values.push(Value::Integer(count as i64));
-        let row = Row::from_compact_vec(result_values);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, row));
-
-        AggregatePath::CompiledCountDistinct.taken();
-        Ok(Some(Box::new(ExecutorResult::new(
-            vec![cd.result_column_name.clone()],
-            rows,
-        ))))
-    }
-
-    /// Compile and execute COUNT(DISTINCT col), caching the compiled state
-    fn compile_and_execute_count_distinct(
-        &self,
-        stmt: &SelectStatement,
-        compiled: &RwLock<CompiledExecution>,
-    ) -> Option<Result<Box<dyn QueryResult>>> {
-        use crate::common::SmartString;
-
-        // Acquire write lock
-        let mut compiled_guard = match compiled.write() {
-            Ok(guard) => guard,
-            Err(_) => return None,
-        };
-
-        // Double-check (another thread may have compiled while we waited)
-        match &*compiled_guard {
-            CompiledExecution::NotOptimizable(validity)
-                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
-            {
-                return None
-            }
-            CompiledExecution::CountDistinct(cd) => {
-                if cd.validity.holds(&*self.engine, self.engine.schema_epoch()) {
-                    return self.execute_compiled_count_distinct(cd).transpose();
-                }
-                // Schema changed, continue to recompile
-            }
-            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
-            _ => return None,
-        }
-
-        let validity = self.select_validity(stmt, self.engine.schema_epoch());
-
-        // Pattern detection: SELECT COUNT(DISTINCT col) FROM table
-        // Must have:
-        // - Exactly one column expression
-        // - That column is COUNT(DISTINCT col) function call
-        // - No WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, CTEs, set operations
-        // - Single table source (no joins)
-
-        if stmt.columns.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-            return None;
-        }
-
-        // Check for disqualifying clauses
-        if stmt.where_clause.is_some()
-            || !stmt.group_by.columns.is_empty()
-            || stmt.having.is_some()
-            || !stmt.order_by.is_empty()
-            || stmt.limit.is_some()
-            || stmt.offset.is_some()
-            || stmt.with.is_some()
-            || !stmt.set_operations.is_empty()
-        {
-            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-            return None;
-        }
-
-        // Extract COUNT(DISTINCT col) pattern
-        let (column_name, result_column_name) = match &stmt.columns[0] {
-            Expression::FunctionCall(func) => {
-                // Must be COUNT function
-                if func.function.to_uppercase() != "COUNT" {
-                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                    return None;
-                }
-                // Must be DISTINCT - if not, don't mark as NotOptimizable
-                // because COUNT(*) fast path might handle it
-                if !func.is_distinct {
-                    return None;
-                }
-                if func.arguments.len() != 1
-                    || !Modifiers::of_call(func).within(Modifiers::DISTINCT)
-                {
-                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                    return None;
-                }
-                // Get column name from argument
-                let (col, result_name) = match &func.arguments[0] {
-                    Expression::Identifier(ident) => {
-                        (ident.value.to_lowercase(), item_name(&stmt.columns[0]))
-                    }
-                    _ => {
-                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                        return None;
-                    }
-                };
-                (col, result_name)
-            }
-            Expression::Aliased(aliased) => {
-                // Handle COUNT(DISTINCT col) AS alias
-                match aliased.expression.as_ref() {
-                    Expression::FunctionCall(func) => {
-                        // Must be COUNT function
-                        if func.function.to_uppercase() != "COUNT" {
-                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                            return None;
-                        }
-                        // Must be DISTINCT - if not, don't mark as NotOptimizable
-                        // because COUNT(*) fast path might handle it
-                        if !func.is_distinct {
-                            return None;
-                        }
-                        if func.arguments.len() != 1
-                            || !Modifiers::of_call(func).within(Modifiers::DISTINCT)
-                        {
-                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                            return None;
-                        }
-                        let col = match &func.arguments[0] {
-                            Expression::Identifier(ident) => ident.value.to_lowercase(),
-                            _ => {
-                                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                                return None;
-                            }
-                        };
-                        (col, aliased.alias.value.to_string())
-                    }
-                    _ => {
-                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                        return None;
-                    }
-                }
-            }
-            _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        // Extract table name (bail out for AS OF temporal queries)
-        let table_name = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => {
-                if ts.as_of.is_some() {
-                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                    return None;
-                }
-                ts.name.value_lower.clone()
-            }
-            _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        // Try to get table and verify index exists
-        let tx = match self.begin_transaction() {
-            Ok(tx) => tx,
-            Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        let table = match tx.get_read_table_at(
-            &table_name,
-            self.autocommit_view().as_ref(),
-            TableUse::Read,
-        ) {
-            Ok(t) => t,
-            Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        // Cache only an available count; storage failures must reach the caller.
-        let count = match table.get_partition_count(&column_name) {
-            Ok(Some(c)) => c,
-            // An index that cannot answer for this statement may for the next
-            Ok(None) if table.get_index_on_column(&column_name).is_some() => return None,
-            Ok(None) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-            Err(error) => return Some(Err(error)),
-        };
-
-        // Cache the compiled state
-        let compiled_cd = CompiledCountDistinct {
-            table_name: SmartString::new(&table_name),
-            column_name: SmartString::new(&column_name),
-            result_column_name: result_column_name.clone(),
-            validity,
-        };
-        *compiled_guard = CompiledExecution::CountDistinct(compiled_cd);
-        drop(compiled_guard);
-
-        // Build result
-        let mut result_values = CompactVec::with_capacity(1);
-        result_values.push(Value::Integer(count as i64));
-        let row = Row::from_compact_vec(result_values);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, row));
-
-        AggregatePath::CompiledCountDistinct.taken();
-        Some(Ok(Box::new(ExecutorResult::new(
-            vec![result_column_name],
-            rows,
-        ))))
-    }
-
-    /// COUNT(*) fast path for simple queries
-    ///
-    /// This is a compiled fast path for simple `SELECT COUNT(*) FROM table` queries.
-    /// On first execution, it analyzes and compiles the query pattern.
-    /// On subsequent executions, it skips parsing and directly fetches the row count.
-    ///
-    /// # Arguments
-    /// * `stmt` - The SELECT statement
-    /// * `compiled` - The compiled execution state (shared via RwLock)
-    ///
-    /// # Returns
-    /// * `Some(Ok(result))` - Query succeeded via fast path
-    /// * `Some(Err(e))` - Query failed
-    /// * `None` - Query doesn't qualify for this fast path (use normal path)
-    pub(crate) fn try_fast_count_star_compiled(
-        &self,
-        stmt: &SelectStatement,
-        compiled: &RwLock<CompiledExecution>,
-    ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
-        // is active; this path reads committed state only.
-
-        // Try read lock first - check if already compiled
-        {
-            let compiled_guard = match compiled.read() {
-                Ok(guard) => guard,
-                Err(_) => return None,
-            };
-            match &*compiled_guard {
-                CompiledExecution::NotOptimizable(validity)
-                    if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
-                {
-                    return None
-                }
-                CompiledExecution::CountStar(cs) => {
-                    // Fast path: validate epoch and execute directly
-                    if cs.validity.holds(&*self.engine, self.engine.schema_epoch()) {
-                        return Some(self.execute_compiled_count_star(cs));
-                    }
-                    // Schema changed - fall through to recompile
-                }
-                CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - fall through to recompile
-                // Other variants - not a COUNT(*) query
-                _ => return None,
-            }
-        }
-
-        // First execution or schema changed - compile and cache (write lock)
-        self.compile_and_execute_count_star(stmt, compiled)
-    }
-
-    /// Execute using pre-compiled COUNT(*) info
-    fn execute_compiled_count_star(
-        &self,
-        cs: &crate::executor::query_cache::CompiledCountStar,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Under read committed the table's own count is the latest committed
-        // one: it answers only when no commit published across its reads.
-        // Else the count is read through a view
-        let quiet_count = || -> Result<Option<usize>> {
-            let tx = self.begin_transaction()?;
-            let table = tx.get_read_table_at(&cs.table_name, None, TableUse::Read)?;
-            table.fast_row_count()
-        };
-        let read_committed = self.isolation_level() == crate::core::IsolationLevel::ReadCommitted;
-        let count = match read_committed.then(quiet_count).transpose()?.flatten() {
-            Some(count) => count,
-            None => {
-                let view = self.autocommit_view();
-                let tx = self.begin_transaction()?;
-                let table = tx.get_read_table_at(&cs.table_name, view.as_ref(), TableUse::Read)?;
-                let count = table.row_count()?;
-                view.as_ref()
-                    .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)?;
-                count
-            }
-        };
-
-        // Build result
-        let mut result_values = CompactVec::with_capacity(1);
-        result_values.push(Value::Integer(count as i64));
-        let row = Row::from_compact_vec(result_values);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, row));
-
-        AggregatePath::CompiledCountStar.taken();
-        Ok(Box::new(ExecutorResult::new(
-            vec![cs.result_column_name.clone()],
-            rows,
-        )))
-    }
-
-    /// Compile and execute COUNT(*), caching the compiled state
-    fn compile_and_execute_count_star(
-        &self,
-        stmt: &SelectStatement,
-        compiled: &RwLock<CompiledExecution>,
-    ) -> Option<Result<Box<dyn QueryResult>>> {
-        use crate::common::SmartString;
-        use crate::executor::query_cache::CompiledCountStar;
-
-        // Acquire write lock
-        let mut compiled_guard = match compiled.write() {
-            Ok(guard) => guard,
-            Err(_) => return None,
-        };
-
-        // Double-check (another thread may have compiled while we waited)
-        match &*compiled_guard {
-            CompiledExecution::NotOptimizable(validity)
-                if validity.holds(&*self.engine, self.engine.schema_epoch()) =>
-            {
-                return None
-            }
-            CompiledExecution::CountStar(cs) => {
-                if cs.validity.holds(&*self.engine, self.engine.schema_epoch()) {
-                    return Some(self.execute_compiled_count_star(cs));
-                }
-                // Schema changed, continue to recompile
-            }
-            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
-            _ => return None,
-        }
-
-        let validity = self.select_validity(stmt, self.engine.schema_epoch());
-
-        // Pattern detection: SELECT COUNT(*) FROM table
-        // Must have:
-        // - Exactly one column expression
-        // - That column is COUNT(*) or COUNT(1) function call (not DISTINCT)
-        // - No WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, CTEs, set operations
-        // - Single table source (no joins)
-
-        if stmt.columns.len() != 1 {
-            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-            return None;
-        }
-
-        // Check for disqualifying clauses
-        if stmt.where_clause.is_some()
-            || !stmt.group_by.columns.is_empty()
-            || stmt.having.is_some()
-            || !stmt.order_by.is_empty()
-            || stmt.limit.is_some()
-            || stmt.offset.is_some()
-            || stmt.with.is_some()
-            || !stmt.set_operations.is_empty()
-        {
-            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-            return None;
-        }
-
-        // Extract COUNT(*) pattern
-        let result_column_name = match &stmt.columns[0] {
-            Expression::FunctionCall(func) => {
-                // Must be COUNT function
-                if func.function.to_uppercase() != "COUNT" {
-                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                    return None;
-                }
-                // Must NOT be DISTINCT - if DISTINCT, don't mark as NotOptimizable
-                // because COUNT DISTINCT fast path might handle it
-                if func.is_distinct {
-                    return None;
-                }
-                // No other modifier; the argument's shape is checked below
-                if !Modifiers::of_call(func).within(Modifiers::EXPRESSION) {
-                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                    return None;
-                }
-                // Must be COUNT(*) or COUNT(1)
-                match func.arguments.len() {
-                    0 => {
-                        // COUNT(*) without explicit star is rare but handle it
-                        item_name(&stmt.columns[0])
-                    }
-                    1 => {
-                        match &func.arguments[0] {
-                            Expression::Star(_) => item_name(&stmt.columns[0]),
-                            Expression::IntegerLiteral(lit) => {
-                                // COUNT(1) is equivalent to COUNT(*)
-                                if lit.value == 1 {
-                                    item_name(&stmt.columns[0])
-                                } else {
-                                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                                    return None;
-                                }
-                            }
-                            _ => {
-                                // COUNT(col) without DISTINCT - not our fast path
-                                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                                return None;
-                            }
-                        }
-                    }
-                    _ => {
-                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                        return None;
-                    }
-                }
-            }
-            Expression::Aliased(aliased) => {
-                // Handle COUNT(*) AS alias
-                match aliased.expression.as_ref() {
-                    Expression::FunctionCall(func) => {
-                        // Must be COUNT function
-                        if func.function.to_uppercase() != "COUNT" {
-                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                            return None;
-                        }
-                        // Must NOT be DISTINCT - if DISTINCT, don't mark as NotOptimizable
-                        // because COUNT DISTINCT fast path might handle it
-                        if func.is_distinct {
-                            return None;
-                        }
-                        // No other modifier; the argument's shape is checked below
-                        if !Modifiers::of_call(func).within(Modifiers::EXPRESSION) {
-                            *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                            return None;
-                        }
-                        match func.arguments.len() {
-                            0 => aliased.alias.value.to_string(),
-                            1 => match &func.arguments[0] {
-                                Expression::Star(_) => aliased.alias.value.to_string(),
-                                Expression::IntegerLiteral(lit) if lit.value == 1 => {
-                                    aliased.alias.value.to_string()
-                                }
-                                Expression::IntegerLiteral(_) => {
-                                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                                    return None;
-                                }
-                                _ => {
-                                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                                    return None;
-                                }
-                            },
-                            _ => {
-                                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                                return None;
-                            }
-                        }
-                    }
-                    _ => {
-                        *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                        return None;
-                    }
-                }
-            }
-            _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        // Extract table name (bail out for AS OF temporal queries)
-        let table_name = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => {
-                if ts.as_of.is_some() {
-                    *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                    return None;
-                }
-                ts.name.value_lower.clone()
-            }
-            _ => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        // Try to get table and get count
-        let tx = match self.begin_transaction() {
-            Ok(tx) => tx,
-            Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        let view = self.autocommit_view();
-        let table = match tx.get_read_table_at(&table_name, view.as_ref(), TableUse::Read) {
-            Ok(t) => t,
-            Err(_) => {
-                *compiled_guard = CompiledExecution::NotOptimizable(validity);
-                return None;
-            }
-        };
-
-        // Get the count; a truncate or drop that overtook the view leaves it
-        // to the run again
-        let count = match table.row_count().and_then(|count| {
-            view.as_ref()
-                .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)
-                .map(|()| count)
-        }) {
-            Ok(count) => count,
-            Err(error) => return Some(Err(error)),
-        };
-
-        // Cache the compiled state
-        let compiled_cs = CompiledCountStar {
-            table_name: SmartString::new(&table_name),
-            result_column_name: result_column_name.clone(),
-            validity,
-        };
-        *compiled_guard = CompiledExecution::CountStar(compiled_cs);
-        drop(compiled_guard);
-
-        // Build result
-        let mut result_values = CompactVec::with_capacity(1);
-        result_values.push(Value::Integer(count as i64));
-        let row = Row::from_compact_vec(result_values);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, row));
-
-        AggregatePath::CompiledCountStar.taken();
-        Some(Ok(Box::new(ExecutorResult::new(
-            vec![result_column_name],
-            rows,
-        ))))
     }
 }
 
