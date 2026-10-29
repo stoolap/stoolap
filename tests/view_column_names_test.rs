@@ -149,6 +149,39 @@ fn explain_of_a_view_recorded_without_names_runs_nothing() {
 }
 
 #[test]
+fn explain_of_a_join_over_a_view_recorded_without_names_runs_nothing() {
+    let db = Database::open("memory://view_names_old_explain_join").unwrap();
+    setup(&db);
+    for (name, query) in [
+        ("old", "SELECT * FROM t"),
+        (
+            "wrapper",
+            "SELECT t.id, o.a FROM t JOIN old AS o ON o.id = t.id",
+        ),
+    ] {
+        db.engine()
+            .create_view(name, query.to_string(), None, false)
+            .unwrap();
+    }
+    let plan: Vec<String> = db
+        .query("EXPLAIN SELECT * FROM wrapper", ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect();
+    assert!(
+        plan.iter().any(|line| line.contains("View wrapper")),
+        "{plan:?}"
+    );
+    db.execute("ALTER TABLE t RENAME COLUMN a TO z", ())
+        .unwrap();
+    assert_eq!(
+        columns(&db, "SELECT * FROM old"),
+        ["id", "z", "b"],
+        "the EXPLAIN ran the joined view's query, which recorded its names"
+    );
+}
+
+#[test]
 fn a_column_name_longer_than_a_u16_survives_the_record() {
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!("file://{}/db", dir.path().display());

@@ -214,6 +214,8 @@ SELECT n, fib_n as fibonacci FROM fib;
 2. **No Indexes**: CTE results don't have indexes, so filtering should be done in the CTE definition when possible
 3. **Memory Usage**: Large CTEs consume memory, so be mindful of the result set size
 
+A LIMIT without ORDER BY in the statement that reads a CTE stops once it has its rows: the statement's SELECT list is never computed for a row past it, so a value that would fail in that row raises no error. A view that shares the CTE's name does not change this.
+
 ## Use Cases
 
 ### Data Aggregation

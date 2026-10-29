@@ -169,6 +169,32 @@ fn a_source_row_past_the_limit_is_never_computed() {
 }
 
 #[test]
+fn a_cte_answers_alike_whether_or_not_it_hides_a_view() {
+    let db = table("planned_cte_hides_view");
+    let fails_at_3 = "CASE WHEN i = 3 THEN ABS('a') ELSE i END";
+    let statements = [
+        format!("WITH c(i) AS (SELECT id FROM t) SELECT {fails_at_3} FROM c LIMIT 1"),
+        format!("WITH c AS (SELECT id AS i FROM t) SELECT {fails_at_3} FROM c LIMIT 1"),
+    ];
+    let read = |sql: &str| {
+        db.query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map(|rows| rows.len())
+            .map_err(|e| e.to_string())
+    };
+    let alone: Vec<_> = statements.iter().map(|sql| read(sql)).collect();
+    db.execute("CREATE VIEW c AS SELECT 0 AS i", ()).unwrap();
+    for (sql, alone) in statements.iter().zip(alone) {
+        assert_eq!(read(sql), alone, "{sql}: a view the CTE hides changed it");
+        assert_eq!(
+            alone,
+            Ok(1),
+            "{sql}: a row past the LIMIT computed its value"
+        );
+    }
+}
+
+#[test]
 fn a_failing_parameter_or_subquery_fails_only_where_a_row_reaches_it() {
     let db = table("planned_failing_parameter");
     db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();

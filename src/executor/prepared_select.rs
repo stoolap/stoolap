@@ -8278,11 +8278,13 @@ impl Executor {
 
     /// The columns a join side that is not a base table gives, a CTE's, a
     /// view's, a derived table's, a VALUES list's or a table function's,
-    /// named as a FROM names them without reading the side, and untyped
+    /// named as a FROM names them without reading the side, and untyped; a
+    /// view only its run names runs when the caller `runs`
     pub(crate) fn join_side_schema(
         &self,
         side: &Expression,
         ctx: &ExecutionContext,
+        runs: bool,
     ) -> Result<CompactArc<Schema>> {
         let mut on = |reach: Reach<'_>| match reach {
             Reach::Outer(..) => Err(Error::internal("a join side naming an enclosing column")),
@@ -8292,7 +8294,7 @@ impl Executor {
             executor: self,
             ctx,
             on: &mut on,
-            runs: true,
+            runs,
         };
         let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
         let name = scope.tables.first().map(|(name, _)| name.as_str());
@@ -8303,8 +8305,9 @@ impl Executor {
     }
 
     /// A context holding each CTE of `with` under the columns a FROM names
-    /// it with, and no rows: a recursive one named by its first branch
-    pub(crate) fn named_ctes(&self, with: &WithClause) -> Result<ExecutionContext> {
+    /// it with, and no rows: a recursive one named by its first branch; a
+    /// view only its run names runs when the caller `runs`
+    pub(crate) fn named_ctes(&self, with: &WithClause, runs: bool) -> Result<ExecutionContext> {
         let mut registry = super::cte::CteRegistry::new();
         let mut on = |_: Reach<'_>| Ok(None);
         for cte in &with.ctes {
@@ -8331,7 +8334,7 @@ impl Executor {
                         executor: self,
                         ctx: &ctx,
                         on: &mut on,
-                        runs: true,
+                        runs,
                     };
                     named(walk.statement(query, &[], 0, Check::Off)?.1)?
                 }
@@ -9218,14 +9221,19 @@ impl Executor {
         })
     }
 
-    /// Whether `stmt` reads one source that is not a table: a CTE, a view, a
-    /// derived table, a VALUES list, a table function, or no FROM
+    /// Whether `stmt` reads one source that is not a table: a CTE, its own
+    /// or one `ctx` holds, a view, a derived table, a VALUES list, a table
+    /// function, or no FROM
     pub(crate) fn reads_source(&self, stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
         match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => !matches!(
-                self.named(ctx, &ts.name.value_lower),
-                Ok(Named::Table) | Err(_)
-            ),
+            Some(Expression::TableSource(ts)) => {
+                let name = &ts.name.value_lower;
+                let own = stmt
+                    .with
+                    .as_ref()
+                    .is_some_and(|with| with.ctes.iter().any(|cte| cte.name.value_lower == *name));
+                own || !matches!(self.named(ctx, name), Ok(Named::Table) | Err(_))
+            }
             Some(Expression::JoinSource(_)) => false,
             _ => true,
         }
