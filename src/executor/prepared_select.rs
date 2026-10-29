@@ -1543,9 +1543,10 @@ struct StatementWalk<'w> {
     /// Whether a view whose query only its run can name may run here; an
     /// EXPLAIN runs nothing
     runs: bool,
-    /// The SELECT aliases of the statements around the one walked, which a
-    /// bare name its scopes lack reads as the general binder does
-    visible: Vec<SmartString>,
+    /// The SELECT aliases of the statements around the one walked, each with
+    /// the scope count of its statement, which a bare name reads ahead of a
+    /// column of a scope farther out, as the general binder does
+    visible: Vec<(SmartString, usize)>,
 }
 
 impl StatementWalk<'_> {
@@ -1558,7 +1559,9 @@ impl StatementWalk<'_> {
         check: Check,
     ) -> Result<SelectStatement> {
         let mark = self.visible.len();
-        self.visible.extend(level.aliases.iter().cloned());
+        let owner = level.scopes.len();
+        self.visible
+            .extend(level.aliases.iter().map(|alias| (alias.clone(), owner)));
         let walked = self.statement(sq, &level.scopes, level.inside, check);
         self.visible.truncate(mark);
         Ok(walked?.0)
@@ -1865,13 +1868,21 @@ impl StatementWalk<'_> {
                 if level.aliases.contains(&id.value_lower) {
                     return Ok(expr.clone());
                 }
+                // The scope of the nearest statement around it with that alias
+                let alias = self
+                    .visible
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| *name == id.value_lower)
+                    .and_then(|(_, owner)| level.scopes.len().checked_sub(*owner));
                 match chain.bare(id) {
+                    // An alias of a statement around it is read at its run
+                    Ok(Some((depth, _))) if alias.is_some_and(|at| at < depth) => Ok(expr.clone()),
                     Ok(Some((depth, index))) => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
                         None => Ok(expr.clone()),
                     },
-                    // An alias of a statement around it, read at its run
-                    Err(e) if level.check && !self.visible.contains(&id.value_lower) => Err(e),
+                    Err(e) if level.check && alias.is_none() => Err(e),
                     _ => Ok(expr.clone()),
                 }
             }
@@ -1922,6 +1933,14 @@ impl StatementWalk<'_> {
                 token: distinct.token.clone(),
                 expr: Box::new(self.expr(&distinct.expr, level)?),
             })),
+            // A function binds as a name does, in a key the run never computes too
+            Expression::FunctionCall(call)
+                if level.check && !callable(&self.executor.function_registry, &call.function) =>
+            {
+                Err(compile_error(CompileError::FunctionNotFound(
+                    call.function.to_uppercase().to_string(),
+                )))
+            }
             other => rebuild(other, &mut |child| self.expr(child, level)),
         }
     }
@@ -2835,6 +2854,15 @@ fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
 
 fn compile_error(error: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", error))
+}
+
+/// Whether a call of `name` resolves: a scalar, aggregate or window
+/// function, or the transaction id the compiler reads itself
+fn callable(registry: &FunctionRegistry, name: &str) -> bool {
+    registry.is_scalar(name)
+        || registry.is_aggregate(name)
+        || registry.is_window(name)
+        || name.eq_ignore_ascii_case("CURRENT_TRANSACTION_ID")
 }
 
 /// That each ORDER BY position of the block `sq`, whose FROM gives `columns`

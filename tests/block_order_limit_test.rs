@@ -813,3 +813,67 @@ fn a_qualified_name_reads_its_table_s_column_never_a_select_alias() {
         }
     }
 }
+
+#[test]
+fn a_select_alias_is_read_ahead_of_a_column_farther_out() {
+    let db = Database::open("memory://block_order_limit_alias_ahead").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, z INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO t VALUES (1, 1, -1), (2, 2, -1)",
+        "INSERT INTO u VALUES (1, 1), (2, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for (sql, want) in [
+        // z is the block's alias x, not t.z
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT z * u.x) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT (SELECT z * u.x)) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        // Without the alias, z is t.z
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS q FROM u \
+             ORDER BY (SELECT z * u.x) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![1],
+        ),
+    ] {
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, want, "{sql}");
+    }
+}
+
+#[test]
+fn a_statement_block_key_that_chooses_no_row_binds_its_functions() {
+    for (db, _dir) in alias_tables("block_order_limit_unchosen_functions") {
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
+             ORDER BY nosuchfn(MAX(x))) ORDER BY id",
+            "SELECT id FROM t WHERE a IN (SELECT x FROM u UNION SELECT 0 \
+             ORDER BY nosuchfn(x)) ORDER BY id",
+            "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
+             ORDER BY (SELECT nosuchfn(1))) ORDER BY id",
+        ] {
+            let err = error(&db, sql);
+            assert!(err.contains("Function not found: NOSUCHFN"), "{sql}: {err}");
+        }
+        let sql = "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
+                   ORDER BY COALESCE(COUNT(*), CURRENT_TRANSACTION_ID())) ORDER BY id";
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, [1, 2], "{sql}");
+    }
+}
