@@ -26,6 +26,7 @@
 6	9cf16c9bbe74b493	SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t
 3	d37e7a1d21dad975	SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t ORDER BY (SELECT v FROM u WHERE u.id = t.id) DESC, id LIMIT 3 OFFSET $1
 2	0fbdd16a18131326	SELECT id, (SELECT v FROM u WHERE u.id = t.id) FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+2	ba884f5ce1b8ecd9	SELECT id, ROW_NUMBER() OVER w FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) WINDOW w AS (ORDER BY id)
 2	e9f561c810a20390	SELECT id, a + 1 AS s, CASE WHEN b = 1 THEN 'x' END FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
 2	7164b455f4b0c10c	SELECT t.* FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
 2	d9f3a5e1b0bbb11a	SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > (SELECT v FROM u WHERE u.id = t.id)

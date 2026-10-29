@@ -33,7 +33,7 @@ use rustc_hash::FxHasher;
 
 use crate::executor::volatility::expression_volatility;
 use crate::functions::Volatility;
-use crate::parser::ast::{Expression, FunctionCall, GroupByModifier, SelectStatement};
+use crate::parser::ast::{Expression, FunctionCall, GroupByModifier, SelectStatement, WindowFrame};
 
 /// Maximum number of cached query classifications (LRU eviction)
 const CLASSIFICATION_CACHE_SIZE: usize = 512;
@@ -123,7 +123,8 @@ pub struct QueryClassification {
     // === SELECT clause correlated subqueries ===
     /// Whether any SELECT column has correlated subqueries
     pub select_has_correlated_subqueries: bool,
-    /// Whether the SELECT list, HAVING or GROUP BY holds a subquery of any form
+    /// Whether the SELECT list, HAVING, GROUP BY or a named window holds a
+    /// subquery of any form
     pub grouped_has_subqueries: bool,
     /// Whether the SELECT list, ORDER BY or DISTINCT ON holds a subquery of any form
     pub output_has_subqueries: bool,
@@ -231,6 +232,7 @@ impl QueryClassification {
             .chain(stmt.having.as_deref())
             .chain(&stmt.group_by.columns)
             .chain(grouping_set_items(stmt))
+            .chain(window_def_items(stmt))
             .any(super::Executor::has_subqueries);
         let output_has_subqueries = stmt
             .columns
@@ -974,6 +976,16 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
         hash_expression_structure(having, hasher);
     }
 
+    // Hash the named windows' parts, which grouped_has_subqueries reads
+    for def in &stmt.window_defs {
+        def.partition_by.len().hash(hasher);
+        def.order_by.len().hash(hasher);
+        def.frame.is_some().hash(hasher);
+    }
+    for item in window_def_items(stmt) {
+        hash_expression_structure(item, hasher);
+    }
+
     // Hash FROM structure: without it `SELECT * FROM a` and
     // `SELECT * FROM a JOIN b ON ...` share a key and trade
     // classifications (has_joins, join_count, is_simple_scan).
@@ -1041,6 +1053,17 @@ fn grouping_set_items(stmt: &SelectStatement) -> impl Iterator<Item = &Expressio
         _ => &[],
     };
     sets.iter().flatten()
+}
+
+/// The PARTITION BY and ORDER BY keys and frame offsets of `stmt`'s named
+/// windows
+fn window_def_items(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
+    stmt.window_defs.iter().flat_map(|def| {
+        def.partition_by
+            .iter()
+            .chain(def.order_by.iter().map(|ob| &ob.expression))
+            .chain(def.frame.iter().flat_map(WindowFrame::offsets))
+    })
 }
 
 /// Hash a call's name case-insensitively, without allocating, and every

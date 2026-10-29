@@ -146,8 +146,9 @@ fn top_level(sql: &str, keyword: &str) -> Option<usize> {
     None
 }
 
-/// `sql` with an unused named window, which no prepared family takes: the
-/// general path answers it for as long as it lives
+/// `sql` with an unused named window, which the prepared family does not
+/// take. The grouped family takes it, so a grouped statement's twin runs
+/// that family again rather than the general path
 pub fn general_twin(sql: &str) -> String {
     let at = [" ORDER BY ", " LIMIT ", " OFFSET "]
         .iter()

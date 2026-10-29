@@ -793,11 +793,6 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
             "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
             "a subquery outside WHERE and the subquery blocks",
         ),
-        (
-            "SELECT a, SUM(b), RANK() OVER w FROM t GROUP BY a \
-             HAVING SUM(b) > (SELECT MAX(u.x) FROM u) WINDOW w AS (ORDER BY a)",
-            "a named window",
-        ),
     ] {
         assert_eq!(
             prepared_line(&db, sql),

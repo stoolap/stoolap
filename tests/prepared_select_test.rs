@@ -1031,6 +1031,7 @@ fn test_classifier_rules() {
         format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),
         format!("SELECT DISTINCT ON (b) id FROM t WHERE a > {sq} ORDER BY b, id"),
         format!("SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u"),
+        format!("SELECT id, ROW_NUMBER() OVER w FROM t WHERE a > {sq} WINDOW w AS (ORDER BY id)"),
         "SELECT id FROM t WHERE a > (SELECT q.v FROM (SELECT id, v FROM u) AS q WHERE q.id = t.id)"
             .to_string(),
         "SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT v FROM u WHERE u.id <> t.b) AS q \
@@ -1090,12 +1091,6 @@ fn test_classifier_rules() {
         (
             format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
             "LIMIT or OFFSET that is not a literal or a parameter",
-        ),
-        (
-            format!(
-                "SELECT id, ROW_NUMBER() OVER w FROM t WHERE a > {sq} WINDOW w AS (ORDER BY id)"
-            ),
-            "a named window",
         ),
         (
             format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),

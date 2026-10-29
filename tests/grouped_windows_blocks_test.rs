@@ -253,6 +253,49 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT DISTINCT ON (RANK() OVER (ORDER BY t.a) % 2) t.a FROM t GROUP BY t.a \
              ORDER BY t.a",
         ),
+        // Named windows
+        shape(
+            "SELECT t.id, SUM(t.b) OVER w, (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM {t} \
+             WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER w, {count} FROM t \
+             WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b + (SELECT MAX(u.x) FROM u)) OVER (w ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) FROM {t} WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b + 6) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t \
+             WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER w FROM {t} \
+             WINDOW w AS (PARTITION BY t.a > (SELECT MIN(u.x) FROM u) + 3) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER w FROM t WINDOW w AS (PARTITION BY t.a > 3) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER w FROM {t} \
+             WINDOW w AS (ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), t.id) ORDER BY t.id",
+            "SELECT t.id, ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY {count}, t.id) \
+             ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER w FROM {t} WINDOW w AS (ORDER BY t.id \
+             ROWS BETWEEN (SELECT MIN(u.x) FROM u) + 1 PRECEDING AND CURRENT ROW) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER w FROM t WINDOW w AS (ORDER BY t.id \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.a, SUM(t.b), RANK() OVER w FROM {t} GROUP BY t.a \
+             HAVING SUM(t.b) > (SELECT MAX(u.x) FROM u) * 25 WINDOW w AS (ORDER BY SUM(t.b)) \
+             ORDER BY t.a",
+            "SELECT t.a, SUM(t.b), RANK() OVER w FROM t GROUP BY t.a HAVING SUM(t.b) > 150 \
+             WINDOW w AS (ORDER BY SUM(t.b)) ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.a, COUNT(*) OVER w, (SELECT MAX(u.x) FROM u) FROM {t} GROUP BY t.a \
+             WINDOW w AS (ORDER BY t.a + (SELECT MIN(u.x) FROM u)) ORDER BY t.a",
+            "SELECT t.a, COUNT(*) OVER w, 6 FROM t GROUP BY t.a WINDOW w AS (ORDER BY t.a) \
+             ORDER BY t.a",
+        ),
     ]
 }
 

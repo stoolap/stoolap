@@ -692,10 +692,11 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         (format!("{join} UNION ALL SELECT 0, 0"), vec![yes]),
         (format!("SELECT d.id, d.k FROM ({join}) d"), vec![yes]),
         (
-            format!(
-                "SELECT COUNT(*) OVER w, (SELECT MIN(id) FROM s) FROM ({join}) d WINDOW w AS ()"
-            ),
-            vec!["Prepared: no (a named window)", outside],
+            format!("SELECT COUNT(*), (SELECT SUM((SELECT 1)) FROM s) FROM ({join}) d"),
+            vec![
+                "Prepared: no (a subquery outside WHERE and the subquery blocks)",
+                outside,
+            ],
         ),
         (
             format!("SELECT d.id, d.k FROM ({join}) d WHERE d.id > (SELECT MIN(id) FROM s)"),

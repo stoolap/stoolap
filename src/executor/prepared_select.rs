@@ -446,9 +446,6 @@ impl<'a> Family<'a> {
                     Site::GroupedList => Site::GroupedOutput,
                     _ => return Err("a window function outside the SELECT list"),
                 };
-                if window.window_ref.is_some() {
-                    return Err("a named window");
-                }
                 // NTILE's argument, the ones after a call's first and the frame
                 // offsets are read once for the call: a subquery there runs once
                 let call = &window.function;
@@ -463,27 +460,44 @@ impl<'a> Family<'a> {
                     .filter
                     .as_deref()
                     .into_iter()
-                    .chain(call.order_by.iter().map(|o| &o.expression))
-                    .chain(&window.partition_by)
-                    .chain(window.order_by.iter().map(|o| &o.expression));
+                    .chain(call.order_by.iter().map(|o| &o.expression));
                 for expr in read {
                     self.expression(expr, scopes, inner, found)?;
                 }
-                let bounds = window
-                    .frame
-                    .iter()
-                    .flat_map(|frame| std::iter::once(&frame.start).chain(&frame.end));
-                for bound in bounds {
-                    if let WindowFrameBound::Preceding(offset)
-                    | WindowFrameBound::Following(offset) = bound
-                    {
-                        self.expression(offset, scopes, Site::Subqueries, found)?;
-                    }
-                }
-                Ok(())
+                let over = (
+                    &window.partition_by[..],
+                    &window.order_by[..],
+                    &window.frame,
+                );
+                self.window(over, scopes, inner, found)
             }
             _ => Err("an expression form outside the family"),
         }
+    }
+
+    /// A window's PARTITION BY and ORDER BY keys, read at `inner`, and its
+    /// frame offsets, read once for the call
+    fn window(
+        &self,
+        (partition_by, order_by, frame): (
+            &'a [Expression],
+            &'a [OrderByExpression],
+            &'a Option<WindowFrame>,
+        ),
+        scopes: usize,
+        inner: Site,
+        found: &mut bool,
+    ) -> std::result::Result<(), OutOfFamily> {
+        for expr in partition_by
+            .iter()
+            .chain(order_by.iter().map(|o| &o.expression))
+        {
+            self.expression(expr, scopes, inner, found)?;
+        }
+        for offset in frame.iter().flat_map(WindowFrame::offsets) {
+            self.expression(offset, scopes, Site::Subqueries, found)?;
+        }
+        Ok(())
     }
 
     /// One subquery block whose chain holds `scopes` scopes, selecting the
@@ -996,9 +1010,6 @@ impl Executor {
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
-        if !stmt.window_defs.is_empty() {
-            return Err("a named window");
-        }
         // A set operation's branch carries no DISTINCT ON key as a column
         if !stmt.set_operations.is_empty() && stmt.distinct_on.iter().any(mentions_subquery) {
             return Err("a DISTINCT ON subquery in a set operation's branch");
@@ -1065,6 +1076,16 @@ impl Executor {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 family.expression(unaliased(column), 1, list, &mut found)?;
             }
+        }
+        // A named window's keys are read as an OVER's own
+        let over = if grouped {
+            Site::GroupedOutput
+        } else {
+            Site::Subqueries
+        };
+        for def in &stmt.window_defs {
+            let window = (&def.partition_by[..], &def.order_by[..], &def.frame);
+            family.window(window, 1, over, &mut found)?;
         }
         if let Some(having) = stmt.having.as_deref() {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
@@ -7137,6 +7158,18 @@ impl PreparedGrouped {
             }
             ob.expression = Expression::Identifier(column);
         }
+        // A named window's keys and frame offsets are rewritten as an OVER's own
+        let mut window_defs = stmt.window_defs.clone();
+        for def in &mut window_defs {
+            let keys = def
+                .partition_by
+                .iter_mut()
+                .chain(def.order_by.iter_mut().map(|ob| &mut ob.expression))
+                .chain(def.frame.iter_mut().flat_map(WindowFrame::offsets_mut));
+            for expr in keys.filter(|expr| mentions_subquery(expr)) {
+                *expr = output(expr, None)?;
+            }
+        }
         let blocks_read = builder.subqueries.len();
         let values = CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
         let run_slots = run_slots
@@ -7240,6 +7273,7 @@ impl PreparedGrouped {
                 .map(Box::new)
                 .or_else(|| stmt.where_clause.clone()),
             order_by,
+            window_defs,
             ..stmt.clone()
         };
         // A set operation's first branch: the whole one reads the rest

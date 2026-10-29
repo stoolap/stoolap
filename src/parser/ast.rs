@@ -1270,6 +1270,32 @@ pub struct WindowFrame {
     pub end: Option<WindowFrameBound>,
 }
 
+impl WindowFrame {
+    /// The offsets of its bounds
+    pub fn offsets(&self) -> impl Iterator<Item = &Expression> {
+        std::iter::once(&self.start)
+            .chain(&self.end)
+            .filter_map(|bound| match bound {
+                WindowFrameBound::Preceding(offset) | WindowFrameBound::Following(offset) => {
+                    Some(offset.as_ref())
+                }
+                _ => None,
+            })
+    }
+
+    /// The offsets of its bounds, to rewrite
+    pub fn offsets_mut(&mut self) -> impl Iterator<Item = &mut Expression> {
+        std::iter::once(&mut self.start)
+            .chain(self.end.as_mut())
+            .filter_map(|bound| match bound {
+                WindowFrameBound::Preceding(offset) | WindowFrameBound::Following(offset) => {
+                    Some(offset.as_mut())
+                }
+                _ => None,
+            })
+    }
+}
+
 impl fmt::Display for WindowFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let unit = match self.unit {
