@@ -597,7 +597,7 @@ impl Executor {
         let mut reads = Vec::new();
         let mut by = None;
         match &plan.read {
-            AggregateRead::Global { source, pushed } => match source {
+            AggregateRead::Global { source, .. } => match source {
                 GlobalSource::IndexBound => {
                     let column = bare_column(&plan.aggregations[0]);
                     reads.push(format!("IndexBound {table} ({column})"));
@@ -608,15 +608,20 @@ impl Executor {
                     reads.push(format!("Stats {table}"));
                     reads.push(format!("else SeqScan {table}"));
                 }
-                // A WHERE the table declines is read by the scan its index rule picks
+                // A WHERE the table declines is read by the scan, through the
+                // indexes the WHERE it reads picks
                 GlobalSource::StorageFiltered => {
                     let where_clause = stmt.where_clause.as_deref()?;
                     reads.push(format!("StorageFiltered {table} {where_clause}"));
-                    let scan = pushed
-                        .as_deref()
-                        .and_then(|pushed| index_plan::decide(&store, &schema, pushed))
+                    let columns = schema.column_names_arc();
+                    let aliases = Self::build_alias_map_excluding(&stmt.columns, Some(&columns));
+                    let rewritten = Self::scan_where(stmt, &aliases);
+                    let scan_where = rewritten.as_deref().unwrap_or(where_clause);
+                    let scan = super::pushdown::try_pushdown(scan_where, &schema, Some(ctx))
+                        .0
+                        .and_then(|pushed| index_plan::decide(&store, &schema, &*pushed))
                         .map_or(ScanChoice::Seq, ScanChoice::Index);
-                    let lines = scan.explain(table, Some(where_clause));
+                    let lines = scan.explain(table, Some(scan_where));
                     for (at, line) in lines.into_iter().enumerate() {
                         reads.push(if at == 0 {
                             format!("else {line}")

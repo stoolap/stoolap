@@ -453,6 +453,27 @@ fn explain_names_each_read_a_run_may_take() {
 }
 
 #[test]
+fn a_declined_filtered_aggregate_reads_by_the_where_its_scan_reads() {
+    let db = table("planned_filtered_aggregate_scan");
+    db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
+    let lines: Vec<String> = db
+        .query("EXPLAIN SELECT SUM(v) FROM t WHERE FALSE OR v > 1", ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Aggregate SUM(v)",
+            "  StorageFiltered t (FALSE OR (v > 1))",
+            "  else IndexScan t (v > 1)",
+            "    Index t_v (v range)",
+        ],
+        "the scan's indexes"
+    );
+}
+
+#[test]
 fn explain_names_the_source_a_statement_reads() {
     let db = table("planned_explain_sources");
     db.execute("CREATE VIEW w AS SELECT id, v FROM t", ())
