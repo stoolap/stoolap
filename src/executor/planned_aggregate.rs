@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::common::{CompactArc, CompactVec, SmartString};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
-use crate::parser::ast::{Expression, SelectStatement};
+use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::expression::Expression as StorageExpr;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, Index, QueryResult, Table};
@@ -574,9 +574,9 @@ impl Executor {
         }))
     }
 
-    /// The table, its schema, the calls and the source of a statement over
-    /// one table, without WHERE, grouping, ORDER BY, LIMIT or OFFSET, that
-    /// aggregates it into one row; None for any other statement
+    /// The table, its schema, the calls and the source of a statement of a
+    /// SELECT list over one table and no other clause, that aggregates it
+    /// into one row; None for any other statement
     fn global_inputs(
         &self,
         stmt: &SelectStatement,
@@ -587,17 +587,24 @@ impl Executor {
         Vec<SqlAggregateFunction>,
         GlobalSource,
     )> {
+        // The plan runs a SELECT list over one table and nothing else: a
+        // statement with any other clause has the regular path run it whole
+        let list_alone = !stmt.distinct
+            && stmt.distinct_on.is_empty()
+            && stmt.with.is_none()
+            && stmt.where_clause.is_none()
+            && stmt.group_by.columns.is_empty()
+            && matches!(stmt.group_by.modifier, GroupByModifier::None)
+            && stmt.having.is_none()
+            && stmt.window_defs.is_empty()
+            && stmt.order_by.is_empty()
+            && stmt.limit.is_none()
+            && stmt.offset.is_none()
+            && stmt.set_operations.is_empty();
         let shape = get_classification(stmt);
-        if !shape.has_aggregation
-            || shape.has_where
-            || shape.has_group_by
-            || shape.has_having
+        if !list_alone
+            || !shape.has_aggregation
             || shape.has_window_functions
-            || shape.has_order_by
-            || shape.has_limit
-            || stmt.offset.is_some()
-            || shape.has_cte
-            || shape.has_set_operations
             || shape.output_has_subqueries
         {
             return None;

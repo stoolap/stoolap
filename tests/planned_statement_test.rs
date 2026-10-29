@@ -144,6 +144,37 @@ fn a_failing_value_fails_only_for_a_row_that_reaches_it() {
 }
 
 #[test]
+fn an_aggregate_plan_keeps_every_clause_of_its_statement() {
+    let db = table("planned_aggregate_clauses");
+    let answer = |sql: &str| {
+        db.query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| format!("{:?}", row.get_value(0)))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    };
+    for sql in [
+        "SELECT DISTINCT ON (2) MIN(id) FROM t",
+        "SELECT DISTINCT ON (ABS('a')) MIN(id) FROM t",
+        "SELECT DISTINCT ON (1) COUNT(*) FROM t",
+        "SELECT DISTINCT COUNT(*) FROM t",
+        "SELECT MIN(id) FROM t WINDOW w AS (ORDER BY v)",
+    ] {
+        // The first run plans the statement, the second reads by the plan
+        let planning = answer(sql);
+        assert_eq!(
+            answer(sql),
+            planning,
+            "{sql}: the planned run answered otherwise"
+        );
+    }
+    assert!(answer("SELECT DISTINCT ON (2) MIN(id) FROM t").is_err());
+}
+
+#[test]
 fn a_cancelled_aggregate_plan_is_refused() {
     let db = table("planned_aggregate_cancel");
     let executor = Executor::new(std::sync::Arc::clone(db.engine()));
