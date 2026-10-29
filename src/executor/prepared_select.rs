@@ -534,7 +534,7 @@ impl<'a> Family<'a> {
             }
         }
         let registry = &self.executor.function_registry;
-        if statement_form_block(sq, counts_rows, false, registry) {
+        if statement_form_block(sq, counts_rows, registry) {
             return self.derived(sq);
         }
         let columns = || sq.columns.iter().map(unaliased);
@@ -554,9 +554,9 @@ impl<'a> Family<'a> {
     }
 
     /// A block's DISTINCT ON and ORDER BY keys, values over its row and the
-    /// enclosing ones, and no ORDER BY position (an EXISTS checks its own
-    /// where it is bound); one only a statement reads (`statement_order`)
-    /// runs as a statement block instead
+    /// enclosing ones: no ORDER BY position (an EXISTS checks its own where
+    /// it is bound) and no subquery in a key that chooses no row; one only a
+    /// statement reads (`statement_order`) runs as a statement block instead
     fn order(
         &self,
         sq: &'a SelectStatement,
@@ -567,6 +567,17 @@ impl<'a> Family<'a> {
             |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
         if !exists && sq.order_by.iter().any(position) {
             return Err("an ORDER BY position in a subquery block");
+        }
+        // Keys that choose no row are bound but never computed
+        let chooses =
+            !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
+        if !chooses
+            && sq
+                .order_by
+                .iter()
+                .any(|ob| mentions_subquery(&ob.expression))
+        {
+            return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
         }
         let mut found = false;
         let keys = sq
@@ -647,7 +658,7 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        if statement_form_block(sq, false, true, &self.executor.function_registry) {
+        if statement_form_block(sq, false, &self.executor.function_registry) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -746,7 +757,6 @@ fn windowed_block(sq: &SelectStatement) -> bool {
 fn statement_form_block(
     sq: &SelectStatement,
     counts_rows: bool,
-    exists: bool,
     registry: &FunctionRegistry,
 ) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
@@ -755,14 +765,14 @@ fn statement_form_block(
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
-        || statement_order(sq, exists, registry)
+        || statement_order(sq, registry)
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
 /// any of them on a grouped block, a count not a literal or a parameter, a
-/// DISTINCT ON position, a key holding a subquery that chooses no row, or a
-/// key reading a volatile SELECT alias
-fn statement_order(sq: &SelectStatement, exists: bool, registry: &FunctionRegistry) -> bool {
+/// DISTINCT ON position or key holding a subquery, or a key reading a
+/// volatile SELECT alias
+fn statement_order(sq: &SelectStatement, registry: &FunctionRegistry) -> bool {
     if sq.order_by.is_empty()
         && sq.distinct_on.is_empty()
         && sq.limit.is_none()
@@ -783,9 +793,6 @@ fn statement_order(sq: &SelectStatement, exists: bool, registry: &FunctionRegist
     if !counts.into_iter().flatten().all(literal) {
         return true;
     }
-    // Keys that choose no row are bound but never computed
-    let chooses =
-        !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
     let volatile_aliases: SmallVec<[&str; 1]> = sq
         .columns
         .iter()
@@ -799,13 +806,14 @@ fn statement_order(sq: &SelectStatement, exists: bool, registry: &FunctionRegist
     let reads_volatile_alias =
         |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
     let position = |key: &Expression| matches!(key, Expression::IntegerLiteral(_));
-    sq.order_by.iter().map(|ob| &ob.expression).any(|key| {
-        (!chooses && mentions_subquery(key))
-            || (!order_by_names_an_alias(key, sq) && reads_volatile_alias(key))
-    }) || sq
-        .distinct_on
+    sq.order_by
         .iter()
-        .any(|key| position(key) || mentions_subquery(key) || reads_volatile_alias(key))
+        .map(|ob| &ob.expression)
+        .any(|key| !order_by_names_an_alias(key, sq) && reads_volatile_alias(key))
+        || sq
+            .distinct_on
+            .iter()
+            .any(|key| position(key) || mentions_subquery(key) || reads_volatile_alias(key))
 }
 
 /// What a block's SELECT list may hold
@@ -4682,7 +4690,7 @@ impl Builder<'_> {
         // rows its items choose, by a window, a DISTINCT ON or the clauses of
         // a statement block, runs as written
         let dropped = matches!(form, Form::Exists(_))
-            && !statement_form_block(sq, false, true, &executor.function_registry)
+            && !statement_form_block(sq, false, &executor.function_registry)
             && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
@@ -5167,9 +5175,8 @@ impl Builder<'_> {
                     ..
                 }
         );
-        let exists = matches!(form, Form::Exists(_));
         let registry = &self.executor.function_registry;
-        if statement_form_block(sq, counts_rows, exists, registry) {
+        if statement_form_block(sq, counts_rows, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities

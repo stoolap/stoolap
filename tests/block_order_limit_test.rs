@@ -556,10 +556,11 @@ fn an_order_by_that_chooses_no_row_is_still_bound() {
         1,
         "a key that chooses no row reads no outer value"
     );
-    // A key holding a subquery runs as a statement block, and chooses no row
-    let statement = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
-    assert_eq!(prepared_line(&db, &statement), "Prepared: yes");
-    assert_eq!(column(&db, &statement, 1, ()), [Some(5); 4]);
+    let refused = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
+    assert_eq!(
+        prepared_line(&db, &refused),
+        "Prepared: no (a subquery block's ORDER BY key holding a subquery without LIMIT)"
+    );
 }
 
 #[test]
@@ -634,4 +635,26 @@ fn a_grouped_distinct_on_block_keeps_a_group_whose_aggregate_is_null() {
         .map(|row| row.unwrap().get::<i64>(0).unwrap())
         .collect();
     assert_eq!(ids, [4, 5, 7, 8], "{sql}");
+}
+
+#[test]
+fn an_order_by_choosing_no_row_answers_whatever_its_subquery_key_reads() {
+    let db = Database::open("memory://block_order_limit_unchosen_alias").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 7)",
+        "INSERT INTO u VALUES (1, 1), (2, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // The key reads the SELECT alias z inside its subquery
+    let sql = "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u ORDER BY (SELECT z + u.x)) \
+               ORDER BY id";
+    let ids: Vec<i64> = db
+        .query(sql, ())
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids, [1, 2], "{sql}");
 }

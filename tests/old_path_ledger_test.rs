@@ -677,12 +677,6 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
-        "scalar_block_ordered_by_a_subquery_without_limit",
-        "SELECT id, (SELECT x FROM u WHERE x = 2 ORDER BY (SELECT MAX(id) FROM u)) FROM t",
-        "SELECT id, 2 FROM t",
-        Prepared,
-    ),
-    (
         "in_block_with_distinct_on_a_computed_key",
         "SELECT id FROM t WHERE a IN (SELECT DISTINCT ON (x + (SELECT 0)) x FROM u \
          ORDER BY x + (SELECT 0))",
