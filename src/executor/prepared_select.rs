@@ -7418,7 +7418,8 @@ impl PreparedGrouped {
         let key_chain = Chain {
             scopes: &key_scopes,
         };
-        let mut output = |chain: &Chain<'_>,
+        // A block asked of an input row reads no alias: the row holds no item
+        let mut output = |over_group: &Chain<'_>,
                           expr: &Expression,
                           key: Option<&Expression>,
                           window: bool|
@@ -7429,14 +7430,17 @@ impl PreparedGrouped {
             let (first, rewritten) = if !groups {
                 let first = run_slots.len();
                 let rewritten =
-                    input_rewrite(&mut builder, chain, &mut run_slots, &mut input, expr)?;
+                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?;
                 (first, rewritten)
             } else {
                 let read = read_inputs(expr, &items, &mut |call| {
-                    input_rewrite(&mut builder, chain, &mut run_slots, &mut input, call)
+                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
                 })?;
                 let first = run_slots.len();
-                (first, rewrite(&mut builder, chain, &mut run_slots, &read)?)
+                (
+                    first,
+                    rewrite(&mut builder, over_group, &mut run_slots, &read)?,
+                )
             };
             if window {
                 window_slots.extend(run_slots[first..].iter().map(|(slot, _)| *slot));
@@ -7612,14 +7616,9 @@ impl PreparedGrouped {
             }
             let mut grouped = Vec::with_capacity(sq.hole_written.len());
             for (slot, written) in &sq.hole_written {
-                let alias = match key_chain.resolve(written) {
-                    Ok(Some((_, column))) => column.checked_sub(width),
-                    _ => None,
-                };
-                let read = match (alias, chain.resolve(written)) {
-                    (Some(position), _) => {
-                        let item = item_at(position)
-                            .ok_or_else(|| Error::internal("an alias without its item"))?;
+                let opened = open_items(written, &key_chain, width, &item_at)?;
+                let read = match (opened, chain.resolve(written)) {
+                    (Some(item), _) => {
                         if slots.is_none() {
                             let (aggregations, _) = executor.parse_aggregations(&run_stmt, None)?;
                             slots = Some(aggregate_slot_keys(
@@ -7628,7 +7627,7 @@ impl PreparedGrouped {
                                 &run_stmt.columns,
                             ));
                         }
-                        match over_items(item, &chain, &item_of, slots.as_ref())
+                        match over_items(&item, &chain, &item_of, slots.as_ref())
                             .and_then(|expr| compile_with(&slots_ctx, &expr))
                         {
                             Ok(program) => Hole::Program(program),
@@ -10966,6 +10965,40 @@ impl StatementSource<'_> {
             StatementSource::Cte((columns, _)) => Some(columns),
         }
     }
+}
+
+/// `expr` with each bare name `keys` binds past its first `width` columns,
+/// a SELECT alias, opened to the item `item_at` gives at that position;
+/// None when it names no alias
+fn open_items<'e>(
+    expr: &Expression,
+    keys: &Chain<'_>,
+    width: usize,
+    item_at: &dyn Fn(usize) -> Option<&'e Expression>,
+) -> Result<Option<Expression>> {
+    fn open<'e>(
+        expr: &Expression,
+        keys: &Chain<'_>,
+        width: usize,
+        item_at: &dyn Fn(usize) -> Option<&'e Expression>,
+        found: &mut bool,
+    ) -> Result<Expression> {
+        let Expression::Identifier(_) = expr else {
+            return rebuild(expr, &mut |child| open(child, keys, width, item_at, found));
+        };
+        match keys.resolve(expr) {
+            Ok(Some((_, column))) if column >= width => {
+                *found = true;
+                item_at(column - width)
+                    .cloned()
+                    .ok_or_else(|| Error::internal("an alias without its item"))
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+    let mut found = false;
+    let opened = open(expr, keys, width, item_at, &mut found)?;
+    Ok(found.then_some(opened))
 }
 
 /// `expr`, read over a group's row: each group item or aggregate `slots`

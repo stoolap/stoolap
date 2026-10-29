@@ -1034,6 +1034,13 @@ fn a_grouped_key_s_subquery_reads_a_select_alias_as_its_item_over_the_group() {
                 "SELECT k, MAX(a) * 2 AS z FROM t GROUP BY k ORDER BY z + (SELECT 0) DESC",
                 vec![Some(1), Some(3), Some(2)],
             ),
+            // A correlation equality's value reads the aliases inside it:
+            // k + COUNT(*) - 2 is 1, 2, 2, which u.k holds twice, once, once
+            (
+                "SELECT k AS z, COUNT(*) AS c FROM t GROUP BY k \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = z + c - 2) DESC, 1",
+                vec![Some(1), Some(2), Some(3)],
+            ),
         ] {
             assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
             let got: Vec<Option<i64>> = db
@@ -1043,14 +1050,23 @@ fn a_grouped_key_s_subquery_reads_a_select_alias_as_its_item_over_the_group() {
                 .collect();
             assert_eq!(got, want, "{sql}");
         }
-        let err = db
-            .query(
+        // An aggregate's argument is read over an input row, which holds no item
+        for (sql, want) in [
+            (
                 "SELECT k AS z, COUNT(*) FROM t GROUP BY k ORDER BY (SELECT t.z)",
-                (),
-            )
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .unwrap_err()
-            .to_string();
-        assert_eq!(err, "column 't.z' not found");
+                "column 't.z' not found",
+            ),
+            (
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY k ORDER BY SUM((SELECT z)) DESC, z",
+                "column 'z' not found",
+            ),
+        ] {
+            let err = db
+                .query(sql, ())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, want, "{sql}");
+        }
     }
 }
