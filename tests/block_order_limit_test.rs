@@ -822,8 +822,25 @@ fn a_select_alias_is_read_ahead_of_a_column_farther_out() {
         "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
         "INSERT INTO t VALUES (1, 1, -1), (2, 2, -1)",
         "INSERT INTO u VALUES (1, 1), (2, 2)",
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, z INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, z INTEGER)",
+        "INSERT INTO v VALUES (1, 1)",
+        "INSERT INTO w VALUES (1, 2)",
     ] {
         db.execute(sql, ()).unwrap();
+    }
+    // The alias does not answer for a name two nearer sources have
+    for sql in [
+        "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u GROUP BY x \
+         ORDER BY (SELECT z FROM v CROSS JOIN w)) ORDER BY id",
+        "SELECT id FROM t WHERE a IN (SELECT MAX(x) AS z FROM u GROUP BY x \
+         ORDER BY (SELECT z FROM v CROSS JOIN w) LIMIT 1 + 0) ORDER BY id",
+    ] {
+        assert_eq!(
+            error(&db, sql),
+            "invalid argument: column reference 'z' is ambiguous",
+            "{sql}"
+        );
     }
     for (sql, want) in [
         // z is the block's alias x, not t.z
@@ -867,13 +884,41 @@ fn a_statement_block_key_that_chooses_no_row_binds_its_functions() {
             let err = error(&db, sql);
             assert!(err.contains("Function not found: NOSUCHFN"), "{sql}: {err}");
         }
-        let sql = "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
-                   ORDER BY COALESCE(COUNT(*), CURRENT_TRANSACTION_ID())) ORDER BY id";
-        let ids: Vec<i64> = db
-            .query(sql, ())
-            .unwrap()
-            .map(|row| row.unwrap().get::<i64>(0).unwrap())
-            .collect();
-        assert_eq!(ids, [1, 2], "{sql}");
+        let sql = "SELECT id FROM t WHERE a IN (SELECT x FROM u UNION SELECT 0 \
+                   ORDER BY nosuchfn(x) OVER ()) ORDER BY id";
+        let err = error(&db, sql);
+        assert!(
+            err.contains("Unknown window function: NOSUCHFN"),
+            "{sql}: {err}"
+        );
+        for (sql, want) in [
+            (
+                "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY x \
+                 ORDER BY COALESCE(COUNT(*), CURRENT_TRANSACTION_ID())) ORDER BY id",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT GROUPING(x) FROM u \
+                 GROUP BY ROLLUP (x)) ORDER BY id",
+                vec![1, 4],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT MAX(x) FROM u GROUP BY ROLLUP (x) \
+                 ORDER BY GROUPING(x)) ORDER BY id",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (SELECT x FROM u UNION SELECT 0 \
+                 ORDER BY ROW_NUMBER() OVER ()) ORDER BY id",
+                vec![1, 2, 4],
+            ),
+        ] {
+            let ids: Vec<i64> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                .collect();
+            assert_eq!(ids, want, "{sql}");
+        }
     }
 }

@@ -317,6 +317,11 @@ impl<'w> CallArgs<'w> {
     }
 }
 
+/// The error for a call with OVER whose name the registry does not resolve
+pub(super) fn unknown_window_function(name: &str) -> Error {
+    Error::NotSupported(format!("Unknown window function: {}", name))
+}
+
 /// Reads a window argument that counts rows (a ROWS frame offset, the
 /// offset of LAG and LEAD, the n of NTILE and NTH_VALUE): an INTEGER of at
 /// least `min`, read as every INTEGER argument is
@@ -2758,9 +2763,7 @@ impl Executor {
         let window_func = self
             .function_registry
             .get_window(&wf_info.name)
-            .ok_or_else(|| {
-                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
-            })?;
+            .ok_or_else(|| unknown_window_function(&wf_info.name))?;
 
         // Look up precomputed ORDER BY values from cache using semantic key
         let precomputed_order_by: Option<&ColumnarOrderByValues> = if !wf_info.order_by.is_empty() {

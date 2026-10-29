@@ -79,6 +79,7 @@ use super::utils::{
     order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
+use super::window::unknown_window_function;
 use super::Executor;
 use crate::planner::{
     ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
@@ -1868,21 +1869,25 @@ impl StatementWalk<'_> {
                 if level.aliases.contains(&id.value_lower) {
                     return Ok(expr.clone());
                 }
-                // The scope of the nearest statement around it with that alias
+                // The scope of the nearest statement around it with that alias;
+                // only a column of a scope up to it comes before the alias
                 let alias = self
                     .visible
                     .iter()
                     .rev()
                     .find(|(name, _)| *name == id.value_lower)
                     .and_then(|(_, owner)| level.scopes.len().checked_sub(*owner));
-                match chain.bare(id) {
-                    // An alias of a statement around it is read at its run
-                    Ok(Some((depth, _))) if alias.is_some_and(|at| at < depth) => Ok(expr.clone()),
+                let near = Chain {
+                    scopes: alias.map_or(&level.scopes[..], |at| &level.scopes[..=at]),
+                };
+                match near.bare(id) {
                     Ok(Some((depth, index))) => match beyond(depth) {
                         Some(depth) => self.outer(expr, depth, index),
                         None => Ok(expr.clone()),
                     },
-                    Err(e) if level.check && alias.is_none() => Err(e),
+                    // An alias of a statement around it is read at its run
+                    Err(Error::ColumnNotFound(_)) if alias.is_some() => Ok(expr.clone()),
+                    Err(e) if level.check => Err(e),
                     _ => Ok(expr.clone()),
                 }
             }
@@ -1935,11 +1940,20 @@ impl StatementWalk<'_> {
             })),
             // A function binds as a name does, in a key the run never computes too
             Expression::FunctionCall(call)
-                if level.check && !callable(&self.executor.function_registry, &call.function) =>
+                if level.check && !self.executor.function_registry.resolves(&call.function) =>
             {
                 Err(compile_error(CompileError::FunctionNotFound(
                     call.function.to_uppercase().to_string(),
                 )))
+            }
+            Expression::Window(window)
+                if level.check
+                    && !self
+                        .executor
+                        .function_registry
+                        .resolves_over(&window.function.function) =>
+            {
+                Err(unknown_window_function(&window.function.function))
             }
             other => rebuild(other, &mut |child| self.expr(child, level)),
         }
@@ -2854,15 +2868,6 @@ fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
 
 fn compile_error(error: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", error))
-}
-
-/// Whether a call of `name` resolves: a scalar, aggregate or window
-/// function, or the transaction id the compiler reads itself
-fn callable(registry: &FunctionRegistry, name: &str) -> bool {
-    registry.is_scalar(name)
-        || registry.is_aggregate(name)
-        || registry.is_window(name)
-        || name.eq_ignore_ascii_case("CURRENT_TRANSACTION_ID")
 }
 
 /// That each ORDER BY position of the block `sq`, whose FROM gives `columns`
