@@ -45,12 +45,14 @@ pub(crate) enum GroupedSource {
 impl Executor {
     /// Where `stmt`'s groups come from, a statement grouping one table by one
     /// column without WHERE: the rule every run decides it by. `plain` when
-    /// its SELECT list reads the group column and `aggregations` only
+    /// its SELECT list reads the group column and `aggregations` only,
+    /// `grouped_names` when every name outside a call is the group column
     pub(crate) fn grouped_source(
         stmt: &SelectStatement,
         classification: &QueryClassification,
         aggregations: &[SqlAggregateFunction],
         plain: bool,
+        grouped_names: bool,
     ) -> GroupedSource {
         if !plain
             || aggregations.is_empty()
@@ -69,32 +71,35 @@ impl Executor {
         if stored {
             return GroupedSource::Storage;
         }
-        match Self::sorts_groups(stmt, classification, aggregations) {
+        match Self::sorts_groups(stmt, classification, aggregations, grouped_names) {
             true => GroupedSource::SortedStream,
             false => GroupedSource::Hash,
         }
     }
 
     /// Whether the groups may be read in the order of the column's index:
-    /// with no ORDER BY to sort them again, a HAVING without subqueries, and
-    /// COUNT(*), or under a LIMIT the stop pays for reading each group's
-    /// rows, SUM, AVG, MIN and MAX of a column
+    /// with no ORDER BY to sort them again, a HAVING without subqueries that
+    /// names no column but the group's, and COUNT(*), or under a LIMIT the
+    /// stop pays for reading each group's rows, SUM, AVG, MIN and MAX of a
+    /// column
     fn sorts_groups(
         stmt: &SelectStatement,
         classification: &QueryClassification,
         aggregations: &[SqlAggregateFunction],
+        grouped_names: bool,
     ) -> bool {
         let counts = aggregations
             .iter()
             .all(|agg| agg.name == "COUNT" && agg.column == "*");
-        !classification.has_order_by
+        grouped_names
+            && !classification.has_order_by
             && stmt
                 .having
                 .as_deref()
                 .is_none_or(|h| !Self::has_subqueries(h))
             && aggregations.iter().all(|agg| match agg.name.as_str() {
                 "COUNT" => agg.column == "*",
-                "SUM" | "AVG" | "MIN" | "MAX" => true,
+                "SUM" | "AVG" | "MIN" | "MAX" => agg.column != "*",
                 _ => false,
             })
             && (counts || stmt.limit.is_some())
@@ -145,11 +150,14 @@ impl Executor {
                 _ => false,
             }
         };
-        let plain = stmt.columns.iter().all(group_item)
-            && non_aggregated
-                .iter()
-                .all(|column| column.eq_ignore_ascii_case(&group));
-        let source = Self::grouped_source(stmt, classification, &aggregations, plain);
+        let plain = stmt.columns.iter().all(group_item);
+        // A name outside a call, from HAVING or an ORDER BY alias, which only
+        // the walk reads, and only as the group column
+        let grouped_names = non_aggregated
+            .iter()
+            .all(|column| column.eq_ignore_ascii_case(&group));
+        let source =
+            Self::grouped_source(stmt, classification, &aggregations, plain, grouped_names);
         if source == GroupedSource::Hash {
             return Ok(None);
         }
@@ -164,7 +172,7 @@ impl Executor {
         // the walk may read the groups
         let sorted = || {
             source == GroupedSource::SortedStream
-                || Self::sorts_groups(stmt, classification, &aggregations)
+                || Self::sorts_groups(stmt, classification, &aggregations, grouped_names)
         };
         let rows = match stored {
             Some(rows) => (AggregatePath::StorageGrouped, rows),
@@ -252,12 +260,13 @@ impl Executor {
         const CAPTURE_ROWS: usize = 4096;
         const CAPTURE_BYTES: usize = 1024 * 1024;
 
-        // COUNT(*) reads no column; the others read theirs
+        // COUNT(*) reads no column, and is fed one per row; every other call
+        // reads its column
         let agg_columns = columns;
         if aggregations
             .iter()
             .zip(agg_columns)
-            .any(|(agg, column)| agg.column != "*" && column.is_none())
+            .any(|(agg, column)| !agg.counts_rows() && column.is_none())
         {
             return Ok(None);
         }
