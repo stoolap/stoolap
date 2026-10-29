@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate with a WHERE, or one its table's stats cannot answer, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY other than of one column with no WHERE, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -152,6 +152,64 @@ Aggregate MAX(id)
   else SeqScan products
 ```
 
+With a WHERE, the table computes the calls over the rows the WHERE passes (`StorageFiltered`) when its volumes can; otherwise the rows are read by the scan after `else`, through the indexes the WHERE can use:
+
+```sql
+EXPLAIN SELECT SUM(value) FROM products WHERE value > 15;
+```
+
+Output:
+```
+plan
+----
+Aggregate SUM(value)
+  StorageFiltered products (value > 15)
+  else IndexScan products (value > 15)
+    Index idx_value (value range)
+```
+
+### Aggregation
+
+A GROUP BY of one column with no WHERE shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`); groups read in the order of the column's index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped:
+
+```sql
+EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category;
+EXPLAIN SELECT category, COUNT(*) FROM products GROUP BY category HAVING COUNT(*) > 1;
+```
+
+Output:
+```
+plan
+----
+Aggregate category, SUM(value) by category
+  StorageGrouped products (category)
+  else SeqScan products
+
+plan
+----
+Having (COUNT(*) > 1)
+  Aggregate category, COUNT(*) by category
+    SortedStream products (category)
+    else SeqScan products
+```
+
+Other grouped statements print the format of the path that runs them:
+
+```sql
+EXPLAIN SELECT category, SUM(value) FROM products WHERE value > 0 GROUP BY category;
+```
+
+Output:
+```
+plan
+----
+SELECT
+  Columns: category, SUM(value)
+  -> Index Scan using idx_value on products
+       Index Cond: value > 0
+  Group By: category
+```
+
 ### Views, CTEs and Derived Tables
 
 A statement over a view, a CTE, a derived table, a VALUES list or a table function reads the rows its source gives and judges each by the whole WHERE, shown after the source's name. The plan of the statement the rows come from is indented under it, in the format of the path that runs it:
@@ -197,24 +255,6 @@ SELECT
        Alias: o
     -> Seq Scan on customers
        Alias: c
-```
-
-### Aggregation
-
-When using GROUP BY:
-
-```sql
-EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category;
-```
-
-Output:
-```
-plan
-----
-SELECT
-  Columns: category, SUM(value)
-  -> Seq Scan on products
-  Group By: category
 ```
 
 ### Sorting
@@ -410,9 +450,13 @@ For a planned single-table SELECT:
 | Derived, View, Cte | The rows of a derived table, a view or a CTE, each judged by the condition after its name; the plan of its query is under it |
 | Values, Function | The rows of a VALUES list or a table function, each judged by the condition after its name |
 | OneRow | The one row a SELECT without FROM reads |
-| Aggregate | The one row of COUNT, SUM, AVG, MIN and MAX over a table, from the line under it |
+| Aggregate | The one row of COUNT, SUM, AVG, MIN and MAX over a table, or its groups after `by`, from the line under it |
 | Stats | Those values from what the table keeps: row count, distinct count, column sum and bounds |
 | IndexBound | A MIN or MAX from the first or last key of the column's index |
+| StorageFiltered | The calls the table computes over the rows the WHERE passes |
+| StorageGrouped | The groups the table computes over its rows |
+| SortedStream | The groups in the order of the column's index, each read by its rows |
+| Having | The groups the HAVING keeps |
 | Empty unless | The WHERE's terms that read no column; a run where they are not true reads no row |
 | else | The read a run takes when the table cannot answer the line above it |
 | Filter | The part of the WHERE judged after the scan |

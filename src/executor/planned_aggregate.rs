@@ -17,16 +17,21 @@
 
 use std::sync::{Arc, RwLock};
 
+use smallvec::SmallVec;
+
 use crate::common::{CompactArc, CompactVec, SmartString};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
+use crate::planner::{steps_over, ScanChoice, Step};
 use crate::storage::expression::Expression as StorageExpr;
+use crate::storage::mvcc::index_plan;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, Index, QueryResult, Table};
 
 use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateFunction};
 use super::context::ExecutionContext;
 use super::expression::SubqueryExecutor;
+use super::grouped_aggregate::GroupedSource;
 use super::query_cache::{CompiledExecution, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::Executor;
@@ -53,7 +58,7 @@ fn bare_column(agg: &SqlAggregateFunction) -> &str {
 }
 
 /// Whether `index` keeps its values in order, which gives their bounds
-fn bounds(index: Option<Arc<dyn Index>>) -> bool {
+pub(super) fn bounds(index: Option<Arc<dyn Index>>) -> bool {
     index
         .is_some_and(|index| matches!(index.index_type(), IndexType::BTree | IndexType::PrimaryKey))
 }
@@ -68,6 +73,31 @@ impl GlobalSource {
             Self::Scan => AggregatePath::GlobalScan,
         }
     }
+}
+
+/// The calls of a statement that aggregates one table and where its row or
+/// groups come from, as the rules decide them
+pub(crate) struct AggregatePlan {
+    pub(crate) aggregations: Vec<SqlAggregateFunction>,
+    /// Whether the SELECT list reads nothing but the calls
+    pub(super) plain: bool,
+    pub(crate) read: AggregateRead,
+}
+
+/// Where an aggregate over one table reads from
+pub(crate) enum AggregateRead {
+    /// Its one row from `source`, `pushed` the WHERE the table runs whole
+    Global {
+        source: GlobalSource,
+        pushed: Option<Box<dyn StorageExpr>>,
+    },
+    /// Its groups by one column, named and placed as `group`, from `source`;
+    /// `walks` whether the index walk reads them when the table declines
+    Grouped {
+        source: GroupedSource,
+        group: (String, usize),
+        walks: bool,
+    },
 }
 
 /// A statement without WHERE whose one row is one count the table keeps or
@@ -85,6 +115,54 @@ pub struct PlannedAggregate {
 }
 
 impl Executor {
+    /// The plan of `stmt`, which aggregates one table of `schema` whose
+    /// ordered indexes `indexed` names: its calls and the source the rules
+    /// pick; None for a statement the aggregation of its read rows answers.
+    /// Inlined into the table scan, it costs that scan's loop more per row
+    #[inline(never)]
+    pub(crate) fn aggregate_read_plan(
+        &self,
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+        ctx: &ExecutionContext,
+        schema: &Schema,
+        indexed: impl Fn(&str) -> bool,
+    ) -> Result<Option<AggregatePlan>> {
+        if classification.has_window_functions {
+            return Ok(None);
+        }
+        if classification.has_group_by {
+            return self.grouped_read_plan(stmt, classification, ctx, schema);
+        }
+        if classification.has_having {
+            return Ok(None);
+        }
+        // The table runs no WHERE over a parameter or a subquery: its rows are
+        // the scan's to read
+        if classification.has_where
+            && (classification.where_has_parameters || classification.where_has_subqueries)
+        {
+            return Ok(None);
+        }
+        let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx))?;
+        let pushed = match stmt.where_clause.as_deref() {
+            Some(where_clause) => {
+                match super::pushdown::try_pushdown(where_clause, schema, Some(ctx)) {
+                    (Some(pushed), false) => Some(pushed),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        let plain = non_aggregated.is_empty();
+        let source = Self::global_source(stmt, &aggregations, plain, pushed.is_some(), indexed);
+        Ok(Some(AggregatePlan {
+            aggregations,
+            plain,
+            read: AggregateRead::Global { source, pushed },
+        }))
+    }
+
     /// Where `stmt`, which aggregates one table into one row, reads its row
     /// from: the rule every caller decides it by. `plain` when its SELECT
     /// list reads nothing but `aggregations`, `indexed` whether a column's
@@ -341,46 +419,20 @@ impl Executor {
         &self,
         table: &dyn Table,
         stmt: &SelectStatement,
-        classification: &QueryClassification,
+        (classification, plan): (&QueryClassification, &AggregatePlan),
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
-        if classification.has_group_by
-            || classification.has_having
-            || classification.has_window_functions
-        {
+        let AggregateRead::Global { source, pushed } = &plan.read else {
             return Ok(None);
-        }
-        // The table runs no WHERE over a parameter or a subquery: its rows are
-        // the scan's to read
-        if classification.has_where
-            && (classification.where_has_parameters || classification.where_has_subqueries)
-        {
-            return Ok(None);
-        }
-        let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx))?;
-        let source_columns = table.schema().column_names_arc();
-        let pushed = match stmt.where_clause.as_deref() {
-            Some(where_clause) => {
-                match super::pushdown::try_pushdown(where_clause, table.schema(), Some(ctx)) {
-                    (Some(pushed), false) => Some(pushed),
-                    _ => None,
-                }
-            }
-            None => None,
         };
-        let source = Self::global_source(
-            stmt,
-            &aggregations,
-            non_aggregated.is_empty(),
-            pushed.is_some(),
-            |column| bounds(table.get_index_on_column(column)),
-        );
-        let columns = Self::call_columns(&aggregations, &source_columns);
+        let aggregations = &plan.aggregations;
+        let source_columns = table.schema().column_names_arc();
+        let columns = Self::call_columns(aggregations, &source_columns);
         let row = Self::global_values(
-            source,
+            *source,
             table,
-            &aggregations,
+            aggregations,
             &columns,
             false,
             pushed.as_deref(),
@@ -394,23 +446,18 @@ impl Executor {
             // A WHERE the table declined is the scan's to read, and so are
             // calls the feed does not stream
             None if stmt.where_clause.is_some() => return Ok(None),
-            None if !Self::streams_calls(
-                classification,
-                &aggregations,
-                non_aggregated.is_empty(),
-            ) =>
-            {
+            None if !Self::streams_calls(classification, aggregations, plan.plain) => {
                 return Ok(None)
             }
             None => (
                 AggregatePath::GlobalScan,
-                self.global_scan_rows(table, &aggregations, ctx, blocks)?,
+                self.global_scan_rows(table, aggregations, ctx, blocks)?,
             ),
         };
         self.finish_global(
             path,
             stmt,
-            &aggregations,
+            aggregations,
             &source_columns,
             ctx,
             blocks,
@@ -515,29 +562,124 @@ impl Executor {
     }
 
     /// The plan of `stmt` as EXPLAIN shows it when it aggregates one table
-    /// into one row its stats or an index answer, with the reads a run the
-    /// table declines takes; None for any other statement
-    pub(crate) fn explain_global(
+    /// from the source a rule picks, with the reads a run the table declines
+    /// takes; None for a statement the aggregation of its read rows answers,
+    /// which the general format shows
+    pub(crate) fn explain_aggregate(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
-        let (table, _, aggregations, source) = self.global_inputs(stmt, ctx)?;
-        let items: Vec<String> = stmt.columns.iter().map(super::utils::item_name).collect();
-        let mut lines = vec![format!("Aggregate {}", items.join(", "))];
-        match source {
-            GlobalSource::IndexBound => {
-                lines.push(format!(
-                    "  IndexBound {table} ({})",
-                    bare_column(&aggregations[0])
-                ));
-                lines.push(format!("  else Stats {table}"));
-            }
-            GlobalSource::Stats => lines.push(format!("  Stats {table}")),
-            GlobalSource::StorageFiltered | GlobalSource::Scan => return None,
+        let shape = get_classification(stmt);
+        if !shape.has_aggregation
+            || shape.has_set_operations
+            || shape.has_cte
+            || shape.has_distinct_on
+            || shape.has_joins
+            || shape.output_has_subqueries
+            || shape.where_has_subqueries
+        {
+            return None;
         }
-        lines.push(format!("  else SeqScan {table}"));
-        Some(lines)
+        let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
+            return None;
+        };
+        let table = &ts.name.value_lower;
+        if ts.as_of.is_some() || ctx.get_cte_by_lower(table).is_some() {
+            return None;
+        }
+        let store = self.engine.get_version_store(table).ok()?;
+        let schema = store.schema_and_token().0;
+        let indexed = |column: &str| bounds(store.get_index_by_column(column));
+        let plan = self
+            .aggregate_read_plan(stmt, &shape, ctx, &schema, indexed)
+            .ok()??;
+        let mut reads = Vec::new();
+        let mut by = None;
+        match &plan.read {
+            AggregateRead::Global { source, .. } => match source {
+                GlobalSource::IndexBound => {
+                    let column = bare_column(&plan.aggregations[0]);
+                    reads.push(format!("IndexBound {table} ({column})"));
+                    reads.push(format!("else Stats {table}"));
+                    reads.push(format!("else SeqScan {table}"));
+                }
+                GlobalSource::Stats => {
+                    reads.push(format!("Stats {table}"));
+                    reads.push(format!("else SeqScan {table}"));
+                }
+                // A WHERE the table declines is read by the scan, through the
+                // indexes the WHERE it reads picks
+                GlobalSource::StorageFiltered => {
+                    let where_clause = stmt.where_clause.as_deref()?;
+                    reads.push(format!("StorageFiltered {table} {where_clause}"));
+                    let columns = schema.column_names_arc();
+                    let aliases = Self::build_alias_map_excluding(&stmt.columns, Some(&columns));
+                    let rewritten = Self::scan_where(stmt, &aliases);
+                    let scan_where = rewritten.as_deref().unwrap_or(where_clause);
+                    let scan = super::pushdown::try_pushdown(scan_where, &schema, Some(ctx))
+                        .0
+                        .and_then(|pushed| index_plan::decide(&store, &schema, &*pushed))
+                        .map_or(ScanChoice::Seq, ScanChoice::Index);
+                    let lines = scan.explain(table, Some(scan_where));
+                    for (at, line) in lines.into_iter().enumerate() {
+                        reads.push(if at == 0 {
+                            format!("else {line}")
+                        } else {
+                            line
+                        });
+                    }
+                }
+                GlobalSource::Scan
+                    if stmt.where_clause.is_none()
+                        && Self::streams_calls(&shape, &plan.aggregations, plan.plain) =>
+                {
+                    reads.push(format!("SeqScan {table}"));
+                }
+                GlobalSource::Scan => return None,
+            },
+            AggregateRead::Grouped {
+                source,
+                group: (group, _),
+                walks,
+            } => {
+                match source {
+                    GroupedSource::Storage => {
+                        reads.push(format!("StorageGrouped {table} ({group})"));
+                        if *walks {
+                            reads.push(format!("else SortedStream {table} ({group})"));
+                        }
+                    }
+                    GroupedSource::SortedStream | GroupedSource::Hash => {
+                        reads.push(format!("SortedStream {table} ({group})"));
+                    }
+                }
+                reads.push(format!("else SeqScan {table}"));
+                by = Some(group.clone());
+            }
+        }
+        let items: Vec<String> = stmt.columns.iter().map(super::utils::item_name).collect();
+        let head = match by {
+            Some(group) => format!("Aggregate {} by {group}", items.join(", ")),
+            None => format!("Aggregate {}", items.join(", ")),
+        };
+        let below = std::iter::once(head)
+            .chain(reads.into_iter().map(|line| format!("  {line}")))
+            .collect();
+        // The DISTINCT over the aggregate's rows, and the HAVING over its groups
+        let mut inner = SmallVec::<[Step; 2]>::new();
+        if stmt.distinct {
+            inner.push(Step::Distinct);
+        }
+        if stmt.having.is_some() {
+            inner.push(Step::Having);
+        }
+        let steps = Self::finishing_steps(stmt, &inner);
+        Some(steps_over(
+            &steps,
+            &Self::finishing_text(stmt, table),
+            below,
+        ))
     }
 
     /// The plan of a statement over one table, without WHERE, grouping,
@@ -618,14 +760,13 @@ impl Executor {
         }
         let store = self.engine.get_version_store(table).ok()?;
         let schema = store.schema_and_token().0;
-        let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx)).ok()?;
-        let source = Self::global_source(
-            stmt,
-            &aggregations,
-            non_aggregated.is_empty(),
-            false,
-            |column| bounds(store.get_index_by_column(column)),
-        );
-        Some((table.clone(), schema, aggregations, source))
+        let indexed = |column: &str| bounds(store.get_index_by_column(column));
+        let plan = self
+            .aggregate_read_plan(stmt, &shape, ctx, &schema, indexed)
+            .ok()??;
+        let AggregateRead::Global { source, .. } = plan.read else {
+            return None;
+        };
+        Some((table.clone(), schema, plan.aggregations, source))
     }
 }

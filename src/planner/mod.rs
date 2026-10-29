@@ -51,6 +51,8 @@ pub enum Step {
     DistinctOn,
     /// The first row of each output value
     Distinct,
+    /// The groups the HAVING keeps
+    Having,
     Project,
     /// The WHERE's conjuncts the read did not take
     Filter,
@@ -147,6 +149,8 @@ pub struct PlanText<'a> {
     pub keys: Option<String>,
     /// The DISTINCT ON keys
     pub distinct_on: Option<String>,
+    /// The HAVING condition
+    pub having: Option<String>,
     pub names: &'a [String],
     /// The conjuncts the read takes
     pub pushed: Option<&'a Expression>,
@@ -265,6 +269,7 @@ fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
         Step::Sort => format!("Sort {}", text.keys.as_deref()?),
         Step::DistinctOn => format!("DistinctOn {}", text.distinct_on.as_deref()?),
         Step::Distinct => "Distinct".to_string(),
+        Step::Having => format!("Having {}", text.having.as_deref()?),
         Step::Project => format!("Project {}", text.names.join(", ")),
         Step::Filter => "Filter".to_string(),
     })

@@ -3418,6 +3418,7 @@ impl PreparedSelect {
                 offset,
                 keys,
                 distinct_on,
+                having: None,
                 names: &self.output_columns[..self.visible],
                 pushed,
                 ordered: Executor::ordered_read_column(stmt)

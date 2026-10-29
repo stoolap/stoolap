@@ -413,6 +413,33 @@ fn explain_names_each_read_a_run_may_take() {
             ],
         ),
         (
+            "SELECT SUM(v), COUNT(*) FROM t WHERE v > 1",
+            vec![
+                "Aggregate SUM(v), COUNT(*)",
+                "  StorageFiltered t (v > 1)",
+                "  else SeqScan t (v > 1)",
+            ],
+        ),
+        (
+            "SELECT v, COUNT(*) FROM t GROUP BY v HAVING COUNT(*) > 0",
+            vec![
+                "Having (COUNT(*) > 0)",
+                "  Aggregate v, COUNT(*) by v",
+                "    SortedStream t (v)",
+                "    else SeqScan t",
+            ],
+        ),
+        (
+            "SELECT v, COUNT(*) AS n FROM t GROUP BY v ORDER BY n DESC LIMIT 1",
+            vec![
+                "Limit 1",
+                "  TopN n DESC",
+                "    Aggregate v, n by v",
+                "      StorageGrouped t (v)",
+                "      else SeqScan t",
+            ],
+        ),
+        (
             "SELECT id FROM t WHERE 1 = 0 AND v > 1",
             vec![
                 "Project id",
@@ -423,6 +450,27 @@ fn explain_names_each_read_a_run_may_take() {
     ] {
         assert_eq!(explain(sql), plan, "{sql}");
     }
+}
+
+#[test]
+fn a_declined_filtered_aggregate_reads_by_the_where_its_scan_reads() {
+    let db = table("planned_filtered_aggregate_scan");
+    db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
+    let lines: Vec<String> = db
+        .query("EXPLAIN SELECT SUM(v) FROM t WHERE FALSE OR v > 1", ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Aggregate SUM(v)",
+            "  StorageFiltered t (FALSE OR (v > 1))",
+            "  else IndexScan t (v > 1)",
+            "    Index t_v (v range)",
+        ],
+        "the scan's indexes"
+    );
 }
 
 #[test]
