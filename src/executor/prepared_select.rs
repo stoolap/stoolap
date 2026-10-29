@@ -6922,8 +6922,15 @@ impl PreparedSelect {
         };
         let width = scope.columns.len();
         let items = projected_aliases(stmt, &scope.columns, |_| width);
-        let key_scope = scope.with_items(&items);
-        let key_scopes = [&key_scope];
+        // Only a key holding a subquery reads the projected row's aliases
+        let keyed = stmt
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .chain(&stmt.distinct_on)
+            .any(mentions_subquery);
+        let key_scope = keyed.then(|| scope.with_items(&items));
+        let key_scopes = [key_scope.as_ref().unwrap_or(&scope)];
         let key_chain = Chain {
             scopes: &key_scopes,
         };
@@ -7413,8 +7420,12 @@ impl PreparedGrouped {
         // each as its item computed again over the group's row
         let width = scope.columns.len();
         let aliases = projected_aliases(stmt, &scope.lower, |_| width);
-        let key_scope = scope.with_items(&aliases);
-        let key_scopes = [&key_scope];
+        let keyed = stmt
+            .order_by
+            .iter()
+            .any(|ob| mentions_subquery(&ob.expression));
+        let key_scope = keyed.then(|| scope.with_items(&aliases));
+        let key_scopes = [key_scope.as_ref().unwrap_or(&scope)];
         let key_chain = Chain {
             scopes: &key_scopes,
         };
@@ -8551,8 +8562,9 @@ impl JoinBlocks {
             .collect::<Result<Vec<_>>>()?;
         // A key reads the SELECT aliases from the projected row, after the
         // joined row's columns
-        let key_scope = scope.with_items(&items);
-        let key_scopes = [&key_scope];
+        let keyed = output[1].iter().chain(output[2]).any(Option::is_some);
+        let key_scope = keyed.then(|| scope.with_items(&items));
+        let key_scopes = [key_scope.as_ref().unwrap_or(&scope)];
         let key_chain = Chain {
             scopes: &key_scopes,
         };
