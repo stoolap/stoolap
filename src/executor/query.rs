@@ -460,9 +460,7 @@ use super::planned_aggregate::{bounds, AggregateRead};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
-use super::prepared_select::{
-    names_any_within, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
-};
+use super::prepared_select::{joined_aliases, Bound, JoinBlocks, OutOfFamily, PreparedProjection};
 use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::{CachedPlanRef, CompiledExecution, NestedPlan};
@@ -5628,25 +5626,6 @@ impl Executor {
         {
             return Err("a grouped statement whose output holds a subquery");
         }
-        let aliases: Vec<&str> = stmt
-            .columns
-            .iter()
-            .filter_map(|c| match c {
-                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-                _ => None,
-            })
-            .collect();
-        if stmt.order_by.iter().any(|ob| {
-            Self::has_subqueries(&ob.expression)
-                && names_any_within(&ob.expression, &|name| aliases.contains(&name))
-        }) {
-            return Err("an ORDER BY subquery that names a SELECT alias");
-        }
-        if stmt.distinct_on.iter().any(|key| {
-            Self::has_subqueries(key) && names_any_within(key, &|name| aliases.contains(&name))
-        }) {
-            return Err("a DISTINCT ON subquery that names a SELECT alias");
-        }
         Ok(true)
     }
 
@@ -5761,6 +5740,7 @@ impl Executor {
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
                 [&select, &keys, &distinct],
+                joined_aliases(stmt, &columns),
                 sides,
                 columns.len(),
                 ctx,

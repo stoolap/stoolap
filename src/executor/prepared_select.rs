@@ -1019,27 +1019,6 @@ impl Executor {
         if needs_subquery && !found {
             return Err("no WHERE, SELECT list, ORDER BY or DISTINCT ON subquery");
         }
-        let aliases: SmallVec<[&str; 4]> = stmt
-            .columns
-            .iter()
-            .filter_map(|c| match c {
-                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-                _ => None,
-            })
-            .collect();
-        let names_an_alias = |key: &Expression| {
-            mentions_subquery(key) && names_any_within(key, &|name| aliases.contains(&name))
-        };
-        if stmt
-            .order_by
-            .iter()
-            .any(|ob| names_an_alias(&ob.expression))
-        {
-            return Err("an ORDER BY subquery that names a SELECT alias");
-        }
-        if stmt.distinct_on.iter().any(names_an_alias) {
-            return Err("a DISTINCT ON subquery that names a SELECT alias");
-        }
         counts_fit(stmt, ctx)?;
         family.statement_from(stmt.table_expr.as_deref())?;
         family.catalog()
@@ -1340,6 +1319,34 @@ impl ScopeTable {
             lower: CompactArc::clone(&self.lower),
             types: self.types.clone(),
             bare: self.bare,
+            merged: self.merged.clone(),
+        }
+    }
+
+    /// This scope with the projected row its keys read after its columns,
+    /// under a table no qualifier names: each output column by the SELECT
+    /// alias `items` gives it, or by a name no reference can spell
+    fn with_items(&self, items: &[Option<SmartString>]) -> Self {
+        debug_assert_eq!(self.bare, self.lower.len());
+        let names = || {
+            items.iter().enumerate().map(|(at, name)| match name {
+                Some(name) => name.to_string(),
+                None => format!("{RESOLVED}#item{at}"),
+            })
+        };
+        let mut tables = self.tables.clone();
+        tables.push((SmartString::new(""), self.lower.len()));
+        Self {
+            tables,
+            columns: CompactArc::new(self.columns.iter().cloned().chain(names()).collect()),
+            lower: CompactArc::new(self.lower.iter().cloned().chain(names()).collect()),
+            types: self
+                .types
+                .iter()
+                .copied()
+                .chain(items.iter().map(|_| DataType::Null))
+                .collect(),
+            bare: self.lower.len() + items.len(),
             merged: self.merged.clone(),
         }
     }
@@ -2227,6 +2234,22 @@ fn constant_args_any(expr: &Expression, matches: &impl Fn(&Expression) -> bool) 
     }
 }
 
+/// Each column of the projected row `expr` reads past the statement's first
+/// `from` columns, by its position on that row
+fn projected_columns(expr: &Expression, from: usize, out: &mut SmallVec<[usize; 2]>) {
+    if let Expression::Column(column) = expr {
+        if let Some(at) = (column.index as usize).checked_sub(from) {
+            if !out.contains(&at) {
+                out.push(at);
+            }
+        }
+    }
+    let _ = for_each_child(expr, &mut |child| {
+        projected_columns(child, from, out);
+        Ok(())
+    });
+}
+
 /// Each direct operand of an expression of the family's forms
 fn for_each_child<'e>(
     expr: &'e Expression,
@@ -2947,37 +2970,6 @@ fn read_inputs(
             }
         }
         other => rebuild(other, &mut |child| read_inputs(child, items, call)),
-    }
-}
-
-/// Whether a bare name in `expr` or in a clause the family admits of one
-/// of its subqueries passes `matches`
-pub(super) fn names_any_within(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
-    let block = |sq: &SelectStatement| {
-        sq.columns
-            .iter()
-            .chain(sq.where_clause.as_deref())
-            .chain(sq.having.as_deref())
-            .chain(&sq.group_by.columns)
-            .chain(sq.order_by.iter().map(|ob| &ob.expression))
-            .any(|e| names_any_within(e, matches))
-    };
-    match expr {
-        Expression::Identifier(id) => matches(&id.value_lower),
-        Expression::Aliased(aliased) => names_any_within(&aliased.expression, matches),
-        Expression::ScalarSubquery(sq) => block(&sq.subquery),
-        Expression::Exists(exists) => block(&exists.subquery),
-        Expression::AllAny(all_any) => {
-            names_any_within(&all_any.left, matches) || block(&all_any.subquery)
-        }
-        other => {
-            let mut found = false;
-            let _ = for_each_child(other, &mut |child| {
-                found |= names_any_within(child, matches);
-                Ok(())
-            });
-            found
-        }
     }
 }
 
@@ -4389,6 +4381,11 @@ struct Builder<'e> {
     /// The run slots of values a WHERE tests a column against, whose error
     /// a run raises only where a row reads the slot
     where_slots: Vec<usize>,
+    /// The width of the statement's row, past which a column its keys read
+    /// is the projected row's, which a key reads as its second row
+    projected_from: Option<usize>,
+    /// The projected row's columns the key being rewritten reads
+    projected_reads: SmallVec<[usize; 2]>,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -4561,7 +4558,7 @@ impl Builder<'_> {
     /// the holes as a join statement's sites lay them out, and as written
     #[allow(clippy::type_complexity)]
     fn compiled_holes(
-        &self,
+        &mut self,
         outer: &[&ScopeTable],
         parent: Option<u16>,
         work: &Rewritten,
@@ -4570,17 +4567,34 @@ impl Builder<'_> {
         Vec<(usize, Expression)>,
         Vec<(usize, Expression)>,
     )> {
+        // A statement's own block reads a key's projected row as its second
+        let projected = self.projected_from.filter(|_| parent.is_none());
         let holes = if work.holes.is_empty() {
             Vec::new()
         } else {
-            let parent = CompileContext::bound(&self.executor.function_registry);
-            work.holes
-                .iter()
-                .map(|(slot, hole)| match hole {
-                    Expression::Column(c) => Ok((*slot, Hole::Column(c.index as usize))),
-                    _ => compile_with(&parent, hole).map(|p| (*slot, Hole::Program(p))),
-                })
-                .collect::<Result<Vec<_>>>()?
+            let registry = &self.executor.function_registry;
+            let parent = match projected {
+                Some(from) => CompileContext::bound_pair(registry, from as u32),
+                None => CompileContext::bound(registry),
+            };
+            let mut holes = Vec::with_capacity(work.holes.len());
+            for (slot, hole) in &work.holes {
+                if let Some(from) = projected {
+                    projected_columns(hole, from, &mut self.projected_reads);
+                }
+                let index = match hole {
+                    Expression::Column(c) => Some(c.index as usize),
+                    _ => None,
+                };
+                holes.push(match (index, projected) {
+                    (Some(index), Some(from)) if index >= from => {
+                        (*slot, Hole::Column2(index - from))
+                    }
+                    (Some(index), _) => (*slot, Hole::Column(index)),
+                    (None, _) => (*slot, Hole::Program(compile_with(&parent, hole)?)),
+                });
+            }
+            holes
         };
         let hole_exprs = if parent.is_none() && outer[0].tables.len() > 1 {
             work.holes.clone()
@@ -4936,6 +4950,29 @@ impl Builder<'_> {
             }
             other => rebuild(other, &mut |child| self.rewrite_blocks(chain, child)),
         }
+    }
+
+    /// An ORDER BY or DISTINCT ON `key` holding subqueries over `chain`, past
+    /// whose statement's first `width` columns lies the projected row: as
+    /// `slotted` gives it, and the projected columns it and its blocks read
+    fn key(
+        &mut self,
+        chain: &Chain<'_>,
+        width: usize,
+        key: &Expression,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<(Option<Expression>, SmallVec<[usize; 2]>)> {
+        if !mentions_subquery(key) {
+            return Ok((None, SmallVec::new()));
+        }
+        self.projected_from = Some(width);
+        self.projected_reads.clear();
+        let rewritten = self.rewrite(chain, None, key, &mut Rewritten::default());
+        self.projected_from = None;
+        let rewritten = rewritten?;
+        let mut reads = std::mem::take(&mut self.projected_reads);
+        projected_columns(&rewritten, width, &mut reads);
+        Ok((Some(self.slotted(&rewritten, run_slots)?), reads))
     }
 
     /// `expr`, rewritten for the statement's row, with each uncorrelated
@@ -6070,6 +6107,64 @@ fn check_names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str]) -> Result
     }
 }
 
+/// The SELECT alias each column of `stmt`'s projected row has, a star
+/// item `star_width` columns wide: none where a column of `columns` has
+/// the alias's name, and a repeated alias is its last use
+fn projected_aliases(
+    stmt: &SelectStatement,
+    columns: &[String],
+    star_width: impl Fn(&Expression) -> usize,
+) -> Vec<Option<SmartString>> {
+    let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+    let mut names = Vec::with_capacity(stmt.columns.len());
+    for item in &stmt.columns {
+        match item {
+            Expression::Star(_) | Expression::QualifiedStar(_) => {
+                names.extend((0..star_width(item)).map(|_| None))
+            }
+            Expression::Aliased(a) if alias_map.contains_key(a.alias.value_lower.as_str()) => {
+                names.push(Some(a.alias.value_lower.clone()))
+            }
+            _ => names.push(None),
+        }
+    }
+    for at in 0..names.len() {
+        let repeated = names[at]
+            .as_ref()
+            .is_some_and(|name| names[at + 1..].iter().any(|n| n.as_ref() == Some(name)));
+        if repeated {
+            names[at] = None;
+        }
+    }
+    names
+}
+
+/// The SELECT alias each column of a join statement's projected row has,
+/// over its joined columns `columns`, as `projected_aliases` gives them
+pub(crate) fn joined_aliases(
+    stmt: &SelectStatement,
+    columns: &[String],
+) -> Vec<Option<SmartString>> {
+    projected_aliases(stmt, columns, |item| match item {
+        Expression::QualifiedStar(q) => {
+            let mut width = 0;
+            for_each_qualified_star_column(columns, &q.qualifier, None, |_, _| width += 1);
+            width
+        }
+        _ => columns.len(),
+    })
+}
+
+/// The ORDER BY and DISTINCT ON keys holding subqueries as the blocks
+/// rewrote them, and what they read of the projected row: its aliases by
+/// position, and each key's columns of it
+#[derive(Clone, Copy)]
+struct KeyReads<'a> {
+    rewritten: [&'a [Option<Expression>]; 2],
+    items: &'a [Option<SmartString>],
+    keys: [&'a [SmallVec<[usize; 2]>]; 2],
+}
+
 /// Each ORDER BY and DISTINCT ON key's names as `chain` binds them, over the
 /// rows of `columns`: a bare key names a SELECT alias first; inside an
 /// expression a column of the same name comes first
@@ -6101,14 +6196,14 @@ fn check_key_names(stmt: &SelectStatement, chain: &Chain<'_>, columns: &[String]
 impl PreparedProjection {
     /// The SELECT list over `chain`'s one table and what ORDER BY and
     /// DISTINCT ON append, with the names and the sources of the appended
-    /// columns. `rewritten` holds each SELECT item, ORDER BY key and DISTINCT
-    /// ON key holding subqueries as the blocks rewrote it, which compiles in
-    /// its place
+    /// columns. `select` and `keys` hold each SELECT item and key holding
+    /// subqueries as the blocks rewrote it, which compiles in its place
     fn prepare(
         executor: &Executor,
         stmt: &SelectStatement,
         chain: &Chain<'_>,
-        rewritten: [&[Option<Expression>]; 3],
+        select: &[Option<Expression>],
+        keys: KeyReads<'_>,
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
         let scope = chain.scopes[0];
         let columns: &[String] = &scope.columns;
@@ -6120,7 +6215,7 @@ impl PreparedProjection {
         // A `*` item is read by position, under its column's name, by which
         // an ORDER BY key finds it selected
         let star_item = |i: usize| Expression::Identifier(ident(&columns[i], &scope.lower[i]));
-        for (column, rewritten) in stmt.columns.iter().zip(rewritten[0]) {
+        for (column, rewritten) in stmt.columns.iter().zip(select) {
             match column {
                 Expression::Star(_) => {
                     select_exprs.extend((0..columns.len()).map(star_item));
@@ -6149,9 +6244,8 @@ impl PreparedProjection {
             stars: star_columns,
             rewritten: item_rewritten,
         };
-        let keys = (&stmt.order_by[..], &stmt.distinct_on[..]);
-        let rewritten_keys = [rewritten[1], rewritten[2]];
-        Self::build(executor, stmt, chain, items, keys, columns, rewritten_keys)
+        let sort = (&stmt.order_by[..], &stmt.distinct_on[..]);
+        Self::build(executor, stmt, chain, items, sort, columns, keys)
     }
 
     /// The SELECT list over a join's rows of `all_columns` and, unless the
@@ -6196,14 +6290,21 @@ impl PreparedProjection {
                 }
             }
         }
-        let (keys, rewritten): (_, [&[Option<Expression>]; 2]) = match sorted {
-            true => ((&[][..], &[][..]), [&[], &[]]),
+        let (keys, rewritten, key_reads): (_, [&[Option<Expression>]; 2], [&[_]; 2]) = match sorted
+        {
+            true => ((&[][..], &[][..]), [&[], &[]], [&[], &[]]),
             false => (
                 (&stmt.order_by[..], &stmt.distinct_on[..]),
                 [&blocks.order_by, &blocks.distinct_on],
+                [&blocks.key_reads[0], &blocks.key_reads[1]],
             ),
         };
-        Self::build(executor, stmt, &chain, items, keys, all_columns, rewritten)
+        let reads = KeyReads {
+            rewritten,
+            items: &blocks.items,
+            keys: key_reads,
+        };
+        Self::build(executor, stmt, &chain, items, keys, all_columns, reads)
     }
 
     /// `items` and the columns `order_by` and `distinct_on` append over the
@@ -6216,14 +6317,13 @@ impl PreparedProjection {
         items: SelectItems<'_>,
         (order_by, distinct_on): (&[OrderByExpression], &[Expression]),
         columns: &[String],
-        rewritten: [&[Option<Expression>]; 2],
+        reads: KeyReads<'_>,
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
         let SelectItems {
             exprs: select_exprs,
             stars: star_columns,
             rewritten: item_rewritten,
         } = items;
-        let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
         let sort_keys = || order_by.iter().map(|ob| &ob.expression).chain(distinct_on);
         // A key holding a subquery is computed into a column named after it
         let plan = executor.order_by_projection(
@@ -6255,24 +6355,36 @@ impl PreparedProjection {
             });
         }
         outputs.extend(plan.extra_order_indices.iter().map(|&i| Output::Column(i)));
-        // Each key as the blocks rewrote it, found by the node it is
+        // Each key as the blocks rewrote it and the projected columns it
+        // reads, found by the node it is
         let rewritten_key = |expr: &Expression| {
             let order_at = order_by
                 .iter()
                 .position(|ob| std::ptr::eq(&ob.expression, expr));
             let distinct_at = distinct_on.iter().position(|k| std::ptr::eq(k, expr));
+            let read = |side: usize, at: usize| reads.keys[side].get(at).filter(|r| !r.is_empty());
             match (order_at, distinct_at) {
-                (Some(at), _) => rewritten[0][at].as_ref(),
-                (None, Some(at)) => rewritten[1][at].as_ref(),
-                (None, None) => None,
+                (Some(at), _) => (reads.rewritten[0][at].as_ref(), read(0, at)),
+                (None, Some(at)) => (reads.rewritten[1][at].as_ref(), read(1, at)),
+                (None, None) => (None, None),
             }
         };
+        // A key reading the projected row runs over it, as its second row
+        let projected =
+            CompileContext::bound_pair(registry, columns.len() as u32).with_prepared_subqueries();
         for expr in plan
             .computed_order_by
             .iter()
             .chain(&plan.computed_distinct_on)
         {
-            let rewritten = rewritten_key(expr);
+            let (rewritten, read) = rewritten_key(expr);
+            if let (Some(rewritten), Some(read)) = (rewritten, read) {
+                outputs.push(Output::AliasKey(
+                    Computed::new(compile_with(&projected, rewritten)?),
+                    read.clone(),
+                ));
+                continue;
+            }
             // A key holding subqueries that is a SELECT item reads its value,
             // so the subqueries run once per row
             let key = ExprKey::of(expr);
@@ -6297,17 +6409,20 @@ impl PreparedProjection {
         // so no column name can meet it; a repeated alias is its last use,
         // as the general path's evaluator over the output columns reads it
         let mut positions: FxHashMap<&str, u16> = FxHashMap::default();
-        for (i, e) in select_exprs.iter().enumerate() {
-            if let Expression::Aliased(a) = e {
-                if alias_map.contains_key(a.alias.value_lower.as_str()) {
-                    let i = u16::try_from(i)
-                        .map_err(|_| Error::internal("too many SELECT expressions"))?;
-                    positions.insert(a.alias.value_lower.as_str(), i);
-                }
+        for (i, name) in reads.items.iter().enumerate() {
+            if let Some(name) = name {
+                let i =
+                    u16::try_from(i).map_err(|_| Error::internal("too many SELECT expressions"))?;
+                positions.insert(name.as_str(), i);
             }
         }
+        // A key holding a subquery reads them as its blocks were rewritten
         let keys: Vec<&Expression> = sort_keys()
-            .filter(|key| !is_leaf(key) && names_any(key, &|name| positions.contains_key(name)))
+            .filter(|key| {
+                !is_leaf(key)
+                    && !mentions_subquery(key)
+                    && names_any(key, &|name| positions.contains_key(name))
+            })
             .collect();
         // Each key's columns bound, its aliases left for their positions
         let is_alias = |id: &Identifier| positions.contains_key(id.value_lower.as_str());
@@ -6640,7 +6755,7 @@ impl PreparedProjection {
         }
         for (position, output) in self.outputs.iter().enumerate() {
             if let Output::AliasKey(computed, _) = output {
-                let mut exec = run.exec_over(row, &run.base);
+                let mut exec = run.exec_over(row, &run.base).with_subquery_executor(run);
                 exec.row2 = Some(&out);
                 let key = vm.execute(Self::bound_program(run, bound, computed), &exec)?;
                 out.set(position, key)?;
@@ -6751,6 +6866,8 @@ impl PreparedSelect {
             max_param: 0,
             keeps_holes: false,
             where_slots: Vec::new(),
+            projected_from: None,
+            projected_reads: SmallVec::new(),
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -6795,22 +6912,28 @@ impl PreparedSelect {
                     .iter()
                     .any(|c| ExprKey::of(unaliased(c)) == ExprKey::of(key))
         };
-        let order_by = stmt
-            .order_by
-            .iter()
-            .map(|ob| match repeats(&ob.expression) {
-                true => Ok(None),
-                false => output(&ob.expression),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let distinct_on = stmt
-            .distinct_on
-            .iter()
-            .map(|key| match repeats(key) {
-                true => Ok(None),
-                false => output(key),
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let width = scope.columns.len();
+        let items = projected_aliases(stmt, &scope.columns, |_| width);
+        let key_scope = scope.with_items(&items);
+        let key_scopes = [&key_scope];
+        let key_chain = Chain {
+            scopes: &key_scopes,
+        };
+        let mut keys = |exprs: &mut dyn Iterator<Item = &Expression>| {
+            let mut rewritten = Vec::new();
+            let mut reads = Vec::new();
+            for key in exprs {
+                let (key, read) = match repeats(key) {
+                    true => (None, SmallVec::new()),
+                    false => builder.key(&key_chain, width, key, &mut run_slots)?,
+                };
+                rewritten.push(key);
+                reads.push(read);
+            }
+            Ok::<_, Error>((rewritten, reads))
+        };
+        let (order_by, order_reads) = keys(&mut stmt.order_by.iter().map(|ob| &ob.expression))?;
+        let (distinct_on, distinct_reads) = keys(&mut stmt.distinct_on.iter())?;
         let output_blocks = first_output_block..builder.subqueries.len();
         let mut read_as = FxHashMap::default();
         parts.read_as(schema, &mut read_as);
@@ -6827,7 +6950,12 @@ impl PreparedSelect {
             executor,
             stmt,
             &chain,
-            [&select, &order_by, &distinct_on],
+            &select,
+            KeyReads {
+                rewritten: [&order_by, &distinct_on],
+                items: &items,
+                keys: [&order_reads, &distinct_reads],
+            },
         )?;
         for column in stmt
             .columns
@@ -7157,6 +7285,8 @@ impl PreparedGrouped {
             max_param: 0,
             keeps_holes: true,
             where_slots: Vec::new(),
+            projected_from: None,
+            projected_reads: SmallVec::new(),
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -7865,6 +7995,8 @@ impl PreparedDml {
             max_param: 0,
             keeps_holes: false,
             where_slots: Vec::new(),
+            projected_from: None,
+            projected_reads: SmallVec::new(),
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -8136,6 +8268,9 @@ pub(crate) struct JoinBlocks {
     pub(crate) select: Vec<Option<Expression>>,
     pub(crate) order_by: Vec<Option<Expression>>,
     pub(crate) distinct_on: Vec<Option<Expression>>,
+    /// The projected row's aliases, and the columns of it each key reads
+    items: Vec<Option<SmartString>>,
+    key_reads: [Vec<SmallVec<[usize; 2]>>; 2],
     /// The uncorrelated member blocks those read, read before the join
     /// reads a row; a value block they read is a run slot
     ahead: Vec<u16>,
@@ -8215,6 +8350,7 @@ impl JoinBlocks {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
+        items: Vec<Option<SmartString>>,
         sides: &JoinSides,
         width: usize,
         param_count: usize,
@@ -8248,6 +8384,8 @@ impl JoinBlocks {
             max_param: 0,
             keeps_holes: false,
             where_slots: Vec::new(),
+            projected_from: None,
+            projected_reads: SmallVec::new(),
         };
         // A side read as rows keeps the conditions its read asks: those
         // without a block, which the read takes, and those whose blocks bind
@@ -8328,20 +8466,39 @@ impl JoinBlocks {
         // before the join reads a row
         let mut run_slots = Vec::new();
         let first_output_block = builder.subqueries.len();
-        let [select, order_by, distinct_on] = output.map(|exprs| {
-            exprs
-                .iter()
-                .map(|expr| {
-                    expr.map(|expr| {
-                        let rewritten =
-                            builder.rewrite(&chain, None, expr, &mut Rewritten::default())?;
-                        builder.slotted(&rewritten, &mut run_slots)
-                    })
-                    .transpose()
+        let select = output[0]
+            .iter()
+            .map(|expr| {
+                expr.map(|expr| {
+                    let rewritten =
+                        builder.rewrite(&chain, None, expr, &mut Rewritten::default())?;
+                    builder.slotted(&rewritten, &mut run_slots)
                 })
-                .collect::<Result<Vec<_>>>()
-        });
-        let (select, order_by, distinct_on) = (select?, order_by?, distinct_on?);
+                .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // A key reads the SELECT aliases from the projected row, after the
+        // joined row's columns
+        let key_scope = scope.with_items(&items);
+        let key_scopes = [&key_scope];
+        let key_chain = Chain {
+            scopes: &key_scopes,
+        };
+        let mut keys = |exprs: &[Option<&Expression>]| {
+            let mut rewritten = Vec::with_capacity(exprs.len());
+            let mut reads = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                let (key, read) = match expr {
+                    Some(expr) => builder.key(&key_chain, width, expr, &mut run_slots)?,
+                    None => (None, SmallVec::new()),
+                };
+                rewritten.push(key);
+                reads.push(read);
+            }
+            Ok::<_, Error>((rewritten, reads))
+        };
+        let (order_by, order_reads) = keys(output[1])?;
+        let (distinct_on, distinct_reads) = keys(output[2])?;
         let output_blocks = first_output_block..builder.subqueries.len();
         // Each side's conditions as its own scan reads them, a value a column
         // is compared with a run slot; the joined row reads the same blocks
@@ -8445,6 +8602,8 @@ impl JoinBlocks {
             select,
             order_by,
             distinct_on,
+            items,
+            key_reads: [order_reads, distinct_reads],
             ahead,
             left,
             right,
@@ -8578,6 +8737,7 @@ impl Executor {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
+        items: Vec<Option<SmartString>>,
         sides: &JoinSides,
         width: usize,
         ctx: &ExecutionContext,
@@ -8589,6 +8749,7 @@ impl Executor {
             cross,
             side_filters,
             output,
+            items,
             sides,
             width,
             ctx.params().len(),
