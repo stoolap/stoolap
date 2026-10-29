@@ -2934,6 +2934,9 @@ struct PreparedBlocks {
     run_slots: Vec<(usize, SharedProgram)>,
     /// The run slots whose error is raised where a row reads the slot
     where_slots: Vec<usize>,
+    /// The run slots a named window's parts hold, whose error the window
+    /// raises once it runs over a row
+    window_slots: Vec<usize>,
     /// Indexed by subquery id, nested ones included
     subqueries: Vec<PreparedSubquery>,
 }
@@ -4272,9 +4275,8 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
-    /// The run slots of values a WHERE tests a column against, or a named
-    /// window's parts hold, whose error a run raises only where a row reads
-    /// the slot
+    /// The run slots of values a WHERE tests a column against, whose error
+    /// a run raises only where a row reads the slot
     where_slots: Vec<usize>,
 }
 
@@ -4399,6 +4401,7 @@ impl Builder<'_> {
             slot_count: self.next_slot,
             run_slots,
             where_slots: self.where_slots,
+            window_slots: Vec::new(),
             subqueries,
         };
         Ok((blocks, holes))
@@ -7103,10 +7106,11 @@ impl PreparedGrouped {
         // above, and so is every item of rows that do not group; any other
         // for each group
         let groups = grouped_block(stmt);
-        // `deferred`: the run slots it adds raise their error only where a
-        // row reads them
+        // `window`: the run slots it adds are a named window's, which raise
+        // their error once the window runs over a row
+        let mut window_slots = Vec::new();
         let mut output =
-            |expr: &Expression, key: Option<&Expression>, deferred: bool| -> Result<Expression> {
+            |expr: &Expression, key: Option<&Expression>, window: bool| -> Result<Expression> {
                 if let Some(rewritten) = key {
                     return Ok(rewritten.clone());
                 }
@@ -7119,9 +7123,8 @@ impl PreparedGrouped {
                     })?;
                     rewrite(&mut builder, &chain, &mut run_slots, &read)?
                 };
-                if deferred {
-                    let added = run_slots[first..].iter().map(|(slot, _)| *slot);
-                    builder.where_slots.extend(added);
+                if window {
+                    window_slots.extend(run_slots[first..].iter().map(|(slot, _)| *slot));
                 }
                 Ok(rewritten)
             };
@@ -7208,7 +7211,8 @@ impl PreparedGrouped {
             .as_ref()
             .map(|parts| parts.programs(|expr| compile_with(&own, expr)))
             .transpose()?;
-        let (blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
+        let (mut blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
+        blocks.window_slots = window_slots;
         // The statement the grouped run reads names its columns again
         let where_clause = where_parts
             .as_ref()
@@ -10760,6 +10764,9 @@ pub(crate) struct PreparedRunner<'a> {
     /// The WHERE's run slots whose value failed, NULL in `base`; boxed, as
     /// a run seldom has one
     failed_slots: Option<Box<FailedSlots>>,
+    /// The first error of a named window's run slots, which the window
+    /// raises once it runs over a row
+    window_failure: Option<Box<Error>>,
     transaction_id: Option<u64>,
     /// The context the subqueries read their tables under
     ctx: ExecutionContext,
@@ -10975,6 +10982,7 @@ impl<'a> PreparedRunner<'a> {
                 .collect(),
             base,
             failed_slots: None,
+            window_failure: None,
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
@@ -11008,7 +11016,9 @@ impl<'a> PreparedRunner<'a> {
                 .with_subquery_executor(self);
             for (slot, program) in &self.prepared.run_slots {
                 let value = vm.execute(program, &exec);
-                let raised = value.is_err() && !self.prepared.where_slots.contains(slot);
+                let raised = value.is_err()
+                    && !self.prepared.where_slots.contains(slot)
+                    && !self.prepared.window_slots.contains(slot);
                 computed.push((*slot, value));
                 if raised {
                     break;
@@ -11021,6 +11031,10 @@ impl<'a> PreparedRunner<'a> {
                 Err(e) if self.prepared.where_slots.contains(&slot) => {
                     let e = deferred(e)?;
                     self.failed_slots.get_or_insert_default().push((slot, e));
+                }
+                Err(e) if self.prepared.window_slots.contains(&slot) => {
+                    let e = deferred(e)?;
+                    self.window_failure.get_or_insert_with(|| Box::new(e));
                 }
                 Err(e) => return Err(e),
             }
@@ -12185,6 +12199,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         self.slot_failures()
     }
 
+    fn window_failure(&self) -> Option<&Error> {
+        self.window_failure.as_deref()
+    }
+
     fn bind_members(&self, program: &SharedProgram) -> Option<SharedProgram> {
         self.bound_program(program)
     }
@@ -12257,6 +12275,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
 
     fn failed_slots(&self) -> &[(usize, Error)] {
         self.runner.slot_failures()
+    }
+
+    fn window_failure(&self) -> Option<&Error> {
+        self.runner.window_failure.as_deref()
     }
 }
 

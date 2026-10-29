@@ -599,3 +599,25 @@ fn a_named_window_over_no_row_reads_none_of_its_parts() {
         assert_eq!(rows(&db, sql), Ok(Vec::new()), "{sql}");
     }
 }
+
+#[test]
+fn a_named_window_over_rows_raises_its_parts_errors() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_named_raise").unwrap();
+    fill(&db);
+    // (SELECT u.x FROM u) gives many rows: reading it is an error
+    for (over, def) in [
+        ("w", "PARTITION BY (SELECT u.x FROM u)"),
+        (
+            "w",
+            "ORDER BY t.id ROWS BETWEEN COALESCE((SELECT u.x FROM u), 0) PRECEDING \
+             AND CURRENT ROW",
+        ),
+    ] {
+        let sql = format!("SELECT t.id, SUM(t.b) OVER {over} FROM t WINDOW w AS ({def})");
+        let twin = format!("SELECT t.id, SUM(t.b) OVER ({def}) FROM t");
+        let got = rows(&db, &sql);
+        assert!(got.is_err(), "{sql}: {got:?}");
+        assert_eq!(got, rows(&db, &twin), "{sql}");
+    }
+}
