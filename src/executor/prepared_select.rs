@@ -1106,13 +1106,15 @@ impl Executor {
                 _ => None,
             })
             .collect();
+        // A DISTINCT ON key holding a subquery runs as an item, read as these are
+        let distinct_keys = stmt.distinct_on.iter().filter(|key| mentions_subquery(key));
         if keys
             .iter()
+            .copied()
+            .chain(distinct_keys)
             .any(|key| names_anywhere(key, &|name| unrepeatable.contains(&name)))
         {
-            return Err(
-                "an ORDER BY subquery key naming a SELECT alias of a subquery or a volatile item",
-            );
+            return Err("an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item");
         }
         // A GROUP BY item naming a SELECT alias or position groups that item
         self.parse_group_by(stmt, &[])
@@ -7290,6 +7292,14 @@ impl PreparedGrouped {
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
+        // A DISTINCT ON key rides as an item named by its identity, here or
+        // where a caller keyed the statement, and reads as an ORDER BY key does
+        let key_names: SmallVec<[String; 1]> = stmt
+            .distinct_on
+            .iter()
+            .map(|key| ExprKey::of(key).hidden_column_name())
+            .collect();
+        let key_item = |column: &Expression| matches!(column, Expression::Aliased(a) if key_names.iter().any(|n| a.alias.value == *n));
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -7423,7 +7433,9 @@ impl PreparedGrouped {
         let keyed = stmt
             .order_by
             .iter()
-            .any(|ob| mentions_subquery(&ob.expression));
+            .map(|ob| &ob.expression)
+            .chain(stmt.columns.iter().filter(|c| key_item(c)).map(unaliased))
+            .any(mentions_subquery);
         let key_scope = keyed.then(|| scope.with_items(&aliases));
         let key_scopes = [key_scope.as_ref().unwrap_or(&scope)];
         let key_chain = Chain {
@@ -7464,6 +7476,20 @@ impl PreparedGrouped {
             let key = key.as_ref();
             columns.push(match column {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
+                Expression::Aliased(aliased) if key_item(column) => {
+                    let read = alias_blocks(
+                        &aliased.expression,
+                        &key_chain,
+                        width,
+                        &stmt.columns,
+                        &scope.lower,
+                    )?;
+                    Expression::Aliased(AliasedExpression {
+                        token: aliased.token.clone(),
+                        expression: Box::new(output(&key_chain, &read, key, false)?),
+                        alias: aliased.alias.clone(),
+                    })
+                }
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
                     expression: Box::new(output(&chain, &aliased.expression, key, false)?),

@@ -790,7 +790,7 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
         (
             "SELECT a, RANDOM() AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
              ORDER BY (SELECT MIN(u.x) FROM u) + g",
-            "an ORDER BY subquery key naming a SELECT alias of a subquery or a volatile item",
+            "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
         ),
         (
             "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
@@ -1052,6 +1052,25 @@ fn a_grouped_key_s_subquery_reads_a_select_alias_as_its_item_over_the_group() {
                 "SELECT k AS z, COUNT(*) FROM t GROUP BY GROUPING SETS ((k), (k + 1)) \
                  ORDER BY z + 1 + (SELECT 0) DESC NULLS LAST, z ASC NULLS LAST",
                 vec![Some(3), Some(2), Some(1), None, None, None],
+            ),
+            // A DISTINCT ON key reads the alias as an ORDER BY key does: k % 2
+            // is 1, 0, 1, and the first group of each key is kept
+            (
+                "SELECT DISTINCT ON ((SELECT z % 2)) k AS z, COUNT(*) FROM t GROUP BY k \
+                 ORDER BY (SELECT z % 2), 1",
+                vec![Some(2), Some(1)],
+            ),
+            // over a join, whose groups are k = 1 and 2
+            (
+                "SELECT DISTINCT ON ((SELECT z % 2)) t.k AS z, COUNT(*) FROM t \
+                 JOIN u ON u.k = t.k GROUP BY t.k ORDER BY 1",
+                vec![Some(1), Some(2)],
+            ),
+            // u.k * 10 <= 30, 10, 20 counts 3, 2, 3 rows
+            (
+                "SELECT DISTINCT ON ((SELECT COUNT(*) FROM u WHERE u.k * 10 <= z)) k, MAX(a) AS z \
+                 FROM t GROUP BY k ORDER BY (SELECT COUNT(*) FROM u WHERE u.k * 10 <= z) DESC, 1",
+                vec![Some(1), Some(2)],
             ),
         ] {
             assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
