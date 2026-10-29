@@ -102,6 +102,8 @@ pub struct PlanText<'a> {
     pub ordered: Option<(&'a str, bool)>,
     /// The WHERE's constant terms, whose run reads no row unless they hold
     pub empty_unless: Option<String>,
+    /// The read a run takes when a key read declines it
+    pub otherwise: Vec<String>,
 }
 
 impl Plan {
@@ -132,6 +134,12 @@ impl Plan {
                     &mut read,
                     format!("PkGet {} {}", text.table, key.describe()),
                 );
+                for (at, line) in text.otherwise.iter().enumerate() {
+                    match at {
+                        0 => alternative(&mut read, line.clone()),
+                        _ => read.push(line.clone()),
+                    }
+                }
             }
             (
                 Read::Ordered {
@@ -201,8 +209,9 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
-    /// The plan as EXPLAIN shows it, outermost step first
-    pub fn explain(&self, table: &str) -> Vec<String> {
+    /// The plan as EXPLAIN shows it, outermost step first, with `otherwise`,
+    /// the read a run the key read declines takes
+    pub fn explain(&self, table: &str, otherwise: Vec<String>) -> Vec<String> {
         self.plan.explain(PlanText {
             table,
             limit: self.limit.map(|limit| limit.to_string()),
@@ -212,6 +221,7 @@ impl SelectPlan {
             pushed: None,
             ordered: None,
             empty_unless: None,
+            otherwise,
         })
     }
 }

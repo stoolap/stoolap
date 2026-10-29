@@ -3258,8 +3258,18 @@ impl PreparedSelect {
                 ordered: Executor::ordered_read_column(stmt)
                     .map(|(column, ascending, _)| (column, ascending)),
                 empty_unless,
+                otherwise: Vec::new(),
             }),
         )
+    }
+
+    /// The read of `table` the plan chose, as EXPLAIN shows it; none when the
+    /// table chooses
+    pub(crate) fn explain_read(&self, table: &str) -> Vec<String> {
+        let scan = self.plan.as_ref().and_then(|plan| plan.read.scan());
+        scan.map_or_else(Vec::new, |scan| {
+            scan.explain(table, self.where_.pushdown.as_ref())
+        })
     }
 
     /// The plan's inputs, for a statement that asks no block and computes no

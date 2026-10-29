@@ -206,6 +206,15 @@ fn explain_names_each_read_a_run_may_take() {
             vec!["Sort v ASC", "  Project id", "    SeqScan t"],
         ),
         (
+            "SELECT id FROM t WHERE id = 1",
+            vec![
+                "Project id",
+                "  PkGet t id = 1",
+                "  else IndexScan t (id = 1)",
+                "    PkKey",
+            ],
+        ),
+        (
             "SELECT id FROM t WHERE 1 = 0 AND v > 1",
             vec![
                 "Project id",

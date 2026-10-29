@@ -55,7 +55,11 @@ plan
 ----
 Project id, name, email
   PkGet users id = 1
+  else IndexScan users (id = 1)
+    PkKey
 ```
+
+A run whose key is not an integer, or one in a transaction with a timeout, takes the read after `else`.
 
 ### Index Scan
 

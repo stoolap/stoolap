@@ -189,8 +189,10 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         let slot = RwLock::new(CompiledExecution::Unknown);
-        if let Some(lines) = self.with_planned(stmt, &slot, Some(ctx), |p| p.plan.explain(&p.table))
-        {
+        // A run the key read declines reads as the runner's plan does
+        let key_read =
+            |p: &PlannedSelect| p.plan.explain(&p.table, p.prepared.explain_read(&p.table));
+        if let Some(lines) = self.with_planned(stmt, &slot, Some(ctx), key_read) {
             return Some(lines);
         }
         let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? else {
