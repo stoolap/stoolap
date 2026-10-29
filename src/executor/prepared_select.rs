@@ -7492,8 +7492,13 @@ impl PreparedGrouped {
                 .iter()
                 .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == column.value))
             {
-                // An alias outside its subqueries reads the item as written
-                let key = with_aliases(&ob.expression, &stmt.columns, &scope.lower);
+                let key = alias_blocks(
+                    &ob.expression,
+                    &key_chain,
+                    width,
+                    &stmt.columns,
+                    &scope.lower,
+                )?;
                 columns.push(Expression::Aliased(AliasedExpression {
                     token,
                     expression: Box::new(output(&key_chain, &key, None, false)?),
@@ -10971,6 +10976,56 @@ impl StatementSource<'_> {
             | StatementSource::Values(columns, _) => Some(columns),
             StatementSource::Cte((columns, _)) => Some(columns),
         }
+    }
+}
+
+/// A grouped ORDER BY `key` with each SELECT alias outside its subqueries,
+/// a bare name `keys` binds past its first `width` columns, read as a block
+/// of its own, `(SELECT z)`, so it reads its item as an alias inside one
+/// does; an aggregate's arguments read input rows, which take the items of
+/// `select` as written, unless a column of `names` has the alias's name
+fn alias_blocks(
+    key: &Expression,
+    keys: &Chain<'_>,
+    width: usize,
+    select: &[Expression],
+    names: &[String],
+) -> Result<Expression> {
+    match key {
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(key.clone()),
+        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
+            Ok(with_aliases(key, select, names).into_owned())
+        }
+        Expression::Identifier(_) => match keys.resolve(key) {
+            Ok(Some((_, column))) if column >= width => {
+                let token = Token::new(TokenType::Keyword, "SELECT", Position::default());
+                Ok(Expression::ScalarSubquery(ScalarSubquery {
+                    token: token.clone(),
+                    subquery: Box::new(SelectStatement {
+                        param_count: 0,
+                        token,
+                        distinct: false,
+                        distinct_on: Vec::new(),
+                        columns: vec![key.clone()],
+                        with: None,
+                        table_expr: None,
+                        where_clause: None,
+                        group_by: GroupByClause::default(),
+                        having: None,
+                        window_defs: Vec::new(),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        set_operations: Vec::new(),
+                        prepared: None,
+                    }),
+                }))
+            }
+            _ => Ok(key.clone()),
+        },
+        other => rebuild(other, &mut |child| {
+            alias_blocks(child, keys, width, select, names)
+        }),
     }
 }
 

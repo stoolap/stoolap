@@ -1047,6 +1047,12 @@ fn a_grouped_key_s_subquery_reads_a_select_alias_as_its_item_over_the_group() {
                  ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = z + 1) DESC, z",
                 vec![Some(1), Some(3), Some(2), None, None, None],
             ),
+            // The same outside the key's subquery
+            (
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY GROUPING SETS ((k), (k + 1)) \
+                 ORDER BY z + 1 + (SELECT 0) DESC NULLS LAST, z ASC NULLS LAST",
+                vec![Some(3), Some(2), Some(1), None, None, None],
+            ),
         ] {
             assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
             let got: Vec<Option<i64>> = db
