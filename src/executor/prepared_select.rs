@@ -537,7 +537,7 @@ impl<'a> Family<'a> {
         if statement_order_holding_subquery(sq, counts_rows, registry) {
             return Err("a subquery block's ORDER BY or DISTINCT ON key holding a subquery");
         }
-        if statement_form_block(sq, counts_rows, registry) {
+        if statement_form_block(sq, counts_rows, false, registry) {
             return self.derived(sq);
         }
         let columns = || sq.columns.iter().map(unaliased);
@@ -661,11 +661,11 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        let registry = &self.executor.function_registry;
-        if statement_order_holding_subquery(sq, false, registry) {
-            return Err("a subquery block's ORDER BY or DISTINCT ON key holding a subquery");
+        // An EXISTS runs the clauses only a statement reads as main does
+        if !clause_block(sq, false) && statement_order(sq, &self.executor.function_registry) {
+            return Err("an EXISTS block whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads");
         }
-        if statement_form_block(sq, false, registry) {
+        if clause_block(sq, false) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -757,21 +757,22 @@ fn windowed_block(sq: &SelectStatement) -> bool {
         .any(QueryClassification::expression_has_window_function)
 }
 
-/// A block that runs as one statement: a windowed one, or one holding a
-/// set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a DISTINCT
-/// that changes its answer, which it does only where something counts its
-/// rows: a value block (`counts_rows`), a LIMIT or an OFFSET
+/// A block that runs as one statement: one `clause_block` names, or, but
+/// for an EXISTS (`exists`), whose ORDER BY chooses no row, one whose
+/// ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads
 fn statement_form_block(
     sq: &SelectStatement,
     counts_rows: bool,
+    exists: bool,
     registry: &FunctionRegistry,
 ) -> bool {
-    clause_block(sq, counts_rows) || statement_order(sq, registry)
+    clause_block(sq, counts_rows) || (!exists && statement_order(sq, registry))
 }
 
 /// A block a statement runs for its clauses: a windowed one, or one holding
 /// a set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a
-/// counted DISTINCT
+/// DISTINCT that changes its answer, which it does only where something
+/// counts its rows: a value block (`counts_rows`), a LIMIT or an OFFSET
 fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
@@ -789,14 +790,65 @@ fn statement_order_holding_subquery(
     counts_rows: bool,
     registry: &FunctionRegistry,
 ) -> bool {
-    !clause_block(sq, counts_rows)
-        && statement_order(sq, registry)
-        && sq
-            .order_by
+    !clause_block(sq, counts_rows) && statement_order(sq, registry) && key_subquery_anywhere(sq)
+}
+
+/// Whether an ORDER BY or DISTINCT ON key of `sq`, or of a statement inside
+/// it at any depth (a subquery, a derived table, a set operation branch),
+/// holds a subquery
+fn key_subquery_anywhere(sq: &SelectStatement) -> bool {
+    let keys = || {
+        sq.order_by
             .iter()
             .map(|ob| &ob.expression)
             .chain(&sq.distinct_on)
-            .any(mentions_subquery)
+    };
+    if keys().any(mentions_subquery) {
+        return true;
+    }
+    let mut nested = Vec::new();
+    let clauses = sq
+        .columns
+        .iter()
+        .chain(sq.where_clause.as_deref())
+        .chain(sq.having.as_deref())
+        .chain(&sq.group_by.columns)
+        .chain(keys());
+    for expr in clauses {
+        nested_statements(expr, &mut nested);
+    }
+    source_statements(sq.table_expr.as_deref(), &mut nested);
+    nested.extend(sq.set_operations.iter().map(|op| &*op.right));
+    nested.into_iter().any(key_subquery_anywhere)
+}
+
+/// The statements a FROM source holds: derived tables, and the subqueries
+/// of its join conditions, VALUES rows and table function arguments
+fn source_statements<'e>(source: Option<&'e Expression>, out: &mut Vec<&'e SelectStatement>) {
+    match source {
+        Some(Expression::SubquerySource(derived)) => out.push(&derived.subquery),
+        Some(Expression::JoinSource(join)) => {
+            source_statements(Some(&join.left), out);
+            source_statements(Some(&join.right), out);
+            if let Some(condition) = join.condition.as_deref() {
+                nested_statements(condition, out);
+            }
+        }
+        Some(Expression::ValuesSource(values)) => {
+            values
+                .rows
+                .iter()
+                .flatten()
+                .for_each(|e| nested_statements(e, out));
+        }
+        Some(Expression::FunctionTableSource(function)) => {
+            function
+                .arguments
+                .iter()
+                .for_each(|e| nested_statements(e, out));
+        }
+        _ => {}
+    }
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
@@ -4721,7 +4773,7 @@ impl Builder<'_> {
         // rows its items choose, by a window, a DISTINCT ON or the clauses of
         // a statement block, runs as written
         let dropped = matches!(form, Form::Exists(_))
-            && !statement_form_block(sq, false, &executor.function_registry)
+            && !clause_block(sq, false)
             && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
@@ -5206,8 +5258,9 @@ impl Builder<'_> {
                     ..
                 }
         );
+        let exists = matches!(form, Form::Exists(_));
         let registry = &self.executor.function_registry;
-        if statement_form_block(sq, counts_rows, registry) {
+        if statement_form_block(sq, counts_rows, exists, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities

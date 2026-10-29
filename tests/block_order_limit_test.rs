@@ -668,6 +668,18 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
              ORDER BY (SELECT DISTINCT ON (u.z) u.x) DESC LIMIT 1 + 0) ORDER BY id",
             vec![2],
         ),
+        // The same key one statement deeper, in a block a computed LIMIT sends
+        (
+            "SELECT id FROM t WHERE a IN (SELECT (SELECT x AS z FROM u \
+             ORDER BY (SELECT z + u.x) DESC LIMIT 1 + 0) FROM v LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        // An EXISTS computes no key: u.id * 9223372036854775807 overflows for 2
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
+             GROUP BY u.id ORDER BY u.id * 9223372036854775807) ORDER BY id",
+            vec![1, 2],
+        ),
         // An EXISTS orders no row: (SELECT id FROM v), two rows, is never read
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
