@@ -396,8 +396,8 @@ pub enum CompiledExecution {
     Insert(CompiledInsert),
     /// Compiled INSERT with conflict handling
     ConflictInsert(CompiledConflictInsert),
-    /// A statement without WHERE whose one row is counts the table keeps or
-    /// an index's bound
+    /// A statement without WHERE whose one row is one count the table keeps
+    /// or an index's bound
     GlobalAggregate(Arc<super::planned_aggregate::PlannedAggregate>),
     /// The programs a join statement compiles (general SELECT path)
     PreparedJoin(Arc<super::prepared_join::PreparedJoin>),

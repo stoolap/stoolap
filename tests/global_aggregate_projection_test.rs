@@ -59,6 +59,12 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
             s(&["x", "y"]),
             s(&["13", "13"]),
         ),
+        // A named window's aggregate takes a slot beside the list's own
+        (
+            "SELECT SUM(a) AS x, SUM(a) AS y FROM t WINDOW w AS (ORDER BY MAX(a))",
+            s(&["x", "y"]),
+            s(&["13", "13"]),
+        ),
         (
             "SELECT COUNT(*), COUNT(*) FROM t",
             s(&["COUNT(*)", "COUNT(*)"]),

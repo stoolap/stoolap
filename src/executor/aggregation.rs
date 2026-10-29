@@ -1423,15 +1423,19 @@ impl Executor {
         stmt: &SelectStatement,
         aggregations: &[SqlAggregateFunction],
     ) -> Option<Vec<String>> {
+        // Each item is its own slot's call: a slot another clause added, or
+        // one the parse shared between items, moves the others
         let alone = stmt.having.is_none()
             && stmt.order_by.is_empty()
             && stmt.columns.len() == aggregations.len()
-            && stmt.columns.iter().all(|column| {
+            && aggregations.iter().all(|agg| !agg.hidden)
+            && stmt.columns.iter().zip(aggregations).all(|(column, agg)| {
                 let call = match column {
                     Expression::Aliased(aliased) => aliased.expression.as_ref(),
                     other => other,
                 };
-                matches!(call, Expression::FunctionCall(f) if is_aggregate_function(&f.function))
+                matches!(call, Expression::FunctionCall(f)
+                    if is_aggregate_function(&f.function) && ExprKey::of_call(f) == agg.key)
             });
         alone.then(|| stmt.columns.iter().map(item_name).collect())
     }

@@ -144,6 +144,44 @@ fn a_failing_value_fails_only_for_a_row_that_reaches_it() {
 }
 
 #[test]
+fn a_cancelled_aggregate_plan_is_refused() {
+    let db = table("planned_aggregate_cancel");
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    for sql in ["SELECT MIN(id) FROM t", "SELECT COUNT(*) FROM t"] {
+        // The first run plans it, the second reads by the plan
+        executor.execute(sql).unwrap();
+        executor.execute(sql).unwrap();
+        let ctx = ExecutionContext::new();
+        ctx.cancel();
+        let answer = executor.execute_with_context(sql, &ctx);
+        assert!(
+            matches!(answer, Err(stoolap::Error::QueryCancelled)),
+            "{sql}: a cancelled statement answered"
+        );
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_planned_aggregate_of_several_calls_reads_the_statement_view() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let db = table("planned_aggregate_several_calls");
+    let sql = "SELECT COUNT(*) AS a, COUNT(1) AS b FROM t";
+    db.query(sql, ()).unwrap().for_each(drop);
+    db.query(sql, ()).unwrap().for_each(drop);
+    let taken = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&taken);
+    stoolap::test_failpoints::after_statement_view_taken(move || flag.set(true));
+    db.query(sql, ()).unwrap().for_each(drop);
+    stoolap::test_failpoints::after_statement_view_taken(|| {});
+    assert!(
+        taken.get(),
+        "two counts read one by one, a commit between them unseen"
+    );
+}
+
+#[test]
 fn a_source_row_past_the_limit_is_never_computed() {
     let db = table("planned_source_row_past_limit");
     let fails_at_3 = "CASE WHEN id = 3 THEN ABS('a') ELSE id END";

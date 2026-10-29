@@ -70,14 +70,12 @@ impl GlobalSource {
     }
 }
 
-/// A statement without WHERE whose one row is counts the table keeps or an
-/// index's bound, planned once and run before the statement is classified
+/// A statement without WHERE whose one row is one count the table keeps or
+/// an index's bound, planned once and run before the statement is classified
 #[derive(Debug)]
 pub struct PlannedAggregate {
     source: GlobalSource,
     aggregations: Vec<SqlAggregateFunction>,
-    /// Each call's column in the table, None for a call that reads none
-    columns: Vec<Option<usize>>,
     table: SmartString,
     /// The table's columns, which the SELECT list reads through the calls
     source_columns: CompactArc<Vec<String>>,
@@ -422,7 +420,7 @@ impl Executor {
         .map(Some)
     }
 
-    /// `stmt` run by the aggregate plan `compiled` holds: counts the table
+    /// `stmt` run by the aggregate plan `compiled` holds: one count the table
     /// keeps or an index's bound, read through committed state. None for the
     /// regular path to answer, as it does the run that plans
     pub(crate) fn run_planned_aggregate(
@@ -449,6 +447,9 @@ impl Executor {
             self.plan_aggregate(stmt, compiled, ctx, epoch);
             return None;
         };
+        if let Err(error) = ctx.check_cancelled() {
+            return Some(Err(error));
+        }
         let run = || -> Result<Option<Box<dyn QueryResult>>> {
             // Under read committed only a count that vouches for itself, the
             // latest committed one; under snapshot isolation the counts of a
@@ -460,7 +461,9 @@ impl Executor {
                 planned.source,
                 &*table,
                 &planned.aggregations,
-                &planned.columns,
+                // A count reads no column, a bound its index: no column place
+                // the table's layout may move
+                &[None],
                 quiet,
                 None,
             )?;
@@ -538,8 +541,8 @@ impl Executor {
     }
 
     /// The plan of a statement over one table, without WHERE, grouping,
-    /// ORDER BY, LIMIT or OFFSET, whose one row is counts the table keeps or
-    /// an index's bound
+    /// ORDER BY, LIMIT or OFFSET, whose one row is one count the table keeps
+    /// or an index's bound
     fn aggregate_plan(
         &self,
         stmt: &SelectStatement,
@@ -547,14 +550,16 @@ impl Executor {
         validity: PlanValidity,
     ) -> Option<Arc<PlannedAggregate>> {
         let (table, schema, aggregations, source) = self.global_inputs(stmt, ctx)?;
-        // A count or an index's bound vouches for itself read through no
-        // view; a sum or a column's bound may cross a seal the statement's
-        // snapshot holds, and the regular path reads those
-        let counts = aggregations
-            .iter()
-            .all(|agg| agg.counts_rows() || agg.name == "COUNT" && agg.distinct);
+        // One count or an index's bound vouches for itself read through no
+        // view. Several calls each vouch only for their own read, and a sum
+        // or a column's bound may cross a seal: the regular path reads those
+        // through the statement's snapshot
+        let [agg] = aggregations.as_slice() else {
+            return None;
+        };
+        let count = agg.counts_rows() || agg.name == "COUNT" && agg.distinct;
         match source {
-            GlobalSource::Stats if counts => {}
+            GlobalSource::Stats if count => {}
             GlobalSource::IndexBound => {}
             _ => return None,
         }
@@ -562,7 +567,6 @@ impl Executor {
         Some(Arc::new(PlannedAggregate {
             alone: Self::calls_alone(stmt, &aggregations).map(CompactArc::new),
             source,
-            columns: Self::call_columns(&aggregations, &source_columns),
             aggregations,
             table,
             source_columns,
