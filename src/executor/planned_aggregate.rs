@@ -283,7 +283,7 @@ impl Executor {
 
     /// Each call's column in `columns`, the one table's, whatever qualifier
     /// names it
-    fn call_columns(
+    pub(super) fn call_columns(
         aggregations: &[SqlAggregateFunction],
         columns: &[String],
     ) -> Vec<Option<usize>> {

@@ -66,6 +66,7 @@ mod dml_fast_path;
 mod explain;
 pub(crate) mod expr_key;
 mod foreign_key;
+mod grouped_aggregate;
 mod index_optimizer;
 mod plan_reads;
 pub(crate) mod planned;
@@ -108,7 +109,8 @@ use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
-pub(crate) use aggregation::{AggregatePath, AggregateSlots};
+#[cfg(any(test, feature = "test-failpoints"))]
+pub(crate) use aggregation::AggregatePath;
 pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
 pub use expression::{
     CompileContext, CompileError, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,

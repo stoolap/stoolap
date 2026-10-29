@@ -77,6 +77,27 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT SUM(a) AS x, g, SUM(a) AS y, COUNT(*) FROM t GROUP BY g",
         "SELECT SUM(a) AS x, g, SUM(a) AS y, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g",
     ),
+    // An ORDER BY naming a SELECT alias reads the grouped slots all the same
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT g, COUNT(*) AS n FROM t GROUP BY g ORDER BY n, g",
+        "SELECT g, COUNT(*) AS n FROM t WHERE id + 0 = id GROUP BY g ORDER BY n, g",
+    ),
+    // Only COUNT counts the rows of a star; any other call of one is grouped
+    // by the general path
+    (
+        "memory",
+        "general",
+        "SELECT g, SUM(*) FROM t GROUP BY g LIMIT 1",
+        "SELECT g, SUM(*) FROM t WHERE id + 0 = id GROUP BY g LIMIT 1",
+    ),
+    (
+        "memory",
+        "general",
+        "SELECT g, MAX(*) FROM t GROUP BY g LIMIT 1",
+        "SELECT g, MAX(*) FROM t WHERE id + 0 = id GROUP BY g LIMIT 1",
+    ),
     (
         "sealed",
         "storage_grouped",
