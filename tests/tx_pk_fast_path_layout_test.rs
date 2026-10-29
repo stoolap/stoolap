@@ -120,3 +120,16 @@ fn test_transaction_update_takes_the_compiled_path_and_rereads_a_dropped_column(
     let expected = if result.is_ok() { 12 } else { 11 };
     assert_eq!(v, expected, "{result:?}");
 }
+
+#[test]
+fn a_key_that_is_no_row_id_once_leaves_later_runs_on_the_plan() {
+    let db = table("tx_pk_layout_key_kind");
+    let update = db.prepare("UPDATE t SET v = $1 WHERE id = $2").unwrap();
+    assert_eq!(update.execute((11, "1")).unwrap(), 1, "a text key");
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    stoolap::test_failpoints::after_compiled_epoch_checked(move || hook_fired.set(true));
+    assert_eq!(update.execute((12, 1)).unwrap(), 1);
+    assert!(fired.get(), "an integer key after a text one took the plan");
+    assert_eq!(db.query_one::<i64, _>(SELECT, (1,)).unwrap(), 12);
+}

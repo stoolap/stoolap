@@ -42,8 +42,6 @@ use std::sync::{Arc, RwLock};
 use crate::common::SmartString;
 use rustc_hash::FxHashMap;
 
-use crate::common::CompactArc;
-use crate::core::Schema;
 use crate::parser::ast::{ParamSlots, SelectStatement, Statement, WithClause};
 use crate::storage::mvcc::version_store::LayoutToken;
 
@@ -182,42 +180,6 @@ impl std::fmt::Debug for UpdateValueSource {
             UpdateValueSource::Expression(_) => f.write_str("Expression(<compiled>)"),
         }
     }
-}
-
-/// Pre-compiled state for PK-based UPDATE (UPDATE table SET col = val WHERE pk = value)
-#[derive(Debug, Clone)]
-pub struct CompiledPkUpdate {
-    /// Table name (already lowercased)
-    pub table_name: SmartString,
-    /// Cached schema
-    pub schema: CompactArc<Schema>,
-    /// Cached PK column name
-    pub pk_column_name: SmartString,
-    /// How to extract the PK value
-    pub pk_value_source: PkValueSource,
-    /// Pre-compiled column assignments
-    pub updates: Vec<CompiledUpdateColumn>,
-    /// When the compiled state holds
-    pub validity: PlanValidity,
-    /// The table instance and layout the column indices describe
-    pub token: LayoutToken,
-}
-
-/// Pre-compiled state for PK-based DELETE (DELETE FROM table WHERE pk = value)
-#[derive(Debug, Clone)]
-pub struct CompiledPkDelete {
-    /// Table name (already lowercased)
-    pub table_name: SmartString,
-    /// Cached schema
-    pub schema: CompactArc<Schema>,
-    /// Cached PK column name
-    pub pk_column_name: SmartString,
-    /// How to extract the PK value
-    pub pk_value_source: PkValueSource,
-    /// When the compiled state holds
-    pub validity: PlanValidity,
-    /// The table instance and layout `schema` describes
-    pub token: LayoutToken,
 }
 
 /// Pre-compiled state for INSERT statements
@@ -388,10 +350,8 @@ pub enum CompiledExecution {
     Unknown,
     /// Analyzed but doesn't qualify for any fast path, while the validity holds
     NotOptimizable(PlanValidity),
-    /// PK-based UPDATE fast path
-    PkUpdate(CompiledPkUpdate),
-    /// PK-based DELETE fast path
-    PkDelete(CompiledPkDelete),
+    /// An UPDATE or DELETE that reads the row its primary key names
+    PlannedDml(Arc<super::planned_dml::PlannedDml>),
     /// Cached INSERT compilation (schema-derived info)
     Insert(CompiledInsert),
     /// Compiled INSERT with conflict handling

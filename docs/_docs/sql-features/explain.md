@@ -61,6 +61,37 @@ Project id, name, email
 
 A run whose key is not an integer, or one in a transaction with a timeout, takes the read after `else`.
 
+An UPDATE or DELETE whose WHERE is the primary key's equality reads its row the same way, when it has no RETURNING or WITH, keeps no foreign key, and runs no CHECK on a column it sets. Its SET values show in column order:
+
+```sql
+EXPLAIN UPDATE users SET email = 'new@example.com' WHERE id = 1;
+```
+
+Output:
+```
+plan
+----
+Update users SET email = 'new@example.com'
+  PkGet users id = 1
+  else IndexScan users (id = 1)
+    PkKey
+```
+
+Any other UPDATE or DELETE shows its clauses:
+
+```sql
+EXPLAIN UPDATE users SET name = 'x' WHERE email = 'a';
+```
+
+Output:
+```
+plan
+----
+UPDATE users
+  Set: 1 column(s)
+  Filter: (email = 'a')
+```
+
 ### Index Scan
 
 When using an index for equality, the scan line shows the condition every row it reads is judged by, and the line under it the index that finds the rows:
