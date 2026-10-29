@@ -69,7 +69,8 @@ use super::query::{
 use super::query_cache::{CompiledExecution, NestedPlan, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
-    AliasedResult, DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
+    AliasedResult, DistinctResult, DistinctRows, ExecutorResult, FilteredResult, ProjectionResult,
+    ScannerResult,
 };
 use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
@@ -892,6 +893,29 @@ fn width(expr: &Expression) -> usize {
         Expression::List(list) => list.elements.len().max(1),
         Expression::ExpressionList(list) => list.expressions.len().max(1),
         _ => 1,
+    }
+}
+
+/// A set operation's first branch, which runs without the whole one's
+/// ORDER BY, LIMIT and OFFSET; any other statement as it is
+fn first_branch(stmt: SelectStatement) -> SelectStatement {
+    match stmt.set_operations.is_empty() {
+        true => stmt,
+        false => SelectStatement {
+            set_operations: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            ..stmt
+        },
+    }
+}
+
+/// [`first_branch`] of a borrowed statement, copied only for a set operation
+pub(crate) fn first_branch_of(stmt: &SelectStatement) -> std::borrow::Cow<'_, SelectStatement> {
+    match stmt.set_operations.is_empty() {
+        true => std::borrow::Cow::Borrowed(stmt),
+        false => std::borrow::Cow::Owned(first_branch(stmt.clone())),
     }
 }
 
@@ -3353,6 +3377,10 @@ impl PreparedSelect {
             let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
             keys.join(", ")
         });
+        let distinct_on = (!stmt.distinct_on.is_empty()).then(|| {
+            let keys: Vec<String> = stmt.distinct_on.iter().map(|k| k.to_string()).collect();
+            keys.join(", ")
+        });
         // A key read judges each row by the whole WHERE
         let empty_unless = stmt
             .where_clause
@@ -3377,6 +3405,7 @@ impl PreparedSelect {
                 limit: stmt.limit.as_deref().map(Expression::to_string),
                 offset,
                 keys,
+                distinct_on,
                 names: &self.output_columns[..self.visible],
                 pushed,
                 ordered: Executor::ordered_read_column(stmt)
@@ -6850,7 +6879,10 @@ impl PreparedSelect {
                     .collect::<Option<Vec<_>>>()
             })
             .flatten();
-        let sort = match stmt.limit.is_some() && order_keys.is_some() {
+        // A DISTINCT ON keeps a row per key of every sorted row, and only then
+        // the LIMIT's
+        let sort = match stmt.limit.is_some() && order_keys.is_some() && stmt.distinct_on.is_empty()
+        {
             true => Step::TopN,
             false => Step::Sort,
         };
@@ -6859,10 +6891,19 @@ impl PreparedSelect {
         if stmt.limit.is_some() || stmt.offset.is_some() {
             steps.push(Step::Limit);
         }
+        // DISTINCT ON keeps a row per key of the sorted rows; DISTINCT is
+        // taken before the sort
+        if !stmt.distinct_on.is_empty() {
+            steps.push(Step::DistinctOn);
+        }
+        let distinct = stmt.distinct && stmt.distinct_on.is_empty();
         let mut plan = None;
         if let Some(source) = executor.source_line(stmt, ctx)? {
             if !stmt.order_by.is_empty() {
                 steps.push(sort);
+            }
+            if distinct {
+                steps.push(Step::Distinct);
             }
             steps.push(Step::Project);
             let read = Read::Source(source);
@@ -6878,8 +6919,11 @@ impl PreparedSelect {
                         &schema.column_names_lower_arc(),
                     );
                 }
+                // A DISTINCT reads every row before its LIMIT counts them
                 let ordered = Executor::ordered_read_column(stmt)
-                    .filter(|(column, ..)| stmt.limit.is_some() && schema.has_column(column))
+                    .filter(|(column, ..)| {
+                        stmt.limit.is_some() && !stmt.distinct && schema.has_column(column)
+                    })
                     .and_then(|(column, ascending, _)| {
                         ordered_read(
                             &store,
@@ -6893,6 +6937,9 @@ impl PreparedSelect {
                 if ordered.is_none() && !stmt.order_by.is_empty() {
                     steps.push(sort);
                 }
+                if distinct {
+                    steps.push(Step::Distinct);
+                }
                 steps.push(Step::Project);
                 if where_.conjuncts > where_.pushed {
                     steps.push(Step::Filter);
@@ -6904,6 +6951,22 @@ impl PreparedSelect {
                         sort,
                     },
                     None => Read::Scan(scan),
+                };
+                // A DISTINCT of one column and no WHERE reads its distinct values
+                let distinct_column = (stmt.distinct
+                    && stmt.distinct_on.is_empty()
+                    && stmt.where_clause.is_none()
+                    && projection.outputs.len() == 1)
+                    .then_some(projection.columns.as_deref())
+                    .flatten()
+                    .and_then(<[usize]>::first)
+                    .and_then(|&column| schema.column_names_lower_arc().get(column).cloned());
+                let read = match distinct_column {
+                    Some(column) => Read::DistinctValues {
+                        column: SmartString::from(column.as_str()),
+                        otherwise: Box::new(read),
+                    },
+                    None => read,
                 };
                 plan = Some(Plan { steps, read });
             }
@@ -7395,17 +7458,7 @@ impl PreparedGrouped {
             window_defs,
             ..stmt.clone()
         };
-        // A set operation's first branch: the whole one reads the rest
-        let stmt = match stmt.set_operations.is_empty() {
-            true => stmt,
-            false => SelectStatement {
-                set_operations: Vec::new(),
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-                ..stmt
-            },
-        };
+        let stmt = first_branch(stmt);
         // An argument read once for its call holds only run slots: one reading
         // the row is the general path's to refuse
         // The ORDER BY keys a hidden item computes count with the list
@@ -9550,7 +9603,11 @@ impl Executor {
     /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
     /// the runner's for a statement over a source, else the general path's,
     /// which runs every other one
-    fn explain_lines(&self, stmt: &SelectStatement, ctx: &ExecutionContext) -> Vec<String> {
+    pub(super) fn explain_lines(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Vec<String> {
         self.reads_source(stmt, ctx)
             .then(|| self.explain_over_source(stmt, ctx))
             .flatten()
@@ -9755,21 +9812,8 @@ impl Executor {
                 }
             }
         }
-        // A set operation's first branch: the whole one reads the rest
-        let branch;
-        let stmt = match stmt.set_operations.is_empty() {
-            true => stmt,
-            false => {
-                branch = SelectStatement {
-                    set_operations: Vec::new(),
-                    order_by: Vec::new(),
-                    limit: None,
-                    offset: None,
-                    ..stmt.clone()
-                };
-                &branch
-            }
-        };
+        let branch = first_branch_of(stmt);
+        let stmt = &*branch;
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
             ctx,
@@ -10074,6 +10118,7 @@ impl Executor {
         wanted: Option<usize>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
+        super::result::DistinctPath::Scan.taken();
         let (mut vm, mut filter_vm) = (ExprVM::new(), ExprVM::new());
         let (mut values, mut kept) = (Vec::new(), RowVec::new());
         let mut outputs = projection.unbound();
@@ -10248,6 +10293,33 @@ impl Executor {
                 .where_clause
                 .as_deref()
                 .is_some_and(|w| true_for_no_row(w, ctx));
+        // A DISTINCT of one column answers with the values the table keeps
+        let column = stmt
+            .distinct
+            .then(|| prepared.plan.as_ref())
+            .flatten()
+            .and_then(|plan| plan.read.distinct_values());
+        let values = match (&source, column) {
+            (StatementSource::Table(table), Some(column)) => {
+                Self::distinct_column_values(&**table, column)?
+            }
+            _ => None,
+        };
+        if let Some(values) = values {
+            let rows = (0i64..)
+                .zip(values)
+                .map(|(id, value)| (id, Row::from_values(vec![value])))
+                .collect();
+            let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), rows);
+            return Ok((
+                Box::new(result),
+                output_columns,
+                false,
+                prepared.visible,
+                prepared.layout.clone(),
+                true,
+            ));
+        }
         // An ORDER BY of one column under a LIMIT reads the rows it keeps in
         // order, as the plan chose
         let planned_order = prepared.plan.as_ref().and_then(|plan| plan.read.ordered());
@@ -10298,18 +10370,17 @@ impl Executor {
         // the cancel; a timed read is collected, so its deadline holds while it
         // reads, and so is a run whose failed slot only the runner raises
         let projection = &prepared.projection;
+        // A DISTINCT over such an output flows too, each row checked as it passes
         let flowing = !ctx.has_timeout()
             && runner.failed_slots.is_none()
-            && distinct.is_none()
-            && stmt.order_by.is_empty()
-            && limit.is_none()
-            && offset == 0;
+            && (distinct.is_some() || stmt.order_by.is_empty() && limit.is_none() && offset == 0);
         // Computed items that ask no block flow through the shared projection
         let items = (flowing && !projection.whole_row && projection.columns.is_none())
             .then(|| prepared.output_items())
             .flatten();
         let flows =
             flowing && (projection.whole_row || projection.columns.is_some() || items.is_some());
+        let distinct_flows = flows && distinct.is_some();
         // With an ORDER BY a SELECT item is computed for the rows LIMIT and
         // OFFSET keep, once the sort chose them by the columns the general
         // sort reads
@@ -10352,8 +10423,9 @@ impl Executor {
             (false, false) => Take::Kept,
         };
         let streamed = |flow: Flow, bound: Option<SharedProgram>| -> Result<PreparedOutput> {
-            // A flowing read: the general path's scan, filter and projection
-            let Some(distinct) = distinct else {
+            // A flowing read: the general path's scan, filter and projection,
+            // and its DISTINCT over them
+            let Some(distinct) = distinct.filter(|_| !distinct_flows) else {
                 let mut rows: Box<dyn QueryResult> = match flow {
                     Flow::Scan(scan) => {
                         let names = match projection.whole_row {
@@ -10396,13 +10468,17 @@ impl Executor {
                             .with_context(ctx),
                     );
                 }
+                if distinct_flows {
+                    let visible = Some(prepared.visible);
+                    rows = Box::new(DistinctResult::with_column_count(rows, visible));
+                }
                 return Ok((
                     rows,
                     CompactArc::clone(&output_columns),
                     false,
                     prepared.visible,
                     prepared.layout.clone(),
-                    false,
+                    distinct_flows,
                 ));
             };
             let scan = match flow {

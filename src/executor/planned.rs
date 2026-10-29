@@ -16,9 +16,11 @@
 
 use std::sync::{Arc, RwLock, Weak};
 
+use smallvec::SmallVec;
+
 use crate::core::{Error, KeyRows, Result, Row, RowVec, Value};
 use crate::parser::ast::{Expression, SelectStatement};
-use crate::planner::KeyRead;
+use crate::planner::{steps_over, KeyRead, PlanText, Step};
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::table::normalize_row_to_schema;
@@ -28,7 +30,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
-use super::prepared_select::PreparedSelect;
+use super::prepared_select::{first_branch_of, PreparedSelect};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
@@ -92,10 +94,7 @@ impl Executor {
             || shape.has_window_functions
             || shape.has_group_by
             || shape.has_having
-            || shape.has_distinct
-            || shape.has_distinct_on
             || shape.has_cte
-            || shape.has_set_operations
             || shape.output_has_subqueries
             || shape.where_has_subqueries
             || shape.has_joins
@@ -110,6 +109,10 @@ impl Executor {
         if ts.as_of.is_some() || ctx.get_cte_by_lower(table).is_some() {
             return None;
         }
+        // DISTINCT, DISTINCT ON and set operations as the runner's family takes them
+        if shape.has_distinct || shape.has_distinct_on || shape.has_set_operations {
+            self.planned_family(stmt, Some(ctx)).ok()?;
+        }
         // Read before the schema: a change in between leaves this behind
         let validity = self.select_validity(stmt, epoch);
         let store = self.engine.get_version_store(table).ok()?;
@@ -118,19 +121,25 @@ impl Executor {
         crate::test_failpoints::compile_schema_read();
         let scope = ts.alias.as_ref().map_or(table, |alias| &alias.value_lower);
         let param_count = ctx.params().len();
-        let prepared = PreparedSelect::prepare(self, ctx, stmt, &schema, scope, param_count, epoch)
-            .ok()
-            .map(|mut prepared| {
-                // A LIMIT or OFFSET read per run leaves the statement to a scan
-                if let Some(counts) = static_row_counts(stmt) {
-                    prepared.read_by_key(
-                        (table.clone(), &store),
-                        (schema, token),
-                        (counts.offset, counts.limit),
-                    );
-                }
-                Arc::new(prepared)
-            });
+        let branch = first_branch_of(stmt);
+        let prepared =
+            PreparedSelect::prepare(self, ctx, &branch, &schema, scope, param_count, epoch)
+                .ok()
+                .map(|mut prepared| {
+                    // A LIMIT or OFFSET read per run leaves the statement to a
+                    // scan, and so do a DISTINCT, which the key read does not
+                    // take, and a set operation, whose rows are its branches' too
+                    let counts = static_row_counts(stmt)
+                        .filter(|_| stmt.set_operations.is_empty() && !stmt.distinct);
+                    if let Some(counts) = counts {
+                        prepared.read_by_key(
+                            (table.clone(), &store),
+                            (schema, token),
+                            (counts.offset, counts.limit),
+                        );
+                    }
+                    Arc::new(prepared)
+                });
         let mut slot = compiled.write().ok()?;
         if matches!(
             &*slot,
@@ -159,10 +168,66 @@ impl Executor {
             let Some(Expression::TableSource(source)) = stmt.table_expr.as_deref() else {
                 return None;
             };
-            return prepared.explain(stmt, &source.name.value_lower, Vec::new());
+            let table = &source.name.value_lower;
+            let first = prepared.explain(&first_branch_of(stmt), table, Vec::new())?;
+            return Some(self.explain_set_operations(stmt, first, ctx));
         }
         self.explain_over_source(stmt, ctx)
             .or_else(|| self.explain_global(stmt, ctx))
+    }
+
+    /// `stmt`'s plan over `first`, its first branch's: each set operation
+    /// over the rows before it and its right branch as EXPLAIN shows that
+    /// statement, under the whole statement's ORDER BY and LIMIT
+    fn explain_set_operations(
+        &self,
+        stmt: &SelectStatement,
+        first: Vec<String>,
+        ctx: &ExecutionContext,
+    ) -> Vec<String> {
+        if stmt.set_operations.is_empty() {
+            return first;
+        }
+        let branch_ctx = ctx.with_incremented_query_depth();
+        let mut lines = first;
+        for op in &stmt.set_operations {
+            let right = self.explain_lines(&op.right, &branch_ctx);
+            lines = std::iter::once(op.operation.to_string())
+                .chain(
+                    lines
+                        .into_iter()
+                        .chain(right)
+                        .map(|line| format!("  {line}")),
+                )
+                .collect();
+        }
+        let mut steps = SmallVec::<[Step; 2]>::new();
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            steps.push(Step::Limit);
+        }
+        match (stmt.order_by.is_empty(), stmt.limit.is_some()) {
+            (true, _) => {}
+            (false, true) => steps.push(Step::TopN),
+            (false, false) => steps.push(Step::Sort),
+        }
+        let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
+        let text = PlanText {
+            table: "",
+            limit: stmt.limit.as_deref().map(Expression::to_string),
+            offset: stmt
+                .offset
+                .as_deref()
+                .filter(|o| !matches!(o, Expression::IntegerLiteral(lit) if lit.value == 0))
+                .map(Expression::to_string),
+            keys: Some(keys.join(", ")),
+            distinct_on: None,
+            names: &[],
+            pushed: None,
+            ordered: None,
+            empty_unless: None,
+            body: Vec::new(),
+        };
+        steps_over(&steps, &text, lines)
     }
 
     /// `stmt` run by the plan `compiled` holds, planned now in `ctx` when it
