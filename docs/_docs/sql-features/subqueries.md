@@ -354,7 +354,7 @@ JOIN (
 ) AS order_summary ON c.id = order_summary.customer_id;
 ```
 
-A derived table's rows are read as the outer query needs them, as a view's are. A LIMIT without ORDER BY stops reading once it has its rows, so a row past it is never computed, and a value that would fail in that row raises no error.
+A derived table's rows are read as the outer query needs them, as a view's are. In an outer query that only filters and projects them, with no subquery, aggregate, window function, DISTINCT or set operation, a LIMIT without ORDER BY stops reading once it has its rows, so a row past it is never computed, and a value that would fail in that row raises no error. Other queries may read every row first.
 
 ### Subqueries in UPDATE SET Clause
 
