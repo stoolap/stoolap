@@ -638,23 +638,42 @@ fn a_grouped_distinct_on_block_keeps_a_group_whose_aggregate_is_null() {
 }
 
 #[test]
-fn an_order_by_choosing_no_row_answers_whatever_its_subquery_key_reads() {
+fn a_block_key_s_subquery_answers_whatever_it_reads() {
     let db = Database::open("memory://block_order_limit_unchosen_alias").unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
         "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE v (id INTEGER PRIMARY KEY)",
         "INSERT INTO t VALUES (1, 1), (2, 2), (3, 7)",
         "INSERT INTO u VALUES (1, 1), (2, 2)",
+        "INSERT INTO v VALUES (1), (2)",
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // The key reads the SELECT alias z inside its subquery
-    let sql = "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u ORDER BY (SELECT z + u.x)) \
-               ORDER BY id";
-    let ids: Vec<i64> = db
-        .query(sql, ())
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .map(|row| row.unwrap().get::<i64>(0).unwrap())
-        .collect();
-    assert_eq!(ids, [1, 2], "{sql}");
+    for (sql, want) in [
+        // The key reads the SELECT alias z inside its subquery
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u ORDER BY (SELECT z + u.x)) \
+             ORDER BY id",
+            vec![1, 2],
+        ),
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u ORDER BY (SELECT z + u.x) DESC \
+             LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
+        // An EXISTS orders no row: (SELECT id FROM v), two rows, is never read
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
+             GROUP BY u.id ORDER BY (SELECT id FROM v)) ORDER BY id",
+            vec![1, 2],
+        ),
+    ] {
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, want, "{sql}");
+    }
 }
