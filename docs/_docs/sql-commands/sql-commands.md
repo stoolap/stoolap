@@ -915,6 +915,8 @@ plan
 ----
 Project id, name, email
   PkGet users id = 1
+  else IndexScan users (id = 1)
+    PkKey
 ```
 
 ### EXPLAIN ANALYZE

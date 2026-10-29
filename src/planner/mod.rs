@@ -40,6 +40,8 @@ pub struct Plan {
 pub enum Step {
     /// The LIMIT and OFFSET
     Limit,
+    /// The ORDER BY keeping only the rows the LIMIT keeps
+    TopN,
     /// The ORDER BY over every row
     Sort,
     Project,
@@ -55,10 +57,12 @@ pub enum Read {
     PkGet(PreparedComparison),
     /// A scan, through the indexes the choice reads
     Scan(Option<ScanChoice>),
-    /// The rows in ORDER BY order, or `otherwise` when the table declines
+    /// The rows in ORDER BY order. When the table declines the read, its
+    /// top-k scan; when that declines too, `otherwise` sorted by `sort`
     Ordered {
         read: OrderedRead,
         otherwise: Option<ScanChoice>,
+        sort: Step,
     },
 }
 
@@ -89,49 +93,105 @@ pub struct PlanText<'a> {
     pub table: &'a str,
     pub limit: Option<String>,
     pub offset: Option<String>,
-    pub sort: Option<String>,
+    /// The ORDER BY keys
+    pub keys: Option<String>,
     pub names: &'a [String],
     /// The conjuncts the read takes
     pub pushed: Option<&'a Expression>,
     /// The ORDER BY column and direction of an ordered read
     pub ordered: Option<(&'a str, bool)>,
+    /// The WHERE's constant terms, whose run reads no row unless they hold
+    pub empty_unless: Option<String>,
+    /// The read a run takes when a key read declines it
+    pub otherwise: Vec<String>,
 }
 
 impl Plan {
     /// The plan as EXPLAIN shows it: each step indented under the one it
-    /// feeds, the read last
+    /// feeds, then the read, a run's alternative reads each after `else`
     pub fn explain(&self, text: PlanText<'_>) -> Vec<String> {
         let mut lines = Vec::new();
         for step in &self.steps {
-            let line = match step {
-                Step::Limit => match (&text.limit, &text.offset) {
-                    (None, None) => continue,
-                    (Some(limit), None) => format!("Limit {limit}"),
-                    (None, Some(offset)) => format!("Offset {offset}"),
-                    (Some(limit), Some(offset)) => format!("Limit {limit} offset {offset}"),
-                },
-                Step::Sort => match &text.sort {
-                    Some(keys) => format!("Sort {keys}"),
-                    None => continue,
-                },
-                Step::Project => format!("Project {}", text.names.join(", ")),
-                Step::Filter => "Filter".to_string(),
+            let Some(line) = step_line(*step, &text) else {
+                continue;
             };
             lines.push(format!("{}{line}", "  ".repeat(lines.len())));
         }
-        let read = match (&self.read, text.ordered) {
-            (Read::PkGet(key), _) => vec![format!("PkGet {} {}", text.table, key.describe())],
-            (Read::Ordered { read, .. }, Some(column)) => {
-                vec![read.explain(text.table, column, text.pushed)]
-            }
-            (read, _) => read
-                .scan()
-                .map_or_else(Vec::new, |scan| scan.explain(text.table, text.pushed)),
+        let mut read = Vec::new();
+        let alternative = |read: &mut Vec<String>, line: String| match read.is_empty() {
+            true => read.push(line),
+            false => read.push(format!("else {line}")),
         };
+        if let Some(terms) = &text.empty_unless {
+            alternative(&mut read, format!("Empty unless {terms}"));
+        }
+        let scan = |scan: Option<&ScanChoice>| {
+            scan.map_or_else(Vec::new, |scan| scan.explain(text.table, text.pushed))
+        };
+        match (&self.read, text.ordered) {
+            (Read::PkGet(key), _) => {
+                alternative(
+                    &mut read,
+                    format!("PkGet {} {}", text.table, key.describe()),
+                );
+                for (at, line) in text.otherwise.iter().enumerate() {
+                    match at {
+                        0 => alternative(&mut read, line.clone()),
+                        _ => read.push(line.clone()),
+                    }
+                }
+            }
+            (
+                Read::Ordered {
+                    read: ordered,
+                    otherwise,
+                    sort,
+                },
+                Some(column),
+            ) => {
+                alternative(&mut read, ordered.explain(text.table, column, text.pushed));
+                if *ordered != OrderedRead::TopK {
+                    let top = OrderedRead::TopK.explain(text.table, column, text.pushed);
+                    alternative(&mut read, top);
+                }
+                if let Some(line) = step_line(*sort, &text) {
+                    alternative(&mut read, line);
+                }
+                read.extend(
+                    scan(otherwise.as_ref())
+                        .into_iter()
+                        .map(|l| format!("  {l}")),
+                );
+            }
+            (other, _) => {
+                for (at, line) in scan(other.scan()).into_iter().enumerate() {
+                    match at {
+                        0 => alternative(&mut read, line),
+                        _ => read.push(line),
+                    }
+                }
+            }
+        }
         let depth = "  ".repeat(lines.len());
         lines.extend(read.into_iter().map(|line| format!("{depth}{line}")));
         lines
     }
+}
+
+/// `step` as EXPLAIN shows it; None for a step the statement leaves empty
+fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
+    Some(match step {
+        Step::Limit => match (&text.limit, &text.offset) {
+            (None, None) => return None,
+            (Some(limit), None) => format!("Limit {limit}"),
+            (None, Some(offset)) => format!("Offset {offset}"),
+            (Some(limit), Some(offset)) => format!("Limit {limit} offset {offset}"),
+        },
+        Step::TopN => format!("TopN {}", text.keys.as_deref()?),
+        Step::Sort => format!("Sort {}", text.keys.as_deref()?),
+        Step::Project => format!("Project {}", text.names.join(", ")),
+        Step::Filter => "Filter".to_string(),
+    })
 }
 
 /// A single-table SELECT: its access, the WHERE over the rows it reads, the
@@ -149,16 +209,19 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
-    /// The plan as EXPLAIN shows it, outermost step first
-    pub fn explain(&self, table: &str) -> Vec<String> {
+    /// The plan as EXPLAIN shows it, outermost step first, with `otherwise`,
+    /// the read a run the key read declines takes
+    pub fn explain(&self, table: &str, otherwise: Vec<String>) -> Vec<String> {
         self.plan.explain(PlanText {
             table,
             limit: self.limit.map(|limit| limit.to_string()),
             offset: (self.offset > 0).then(|| self.offset.to_string()),
-            sort: None,
+            keys: None,
             names: &self.names,
             pushed: None,
             ordered: None,
+            empty_unless: None,
+            otherwise,
         })
     }
 }

@@ -40,6 +40,8 @@ use super::Executor;
 #[derive(Debug)]
 pub struct PlannedSelect {
     pub(crate) plan: SelectPlan,
+    /// The statement as the runner reads it, for a run the key read declines
+    pub(crate) prepared: Arc<PreparedSelect>,
     pub(crate) table: SmartString,
     schema: CompactArc<Schema>,
     token: LayoutToken,
@@ -79,9 +81,15 @@ impl Executor {
                 {
                     return None
                 }
+                // The runner reads a statement prepared for the tables as they are
+                CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
+                    return None
+                }
+                // One prepared for tables since changed is planned again
                 CompiledExecution::Unknown
                 | CompiledExecution::Planned(_)
-                | CompiledExecution::NotOptimizable(_) => {}
+                | CompiledExecution::NotOptimizable(_)
+                | CompiledExecution::PreparedSelect(_) => {}
                 _ => return None,
             }
         }
@@ -129,12 +137,13 @@ impl Executor {
         crate::test_failpoints::compile_schema_read();
         let scope = ts.alias.as_ref().map_or(table, |alias| &alias.value_lower);
         let param_count = ctx.params().len();
-        let prepared =
-            PreparedSelect::prepare(self, ctx, stmt, &schema, scope, param_count, epoch).ok();
+        let prepared = PreparedSelect::prepare(self, ctx, stmt, &schema, scope, param_count, epoch)
+            .ok()
+            .map(Arc::new);
         // A LIMIT or OFFSET read per run leaves the statement to the runner
         let plan = static_row_counts(stmt).and_then(|counts| {
             prepared
-                .as_ref()
+                .as_deref()
                 .and_then(PreparedSelect::plan_inputs)
                 .and_then(|inputs| plan_select(inputs, &schema, counts.offset, counts.limit))
         });
@@ -144,12 +153,13 @@ impl Executor {
             CompiledExecution::Unknown
                 | CompiledExecution::Planned(_)
                 | CompiledExecution::NotOptimizable(_)
+                | CompiledExecution::PreparedSelect(_)
         );
-        let Some(plan) = plan else {
+        let (Some(plan), Some(prepared)) = (plan, prepared.clone()) else {
             if open {
                 // A statement read by a scan runs on the runner
                 *slot = match prepared {
-                    Some(prepared) => CompiledExecution::PreparedSelect(Arc::new(prepared)),
+                    Some(prepared) => CompiledExecution::PreparedSelect(prepared),
                     None => CompiledExecution::NotOptimizable(validity),
                 };
             }
@@ -157,6 +167,7 @@ impl Executor {
         };
         let planned = Arc::new(PlannedSelect {
             plan,
+            prepared,
             table: table.clone(),
             schema,
             token,
@@ -178,8 +189,10 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         let slot = RwLock::new(CompiledExecution::Unknown);
-        if let Some(lines) = self.with_planned(stmt, &slot, Some(ctx), |p| p.plan.explain(&p.table))
-        {
+        // A run the key read declines reads as the runner's plan does
+        let key_read =
+            |p: &PlannedSelect| p.plan.explain(&p.table, p.prepared.explain_read(&p.table));
+        if let Some(lines) = self.with_planned(stmt, &slot, Some(ctx), key_read) {
             return Some(lines);
         }
         let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? else {
