@@ -533,9 +533,11 @@ impl<'a> Family<'a> {
                 return Err("a subquery block selecting *");
             }
         }
-        let statement = statement_form_block(sq, counts_rows, &self.executor.function_registry);
-        block_keys(sq, false, statement)?;
-        if statement {
+        let registry = &self.executor.function_registry;
+        if statement_order_holding_subquery(sq, counts_rows, registry) {
+            return Err("a subquery block's ORDER BY or DISTINCT ON key holding a subquery");
+        }
+        if statement_form_block(sq, counts_rows, registry) {
             return self.derived(sq);
         }
         let columns = || sq.columns.iter().map(unaliased);
@@ -555,9 +557,9 @@ impl<'a> Family<'a> {
     }
 
     /// A block's DISTINCT ON and ORDER BY keys, values over its row and the
-    /// enclosing ones, and no ORDER BY position (an EXISTS checks its own
-    /// where it is bound); `block_keys` checked the rest before the block's
-    /// path was chosen
+    /// enclosing ones: no ORDER BY position (an EXISTS checks its own where
+    /// it is bound) and no subquery in a key that chooses no row; one only a
+    /// statement reads (`statement_order`) runs as a statement block instead
     fn order(
         &self,
         sq: &'a SelectStatement,
@@ -568,6 +570,17 @@ impl<'a> Family<'a> {
             |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
         if !exists && sq.order_by.iter().any(position) {
             return Err("an ORDER BY position in a subquery block");
+        }
+        // Keys that choose no row are bound but never computed
+        let chooses =
+            !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
+        if !chooses
+            && sq
+                .order_by
+                .iter()
+                .any(|ob| mentions_subquery(&ob.expression))
+        {
+            return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
         }
         let mut found = false;
         let keys = sq
@@ -648,9 +661,11 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        let statement = statement_form_block(sq, false, &self.executor.function_registry);
-        block_keys(sq, true, statement)?;
-        if statement {
+        let registry = &self.executor.function_registry;
+        if statement_order_holding_subquery(sq, false, registry) {
+            return Err("a subquery block's ORDER BY or DISTINCT ON key holding a subquery");
+        }
+        if statement_form_block(sq, false, registry) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -751,62 +766,37 @@ fn statement_form_block(
     counts_rows: bool,
     registry: &FunctionRegistry,
 ) -> bool {
+    clause_block(sq, counts_rows) || statement_order(sq, registry)
+}
+
+/// A block a statement runs for its clauses: a windowed one, or one holding
+/// a set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a
+/// counted DISTINCT
+fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
         || !sq.set_operations.is_empty()
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
-        || statement_order(sq, registry)
 }
 
-/// What a block's ORDER BY and DISTINCT ON keys may hold on either path: no
-/// subquery in a key that chooses no row, which no answer reads but a run
-/// would compute; and on a statement block (`statement`) no subquery naming
-/// a SELECT alias, which its walk binds against the block's sources only
-fn block_keys(
+/// A block a statement would run only for its ORDER BY or DISTINCT ON, one
+/// of whose keys holds a subquery: a statement's walk binds that subquery
+/// against the block's sources alone, and computes a key that chooses no row
+fn statement_order_holding_subquery(
     sq: &SelectStatement,
-    exists: bool,
-    statement: bool,
-) -> std::result::Result<(), OutOfFamily> {
-    // Keys that choose no row are bound but never computed
-    let chooses =
-        !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
-    if !chooses
+    counts_rows: bool,
+    registry: &FunctionRegistry,
+) -> bool {
+    !clause_block(sq, counts_rows)
+        && statement_order(sq, registry)
         && sq
             .order_by
             .iter()
-            .any(|ob| mentions_subquery(&ob.expression))
-    {
-        return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
-    }
-    if !statement {
-        return Ok(());
-    }
-    let aliases: SmallVec<[&str; 4]> = sq
-        .columns
-        .iter()
-        .filter_map(|column| match column {
-            Expression::Aliased(item) => Some(item.alias.value_lower.as_str()),
-            _ => None,
-        })
-        .collect();
-    let mut nested = Vec::new();
-    for key in sq
-        .order_by
-        .iter()
-        .map(|ob| &ob.expression)
-        .chain(&sq.distinct_on)
-    {
-        nested_statements(key, &mut nested);
-    }
-    match nested
-        .iter()
-        .any(|inner| statement_names(inner, &|name| aliases.contains(&name)))
-    {
-        true => Err("a statement block's ORDER BY or DISTINCT ON subquery naming a SELECT alias"),
-        false => Ok(()),
-    }
+            .map(|ob| &ob.expression)
+            .chain(&sq.distinct_on)
+            .any(mentions_subquery)
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
@@ -9005,22 +8995,19 @@ fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<E
     combine_predicates_with_and(range).map(Box::new)
 }
 
-/// Whether a name in the clauses of `sq` passes `matches`, as `names_anywhere`
-fn statement_names(sq: &SelectStatement, matches: &impl Fn(&str) -> bool) -> bool {
-    sq.columns
-        .iter()
-        .chain(sq.where_clause.as_deref())
-        .chain(sq.having.as_deref())
-        .chain(&sq.group_by.columns)
-        .chain(sq.order_by.iter().map(|o| &o.expression))
-        .any(|e| names_anywhere(e, matches))
-}
-
 /// Whether a name anywhere in `expr`, its subqueries' clauses included, bare,
 /// as the part after a dotted name's last dot or as the column of a qualified
 /// name, passes `matches`
 fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
-    let statement = |sq: &SelectStatement| statement_names(sq, matches);
+    let statement = |sq: &SelectStatement| {
+        sq.columns
+            .iter()
+            .chain(sq.where_clause.as_deref())
+            .chain(sq.having.as_deref())
+            .chain(&sq.group_by.columns)
+            .chain(sq.order_by.iter().map(|o| &o.expression))
+            .any(|e| names_anywhere(e, matches))
+    };
     match expr {
         Expression::Identifier(id) => {
             matches(&id.value_lower)

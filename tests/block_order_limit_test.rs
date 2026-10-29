@@ -662,6 +662,12 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
              LIMIT 1 + 0) ORDER BY id",
             vec![2],
         ),
+        // The inner DISTINCT ON reads u.z, the alias, not a column of u
+        (
+            "SELECT id FROM t WHERE a IN (SELECT x AS z FROM u \
+             ORDER BY (SELECT DISTINCT ON (u.z) u.x) DESC LIMIT 1 + 0) ORDER BY id",
+            vec![2],
+        ),
         // An EXISTS orders no row: (SELECT id FROM v), two rows, is never read
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \

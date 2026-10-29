@@ -676,13 +676,6 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT id FROM t WHERE a IN (3)",
         Prepared,
     ),
-    (
-        "in_block_with_distinct_on_a_computed_key",
-        "SELECT id FROM t WHERE a IN (SELECT DISTINCT ON (x + (SELECT 0)) x FROM u \
-         ORDER BY x + (SELECT 0))",
-        "SELECT id FROM t WHERE a IN (1, 2, 3)",
-        Prepared,
-    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
