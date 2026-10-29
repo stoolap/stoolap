@@ -1311,6 +1311,40 @@ impl QueryResult for TopNResult {
     }
 }
 
+/// The paths that answer a DISTINCT
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DistinctPath {
+    /// `DistinctResult` over the statement's rows
+    Rows,
+    /// The distinct values the table keeps for the one column
+    Values,
+    /// The runner keeping each new row as its scan reads it, for an output
+    /// that asks a block
+    Scan,
+}
+
+impl DistinctPath {
+    #[inline]
+    pub(crate) fn taken(self) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::distinct_path_taken(self as usize);
+    }
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl DistinctPath {
+    pub(crate) const ALL: [DistinctPath; 3] =
+        [DistinctPath::Rows, DistinctPath::Values, DistinctPath::Scan];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            DistinctPath::Rows => "rows",
+            DistinctPath::Values => "values",
+            DistinctPath::Scan => "scan",
+        }
+    }
+}
+
 /// The rows a DISTINCT has passed, by the values of their first columns: the
 /// one rule of which rows DISTINCT keeps, the first of each in the order read
 pub(crate) struct DistinctRows {
@@ -1395,6 +1429,7 @@ impl DistinctResult {
     pub fn with_column_count(inner: Box<dyn QueryResult>, distinct_columns: Option<usize>) -> Self {
         let columns = inner.columns().to_vec();
         let distinct_column_count = distinct_columns.unwrap_or(columns.len());
+        DistinctPath::Rows.taken();
 
         Self {
             inner,

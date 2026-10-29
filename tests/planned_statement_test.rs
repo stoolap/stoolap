@@ -347,6 +347,62 @@ fn explain_names_each_read_a_run_may_take() {
             ],
         ),
         (
+            "SELECT DISTINCT v FROM t",
+            vec![
+                "Distinct",
+                "  Project v",
+                "    DistinctValues t (v)",
+                "    else SeqScan t",
+            ],
+        ),
+        (
+            "SELECT DISTINCT v FROM t WHERE v > 1 ORDER BY v LIMIT 1",
+            vec![
+                "Limit 1",
+                "  TopN v ASC",
+                "    Distinct",
+                "      Project v",
+                "        SeqScan t (v > 1)",
+            ],
+        ),
+        (
+            "SELECT DISTINCT ON (v) id, v FROM t ORDER BY v, id",
+            vec![
+                "DistinctOn v",
+                "  Sort v ASC, id ASC",
+                "    Project id, v",
+                "      SeqScan t",
+            ],
+        ),
+        (
+            "SELECT id FROM t WHERE v > 1 UNION ALL SELECT id FROM t ORDER BY id LIMIT 2",
+            vec![
+                "Limit 2",
+                "  TopN id ASC",
+                "    UNION ALL",
+                "      Project id",
+                "        SeqScan t (v > 1)",
+                "      SELECT",
+                "        Columns: id",
+                "        -> Seq Scan on t",
+            ],
+        ),
+        (
+            "SELECT id FROM t EXCEPT SELECT v FROM t INTERSECT SELECT id FROM t",
+            vec![
+                "EXCEPT",
+                "  Project id",
+                "    SeqScan t",
+                "  SELECT",
+                "    Columns: v",
+                "    -> Seq Scan on t",
+                "    INTERSECT",
+                "      SELECT",
+                "        Columns: id",
+                "        -> Seq Scan on t",
+            ],
+        ),
+        (
             "SELECT id FROM t WHERE 1 = 0 AND v > 1",
             vec![
                 "Project id",

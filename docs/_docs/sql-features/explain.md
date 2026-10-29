@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT, set operations, a WHERE or select list with a subquery, an aggregate with a WHERE, or one its table's stats cannot answer, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, GROUP BY, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate with a WHERE, or one its table's stats cannot answer, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -297,6 +297,60 @@ Project id, name, category, value
     Index idx_value (value range)
 ```
 
+A DISTINCT is taken over the projected rows, before the ORDER BY. A DISTINCT of one column with no WHERE reads the distinct values the table keeps for that column in its index or its volumes, and scans when it keeps none, or when the transaction running it has written to the table:
+
+```sql
+EXPLAIN SELECT DISTINCT category FROM products;
+```
+
+Output:
+```
+plan
+----
+Distinct
+  Project category
+    DistinctValues products (category)
+    else SeqScan products
+```
+
+A DISTINCT ON keeps the first row of each key once the rows are sorted:
+
+```sql
+EXPLAIN SELECT DISTINCT ON (category) category, name FROM products ORDER BY category, value DESC;
+```
+
+Output:
+```
+plan
+----
+DistinctOn category
+  Sort category ASC, value DESC
+    Project category, name
+      SeqScan products
+```
+
+A set operation over a table shows its first branch's plan and, beside it, each other branch as EXPLAIN shows that statement on its own. The ORDER BY and LIMIT above it are the whole statement's:
+
+```sql
+EXPLAIN SELECT name FROM products WHERE value > 15
+UNION SELECT category FROM products ORDER BY name LIMIT 5;
+```
+
+Output:
+```
+plan
+----
+Limit 5
+  TopN name ASC
+    UNION
+      Project name
+        IndexScan products (value > 15)
+          Index idx_value (value range)
+      SELECT
+        Columns: category
+        -> Seq Scan on products
+```
+
 ## EXPLAIN ANALYZE
 
 Executes the query and shows actual runtime statistics.
@@ -352,6 +406,7 @@ For a planned single-table SELECT:
 | PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
 | Intersect, Union | The rows every index under it names, or any of them names |
 | IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row |
+| DistinctValues | The distinct values the table keeps for one column, for a DISTINCT of that column with no WHERE |
 | Derived, View, Cte | The rows of a derived table, a view or a CTE, each judged by the condition after its name; the plan of its query is under it |
 | Values, Function | The rows of a VALUES list or a table function, each judged by the condition after its name |
 | OneRow | The one row a SELECT without FROM reads |
@@ -362,6 +417,9 @@ For a planned single-table SELECT:
 | else | The read a run takes when the table cannot answer the line above it |
 | Filter | The part of the WHERE judged after the scan |
 | Project | The output columns |
+| Distinct | The first row of each output value |
+| DistinctOn | The first row of each DISTINCT ON key, over the sorted rows |
+| UNION, UNION ALL, INTERSECT, EXCEPT | A set operation over its first branch's rows and each other branch's |
 | TopN | The ORDER BY under a LIMIT, keeping only the rows the LIMIT keeps |
 | Sort | The ORDER BY over every row |
 | Limit | The LIMIT and OFFSET |
