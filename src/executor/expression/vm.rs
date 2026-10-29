@@ -442,6 +442,12 @@ pub trait SubqueryExecutor {
         &[]
     }
 
+    /// The error of a named window's slot that failed to compute in this
+    /// run, which its window raises once it runs over a row
+    fn window_failure(&self) -> Option<&Error> {
+        None
+    }
+
     /// `program` with every block it tests members of read once and tested
     /// as that set in place; None when it calls a block another way
     fn bind_members(&self, _program: &CompactArc<Program>) -> Option<CompactArc<Program>> {

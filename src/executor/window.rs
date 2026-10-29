@@ -912,6 +912,12 @@ impl Executor {
         pre_grouped: Option<WindowPreGroupedState>,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
+        // A window over a row reads its named window's parts
+        if let Some(e) = blocks.and_then(|b| b.window_failure()) {
+            if !base_rows.is_empty() {
+                return Err(e.clone());
+            }
+        }
         // A window function in ORDER BY that the select list does not carry
         // is computed into a column of its own, named after it, which the
         // sort reads and the projection then drops. It goes in before the
@@ -2166,6 +2172,52 @@ impl Executor {
         Ok(window_functions)
     }
 
+    /// The named windows of `stmt` as its windows read them: the parts an
+    /// OVER resolves to, the others emptied, and a window no OVER names left out
+    pub(crate) fn used_window_defs(stmt: &SelectStatement) -> Vec<WindowDefinition> {
+        if stmt.window_defs.is_empty() {
+            return Vec::new();
+        }
+        let mut windows = Vec::new();
+        let read = stmt
+            .columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on);
+        for expr in read {
+            Self::collect_all_windows_in_expression(expr, &mut windows);
+        }
+        // Whether each definition is named, and its ORDER BY and frame read
+        let mut used = vec![(false, false, false); stmt.window_defs.len()];
+        for window in windows {
+            let (Some((at, def)), Some((_, order_by, frame))) = (
+                window.named(&stmt.window_defs),
+                window.resolved(&stmt.window_defs),
+            ) else {
+                continue;
+            };
+            let read = &mut used[at];
+            read.0 = true;
+            read.1 |= std::ptr::eq(order_by, def.order_by.as_slice());
+            read.2 |= frame.is_some_and(|f| def.frame.as_ref().is_some_and(|d| std::ptr::eq(f, d)));
+        }
+        stmt.window_defs
+            .iter()
+            .zip(used)
+            .filter(|(_, (named, ..))| *named)
+            .map(|(def, (_, order_by, frame))| WindowDefinition {
+                name: def.name.clone(),
+                partition_by: def.partition_by.clone(),
+                order_by: if order_by {
+                    def.order_by.clone()
+                } else {
+                    Vec::new()
+                },
+                frame: def.frame.clone().filter(|_| frame),
+            })
+            .collect()
+    }
+
     /// Recursively find a window expression inside an expression
     /// Returns the first Window expression found, if any
     /// Collect all window expressions found anywhere in an expression tree (depth-first order).
@@ -2418,32 +2470,17 @@ impl Executor {
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
 
-        // Resolve named window reference if present
-        let (partition_by_exprs, order_by, frame) = if let Some(ref win_ref) =
-            window_expr.window_ref
-        {
-            // Look up the named window definition
-            let win_def = window_defs
-                .iter()
-                .find(|wd| wd.name.eq_ignore_ascii_case(win_ref))
-                .ok_or_else(|| Error::NotSupported(format!("Unknown window name: {}", win_ref)))?;
-            // OVER (w ...) adds its own ORDER BY, where the named window
-            // has none, and its own frame on top of the named window
-            (
-                win_def.partition_by.clone(),
-                if window_expr.order_by.is_empty() {
-                    win_def.order_by.clone()
-                } else {
-                    window_expr.order_by.clone()
-                },
-                window_expr.frame.clone().or_else(|| win_def.frame.clone()),
-            )
-        } else {
-            (
-                window_expr.partition_by.clone(),
-                window_expr.order_by.clone(),
-                window_expr.frame.clone(),
-            )
+        let (partition_by_exprs, order_by, frame) = match window_expr.resolved(window_defs) {
+            Some((partition_by, order_by, frame)) => {
+                (partition_by.to_vec(), order_by.to_vec(), frame.cloned())
+            }
+            None => {
+                let name = window_expr.window_ref.as_deref().unwrap_or_default();
+                return Err(Error::NotSupported(format!(
+                    "Unknown window name: {}",
+                    name
+                )));
+            }
         };
 
         // Extract partition by column names (identifiers only, for fast-path)

@@ -322,6 +322,28 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "named_window_select",
+        "SELECT id, ROW_NUMBER() OVER w, (SELECT COUNT(*) FROM u WHERE u.id = t.a) \
+         FROM t WINDOW w AS (ORDER BY id)",
+        "SELECT id, ROW_NUMBER() OVER w, CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END \
+         FROM t WINDOW w AS (ORDER BY id)",
+        Prepared,
+    ),
+    (
+        "named_window_key",
+        "SELECT id, SUM(b) OVER w FROM t WINDOW w AS (PARTITION BY a > (SELECT MIN(x) FROM u))",
+        "SELECT id, SUM(b) OVER w FROM t WINDOW w AS (PARTITION BY a > 1)",
+        Prepared,
+    ),
+    (
+        "named_window_having",
+        "SELECT a, SUM(b), RANK() OVER w FROM t GROUP BY a \
+         HAVING SUM(b) > (SELECT MAX(x) FROM u) * 20 WINDOW w AS (ORDER BY a)",
+        "SELECT a, SUM(b), RANK() OVER w FROM t GROUP BY a HAVING SUM(b) > 60 \
+         WINDOW w AS (ORDER BY a)",
+        Prepared,
+    ),
+    (
         "grouped_order_by",
         "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY (SELECT COUNT(*) FROM u WHERE u.id = t.a), a",
         "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END, a",

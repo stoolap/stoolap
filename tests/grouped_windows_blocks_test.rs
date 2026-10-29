@@ -253,6 +253,49 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT DISTINCT ON (RANK() OVER (ORDER BY t.a) % 2) t.a FROM t GROUP BY t.a \
              ORDER BY t.a",
         ),
+        // Named windows
+        shape(
+            "SELECT t.id, SUM(t.b) OVER w, (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM {t} \
+             WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER w, {count} FROM t \
+             WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b + (SELECT MAX(u.x) FROM u)) OVER (w ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) FROM {t} WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b + 6) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t \
+             WINDOW w AS (PARTITION BY t.a ORDER BY t.id) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER w FROM {t} \
+             WINDOW w AS (PARTITION BY t.a > (SELECT MIN(u.x) FROM u) + 3) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER w FROM t WINDOW w AS (PARTITION BY t.a > 3) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER w FROM {t} \
+             WINDOW w AS (ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), t.id) ORDER BY t.id",
+            "SELECT t.id, ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY {count}, t.id) \
+             ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER w FROM {t} WINDOW w AS (ORDER BY t.id \
+             ROWS BETWEEN (SELECT MIN(u.x) FROM u) + 1 PRECEDING AND CURRENT ROW) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER w FROM t WINDOW w AS (ORDER BY t.id \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.a, SUM(t.b), RANK() OVER w FROM {t} GROUP BY t.a \
+             HAVING SUM(t.b) > (SELECT MAX(u.x) FROM u) * 25 WINDOW w AS (ORDER BY SUM(t.b)) \
+             ORDER BY t.a",
+            "SELECT t.a, SUM(t.b), RANK() OVER w FROM t GROUP BY t.a HAVING SUM(t.b) > 150 \
+             WINDOW w AS (ORDER BY SUM(t.b)) ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.a, COUNT(*) OVER w, (SELECT MAX(u.x) FROM u) FROM {t} GROUP BY t.a \
+             WINDOW w AS (ORDER BY t.a + (SELECT MIN(u.x) FROM u)) ORDER BY t.a",
+            "SELECT t.a, COUNT(*) OVER w, 6 FROM t GROUP BY t.a WINDOW w AS (ORDER BY t.a) \
+             ORDER BY t.a",
+        ),
     ]
 }
 
@@ -492,5 +535,103 @@ fn an_item_holding_a_subquery_keeps_the_name_it_is_written_under() {
         ),
     ] {
         assert_eq!(db.query(sql, ()).unwrap().columns(), names, "{sql}");
+    }
+}
+
+#[test]
+fn a_part_of_a_named_window_no_over_reads_is_never_read() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_unread").unwrap();
+    fill(&db);
+    // (SELECT u.x FROM u) gives many rows: reading it is an error
+    for (sql, twin) in [
+        (
+            "SELECT COUNT(*), (SELECT MAX(u.x) FROM u) FROM t \
+             WINDOW w AS (ORDER BY (SELECT u.x FROM u))",
+            "SELECT COUNT(*), (SELECT MAX(u.x) FROM u) FROM t",
+        ),
+        (
+            "SELECT t.id, SUM(t.b) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             (SELECT MAX(u.x) FROM u) FROM t WINDOW w AS (ORDER BY t.id \
+             ROWS BETWEEN (SELECT u.x FROM u) PRECEDING AND CURRENT ROW) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             (SELECT MAX(u.x) FROM u) FROM t ORDER BY t.id",
+        ),
+        (
+            "SELECT t.id, SUM(t.b) OVER (w ORDER BY t.id), (SELECT MAX(u.x) FROM u) FROM t \
+             WINDOW w AS (PARTITION BY t.a ORDER BY (SELECT u.x FROM u)) ORDER BY t.id",
+            "SELECT t.id, SUM(t.b) OVER (PARTITION BY t.a ORDER BY t.id), \
+             (SELECT MAX(u.x) FROM u) FROM t ORDER BY t.id",
+        ),
+    ] {
+        let want = rows(&db, twin).unwrap_or_else(|e| panic!("{twin}: {e}"));
+        assert_eq!(rows(&db, sql), Ok(want), "{sql}");
+    }
+}
+
+#[test]
+fn a_statement_differing_only_in_the_window_its_over_names_classifies_alone() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_named_key").unwrap();
+    fill(&db);
+    let window = "WINDOW w AS (ORDER BY t.id ROWS BETWEEN (SELECT 1) PRECEDING AND CURRENT ROW)";
+    let unread = format!("SELECT t.id, SUM(t.b) OVER () FROM t {window} ORDER BY t.id");
+    let read = format!("SELECT t.id, SUM(t.b) OVER w FROM t {window} ORDER BY t.id");
+    let twin =
+        "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                FROM t ORDER BY t.id";
+    assert!(rows(&db, &unread).is_ok(), "{unread}");
+    assert_eq!(rows(&db, &read), rows(&db, twin), "{read}");
+}
+
+#[test]
+fn a_named_window_over_no_row_reads_none_of_its_parts() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_named_empty").unwrap();
+    fill(&db);
+    // (SELECT u.x FROM u) gives many rows: reading it is an error
+    for sql in [
+        "SELECT t.id, SUM(t.b) OVER w FROM t WHERE t.id < 0 \
+         WINDOW w AS (ORDER BY t.id ROWS BETWEEN (SELECT u.x FROM u) PRECEDING AND CURRENT ROW)",
+        "SELECT t.id, SUM(t.b) OVER w FROM t WHERE t.id < 0 \
+         WINDOW w AS (PARTITION BY t.a > (SELECT u.x FROM u))",
+    ] {
+        assert_eq!(rows(&db, sql), Ok(Vec::new()), "{sql}");
+    }
+}
+
+#[test]
+fn a_named_window_over_rows_raises_its_parts_errors() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_named_raise").unwrap();
+    fill(&db);
+    // (SELECT u.x FROM u) gives many rows: reading it is an error
+    let over_rows = |def: &str| {
+        (
+            format!("SELECT t.id, SUM(t.b) OVER w FROM t WINDOW w AS ({def})"),
+            format!("SELECT t.id, SUM(t.b) OVER ({def}) FROM t"),
+        )
+    };
+    // An aggregate's input is read as the rows group, before HAVING
+    let aggregate = "ORDER BY SUM((SELECT u.x FROM u))";
+    for (sql, twin) in [
+        over_rows("PARTITION BY (SELECT u.x FROM u)"),
+        over_rows(
+            "ORDER BY t.id ROWS BETWEEN COALESCE((SELECT u.x FROM u), 0) PRECEDING \
+             AND CURRENT ROW",
+        ),
+        (
+            format!(
+                "SELECT t.a, RANK() OVER w FROM t GROUP BY t.a HAVING COUNT(*) = 0 \
+                 WINDOW w AS ({aggregate})"
+            ),
+            format!(
+                "SELECT t.a, RANK() OVER ({aggregate}) FROM t GROUP BY t.a HAVING COUNT(*) = 0"
+            ),
+        ),
+    ] {
+        let got = rows(&db, &sql);
+        assert!(got.is_err(), "{sql}: {got:?}");
+        assert_eq!(got, rows(&db, &twin), "{sql}");
     }
 }

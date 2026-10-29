@@ -380,6 +380,8 @@ FROM employees
 WINDOW w AS (PARTITION BY dept ORDER BY salary DESC);
 ```
 
+A named window holds anything the same window written in `OVER (...)` holds, subqueries included, and a query using it answers as that query written out.
+
 ## Notes
 
 - When ORDER BY is omitted, the entire partition is treated as a single group

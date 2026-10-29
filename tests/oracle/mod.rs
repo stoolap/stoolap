@@ -146,8 +146,35 @@ fn top_level(sql: &str, keyword: &str) -> Option<usize> {
     None
 }
 
-/// `sql` with an unused named window, which no prepared family takes: the
-/// general path answers it for as long as it lives
+/// What `run`, reading the `general_twin` of `sql` under its file's lock,
+/// gives with the prepared families and their plans refused; it fails unless
+/// a general path mechanism ran, so a recorded answer is confirmed by another
+/// path than the one that gave it
+#[cfg(feature = "test-failpoints")]
+pub fn on_general_path<T>(sql: &str, run: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering::Relaxed;
+    use stoolap::test_failpoints::{general_path_total, PREPARED_FAMILIES_OFF};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREPARED_FAMILIES_OFF.store(false, Relaxed);
+        }
+    }
+    let before = general_path_total();
+    PREPARED_FAMILIES_OFF.store(true, Relaxed);
+    let given = {
+        let _restore = Restore;
+        run()
+    };
+    assert!(
+        general_path_total() > before,
+        "{sql}: the reference ran no general path mechanism"
+    );
+    given
+}
+
+/// `sql` with an unused named window, which no prepared plan the statement
+/// already holds answers; `on_general_path` keeps the families off it
 pub fn general_twin(sql: &str) -> String {
     let at = [" ORDER BY ", " LIMIT ", " OFFSET "]
         .iter()

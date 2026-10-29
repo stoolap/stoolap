@@ -446,9 +446,6 @@ impl<'a> Family<'a> {
                     Site::GroupedList => Site::GroupedOutput,
                     _ => return Err("a window function outside the SELECT list"),
                 };
-                if window.window_ref.is_some() {
-                    return Err("a named window");
-                }
                 // NTILE's argument, the ones after a call's first and the frame
                 // offsets are read once for the call: a subquery there runs once
                 let call = &window.function;
@@ -463,27 +460,44 @@ impl<'a> Family<'a> {
                     .filter
                     .as_deref()
                     .into_iter()
-                    .chain(call.order_by.iter().map(|o| &o.expression))
-                    .chain(&window.partition_by)
-                    .chain(window.order_by.iter().map(|o| &o.expression));
+                    .chain(call.order_by.iter().map(|o| &o.expression));
                 for expr in read {
                     self.expression(expr, scopes, inner, found)?;
                 }
-                let bounds = window
-                    .frame
-                    .iter()
-                    .flat_map(|frame| std::iter::once(&frame.start).chain(&frame.end));
-                for bound in bounds {
-                    if let WindowFrameBound::Preceding(offset)
-                    | WindowFrameBound::Following(offset) = bound
-                    {
-                        self.expression(offset, scopes, Site::Subqueries, found)?;
-                    }
-                }
-                Ok(())
+                let over = (
+                    &window.partition_by[..],
+                    &window.order_by[..],
+                    &window.frame,
+                );
+                self.window(over, scopes, inner, found)
             }
             _ => Err("an expression form outside the family"),
         }
+    }
+
+    /// A window's PARTITION BY and ORDER BY keys, read at `inner`, and its
+    /// frame offsets, read once for the call
+    fn window(
+        &self,
+        (partition_by, order_by, frame): (
+            &'a [Expression],
+            &'a [OrderByExpression],
+            &'a Option<WindowFrame>,
+        ),
+        scopes: usize,
+        inner: Site,
+        found: &mut bool,
+    ) -> std::result::Result<(), OutOfFamily> {
+        for expr in partition_by
+            .iter()
+            .chain(order_by.iter().map(|o| &o.expression))
+        {
+            self.expression(expr, scopes, inner, found)?;
+        }
+        for offset in frame.iter().flat_map(WindowFrame::offsets) {
+            self.expression(offset, scopes, Site::Subqueries, found)?;
+        }
+        Ok(())
     }
 
     /// One subquery block whose chain holds `scopes` scopes, selecting the
@@ -893,6 +907,10 @@ impl Executor {
         ctx: Option<&ExecutionContext>,
         needs_subquery: bool,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
@@ -993,11 +1011,12 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
-        }
-        if !stmt.window_defs.is_empty() {
-            return Err("a named window");
         }
         // A set operation's branch carries no DISTINCT ON key as a column
         if !stmt.set_operations.is_empty() && stmt.distinct_on.iter().any(mentions_subquery) {
@@ -1050,6 +1069,7 @@ impl Executor {
         // A GROUP BY item naming a SELECT alias or position groups that item
         self.parse_group_by(stmt, &[])
             .map_err(|_| "a GROUP BY position outside the SELECT list")?;
+        let windows = Executor::used_window_defs(stmt);
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
@@ -1065,6 +1085,16 @@ impl Executor {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 family.expression(unaliased(column), 1, list, &mut found)?;
             }
+        }
+        // A named window's keys are read as an OVER's own
+        let over = if grouped {
+            Site::GroupedOutput
+        } else {
+            Site::Subqueries
+        };
+        for def in &windows {
+            let window = (&def.partition_by[..], &def.order_by[..], &def.frame);
+            family.window(window, 1, over, &mut found)?;
         }
         if let Some(having) = stmt.having.as_deref() {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
@@ -2904,6 +2934,9 @@ struct PreparedBlocks {
     run_slots: Vec<(usize, SharedProgram)>,
     /// The run slots whose error is raised where a row reads the slot
     where_slots: Vec<usize>,
+    /// The run slots a named window's parts hold, whose error the window
+    /// raises once it runs over a row
+    window_slots: Vec<usize>,
     /// Indexed by subquery id, nested ones included
     subqueries: Vec<PreparedSubquery>,
 }
@@ -4368,6 +4401,7 @@ impl Builder<'_> {
             slot_count: self.next_slot,
             run_slots,
             where_slots: self.where_slots,
+            window_slots: Vec::new(),
             subqueries,
         };
         Ok((blocks, holes))
@@ -7072,18 +7106,32 @@ impl PreparedGrouped {
         // above, and so is every item of rows that do not group; any other
         // for each group
         let groups = grouped_block(stmt);
-        let mut output = |expr: &Expression, key: Option<&Expression>| -> Result<Expression> {
-            if let Some(rewritten) = key {
-                return Ok(rewritten.clone());
-            }
-            if !groups {
-                return input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr);
-            }
-            let read = read_inputs(expr, &items, &mut |call| {
-                input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
-            })?;
-            rewrite(&mut builder, &chain, &mut run_slots, &read)
-        };
+        // `window`: the run slots the window reads first are a named
+        // window's, which raise their error once it runs over a row; an
+        // aggregate's input slots are read as the rows group
+        let mut window_slots = Vec::new();
+        let mut output =
+            |expr: &Expression, key: Option<&Expression>, window: bool| -> Result<Expression> {
+                if let Some(rewritten) = key {
+                    return Ok(rewritten.clone());
+                }
+                let (first, rewritten) = if !groups {
+                    let first = run_slots.len();
+                    let rewritten =
+                        input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?;
+                    (first, rewritten)
+                } else {
+                    let read = read_inputs(expr, &items, &mut |call| {
+                        input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
+                    })?;
+                    let first = run_slots.len();
+                    (first, rewrite(&mut builder, &chain, &mut run_slots, &read)?)
+                };
+                if window {
+                    window_slots.extend(run_slots[first..].iter().map(|(slot, _)| *slot));
+                }
+                Ok(rewritten)
+            };
         // An item holding a subquery keeps the name it is written under
         let mut columns = Vec::with_capacity(stmt.columns.len());
         for (column, key) in stmt.columns.iter().zip(&grouped) {
@@ -7092,14 +7140,14 @@ impl PreparedGrouped {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
-                    expression: Box::new(output(&aliased.expression, key)?),
+                    expression: Box::new(output(&aliased.expression, key, false)?),
                     alias: aliased.alias.clone(),
                 }),
                 column => {
                     let name = item_name(column);
                     Expression::Aliased(AliasedExpression {
                         token: Token::new(TokenType::Identifier, &name, Position::default()),
-                        expression: Box::new(output(column, key)?),
+                        expression: Box::new(output(column, key, false)?),
                         alias: Identifier::new(
                             Token::new(TokenType::Identifier, &name, Position::default()),
                             &name,
@@ -7109,7 +7157,7 @@ impl PreparedGrouped {
             });
         }
         let having = match (&opened_having, stmt.having.as_deref()) {
-            (Some(opened), _) => Some(Box::new(output(opened, None)?)),
+            (Some(opened), _) => Some(Box::new(output(opened, None, false)?)),
             (None, other) => other.map(|having| Box::new(having.clone())),
         };
         // An ORDER BY key holding a subquery is computed for each group into a
@@ -7131,11 +7179,24 @@ impl PreparedGrouped {
             {
                 columns.push(Expression::Aliased(AliasedExpression {
                     token,
-                    expression: Box::new(output(&ob.expression, None)?),
+                    expression: Box::new(output(&ob.expression, None, false)?),
                     alias: column.clone(),
                 }));
             }
             ob.expression = Expression::Identifier(column);
+        }
+        // A named window's keys and frame offsets an OVER reads are rewritten
+        // as an OVER's own; the parts none reads are left out
+        let mut window_defs = Executor::used_window_defs(stmt);
+        for def in &mut window_defs {
+            let keys = def
+                .partition_by
+                .iter_mut()
+                .chain(def.order_by.iter_mut().map(|ob| &mut ob.expression))
+                .chain(def.frame.iter_mut().flat_map(WindowFrame::offsets_mut));
+            for expr in keys.filter(|expr| mentions_subquery(expr)) {
+                *expr = output(expr, None, true)?;
+            }
         }
         let blocks_read = builder.subqueries.len();
         let values = CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
@@ -7154,7 +7215,8 @@ impl PreparedGrouped {
             .as_ref()
             .map(|parts| parts.programs(|expr| compile_with(&own, expr)))
             .transpose()?;
-        let (blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
+        let (mut blocks, mut row_holes) = builder.finish(param_count, run_slots)?;
+        blocks.window_slots = window_slots;
         // The statement the grouped run reads names its columns again
         let where_clause = where_parts
             .as_ref()
@@ -7240,6 +7302,7 @@ impl PreparedGrouped {
                 .map(Box::new)
                 .or_else(|| stmt.where_clause.clone()),
             order_by,
+            window_defs,
             ..stmt.clone()
         };
         // A set operation's first branch: the whole one reads the rest
@@ -7473,6 +7536,10 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return false;
+        }
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| match &*guard {
@@ -8266,6 +8333,10 @@ impl Executor {
         &self,
         clause: &Expression,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
@@ -9640,6 +9711,10 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return false;
+        }
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| {
@@ -10693,6 +10768,9 @@ pub(crate) struct PreparedRunner<'a> {
     /// The WHERE's run slots whose value failed, NULL in `base`; boxed, as
     /// a run seldom has one
     failed_slots: Option<Box<FailedSlots>>,
+    /// The first error of a named window's run slots, which the window
+    /// raises once it runs over a row
+    window_failure: Option<Box<Error>>,
     transaction_id: Option<u64>,
     /// The context the subqueries read their tables under
     ctx: ExecutionContext,
@@ -10908,6 +10986,7 @@ impl<'a> PreparedRunner<'a> {
                 .collect(),
             base,
             failed_slots: None,
+            window_failure: None,
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
@@ -10941,7 +11020,9 @@ impl<'a> PreparedRunner<'a> {
                 .with_subquery_executor(self);
             for (slot, program) in &self.prepared.run_slots {
                 let value = vm.execute(program, &exec);
-                let raised = value.is_err() && !self.prepared.where_slots.contains(slot);
+                let raised = value.is_err()
+                    && !self.prepared.where_slots.contains(slot)
+                    && !self.prepared.window_slots.contains(slot);
                 computed.push((*slot, value));
                 if raised {
                     break;
@@ -10954,6 +11035,10 @@ impl<'a> PreparedRunner<'a> {
                 Err(e) if self.prepared.where_slots.contains(&slot) => {
                     let e = deferred(e)?;
                     self.failed_slots.get_or_insert_default().push((slot, e));
+                }
+                Err(e) if self.prepared.window_slots.contains(&slot) => {
+                    let e = deferred(e)?;
+                    self.window_failure.get_or_insert_with(|| Box::new(e));
                 }
                 Err(e) => return Err(e),
             }
@@ -12118,6 +12203,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         self.slot_failures()
     }
 
+    fn window_failure(&self) -> Option<&Error> {
+        self.window_failure.as_deref()
+    }
+
     fn bind_members(&self, program: &SharedProgram) -> Option<SharedProgram> {
         self.bound_program(program)
     }
@@ -12190,6 +12279,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
 
     fn failed_slots(&self) -> &[(usize, Error)] {
         self.runner.slot_failures()
+    }
+
+    fn window_failure(&self) -> Option<&Error> {
+        self.runner.window_failure.as_deref()
     }
 }
 

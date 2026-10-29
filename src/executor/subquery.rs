@@ -252,7 +252,13 @@ impl Executor {
                             None
                         };
                         let values_arc = match cached_set {
-                            Some(arc) => arc,
+                            Some(arc) => {
+                                #[cfg(feature = "test-failpoints")]
+                                crate::test_failpoints::general_path_reached(
+                                    crate::test_failpoints::GeneralPath::InSubquery,
+                                );
+                                arc
+                            }
                             None => {
                                 let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
                                 let members = CompactArc::new(values.into_iter().collect());

@@ -5354,6 +5354,10 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<std::sync::Arc<PreparedJoin>> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return None;
+        }
         let epoch = self.engine.schema_epoch();
         let current = |guard: &CompiledExecution| match guard {
             CompiledExecution::PreparedJoin(held)
@@ -5510,6 +5514,10 @@ impl Executor {
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         sides: Option<&JoinSides>,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("a test refusing the prepared families");
+        }
         let Some(sides @ [left, right]) = sides else {
             return Err("a side read with AS OF or not named before it is read");
         };
