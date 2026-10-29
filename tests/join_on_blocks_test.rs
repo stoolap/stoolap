@@ -690,7 +690,13 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
     let selects = [
         (format!("SELECT 0, 0 UNION ALL {join}"), vec![yes]),
         (format!("{join} UNION ALL SELECT 0, 0"), vec![yes]),
-        (format!("SELECT d.id, d.k FROM ({join}) d"), vec![outside]),
+        (format!("SELECT d.id, d.k FROM ({join}) d"), vec![yes]),
+        (
+            format!(
+                "SELECT COUNT(*) OVER w, (SELECT MIN(id) FROM s) FROM ({join}) d WINDOW w AS ()"
+            ),
+            vec!["Prepared: no (a named window)", outside],
+        ),
         (
             format!("SELECT d.id, d.k FROM ({join}) d WHERE d.id > (SELECT MIN(id) FROM s)"),
             vec![yes, yes],
@@ -714,7 +720,7 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
                 "SELECT l.id, d.k FROM l JOIN ({join}) d ON d.id = l.id JOIN r ON r.id = l.id \
                  WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)"
             ),
-            vec![yes, outside],
+            vec![yes, yes],
         ),
         (
             format!(
@@ -801,6 +807,30 @@ fn explain_analyze_says_whether_the_statement_it_ran_held_a_plan() {
         ["Prepared: yes"],
         "run with its cached plan"
     );
+    let body = "SELECT l.id FROM l JOIN r ON l.id = r.id \
+                WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
+    for from in [
+        format!("({body}) d"),
+        format!("l AS o JOIN ({body}) d ON d.id = o.id"),
+    ] {
+        let sql = format!("EXPLAIN ANALYZE SELECT d.id FROM {from}");
+        assert_eq!(
+            prepared(executor.execute(&sql)),
+            ["Prepared: yes"],
+            "{from}: run under the statement's cached plan"
+        );
+        let program = stoolap::parser::Parser::new(&sql).parse_program().unwrap();
+        assert_eq!(
+            prepared(executor.execute_program(&program)),
+            ["Prepared: yes"],
+            "{from}: run as a program"
+        );
+        assert_eq!(
+            prepared(executor.execute_statement(&program.statements[0], &ExecutionContext::new())),
+            ["Prepared: yes"],
+            "{from}: run as a parsed statement"
+        );
+    }
     let none = ["Prepared: no (a join in a SELECT that holds no plan)"];
     assert_eq!(
         prepared(executor.execute_program(&program)),

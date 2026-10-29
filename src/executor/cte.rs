@@ -199,11 +199,12 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         // Get the WITH clause
         let with_clause = match &stmt.with {
             Some(with) => with,
-            None => return self.execute_select(stmt, ctx),
+            None => return self.execute_select_with_plan(stmt, ctx, None, plan, None),
         };
 
         // CTE INLINING OPTIMIZATION:
@@ -213,11 +214,11 @@ impl Executor {
         // This is similar to PostgreSQL 12+'s CTE inlining behavior
         if let Some(inlined_stmt) = self.try_inline_ctes(stmt, with_clause) {
             // Execute the rewritten query (without WITH clause or with fewer CTEs)
-            return self.execute_select(&inlined_stmt, ctx);
+            return self.execute_select_with_plan(&inlined_stmt, ctx, None, plan, None);
         }
 
-        self.run_over_cut_ctes(stmt, with_clause, None, ctx, |cte_registry| {
-            self.execute_main_query_with_ctes(stmt, ctx, cte_registry)
+        self.run_over_cut_ctes(stmt, with_clause, plan, ctx, |cte_registry| {
+            self.execute_main_query_with_ctes(stmt, ctx, cte_registry, plan)
         })
     }
 
@@ -560,6 +561,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
+        plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
         // Create a context with CTE data so subqueries can access CTEs
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
@@ -606,7 +608,7 @@ impl Executor {
             prepared: None,
         };
 
-        self.execute_select(&stmt_without_with, &ctx_with_ctes)
+        self.execute_select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan, None)
     }
 
     /// Execute a query on CTE result data
@@ -1833,16 +1835,35 @@ impl Executor {
         self.execute_cte_query(&modified_stmt, plan, ctx, cte_registry)
     }
 
-    /// Whether the CTE body `stmt` holds a subquery its plan runs as a block
+    /// Whether the CTE body `stmt` holds a subquery its plan runs as a block,
+    /// a set operation branch's, a derived FROM's or a join side's included
     fn body_runs_blocks(stmt: &SelectStatement) -> bool {
         let classification = get_classification(stmt);
         classification.where_has_subqueries
             || classification.output_has_subqueries
             || classification.grouped_has_subqueries
-            || matches!(
-                stmt.table_expr.as_deref(),
-                Some(Expression::JoinSource(join)) if Self::ons_hold_subqueries(join)
-            )
+            || stmt
+                .table_expr
+                .as_deref()
+                .is_some_and(Self::source_runs_blocks)
+            || stmt
+                .set_operations
+                .iter()
+                .any(|op| Self::body_runs_blocks(&op.right))
+    }
+
+    /// Whether a FROM source holds a subquery its statement's plan runs as a
+    /// block: in a join's ONs or in a derived table's statement
+    fn source_runs_blocks(source: &Expression) -> bool {
+        match source {
+            Expression::JoinSource(join) => {
+                Self::ons_hold_subqueries(join)
+                    || Self::source_runs_blocks(&join.left)
+                    || Self::source_runs_blocks(&join.right)
+            }
+            Expression::SubquerySource(derived) => Self::body_runs_blocks(&derived.subquery),
+            _ => false,
+        }
     }
 }
 

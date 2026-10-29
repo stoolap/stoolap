@@ -382,13 +382,14 @@ fn a_join_without_a_plan_builds_no_shared_list() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // The inner join of a nested join runs without the statement's plan
+    // A named window's SELECT list subquery keeps the statement off a plan
     let with = |conditions: &[&str]| {
         let on: String = conditions.iter().map(|c| format!(" AND {c}")).collect();
         allocations_per_run(
             &db,
             &format!(
-                "SELECT l.id, r.id, s.id FROM l JOIN r ON l.g = r.w{on} JOIN s ON s.id = r.id"
+                "SELECT COUNT(*) OVER w, (SELECT MIN(id) FROM s) FROM \
+                 (SELECT l.id, r.id AS rid FROM l JOIN r ON l.g = r.w{on}) AS d WINDOW w AS ()"
             ),
         )
     };

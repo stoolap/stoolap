@@ -33,7 +33,7 @@ use super::prepared_select::OutOfFamily;
 use super::pushdown;
 use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
 use super::query_cache::NestedPlan;
-use super::query_classification::get_classification;
+use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::utils::{
     collect_table_qualifiers, collect_unqualified_columns, combine_predicates_with_and,
@@ -139,13 +139,17 @@ impl Executor {
                 }
             }
 
+            // A SELECT run as a parsed tree held the plan its structure keys
+            let held = plan.is_some()
+                || matches!(&*stmt.statement, Statement::Select(select)
+                    if self.query_cache.statement_plan(select).is_some());
             // Generate plan with actual statistics (using inlined version if available)
             self.explain_statement_with_stats(
                 explain_stmt,
                 &mut plan_lines,
                 0,
                 (row_count, &time_str),
-                plan.is_some(),
+                held,
             );
 
             // Return the plan as a result
@@ -237,6 +241,11 @@ impl Executor {
                         }
                     }
                 } else if let Some(ref table_expr) = select.table_expr {
+                    let classification = get_classification(select);
+                    let grouped = Self::grouped_family_reach(select, &classification)
+                        .then(|| self.grouped_family(select, None));
+                    let from_plan =
+                        Self::sources_hold_plan(select, &classification, grouped.as_ref(), held);
                     self.explain_table_expr_with_where_and_stats(
                         table_expr,
                         select.where_clause.as_deref(),
@@ -245,6 +254,7 @@ impl Executor {
                         row_count,
                         self.join_index_use(select, self.join_runs_blocks(select, held)),
                         &cte_names(select),
+                        (from_plan, select.with.as_ref()),
                     );
                 }
 
@@ -343,7 +353,8 @@ impl Executor {
         }
     }
 
-    /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats
+    /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats,
+    /// `plans` as `explain_table_expr_with_where` takes them
     #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_with_where_and_stats(
         &self,
@@ -354,6 +365,7 @@ impl Executor {
         row_count: usize,
         index_use: JoinIndexUse,
         ctes: &[String],
+        plans: (bool, Option<&WithClause>),
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -460,7 +472,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1, false);
+                self.explain_select(&subquery.subquery, lines, indent + 1, plans.0);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
@@ -509,6 +521,7 @@ impl Executor {
                     indent + 1,
                     index_use,
                     ctes,
+                    plans,
                 );
                 self.explain_table_expr_plan_only(
                     &join.right,
@@ -517,6 +530,7 @@ impl Executor {
                     indent + 1,
                     index_use,
                     ctes,
+                    plans,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -654,9 +668,22 @@ impl Executor {
         }
     }
 
+    /// Whether a derived FROM or join side of `select` holds a plan in its
+    /// statement's, `own` when `select` holds one: a statement reading its
+    /// SELECT list's subqueries first outside the grouped family keeps none
+    fn sources_hold_plan(
+        select: &SelectStatement,
+        classification: &QueryClassification,
+        grouped: Option<&std::result::Result<(), OutOfFamily>>,
+        own: bool,
+    ) -> bool {
+        own && !(Self::folds_select_subqueries(select, classification)
+            && !matches!(grouped, Some(Ok(()))))
+    }
+
     /// Generate EXPLAIN output for a SELECT statement; `own` when it holds a
-    /// plan: the statement's own, an INSERT's source, a branch of one that
-    /// does, or a derived FROM or join side of one the runner runs
+    /// plan: the statement's own, an INSERT's source, or a branch, a derived
+    /// FROM or a join side of one that does
     fn explain_select(
         &self,
         select: &SelectStatement,
@@ -706,9 +733,8 @@ impl Executor {
         let on_subqueries = join.is_some_and(Self::ons_hold_subqueries);
         let classification = get_classification(select);
         let grouped_output = Self::grouped_family_reach(select, &classification);
-        // A derived FROM or join side holds a plan in that of a statement the
-        // runner runs
-        let mut from_plan = false;
+        let grouped = grouped_output.then(|| self.grouped_family(select, None));
+        let from_plan = Self::sources_hold_plan(select, &classification, grouped.as_ref(), own);
         if on_subqueries
             || classification.output_has_subqueries
             || grouped_output
@@ -717,16 +743,13 @@ impl Executor {
                 .as_deref()
                 .is_some_and(Self::has_subqueries)
         {
-            let prepared = match join {
-                _ if grouped_output => self.grouped_family(select, None),
-                Some(join) => self.join_prepared(select, join, own, select.with.as_ref()),
-                None => self.prepared_family(select, None),
+            let prepared = match (grouped, join) {
+                (Some(grouped), _) => grouped,
+                (None, Some(join)) => self.join_prepared(select, join, own, select.with.as_ref()),
+                (None, None) => self.prepared_family(select, None),
             };
             match prepared {
-                Ok(()) => {
-                    from_plan = own;
-                    lines.push(format!("{}  Prepared: yes", prefix))
-                }
+                Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),
                 Err(reason) => lines.push(format!("{}  Prepared: no ({})", prefix, reason)),
             }
         }
@@ -804,6 +827,7 @@ impl Executor {
 
     /// Generate EXPLAIN output for a table expression with WHERE clause analysis
     /// Show plan structure without join cost estimates (for EXPLAIN ANALYZE child nodes)
+    #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_plan_only(
         &self,
         expr: &Expression,
@@ -812,6 +836,7 @@ impl Executor {
         indent: usize,
         index_use: JoinIndexUse,
         ctes: &[String],
+        plans: (bool, Option<&WithClause>),
     ) {
         self.explain_table_expr_inner(
             expr,
@@ -821,7 +846,7 @@ impl Executor {
             false,
             index_use,
             ctes,
-            (false, None),
+            plans,
         )
     }
 
@@ -1035,17 +1060,6 @@ impl Executor {
                 if let Some(ref jf) = join_filter {
                     lines.push(format!("{}   Join Filter: {}", prefix, jf));
                 }
-                // A side that is a join holds a plan its sides' do only when
-                // it runs its own blocks, as the statement it runs as decides
-                // with the statement's CTEs named
-                let side_plan = |side: &Expression| match side {
-                    Expression::JoinSource(inner) => {
-                        let statement = Self::joined_side_statement(inner);
-                        let held = self.join_prepared(&statement, inner, from_plan, with);
-                        (held.is_ok(), with)
-                    }
-                    _ => (from_plan, with),
-                };
                 self.explain_table_expr_inner(
                     &join.left,
                     left_where.as_ref(),
@@ -1054,7 +1068,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
-                    side_plan(&join.left),
+                    (from_plan, with),
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -1064,7 +1078,7 @@ impl Executor {
                     show_join_cost,
                     index_use,
                     ctes,
-                    side_plan(&join.right),
+                    (from_plan, with),
                 );
             }
             Expression::CteReference(cte_ref) => {

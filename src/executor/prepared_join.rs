@@ -28,7 +28,7 @@ use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
 use super::prepared_select::{JoinBlocks, PreparedGrouped};
 use super::query::JoinOutput;
-use super::query_cache::PlanValidity;
+use super::query_cache::{NestedPlan, PlanValidity};
 
 /// The programs one compile builds, shared only once they are held
 pub type BuiltPrograms = SmallVec<[SharedProgram; 2]>;
@@ -215,6 +215,9 @@ pub struct PreparedJoin {
     grouped: std::sync::OnceLock<bool>,
     /// None stands for blocks that read a column outside the groups
     grouped_blocks: Shelf<GroupedKey, Option<PreparedGrouped>>,
+    /// The plan of each side that runs as a statement of its own: a join or
+    /// a derived table
+    side_plans: [NestedPlan; 2],
 }
 
 impl PreparedJoin {
@@ -231,7 +234,13 @@ impl PreparedJoin {
             join_blocks: RwLock::new(None),
             grouped: std::sync::OnceLock::new(),
             grouped_blocks: Shelf::new(),
+            side_plans: Default::default(),
         }
+    }
+
+    /// The plan of side `side` when it runs as a statement of its own
+    pub(crate) fn side_plan(&self, side: usize) -> &NestedPlan {
+        &self.side_plans[side]
     }
 
     /// Whether the WHERE's subqueries run as the statement's blocks, as
