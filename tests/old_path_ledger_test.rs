@@ -570,6 +570,16 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
          SELECT c.id FROM c JOIN c AS e ON e.id = c.id",
         Prepared,
     ),
+    (
+        "join_inside_a_derived_table_of_a_cte_cut_by_limit",
+        "WITH c AS (SELECT d.id, COUNT(*) AS n FROM (SELECT t.id FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > (SELECT MAX(x) FROM u)) AS d GROUP BY d.id) \
+         SELECT c.id FROM c LEFT JOIN u ON u.id = c.id LIMIT 1",
+        "WITH c AS (SELECT d.id, COUNT(*) AS n FROM (SELECT t.id FROM t JOIN u ON u.id = t.a \
+         WHERE t.b > 3) AS d GROUP BY d.id) \
+         SELECT c.id FROM c LEFT JOIN u ON u.id = c.id LIMIT 1",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order

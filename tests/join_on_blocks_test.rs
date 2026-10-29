@@ -807,6 +807,18 @@ fn explain_analyze_says_whether_the_statement_it_ran_held_a_plan() {
         ["Prepared: yes"],
         "run with its cached plan"
     );
+    let body = "SELECT l.id FROM l JOIN r ON l.id = r.id \
+                WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
+    for from in [
+        format!("({body}) d"),
+        format!("l AS o JOIN ({body}) d ON d.id = o.id"),
+    ] {
+        assert_eq!(
+            prepared(executor.execute(&format!("EXPLAIN ANALYZE SELECT d.id FROM {from}"))),
+            ["Prepared: yes"],
+            "{from}: run under the statement's cached plan"
+        );
+    }
     let none = ["Prepared: no (a join in a SELECT that holds no plan)"];
     assert_eq!(
         prepared(executor.execute_program(&program)),

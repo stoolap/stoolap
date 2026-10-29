@@ -33,7 +33,7 @@ use super::prepared_select::OutOfFamily;
 use super::pushdown;
 use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
 use super::query_cache::NestedPlan;
-use super::query_classification::get_classification;
+use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::utils::{
     collect_table_qualifiers, collect_unqualified_columns, combine_predicates_with_and,
@@ -237,6 +237,11 @@ impl Executor {
                         }
                     }
                 } else if let Some(ref table_expr) = select.table_expr {
+                    let classification = get_classification(select);
+                    let grouped = Self::grouped_family_reach(select, &classification)
+                        .then(|| self.grouped_family(select, None));
+                    let from_plan =
+                        Self::sources_hold_plan(select, &classification, grouped.as_ref(), held);
                     self.explain_table_expr_with_where_and_stats(
                         table_expr,
                         select.where_clause.as_deref(),
@@ -245,6 +250,7 @@ impl Executor {
                         row_count,
                         self.join_index_use(select, self.join_runs_blocks(select, held)),
                         &cte_names(select),
+                        (from_plan, select.with.as_ref()),
                     );
                 }
 
@@ -343,7 +349,8 @@ impl Executor {
         }
     }
 
-    /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats
+    /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats,
+    /// `plans` as `explain_table_expr_with_where` takes them
     #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_with_where_and_stats(
         &self,
@@ -354,6 +361,7 @@ impl Executor {
         row_count: usize,
         index_use: JoinIndexUse,
         ctes: &[String],
+        plans: (bool, Option<&WithClause>),
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -460,7 +468,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1, false);
+                self.explain_select(&subquery.subquery, lines, indent + 1, plans.0);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
@@ -509,6 +517,7 @@ impl Executor {
                     indent + 1,
                     index_use,
                     ctes,
+                    plans,
                 );
                 self.explain_table_expr_plan_only(
                     &join.right,
@@ -517,6 +526,7 @@ impl Executor {
                     indent + 1,
                     index_use,
                     ctes,
+                    plans,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -654,6 +664,19 @@ impl Executor {
         }
     }
 
+    /// Whether a derived FROM or join side of `select` holds a plan in its
+    /// statement's, `own` when `select` holds one: a statement reading its
+    /// SELECT list's subqueries first outside the grouped family keeps none
+    fn sources_hold_plan(
+        select: &SelectStatement,
+        classification: &QueryClassification,
+        grouped: Option<&std::result::Result<(), OutOfFamily>>,
+        own: bool,
+    ) -> bool {
+        own && !(Self::folds_select_subqueries(select, classification)
+            && !matches!(grouped, Some(Ok(()))))
+    }
+
     /// Generate EXPLAIN output for a SELECT statement; `own` when it holds a
     /// plan: the statement's own, an INSERT's source, or a branch, a derived
     /// FROM or a join side of one that does
@@ -707,12 +730,7 @@ impl Executor {
         let classification = get_classification(select);
         let grouped_output = Self::grouped_family_reach(select, &classification);
         let grouped = grouped_output.then(|| self.grouped_family(select, None));
-        // A derived FROM or join side holds a plan in its statement's, which
-        // one reading its SELECT list's subqueries first outside the grouped
-        // family does not keep
-        let folded = Self::folds_select_subqueries(select, &classification)
-            && !matches!(grouped, Some(Ok(())));
-        let from_plan = own && !folded;
+        let from_plan = Self::sources_hold_plan(select, &classification, grouped.as_ref(), own);
         if on_subqueries
             || classification.output_has_subqueries
             || grouped_output
@@ -805,6 +823,7 @@ impl Executor {
 
     /// Generate EXPLAIN output for a table expression with WHERE clause analysis
     /// Show plan structure without join cost estimates (for EXPLAIN ANALYZE child nodes)
+    #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_plan_only(
         &self,
         expr: &Expression,
@@ -813,6 +832,7 @@ impl Executor {
         indent: usize,
         index_use: JoinIndexUse,
         ctes: &[String],
+        plans: (bool, Option<&WithClause>),
     ) {
         self.explain_table_expr_inner(
             expr,
@@ -822,7 +842,7 @@ impl Executor {
             false,
             index_use,
             ctes,
-            (false, None),
+            plans,
         )
     }
 
