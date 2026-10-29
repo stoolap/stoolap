@@ -5259,7 +5259,7 @@ impl Table for MVCCTable {
                 }
             }
 
-            // An AND with a key equality reads that one row, as index_lookup does
+            // An AND with a key equality reads that one row, as an index plan's Key does
             if let (Some(id), Some(index)) = (
                 pk_conjunct_id(expr, schema),
                 self.version_store.get_index_by_column(&pk_col.name),
@@ -5304,7 +5304,7 @@ impl Table for MVCCTable {
             }
         }
 
-        // Check for LIKE prefix pattern, as index_lookup reads it
+        // Check for LIKE prefix pattern, as an index plan reads it
         if let (Some((col_name, prefix, _)), Some((index, _, _))) =
             (expr.get_like_prefix_info(), self.like_prefix_range(expr))
         {

@@ -359,21 +359,6 @@ impl Executor {
         }
     }
 
-    /// Create a new executor with a custom cache size
-    pub fn with_cache_size(engine: Arc<MVCCEngine>, cache_size: usize) -> Self {
-        Self {
-            engine,
-            function_registry: default_function_registry(),
-            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
-            query_cache: Arc::new(QueryCache::new(cache_size)),
-            semantic_cache: Arc::new(SemanticCache::default()),
-            statement_gate: RwLock::new(()),
-            active_transaction: TransactionSlot::new(None),
-            query_planner: std::sync::OnceLock::new(),
-            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
-        }
-    }
-
     /// An executor that runs `tx` as its open transaction, sharing this
     /// one's plans, compiled paths and result cache
     pub(crate) fn for_transaction(&self, tx: Box<dyn Transaction>) -> Self {
@@ -393,11 +378,6 @@ impl Executor {
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
-    }
-
-    /// Check if there is an active explicit transaction
-    pub fn has_active_transaction(&self) -> bool {
-        self.active_transaction.lock().unwrap().is_some()
     }
 
     /// Get the query planner (lazily initialized)
@@ -797,13 +777,6 @@ impl Executor {
     /// Clear the semantic cache
     pub fn clear_semantic_cache(&self) {
         self.semantic_cache.clear();
-    }
-
-    /// Invalidate semantic cache for a specific table
-    ///
-    /// Call this after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
-    pub fn invalidate_semantic_cache(&self, table_name: &str) {
-        self.semantic_cache.invalidate_table(table_name);
     }
 
     /// The stamp a semantic cache read of `table_name` happens under now, or

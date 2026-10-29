@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The prepared family: a single-table SELECT whose WHERE holds scalar
-//! subqueries over single tables. It is classified from its syntax, prepared
-//! once per cached plan into programs, and run with each subquery as a
-//! parameterised scan whose outer reads fill parameter slots.
+//! The prepared runner: a plain single-table SELECT, or a statement whose
+//! subqueries a family takes, prepared once per cached plan into programs,
+//! and run with each subquery as a block whose outer reads fill parameter
+//! slots.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::{Arc, RwLock};

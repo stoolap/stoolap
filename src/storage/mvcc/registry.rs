@@ -731,28 +731,6 @@ impl TransactionRegistry {
         false
     }
 
-    /// Check if any active transaction uses snapshot isolation.
-    /// Used by seal_hot_buffers to avoid breaking snapshot isolation guarantees.
-    pub fn has_active_snapshot_transactions(&self) -> bool {
-        let global = self.global_isolation_level.load(Ordering::Relaxed);
-        if global == 1 {
-            // Global snapshot isolation — any active transaction uses it
-            return !self.transactions.lock().is_empty();
-        }
-        if self.override_count.load(Ordering::Relaxed) > 0 {
-            // Lock order: transactions FIRST, then isolation_overrides
-            // (matches get_snapshot_transaction_ids to prevent ABBA deadlock)
-            let transactions = self.transactions.lock();
-            let overrides = self.isolation_overrides.lock();
-            for txn_id in transactions.keys() {
-                if overrides.get(txn_id) == Some(&1) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Get transaction IDs of all active snapshot-isolation transactions.
     pub fn get_snapshot_transaction_ids(&self) -> Vec<i64> {
         let global = self.global_isolation_level.load(Ordering::Relaxed);
@@ -1560,27 +1538,6 @@ impl TransactionRegistry {
     #[inline]
     pub fn active_count(&self) -> usize {
         self.active_txn_count.load(Ordering::Relaxed)
-    }
-
-    /// Returns all currently active transaction IDs.
-    ///
-    /// Used by cleanup routines to identify which transactions still hold
-    /// resources (e.g., pending cold deletes in segment managers).
-    pub fn active_transaction_ids(&self) -> Vec<i64> {
-        self.transactions
-            .lock()
-            .iter()
-            .filter(|(_, s)| {
-                let status = s.status();
-                status == TxnStatus::Active || status == TxnStatus::Committing
-            })
-            .map(|(id, _)| id)
-            .collect()
-    }
-
-    /// Gets the count of entries in snapshot_seqs.
-    pub fn committed_count(&self) -> usize {
-        self.snapshot_seqs.lock().len()
     }
 
     /// Checks if a transaction is active.

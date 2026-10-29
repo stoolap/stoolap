@@ -1237,11 +1237,6 @@ impl SnapshotReader {
         &self.schema
     }
 
-    /// Get the file format version
-    pub fn format_version(&self) -> u32 {
-        self.header.version
-    }
-
     /// Get the total row count
     pub fn row_count(&self) -> u64 {
         self.footer.row_count
@@ -1269,7 +1264,7 @@ impl SnapshotReader {
     /// This is used to determine if a row should be fetched from disk during queries.
     /// Returns `false` if:
     /// - The row doesn't exist in this snapshot, OR
-    /// - The row exists but has already been loaded to memory (marked via `mark_loaded`)
+    /// - The row exists but has already been loaded to memory (marked by `get_row`)
     ///
     /// For checking if a row exists in the snapshot regardless of load status,
     /// use `row_exists_in_index()` instead.
@@ -1292,13 +1287,6 @@ impl SnapshotReader {
     /// without considering whether it has been loaded to memory.
     pub fn row_exists_in_index(&self, row_id: i64) -> bool {
         self.index.contains_key(&row_id)
-    }
-
-    /// Deprecated: Use `has_unloaded_row()` instead.
-    /// This method is kept for backward compatibility.
-    #[deprecated(since = "0.1.0", note = "Use has_unloaded_row() for clarity")]
-    pub fn has_row(&self, row_id: i64) -> bool {
-        self.has_unloaded_row(row_id)
     }
 
     /// Get a single row by row_id
@@ -1325,19 +1313,6 @@ impl SnapshotReader {
         Some(version)
     }
 
-    /// Get multiple rows by row_ids
-    pub fn get_rows(&mut self, row_ids: &[i64]) -> Vec<(i64, RowVersion)> {
-        let mut results = Vec::new();
-
-        for &row_id in row_ids {
-            if let Some(version) = self.get_row(row_id) {
-                results.push((row_id, version));
-            }
-        }
-
-        results
-    }
-
     /// Iterate over all rows (without loading tracking)
     pub fn for_each<F>(&mut self, mut callback: F) -> Result<()>
     where
@@ -1358,22 +1333,6 @@ impl SnapshotReader {
         }
 
         Ok(())
-    }
-
-    /// Get all rows (for full table scan)
-    pub fn get_all_rows(&mut self) -> BTreeMap<i64, RowVersion> {
-        let mut results = BTreeMap::new();
-
-        // Collect entries first
-        let entries: Vec<(i64, u64)> = self.index.iter().map(|(&k, &v)| (k, v)).collect();
-
-        for (row_id, offset) in entries {
-            if let Ok(version) = self.read_row_at_offset(offset) {
-                results.insert(row_id, version);
-            }
-        }
-
-        results
     }
 
     /// Read a row at a specific file offset
@@ -1411,21 +1370,6 @@ impl SnapshotReader {
 
         // Deserialize
         deserialize_row_version(&row_bytes)
-    }
-
-    /// Mark a row_id as loaded (used during merge with memory)
-    pub fn mark_loaded(&self, row_id: i64) {
-        if let Ok(mut loaded) = self.loaded_row_ids.write() {
-            loaded.insert(row_id);
-        }
-    }
-
-    /// Check if a row_id has been loaded
-    pub fn is_loaded(&self, row_id: i64) -> bool {
-        self.loaded_row_ids
-            .read()
-            .map(|s| s.contains(row_id))
-            .unwrap_or(false)
     }
 
     /// Get the index for external iteration
@@ -1697,22 +1641,6 @@ impl DiskVersionStore {
             }
         }
         false
-    }
-
-    /// Deprecated: Use `has_unloaded_row()` instead.
-    #[deprecated(since = "0.1.0", note = "Use has_unloaded_row() for clarity")]
-    #[allow(deprecated)]
-    pub fn has_row(&self, row_id: i64) -> bool {
-        self.has_unloaded_row(row_id)
-    }
-
-    /// Mark a row_id as loaded to memory
-    pub fn mark_row_loaded(&self, row_id: i64) {
-        if let Ok(readers) = self.readers.read() {
-            if let Some(reader) = readers.last() {
-                reader.mark_loaded(row_id);
-            }
-        }
     }
 
     /// Cleanup old snapshots, keeping only the most recent `keep_count` files

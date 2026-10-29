@@ -5248,13 +5248,6 @@ impl VersionStore {
             .collect()
     }
 
-    /// Check if there are any indexes
-    #[inline]
-    pub fn has_indexes(&self) -> bool {
-        let indexes = self.indexes.read();
-        !indexes.is_empty()
-    }
-
     /// Iterate over all indexes, calling the provided function for each with
     /// its definition's identity, under the index map's read lock: `f` must
     /// not take that lock again, as a writer queued behind it would wait on it
@@ -6147,78 +6140,6 @@ impl VersionStore {
         }
     }
 
-    /// Populate HNSW indexes from external rows (e.g., cold segment data).
-    ///
-    /// Regular indexes (B-tree, Hash, Bitmap) are hot-only by design and use
-    /// zone maps/bloom filters for cold data. HNSW indexes are different:
-    /// vector similarity search cannot fall back to zone maps, so HNSW must
-    /// contain all rows (hot + cold) to return correct results.
-    ///
-    /// HnswInner::insert skips duplicate row_ids, so calling this after
-    /// populate_all_indexes() is safe (hot rows already in the index).
-    pub fn populate_hnsw_from_rows(&self, rows: &[(i64, crate::core::Row)]) {
-        let indexes = self.indexes.read();
-        if indexes.is_empty() || rows.is_empty() {
-            return;
-        }
-
-        // Collect only HNSW indexes with their column indices
-        let hnsw_infos: Vec<(Vec<usize>, Arc<dyn Index>)> = indexes
-            .values()
-            .map(|entry| &entry.index)
-            .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
-            .filter_map(|idx| {
-                let col_ids = idx.column_ids();
-                if col_ids.is_empty() {
-                    return None;
-                }
-                let col_indices: Vec<usize> = col_ids.iter().map(|&id| id as usize).collect();
-                Some((col_indices, Arc::clone(idx)))
-            })
-            .collect();
-
-        drop(indexes);
-
-        if hnsw_infos.is_empty() {
-            return;
-        }
-
-        // Pre-allocate per-index batch vectors
-        let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> = (0..hnsw_infos.len())
-            .map(|_| Vec::with_capacity(rows.len()))
-            .collect();
-
-        for &(row_id, ref row) in rows {
-            for (idx, (col_indices, _)) in hnsw_infos.iter().enumerate() {
-                if col_indices.len() == 1 {
-                    if let Some(value) = row.get(col_indices[0]) {
-                        batches[idx].push((row_id, vec![value.clone()]));
-                    }
-                } else {
-                    let values: Vec<crate::core::Value> = col_indices
-                        .iter()
-                        .map(|&col_idx| {
-                            row.get(col_idx)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    batches[idx].push((row_id, values));
-                }
-            }
-        }
-
-        for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
-            if !batches[idx].is_empty() {
-                let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
-                    .iter()
-                    .map(|(row_id, values)| (*row_id, values.as_slice()))
-                    .collect();
-                let _ = index.add_batch_slice(&entry_refs);
-            }
-        }
-    }
-
     // =========================================================================
     // Cleanup Functions
     // =========================================================================
@@ -6854,40 +6775,6 @@ impl VersionStore {
         }
     }
 
-    /// Get the count of committed (non-deleted) versions for statistics
-    pub fn count_committed_versions(&self) -> usize {
-        if self.closed.load(Ordering::Acquire) {
-            return 0;
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
-            None => return 0,
-        };
-
-        let snapshot_txn_id = i64::MAX;
-        let mut count = 0;
-
-        let versions = self.versions.read().clone();
-        for (_, chain_entry) in versions.iter() {
-            let mut current: Option<&VersionChainEntry> = Some(chain_entry);
-
-            while let Some(e) = current {
-                if checker.is_visible(e.version.txn_id, snapshot_txn_id) {
-                    if e.version.deleted_at_txn_id == 0
-                        || !checker.is_visible(e.version.deleted_at_txn_id, snapshot_txn_id)
-                    {
-                        count += 1;
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|arc| arc.as_ref());
-            }
-        }
-
-        count
-    }
-
     /// Get the transaction ID of the latest committed version for a row.
     ///
     /// This retrieves the "head" of the version chain, effectively checking
@@ -7493,17 +7380,6 @@ impl TransactionVersionStore {
         Ok(())
     }
 
-    /// Batch put for UPDATE operations where we already have the row data
-    ///
-    /// This is used for rows that are already tracked in local_versions (updates within same txn)
-    /// or when we don't have pre-fetched original versions.
-    pub fn put_batch_for_update(&mut self, rows: RowVec) -> Result<(), Error> {
-        for (row_id, data) in rows {
-            self.put(row_id, data, false)?;
-        }
-        Ok(())
-    }
-
     /// Optimized single-row put with pre-fetched original version
     ///
     /// This avoids redundant get_visible_version() calls by accepting the original
@@ -7971,25 +7847,6 @@ impl TransactionVersionStore {
             .filter_map(|(k, versions)| versions.last().map(|v| (k, v)))
     }
 
-    /// Iterate over local versions with their original (old) versions for index updates
-    /// Returns (row_id, new_version, old_row_option)
-    pub fn iter_local_with_old(&self) -> impl Iterator<Item = (i64, &RowVersion, Option<&Row>)> {
-        let write_set_ref = self.write_set.as_ref();
-        self.local_versions
-            .iter()
-            .flat_map(|lv| lv.iter())
-            .filter_map(move |(row_id, versions)| {
-                versions.last().map(|version| {
-                    let old_row = write_set_ref
-                        .and_then(|ws| ws.get(row_id))
-                        .and_then(|entry| entry.read_version.as_ref())
-                        .filter(|v| !v.is_deleted())
-                        .map(|v| &v.data);
-                    (row_id, version, old_row)
-                })
-            })
-    }
-
     /// Get the local version for a row (without checking parent)
     /// Returns the most recent version in the transaction's history
     pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
@@ -8075,22 +7932,6 @@ impl TransactionVersionStore {
         }
 
         Ok(())
-    }
-
-    /// Prepare commit - returns list of versions to commit (most recent per row)
-    pub fn prepare_commit(&self) -> Vec<(i64, RowVersion)> {
-        let Some(local_versions) = self.local_versions.as_ref() else {
-            return Vec::new();
-        };
-
-        let mut versions = Vec::new();
-        for (row_id, version_history) in local_versions.iter() {
-            // Only commit the most recent version per row
-            if let Some(version) = version_history.last() {
-                versions.push((row_id, version.clone()));
-            }
-        }
-        versions
     }
 
     /// Commit local changes to parent store
