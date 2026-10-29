@@ -25,7 +25,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
     before_prepared_exists, force_exists_strategy, general_path_hits, prepared_exists_counts,
-    prepared_rows_narrowed, subquery_cache_hits, GeneralPath,
+    prepared_rows_narrowed, prepared_strategy_runs, subquery_cache_hits, GeneralPath,
+    PreparedStrategy,
 };
 use stoolap::Database;
 
@@ -817,5 +818,35 @@ fn test_a_failed_value_raises_only_where_it_is_read() {
         // A FALSE first ends it before the failed slot
         let first = "SELECT id FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v < 0 AND u.v > $1 * 9223372036854775807)";
         assert_eq!(rows(first), Ok(vec![]), "{first} under {strategy:?}");
+    }
+}
+
+#[test]
+fn test_a_distinct_no_count_reads_runs_as_its_block_without_it() {
+    let _guard = serial();
+    let db = setup("distinct");
+    for (sql, plain) in [
+        (
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT DISTINCT 1 FROM u WHERE u.k = t.k)",
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        ),
+        // Its items are never computed: k = 2 would overflow
+        (
+            "SELECT id FROM t WHERE EXISTS \
+             (SELECT DISTINCT u.k * 9223372036854775807 FROM u WHERE u.k = t.k)",
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        ),
+        (
+            "SELECT id FROM t WHERE t.k IN (SELECT DISTINCT u.k FROM u WHERE u.v > 1)",
+            "SELECT id FROM t WHERE t.k IN (SELECT u.k FROM u WHERE u.v > 1)",
+        ),
+    ] {
+        let runs = prepared_strategy_runs(PreparedStrategy::BlockStatement);
+        assert_eq!(ids(&db, sql), ids(&db, plain), "{sql}");
+        assert_eq!(
+            prepared_strategy_runs(PreparedStrategy::BlockStatement),
+            runs,
+            "{sql} ran its block as a statement"
+        );
     }
 }

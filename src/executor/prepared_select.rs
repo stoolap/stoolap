@@ -349,7 +349,7 @@ impl<'a> Family<'a> {
                     }
                     self.expression(row, scopes, site.operand(), found)?;
                     *found = true;
-                    return self.block(&sq.subquery, scopes + 1, width(row));
+                    return self.block(&sq.subquery, scopes + 1, width(row), true);
                 }
                 walk(&infix.left)?;
                 walk(&infix.right)
@@ -375,7 +375,7 @@ impl<'a> Family<'a> {
                         }
                         self.expression(&in_expr.left, scopes, site.operand(), found)?;
                         *found = true;
-                        return self.block(&sq.subquery, scopes + 1, width(&in_expr.left));
+                        return self.block(&sq.subquery, scopes + 1, width(&in_expr.left), false);
                     }
                     _ => return Err("IN over something other than a list"),
                 };
@@ -420,7 +420,7 @@ impl<'a> Family<'a> {
                     return Err("a subquery outside WHERE and the subquery blocks");
                 }
                 *found = true;
-                self.block(&sq.subquery, scopes + 1, 1)
+                self.block(&sq.subquery, scopes + 1, 1, true)
             }
             Expression::Exists(exists) => {
                 if !subqueries {
@@ -438,7 +438,7 @@ impl<'a> Family<'a> {
                 }
                 self.expression(&all_any.left, scopes, site.operand(), found)?;
                 *found = true;
-                self.block(&all_any.subquery, scopes + 1, width(&all_any.left))
+                self.block(&all_any.subquery, scopes + 1, width(&all_any.left), false)
             }
             Expression::Window(window) => {
                 let inner = match site {
@@ -507,6 +507,7 @@ impl<'a> Family<'a> {
         sq: &'a SelectStatement,
         scopes: usize,
         width: usize,
+        counts_rows: bool,
     ) -> std::result::Result<(), OutOfFamily> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
@@ -531,7 +532,7 @@ impl<'a> Family<'a> {
                 return Err("a subquery block selecting *");
             }
         }
-        if statement_form_block(sq) {
+        if statement_form_block(sq, counts_rows) {
             return self.derived(sq);
         }
         let columns = || sq.columns.iter().map(unaliased);
@@ -692,7 +693,7 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        if statement_form_block(sq) {
+        if statement_form_block(sq, false) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -785,12 +786,15 @@ fn windowed_block(sq: &SelectStatement) -> bool {
 }
 
 /// A block that runs as one statement: a windowed one, or one holding a
-/// set operation, a DISTINCT, grouping sets or a WINDOW clause
-fn statement_form_block(sq: &SelectStatement) -> bool {
+/// set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a DISTINCT
+/// that changes its answer, which it does only where something counts its
+/// rows: a value block (`counts_rows`), a LIMIT or an OFFSET
+fn statement_form_block(sq: &SelectStatement, counts_rows: bool) -> bool {
+    let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
         || !sq.set_operations.is_empty()
-        || (sq.distinct && sq.distinct_on.is_empty())
-        || matches!(sq.group_by.modifier, GroupByModifier::GroupingSets(_))
+        || (sq.distinct && sq.distinct_on.is_empty() && counted)
+        || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
 }
 
@@ -4644,7 +4648,7 @@ impl Builder<'_> {
         // rows its items choose, by a window, a DISTINCT ON or the clauses of
         // a statement block, runs as written
         let dropped = matches!(form, Form::Exists(_))
-            && !statement_form_block(sq)
+            && !statement_form_block(sq, false)
             && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
@@ -5119,7 +5123,17 @@ impl Builder<'_> {
         parent: Option<u16>,
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
-        if statement_form_block(sq) {
+        // A value block, and a row compared with the block's one row, count
+        // its rows
+        let counts_rows = matches!(
+            form,
+            Form::Scalar
+                | Form::Members {
+                    test: MemberTest::One(_),
+                    ..
+                }
+        );
+        if statement_form_block(sq, counts_rows) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities
