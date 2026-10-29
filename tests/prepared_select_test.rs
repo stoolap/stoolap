@@ -2802,18 +2802,14 @@ fn test_a_table_function_without_where_or_order_by_generates_the_rows_returned()
 }
 
 #[test]
-fn test_an_order_by_subquery_naming_a_select_alias_inside_it_is_not_prepared() {
+fn test_an_order_by_subquery_naming_a_select_alias_inside_it_reads_the_item() {
     let _guard = serial();
     let db = setup("prepared_order_by_alias_inside");
     for sql in [
         "SELECT id AS z FROM t ORDER BY (SELECT z + t.id) DESC",
         "SELECT t.id AS z FROM t JOIN u ON u.id = t.id ORDER BY (SELECT z + t.id) DESC",
     ] {
-        assert_eq!(
-            prepared_line(&db, sql),
-            "Prepared: no (an ORDER BY subquery that names a SELECT alias)",
-            "{sql}"
-        );
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
         assert!(db.query(sql, ()).is_ok(), "{sql}");
     }
     assert_eq!(
@@ -2964,15 +2960,115 @@ fn test_an_ordered_limit_computes_select_items_for_the_rows_it_keeps() {
 }
 
 #[test]
-fn test_an_alias_inside_an_aliased_order_by_subquery_item_is_not_prepared() {
+fn test_an_alias_inside_an_aliased_order_by_subquery_item_reads_the_item() {
     let _guard = serial();
     let db = setup("prepared_order_by_inner_alias");
     const SQL: &str = "SELECT id AS z FROM t ORDER BY (SELECT z + t.id AS k) DESC";
-    assert_eq!(
-        prepared_line(&db, SQL),
-        "Prepared: no (an ORDER BY subquery that names a SELECT alias)"
-    );
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
     assert_eq!(ids(&db, SQL, ()).0, vec![6, 5, 4, 3, 2, 1]);
+}
+
+/// The same rows hot in memory and sealed into a volume
+fn alias_key_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
+    let open = |dsn: &str, dir: tempfile::TempDir, seal: bool| {
+        let db = Database::open(dsn).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+            "INSERT INTO t VALUES (1, 30, 1), (2, 10, 2), (3, NULL, 1), (4, 20, 3), (5, 10, 2)",
+            "INSERT INTO u VALUES (1, 1, 5), (2, 2, 7), (3, 1, NULL), (4, 4, 1)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if seal {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        (db, dir)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    [
+        open(
+            &format!("memory://{name}"),
+            tempfile::tempdir().unwrap(),
+            false,
+        ),
+        open(&sealed, dir, true),
+    ]
+}
+
+#[test]
+fn test_an_order_by_key_s_subquery_reads_a_select_alias_as_the_item_s_value() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_order_by_alias_item") {
+        for (sql, want) in [
+            (
+                "SELECT id AS z, a FROM t ORDER BY (SELECT z) DESC, 1",
+                vec![Some(5), Some(4), Some(3), Some(2), Some(1)],
+            ),
+            (
+                "SELECT id AS z, a FROM t ORDER BY (SELECT (SELECT z)) DESC, 1",
+                vec![Some(5), Some(4), Some(3), Some(2), Some(1)],
+            ),
+            (
+                "SELECT id AS z, a FROM t ORDER BY (SELECT z) DESC, 1 LIMIT 2 OFFSET 1",
+                vec![Some(4), Some(3)],
+            ),
+            // u.k <= a * 2 counts every row of u, none where a is NULL
+            (
+                "SELECT id, a * 2 AS z FROM t \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k <= z), 1",
+                vec![Some(3), Some(1), Some(2), Some(4), Some(5)],
+            ),
+            // An item holding a subquery is read as computed for the row
+            (
+                "SELECT id, (SELECT MAX(v) FROM u WHERE u.k = t.k) AS z FROM t \
+                 ORDER BY (SELECT z) DESC, 1",
+                vec![Some(4), Some(2), Some(5), Some(1), Some(3)],
+            ),
+            // A column of the table comes before an alias of its name
+            (
+                "SELECT a AS id, k FROM t ORDER BY (SELECT id) DESC",
+                vec![Some(10), Some(20), None, Some(10), Some(30)],
+            ),
+            (
+                "SELECT t.id AS z, u.v FROM t LEFT JOIN u ON u.k = t.k \
+                 ORDER BY (SELECT z) DESC, 2 LIMIT 2",
+                vec![Some(5), Some(4)],
+            ),
+            (
+                "SELECT DISTINCT ON ((SELECT z % 2)) id AS z, a FROM t \
+                 ORDER BY (SELECT z % 2), 1",
+                vec![Some(2), Some(1)],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+        }
+        // A volatile item is computed once for the row, and the key reads it
+        let sql = "SELECT id, RANDOM() AS z FROM t ORDER BY (SELECT z)";
+        let drawn: Vec<f64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<f64>(1).unwrap())
+            .collect();
+        assert_eq!(drawn.len(), 5);
+        assert!(drawn.windows(2).all(|w| w[0] <= w[1]), "{drawn:?}");
+        let err = db
+            .query("SELECT id AS z FROM t ORDER BY (SELECT t.z)", ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "column 't.z' not found");
+    }
 }
 
 #[test]

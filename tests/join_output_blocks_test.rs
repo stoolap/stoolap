@@ -335,7 +335,7 @@ fn a_join_output_s_subqueries_answer_in_every_context() {
         (
             "SELECT l.id AS x, r.id FROM l JOIN r ON l.k = r.k \
              ORDER BY (SELECT s.a FROM s WHERE s.id = x), 1, 2",
-            false,
+            true,
         ),
         (
             "SELECT l.id, r.id, (SELECT s.a FROM s WHERE s.id = l.id) FROM l JOIN r USING (k) \
@@ -348,13 +348,7 @@ fn a_join_output_s_subqueries_answer_in_every_context() {
             true,
         ),
     ] {
-        let got = recorded(&db, &RECORDED_CONTEXTS, sql, sql);
-        if let Err(e) = &got {
-            assert!(
-                e.to_lowercase().contains("column 'x' not found"),
-                "{sql}: {e}"
-            );
-        }
+        recorded(&db, &RECORDED_CONTEXTS, sql, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         let line = prepared_line(&db, sql);
         assert_eq!(line == "Prepared: yes", prepared, "{sql}: {line}");
     }

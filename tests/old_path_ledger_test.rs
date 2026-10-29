@@ -676,6 +676,19 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT id FROM t WHERE a IN (3)",
         Prepared,
     ),
+    (
+        "order_by_subquery_reading_an_alias",
+        "SELECT b AS z FROM t ORDER BY (SELECT COUNT(*) FROM u WHERE u.x * 20 <= z) DESC, z",
+        "SELECT b AS z FROM t ORDER BY CASE WHEN b >= 60 THEN 3 WHEN b >= 40 THEN 2 \
+         WHEN b >= 20 THEN 1 ELSE 0 END DESC, z",
+        Prepared,
+    ),
+    (
+        "join_order_by_subquery_reading_an_alias",
+        "SELECT t.b AS z, u.x FROM t JOIN u ON u.id = t.a ORDER BY (SELECT z) DESC",
+        "SELECT t.b AS z, u.x FROM t JOIN u ON u.id = t.a ORDER BY z DESC",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order
