@@ -7106,22 +7106,26 @@ impl PreparedGrouped {
         // above, and so is every item of rows that do not group; any other
         // for each group
         let groups = grouped_block(stmt);
-        // `window`: the run slots it adds are a named window's, which raise
-        // their error once the window runs over a row
+        // `window`: the run slots the window reads first are a named
+        // window's, which raise their error once it runs over a row; an
+        // aggregate's input slots are read as the rows group
         let mut window_slots = Vec::new();
         let mut output =
             |expr: &Expression, key: Option<&Expression>, window: bool| -> Result<Expression> {
                 if let Some(rewritten) = key {
                     return Ok(rewritten.clone());
                 }
-                let first = run_slots.len();
-                let rewritten = if !groups {
-                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?
+                let (first, rewritten) = if !groups {
+                    let first = run_slots.len();
+                    let rewritten =
+                        input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?;
+                    (first, rewritten)
                 } else {
                     let read = read_inputs(expr, &items, &mut |call| {
                         input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
                     })?;
-                    rewrite(&mut builder, &chain, &mut run_slots, &read)?
+                    let first = run_slots.len();
+                    (first, rewrite(&mut builder, &chain, &mut run_slots, &read)?)
                 };
                 if window {
                     window_slots.extend(run_slots[first..].iter().map(|(slot, _)| *slot));

@@ -606,16 +606,30 @@ fn a_named_window_over_rows_raises_its_parts_errors() {
     let db = Database::open("memory://grouped_windows_blocks_named_raise").unwrap();
     fill(&db);
     // (SELECT u.x FROM u) gives many rows: reading it is an error
-    for (over, def) in [
-        ("w", "PARTITION BY (SELECT u.x FROM u)"),
+    let over_rows = |def: &str| {
         (
-            "w",
+            format!("SELECT t.id, SUM(t.b) OVER w FROM t WINDOW w AS ({def})"),
+            format!("SELECT t.id, SUM(t.b) OVER ({def}) FROM t"),
+        )
+    };
+    // An aggregate's input is read as the rows group, before HAVING
+    let aggregate = "ORDER BY SUM((SELECT u.x FROM u))";
+    for (sql, twin) in [
+        over_rows("PARTITION BY (SELECT u.x FROM u)"),
+        over_rows(
             "ORDER BY t.id ROWS BETWEEN COALESCE((SELECT u.x FROM u), 0) PRECEDING \
              AND CURRENT ROW",
         ),
+        (
+            format!(
+                "SELECT t.a, RANK() OVER w FROM t GROUP BY t.a HAVING COUNT(*) = 0 \
+                 WINDOW w AS ({aggregate})"
+            ),
+            format!(
+                "SELECT t.a, RANK() OVER ({aggregate}) FROM t GROUP BY t.a HAVING COUNT(*) = 0"
+            ),
+        ),
     ] {
-        let sql = format!("SELECT t.id, SUM(t.b) OVER {over} FROM t WINDOW w AS ({def})");
-        let twin = format!("SELECT t.id, SUM(t.b) OVER ({def}) FROM t");
         let got = rows(&db, &sql);
         assert!(got.is_err(), "{sql}: {got:?}");
         assert_eq!(got, rows(&db, &twin), "{sql}");
