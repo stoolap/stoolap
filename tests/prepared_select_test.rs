@@ -1097,18 +1097,13 @@ fn test_classifier_rules() {
             "a NATURAL or USING join whose output holds a subquery",
         ),
         (
-            "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"
-                .to_string(),
-            "a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET",
-        ),
-        (
             "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1 LIMIT 1)"
                 .to_string(),
             "an ORDER BY position in a subquery block",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT t.a)".to_string(),
-            "a subquery block's LIMIT or OFFSET that is not a literal or a parameter",
+            "a derived table's LIMIT or OFFSET naming a column",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT v, id FROM u WHERE u.id = t.id)".to_string(),

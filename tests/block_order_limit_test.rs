@@ -280,18 +280,17 @@ fn exists_and_member_blocks_answer_from_the_rows_kept() {
 fn a_cut_block_outside_the_family_says_why() {
     let _guard = serial();
     let db = setup("block_order_refused");
+    // A grouped block with ORDER BY and LIMIT runs as a statement block
+    let grouped = scalar("SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1");
+    assert_eq!(prepared_line(&db, &grouped), "Prepared: yes", "{grouped}");
     for (block, reason) in [
-        (
-            "SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",
-            "a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET",
-        ),
         (
             "SELECT x FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",
             "an ORDER BY position in a subquery block",
         ),
         (
             "SELECT x FROM u WHERE u.k = t.id ORDER BY x LIMIT t.a",
-            "a subquery block's LIMIT or OFFSET that is not a literal or a parameter",
+            "a derived table's LIMIT or OFFSET naming a column",
         ),
     ] {
         let sql = scalar(block);
@@ -388,11 +387,14 @@ fn a_key_that_is_the_select_item_answers_with_the_value_it_sorted() {
             "{sql} sorts by the value it answers"
         );
     }
-    let refused = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r + 0 LIMIT 1) FROM t";
-    assert_eq!(
-        prepared_line(&db, refused),
-        "Prepared: no (an ORDER BY expression reading a volatile SELECT alias)"
-    );
+    // A key computed from a volatile alias runs as a statement block
+    let statement = "SELECT (SELECT RANDOM() AS r FROM u ORDER BY r + 0 LIMIT 1) FROM t";
+    assert_eq!(prepared_line(&db, statement), "Prepared: yes");
+    let found = db
+        .query(statement, ())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>();
+    assert_eq!(found.unwrap().len(), 4);
 }
 
 #[test]
@@ -457,12 +459,15 @@ fn a_row_block_key_that_is_a_value_answers_with_the_value_it_sorted() {
             "{sql}: one run, one draw per inner row and none for the answer"
         );
     }
-    let refused =
+    // A key computed from a volatile alias runs as a statement block
+    let statement =
         "SELECT (0.5, 0) < (SELECT RANDOM() AS r, 0 FROM u ORDER BY r + 0 LIMIT 1) FROM t";
-    assert_eq!(
-        prepared_line(&db, refused),
-        "Prepared: no (an ORDER BY expression reading a volatile SELECT alias)"
-    );
+    assert_eq!(prepared_line(&db, statement), "Prepared: yes");
+    let found = db
+        .query(statement, ())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>();
+    assert_eq!(found.unwrap().len(), 4);
 }
 
 #[test]
@@ -551,11 +556,10 @@ fn an_order_by_that_chooses_no_row_is_still_bound() {
         1,
         "a key that chooses no row reads no outer value"
     );
-    let refused = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
-    assert_eq!(
-        prepared_line(&db, &refused),
-        "Prepared: no (a subquery block's ORDER BY key holding a subquery without LIMIT)"
-    );
+    // A key holding a subquery runs as a statement block, and chooses no row
+    let statement = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
+    assert_eq!(prepared_line(&db, &statement), "Prepared: yes");
+    assert_eq!(column(&db, &statement, 1, ()), [Some(5); 4]);
 }
 
 #[test]
@@ -608,4 +612,26 @@ fn a_block_in_a_key_that_chooses_no_row_is_not_kept_to_run() {
         };
         assert_eq!(blocks(&sql("k")), blocks(&sql("x")), "{from}");
     }
+}
+
+#[test]
+fn a_grouped_distinct_on_block_keeps_a_group_whose_aggregate_is_null() {
+    let db = Database::open("memory://block_order_limit_grouped_distinct_on_null").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 0), (5, 1), (6, 2), (7, 3), (8, 0)",
+        "INSERT INTO u VALUES (1, 1, 1), (2, 2, 2), (3, 0, 3), (4, 1, 4), (5, 2, 5), (6, 0, NULL)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Row 6's block has one group, whose MAX(y) is NULL: NOT IN over it is unknown
+    let sql = "SELECT id FROM t WHERE a NOT IN (SELECT DISTINCT ON (x) MAX(y) FROM u \
+               WHERE id = t.id GROUP BY x ORDER BY x) ORDER BY id";
+    let ids: Vec<i64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids, [4, 5, 7, 8], "{sql}");
 }

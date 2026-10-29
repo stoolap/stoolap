@@ -533,7 +533,8 @@ impl<'a> Family<'a> {
                 return Err("a subquery block selecting *");
             }
         }
-        if statement_form_block(sq, counts_rows) {
+        let registry = &self.executor.function_registry;
+        if statement_form_block(sq, counts_rows, false, registry) {
             return self.derived(sq);
         }
         let columns = || sq.columns.iter().map(unaliased);
@@ -552,76 +553,28 @@ impl<'a> Family<'a> {
         }
     }
 
-    /// A block's DISTINCT ON, ORDER BY, LIMIT and OFFSET: its counts literals
-    /// or parameters, its keys values over its row and the enclosing ones; a
-    /// block that groups holds none of them
+    /// A block's DISTINCT ON and ORDER BY keys, values over its row and the
+    /// enclosing ones, and no ORDER BY position (an EXISTS checks its own
+    /// where it is bound); one only a statement reads (`statement_order`)
+    /// runs as a statement block instead
     fn order(
         &self,
         sq: &'a SelectStatement,
         scopes: usize,
         exists: bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        if sq.order_by.is_empty()
-            && sq.distinct_on.is_empty()
-            && sq.limit.is_none()
-            && sq.offset.is_none()
-        {
-            return Ok(());
+        let position =
+            |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
+        if !exists && sq.order_by.iter().any(position) {
+            return Err("an ORDER BY position in a subquery block");
         }
-        if grouped_block(sq) {
-            return Err("a grouped subquery block with DISTINCT ON, ORDER BY, LIMIT or OFFSET");
-        }
-        let counts = [sq.limit.as_deref(), sq.offset.as_deref()];
-        if counts.into_iter().flatten().any(|count| {
-            !matches!(
-                count,
-                Expression::IntegerLiteral(_) | Expression::Parameter(_)
-            )
-        }) {
-            return Err("a subquery block's LIMIT or OFFSET that is not a literal or a parameter");
-        }
-        // Keys that choose no row are bound but never computed
-        let chooses =
-            !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
-        let volatile_aliases: SmallVec<[&str; 1]> = sq
-            .columns
-            .iter()
-            .filter_map(|column| match column {
-                Expression::Aliased(item)
-                    if volatile(&item.expression, &self.executor.function_registry) =>
-                {
-                    Some(item.alias.value_lower.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        let reads_volatile_alias =
-            |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
         let mut found = false;
-        for ob in &sq.order_by {
-            let key = &ob.expression;
-            // An EXISTS block checks its positions where it is bound
-            if matches!(key, Expression::IntegerLiteral(_)) && !exists {
-                return Err("an ORDER BY position in a subquery block");
-            }
-            if !chooses && mentions_subquery(key) {
-                return Err("a subquery block's ORDER BY key holding a subquery without LIMIT");
-            }
-            if !order_by_names_an_alias(key, sq) && reads_volatile_alias(key) {
-                return Err("an ORDER BY expression reading a volatile SELECT alias");
-            }
-            self.expression(key, scopes, Site::Values, &mut found)?;
-        }
-        for key in &sq.distinct_on {
-            if matches!(key, Expression::IntegerLiteral(_)) {
-                return Err("a DISTINCT ON position in a subquery block");
-            }
-            if mentions_subquery(key) {
-                return Err("a subquery block's DISTINCT ON key holding a subquery");
-            }
-            if reads_volatile_alias(key) {
-                return Err("a DISTINCT ON key reading a volatile SELECT alias");
-            }
+        let keys = sq
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .chain(&sq.distinct_on);
+        for key in keys {
             self.expression(key, scopes, Site::Values, &mut found)?;
         }
         Ok(())
@@ -694,7 +647,7 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        if statement_form_block(sq, false) {
+        if statement_form_block(sq, false, true, &self.executor.function_registry) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -790,13 +743,69 @@ fn windowed_block(sq: &SelectStatement) -> bool {
 /// set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a DISTINCT
 /// that changes its answer, which it does only where something counts its
 /// rows: a value block (`counts_rows`), a LIMIT or an OFFSET
-fn statement_form_block(sq: &SelectStatement, counts_rows: bool) -> bool {
+fn statement_form_block(
+    sq: &SelectStatement,
+    counts_rows: bool,
+    exists: bool,
+    registry: &FunctionRegistry,
+) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
         || !sq.set_operations.is_empty()
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
+        || statement_order(sq, exists, registry)
+}
+
+/// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
+/// any of them on a grouped block, a count not a literal or a parameter, a
+/// DISTINCT ON position, a key holding a subquery that chooses no row, or a
+/// key reading a volatile SELECT alias
+fn statement_order(sq: &SelectStatement, exists: bool, registry: &FunctionRegistry) -> bool {
+    if sq.order_by.is_empty()
+        && sq.distinct_on.is_empty()
+        && sq.limit.is_none()
+        && sq.offset.is_none()
+    {
+        return false;
+    }
+    if grouped_block(sq) {
+        return true;
+    }
+    let counts = [sq.limit.as_deref(), sq.offset.as_deref()];
+    let literal = |count: &Expression| {
+        matches!(
+            count,
+            Expression::IntegerLiteral(_) | Expression::Parameter(_)
+        )
+    };
+    if !counts.into_iter().flatten().all(literal) {
+        return true;
+    }
+    // Keys that choose no row are bound but never computed
+    let chooses =
+        !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
+    let volatile_aliases: SmallVec<[&str; 1]> = sq
+        .columns
+        .iter()
+        .filter_map(|column| match column {
+            Expression::Aliased(item) if volatile(&item.expression, registry) => {
+                Some(item.alias.value_lower.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let reads_volatile_alias =
+        |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
+    let position = |key: &Expression| matches!(key, Expression::IntegerLiteral(_));
+    sq.order_by.iter().map(|ob| &ob.expression).any(|key| {
+        (!chooses && mentions_subquery(key))
+            || (!order_by_names_an_alias(key, sq) && reads_volatile_alias(key))
+    }) || sq
+        .distinct_on
+        .iter()
+        .any(|key| position(key) || mentions_subquery(key) || reads_volatile_alias(key))
 }
 
 /// What a block's SELECT list may hold
@@ -4673,7 +4682,7 @@ impl Builder<'_> {
         // rows its items choose, by a window, a DISTINCT ON or the clauses of
         // a statement block, runs as written
         let dropped = matches!(form, Form::Exists(_))
-            && !statement_form_block(sq, false)
+            && !statement_form_block(sq, false, true, &executor.function_registry)
             && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
@@ -5158,7 +5167,9 @@ impl Builder<'_> {
                     ..
                 }
         );
-        if statement_form_block(sq, counts_rows) {
+        let exists = matches!(form, Form::Exists(_));
+        let registry = &self.executor.function_registry;
+        if statement_form_block(sq, counts_rows, exists, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities
