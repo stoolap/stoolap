@@ -492,9 +492,17 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
     let _guard = serial();
     let db = Database::open("memory://grouped_windows_blocks_alias").unwrap();
     fill(&db);
+    // A qualified name reads a column of its table, never a SELECT alias
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT t.grp) DESC"
+        ),
+        Err("column 't.grp' not found".to_string())
+    );
     for (sql, twin) in [
         (
-            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT t.grp) DESC",
+            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT grp) DESC",
             "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a DESC",
         ),
         // A dotted name is one name, which no column has: its text

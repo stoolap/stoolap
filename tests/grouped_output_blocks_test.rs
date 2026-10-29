@@ -788,9 +788,9 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
             "an ORDER BY holding a subquery",
         ),
         (
-            "SELECT a AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+            "SELECT a, RANDOM() AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
              ORDER BY (SELECT MIN(u.x) FROM u) + g",
-            "an ORDER BY subquery key naming a SELECT alias",
+            "an ORDER BY subquery key naming a SELECT alias of a subquery or a volatile item",
         ),
         (
             "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
@@ -958,4 +958,99 @@ fn a_recorded_answer_s_reference_reads_a_prepared_view_on_the_general_path() {
     // The view's statement holds its prepared plan by now
     assert_eq!(rows(&db, &twin), want, "{twin}");
     assert_eq!(oracle::on_general_path(sql, || rows(&db, &twin)), want);
+}
+
+/// The same rows hot in memory and sealed into a volume
+fn alias_key_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
+    let open = |dsn: &str, dir: tempfile::TempDir, seal: bool| {
+        let db = Database::open(dsn).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+            "INSERT INTO t VALUES (1, 30, 1), (2, 10, 2), (3, NULL, 1), (4, 20, 3), (5, 10, 2)",
+            "INSERT INTO u VALUES (1, 1, 5), (2, 2, 7), (3, 1, NULL), (4, 4, 1)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if seal {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        (db, dir)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    [
+        open(
+            &format!("memory://{name}"),
+            tempfile::tempdir().unwrap(),
+            false,
+        ),
+        open(&sealed, dir, true),
+    ]
+}
+
+#[test]
+fn a_grouped_key_s_subquery_reads_a_select_alias_as_its_item_over_the_group() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("grouped_output_blocks_alias_key") {
+        for (sql, want) in [
+            // MAX(a) by k: 30, 10, 20
+            (
+                "SELECT k, MAX(a) AS z FROM t GROUP BY k ORDER BY (SELECT z) DESC, 1",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            // u.k * 20 <= 60, 20, 40 counts 3, 2, 3 rows
+            (
+                "SELECT k, MAX(a) * 2 AS z FROM t GROUP BY k \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k * 20 <= z) DESC, 1",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            (
+                "SELECT k + 1 AS z, COUNT(*) FROM t GROUP BY k + 1 \
+                 ORDER BY (SELECT (SELECT z)) DESC",
+                vec![Some(4), Some(3), Some(2)],
+            ),
+            // SUM(a) by k: 30, 20, 20, and 70 over every row
+            (
+                "SELECT k, SUM(a) AS z FROM t GROUP BY ROLLUP (k) ORDER BY (SELECT z) DESC, 1",
+                vec![None, Some(1), Some(2), Some(3)],
+            ),
+            (
+                "SELECT t.k AS z, COUNT(*) FROM t JOIN u ON u.k = t.k GROUP BY t.k \
+                 ORDER BY (SELECT z) DESC",
+                vec![Some(2), Some(1)],
+            ),
+            // COUNT(*) by k: 2, 2, 1
+            (
+                "SELECT k, COUNT(*) AS z FROM t GROUP BY k HAVING COUNT(*) > 0 \
+                 ORDER BY (SELECT z), 1 LIMIT 2 OFFSET 1",
+                vec![Some(1), Some(2)],
+            ),
+            // An alias outside the key's subqueries reads its item too
+            (
+                "SELECT k, MAX(a) * 2 AS z FROM t GROUP BY k ORDER BY z + (SELECT 0) DESC",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+        }
+        let err = db
+            .query(
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY k ORDER BY (SELECT t.z)",
+                (),
+            )
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "column 't.z' not found");
+    }
 }

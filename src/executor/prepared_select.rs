@@ -1082,7 +1082,7 @@ impl Executor {
         // read over its rows once the blocks gave the first branch's
         let whole = stmt.set_operations.is_empty();
         // A grouped key holding a subquery is computed for each group, where
-        // a SELECT alias names no column
+        // a SELECT alias reads its item again over the group's row
         let keys: SmallVec<[&Expression; 2]> = stmt
             .order_by
             .iter()
@@ -1092,19 +1092,27 @@ impl Executor {
         if !keys.is_empty() && windowed {
             return Err("an ORDER BY holding a subquery");
         }
-        let aliases: SmallVec<[&str; 4]> = stmt
+        // which gives the item's value only where computing it again does
+        let unrepeatable: SmallVec<[&str; 4]> = stmt
             .columns
             .iter()
             .filter_map(|c| match c {
-                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+                Expression::Aliased(a)
+                    if mentions_subquery(&a.expression)
+                        || volatile(&a.expression, &self.function_registry) =>
+                {
+                    Some(a.alias.value_lower.as_str())
+                }
                 _ => None,
             })
             .collect();
         if keys
             .iter()
-            .any(|key| names_anywhere(key, &|name| aliases.contains(&name)))
+            .any(|key| names_anywhere(key, &|name| unrepeatable.contains(&name)))
         {
-            return Err("an ORDER BY subquery key naming a SELECT alias");
+            return Err(
+                "an ORDER BY subquery key naming a SELECT alias of a subquery or a volatile item",
+            );
         }
         // A GROUP BY item naming a SELECT alias or position groups that item
         self.parse_group_by(stmt, &[])
@@ -7401,28 +7409,40 @@ impl PreparedGrouped {
         // window's, which raise their error once it runs over a row; an
         // aggregate's input slots are read as the rows group
         let mut window_slots = Vec::new();
-        let mut output =
-            |expr: &Expression, key: Option<&Expression>, window: bool| -> Result<Expression> {
-                if let Some(rewritten) = key {
-                    return Ok(rewritten.clone());
-                }
-                let (first, rewritten) = if !groups {
-                    let first = run_slots.len();
-                    let rewritten =
-                        input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?;
-                    (first, rewritten)
-                } else {
-                    let read = read_inputs(expr, &items, &mut |call| {
-                        input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, call)
-                    })?;
-                    let first = run_slots.len();
-                    (first, rewrite(&mut builder, &chain, &mut run_slots, &read)?)
-                };
-                if window {
-                    window_slots.extend(run_slots[first..].iter().map(|(slot, _)| *slot));
-                }
-                Ok(rewritten)
+        // An ORDER BY key reads the SELECT aliases after the row's columns,
+        // each as its item computed again over the group's row
+        let width = scope.columns.len();
+        let aliases = projected_aliases(stmt, &scope.lower, |_| width);
+        let key_scope = scope.with_items(&aliases);
+        let key_scopes = [&key_scope];
+        let key_chain = Chain {
+            scopes: &key_scopes,
+        };
+        let mut output = |chain: &Chain<'_>,
+                          expr: &Expression,
+                          key: Option<&Expression>,
+                          window: bool|
+         -> Result<Expression> {
+            if let Some(rewritten) = key {
+                return Ok(rewritten.clone());
+            }
+            let (first, rewritten) = if !groups {
+                let first = run_slots.len();
+                let rewritten =
+                    input_rewrite(&mut builder, chain, &mut run_slots, &mut input, expr)?;
+                (first, rewritten)
+            } else {
+                let read = read_inputs(expr, &items, &mut |call| {
+                    input_rewrite(&mut builder, chain, &mut run_slots, &mut input, call)
+                })?;
+                let first = run_slots.len();
+                (first, rewrite(&mut builder, chain, &mut run_slots, &read)?)
             };
+            if window {
+                window_slots.extend(run_slots[first..].iter().map(|(slot, _)| *slot));
+            }
+            Ok(rewritten)
+        };
         // An item holding a subquery keeps the name it is written under
         let mut columns = Vec::with_capacity(stmt.columns.len());
         for (column, key) in stmt.columns.iter().zip(&grouped) {
@@ -7431,14 +7451,14 @@ impl PreparedGrouped {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
-                    expression: Box::new(output(&aliased.expression, key, false)?),
+                    expression: Box::new(output(&chain, &aliased.expression, key, false)?),
                     alias: aliased.alias.clone(),
                 }),
                 column => {
                     let name = item_name(column);
                     Expression::Aliased(AliasedExpression {
                         token: Token::new(TokenType::Identifier, &name, Position::default()),
-                        expression: Box::new(output(column, key, false)?),
+                        expression: Box::new(output(&chain, column, key, false)?),
                         alias: Identifier::new(
                             Token::new(TokenType::Identifier, &name, Position::default()),
                             &name,
@@ -7448,7 +7468,7 @@ impl PreparedGrouped {
             });
         }
         let having = match (&opened_having, stmt.having.as_deref()) {
-            (Some(opened), _) => Some(Box::new(output(opened, None, false)?)),
+            (Some(opened), _) => Some(Box::new(output(&chain, opened, None, false)?)),
             (None, other) => other.map(|having| Box::new(having.clone())),
         };
         // An ORDER BY key holding a subquery is computed for each group into a
@@ -7468,9 +7488,11 @@ impl PreparedGrouped {
                 .iter()
                 .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == column.value))
             {
+                // An alias outside its subqueries reads the item as written
+                let key = with_aliases(&ob.expression, &stmt.columns, &scope.lower);
                 columns.push(Expression::Aliased(AliasedExpression {
                     token,
-                    expression: Box::new(output(&ob.expression, None, false)?),
+                    expression: Box::new(output(&key_chain, &key, None, false)?),
                     alias: column.clone(),
                 }));
             }
@@ -7486,7 +7508,7 @@ impl PreparedGrouped {
                 .chain(def.order_by.iter_mut().map(|ob| &mut ob.expression))
                 .chain(def.frame.iter_mut().flat_map(WindowFrame::offsets_mut));
             for expr in keys.filter(|expr| mentions_subquery(expr)) {
-                *expr = output(expr, None, true)?;
+                *expr = output(&chain, expr, None, true)?;
             }
         }
         let blocks_read = builder.subqueries.len();
@@ -7516,6 +7538,34 @@ impl PreparedGrouped {
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
+        let run_stmt = SelectStatement {
+            columns,
+            having,
+            group_by,
+            where_clause: where_clause
+                .map(Box::new)
+                .or_else(|| stmt.where_clause.clone()),
+            order_by,
+            window_defs,
+            ..stmt.clone()
+        };
+        // The grouped run's row holds the aggregates after the group items,
+        // in the order it parses them from the statement it runs; found once
+        // a hole reads an alias
+        let mut slots = None;
+        // The SELECT item at a position of the projected row
+        let item_at = |position: usize| {
+            let mut at = 0;
+            for column in &stmt.columns {
+                let wide = matches!(column, Expression::Star(_) | Expression::QualifiedStar(_));
+                let next = at + if wide { width } else { 1 };
+                if position < next {
+                    return (!wide).then(|| unaliased(column));
+                }
+                at = next;
+            }
+            None
+        };
         // A group's row holds its GROUP BY items first, each holding the
         // column its key binds to when it is one. A hole reads an item holding
         // the column it binds to: between several, the one the grouped output
@@ -7562,12 +7612,34 @@ impl PreparedGrouped {
             }
             let mut grouped = Vec::with_capacity(sq.hole_written.len());
             for (slot, written) in &sq.hole_written {
-                let read = match chain.resolve(written) {
-                    Ok(Some((_, column))) => match item_of(column, written) {
+                let alias = match key_chain.resolve(written) {
+                    Ok(Some((_, column))) => column.checked_sub(width),
+                    _ => None,
+                };
+                let read = match (alias, chain.resolve(written)) {
+                    (Some(position), _) => {
+                        let item = item_at(position)
+                            .ok_or_else(|| Error::internal("an alias without its item"))?;
+                        if slots.is_none() {
+                            let (aggregations, _) = executor.parse_aggregations(&run_stmt, None)?;
+                            slots = Some(aggregate_slot_keys(
+                                &group_items,
+                                &aggregations,
+                                &run_stmt.columns,
+                            ));
+                        }
+                        match over_items(item, &chain, &item_of, slots.as_ref())
+                            .and_then(|expr| compile_with(&slots_ctx, &expr))
+                        {
+                            Ok(program) => Hole::Program(program),
+                            Err(_) => return Ok(None),
+                        }
+                    }
+                    (None, Ok(Some((_, column)))) => match item_of(column, written) {
                         Some(item) => Hole::Column(item),
                         None => return Ok(None),
                     },
-                    _ => match over_items(written, &chain, &item_of)
+                    _ => match over_items(written, &chain, &item_of, None)
                         .and_then(|expr| compile_with(&slots_ctx, &expr))
                     {
                         Ok(program) => Hole::Program(program),
@@ -7585,18 +7657,7 @@ impl PreparedGrouped {
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
-        let stmt = SelectStatement {
-            columns,
-            having,
-            group_by,
-            where_clause: where_clause
-                .map(Box::new)
-                .or_else(|| stmt.where_clause.clone()),
-            order_by,
-            window_defs,
-            ..stmt.clone()
-        };
-        let stmt = first_branch(stmt);
+        let stmt = first_branch(run_stmt);
         // An argument read once for its call holds only run slots: one reading
         // the row is the general path's to refuse
         // The ORDER BY keys a hidden item computes count with the list
@@ -10907,13 +10968,22 @@ impl StatementSource<'_> {
     }
 }
 
-/// `expr`, read over a group's row: each column it names, resolved in the
-/// `chain`, bound to the group item `item_of` reads it from
+/// `expr`, read over a group's row: each group item or aggregate `slots`
+/// holds read from its slot, and each other column it names, resolved in
+/// the `chain`, bound to the group item `item_of` reads it from
 fn over_items(
     expr: &Expression,
     chain: &Chain<'_>,
     item_of: &dyn Fn(usize, &Expression) -> Option<usize>,
+    slots: Option<&FxHashMap<ExprKey, usize>>,
 ) -> Result<Expression> {
+    if let Some(&slot) = slots.and_then(|slots| slots.get(&ExprKey::of(expr))) {
+        let name = expr.to_string();
+        return Ok(Expression::Column(ColumnRef {
+            index: slot as u32,
+            name: ident(&name, &name),
+        }));
+    }
     match expr {
         Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
             match chain.resolve(expr)? {
@@ -10929,7 +10999,7 @@ fn over_items(
                 }
             }
         }
-        other => rebuild(other, &mut |child| over_items(child, chain, item_of)),
+        other => rebuild(other, &mut |child| over_items(child, chain, item_of, slots)),
     }
 }
 
