@@ -1642,6 +1642,9 @@ impl Executor {
             if !self.holds_prepared_select(slot, ctx)
                 && !self.holds_prepared_grouped(slot, ctx)
                 && self.prepared_family(stmt, Some(ctx)).is_err()
+                && !(slot.is_some()
+                    && self.reads_source(stmt, ctx)
+                    && self.planned_family(stmt, Some(ctx)).is_ok())
                 && !grouped()
                 && !self.join_keeps_plan(stmt, with)
             {
@@ -1705,11 +1708,15 @@ impl Executor {
             None => get_classification(stmt),
         };
 
-        // A statement of the prepared family runs on that path and no other
+        // A statement of the prepared family runs on that path and no other,
+        // and so does one over a single source with a plan slot to keep
         let slot = compiled.map(NestedPlan::slot);
         let in_family = self.holds_prepared_select(slot, ctx)
             || ((classification.where_has_subqueries || classification.output_has_subqueries)
-                && self.prepared_family(stmt, Some(ctx)).is_ok());
+                && self.prepared_family(stmt, Some(ctx)).is_ok())
+            || (slot.is_some()
+                && self.reads_source(stmt, ctx)
+                && self.planned_family(stmt, Some(ctx)).is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
         // them as its blocks
         let grouped_family = Self::grouped_family_reach(stmt, &classification)
@@ -8128,20 +8135,24 @@ impl Executor {
             .put(view_query, stmt_arc, ParamSlots::default()))
     }
 
+    /// Refuse a view read one view too deep, before its nesting overflows the stack
+    pub(super) fn check_view_depth(ctx: &ExecutionContext) -> Result<()> {
+        if ctx.view_depth() >= MAX_VIEW_DEPTH {
+            return Err(Error::InvalidArgument(format!(
+                "Maximum view nesting depth ({}) exceeded",
+                MAX_VIEW_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
     /// The rows of a view's own query, one view deeper than `ctx`
     pub(super) fn execute_view_body(
         &self,
         view_def: &ViewDefinition,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        // Check view depth to prevent stack overflow from deeply nested views
-        let depth = ctx.view_depth();
-        if depth >= MAX_VIEW_DEPTH {
-            return Err(Error::InvalidArgument(format!(
-                "Maximum view nesting depth ({}) exceeded",
-                MAX_VIEW_DEPTH
-            )));
-        }
+        Self::check_view_depth(ctx)?;
 
         // Parse the view's query using cache (an Arc clone of its plan, no clone)
         let view_plan = self.parse_view_statement(&view_def.query)?;

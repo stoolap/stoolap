@@ -341,6 +341,21 @@ impl Executor {
         Ok(cte_registry)
     }
 
+    /// The CTE of `registry` the CTE body `stmt` reads when the CTE path can
+    /// finish it on its own; None for a body execute_select runs, which
+    /// handles set operations and the rest
+    pub(super) fn cte_result_source<'r>(
+        &self,
+        stmt: &SelectStatement,
+        registry: &'r CteRegistry,
+    ) -> Option<&'r CteData> {
+        if !Self::cte_result_path_finishes(stmt) {
+            return None;
+        }
+        let name = self.extract_cte_name_for_lookup(stmt.table_expr.as_deref()?)?;
+        registry.get(&name)
+    }
+
     /// Execute a single CTE query, under `plan` when it holds one
     fn execute_cte_query(
         &self,
@@ -349,29 +364,19 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
     ) -> Result<(Vec<String>, RowVec)> {
-        // Check if the CTE references another CTE
-        if let Some(ref table_expr) = stmt.table_expr {
-            // First check for simple CTE reference, when the CTE path can
-            // finish the statement on its own; otherwise fall through to
-            // execute_select, which handles set operations and the rest
-            if Self::cte_result_path_finishes(stmt) {
-                if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
-                    if let Some((columns, rows)) = cte_registry.get(&cte_name) {
-                        // Execute query against CTE result
-                        // Clone Arc data into RowVec for processing
-                        // A subquery in the statement reads the earlier
-                        // CTEs through the context
-                        let counted = self.read_volatile_counts(stmt, ctx, None)?;
-                        let ctx = counted.as_ref().unwrap_or(ctx);
-                        return self.execute_query_on_cte_result(
-                            stmt,
-                            &ctx.with_cte_data(cte_registry.data()),
-                            columns.to_vec(),
-                            RowVec::from_vec((**rows).clone()),
-                        );
-                    }
-                }
-            }
+        if let Some((columns, rows)) = self.cte_result_source(stmt, cte_registry) {
+            // Execute query against CTE result
+            // Clone Arc data into RowVec for processing
+            // A subquery in the statement reads the earlier
+            // CTEs through the context
+            let counted = self.read_volatile_counts(stmt, ctx, None)?;
+            let ctx = counted.as_ref().unwrap_or(ctx);
+            return self.execute_query_on_cte_result(
+                stmt,
+                &ctx.with_cte_data(cte_registry.data()),
+                columns.to_vec(),
+                RowVec::from_vec((**rows).clone()),
+            );
         }
 
         // Execute as a normal SELECT and materialize

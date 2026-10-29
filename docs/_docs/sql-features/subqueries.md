@@ -354,6 +354,8 @@ JOIN (
 ) AS order_summary ON c.id = order_summary.customer_id;
 ```
 
+A derived table's rows are read as the outer query needs them, as a view's are. A LIMIT without ORDER BY stops reading once it has its rows, so a row past it is never computed, and a value that would fail in that row raises no error.
+
 ### Subqueries in UPDATE SET Clause
 
 Scalar subqueries can be used in the SET clause of UPDATE statements:

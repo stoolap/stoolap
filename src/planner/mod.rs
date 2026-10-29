@@ -64,6 +64,9 @@ pub enum Read {
         otherwise: Option<ScanChoice>,
         sort: Step,
     },
+    /// The rows of what the FROM names in place of a table, each judged by
+    /// the whole WHERE: its line as EXPLAIN names it
+    Source(String),
 }
 
 impl Read {
@@ -71,7 +74,7 @@ impl Read {
     /// key read or a scan the table chooses
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
-            Self::PkGet(_) => None,
+            Self::PkGet(_) | Self::Source(_) => None,
             Self::Scan(scan)
             | Self::Ordered {
                 otherwise: scan, ..
@@ -104,6 +107,8 @@ pub struct PlanText<'a> {
     pub empty_unless: Option<String>,
     /// The read a run takes when a key read declines it
     pub otherwise: Vec<String>,
+    /// The plan of the statement a source's rows come from
+    pub body: Vec<String>,
 }
 
 impl Plan {
@@ -162,6 +167,14 @@ impl Plan {
                         .into_iter()
                         .map(|l| format!("  {l}")),
                 );
+            }
+            (Read::Source(source), _) => {
+                let line = match text.pushed {
+                    Some(pushed) => format!("{source} {pushed}"),
+                    None => source.clone(),
+                };
+                alternative(&mut read, line);
+                read.extend(text.body.iter().map(|l| format!("  {l}")));
             }
             (other, _) => {
                 for (at, line) in scan(other.scan()).into_iter().enumerate() {
@@ -222,6 +235,7 @@ impl SelectPlan {
             ordered: None,
             empty_unless: None,
             otherwise,
+            body: Vec::new(),
         })
     }
 }

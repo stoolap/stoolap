@@ -69,7 +69,7 @@ use super::query::{
 use super::query_cache::{CompiledExecution, NestedPlan, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
-    DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
+    AliasedResult, DistinctRows, ExecutorResult, FilteredResult, ProjectionResult, ScannerResult,
 };
 use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
@@ -866,6 +866,33 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
+        self.family(stmt, ctx, true)
+    }
+
+    /// Whether the runner reads `stmt`, a statement over one source that
+    /// may hold no subquery, or why not
+    pub(crate) fn planned_family(
+        &self,
+        stmt: &SelectStatement,
+        ctx: Option<&ExecutionContext>,
+    ) -> std::result::Result<(), OutOfFamily> {
+        if matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_))) {
+            return Err("a join");
+        }
+        if Self::vector_distance_order(stmt).is_some() {
+            return Err("an ORDER BY of a vector distance");
+        }
+        self.family(stmt, ctx, false)
+    }
+
+    /// [`Self::prepared_family`], which with `needs_subquery` takes only a
+    /// statement holding one
+    fn family(
+        &self,
+        stmt: &SelectStatement,
+        ctx: Option<&ExecutionContext>,
+        needs_subquery: bool,
+    ) -> std::result::Result<(), OutOfFamily> {
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
@@ -910,7 +937,7 @@ impl Executor {
                 family.expression(key, 1, Site::Subqueries, &mut found)?;
             }
         }
-        if !found {
+        if needs_subquery && !found {
             return Err("no WHERE, SELECT list, ORDER BY or DISTINCT ON subquery");
         }
         let aliases: SmallVec<[&str; 4]> = stmt
@@ -1419,6 +1446,9 @@ struct StatementWalk<'w> {
     executor: &'w Executor,
     ctx: &'w ExecutionContext,
     on: &'w mut dyn FnMut(Reach<'_>) -> Result<Option<Expression>>,
+    /// Whether a view whose query only its run can name may run here; an
+    /// EXPLAIN runs nothing
+    runs: bool,
 }
 
 impl StatementWalk<'_> {
@@ -1598,22 +1628,25 @@ impl StatementWalk<'_> {
             Expression::TableSource(ts) => {
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
                 let lower = &ts.name.value_lower;
-                if let Some((columns, _)) = self.ctx.get_cte_by_lower(lower) {
-                    untyped(&name, columns)
-                } else if let Some(view) = self.executor.engine.get_view_lowercase(lower)? {
-                    untyped(&name, &view_names(self.executor, &view, self.ctx)?)
-                } else {
-                    let schema =
-                        self.executor
-                            .engine
-                            .get_table_schema(lower)
-                            .map_err(|e| match e {
-                                Error::TableNotFound(_) => {
-                                    Error::TableOrViewNotFound(ts.name.value.to_string())
-                                }
-                                other => other,
-                            })?;
-                    ScopeTable::of(name, &schema)
+                match self.executor.named(self.ctx, lower)? {
+                    Named::Cte((columns, _)) => untyped(&name, columns),
+                    Named::View(view) => untyped(
+                        &name,
+                        &view_names(self.executor, &view, self.ctx, self.runs)?,
+                    ),
+                    Named::Table => {
+                        let schema =
+                            self.executor
+                                .engine
+                                .get_table_schema(lower)
+                                .map_err(|e| match e {
+                                    Error::TableNotFound(_) => {
+                                        Error::TableOrViewNotFound(ts.name.value.to_string())
+                                    }
+                                    other => other,
+                                })?;
+                        ScopeTable::of(name, &schema)
+                    }
                 }
             }
             Expression::ValuesSource(values) => {
@@ -1879,14 +1912,24 @@ fn named(names: Option<Vec<String>>) -> Result<Vec<String>> {
 }
 
 /// The names of `view`'s columns, recorded when it was created; a view
-/// recorded without them runs once here, which records them
+/// recorded without them runs once here when it `runs`, which records them,
+/// else takes the names its query gives without running it
 fn view_names(
     executor: &Executor,
     view: &ViewDefinition,
     ctx: &ExecutionContext,
+    runs: bool,
 ) -> Result<Vec<String>> {
     if let Some(columns) = view.columns() {
         return Ok(columns.to_vec());
+    }
+    if !runs {
+        Executor::check_view_depth(ctx)?;
+        let plan = executor.parse_view_statement(&view.query)?;
+        let Statement::Select(select) = plan.statement.as_ref() else {
+            return Err(Error::internal("a view's query is not a SELECT"));
+        };
+        return executor.statement_names(select, &ctx.with_incremented_view_depth());
     }
     let mut result = executor.execute_view_body(view, ctx)?;
     let columns = result.columns().to_vec();
@@ -3219,13 +3262,24 @@ pub struct PlanInputs {
 }
 
 impl PreparedSelect {
-    /// The plan of a statement the planner reads by a scan of `table`, as
-    /// EXPLAIN shows it; None when the table chooses how it reads
-    pub(crate) fn explain(&self, stmt: &SelectStatement, table: &str) -> Option<Vec<String>> {
+    /// The plan of a statement the planner reads by a scan of `table` or
+    /// over a source whose statement's plan is `body`, as EXPLAIN shows it;
+    /// None when the table chooses how it reads
+    pub(crate) fn explain(
+        &self,
+        stmt: &SelectStatement,
+        table: &str,
+        body: Vec<String>,
+    ) -> Option<Vec<String>> {
         let plan = self
             .plan
             .as_ref()
-            .filter(|plan| plan.read.scan().is_some())?;
+            .filter(|plan| plan.read.scan().is_some() || matches!(plan.read, Read::Source(_)))?;
+        // A source's rows are each judged by the whole WHERE
+        let pushed = match plan.read {
+            Read::Source(_) => stmt.where_clause.as_deref(),
+            _ => self.where_.pushdown.as_ref(),
+        };
         let keys = (!stmt.order_by.is_empty()).then(|| {
             let keys: Vec<String> = stmt.order_by.iter().map(|o| o.to_string()).collect();
             keys.join(", ")
@@ -3254,11 +3308,12 @@ impl PreparedSelect {
                 offset,
                 keys,
                 names: &self.output_columns[..self.visible],
-                pushed: self.where_.pushdown.as_ref(),
+                pushed,
                 ordered: Executor::ordered_read_column(stmt)
                     .map(|(column, ascending, _)| (column, ascending)),
                 empty_unless,
                 otherwise: Vec::new(),
+                body,
             }),
         )
     }
@@ -4416,6 +4471,7 @@ impl Builder<'_> {
                 }
                 Reach::Param(_) => Ok(None),
             },
+            runs: true,
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
@@ -4573,6 +4629,7 @@ impl Builder<'_> {
                     Ok(None)
                 }
             },
+            runs: true,
         }
         .statement(sq, outer, 0, Check::All)?;
         self.max_param = self.max_param.max(max_param);
@@ -4995,18 +5052,19 @@ impl Builder<'_> {
     /// general path reads them, with its columns; None for a table. A view
     /// is read when a call first needs it
     fn named_source(&self, name: &str) -> Result<Option<NamedSource>> {
-        if let Some((columns, _)) = self.ctx.get_cte_by_lower(name) {
-            return Ok(Some((BlockSource::Cte(name.into()), columns.to_vec())));
-        }
-        let Some(view) = self.executor.engine.get_view_lowercase(name)? else {
-            return Ok(None);
+        let view = match self.executor.named(self.ctx, name)? {
+            Named::Cte((columns, _)) => {
+                return Ok(Some((BlockSource::Cte(name.into()), columns.to_vec())))
+            }
+            Named::View(view) => view,
+            Named::Table => return Ok(None),
         };
         let parsed = self.executor.parse_view_statement(&view.query)?;
         let tables = match parsed.statement.as_ref() {
             Statement::Select(select) => self.executor.read_tables(select),
             _ => None,
         };
-        let named = view_names(self.executor, &view, self.ctx)?;
+        let named = view_names(self.executor, &view, self.ctx, true)?;
         let source = BlockSource::View(name.into(), tables, view.query.clone());
         Ok(Some((source, named)))
     }
@@ -6673,8 +6731,19 @@ impl PreparedSelect {
             false => Step::Sort,
         };
         let mut where_ = parts.prepare(where_programs, &blocks, schema);
+        let mut steps = SmallVec::new();
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            steps.push(Step::Limit);
+        }
         let mut plan = None;
-        if where_.sets.is_empty() && where_.narrowing.is_none() {
+        if let Some(source) = executor.source_line(stmt, ctx)? {
+            if !stmt.order_by.is_empty() {
+                steps.push(sort);
+            }
+            steps.push(Step::Project);
+            let read = Read::Source(source);
+            plan = Some(Plan { steps, read });
+        } else if where_.sets.is_empty() && where_.narrowing.is_none() {
             if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
                 let mut scan = None;
                 if blocks.subqueries.is_empty() {
@@ -6697,10 +6766,6 @@ impl PreparedSelect {
                             stmt.offset.is_some(),
                         )
                     });
-                let mut steps = SmallVec::new();
-                if stmt.limit.is_some() || stmt.offset.is_some() {
-                    steps.push(Step::Limit);
-                }
                 if ordered.is_none() && !stmt.order_by.is_empty() {
                     steps.push(sort);
                 }
@@ -6813,6 +6878,9 @@ impl GroupedRun<'_> {
         let Some((run, where_)) = run.zip(where_) else {
             let rows = match source {
                 StatementSource::Rows(_, rows) => rows,
+                StatementSource::Stream(_, mut result) => {
+                    result_rows(&mut *result).collect::<Result<_>>()?
+                }
                 StatementSource::Values(_, values) => (0i64..)
                     .zip(&values.rows)
                     .map(|(id, exprs)| Executor::values_row(exprs, ctx).map(|row| (id, row)))
@@ -6834,6 +6902,9 @@ impl GroupedRun<'_> {
         let read = match source {
             StatementSource::Rows(_, source) => {
                 run.rows_passing(where_, source.into_iter().map(Ok), ctx, None, keep)
+            }
+            StatementSource::Stream(_, mut result) => {
+                run.rows_passing(where_, result_rows(&mut *result), ctx, None, keep)
             }
             StatementSource::Values(_, values) => run.rows_passing(
                 where_,
@@ -8221,6 +8292,7 @@ impl Executor {
             executor: self,
             ctx,
             on: &mut on,
+            runs: true,
         };
         let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
         let name = scope.tables.first().map(|(name, _)| name.as_str());
@@ -8259,6 +8331,7 @@ impl Executor {
                         executor: self,
                         ctx: &ctx,
                         on: &mut on,
+                        runs: true,
                     };
                     named(walk.statement(query, &[], 0, Check::Off)?.1)?
                 }
@@ -8861,6 +8934,7 @@ fn sides_read_within(
         executor,
         ctx,
         on: &mut on,
+        runs: true,
     };
     walk.subqueries_of(expr, &[scope])?;
     Ok(read)
@@ -9124,7 +9198,217 @@ impl Builder<'_> {
     }
 }
 
+/// What a name in a FROM reads
+enum Named<'c> {
+    Cte(&'c super::cte::CteData),
+    View(Arc<ViewDefinition>),
+    Table,
+}
+
 impl Executor {
+    /// What `name` reads in `ctx`: a CTE the context holds before a view,
+    /// and a view before a table
+    fn named<'c>(&self, ctx: &'c ExecutionContext, name: &str) -> Result<Named<'c>> {
+        if let Some(cte) = ctx.get_cte_by_lower(name) {
+            return Ok(Named::Cte(cte));
+        }
+        Ok(match self.engine.get_view_lowercase(name)? {
+            Some(view) => Named::View(view),
+            None => Named::Table,
+        })
+    }
+
+    /// Whether `stmt` reads one source that is not a table: a CTE, a view, a
+    /// derived table, a VALUES list, a table function, or no FROM
+    pub(crate) fn reads_source(&self, stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
+        match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => !matches!(
+                self.named(ctx, &ts.name.value_lower),
+                Ok(Named::Table) | Err(_)
+            ),
+            Some(Expression::JoinSource(_)) => false,
+            _ => true,
+        }
+    }
+
+    /// What EXPLAIN names `stmt`'s FROM by when it reads no table, or no
+    /// FROM; None for a table or a join
+    fn source_line(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<String>> {
+        let named = |kind: &str, alias: &Option<Identifier>| match alias {
+            Some(alias) => format!("{kind} {}", alias.value_lower),
+            None => kind.to_string(),
+        };
+        Ok(Some(match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => match self.named(ctx, &ts.name.value_lower)? {
+                Named::Cte(_) => format!("Cte {}", ts.name.value_lower),
+                Named::View(_) => format!("View {}", ts.name.value_lower),
+                Named::Table => return Ok(None),
+            },
+            Some(Expression::SubquerySource(derived)) => named("Derived", &derived.alias),
+            Some(Expression::ValuesSource(values)) => named("Values", &values.alias),
+            Some(Expression::FunctionTableSource(function)) => {
+                format!("Function {}", function.function.value_lower)
+            }
+            None => "OneRow".to_string(),
+            Some(_) => return Ok(None),
+        }))
+    }
+
+    /// The plan of `stmt`, which the runner reads over a source or after its
+    /// WITH, as EXPLAIN shows it; None for a statement the plan cannot show
+    pub(crate) fn explain_over_source(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<Vec<String>> {
+        // A statement with a subquery prints as a table's does, with its blocks
+        let shape = get_classification(stmt);
+        if shape.where_has_subqueries
+            || shape.output_has_subqueries
+            || self.planned_family(stmt, Some(ctx)).is_err()
+            || stmt.distinct
+            || !stmt.distinct_on.is_empty()
+            || !stmt.set_operations.is_empty()
+        {
+            return None;
+        }
+        let Some(with) = stmt.with.as_ref() else {
+            return self.explain_source(stmt, ctx, &[]);
+        };
+        if let Some(inlined) = self.try_inline_ctes(stmt, with) {
+            return Some(self.explain_lines(&inlined, ctx));
+        }
+        // Each CTE named before the statement runs, its rows left empty
+        let mut registry = super::cte::CteRegistry::new();
+        let mut bodies = Vec::with_capacity(with.ctes.len());
+        for cte in &with.ctes {
+            if cte.is_recursive {
+                return None;
+            }
+            let ctes = ctx.with_cte_data(registry.data());
+            let mut names = self.statement_names(&cte.query, &ctes).ok()?;
+            if !cte.column_names.is_empty() {
+                if cte.column_names.len() != names.len() {
+                    return None;
+                }
+                names = cte
+                    .column_names
+                    .iter()
+                    .map(|c| c.value.to_string())
+                    .collect();
+            }
+            let body = match self.cte_result_source(&cte.query, &registry) {
+                Some(_) => self.general_explain(&cte.query),
+                None => self.explain_lines(&cte.query, &ctes),
+            };
+            bodies.push((cte.name.value_lower.clone(), body));
+            registry.store(&cte.name.value, names, RowVec::new());
+        }
+        self.explain_source(stmt, &ctx.with_cte_data(registry.data()), &bodies)
+    }
+
+    /// The plan of `stmt` over its one source, the CTEs of its WITH planned
+    /// as `bodies`
+    fn explain_source(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        bodies: &[(SmartString, Vec<String>)],
+    ) -> Option<Vec<String>> {
+        let inner_ctx = ctx.with_incremented_query_depth();
+        let scope = |alias: &Option<Identifier>| {
+            alias
+                .as_ref()
+                .map(|a| a.value_lower.clone())
+                .unwrap_or_default()
+        };
+        let (columns, scope, body) = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => {
+                let name = &ts.name.value_lower;
+                let scope = ts.alias.as_ref().map_or(name, |a| &a.value_lower).clone();
+                match self.named(ctx, name).ok()? {
+                    Named::Cte((columns, _)) => {
+                        let body = bodies.iter().find(|(cte, _)| cte == name);
+                        let body = body.map(|(_, body)| body.clone()).unwrap_or_default();
+                        (columns.to_vec(), scope, body)
+                    }
+                    Named::View(view) => {
+                        let names = view_names(self, &view, &inner_ctx, false).ok()?;
+                        let plan = self.parse_view_statement(&view.query).ok()?;
+                        let Statement::Select(select) = plan.statement.as_ref() else {
+                            return None;
+                        };
+                        let body =
+                            self.explain_lines(select, &inner_ctx.with_incremented_view_depth());
+                        (names, scope, body)
+                    }
+                    Named::Table => return None,
+                }
+            }
+            Some(Expression::SubquerySource(derived)) => {
+                let names = self.statement_names(&derived.subquery, &inner_ctx).ok()?;
+                let body = self.explain_lines(&derived.subquery, &inner_ctx);
+                (names, scope(&derived.alias), body)
+            }
+            Some(Expression::ValuesSource(values)) => (
+                Self::values_columns(values),
+                scope(&values.alias),
+                Vec::new(),
+            ),
+            Some(Expression::FunctionTableSource(function)) => {
+                let name = function.alias.as_ref().unwrap_or(&function.function);
+                let columns = Self::tvf_columns(function).ok()?;
+                (columns, name.value_lower.clone(), Vec::new())
+            }
+            None => (Vec::new(), SmartString::new(""), Vec::new()),
+            Some(_) => return None,
+        };
+        let schema = untyped_schema(&scope, &columns);
+        let epoch = self.engine.schema_epoch();
+        let params = ctx.params().len();
+        let prepared =
+            PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch).ok()?;
+        prepared.explain(stmt, &scope, body)
+    }
+
+    /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
+    /// the runner's for a statement over a source, else the general path's,
+    /// which runs every other one
+    fn explain_lines(&self, stmt: &SelectStatement, ctx: &ExecutionContext) -> Vec<String> {
+        self.reads_source(stmt, ctx)
+            .then(|| self.explain_over_source(stmt, ctx))
+            .flatten()
+            .unwrap_or_else(|| self.general_explain(stmt))
+    }
+
+    /// The general path's EXPLAIN of `stmt`
+    fn general_explain(&self, stmt: &SelectStatement) -> Vec<String> {
+        let mut lines = Vec::new();
+        self.explain_statement(&Statement::Select(stmt.clone()), &mut lines, 0);
+        lines
+    }
+
+    /// The names `stmt`'s rows have, read from the catalog and `ctx`
+    /// without running it
+    fn statement_names(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<String>> {
+        let (_, names, _) = StatementWalk {
+            executor: self,
+            ctx,
+            on: &mut |_| Ok(None),
+            runs: false,
+        }
+        .statement(stmt, &[], 0, Check::Off)?;
+        named(names)
+    }
+
     /// The tables `select` reads, unknown when one of them is a view or it
     /// reads anything else
     fn read_tables(&self, select: &SelectStatement) -> Option<Vec<SmartString>> {
@@ -9536,10 +9820,10 @@ impl Executor {
     }
 
     /// What `stmt` reads its rows from, and the name its scope bears: None
-    /// for a base table, left closed; else a CTE's rows, a VALUES list, or a
-    /// view's, a derived table's or a table function's rows, read once under
-    /// the statement's snapshot, before a plan is taken, a derived table
-    /// under its own in `plan`, or without FROM the one row without columns.
+    /// for a base table, left closed; else a CTE's rows, a VALUES list, a
+    /// view's or a derived table's rows as its query streams them, a derived
+    /// table under its own plan in `plan`, a table function's rows read once,
+    /// or without FROM the one row without columns.
     /// A table function generates at most `first` rows when the caller
     /// needs no more
     fn read_source<'s>(
@@ -9554,21 +9838,13 @@ impl Executor {
         Ok(match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = &ts.name.value_lower;
-                // A CTE comes before a view, and a view before a table, of
-                // one name, as the general path reads them
-                let source = match ctx.get_cte_by_lower(name) {
-                    Some(cte) => Some(StatementSource::Cte(cte)),
-                    None => match self.engine.get_view_lowercase(name)? {
-                        Some(view) => {
-                            let result = self.execute_view_body(&view, inner_ctx)?;
-                            let columns = result.columns().to_vec();
-                            Some(StatementSource::Rows(
-                                columns,
-                                Self::materialize_result(result)?,
-                            ))
-                        }
-                        None => None,
-                    },
+                let source = match self.named(ctx, name)? {
+                    Named::Cte(cte) => Some(StatementSource::Cte(cte)),
+                    Named::View(view) => {
+                        let result = self.execute_view_body(&view, inner_ctx)?;
+                        Some(StatementSource::Stream(result.columns().to_vec(), result))
+                    }
+                    Named::Table => None,
                 };
                 let scope = ts.alias.as_ref().map_or(name, |alias| &alias.value_lower);
                 (source, Some(scope))
@@ -9578,8 +9854,10 @@ impl Executor {
                 let result =
                     self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan, None)?;
                 let columns = result.columns().to_vec();
-                let rows = Self::materialize_result(result)?;
-                (Some(StatementSource::Rows(columns, rows)), named(&ss.alias))
+                (
+                    Some(StatementSource::Stream(columns, result)),
+                    named(&ss.alias),
+                )
             }
             Some(Expression::ValuesSource(values)) => (
                 Some(StatementSource::Values(
@@ -9707,12 +9985,17 @@ impl Executor {
                 table_columns = table.schema().column_names_arc();
                 &table_columns
             }
-            StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => columns,
+            StatementSource::Rows(columns, _)
+            | StatementSource::Stream(columns, _)
+            | StatementSource::Values(columns, _) => columns,
             StatementSource::Cte((columns, _)) => columns,
         };
         let schema = || match &source {
             StatementSource::Table(table) => std::borrow::Cow::Borrowed(table.schema()),
-            StatementSource::Rows(..) | StatementSource::Values(..) | StatementSource::Cte(_) => {
+            StatementSource::Rows(..)
+            | StatementSource::Stream(..)
+            | StatementSource::Values(..)
+            | StatementSource::Cte(_) => {
                 std::borrow::Cow::Owned(untyped_schema(scope_name, columns))
             }
         };
@@ -9740,9 +10023,20 @@ impl Executor {
         let statement_limit = limit
             .filter(|_| stmt.order_by.is_empty())
             .map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
+        // A subquery's probe is chosen by the statement's row count
+        let source = match source {
+            StatementSource::Stream(columns, mut result)
+                if !prepared.blocks.subqueries.is_empty() =>
+            {
+                let rows = result_rows(&mut *result).collect::<Result<_>>()?;
+                StatementSource::Rows(columns, rows)
+            }
+            source => source,
+        };
         let statement_rows = match &source {
             StatementSource::Table(table) => table.row_count_hint(),
             StatementSource::Rows(_, rows) => rows.len(),
+            StatementSource::Stream(_, result) => result.estimated_count().unwrap_or(0),
             StatementSource::Values(_, values) => values.rows.len(),
             StatementSource::Cte((_, rows)) => rows.len(),
         };
@@ -9878,62 +10172,32 @@ impl Executor {
             && !stmt.order_by.is_empty()
             && distinct.is_none()
             && !prepared.asks_blocks();
-        let read = match (ordered, source) {
-            _ if keeps_none => Ok(Passing::Pruned),
-            (Some(rows), _) => Ok(Passing::Answers(rows)),
-            (None, StatementSource::Table(table)) => runner.passing_rows(
-                (
-                    &prepared.where_,
-                    prepared.plan.as_ref().and_then(|plan| plan.read.scan()),
-                ),
-                None,
-                &*table,
-                ctx,
-                target,
-                match (sorts || sorts_all, distinct.is_some() || flows) {
-                    (true, _) => Take::Collected,
-                    (false, true) => Take::Stream,
-                    (false, false) => Take::Kept,
-                },
-                &mut keep,
-            ),
-            (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
-                &prepared.where_,
-                rows.into_iter().map(Ok),
-                ctx,
-                target,
-                &mut keep,
-            ),
-            (None, StatementSource::Values(_, values)) => runner.rows_passing(
-                &prepared.where_,
-                (0i64..)
-                    .zip(&values.rows)
-                    .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
-                ctx,
-                target,
-                &mut keep,
-            ),
-            (None, StatementSource::Cte((_, rows))) => runner.rows_passing(
-                &prepared.where_,
-                rows.iter().map(|(id, row)| Ok((*id, row))),
-                ctx,
-                target,
-                &mut keep,
-            ),
+        let take = match (sorts || sorts_all, distinct.is_some() || flows) {
+            (true, _) => Take::Collected,
+            (false, true) => Take::Stream,
+            (false, false) => Take::Kept,
         };
-        let streamed = |scan: Box<dyn Scanner>,
-                        bound: Option<SharedProgram>|
-         -> Result<PreparedOutput> {
+        let streamed = |flow: Flow, bound: Option<SharedProgram>| -> Result<PreparedOutput> {
             // A flowing read: the general path's scan, filter and projection
             let Some(distinct) = distinct else {
-                let names = match projection.whole_row {
-                    true => &output_columns,
-                    false => &prepared.columns,
+                let mut rows: Box<dyn QueryResult> = match flow {
+                    Flow::Scan(scan) => {
+                        let names = match projection.whole_row {
+                            true => &output_columns,
+                            false => &prepared.columns,
+                        };
+                        Box::new(
+                            ScannerResult::new(scan, CompactArc::clone(names))
+                                .with_cancel(ctx.cancellation_handle()),
+                        )
+                    }
+                    Flow::Source(rows)
+                        if projection.whole_row && rows.columns() != output_columns.as_slice() =>
+                    {
+                        Box::new(AliasedResult::renamed(rows, output_columns.to_vec()))
+                    }
+                    Flow::Source(rows) => rows,
                 };
-                let mut rows: Box<dyn QueryResult> = Box::new(
-                    ScannerResult::new(scan, CompactArc::clone(names))
-                        .with_cancel(ctx.cancellation_handle()),
-                );
                 if let Some(bound) = bound {
                     let mut filter = RowFilter::from_program(bound).with_context(ctx);
                     // The values the run computed once sit past the statement's own
@@ -9967,6 +10231,10 @@ impl Executor {
                     false,
                 ));
             };
+            let scan = match flow {
+                Flow::Scan(scan) => scan,
+                Flow::Source(rows) => Box::new(SourceScanner::new(rows)),
+            };
             // Without an ORDER BY the first rows a LIMIT keeps end the read;
             // a set operation's LIMIT counts its own rows, not the branch's
             let branch = !stmt.set_operations.is_empty();
@@ -9984,6 +10252,65 @@ impl Executor {
                 prepared.layout.clone(),
                 true,
             ))
+        };
+        let read = match (ordered, source) {
+            _ if keeps_none => Ok(Passing::Pruned),
+            (Some(rows), _) => Ok(Passing::Answers(rows)),
+            (None, StatementSource::Table(table)) => runner.passing_rows(
+                (
+                    &prepared.where_,
+                    prepared.plan.as_ref().and_then(|plan| plan.read.scan()),
+                ),
+                None,
+                &*table,
+                ctx,
+                target,
+                take,
+                &mut keep,
+            ),
+            (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
+                &prepared.where_,
+                rows.into_iter().map(Ok),
+                ctx,
+                target,
+                &mut keep,
+            ),
+            (None, StatementSource::Stream(_, mut result)) => {
+                let filtered = stmt.where_clause.is_some();
+                match runner.source_scan(&prepared.where_, filtered, take) {
+                    Some(bound) if take == Take::Stream => {
+                        return streamed(Flow::Source(result), bound)
+                    }
+                    Some(None) => Ok(Passing::Scan(Box::new(SourceScanner::new(result)))),
+                    Some(Some(bound)) => Ok(Passing::Filtered(
+                        Box::new(SourceScanner::new(result)),
+                        bound,
+                    )),
+                    None => runner.rows_passing(
+                        &prepared.where_,
+                        result_rows(&mut *result),
+                        ctx,
+                        target,
+                        &mut keep,
+                    ),
+                }
+            }
+            (None, StatementSource::Values(_, values)) => runner.rows_passing(
+                &prepared.where_,
+                (0i64..)
+                    .zip(&values.rows)
+                    .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
+                ctx,
+                target,
+                &mut keep,
+            ),
+            (None, StatementSource::Cte((_, rows))) => runner.rows_passing(
+                &prepared.where_,
+                rows.iter().map(|(id, row)| Ok((*id, row))),
+                ctx,
+                target,
+                &mut keep,
+            ),
         };
         let mut scanned = None;
         let mut rows = match read? {
@@ -10007,8 +10334,8 @@ impl Executor {
             Passing::Filtered(scan, bound) if sorts_all || sorts => {
                 runner.drain(scan, Some(bound))?
             }
-            Passing::Filtered(scan, bound) => return streamed(scan, Some(bound)),
-            Passing::Scan(scan) if !sorts => return streamed(scan, None),
+            Passing::Filtered(scan, bound) => return streamed(Flow::Scan(scan), Some(bound)),
+            Passing::Scan(scan) if !sorts => return streamed(Flow::Scan(scan), None),
             Passing::Scan(scan) => {
                 scanned = Some(SortInput::Scan(scan));
                 RowVec::new()
@@ -10055,6 +10382,13 @@ impl Executor {
     }
 }
 
+/// The rows a flowing read hands on as they come: a table's scan, or a
+/// source's own stream
+enum Flow {
+    Scan(Box<dyn Scanner>),
+    Source(Box<dyn QueryResult>),
+}
+
 /// The rows a sort reads: collected, or a scan that took the whole WHERE
 enum SortInput<'a> {
     Rows(&'a RowVec),
@@ -10085,6 +10419,22 @@ fn top_rows(
     Ok((0i64..).zip(top.into_rows()).collect())
 }
 
+/// The rows of `result` as it reads them, then its error, if it failed
+fn result_rows(result: &mut dyn QueryResult) -> impl Iterator<Item = Result<(i64, Row)>> + '_ {
+    let mut read = 0i64..;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        if result.next() {
+            return read.next().map(|id| Ok((id, result.take_row())));
+        }
+        done = true;
+        result.last_error().map(Err)
+    })
+}
+
 /// A row a source hands the runner: its own, or one it lends, copied only
 /// when the WHERE keeps it
 trait SourceRow {
@@ -10113,8 +10463,12 @@ impl SourceRow for &Row {
 /// What a prepared statement reads its rows from
 enum StatementSource<'s> {
     Table(Box<dyn Table>),
-    /// A derived table's columns and rows, read once
+    /// Columns and rows read once: a table function's, or a stream's whose
+    /// statement's subqueries ask how many rows it reads
     Rows(Vec<String>, RowVec),
+    /// A view's or a derived table's columns and rows, read as the WHERE
+    /// reads them
+    Stream(Vec<String>, Box<dyn QueryResult>),
     /// A VALUES list's columns and rows, each evaluated as the WHERE reads it
     Values(Vec<String>, &'s ValuesTableSource),
     /// A CTE's columns and rows, materialized by the statement's WITH
@@ -10126,9 +10480,9 @@ impl StatementSource<'_> {
     fn columns(&self) -> Option<&[String]> {
         match self {
             StatementSource::Table(_) => None,
-            StatementSource::Rows(columns, _) | StatementSource::Values(columns, _) => {
-                Some(columns)
-            }
+            StatementSource::Rows(columns, _)
+            | StatementSource::Stream(columns, _)
+            | StatementSource::Values(columns, _) => Some(columns),
             StatementSource::Cte((columns, _)) => Some(columns),
         }
     }
@@ -10266,6 +10620,48 @@ impl Scanner for OneRow {
 
     fn close(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A view's or a derived table's stream, read as a table's scan
+struct SourceScanner {
+    result: Box<dyn QueryResult>,
+    err: Option<Error>,
+}
+
+impl SourceScanner {
+    fn new(result: Box<dyn QueryResult>) -> Self {
+        Self { result, err: None }
+    }
+}
+
+impl Scanner for SourceScanner {
+    fn next(&mut self) -> bool {
+        if self.result.next() {
+            return true;
+        }
+        self.err = self.result.last_error();
+        false
+    }
+
+    fn row(&self) -> &Row {
+        self.result.row()
+    }
+
+    fn take_row(&mut self) -> Row {
+        self.result.take_row()
+    }
+
+    fn err(&self) -> Option<&Error> {
+        self.err.as_ref()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.result.close()
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        self.result.estimated_count()
     }
 }
 
@@ -11106,6 +11502,26 @@ impl<'a> PreparedRunner<'a> {
         // A read that checks for no cancel is the statement's all the same
         ctx.check_cancelled()?;
         Ok(Passing::Read)
+    }
+
+    /// Whether a source's stream is read as a table's scan, for a caller
+    /// that takes its rows as they come: with the WHERE bound to the run
+    /// when `filtered`; None when each row is handed to a `keep`
+    fn source_scan(
+        &self,
+        where_: &PreparedWhere,
+        filtered: bool,
+        take: Take,
+    ) -> Option<Option<SharedProgram>> {
+        let plain =
+            where_.sets.is_empty() && where_.narrowing_set.is_none() && self.failed_slots.is_none();
+        if take == Take::Kept || !plain {
+            return None;
+        }
+        match filtered {
+            true => self.bound_program(&where_.whole.program).map(Some),
+            false => Some(None),
+        }
     }
 
     /// Hand `keep` each of `rows` that passes `where_`, with the count of

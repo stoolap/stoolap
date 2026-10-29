@@ -93,16 +93,17 @@ const CASES: &[Case] = &[
         "SELECT * FROM (SELECT id FROM t ORDER BY b DESC, a + 0, id) s",
         Some((4, 3)),
     ),
+    // A statement over a derived table or a view runs on the runner
     case(
         "sealed",
-        "projected_top",
+        "prepared_project_first",
         "SELECT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id LIMIT 4 OFFSET 1",
         "SELECT id, a FROM (SELECT id, a, c FROM t) s ORDER BY a + 0, id",
         Some((4, 1)),
     ),
     case(
         "memory",
-        "projected_top",
+        "prepared_project_first",
         "SELECT id FROM tv ORDER BY a + 0 DESC, id LIMIT 4",
         "SELECT id FROM tv ORDER BY a + 0 DESC, id",
         Some((4, 0)),

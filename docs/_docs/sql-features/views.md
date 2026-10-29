@@ -65,6 +65,8 @@ SELECT DISTINCT department FROM all_employees;
 SELECT COUNT(*), AVG(salary) FROM engineering;
 ```
 
+A view's rows are read as the query needs them. A LIMIT without ORDER BY stops reading once it has its rows, so a row past it is never computed, and a value that would fail in that row raises no error.
+
 ## Views with Joins
 
 Views can encapsulate join logic:

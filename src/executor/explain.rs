@@ -576,7 +576,12 @@ impl Executor {
     }
 
     /// Generate EXPLAIN output for a statement
-    fn explain_statement(&self, stmt: &Statement, lines: &mut Vec<String>, indent: usize) {
+    pub(super) fn explain_statement(
+        &self,
+        stmt: &Statement,
+        lines: &mut Vec<String>,
+        indent: usize,
+    ) {
         let prefix = "  ".repeat(indent);
 
         match stmt {
