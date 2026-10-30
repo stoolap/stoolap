@@ -175,8 +175,8 @@ fn a_subquery_reads_its_own_ctes() {
 #[test]
 fn a_with_inside_hides_and_reads_the_ctes_around_it_on_every_path() {
     for (db, _dir) in tables("own_with_scopes") {
-        // A computed LIMIT leaves the statement to the general path
-        for tail in ["", " LIMIT 1 + 9"] {
+        // An unused named window leaves the statement to the general path
+        for window in ["", " WINDOW unused AS ()"] {
             for (sql, at, want) in [
                 (
                     "WITH c AS (SELECT 1 AS x) \
@@ -246,7 +246,8 @@ fn a_with_inside_hides_and_reads_the_ctes_around_it_on_every_path() {
                     vec![Some(1)],
                 ),
             ] {
-                let sql = format!("{sql}{tail}");
+                let at_order = sql.rfind(" ORDER BY ").unwrap_or(sql.len());
+                let sql = format!("{}{window}{}", &sql[..at_order], &sql[at_order..]);
                 assert_eq!(column(&db, &sql, at), want, "{sql}");
             }
         }

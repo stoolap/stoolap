@@ -77,7 +77,7 @@ use super::utils::{
     extract_literal_value, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
     order_by_names_an_alias, split_qualified, strip_table_qualifier, value_to_expression,
-    QUALIFIER_SEP,
+    visit_column_refs, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -1170,7 +1170,7 @@ impl Executor {
         if needs_subquery && !found {
             return Err("no WHERE, SELECT list, ORDER BY or DISTINCT ON subquery");
         }
-        counts_fit(stmt, ctx)?;
+        counts_fit(stmt)?;
         family.statement_from(stmt.table_expr.as_deref())?;
         family.catalog()
     }
@@ -1294,7 +1294,7 @@ impl Executor {
             return Err("no clause the blocks run holds a subquery");
         }
         if whole {
-            counts_fit(stmt, ctx)?;
+            counts_fit(stmt)?;
         }
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
@@ -1321,22 +1321,17 @@ impl Executor {
     }
 }
 
-/// Whether the LIMIT and OFFSET are literals or parameters, or counts read
-/// before the statement's rows
-fn counts_fit(
-    stmt: &SelectStatement,
-    ctx: Option<&ExecutionContext>,
-) -> std::result::Result<(), OutOfFamily> {
-    for (count, clause) in [(&stmt.limit, "LIMIT"), (&stmt.offset, "OFFSET")] {
-        let Some(count) = count else {
-            continue;
-        };
-        if !matches!(
-            **count,
-            Expression::IntegerLiteral(_) | Expression::Parameter(_)
-        ) && !ctx.is_some_and(|ctx| ctx.read_count(count, clause).is_some())
-        {
-            return Err("LIMIT or OFFSET that is not a literal or a parameter");
+/// Whether the LIMIT and OFFSET read no column outside their subqueries:
+/// each is then a count read once per run, before the statement's rows. A
+/// count's scope has no column, so a double-quoted bare name reads as text
+fn counts_fit(stmt: &SelectStatement) -> std::result::Result<(), OutOfFamily> {
+    for count in stmt.limit.iter().chain(&stmt.offset) {
+        let mut names = false;
+        visit_column_refs(count, &mut |column| {
+            names |= !matches!(column, Expression::Identifier(id) if id.quoted)
+        });
+        if names {
+            return Err("a LIMIT or OFFSET naming a column");
         }
     }
     Ok(())

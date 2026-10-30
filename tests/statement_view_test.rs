@@ -308,13 +308,14 @@ fn a_dml_under_a_snapshot_view_selects_its_target_from_the_newest_state() {
 
 #[test]
 fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statements() {
-    // A LIMIT that is not a literal keeps the general path's probe; with a
-    // literal one the prepared family probes
+    // An unused named window keeps the general path's probe; without one the
+    // prepared family probes
     let cases: [(&str, &str, &str, &'static str); 5] = [
         (
             "probe",
             "INSERT INTO w VALUES (1, 1)",
-            "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 5 + 5",
+            "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) \
+             WINDOW unused AS () ORDER BY id LIMIT 10",
             "DELETE FROM w WHERE id = 1",
         ),
         (

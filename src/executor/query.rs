@@ -1769,6 +1769,10 @@ impl Executor {
             ctx
         };
 
+        // The LIMIT and OFFSET are read before any path reads a row, a grouped
+        // statement's source included
+        let RowCounts { limit, offset } = row_counts(stmt, ctx)?;
+
         // An uncorrelated subquery inside an aggregate's FILTER or argument
         // folds before the aggregates are parsed, since every aggregation
         // path reads the statement's own columns; a correlated one is
@@ -1807,9 +1811,6 @@ impl Executor {
         } else {
             stmt
         };
-
-        // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
-        let RowCounts { limit, offset } = row_counts(stmt, ctx)?;
 
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)

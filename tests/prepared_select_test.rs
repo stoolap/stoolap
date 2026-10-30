@@ -1098,8 +1098,8 @@ fn test_classifier_rules() {
     }
     let no = [
         (
-            format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
-            "LIMIT or OFFSET that is not a literal or a parameter",
+            format!("SELECT id FROM t WHERE a > {sq} LIMIT a"),
+            "a LIMIT or OFFSET naming a column",
         ),
         (
             format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),
@@ -3424,6 +3424,47 @@ fn test_a_block_selecting_a_star_reads_its_source_s_columns() {
             assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
             assert!(error(&db, sql, ()).0.contains(want), "{sql}");
         }
+    }
+}
+
+#[test]
+fn test_a_computed_limit_and_offset_are_read_once_before_the_rows() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_computed_counts") {
+        for (sql, want) in [
+            (
+                "SELECT id FROM t WHERE a < (SELECT MAX(v) FROM u) * 10 ORDER BY id LIMIT 1 + 1",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a < (SELECT MAX(v) FROM u) * 10 ORDER BY id \
+                 LIMIT 10 OFFSET (SELECT MIN(k) FROM u) + 1",
+                vec![4, 5],
+            ),
+            (
+                "SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) < (SELECT COUNT(*) FROM u) \
+                 ORDER BY k LIMIT ABS(-2)",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM t WHERE a < (SELECT MAX(v) FROM u) * 10 ORDER BY id \
+                 LIMIT LENGTH(\"xx\") + (SELECT 0)",
+                vec![1, 2],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let before = general_hits();
+            assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+            assert_eq!(general_hits(), before, "{sql} reached a general path");
+        }
+        const GROUPED: &str = "SELECT COUNT(*) FROM generate_series(1, 3, 0) \
+                               HAVING COUNT(*) > (SELECT 0) LIMIT 0 - 1";
+        let err = db.query(GROUPED, ()).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("LIMIT must be non-negative")),
+            "the count is read before the source: {err:?}"
+        );
     }
 }
 

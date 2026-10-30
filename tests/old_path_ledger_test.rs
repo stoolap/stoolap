@@ -308,6 +308,12 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "computed_limit_and_offset",
+        "SELECT id FROM t WHERE id > (SELECT MAX(x) FROM u) - 2 ORDER BY id LIMIT 1 + 1 OFFSET 2 - 1",
+        "SELECT id FROM t WHERE id > 1 ORDER BY id LIMIT 2 OFFSET 1",
+        Prepared,
+    ),
+    (
         "union_order_by",
         "SELECT id FROM t UNION SELECT 9 ORDER BY (SELECT MAX(x) FROM u) - id LIMIT 2",
         "SELECT id FROM t UNION SELECT 9 ORDER BY 3 - id LIMIT 2",

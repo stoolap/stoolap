@@ -417,7 +417,7 @@ fn test_where_over_a_source_outside_the_family() {
     ];
     // Each keeps the statement out of the prepared family
     let outside = [
-        ("", " LIMIT 5 + 5"),
+        (" WINDOW unused AS ()", ""),
         (" AND (s.id, s.a) IN (SELECT id, a FROM t)", ""),
     ];
     for (with, from) in sources {
