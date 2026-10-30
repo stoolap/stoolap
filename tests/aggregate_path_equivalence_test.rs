@@ -386,6 +386,95 @@ fn every_aggregate_path_answers_as_the_general_path() {
 }
 
 #[test]
+fn a_filtered_aggregate_keeps_every_conjunct_with_literals_and_parameters() {
+    let int = Value::Integer;
+    // Each WHERE with its parameters; the literal form writes them in
+    let cases: &[(&str, Vec<Value>, &str)] = &[
+        (
+            "a > $1 AND a NOT BETWEEN $2 AND $3",
+            vec![int(0), int(1), int(2)],
+            "a > 0 AND a NOT BETWEEN 1 AND 2",
+        ),
+        (
+            "id > $1 AND id NOT BETWEEN $2 AND $3",
+            vec![int(0), int(1), int(2)],
+            "id > 0 AND id NOT BETWEEN 1 AND 2",
+        ),
+        (
+            "a > $1 AND a BETWEEN $2 AND $3",
+            vec![int(0), int(2), int(10)],
+            "a > 0 AND a BETWEEN 2 AND 10",
+        ),
+        (
+            "a > $1 AND a NOT IN ($2, $3)",
+            vec![int(0), int(1), int(10)],
+            "a > 0 AND a NOT IN (1, 10)",
+        ),
+        (
+            "a > $1 AND a IN ($2, $3)",
+            vec![int(0), int(1), int(10)],
+            "a > 0 AND a IN (1, 10)",
+        ),
+        ("a > $1 AND g IS NULL", vec![int(0)], "a > 0 AND g IS NULL"),
+        (
+            "a > $1 AND a <> $2",
+            vec![int(0), int(2)],
+            "a > 0 AND a <> 2",
+        ),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = open(
+        Database::open(&format!(
+            "file://{}?checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap(),
+        true,
+        true,
+    );
+    let hot = open(
+        Database::open("memory://aggregate_conjuncts_hot").unwrap(),
+        false,
+        true,
+    );
+    let mut wrong = Vec::new();
+    for (ctx, db) in [("hot", &hot), ("sealed", &sealed)] {
+        for (with_params, params, literal) in cases {
+            let select = "SELECT COUNT(*), SUM(a), MIN(id) FROM t WHERE";
+            let general = run(db, &format!("{select} {literal} AND id + 0 = id")).0;
+            let written = run(db, &format!("{select} {literal}")).0;
+            let prepared = db
+                .query(&format!("{select} {with_params}"), params.clone())
+                .map_err(|e| e.to_string())
+                .map(|rows| {
+                    let rows: Vec<String> = rows
+                        .map(|row| {
+                            let row = row.unwrap();
+                            (0..row.len())
+                                .map(|i| render(row.get_value(i).unwrap()))
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
+                        .collect();
+                    rows
+                });
+            let general_rows = general.clone().map(|(_, rows)| rows);
+            if written != general {
+                wrong.push(format!(
+                    "{ctx}: {literal}: {written:?}, general {general:?}"
+                ));
+            }
+            if prepared != general_rows {
+                wrong.push(format!(
+                    "{ctx}: {with_params} {params:?}: {prepared:?}, general {general_rows:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_having_that_calls_a_scalar_function_is_not_judged_inside_the_index_walk() {
     let db = open(
         Database::open("memory://aggregate_path_having_scalar_call").unwrap(),
