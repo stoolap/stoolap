@@ -631,6 +631,18 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "in_block_selecting_star",
+        "SELECT id FROM t WHERE a IN (SELECT * FROM (SELECT x FROM u WHERE x < 3) AS s)",
+        "SELECT id FROM t WHERE a IN (1, 2)",
+        Prepared,
+    ),
+    (
+        "value_block_ordered_by_subquery",
+        "SELECT id, (SELECT x FROM u ORDER BY (SELECT ABS(x - t.a)), x LIMIT 1) FROM t",
+        "SELECT id, CASE WHEN a = 2 THEN 2 ELSE 1 END FROM t",
+        Prepared,
+    ),
+    (
         "not_in_block_with_except",
         "SELECT id FROM t WHERE a NOT IN (SELECT x FROM u EXCEPT SELECT 1)",
         "SELECT id FROM t WHERE a NOT IN (2, 3)",

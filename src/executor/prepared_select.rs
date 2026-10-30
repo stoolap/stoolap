@@ -352,7 +352,7 @@ impl<'a> Family<'a> {
                     }
                     self.expression(row, scopes, site.operand(), found)?;
                     *found = true;
-                    return self.block(&sq.subquery, scopes + 1, width(row), true);
+                    return self.block(&sq.subquery, scopes + 1, true);
                 }
                 walk(&infix.left)?;
                 walk(&infix.right)
@@ -378,7 +378,7 @@ impl<'a> Family<'a> {
                         }
                         self.expression(&in_expr.left, scopes, site.operand(), found)?;
                         *found = true;
-                        return self.block(&sq.subquery, scopes + 1, width(&in_expr.left), false);
+                        return self.block(&sq.subquery, scopes + 1, false);
                     }
                     _ => return Err("IN over something other than a list"),
                 };
@@ -423,7 +423,7 @@ impl<'a> Family<'a> {
                     return Err("a subquery outside WHERE and the subquery blocks");
                 }
                 *found = true;
-                self.block(&sq.subquery, scopes + 1, 1, true)
+                self.block(&sq.subquery, scopes + 1, true)
             }
             Expression::Exists(exists) => {
                 if !subqueries {
@@ -441,7 +441,7 @@ impl<'a> Family<'a> {
                 }
                 self.expression(&all_any.left, scopes, site.operand(), found)?;
                 *found = true;
-                self.block(&all_any.subquery, scopes + 1, width(&all_any.left), false)
+                self.block(&all_any.subquery, scopes + 1, false)
             }
             Expression::Window(window) => {
                 let inner = match site {
@@ -503,13 +503,12 @@ impl<'a> Family<'a> {
         Ok(())
     }
 
-    /// One subquery block whose chain holds `scopes` scopes, selecting the
-    /// `width` values of the row it is compared with, one for a value
+    /// One subquery block whose chain holds `scopes` scopes; the values it
+    /// selects are counted where it is prepared, its stars expanded
     fn block(
         &self,
         sq: &'a SelectStatement,
         scopes: usize,
-        width: usize,
         counts_rows: bool,
     ) -> std::result::Result<(), OutOfFamily> {
         if scopes > MAX_SCOPES {
@@ -518,28 +517,30 @@ impl<'a> Family<'a> {
         if sq.with.is_some() {
             return Err("a subquery block with its own WITH");
         }
-        // A set operation's every branch gives the block's row
+        // A star over a join is named only by its run, which counts its values
         let branches = std::iter::once(sq).chain(sq.set_operations.iter().map(|op| &*op.right));
         for branch in branches {
-            if branch.columns.len() != width {
-                return Err(match width {
-                    1 => "a subquery block without exactly one SELECT expression",
-                    _ => "a subquery block selecting another number of values than its row holds",
-                });
-            }
-            if branch
+            if matches!(
+                branch.table_expr.as_deref(),
+                Some(Expression::JoinSource(_))
+            ) && branch
                 .columns
                 .iter()
-                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+                .any(|c| matches!(c, Expression::Star(_)))
             {
-                return Err("a subquery block selecting *");
+                return Err("a subquery block selecting * over a join");
             }
         }
         let registry = &self.executor.function_registry;
         if statement_form_block(sq, counts_rows, false, registry) {
             return self.derived(sq);
         }
-        let columns = || sq.columns.iter().map(unaliased);
+        let columns = || {
+            sq.columns
+                .iter()
+                .filter(|c| !matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+                .map(unaliased)
+        };
         self.order(sq, scopes, false)?;
         self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
@@ -783,8 +784,8 @@ fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
 /// any of them on a grouped block, a count not a literal or a parameter, a
-/// DISTINCT ON position or key holding a subquery, or a key reading a
-/// volatile SELECT alias
+/// DISTINCT ON position, an ORDER BY or DISTINCT ON key holding a subquery,
+/// or a key reading a volatile SELECT alias
 fn statement_order(sq: &SelectStatement, registry: &FunctionRegistry) -> bool {
     if sq.order_by.is_empty()
         && sq.distinct_on.is_empty()
@@ -819,14 +820,12 @@ fn statement_order(sq: &SelectStatement, registry: &FunctionRegistry) -> bool {
     let reads_volatile_alias =
         |key: &Expression| names_any(key, &|name| volatile_aliases.contains(&name));
     let position = |key: &Expression| matches!(key, Expression::IntegerLiteral(_));
-    sq.order_by
+    sq.order_by.iter().map(|ob| &ob.expression).any(|key| {
+        mentions_subquery(key) || (!order_by_names_an_alias(key, sq) && reads_volatile_alias(key))
+    }) || sq
+        .distinct_on
         .iter()
-        .map(|ob| &ob.expression)
-        .any(|key| !order_by_names_an_alias(key, sq) && reads_volatile_alias(key))
-        || sq
-            .distinct_on
-            .iter()
-            .any(|key| position(key) || mentions_subquery(key) || reads_volatile_alias(key))
+        .any(|key| position(key) || mentions_subquery(key) || reads_volatile_alias(key))
 }
 
 /// What a block's SELECT list may hold
@@ -891,6 +890,82 @@ fn width(expr: &Expression) -> usize {
         Expression::List(list) => list.elements.len().max(1),
         Expression::ExpressionList(list) => list.expressions.len().max(1),
         _ => 1,
+    }
+}
+
+/// A block selecting other than the `width` values its place takes is an
+/// error: a value or a member is never read from part of the block's row
+fn block_width(selected: usize, width: usize) -> Result<()> {
+    match selected == width {
+        true => Ok(()),
+        false => Err(Error::invalid_argument(format!(
+            "a subquery selects {selected} values where its place takes {width}"
+        ))),
+    }
+}
+
+/// `items` with each star written as the columns of `scope`, a block's one
+/// source, each read by its position: names may repeat or read as a
+/// literal; None when no item is a star
+fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Expression>>> {
+    let star =
+        |item: &Expression| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_));
+    if !items.iter().any(star) {
+        return Ok(None);
+    }
+    let name = scope.tables.first().map_or("", |(name, _)| name.as_str());
+    let mut written = Vec::with_capacity(items.len() + scope.lower.len());
+    for item in items {
+        match item {
+            Expression::Star(_) => {}
+            Expression::QualifiedStar(star) if star.qualifier.to_lowercase() == name => {}
+            Expression::QualifiedStar(star) => {
+                return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)))
+            }
+            item => {
+                written.push(item.clone());
+                continue;
+            }
+        }
+        written.extend(scope.lower.iter().enumerate().map(|(index, column)| {
+            Expression::Column(ColumnRef {
+                index: index as u32,
+                name: ident(column, column),
+            })
+        }));
+    }
+    Ok(Some(written))
+}
+
+/// `stmt`, its stars expanded by `star_items`, with each star column read
+/// by its name, quoted, as a statement run of the block binds it
+fn named_star_columns(stmt: &SelectStatement, scope: &ScopeTable) -> SelectStatement {
+    let source = scope.tables.first().map_or("", |(name, _)| name.as_str());
+    let named = |value: &str, lower: &str| Identifier {
+        quoted: true,
+        ..ident(value, lower)
+    };
+    let columns = stmt
+        .columns
+        .iter()
+        .map(|item| match item {
+            Expression::Column(column) => {
+                let at = column.index as usize;
+                let name = named(&scope.columns[at], &scope.lower[at]);
+                match source {
+                    "" => Expression::Identifier(name),
+                    source => Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        qualifier: ident(source, source),
+                        name,
+                    }),
+                }
+            }
+            item => item.clone(),
+        })
+        .collect();
+    SelectStatement {
+        columns,
+        ..stmt.clone()
     }
 }
 
@@ -2918,6 +2993,7 @@ fn block_identity(sq: &SelectStatement, form: Form<'_>) -> (Expression, String, 
             block,
             read_as,
             test,
+            ..
         } => (
             as_value(block),
             format!("{read_as:?}{test:?}"),
@@ -3770,7 +3846,7 @@ impl PreparedSubquery {
     fn member_width(&self) -> usize {
         match &self.answer {
             Answer::Members(_, members) => members.width(),
-            Answer::Statement(_, block) => block.run.statement.columns.len(),
+            Answer::Statement(_, block) => block.width,
             _ => 1,
         }
     }
@@ -3914,6 +3990,8 @@ struct StatementBlock {
     tables: Option<Vec<SmartString>>,
     /// Whether it computes a window function
     windowed: bool,
+    /// The values each of its rows gives, its stars counted; 0 for an EXISTS
+    width: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4122,7 +4200,21 @@ enum Form<'a> {
         block: &'a SelectStatement,
         read_as: Option<DataType>,
         test: MemberTest,
+        /// The values of the row a member is compared with
+        width: usize,
     },
+}
+
+impl Form<'_> {
+    /// The values the block selects where it stands; None for an EXISTS,
+    /// which may select anything
+    fn width(&self) -> Option<usize> {
+        match self {
+            Form::Scalar => Some(1),
+            Form::Exists(_) => None,
+            Form::Members { width, .. } => Some(*width),
+        }
+    }
 }
 
 /// What an EXISTS or value block needs beyond its probe
@@ -4910,7 +5002,7 @@ impl Builder<'_> {
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
         let mut params = SmallVec::<[usize; 2]>::new();
-        let (statement, _, own) = StatementWalk {
+        let (statement, names, own) = StatementWalk {
             executor,
             ctx,
             on: &mut |reach| match reach {
@@ -4933,6 +5025,10 @@ impl Builder<'_> {
             visible: Vec::new(),
         }
         .statement(sq, outer, 0, Check::All)?;
+        let width = form.width().unwrap_or(0);
+        if form.width().is_some() {
+            block_width(named(names)?.len(), width)?;
+        }
         self.max_param = self.max_param.max(max_param);
         let joined = own.tables.len() > 1;
         if joined {
@@ -4982,6 +5078,7 @@ impl Builder<'_> {
             },
             form,
             windowed: windowed_block(sq),
+            width,
         };
         let (holes, hole_exprs, hole_written) = self.compiled_holes(outer, parent, &work)?;
         self.subqueries[id as usize] = Some(PreparedSubquery {
@@ -5034,6 +5131,7 @@ impl Builder<'_> {
                         block: &nested.subquery,
                         read_as: None,
                         test: MemberTest::One(comparison),
+                        width: width(row),
                     };
                     let row = self.rewrite_blocks(chain, row)?;
                     let mark = self.nested(chain, None, &nested.subquery, form, &mut work)?;
@@ -5053,6 +5151,7 @@ impl Builder<'_> {
                     block: &nested.subquery,
                     read_as: chain.column_type(&in_expr.left)?,
                     test: MemberTest::In,
+                    width: width(&in_expr.left),
                 };
                 let left = self.rewrite_blocks(chain, &in_expr.left)?;
                 let mark = self.nested(chain, None, &nested.subquery, form, &mut work)?;
@@ -5075,6 +5174,7 @@ impl Builder<'_> {
                     block: &all_any.subquery,
                     read_as: chain.column_type(&all_any.left)?,
                     test: MemberTest::Quantified(op, all),
+                    width: width(&all_any.left),
                 };
                 let left = self.rewrite_blocks(chain, &all_any.left)?;
                 let mark = self.nested(chain, None, &all_any.subquery, form, &mut work)?;
@@ -5216,6 +5316,7 @@ impl Builder<'_> {
                     block: &nested.subquery,
                     read_as: chain.column_type(&in_expr.left)?,
                     test: MemberTest::In,
+                    width: width(&in_expr.left),
                 };
                 let left = self.rewrite(chain, id, &in_expr.left, work)?;
                 let mark = self.nested(chain, id, &nested.subquery, form, work)?;
@@ -5238,6 +5339,7 @@ impl Builder<'_> {
                     block: &all_any.subquery,
                     read_as: chain.column_type(&all_any.left)?,
                     test: MemberTest::Quantified(op, all),
+                    width: width(&all_any.left),
                 };
                 let left = self.rewrite(chain, id, &all_any.left, work)?;
                 let mark = self.nested(chain, id, &all_any.subquery, form, work)?;
@@ -5255,6 +5357,7 @@ impl Builder<'_> {
                         block: &nested.subquery,
                         read_as: None,
                         test: MemberTest::One(comparison),
+                        width: width(row),
                     };
                     let row = self.rewrite(chain, id, row, work)?;
                     let mark = self.nested(chain, id, &nested.subquery, form, work)?;
@@ -5516,6 +5619,20 @@ impl Builder<'_> {
             ),
             Some(_) => return Err(Error::internal("a prepared subquery without one table")),
         };
+        // A star stands for its source's columns, which then count
+        let starred = match form.width() {
+            Some(width) => {
+                let starred = star_items(&sq.columns, &scope)?.map(|columns| SelectStatement {
+                    columns,
+                    ..sq.clone()
+                });
+                block_width(starred.as_ref().unwrap_or(sq).columns.len(), width)?;
+                starred
+            }
+            None => None,
+        };
+        let written = sq;
+        let sq = starred.as_ref().unwrap_or(sq);
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
         self.subqueries.push(None);
@@ -5715,7 +5832,7 @@ impl Builder<'_> {
             let first = programs.remove(0);
             Ok((first, programs))
         };
-        let (identity, signature, keyed_test) = block_identity(sq, form);
+        let (identity, signature, keyed_test) = block_identity(written, form);
         let mut others = SmallVec::new();
         for expr in values.iter().chain(&filter) {
             slots_read(expr, &mut others);
@@ -5838,7 +5955,10 @@ impl Builder<'_> {
                 && !sq.where_clause.as_deref().is_some_and(mentions_subquery)
             {
                 grouping.statement = Some(Box::new(StatementRun {
-                    statement: sq.clone(),
+                    statement: match &starred {
+                        Some(starred) => named_star_columns(starred, &scope),
+                        None => written.clone(),
+                    },
                     classification: std::sync::OnceLock::new(),
                     compiled: NestedPlan::default(),
                 }));

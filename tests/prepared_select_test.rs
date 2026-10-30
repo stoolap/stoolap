@@ -1083,11 +1083,20 @@ fn test_classifier_rules() {
         let wrong = oracle::check_confirmed(&RECORDED_IN_FAMILY, sql, &found, old_path);
         assert_eq!(wrong, None);
     }
-    let no = [
+    for (sql, want) in [
         (
-            "SELECT id FROM t WHERE (id, a) IN (SELECT id, v, a FROM u)".to_string(),
-            "a subquery block selecting another number of values than its row holds",
+            "SELECT id FROM t WHERE (id, a) IN (SELECT id, v, a FROM u)",
+            "a subquery selects 3 values where its place takes 2",
         ),
+        (
+            "SELECT id FROM t WHERE a > (SELECT v, id FROM u WHERE u.id = t.id)",
+            "a subquery selects 2 values where its place takes 1",
+        ),
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        assert!(error(&db, sql, ()).0.contains(want), "{sql}");
+    }
+    let no = [
         (
             format!("SELECT id FROM t WHERE a > {sq} LIMIT 1 + 1"),
             "LIMIT or OFFSET that is not a literal or a parameter",
@@ -1104,10 +1113,6 @@ fn test_classifier_rules() {
         (
             "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT t.a)".to_string(),
             "a derived table's LIMIT or OFFSET naming a column",
-        ),
-        (
-            "SELECT id FROM t WHERE a > (SELECT v, id FROM u WHERE u.id = t.id)".to_string(),
-            "a subquery block without exactly one SELECT expression",
         ),
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
@@ -3280,6 +3285,89 @@ fn test_a_recursive_cte_ordered_by_a_subquery_keeps_its_members() {
              ORDER BY 1) SELECT n FROM r ORDER BY n",
         ] {
             assert_eq!(ids(&db, sql, ()).0, vec![1, 2, 3], "{sql}");
+        }
+    }
+}
+
+#[test]
+fn test_a_block_selecting_a_star_reads_its_source_s_columns() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_block_star") {
+        for (sql, want) in [
+            (
+                "SELECT id, (SELECT * FROM (SELECT v AS z FROM u) s \
+                 ORDER BY (SELECT ABS(z - a / 5)), z LIMIT 1) FROM t ORDER BY id",
+                vec![5, 1, 1, 5, 1],
+            ),
+            (
+                "SELECT id, (SELECT v AS z FROM u UNION ALL SELECT k FROM u \
+                 ORDER BY (SELECT ABS(z - a / 5)), z LIMIT 1) FROM t ORDER BY id",
+                vec![5, 2, 1, 4, 2],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let before = general_hits();
+            let got: Vec<i64> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<i64>(1).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+            assert_eq!(general_hits(), before, "{sql} reached a general path");
+        }
+        db.execute("CREATE TABLE g (\"true\" INTEGER)", ()).unwrap();
+        db.execute("INSERT INTO g VALUES (7), (2)", ()).unwrap();
+        // A star's columns are read by position, its width kept for the run,
+        // and a grouped block's statement run reads them by their names
+        for (sql, want) in [
+            (
+                "SELECT id FROM t WHERE (SELECT * FROM g WHERE \"true\" > 5 GROUP BY \"true\") = 7 \
+                 ORDER BY id",
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE k IN (SELECT * FROM g GROUP BY \"true\") ORDER BY id",
+                vec![2, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE k IN (SELECT * FROM (SELECT k FROM u) s) ORDER BY id",
+                vec![1, 2, 3, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE (k, k) IN (SELECT * FROM (SELECT k, k AS j FROM u) s \
+                 ORDER BY (SELECT 1)) ORDER BY id",
+                vec![1, 2, 3, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE (SELECT * FROM (SELECT 7 AS \"true\")) = 7 ORDER BY id",
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE (1, 2) IN (SELECT * FROM (SELECT 1 AS x, 2 AS x) s) \
+                 ORDER BY id",
+                vec![1, 2, 3, 4, 5],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+        }
+        // A value or a member is never read from part of the block's row
+        for (sql, want) in [
+            (
+                "SELECT id, (SELECT * FROM u WHERE u.id = t.id) FROM t",
+                "a subquery selects 3 values where its place takes 1",
+            ),
+            (
+                "SELECT id FROM t WHERE k IN (SELECT u.* FROM u)",
+                "a subquery selects 3 values where its place takes 1",
+            ),
+            (
+                "SELECT id FROM t WHERE (id, k) IN (SELECT * FROM u)",
+                "a subquery selects 3 values where its place takes 2",
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            assert!(error(&db, sql, ()).0.contains(want), "{sql}");
         }
     }
 }

@@ -229,21 +229,23 @@ fn test_a_set_test_belongs_to_the_family_wherever_where_holds_it() {
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
-    for (sql, reason) in [
+    for (sql, want) in [
         (
             "SELECT id FROM t WHERE x IN (SELECT v, k FROM u)",
-            "a subquery block without exactly one SELECT expression",
+            "a subquery selects 2 values where its place takes 1",
         ),
         (
             "SELECT id FROM t WHERE (x, k) IN (SELECT v FROM u)",
-            "a subquery block selecting another number of values than its row holds",
+            "a subquery selects 1 values where its place takes 2",
         ),
     ] {
-        assert_eq!(
-            prepared_line(&db, sql),
-            format!("Prepared: no ({reason})"),
-            "{sql}"
-        );
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let err = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(want), "{sql}: {err}");
     }
 }
 
