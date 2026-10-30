@@ -3315,8 +3315,20 @@ fn test_a_block_selecting_a_star_reads_its_source_s_columns() {
             assert_eq!(got, want, "{sql}");
             assert_eq!(general_hits(), before, "{sql} reached a general path");
         }
-        // A star's columns are read by position, its width kept for the run
+        db.execute("CREATE TABLE g (\"true\" INTEGER)", ()).unwrap();
+        db.execute("INSERT INTO g VALUES (7), (2)", ()).unwrap();
+        // A star's columns are read by position, its width kept for the run,
+        // and a grouped block's statement run reads them by their names
         for (sql, want) in [
+            (
+                "SELECT id FROM t WHERE (SELECT * FROM g WHERE \"true\" > 5 GROUP BY \"true\") = 7 \
+                 ORDER BY id",
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE k IN (SELECT * FROM g GROUP BY \"true\") ORDER BY id",
+                vec![2, 5],
+            ),
             (
                 "SELECT id FROM t WHERE k IN (SELECT * FROM (SELECT k FROM u) s) ORDER BY id",
                 vec![1, 2, 3, 5],

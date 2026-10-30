@@ -937,6 +937,38 @@ fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Exp
     Ok(Some(written))
 }
 
+/// `stmt`, its stars expanded by `star_items`, with each star column read
+/// by its name, quoted, as a statement run of the block binds it
+fn named_star_columns(stmt: &SelectStatement, scope: &ScopeTable) -> SelectStatement {
+    let source = scope.tables.first().map_or("", |(name, _)| name.as_str());
+    let named = |value: &str, lower: &str| Identifier {
+        quoted: true,
+        ..ident(value, lower)
+    };
+    let columns = stmt
+        .columns
+        .iter()
+        .map(|item| match item {
+            Expression::Column(column) => {
+                let at = column.index as usize;
+                let name = named(&scope.columns[at], &scope.lower[at]);
+                match source {
+                    "" => Expression::Identifier(name),
+                    source => Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        qualifier: ident(source, source),
+                        name,
+                    }),
+                }
+            }
+            item => item.clone(),
+        })
+        .collect();
+    SelectStatement {
+        columns,
+        ..stmt.clone()
+    }
+}
+
 /// A set operation's first branch, which runs without the whole one's
 /// ORDER BY, LIMIT and OFFSET; any other statement as it is
 fn first_branch(stmt: SelectStatement) -> SelectStatement {
@@ -5599,6 +5631,7 @@ impl Builder<'_> {
             }
             None => None,
         };
+        let written = sq;
         let sq = starred.as_ref().unwrap_or(sq);
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
@@ -5799,7 +5832,7 @@ impl Builder<'_> {
             let first = programs.remove(0);
             Ok((first, programs))
         };
-        let (identity, signature, keyed_test) = block_identity(sq, form);
+        let (identity, signature, keyed_test) = block_identity(written, form);
         let mut others = SmallVec::new();
         for expr in values.iter().chain(&filter) {
             slots_read(expr, &mut others);
@@ -5922,7 +5955,10 @@ impl Builder<'_> {
                 && !sq.where_clause.as_deref().is_some_and(mentions_subquery)
             {
                 grouping.statement = Some(Box::new(StatementRun {
-                    statement: sq.clone(),
+                    statement: match &starred {
+                        Some(starred) => named_star_columns(starred, &scope),
+                        None => written.clone(),
+                    },
                     classification: std::sync::OnceLock::new(),
                     compiled: NestedPlan::default(),
                 }));
