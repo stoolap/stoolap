@@ -331,6 +331,20 @@ WHERE c1.city IN (
 );
 ```
 
+#### Correlated VALUES and Table Functions
+
+A `VALUES` list or a table function in a subquery's FROM may read the outer row's columns, as a derived table there may. It is read again for each outer row:
+
+```sql
+-- The larger of two columns, and a running total up to a column's value
+SELECT id,
+    (SELECT MAX(v) FROM (VALUES (t.a), (t.b)) x(v)) AS larger,
+    (SELECT SUM(value) FROM generate_series(1, t.n)) AS total
+FROM t;
+```
+
+A `VALUES` row in a subquery's FROM cannot hold a subquery of its own.
+
 ### Derived Tables (Subqueries in FROM)
 
 Subqueries in the FROM clause create temporary result sets called derived tables:
