@@ -225,6 +225,26 @@ fn a_with_inside_hides_and_reads_the_ctes_around_it_on_every_path() {
                     0,
                     vec![Some(1)],
                 ),
+                (
+                    "SELECT (WITH c AS (SELECT 1 AS x) SELECT c.x FROM c \
+                     JOIN (SELECT 1 AS y) d ON c.x = d.y \
+                     WHERE c.x IN (SELECT x FROM (SELECT x FROM c) s))",
+                    0,
+                    vec![Some(1)],
+                ),
+                (
+                    "SELECT (WITH c AS (SELECT 1 AS x) SELECT c.x FROM c \
+                     JOIN (SELECT 1 AS y) d ON c.x = d.y \
+                     WHERE EXISTS (SELECT 1 FROM (SELECT x FROM c) s WHERE s.x = d.y))",
+                    0,
+                    vec![Some(1)],
+                ),
+                (
+                    "SELECT (WITH c AS (SELECT 1 AS x) SELECT c.x FROM c \
+                     JOIN (SELECT 1 AS y) d ON c.x = d.y AND c.x IN (SELECT x FROM (SELECT x FROM c) s))",
+                    0,
+                    vec![Some(1)],
+                ),
             ] {
                 let sql = format!("{sql}{tail}");
                 assert_eq!(column(&db, &sql, at), want, "{sql}");

@@ -4921,7 +4921,7 @@ impl Builder<'_> {
             },
             runs: true,
             visible: Vec::new(),
-            ctes: Vec::new(),
+            ctes: self.ctes.clone(),
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
