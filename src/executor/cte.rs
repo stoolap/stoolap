@@ -140,6 +140,14 @@ impl CteRegistry {
         }
     }
 
+    /// A registry holding the CTEs `ctx` brings: a statement's own CTEs
+    /// join those of the WITH clauses around it, hiding one of their name
+    pub(crate) fn within(ctx: &ExecutionContext) -> Self {
+        Self {
+            data: ctx.cte_data().cloned().unwrap_or_default(),
+        }
+    }
+
     /// Store a materialized CTE result
     ///
     /// Uses Arc::make_mut for COW semantics:
@@ -279,7 +287,7 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_limit_hints: Option<&StringMap<CtePushdownHint>>,
     ) -> Result<CteRegistry> {
-        let mut cte_registry = CteRegistry::new();
+        let mut cte_registry = CteRegistry::within(ctx);
         // Each body counts its own rows, not the statement's around it
         let scoped = ctx.without_read_counts();
         let ctx = scoped.as_ref().unwrap_or(ctx);
@@ -1113,6 +1121,12 @@ impl Executor {
         // Build map from pre-computed lowercase names
         let cte_defs: StringMap<&CommonTableExpression> = cte_names_lower.iter().cloned().collect();
         let cte_name_set: AHashSet<&str> = cte_defs.keys().map(|s| s.as_str()).collect();
+
+        // Inlining reads names by their text: a WITH inside that names one
+        // again hides it there, so the CTEs run where their scopes hold
+        if super::prepared_select::redefines_cte(stmt, &|name| cte_name_set.contains(name)) {
+            return None;
+        }
 
         // Check if any CTE references another CTE (CTE chaining)
         // These cannot be simply inlined as they have data dependencies

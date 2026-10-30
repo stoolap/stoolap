@@ -113,8 +113,6 @@ struct Family<'a> {
     executor: &'a Executor,
     /// Every block's FROM that names a table, a view or a CTE
     blocks: RefCell<SmallVec<[&'a SimpleTableSource; 4]>>,
-    /// The statement's own CTEs, which its FROM may name and no block may
-    with: Option<&'a WithClause>,
 }
 
 impl<'a> Family<'a> {
@@ -220,11 +218,12 @@ impl<'a> Family<'a> {
     }
 
     /// A derived table in a block's FROM, which runs as a statement of its
-    /// own: every FROM in it, its subqueries' too, one source whose names
-    /// the walk binds over, no WITH, and no LIMIT or OFFSET naming a column
+    /// own: every FROM in it, its subqueries' and its own CTEs' too, one
+    /// source whose names the walk binds over, and no LIMIT or OFFSET naming
+    /// a column
     fn derived(&self, stmt: &'a SelectStatement) -> std::result::Result<(), OutOfFamily> {
-        if stmt.with.is_some() {
-            return Err("a derived table with its own WITH");
+        for cte in stmt.with.iter().flat_map(|with| &with.ctes) {
+            self.derived(&cte.query)?;
         }
         if stmt
             .limit
@@ -293,14 +292,10 @@ impl<'a> Family<'a> {
         nested.into_iter().try_for_each(|s| self.derived(s))
     }
 
-    /// A block's FROM names a table, a view or a CTE the context holds, and
-    /// no CTE of the statement's own WITH, which may inline into a derived
-    /// table
+    /// A block's FROM names a table, a view or a CTE: one of the statement's
+    /// own WITH is read inlined as a derived table or from the context that
+    /// holds it once run
     fn catalog(&self) -> std::result::Result<(), OutOfFamily> {
-        let own_cte = |name: &str| {
-            self.with
-                .is_some_and(|with| with.ctes.iter().any(|cte| cte.name.value_lower == name))
-        };
         let view = |name: &str| {
             self.executor
                 .engine
@@ -309,11 +304,7 @@ impl<'a> Family<'a> {
                 .map_err(|_| "the catalog could not be read")
         };
         for ts in self.blocks.borrow().iter() {
-            let name = ts.name.value_lower.as_str();
-            if own_cte(name) {
-                return Err("a subquery's FROM names a CTE of the statement's WITH");
-            }
-            view(name)?;
+            view(ts.name.value_lower.as_str())?;
         }
         Ok(())
     }
@@ -514,9 +505,6 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if sq.with.is_some() {
-            return Err("a subquery block with its own WITH");
-        }
         // A star over a join is named only by its run, which counts its values
         let branches = std::iter::once(sq).chain(sq.set_operations.iter().map(|op| &*op.right));
         for branch in branches {
@@ -658,9 +646,6 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if sq.with.is_some() {
-            return Err("a subquery block with its own WITH");
-        }
         // An EXISTS runs the clauses only a statement reads as main does
         if !clause_block(sq, false) && statement_order(sq, &self.executor.function_registry) {
             return Err("an EXISTS block whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads");
@@ -770,12 +755,14 @@ fn statement_form_block(
 }
 
 /// A block a statement runs for its clauses: a windowed one, or one holding
-/// a set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause or a
-/// DISTINCT that changes its answer, which it does only where something
-/// counts its rows: a value block (`counts_rows`), a LIMIT or an OFFSET
+/// its own WITH, a set operation, ROLLUP, CUBE, grouping sets, a WINDOW
+/// clause or a DISTINCT that changes its answer, which it does only where
+/// something counts its rows: a value block (`counts_rows`), a LIMIT or an
+/// OFFSET
 fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
+        || sq.with.is_some()
         || !sq.set_operations.is_empty()
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
@@ -1146,7 +1133,6 @@ impl Executor {
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
-            with: stmt.with.as_ref(),
         };
         let mut found = false;
         if let Some(where_clause) = stmt.where_clause.as_deref() {
@@ -1263,7 +1249,6 @@ impl Executor {
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
-            with: stmt.with.as_ref(),
         };
         let mut found = false;
         let list = if grouped {
@@ -1703,6 +1688,9 @@ struct StatementWalk<'w> {
     /// the scope count of its statement, which a bare name reads ahead of a
     /// column of a scope farther out, as the general binder does
     visible: Vec<(SmartString, usize)>,
+    /// The CTEs of the WITH clauses around the statement walked, innermost
+    /// last, with their columns: a FROM reads them ahead of any other name
+    ctes: Vec<(SmartString, Vec<String>)>,
 }
 
 impl StatementWalk<'_> {
@@ -1750,6 +1738,68 @@ impl StatementWalk<'_> {
         inside: usize,
         check: Check,
     ) -> Result<(SelectStatement, Option<Vec<String>>, ScopeTable)> {
+        // Its own CTEs are read by it and the statements inside it alone
+        let mark = self.ctes.len();
+        let walked = self.statement_in_scope(stmt, enclosing, inside, check);
+        self.ctes.truncate(mark);
+        walked
+    }
+
+    /// `with`'s CTEs, each walked over the scopes `enclosing` and then read
+    /// by its name; a recursive one's members read it as its first does
+    fn with_clause(
+        &mut self,
+        with: &WithClause,
+        enclosing: &[&ScopeTable],
+        inside: usize,
+        check: Check,
+    ) -> Result<WithClause> {
+        let mut ctes = Vec::with_capacity(with.ctes.len());
+        for cte in &with.ctes {
+            let columns = |names: Option<Vec<String>>| -> Result<Vec<String>> {
+                match cte.column_names.is_empty() {
+                    true => named(names),
+                    false => Ok(cte
+                        .column_names
+                        .iter()
+                        .map(|c| c.value.to_string())
+                        .collect()),
+                }
+            };
+            let name = cte.name.value_lower.clone();
+            if cte.is_recursive {
+                let (_, names, _) =
+                    self.statement(&first_branch_of(&cte.query), enclosing, inside, check)?;
+                self.ctes.push((name.clone(), columns(names)?));
+            }
+            let (query, names, _) = self.statement(&cte.query, enclosing, inside, check)?;
+            if !cte.is_recursive {
+                self.ctes.push((name, columns(names)?));
+            }
+            ctes.push(CommonTableExpression {
+                query: Box::new(query),
+                ..cte.clone()
+            });
+        }
+        Ok(WithClause {
+            ctes,
+            ..with.clone()
+        })
+    }
+
+    /// [`Self::statement`] with the CTEs it reads in scope
+    #[allow(clippy::type_complexity)]
+    fn statement_in_scope(
+        &mut self,
+        stmt: &SelectStatement,
+        enclosing: &[&ScopeTable],
+        inside: usize,
+        check: Check,
+    ) -> Result<(SelectStatement, Option<Vec<String>>, ScopeTable)> {
+        let with = match &stmt.with {
+            Some(with) => Some(self.with_clause(with, enclosing, inside, check)?),
+            None => None,
+        };
         let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
         scopes.push(&own);
@@ -1864,6 +1914,7 @@ impl StatementWalk<'_> {
                     })
                 })
                 .collect::<Result<_>>()?,
+            with,
             ..stmt.clone()
         };
         Ok((walked, names, own))
@@ -1899,6 +1950,11 @@ impl StatementWalk<'_> {
             Expression::TableSource(ts) => {
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
                 let lower = &ts.name.value_lower;
+                let walked_cte = self.ctes.iter().rev().find(|(cte, _)| cte == lower);
+                if let Some((_, columns)) = walked_cte {
+                    let scope = untyped(&name, columns);
+                    return Ok((Some(table_expr.clone()), scope));
+                }
                 match self.executor.named(self.ctx, lower)? {
                     Named::Cte((columns, _)) => untyped(&name, columns),
                     Named::View(view) => untyped(
@@ -4616,6 +4672,9 @@ struct Builder<'e> {
     projected_from: Option<usize>,
     /// The projected row's columns the key being rewritten reads
     projected_reads: SmallVec<[usize; 2]>,
+    /// The CTEs of the statement block being bound and of those around it,
+    /// with their columns, which a block's FROM reads ahead of the context
+    ctes: Vec<(SmartString, Vec<String>)>,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -4862,6 +4921,7 @@ impl Builder<'_> {
             },
             runs: true,
             visible: Vec::new(),
+            ctes: self.ctes.clone(),
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
@@ -5002,7 +5062,8 @@ impl Builder<'_> {
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
         let mut params = SmallVec::<[usize; 2]>::new();
-        let (statement, names, own) = StatementWalk {
+        let around = self.ctes.clone();
+        let mut walk = StatementWalk {
             executor,
             ctx,
             on: &mut |reach| match reach {
@@ -5023,8 +5084,12 @@ impl Builder<'_> {
             },
             runs: true,
             visible: Vec::new(),
-        }
-        .statement(sq, outer, 0, Check::All)?;
+            ctes: around,
+        };
+        // Its own CTEs stay in scope for the join's binding below
+        let walked = walk.statement_in_scope(sq, outer, 0, Check::All);
+        let ctes = std::mem::take(&mut walk.ctes);
+        let (statement, names, own) = walked?;
         let width = form.width().unwrap_or(0);
         if form.width().is_some() {
             block_width(named(names)?.len(), width)?;
@@ -5035,7 +5100,11 @@ impl Builder<'_> {
             if dropped {
                 check_block_positions(sq, own.columns.len())?;
             }
-            self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)))?;
+            let around = std::mem::replace(&mut self.ctes, ctes);
+            let bound =
+                self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)));
+            self.ctes = around;
+            bound?;
         }
         let statement = match dropped {
             // A join's run names its columns, so it binds what it reads
@@ -5479,6 +5548,9 @@ impl Builder<'_> {
     /// general path reads them, with its columns; None for a table. A view
     /// is read when a call first needs it
     fn named_source(&self, name: &str) -> Result<Option<NamedSource>> {
+        if let Some((_, columns)) = self.ctes.iter().rev().find(|(cte, _)| cte == name) {
+            return Ok(Some((BlockSource::Cte(name.into()), columns.clone())));
+        }
         let view = match self.executor.named(self.ctx, name)? {
             Named::Cte((columns, _)) => {
                 return Ok(Some((BlockSource::Cte(name.into()), columns.to_vec())))
@@ -6316,6 +6388,83 @@ fn needs_folding(expr: &Expression) -> bool {
     folds
 }
 
+/// Each statement `stmt` holds, not those inside them: its derived tables,
+/// subqueries, set operation branches and CTE bodies
+fn statements_inside<'s>(stmt: &'s SelectStatement, out: &mut Vec<&'s SelectStatement>) {
+    fn from<'s>(source: &'s Expression, out: &mut Vec<&'s SelectStatement>) {
+        match source {
+            Expression::SubquerySource(derived) => out.push(&derived.subquery),
+            Expression::JoinSource(join) => {
+                from(&join.left, out);
+                from(&join.right, out);
+                if let Some(on) = join.condition.as_deref() {
+                    nested_statements(on, out);
+                }
+            }
+            Expression::ValuesSource(values) => {
+                for value in values.rows.iter().flatten() {
+                    nested_statements(value, out);
+                }
+            }
+            Expression::FunctionTableSource(function) => {
+                for argument in &function.arguments {
+                    nested_statements(argument, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(source) = stmt.table_expr.as_deref() {
+        from(source, out);
+    }
+    let grouping_sets = match &stmt.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets.as_slice(),
+        _ => &[],
+    };
+    let windows = stmt.window_defs.iter().flat_map(|def| {
+        def.partition_by
+            .iter()
+            .chain(def.order_by.iter().map(|o| &o.expression))
+    });
+    for expr in stmt
+        .columns
+        .iter()
+        .chain(&stmt.distinct_on)
+        .chain(stmt.where_clause.as_deref())
+        .chain(&stmt.group_by.columns)
+        .chain(grouping_sets.iter().flatten())
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(stmt.limit.as_deref())
+        .chain(stmt.offset.as_deref())
+        .chain(windows)
+    {
+        nested_statements(expr, out);
+    }
+    out.extend(stmt.set_operations.iter().map(|op| &*op.right));
+    out.extend(
+        stmt.with
+            .iter()
+            .flat_map(|with| &with.ctes)
+            .map(|cte| &*cte.query),
+    );
+}
+
+/// Whether a statement inside `stmt`, at any depth, has its own WITH with
+/// a CTE `names` takes: there a name read by its text is that CTE
+pub(crate) fn redefines_cte(stmt: &SelectStatement, names: &dyn Fn(&str) -> bool) -> bool {
+    let mut inside = Vec::new();
+    statements_inside(stmt, &mut inside);
+    inside.into_iter().any(|nested| {
+        nested
+            .with
+            .iter()
+            .flat_map(|with| &with.ctes)
+            .any(|cte| names(&cte.name.value_lower))
+            || redefines_cte(nested, names)
+    })
+}
+
 /// Each statement `expr` holds as a subquery, not those inside them
 fn nested_statements<'e>(expr: &'e Expression, out: &mut Vec<&'e SelectStatement>) {
     match expr {
@@ -7126,6 +7275,7 @@ impl PreparedSelect {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -7560,6 +7710,7 @@ impl PreparedGrouped {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -8378,6 +8529,7 @@ impl PreparedDml {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -8767,6 +8919,7 @@ impl JoinBlocks {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         // A side read as rows keeps the conditions its read asks: those
         // without a block, which the read takes, and those whose blocks bind
@@ -9032,7 +9185,6 @@ impl Executor {
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
-            with: None,
         };
         let mut found = false;
         family.expression(clause, 1, Site::Subqueries, &mut found)?;
@@ -9059,6 +9211,7 @@ impl Executor {
             on: &mut on,
             runs,
             visible: Vec::new(),
+            ctes: Vec::new(),
         };
         let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
         let name = scope.tables.first().map(|(name, _)| name.as_str());
@@ -9100,6 +9253,7 @@ impl Executor {
                         on: &mut on,
                         runs,
                         visible: Vec::new(),
+                        ctes: Vec::new(),
                     };
                     named(walk.statement(query, &[], 0, Check::Off)?.1)?
                 }
@@ -9670,6 +9824,7 @@ fn sides_read_within(
         on: &mut on,
         runs: true,
         visible: Vec::new(),
+        ctes: Vec::new(),
     };
     walk.subqueries_of(expr, &[scope])?;
     Ok(read)
@@ -10168,6 +10323,7 @@ impl Executor {
             on: &mut |_| Ok(None),
             runs: false,
             visible: Vec::new(),
+            ctes: Vec::new(),
         }
         .statement(stmt, &[], 0, Check::Off)?;
         named(names)
@@ -10433,7 +10589,6 @@ impl Executor {
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
-            with: None,
         };
         let mut found = false;
         for expr in where_clause.into_iter().chain(sets) {

@@ -542,8 +542,10 @@ impl Parser<'_> {
         // Check for subquery or VALUES
         if self.cur_token_is_punctuator("(") {
             self.next_token();
-            if self.cur_token_is_keyword(Keyword::Select) {
-                let subquery = self.parse_select_statement()?;
+            if self.cur_token_is_keyword(Keyword::Select)
+                || self.cur_token_is_keyword(Keyword::With)
+            {
+                let subquery = self.parse_query()?;
 
                 if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
                     self.add_error(format!(
@@ -828,6 +830,26 @@ impl Parser<'_> {
             ));
             None
         }
+    }
+
+    /// A query where a subquery or a derived table stands: a SELECT, after
+    /// an optional WITH whose CTEs it and the queries inside it read
+    pub(crate) fn parse_query(&mut self) -> Option<SelectStatement> {
+        if !self.cur_token_is_keyword(Keyword::With) {
+            return self.parse_select_statement();
+        }
+        let with_clause = self.parse_with_clause()?;
+        self.next_token();
+        if !self.cur_token_is_keyword(Keyword::Select) {
+            self.add_error(format!(
+                "expected SELECT after WITH clause at {}",
+                self.cur_token.position
+            ));
+            return None;
+        }
+        let mut select = self.parse_select_statement()?;
+        select.with = Some(with_clause);
+        Some(select)
     }
 
     /// Parse a WITH clause
