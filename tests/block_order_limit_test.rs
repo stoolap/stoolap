@@ -556,11 +556,10 @@ fn an_order_by_that_chooses_no_row_is_still_bound() {
         1,
         "a key that chooses no row reads no outer value"
     );
-    let refused = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
-    assert_eq!(
-        prepared_line(&db, &refused),
-        "Prepared: no (a subquery block's ORDER BY key holding a subquery without LIMIT)"
-    );
+    // A key holding a subquery runs as its statement does
+    let sql = scalar("SELECT x FROM u WHERE u.id = 1 ORDER BY (SELECT 1)");
+    assert_eq!(prepared_line(&db, &sql), "Prepared: yes");
+    assert_eq!(column(&db, &sql, 1, ()), [Some(5); 4]);
 }
 
 #[test]
