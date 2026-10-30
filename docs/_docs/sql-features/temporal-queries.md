@@ -53,8 +53,9 @@ SELECT * FROM orders AS OF TRANSACTION 42;
 SELECT * FROM users AS OF TRANSACTION 100 
 WHERE status = 'active';
 
--- With specific columns
+-- With specific columns, each as the row held it then
 SELECT id, name, email FROM users AS OF TRANSACTION 50;
+SELECT email, name FROM users AS OF TRANSACTION 50;
 ```
 
 ### Basic AS OF TIMESTAMP Query
@@ -136,6 +137,8 @@ This feature enables powerful use cases:
 3. **Version Chain Traversal**: Stoolap traverses the version chain for each row from newest to oldest, finding the appropriate version based on the temporal criteria.
 
 4. **Deletion Handling**: Deleted rows are properly handled - if a row was deleted before the AS OF point, it won't appear in the results.
+
+5. **Columns**: Each version is read whole, so a query answers the columns it names, in any order and with or without a `WHERE`, as the row held them at that point. A column added after a version was written reads as NULL in it.
 
 ## Important Notes
 

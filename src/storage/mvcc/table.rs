@@ -5211,6 +5211,12 @@ impl Table for MVCCTable {
             .iter()
             .filter_map(|name| self.cached_schema.find_column(name).map(|(idx, _)| idx))
             .collect();
+        // Every column in the table's order: a version as wide is its own row, shared
+        let whole = column_indices.len() == self.cached_schema.columns.len()
+            && column_indices
+                .iter()
+                .enumerate()
+                .all(|(at, &idx)| at == idx);
 
         // Get all row IDs
         let row_ids = self.version_store.get_all_row_ids();
@@ -5243,6 +5249,10 @@ impl Table for MVCCTable {
                         }
                     }
 
+                    if whole && v.data.len() == column_indices.len() {
+                        rows.push(v.data.clone());
+                        continue;
+                    }
                     // Project columns
                     let projected: Vec<Value> = column_indices
                         .iter()

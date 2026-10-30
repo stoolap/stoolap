@@ -16,7 +16,7 @@
 //!
 //! Tests for temporal queries using AS OF TRANSACTION and AS OF TIMESTAMP syntax.
 
-use stoolap::Database;
+use stoolap::{Database, Value};
 
 // ============================================================================
 // Parser Tests
@@ -713,41 +713,74 @@ fn test_as_of_selects_the_columns_it_names() {
         std::thread::sleep(std::time::Duration::from_millis(20));
         db.execute("UPDATE u SET x = 30 WHERE id = 2", ()).unwrap();
         db.execute("INSERT INTO u VALUES (3, 9, 'c')", ()).unwrap();
-        let rows = |sql: &str| -> Vec<String> {
-            db.query(sql, ())
-                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        let answer = |sql: &str| -> (Vec<String>, Vec<Vec<Value>>) {
+            let rows = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{dsn}: {sql}: {e}"));
+            let columns = rows.columns().to_vec();
+            let values = rows
                 .map(|row| {
                     let row = row.unwrap();
                     (0..row.len())
-                        .map(|i| row.get::<String>(i).unwrap())
-                        .collect::<Vec<_>>()
-                        .join(" ")
+                        .map(|i| row.get::<Value>(i).unwrap())
+                        .collect()
                 })
-                .collect()
+                .collect();
+            (columns, values)
         };
-        for (sql, want) in [
+        let (int, text) = (Value::Integer, Value::text);
+        for (sql, columns, want) in [
             (
                 "SELECT x, s FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY s".to_string(),
-                vec!["1 a", "30 b", "9 c"],
+                vec!["x", "s"],
+                vec![
+                    vec![int(1), text("a")],
+                    vec![int(30), text("b")],
+                    vec![int(9), text("c")],
+                ],
             ),
             (
                 "SELECT s, x FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY s".to_string(),
-                vec!["a 1", "b 30", "c 9"],
+                vec!["s", "x"],
+                vec![
+                    vec![text("a"), int(1)],
+                    vec![text("b"), int(30)],
+                    vec![text("c"), int(9)],
+                ],
             ),
             (
                 "SELECT h.x FROM u AS OF TIMESTAMP '2099-01-01' h ORDER BY x".to_string(),
-                vec!["1", "9", "30"],
+                vec!["x"],
+                vec![vec![int(1)], vec![int(9)], vec![int(30)]],
             ),
             (
                 "SELECT u.s FROM u AS OF TRANSACTION 1000000 ORDER BY s".to_string(),
-                vec!["a", "b", "c"],
+                vec!["s"],
+                vec![vec![text("a")], vec![text("b")], vec![text("c")]],
             ),
             (
                 format!("SELECT x, s FROM u AS OF TIMESTAMP '{before}' ORDER BY s"),
-                vec!["1 a", "3 b"],
+                vec!["x", "s"],
+                vec![vec![int(1), text("a")], vec![int(3), text("b")]],
             ),
         ] {
-            assert_eq!(rows(&sql), want, "{dsn}: {sql}");
+            assert_eq!(
+                answer(&sql),
+                (columns.into_iter().map(String::from).collect(), want),
+                "{dsn}: {sql}"
+            );
         }
+        // A version written before a column was added reads it as NULL
+        db.execute("ALTER TABLE u ADD COLUMN z INTEGER", ())
+            .unwrap();
+        let sql = "SELECT x, z FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY x";
+        let (columns, rows) = answer(sql);
+        assert_eq!(columns, ["x", "z"], "{dsn}: {sql}");
+        let xs: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
+        assert_eq!(xs, [&int(1), &int(9), &int(30)], "{dsn}: {sql}");
+        assert!(
+            rows.iter().all(|row| row[1].is_null()),
+            "{dsn}: {sql}: {rows:?}"
+        );
     }
 }
