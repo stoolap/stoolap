@@ -1949,6 +1949,10 @@ impl fmt::Display for SelectStatement {
             let wins: Vec<String> = self.window_defs.iter().map(|w| w.to_string()).collect();
             result.push_str(&format!(" WINDOW {}", wins.join(", ")));
         }
+        // ORDER BY, LIMIT and OFFSET apply to the whole set operation
+        for set_op in &self.set_operations {
+            result.push_str(&format!(" {} {}", set_op.operation, set_op.right));
+        }
         if !self.order_by.is_empty() {
             let orders: Vec<String> = self.order_by.iter().map(|o| o.to_string()).collect();
             result.push_str(&format!(" ORDER BY {}", orders.join(", ")));
@@ -1958,10 +1962,6 @@ impl fmt::Display for SelectStatement {
         }
         if let Some(ref offset) = self.offset {
             result.push_str(&format!(" OFFSET {}", offset));
-        }
-        // Add set operations
-        for set_op in &self.set_operations {
-            result.push_str(&format!(" {} {}", set_op.operation, set_op.right));
         }
         write!(f, "{}", result)
     }
