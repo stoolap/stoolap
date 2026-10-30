@@ -691,3 +691,63 @@ fn test_as_of_select_star() {
     let result = db.query("SELECT * FROM star_test AS OF TRANSACTION 2", ());
     assert!(result.is_ok(), "AS OF with SELECT * should execute");
 }
+
+#[test]
+fn test_as_of_selects_the_columns_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    for dsn in ["memory://as_of_named_columns", file.as_str()] {
+        let db = Database::open(dsn).unwrap();
+        db.execute(
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, s TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 1, 'a'), (2, 3, 'b')", ())
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before: String = db.query_one("SELECT CAST(NOW() AS TEXT)", ()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        db.execute("UPDATE u SET x = 30 WHERE id = 2", ()).unwrap();
+        db.execute("INSERT INTO u VALUES (3, 9, 'c')", ()).unwrap();
+        let rows = |sql: &str| -> Vec<String> {
+            db.query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| {
+                    let row = row.unwrap();
+                    (0..row.len())
+                        .map(|i| row.get::<String>(i).unwrap())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect()
+        };
+        for (sql, want) in [
+            (
+                "SELECT x, s FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY s".to_string(),
+                vec!["1 a", "30 b", "9 c"],
+            ),
+            (
+                "SELECT s, x FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY s".to_string(),
+                vec!["a 1", "b 30", "c 9"],
+            ),
+            (
+                "SELECT h.x FROM u AS OF TIMESTAMP '2099-01-01' h ORDER BY x".to_string(),
+                vec!["1", "9", "30"],
+            ),
+            (
+                "SELECT u.s FROM u AS OF TRANSACTION 1000000 ORDER BY s".to_string(),
+                vec!["a", "b", "c"],
+            ),
+            (
+                format!("SELECT x, s FROM u AS OF TIMESTAMP '{before}' ORDER BY s"),
+                vec!["1 a", "3 b"],
+            ),
+        ] {
+            assert_eq!(rows(&sql), want, "{dsn}: {sql}");
+        }
+    }
+}
