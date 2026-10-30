@@ -192,6 +192,12 @@ fn bind_order_key<'e>(expr: &'e Expression, stmt: &SelectStatement) -> OrderKey<
     }
 }
 
+/// Whether ORDER BY `expr` of `stmt` is read from a column computing it,
+/// not by a name or a position
+pub(crate) fn order_key_is_expression(expr: &Expression, stmt: &SelectStatement) -> bool {
+    matches!(bind_order_key(expr, stmt), OrderKey::Expression)
+}
+
 /// Whether a qualified name reads the input of a query whose FROM is `from`:
 /// one whose qualifier no entry shows is an enclosing query's column
 fn reads_input(from: Option<&Expression>, qid: &QualifiedIdentifier) -> bool {
@@ -461,7 +467,8 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    ambiguous_column, joined_aliases, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
+    ambiguous_column, joined_aliases, set_operation_key_item, Bound, JoinBlocks, OutOfFamily,
+    PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -12273,10 +12280,7 @@ impl Executor {
             if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 continue;
             }
-            if set_operation
-                && !matches!(col, Expression::Aliased(_))
-                && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
-            {
+            if set_operation && !set_operation_key_item(col, &self.function_registry) {
                 continue;
             }
             // An item's column by the layout; without one, by its index

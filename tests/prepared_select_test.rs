@@ -3113,6 +3113,53 @@ fn test_a_set_operation_s_order_by_subquery_reads_the_whole_one_s_columns() {
 }
 
 #[test]
+fn test_a_set_operation_s_key_beside_a_subquery_reads_the_item_it_repeats() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_item") {
+        let sql = "SELECT RANDOM() AS r FROM t UNION ALL SELECT 0.5 ORDER BY RANDOM(), (SELECT 1)";
+        let drawn: Vec<f64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<f64>(0).unwrap())
+            .collect();
+        assert_eq!(drawn.len(), 6);
+        assert!(drawn.windows(2).all(|w| w[0] <= w[1]), "{drawn:?}");
+        for (sql, want) in [
+            (
+                "SELECT MAX(a) AS m FROM t UNION SELECT 7 ORDER BY MAX(a) DESC, (SELECT 1)",
+                vec![Some(30), Some(7)],
+            ),
+            (
+                "SELECT a + 1 AS p FROM t UNION SELECT v FROM u ORDER BY a + 1 DESC, (SELECT 1)",
+                vec![
+                    None,
+                    Some(31),
+                    Some(21),
+                    Some(11),
+                    Some(7),
+                    Some(5),
+                    Some(1),
+                ],
+            ),
+        ] {
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+        }
+        // A name is read as a name, never as the item it repeats
+        for sql in [
+            "SELECT a AS p FROM t UNION SELECT v FROM u ORDER BY a DESC",
+            "SELECT a AS p FROM t UNION SELECT v FROM u ORDER BY a DESC, (SELECT 1)",
+        ] {
+            assert!(error(&db, sql, ()).0.contains("'a' not found"), "{sql}");
+        }
+    }
+}
+
+#[test]
 fn test_a_set_operation_s_order_by_subquery_reads_an_enclosing_table_of_a_branch_s_name() {
     let _guard = serial();
     for (db, _dir) in alias_key_tables("prepared_set_operation_order_outer") {
