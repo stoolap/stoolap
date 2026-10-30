@@ -2453,6 +2453,20 @@ pub(crate) fn insert_cold_snapshot_taken() {
     run_hook(&INSERT_COLD_SNAPSHOT_HOOK);
 }
 
+thread_local! {
+    static UNIQUE_READ_COLD_SNAPSHOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next unique key read took the cold
+/// snapshot it looks the value up in, before the lookup reads it
+pub fn after_unique_read_cold_snapshot(hook: impl FnOnce() + 'static) {
+    UNIQUE_READ_COLD_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn unique_read_cold_snapshot_taken() {
+    run_hook(&UNIQUE_READ_COLD_SNAPSHOT_HOOK);
+}
+
 pub(crate) fn table_wal_record_written() {
     TABLE_WAL_RECORDS.with(|n| n.set(n.get() + 1));
 }
@@ -3388,6 +3402,7 @@ pub fn reset_all() {
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     INSERT_COLD_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    UNIQUE_READ_COLD_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     READ_PATHS.with(|paths| paths.borrow_mut().clear());
     FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);

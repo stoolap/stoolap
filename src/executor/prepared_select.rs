@@ -3385,13 +3385,10 @@ impl PreparedSelect {
             let keys: Vec<String> = stmt.distinct_on.iter().map(|k| k.to_string()).collect();
             keys.join(", ")
         });
-        // A key read judges each row by the whole WHERE
         let empty_unless = stmt
             .where_clause
             .as_deref()
-            .filter(|_| {
-                self.constant_where && !matches!(plan.read, Read::PkGet(_) | Read::UniqueGet(_))
-            })
+            .filter(|_| self.constant_where)
             .map(|where_clause| {
                 let mut terms = Vec::new();
                 any_constant_term(where_clause, &mut |term| {
@@ -3485,6 +3482,22 @@ impl PreparedSelect {
                 false => Read::PkGet(read),
             },
         });
+    }
+
+    /// Whether a run of `stmt` in `ctx` keeps no row: a constant AND term
+    /// of its WHERE is false or NULL, which no read reaches a row before
+    pub(crate) fn keeps_no_row(&self, stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
+        self.has_constant_where()
+            && ctx.outer_row().is_none()
+            && stmt
+                .where_clause
+                .as_deref()
+                .is_some_and(|w| true_for_no_row(w, ctx))
+    }
+
+    /// Whether the WHERE holds a constant AND term, which a run asks first
+    pub(crate) fn has_constant_where(&self) -> bool {
+        self.constant_where
     }
 
     /// The key read the plan chose, and whether a unique index reads it
@@ -10591,12 +10604,7 @@ impl Executor {
             target.is_none_or(|target| rows.len() < target)
         };
         // A WHERE that keeps no row reads no row
-        let keeps_none = prepared.constant_where
-            && ctx.outer_row().is_none()
-            && stmt
-                .where_clause
-                .as_deref()
-                .is_some_and(|w| true_for_no_row(w, ctx));
+        let keeps_none = prepared.keeps_no_row(stmt, ctx);
         // A DISTINCT of one column answers with the values the table keeps
         let column = stmt
             .distinct

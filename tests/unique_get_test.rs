@@ -211,3 +211,120 @@ fn a_dropped_unique_index_leaves_the_statement_to_the_scan() {
     db.execute("INSERT INTO d VALUES (3, 14)", ()).unwrap();
     assert_eq!(ids(&stmt), vec![2, 3]);
 }
+
+#[test]
+fn a_false_constant_term_keeps_every_row_out_before_a_key_read() {
+    for cold in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = table("unique_get_constant", cold, &dir);
+        for sql in [
+            "SELECT id, name FROM u WHERE code = $1 AND ABS(name) > 0 AND $2 = 0",
+            "SELECT id, name FROM u WHERE id = $1 AND ABS(name) > 0 AND $2 = 0",
+        ] {
+            assert_eq!(rows(&db, sql, (7, 1)), vec![], "{sql}, cold {cold}");
+            let stmt = db.prepare(sql).unwrap();
+            assert_eq!(stmt.query((7, 1)).unwrap().count(), 0, "{sql}, cold {cold}");
+        }
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT id, name FROM u WHERE code = 7 AND ABS(name) > 0 AND 1 = 0",
+                ()
+            ),
+            vec![],
+            "cold {cold}"
+        );
+        // A constant term that holds leaves the key read to answer
+        assert_eq!(
+            read(
+                &db,
+                "SELECT id, name FROM u WHERE 1 = 1 AND code = $1",
+                (7,)
+            ),
+            n(1),
+            "cold {cold}"
+        );
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+mod windows {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use stoolap::test_failpoints::{
+        after_indexes_published, after_unique_read_cold_snapshot, FailpointGuard,
+    };
+
+    fn ids(db: &Database, code: i64) -> Vec<i64> {
+        db.query("SELECT id FROM u WHERE code = $1", (code,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_commit_moving_a_value_between_rows_is_not_read_half_done() {
+        let _guard = FailpointGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = table("unique_get_moving_value", false, &dir);
+        assert_eq!(ids(&db, 14), vec![2]);
+        let reader = db.clone();
+        let seen = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&seen);
+        after_indexes_published(move || {
+            *slot.borrow_mut() = Some((ids(&reader, 14), ids(&reader, 21)));
+        });
+        db.execute("BEGIN", ()).unwrap();
+        db.execute("UPDATE u SET code = 1000 WHERE id = 2", ())
+            .unwrap();
+        db.execute("UPDATE u SET code = 14 WHERE id = 3", ())
+            .unwrap();
+        db.execute("COMMIT", ()).unwrap();
+        assert_eq!(
+            seen.borrow_mut().take(),
+            Some((vec![2], vec![3])),
+            "the values as they were before the commit"
+        );
+        assert_eq!(ids(&db, 14), vec![3]);
+        assert_eq!(ids(&db, 21), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn a_volume_compacted_after_the_snapshot_still_holds_the_row() {
+        let _guard = FailpointGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&format!(
+            "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+            dir.path().display()
+        ))
+        .unwrap();
+        db.execute(CREATE, ()).unwrap();
+        db.execute("INSERT INTO u VALUES (1, 10, 'n1', 1.0)", ())
+            .unwrap();
+        db.engine().seal_for_test().unwrap();
+        db.execute("INSERT INTO u VALUES (3, 30, 'n3', 3.0)", ())
+            .unwrap();
+        db.engine().seal_for_test().unwrap();
+        assert_eq!(db.engine().volume_stats().len(), 2);
+        db.engine().cold_volumes_for_test("u");
+        db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+        let compactor = db.clone();
+        after_unique_read_cold_snapshot(move || {
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(compactor.engine().compact_for_test().is_ok());
+            });
+            let compacted = finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .ok();
+            assert_eq!(compacted, Some(true), "the compaction did not finish");
+        });
+        assert_eq!(read(&db, BY_CODE, (30,)), n(3));
+        assert_eq!(
+            db.engine().volume_stats().len(),
+            1,
+            "the volumes were not merged"
+        );
+    }
+}

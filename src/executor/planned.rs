@@ -274,6 +274,22 @@ impl Executor {
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::pk_lookup_resolved();
+            // A constant term that is false keeps every row out unread
+            if planned.has_constant_where() {
+                let held;
+                let terms_ctx = match ctx {
+                    Some(ctx) => ctx,
+                    None => {
+                        held = ExecutionContext::with_params(params.into());
+                        &held
+                    }
+                };
+                if planned.keeps_no_row(stmt, terms_ctx) {
+                    let (plan, _) = planned.key_read()?;
+                    let empty = ExecutorResult::with_arc_columns(plan.names.clone(), RowVec::new());
+                    return Some(Ok(Box::new(empty) as Box<dyn QueryResult>));
+                }
+            }
             let view = ctx.and_then(ExecutionContext::statement_view);
             // CURRENT_TRANSACTION_ID() reads the open transaction's id
             let transaction = match ctx.and_then(ExecutionContext::transaction_id) {
