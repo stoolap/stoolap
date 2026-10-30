@@ -244,3 +244,63 @@ fn test_alias_on_the_left_of_a_subquery_comparison() {
         }
     }
 }
+
+#[test]
+fn where_reads_a_select_alias_over_every_source_a_from_column_winning() {
+    let db = Database::open("memory://col_alias_where_every_source").unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO u VALUES (1, 2)",
+        "CREATE VIEW v AS SELECT x FROM u",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let values = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    let prepared = |sql: &str| -> Vec<i64> {
+        db.prepare(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .query(())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    for (sql, want) in [
+        ("SELECT x + 1 AS k FROM u WHERE k < 5", vec![3]),
+        ("SELECT v.x AS k FROM v WHERE k < 5", vec![2]),
+        (
+            "SELECT q.x AS k FROM (SELECT x FROM u) AS q WHERE k < 5",
+            vec![2],
+        ),
+        (
+            "SELECT column1 AS k FROM (VALUES (1)) AS w WHERE k < 5",
+            vec![1],
+        ),
+        (
+            "SELECT value AS k FROM generate_series(1, 2) WHERE k < 5",
+            vec![1, 2],
+        ),
+        (
+            "WITH c AS (SELECT x FROM u) SELECT x AS k FROM c WHERE k < 5",
+            vec![2],
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT v.x AS k FROM v WHERE k < 5 AND v.x = t.id + 1)",
+            vec![1],
+        ),
+        ("SELECT x AS id FROM u WHERE id = 2", vec![]),
+        (
+            "SELECT q.x AS id FROM (SELECT id, x FROM u) AS q WHERE id = 2",
+            vec![],
+        ),
+    ] {
+        assert_eq!(values(sql), want, "{sql}");
+        assert_eq!(prepared(sql), want, "prepared: {sql}");
+    }
+}
