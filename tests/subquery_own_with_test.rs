@@ -173,6 +173,67 @@ fn a_subquery_reads_its_own_ctes() {
 }
 
 #[test]
+fn a_with_inside_hides_and_reads_the_ctes_around_it_on_every_path() {
+    for (db, _dir) in tables("own_with_scopes") {
+        // A computed LIMIT leaves the statement to the general path
+        for tail in ["", " LIMIT 1 + 9"] {
+            for (sql, at, want) in [
+                (
+                    "WITH c AS (SELECT 1 AS x) \
+                     SELECT s.x FROM (WITH c AS (SELECT 2 AS x) SELECT x FROM c) s",
+                    0,
+                    vec![Some(2)],
+                ),
+                (
+                    "WITH c(x) AS (SELECT 1) SELECT (WITH d(y) AS (SELECT x FROM c) SELECT y FROM d)",
+                    0,
+                    vec![Some(1)],
+                ),
+                (
+                    "WITH c(x) AS (SELECT 1) \
+                     SELECT s.y FROM (WITH d(y) AS (SELECT x FROM c) SELECT y FROM d) s",
+                    0,
+                    vec![Some(1)],
+                ),
+                (
+                    "SELECT id FROM t WHERE EXISTS (WITH u AS (SELECT 99 AS x) \
+                     SELECT 1 FROM u WHERE u.x = t.a) ORDER BY id",
+                    0,
+                    vec![],
+                ),
+                (
+                    "SELECT id FROM t WHERE NOT EXISTS (WITH u AS (SELECT 99 AS x) \
+                     SELECT 1 FROM u WHERE u.x = t.a) ORDER BY id",
+                    0,
+                    vec![Some(1), Some(2), Some(3), Some(4)],
+                ),
+                (
+                    "SELECT id, (WITH u AS (SELECT 99 AS x) SELECT COUNT(*) FROM u WHERE u.x = t.a) \
+                     FROM t ORDER BY id",
+                    1,
+                    vec![Some(0); 4],
+                ),
+                (
+                    "SELECT (WITH c AS (SELECT 1 AS x) SELECT c.x FROM c \
+                     JOIN (SELECT 1 AS y) d ON c.x = d.y WHERE c.x IN (SELECT x FROM c))",
+                    0,
+                    vec![Some(1)],
+                ),
+                (
+                    "SELECT (WITH c AS (SELECT 1 AS x) SELECT (SELECT MAX(x) FROM c) FROM c \
+                     JOIN (SELECT 1 AS y) d ON c.x = d.y)",
+                    0,
+                    vec![Some(1)],
+                ),
+            ] {
+                let sql = format!("{sql}{tail}");
+                assert_eq!(column(&db, &sql, at), want, "{sql}");
+            }
+        }
+    }
+}
+
+#[test]
 fn a_subquery_s_own_ctes_read_parameters_and_serve_every_statement() {
     for (db, _dir) in tables("own_with_statements") {
         let prepared = db

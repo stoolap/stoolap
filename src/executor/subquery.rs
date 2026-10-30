@@ -716,7 +716,7 @@ impl Executor {
     /// returns its one row whether or not anything matched. Grouping on its
     /// own is not among them, since a group is there exactly where a row is.
     /// Nor can they check an ORDER BY position beside a star, which only the
-    /// expanded list's width tells valid.
+    /// expanded list's width tells valid, or read a CTE of its own WITH.
     fn exists_subquery_is_more_than_its_where(subquery: &SelectStatement) -> bool {
         let star = subquery
             .columns
@@ -728,6 +728,7 @@ impl Executor {
             .any(|ob| matches!(ob.expression, Expression::IntegerLiteral(_)));
         // ROLLUP, CUBE and grouping sets add total rows that need no row
         if (star && position)
+            || subquery.with.is_some()
             || subquery.having.is_some()
             || subquery.limit.is_some()
             || subquery.offset.is_some()
@@ -878,12 +879,14 @@ impl Executor {
         if !subquery.group_by.columns.is_empty() {
             return Ok(None);
         }
-        // A HAVING, a row count, a set operation or grouping sets decide more than the count
+        // A HAVING, a row count, a set operation or grouping sets decide more
+        // than the count, and a WITH of its own names what its FROM reads
         if subquery.having.is_some()
             || subquery.limit.is_some()
             || subquery.offset.is_some()
             || !subquery.set_operations.is_empty()
             || subquery.group_by.modifier != GroupByModifier::None
+            || subquery.with.is_some()
         {
             return Ok(None);
         }
@@ -1125,8 +1128,13 @@ impl Executor {
             return Ok(None);
         }
 
-        // Must not have HAVING, LIMIT, OFFSET (these would change results)
-        if subquery.having.is_some() || subquery.limit.is_some() || subquery.offset.is_some() {
+        // Must not have HAVING, LIMIT, OFFSET (these would change results),
+        // nor a WITH of its own, which names what its FROM reads
+        if subquery.having.is_some()
+            || subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || subquery.with.is_some()
+        {
             return Ok(None);
         }
 

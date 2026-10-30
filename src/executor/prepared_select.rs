@@ -4672,6 +4672,9 @@ struct Builder<'e> {
     projected_from: Option<usize>,
     /// The projected row's columns the key being rewritten reads
     projected_reads: SmallVec<[usize; 2]>,
+    /// The CTEs of the statement block being bound and of those around it,
+    /// with their columns, which a block's FROM reads ahead of the context
+    ctes: Vec<(SmartString, Vec<String>)>,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -5059,7 +5062,8 @@ impl Builder<'_> {
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
         let mut params = SmallVec::<[usize; 2]>::new();
-        let (statement, names, own) = StatementWalk {
+        let around = self.ctes.clone();
+        let mut walk = StatementWalk {
             executor,
             ctx,
             on: &mut |reach| match reach {
@@ -5080,9 +5084,12 @@ impl Builder<'_> {
             },
             runs: true,
             visible: Vec::new(),
-            ctes: Vec::new(),
-        }
-        .statement(sq, outer, 0, Check::All)?;
+            ctes: around,
+        };
+        // Its own CTEs stay in scope for the join's binding below
+        let walked = walk.statement_in_scope(sq, outer, 0, Check::All);
+        let ctes = std::mem::take(&mut walk.ctes);
+        let (statement, names, own) = walked?;
         let width = form.width().unwrap_or(0);
         if form.width().is_some() {
             block_width(named(names)?.len(), width)?;
@@ -5093,7 +5100,11 @@ impl Builder<'_> {
             if dropped {
                 check_block_positions(sq, own.columns.len())?;
             }
-            self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)))?;
+            let around = std::mem::replace(&mut self.ctes, ctes);
+            let bound =
+                self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)));
+            self.ctes = around;
+            bound?;
         }
         let statement = match dropped {
             // A join's run names its columns, so it binds what it reads
@@ -5537,6 +5548,9 @@ impl Builder<'_> {
     /// general path reads them, with its columns; None for a table. A view
     /// is read when a call first needs it
     fn named_source(&self, name: &str) -> Result<Option<NamedSource>> {
+        if let Some((_, columns)) = self.ctes.iter().rev().find(|(cte, _)| cte == name) {
+            return Ok(Some((BlockSource::Cte(name.into()), columns.clone())));
+        }
         let view = match self.executor.named(self.ctx, name)? {
             Named::Cte((columns, _)) => {
                 return Ok(Some((BlockSource::Cte(name.into()), columns.to_vec())))
@@ -6374,6 +6388,83 @@ fn needs_folding(expr: &Expression) -> bool {
     folds
 }
 
+/// Each statement `stmt` holds, not those inside them: its derived tables,
+/// subqueries, set operation branches and CTE bodies
+fn statements_inside<'s>(stmt: &'s SelectStatement, out: &mut Vec<&'s SelectStatement>) {
+    fn from<'s>(source: &'s Expression, out: &mut Vec<&'s SelectStatement>) {
+        match source {
+            Expression::SubquerySource(derived) => out.push(&derived.subquery),
+            Expression::JoinSource(join) => {
+                from(&join.left, out);
+                from(&join.right, out);
+                if let Some(on) = join.condition.as_deref() {
+                    nested_statements(on, out);
+                }
+            }
+            Expression::ValuesSource(values) => {
+                for value in values.rows.iter().flatten() {
+                    nested_statements(value, out);
+                }
+            }
+            Expression::FunctionTableSource(function) => {
+                for argument in &function.arguments {
+                    nested_statements(argument, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(source) = stmt.table_expr.as_deref() {
+        from(source, out);
+    }
+    let grouping_sets = match &stmt.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets.as_slice(),
+        _ => &[],
+    };
+    let windows = stmt.window_defs.iter().flat_map(|def| {
+        def.partition_by
+            .iter()
+            .chain(def.order_by.iter().map(|o| &o.expression))
+    });
+    for expr in stmt
+        .columns
+        .iter()
+        .chain(&stmt.distinct_on)
+        .chain(stmt.where_clause.as_deref())
+        .chain(&stmt.group_by.columns)
+        .chain(grouping_sets.iter().flatten())
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(stmt.limit.as_deref())
+        .chain(stmt.offset.as_deref())
+        .chain(windows)
+    {
+        nested_statements(expr, out);
+    }
+    out.extend(stmt.set_operations.iter().map(|op| &*op.right));
+    out.extend(
+        stmt.with
+            .iter()
+            .flat_map(|with| &with.ctes)
+            .map(|cte| &*cte.query),
+    );
+}
+
+/// Whether a statement inside `stmt`, at any depth, has its own WITH with
+/// a CTE `names` takes: there a name read by its text is that CTE
+pub(crate) fn redefines_cte(stmt: &SelectStatement, names: &dyn Fn(&str) -> bool) -> bool {
+    let mut inside = Vec::new();
+    statements_inside(stmt, &mut inside);
+    inside.into_iter().any(|nested| {
+        nested
+            .with
+            .iter()
+            .flat_map(|with| &with.ctes)
+            .any(|cte| names(&cte.name.value_lower))
+            || redefines_cte(nested, names)
+    })
+}
+
 /// Each statement `expr` holds as a subquery, not those inside them
 fn nested_statements<'e>(expr: &'e Expression, out: &mut Vec<&'e SelectStatement>) {
     match expr {
@@ -7184,6 +7275,7 @@ impl PreparedSelect {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -7618,6 +7710,7 @@ impl PreparedGrouped {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -8436,6 +8529,7 @@ impl PreparedDml {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -8825,6 +8919,7 @@ impl JoinBlocks {
             where_slots: Vec::new(),
             projected_from: None,
             projected_reads: SmallVec::new(),
+            ctes: Vec::new(),
         };
         // A side read as rows keeps the conditions its read asks: those
         // without a block, which the read takes, and those whose blocks bind

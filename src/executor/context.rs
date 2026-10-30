@@ -1619,6 +1619,11 @@ impl ExecutionContext {
             .is_some_and(|data| !data.is_empty())
     }
 
+    /// The CTEs this context brings, shared
+    pub(crate) fn cte_data(&self) -> Option<&Arc<CteDataMap>> {
+        self.cte_data.as_ref()
+    }
+
     /// The names and columns of the CTEs this context brings
     pub(crate) fn cte_scope(&self) -> CteScope {
         CteScope(
