@@ -8765,6 +8765,12 @@ impl PreparedDml {
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
+        // Every slot is read for a row the statement writes: its error is raised there
+        for (slot, _) in &run_slots {
+            if !builder.where_slots.contains(slot) {
+                builder.where_slots.push(*slot);
+            }
+        }
         let (blocks, holes) = builder.finish(param_count, run_slots)?;
         let where_ = where_parts
             .zip(where_program)
@@ -9651,6 +9657,27 @@ impl<'a> DmlRunner<'a> {
             Some((storage_expr, ..)) => Candidates::Scan(storage_expr),
             None => Candidates::Pruned,
         })
+    }
+
+    /// The scan of `table` that takes the whole WHERE, found without reading
+    /// a row: None when a narrowing reads the rows or the scan takes part
+    pub(crate) fn whole_scan(
+        &self,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Option<Box<dyn StorageExpr>>>> {
+        let Some(where_) = &self.prepared.where_ else {
+            return Ok(Some(None));
+        };
+        if where_.narrowing.is_some() {
+            return Ok(None);
+        }
+        Ok(
+            match self.runner.where_scan(where_, None, None, table, ctx)? {
+                Some((storage_expr, true, ..)) => Some(storage_expr),
+                _ => None,
+            },
+        )
     }
 
     /// Hand `keep` the row id and row of each row of `table` the WHERE
@@ -12438,10 +12465,6 @@ impl<'a> PreparedRunner<'a> {
         let (mut listed, mut scanner, judged, passed) =
             match self.narrowed_rows(where_.narrowing, table, target)? {
                 Some((candidates, settled)) => {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::prepared_rows_narrowed_by_keys(
-                        where_.narrowing.is_some_and(|n| n.negated),
-                    );
                     // A named row needs no second look at the narrowing,
                     // nor at the pushed conjuncts the scan's filter took
                     rest = match (settled, rest) {
@@ -12653,7 +12676,12 @@ impl<'a> PreparedRunner<'a> {
         let index = id as usize;
         let sq = &self.prepared.subqueries[index];
         if members {
-            return self.rows_by_members(table, index, column, whole, negated, target);
+            let rows = self.rows_by_members(table, index, column, whole, negated, target)?;
+            #[cfg(feature = "test-failpoints")]
+            if rows.is_some() {
+                crate::test_failpoints::prepared_rows_narrowed_by_keys(negated);
+            }
+            return Ok(rows);
         }
         let Answer::Exists(existence) = &sq.answer else {
             return Ok(None);
@@ -12705,6 +12733,10 @@ impl<'a> PreparedRunner<'a> {
             let members = set.outcomes.keys().filter_map(|key| key.first());
             Executor::rows_of_members(table, column, members, target.is_some(), enough)?
         };
+        #[cfg(feature = "test-failpoints")]
+        if rows.is_some() {
+            crate::test_failpoints::prepared_rows_narrowed_by_keys(negated);
+        }
         Ok(rows.map(|rows| (rows, !set.failed)))
     }
 

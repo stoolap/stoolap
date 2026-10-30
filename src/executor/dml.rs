@@ -3489,9 +3489,9 @@ impl Executor {
                 // A scan that takes the whole WHERE deletes as it reads; else
                 // the runner reads the rows a prepared WHERE passes
                 match dml_run.as_ref().filter(|_| !has_returning) {
-                    Some(run) => match run.candidates(&*table, ctx)? {
-                        super::prepared_select::Candidates::Whole(expr) => (expr, false, None),
-                        _ => (None, true, None),
+                    Some(run) => match run.whole_scan(&*table, ctx)? {
+                        Some(expr) => (expr, false, None),
+                        None => (None, true, None),
                     },
                     None => (None, true, None),
                 }

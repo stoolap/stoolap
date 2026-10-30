@@ -52,6 +52,18 @@ const RUN: &[(&str, &[i64])] = &[
     ("UPDATE t SET u = 1 WHERE id = 3", &[]),
     ("UPDATE t SET c = NULL WHERE id = 6", &[]),
     ("UPDATE t SET b = 9223372036854775807 + b WHERE id = 2", &[]),
+    ("UPDATE t SET b = 9223372036854775807 + 1 WHERE a = 99", &[]),
+    ("UPDATE t SET b = 9223372036854775807 + 1 WHERE id = 99", &[]),
+    ("UPDATE t SET b = 1 / 0 WHERE s = 'none'", &[]),
+    ("UPDATE t SET b = 9223372036854775807 + 1 WHERE a = 1", &[]),
+    (
+        "INSERT INTO t VALUES (99, 1, 1, 1.0, 'n', 1, 99, 1) ON CONFLICT (id) DO UPDATE SET b = 9223372036854775807 + 1",
+        &[],
+    ),
+    (
+        "INSERT INTO t VALUES (1, 1, 1, 1.0, 'n', 1, 98, 1) ON CONFLICT (id) DO UPDATE SET b = 9223372036854775807 + 1",
+        &[],
+    ),
     ("DELETE FROM t WHERE id = 45", &[]),
     ("DELETE FROM t WHERE a = 6", &[]),
     ("DELETE FROM t WHERE s = 'x9' OR f < 1", &[]),
