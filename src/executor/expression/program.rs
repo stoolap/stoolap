@@ -21,9 +21,12 @@
 
 use smallvec::SmallVec;
 
-use super::ops::Op;
-use super::vm::ExprVM;
+use std::sync::Arc;
+
+use super::ops::{CompareOp, Op};
+use super::vm::{read_param, reads_otherwise, ExprVM};
 use crate::common::CompactArc;
+use crate::core::DataType;
 use crate::core::Value;
 
 /// Compiled expression program
@@ -49,6 +52,9 @@ pub struct Program {
     /// Whether the ops are single-op predicates joined by AND and OR, which
     /// a filter answers without the stack
     predicate_chain: bool,
+
+    /// How many parameter slots the chain reads, one past the highest
+    chain_params: usize,
 
     /// What binding the program to its execution's parameters reads, for a
     /// program that loads one
@@ -86,6 +92,7 @@ impl Program {
 
         let binding = Binding::of(&ops, folds);
         let predicate_chain = ExprVM::is_predicate_chain(&ops);
+        let chain_params = ExprVM::chain_params(&ops);
 
         Self {
             ops,
@@ -93,6 +100,7 @@ impl Program {
             needs_second_row,
             has_subqueries,
             predicate_chain,
+            chain_params,
             binding,
             bound_from: None,
         }
@@ -121,6 +129,7 @@ impl Program {
 
         let binding = Binding::of(&ops, Vec::new());
         let predicate_chain = ExprVM::is_predicate_chain(&ops);
+        let chain_params = ExprVM::chain_params(&ops);
 
         Self {
             ops,
@@ -128,6 +137,7 @@ impl Program {
             needs_second_row,
             has_subqueries,
             predicate_chain,
+            chain_params,
             binding,
             bound_from: None,
         }
@@ -163,11 +173,15 @@ impl Program {
     /// at the cost of its value. A parameter `params` lacks keeps its error
     pub fn bind(&self, params: &[Value]) -> Option<Self> {
         let binding = self.binding.as_deref()?;
-        if binding.shrinks.get() == Some(&false) {
+        // A parameter read as another value is read once here, not per row
+        let reads = binding.reads && self.ops.iter().any(|op| reads_now(op, params));
+        if binding.shrinks.get() == Some(&false) && !reads {
             return None;
         }
+        let value = |slot: u32| params.get(slot as usize).cloned();
         let bound = self.bind_with(|op| match op {
-            Op::LoadParam(slot) => params.get(*slot as usize).cloned().map(Op::LoadConst),
+            Op::LoadParam(slot) => value(*slot).map(Op::LoadConst),
+            op if reads_now(op, params) => known_params(op, value),
             _ => None,
         })?;
         let shrinks = bound.ops.len() < self.ops.len();
@@ -180,7 +194,13 @@ impl Program {
         if settled {
             let _ = binding.shrinks.set(shrinks);
         }
-        shrinks.then_some(bound)
+        (shrinks || reads).then_some(bound)
+    }
+
+    /// Whether binding the program to its execution's parameters may change
+    /// it: it loads a parameter or reads one as a column's type
+    pub(crate) fn binds_params(&self) -> bool {
+        self.binding.is_some()
     }
 
     /// `program` bound to `params`, from the program it was bound from when
@@ -202,7 +222,7 @@ impl Program {
     pub fn bind_never_shrinks(&self) -> bool {
         self.binding
             .as_deref()
-            .is_some_and(|binding| binding.shrinks.get() == Some(&false))
+            .is_some_and(|binding| binding.shrinks.get() == Some(&false) && !binding.reads)
     }
 
     /// This program with each op `known` replaces taken as its replacement,
@@ -457,6 +477,11 @@ impl Program {
         self.predicate_chain
     }
 
+    /// How many parameter slots the predicate chain reads
+    pub(crate) fn chain_params(&self) -> usize {
+        self.chain_params
+    }
+
     /// Get the number of operations
     #[inline]
     pub fn len(&self) -> usize {
@@ -485,6 +510,7 @@ impl Program {
         self.ops = Self::peephole_optimize(self.ops, &mut folds);
         self.binding = Binding::of(&self.ops, folds);
         self.predicate_chain = ExprVM::is_predicate_chain(&self.ops);
+        self.chain_params = ExprVM::chain_params(&self.ops);
         self
     }
 
@@ -600,6 +626,17 @@ impl Program {
                 }
             }
 
+            // Pattern 4: LoadColumn + parameters + their test → one op
+            let at = i;
+            if let Some((fused_op, taken)) =
+                Self::param_test(&ops[i..], |k| jump_targets.contains(&(at + k)))
+            {
+                result.push(fused_op);
+                position_map.extend(std::iter::repeat_n(new_pos, taken));
+                i += taken;
+                continue;
+            }
+
             // No fusion, copy the op
             result.push(std::mem::replace(&mut ops[i], Op::Nop));
             position_map.push(new_pos);
@@ -613,6 +650,44 @@ impl Program {
         }
 
         result
+    }
+
+    /// The op testing a column against the parameters loaded after it that
+    /// `ops` start with, each read as one type or each as it is, and how
+    /// many ops it stands for; None when one of them is a jump `target` or
+    /// the test is no comparison, BETWEEN or short IN list
+    fn param_test(ops: &[Op], target: impl Fn(usize) -> bool) -> Option<(Op, usize)> {
+        let (Op::LoadColumn(col) | Op::LoadAggregateResult(col)) = *ops.first()? else {
+            return None;
+        };
+        let mut slots: SmallVec<[u32; IN_PARAMS_FUSED]> = SmallVec::new();
+        let mut read_as = None;
+        let mut at = 1;
+        while let Some(Op::LoadParam(slot)) = ops.get(at) {
+            let read = match ops.get(at + 1) {
+                Some(Op::ReadAsColumn(column_type)) => Some(*column_type),
+                _ => None,
+            };
+            if !slots.is_empty() && read != read_as {
+                return None;
+            }
+            (read_as, at) = (read, at + 1 + usize::from(read.is_some()));
+            slots.push(*slot);
+        }
+        let fused = match (&slots[..], ops.get(at)?) {
+            ([low, high], Op::Between) => Op::BetweenColumnParams(col, *low, *high, read_as),
+            (slots, Op::InList(count))
+                if !slots.is_empty()
+                    && slots.len() == *count as usize
+                    && slots.len() <= IN_PARAMS_FUSED =>
+            {
+                Op::InColumnParams(col, Arc::from(slots), read_as)
+            }
+            ([slot], test) => Op::CompareColumnParam(col, *slot, compare_of(test)?, read_as),
+            _ => return None,
+        };
+        let taken = at + 1;
+        (0..taken).all(|k| !target(k)).then_some((fused, taken))
     }
 
     /// The fold ranges at their positions after fusion; a range an op fused
@@ -638,6 +713,58 @@ impl Program {
     }
 }
 
+/// The longest IN list of parameters tested in one op; a longer one is
+/// bound into a hash set
+const IN_PARAMS_FUSED: usize = 8;
+
+/// The comparison the stack op `op` makes
+fn compare_of(op: &Op) -> Option<CompareOp> {
+    Some(match op {
+        Op::Eq => CompareOp::Eq,
+        Op::Ne => CompareOp::Ne,
+        Op::Lt => CompareOp::Lt,
+        Op::Le => CompareOp::Le,
+        Op::Gt => CompareOp::Gt,
+        Op::Ge => CompareOp::Ge,
+        _ => return None,
+    })
+}
+
+/// `op` with the parameters it tests a column against known by `value`, as
+/// the op fused from them written as literals; None for any other op or a
+/// slot `value` lacks
+pub(crate) fn known_params(op: &Op, value: impl Fn(u32) -> Option<Value>) -> Option<Op> {
+    let read = |slot: u32, read_as: Option<DataType>| -> Option<Value> {
+        let value = value(slot)?;
+        Some(read_param(&value, read_as).into_owned())
+    };
+    Some(match op {
+        Op::CompareColumnParam(col, slot, compare, read_as) => {
+            let (col, value) = (*col, read(*slot, *read_as)?);
+            match compare {
+                CompareOp::Eq => Op::EqColumnConst(col, value),
+                CompareOp::Ne => Op::NeColumnConst(col, value),
+                CompareOp::Lt => Op::LtColumnConst(col, value),
+                CompareOp::Le => Op::LeColumnConst(col, value),
+                CompareOp::Gt => Op::GtColumnConst(col, value),
+                CompareOp::Ge => Op::GeColumnConst(col, value),
+            }
+        }
+        Op::BetweenColumnParams(col, low, high, read_as) => {
+            Op::BetweenColumnConst(*col, read(*low, *read_as)?, read(*high, *read_as)?)
+        }
+        Op::InColumnParams(col, slots, read_as) => {
+            let values: SmallVec<[Value; IN_PARAMS_FUSED]> = slots
+                .iter()
+                .map(|slot| read(*slot, *read_as))
+                .collect::<Option<_>>()?;
+            let members: SmallVec<[&Value; IN_PARAMS_FUSED]> = values.iter().collect();
+            Op::InSetColumn(*col, super::compiler::member_set(&members))
+        }
+        _ => return None,
+    })
+}
+
 /// What binding a program to its execution's parameters reads beside its ops
 #[derive(Clone)]
 struct Binding {
@@ -647,19 +774,53 @@ struct Binding {
     /// Whether binding the parameters shrinks the program, once a bind
     /// found it out for every value
     shrinks: std::sync::OnceLock<bool>,
+    /// Whether a column test reads its parameters as the column's type,
+    /// which binding does once when a value is of another type
+    reads: bool,
 }
 
 impl Binding {
-    /// The binding of a program of `ops`, when one loads a parameter
+    /// The binding of a program of `ops`, when one loads a parameter or
+    /// tests a column against parameters read as its type
     fn of(ops: &[Op], folds: Vec<(u16, u16)>) -> Option<Box<Self>> {
-        ops.iter()
-            .any(|op| matches!(op, Op::LoadParam(_)))
-            .then(|| {
-                Box::new(Self {
-                    folds,
-                    shrinks: std::sync::OnceLock::new(),
-                })
+        let reads = ops.iter().any(|op| read_as_of(op).is_some());
+        (reads || ops.iter().any(|op| matches!(op, Op::LoadParam(_)))).then(|| {
+            Box::new(Self {
+                folds,
+                shrinks: std::sync::OnceLock::new(),
+                reads,
             })
+        })
+    }
+}
+
+/// The type a column test against parameters reads them as, when it reads
+/// them as one
+fn read_as_of(op: &Op) -> Option<DataType> {
+    match op {
+        Op::CompareColumnParam(.., read_as)
+        | Op::BetweenColumnParams(.., read_as)
+        | Op::InColumnParams(.., read_as) => *read_as,
+        _ => None,
+    }
+}
+
+/// Whether `op` tests a column against a parameter of `params` that it
+/// reads as another value, which binding reads once for the execution
+fn reads_now(op: &Op, params: &[Value]) -> bool {
+    let Some(column_type) = read_as_of(op) else {
+        return false;
+    };
+    let read = |slot: &u32| {
+        params
+            .get(*slot as usize)
+            .is_some_and(|value| reads_otherwise(value, column_type))
+    };
+    match op {
+        Op::CompareColumnParam(_, slot, ..) => read(slot),
+        Op::BetweenColumnParams(_, low, high, _) => read(low) || read(high),
+        Op::InColumnParams(_, slots, _) => slots.iter().any(read),
+        _ => false,
     }
 }
 
@@ -1118,7 +1279,7 @@ mod tests {
 
     #[test]
     fn a_worker_copy_of_a_bound_program_binds_new_values() {
-        let program = CompactArc::new(Program::new(vec![
+        let program = CompactArc::new(Program::new_unoptimized(vec![
             Op::LoadColumn(0),
             Op::LoadParam(0),
             Op::Eq,

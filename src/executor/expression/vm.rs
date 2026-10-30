@@ -222,6 +222,39 @@ pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) 
     Value::Text(SmartString::from_string_shared(s))
 }
 
+/// A parameter tested against a column, read as the column's type
+/// `read_as` as the compiler reads a literal there
+#[inline]
+pub(crate) fn read_param(value: &Value, read_as: Option<DataType>) -> Cow<'_, Value> {
+    match read_as {
+        Some(column_type) if reads_otherwise(value, column_type) => Cow::Owned(
+            crate::executor::pushdown::read_as_column(column_type, value.clone()),
+        ),
+        _ => Cow::Borrowed(value),
+    }
+}
+
+/// Whether a parameter read as `column_type` reads as another value than it
+/// is: a NULL, or a value of another type
+#[inline]
+pub(crate) fn reads_otherwise(value: &Value, column_type: DataType) -> bool {
+    value.is_null() || value.data_type() != column_type
+}
+
+/// `value IN (items)`: `value = item OR value = item ...`, with OR's
+/// UNKNOWN
+fn in_list<'v>(value: &Value, items: impl Iterator<Item = &'v Value>) -> Option<bool> {
+    let mut result = Some(false);
+    for item in items {
+        match sql_eq(value, item) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => result = None,
+        }
+    }
+    result
+}
+
 /// `value BETWEEN low AND high`: `value >= low AND value <= high`, where a
 /// false half decides even when the other is UNKNOWN
 #[cold]
@@ -912,6 +945,31 @@ impl ExprVM {
                         _ => truth(between_cell(col_val, low, high)),
                     };
                     stack.push(result);
+                    pc += 1;
+                }
+
+                Op::CompareColumnParam(idx, slot, compare, read_as) => {
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
+                    let param = read_param(ctx.param_ref(*slot as usize)?, *read_as);
+                    stack.push(truth(compare.compare(col_val, &param)));
+                    pc += 1;
+                }
+
+                Op::BetweenColumnParams(idx, low, high, read_as) => {
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
+                    let low = read_param(ctx.param_ref(*low as usize)?, *read_as);
+                    let high = read_param(ctx.param_ref(*high as usize)?, *read_as);
+                    stack.push(truth(between_cell(col_val, &low, &high)));
+                    pc += 1;
+                }
+
+                Op::InColumnParams(idx, slots, read_as) => {
+                    let col_val = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
+                    let items: SmallVec<[Cow<'_, Value>; 8]> = slots
+                        .iter()
+                        .map(|slot| Ok(read_param(ctx.param_ref(*slot as usize)?, *read_as)))
+                        .collect::<Result<_>>()?;
+                    stack.push(truth(in_list(col_val, items.iter().map(|v| &**v))));
                     pc += 1;
                 }
 
@@ -1714,18 +1772,7 @@ impl ExprVM {
                 let start = stack.len().saturating_sub(*count as usize);
                 let items = self.take_values(stack, start);
                 let v = stack.pop();
-                // value = item OR value = item ..., with OR's UNKNOWN
-                let mut result = Some(false);
-                for item in &items {
-                    match sql_eq(&v, item) {
-                        Some(true) => {
-                            result = Some(true);
-                            break;
-                        }
-                        Some(false) => {}
-                        None => result = None,
-                    }
-                }
+                let result = in_list(&v, items.iter());
                 self.args_buffer = items;
                 stack.push(truth(result));
             }
@@ -1988,7 +2035,7 @@ impl ExprVM {
     pub fn execute_bool(&mut self, program: &Program, ctx: &ExecuteContext) -> bool {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::program_ran(program);
-        if program.is_predicate_chain() {
+        if Self::runs_chain(program, ctx) {
             return Self::chain(program.ops(), ctx) == Some(true);
         }
 
@@ -2035,7 +2082,7 @@ impl ExprVM {
     ) -> crate::core::Result<bool> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::program_ran(program);
-        if program.is_predicate_chain() {
+        if Self::runs_chain(program, ctx) {
             return Ok(Self::chain(program.ops(), ctx) == Some(true));
         }
 
@@ -2071,7 +2118,34 @@ impl ExprVM {
                 | Op::InSetColumn(..)
                 | Op::LikeColumn(..)
                 | Op::LoadConst(Value::Boolean(_) | Value::Integer(_) | Value::Null(_))
+                | Op::CompareColumnParam(..)
+                | Op::BetweenColumnParams(..)
+                | Op::InColumnParams(..)
         )
+    }
+
+    /// How many parameter slots a predicate chain of `ops` reads: one past
+    /// the highest
+    pub(super) fn chain_params(ops: &[Op]) -> usize {
+        let past = |slot: &u32| *slot as usize + 1;
+        ops.iter()
+            .map(|op| match op {
+                Op::CompareColumnParam(_, slot, ..) => past(slot),
+                Op::BetweenColumnParams(_, low, high, _) => past(low).max(past(high)),
+                Op::InColumnParams(_, slots, _) => slots.iter().map(past).max().unwrap_or(0),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Whether `program` answers as a predicate chain under `ctx`: one
+    /// whose parameters all hold a value, as a chain raises no error
+    #[inline]
+    fn runs_chain(program: &Program, ctx: &ExecuteContext) -> bool {
+        program.is_predicate_chain()
+            && (program.chain_params() == 0
+                || ctx.failed.is_empty() && ctx.params.len() >= program.chain_params())
     }
 
     /// Whether `ops` are single-op predicates joined left to right by AND
@@ -2252,6 +2326,60 @@ impl ExprVM {
             | Op::GeColumnConst(idx, _)
             | Op::EqColumnConst(idx, _)
             | Op::NeColumnConst(idx, _) => Self::fused_cell(op, ctx.row.get(*idx as usize)),
+            // A chain runs only once every parameter it reads holds a value
+            Op::CompareColumnParam(idx, slot, compare, read_as) => {
+                let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
+                let param = ctx.params.get(*slot as usize)?;
+                match (cell, param) {
+                    // An integer read as an integer, or as it is, needs no reading
+                    (Value::Integer(v), Value::Integer(p))
+                        if read_as.is_none_or(|t| t == DataType::Integer) =>
+                    {
+                        Some(compare.integers(*v, *p))
+                    }
+                    _ => compare.compare(cell, &read_param(param, *read_as)),
+                }
+            }
+            Op::BetweenColumnParams(idx, low, high, read_as) => {
+                let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
+                let (low, high) = (
+                    ctx.params.get(*low as usize)?,
+                    ctx.params.get(*high as usize)?,
+                );
+                match (cell, low, high) {
+                    (Value::Integer(v), Value::Integer(lo), Value::Integer(hi))
+                        if read_as.is_none_or(|t| t == DataType::Integer) =>
+                    {
+                        Some(CompareOp::Ge.integers(*v, *lo) && CompareOp::Le.integers(*v, *hi))
+                    }
+                    _ => between_cell(
+                        cell,
+                        &read_param(low, *read_as),
+                        &read_param(high, *read_as),
+                    ),
+                }
+            }
+            Op::InColumnParams(idx, slots, read_as) => {
+                let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
+                let params = ctx.params;
+                if let Value::Integer(v) = cell {
+                    if read_as.is_none_or(|t| t == DataType::Integer) {
+                        let mut members = slots.iter().map(|slot| params.get(*slot as usize));
+                        if let Some(found) = members.try_fold(false, |found, member| match member {
+                            Some(Value::Integer(p)) => {
+                                Some(found || CompareOp::Eq.integers(*v, *p))
+                            }
+                            _ => None,
+                        }) {
+                            return Some(found);
+                        }
+                    }
+                }
+                let items = slots.iter().filter_map(|slot| params.get(*slot as usize));
+                let items: SmallVec<[Cow<'_, Value>; 8]> =
+                    items.map(|v| read_param(v, *read_as)).collect();
+                in_list(cell, items.iter().map(|v| &**v))
+            }
             // For other comparisons, return None to fall back to full VM
             _ => None,
         }

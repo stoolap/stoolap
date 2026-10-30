@@ -1989,6 +1989,21 @@ fn set_test(values: ValueSet, has_null: bool, not: bool) -> Op {
     }
 }
 
+/// The set an IN list of the known `values` tests a value against
+pub(crate) fn member_set(values: &[&Value]) -> CompactArc<PredicateSet> {
+    let mut set = ValueSet::default();
+    let mut has_null = false;
+    for value in values {
+        match value.is_null() {
+            true => has_null = true,
+            false => {
+                set.insert((*value).clone());
+            }
+        }
+    }
+    CompactArc::new(PredicateSet::new(CompactArc::new(set), has_null))
+}
+
 /// The op that takes the last of `values`, known once the program's
 /// execution starts and loaded by the ops before `consumer`, as the compiler
 /// builds it from them written as literals: how many it takes, whether it
@@ -2001,19 +2016,17 @@ pub(crate) fn bound_consumer(
 ) -> Option<(usize, bool, Op)> {
     match (Consumer::of(consumer)?, values) {
         (Consumer::List(count), values) if values.len() >= count => {
-            let mut set = ValueSet::default();
-            let mut has_null = false;
-            for value in &values[values.len() - count..] {
-                match value.is_null() {
-                    true => has_null = true,
-                    false => {
-                        set.insert((*value).clone());
-                    }
-                }
-            }
+            let set = member_set(&values[values.len() - count..]);
             // NOT IN is the list's test and a NOT after it
             let not = matches!(next, Some(Op::Not));
-            Some((count, not, set_test(set, has_null, not)))
+            Some((
+                count,
+                not,
+                match not {
+                    true => Op::NotInSet(set),
+                    false => Op::InSet(set),
+                },
+            ))
         }
         (Consumer::ReadAs(column_type), [.., value]) => Some((
             1,

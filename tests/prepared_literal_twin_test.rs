@@ -78,7 +78,8 @@ fn row_programs(db: &Database, sql: &str, params: &[Value]) -> Result<Vec<String
     }
 }
 
-/// `listing` with each parameter load read as the load of its value, and a
+/// `listing` with each parameter load read as the load of its value, a test
+/// of a column against parameters as that test against their values, and a
 /// NULL constant as a NULL literal loads
 #[cfg(feature = "test-failpoints")]
 fn as_constants(mut listing: String, params: &[Value]) -> String {
@@ -88,14 +89,66 @@ fn as_constants(mut listing: String, params: &[Value]) -> String {
             &format!("LoadConst({value:?})\n"),
         );
     }
+    let listing: String = listing
+        .lines()
+        .map(|line| {
+            let (at, op) = line.split_at(6);
+            format!("{at}{}\n", param_test_as_constant(op, params))
+        })
+        .collect();
     listing.replace("LoadConst(Null(Null))", "LoadNull(Null)")
 }
 
+/// The op `op` lists, or the test of a column against constants it stands
+/// for when it tests one against parameters
+#[cfg(feature = "test-failpoints")]
+fn param_test_as_constant(op: &str, params: &[Value]) -> String {
+    let args = |prefix: &str| -> Option<Vec<String>> {
+        let inner = op.strip_prefix(prefix)?.strip_suffix(')')?;
+        Some(
+            inner
+                .split(", ")
+                .map(|arg| arg.trim_matches(['[', ']']).to_string())
+                .collect(),
+        )
+    };
+    // A run slot past the statement's own parameters keeps its op
+    let value = |slot: &str| params.get(slot.parse::<usize>().unwrap());
+    let known = |slots: &[String]| {
+        slots
+            .iter()
+            .map(|slot| value(slot))
+            .collect::<Option<Vec<_>>>()
+    };
+    if let Some(args) = args("CompareColumnParam(") {
+        if let Some(value) = value(&args[1]) {
+            return format!("{}ColumnConst({}, {value:?})", args[2], args[0]);
+        }
+    }
+    if let Some(args) = args("BetweenColumnParams(") {
+        if let Some([low, high]) = known(&args[1..3]).as_deref() {
+            return format!("BetweenColumnConst({}, {low:?}, {high:?})", args[0]);
+        }
+    }
+    if let Some(args) = args("InColumnParams(") {
+        if let Some(members) = known(&args[1..args.len() - 1]) {
+            let has_null = members.iter().any(|v| v.is_null());
+            let mut distinct: Vec<&Value> = members.into_iter().filter(|v| !v.is_null()).collect();
+            distinct.dedup();
+            let len = distinct.len();
+            return format!("InSetColumn({}, len={len}, has_null={has_null})", args[0]);
+        }
+    }
+    op.to_string()
+}
+
 /// Whether `ran` are `literal` op for op, a run slot's load, which costs
-/// what loading its value does, counting as the constant's
+/// what loading its value does, counting as the constant's, and a column's
+/// test against run slots as its test against constants
 #[cfg(feature = "test-failpoints")]
 fn same_programs(ran: &[String], literal: &[String]) -> bool {
     let load = |op: &str| op.starts_with("LoadConst(") || op.starts_with("LoadNull(");
+    let reads_slots = |op: &str| op.contains("ColumnParam");
     ran.len() == literal.len()
         && ran.iter().zip(literal).all(|(ran, literal)| {
             ran.lines().count() == literal.lines().count()
@@ -103,8 +156,31 @@ fn same_programs(ran: &[String], literal: &[String]) -> bool {
                     let (r, l) = (&r[6..], &l[6..]);
                     r == l
                         || (r.starts_with("LoadParam(") && (load(l) || l.starts_with("LoadParam(")))
+                        || ((reads_slots(r) || reads_slots(l))
+                            && column_test(r).is_some()
+                            && column_test(r) == column_test(l))
                 })
         })
+}
+
+/// The test of a column `op` makes, the same for its constant and its run
+/// slot forms: the constant form's name and the column
+#[cfg(feature = "test-failpoints")]
+fn column_test(op: &str) -> Option<String> {
+    let (name, rest) = op.split_once('(')?;
+    let mut args = rest.split(", ");
+    let column = args.next()?;
+    let name = match name {
+        "CompareColumnParam" => {
+            let operator = args.nth(1)?;
+            format!("{operator}ColumnConst")
+        }
+        "BetweenColumnParams" => "BetweenColumnConst".to_string(),
+        "InColumnParams" => "InSetColumn".to_string(),
+        name if name.ends_with("ColumnConst") || name == "InSetColumn" => name.to_string(),
+        _ => return None,
+    };
+    Some(format!("{name}({column}"))
 }
 
 /// What one execution of `sql` with `params` answers, after one with other

@@ -60,6 +60,7 @@ pub(crate) use once::{
 };
 pub(crate) use ops::more_than_one_row;
 pub use ops::{CompareOp, Op, QuantifiedMembers, RowComparison, RowMembers, RowTest};
+pub(crate) use program::known_params;
 pub use program::Program;
 pub(crate) use vm::concat_values;
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};
