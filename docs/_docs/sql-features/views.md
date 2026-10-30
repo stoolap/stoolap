@@ -25,6 +25,13 @@ CREATE VIEW IF NOT EXISTS engineering AS
 SELECT * FROM employees WHERE department = 'Engineering';
 ```
 
+A view's query may be a set operation. Its `ORDER BY`, `LIMIT` and `OFFSET` apply to the whole set operation, in the view as in the query:
+
+```sql
+CREATE VIEW top_names AS
+SELECT name FROM customers UNION SELECT name FROM suppliers ORDER BY 1 LIMIT 10;
+```
+
 ## Column Names
 
 `CREATE VIEW` runs the view's query once and records the names of its columns with the view. Rows are not fetched, but a query that has to read its input before giving its first row, such as one with GROUP BY or ORDER BY, does that work once. A query that cannot run, because it reads a table or a column that does not exist, is refused, and so is a query that names two columns alike:
