@@ -22,7 +22,7 @@ use stoolap::Database;
 
 fn open(dir: &Path) -> Database {
     Database::open(&format!(
-        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
         dir.display()
     ))
     .unwrap()
@@ -52,11 +52,18 @@ fn count_star_under_a_snapshot_answers_as_the_rows_it_reads() {
         (),
     )
     .unwrap();
-    // Five volumes, then sealed rows rewritten, deleted, and new hot rows
+    // Five volumes, counted in parallel, then sealed rows rewritten,
+    // deleted, and new hot rows
     for volume in 0..5 {
         insert(&db, volume * 1500 + 1, 1500);
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }
+    let volumes = db
+        .query("PRAGMA VOLUME_STATS", ())
+        .unwrap()
+        .filter(|row| row.as_ref().unwrap().get::<String>(0).unwrap() == "t")
+        .count();
+    assert_eq!(volumes, 5, "no compaction merged the volumes");
     db.execute("UPDATE t SET k = k + 1 WHERE id % 10 = 0", ())
         .unwrap();
     db.execute("DELETE FROM t WHERE id % 13 = 0", ()).unwrap();
