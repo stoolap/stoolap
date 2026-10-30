@@ -467,8 +467,8 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    ambiguous_column, joined_aliases, set_operation_key_item, Bound, JoinBlocks, OutOfFamily,
-    PreparedProjection,
+    ambiguous_column, joined_aliases, set_operation_key_column, set_operation_key_item, Bound,
+    JoinBlocks, OutOfFamily, PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -2025,12 +2025,24 @@ impl Executor {
         let item_layout = layout.as_deref();
         // A name two of a set operation's columns carry is ambiguous, as in a derived table
         if !stmt.set_operations.is_empty() {
-            let shown = &columns[..expected_columns.min(columns.len())];
+            // Beside a star over a join the count is unknown: every column is shown
+            let shown = match expected_columns {
+                0 => &columns[..],
+                count => &columns[..count.min(columns.len())],
+            };
+            let reads = |c: &str, name: &str| {
+                eq_folded(c, name)
+                    || split_qualified(c).is_some_and(|(_, last)| eq_folded(last, name))
+            };
             let mut twice = None;
+            let registry = &self.function_registry;
             for ob in &stmt.order_by {
+                if set_operation_key_column(&ob.expression, stmt, registry).is_some() {
+                    continue;
+                }
                 visit_column_refs(&ob.expression, &mut |column| {
                     if let Expression::Identifier(id) = column {
-                        let named = shown.iter().filter(|c| eq_folded(c, &id.value_lower));
+                        let named = shown.iter().filter(|c| reads(c, &id.value_lower));
                         if twice.is_none() && named.count() > 1 {
                             twice = Some(id);
                         }

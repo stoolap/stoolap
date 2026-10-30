@@ -931,22 +931,9 @@ pub(crate) fn set_operation_ordered(stmt: SelectStatement) -> SelectStatement {
     }
     let mut rows = stmt;
     let mut order_by = std::mem::take(&mut rows.order_by);
-    // A key computed as an item the set operation's rows name reads its column
-    let star = rows
-        .columns
-        .iter()
-        .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
     let registry = crate::functions::registry::global_registry();
-    for ob in order_by.iter_mut().filter(|_| !star) {
-        if !super::query::order_key_is_expression(&ob.expression, &rows) {
-            continue;
-        }
-        let key = ExprKey::of(&ob.expression);
-        if let Some(at) = rows
-            .columns
-            .iter()
-            .position(|item| set_operation_key_item(item, registry) && ExprKey::of(item) == key)
-        {
+    for ob in order_by.iter_mut() {
+        if let Some(at) = set_operation_key_column(&ob.expression, &rows, registry) {
             ob.expression = Expression::IntegerLiteral(IntegerLiteral {
                 token: rows.token.clone(),
                 value: at as i64 + 1,
@@ -985,6 +972,27 @@ pub(crate) fn set_operation_ordered(stmt: SelectStatement) -> SelectStatement {
         set_operations: Vec::new(),
         prepared,
     }
+}
+
+/// The item of `stmt`'s first SELECT whose column its set operation's ORDER
+/// BY `key` reads, the key being computed as that item; None for a name, a
+/// position or a key no item computes
+pub(crate) fn set_operation_key_column(
+    key: &Expression,
+    stmt: &SelectStatement,
+    registry: &FunctionRegistry,
+) -> Option<usize> {
+    let star = stmt
+        .columns
+        .iter()
+        .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+    if star || !super::query::order_key_is_expression(key, stmt) {
+        return None;
+    }
+    let key = ExprKey::of(key);
+    stmt.columns
+        .iter()
+        .position(|item| set_operation_key_item(item, registry) && ExprKey::of(item) == key)
 }
 
 /// Whether a set operation's ORDER BY key that is `item` reads the item's

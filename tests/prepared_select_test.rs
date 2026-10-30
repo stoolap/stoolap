@@ -3194,6 +3194,10 @@ fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by
             format!("SELECT * FROM ({DUP} ORDER BY a LIMIT 2) s"),
             format!("SELECT (SELECT COUNT(*) FROM ({DUP} ORDER BY a) s)"),
             format!("EXPLAIN ANALYZE {DUP} ORDER BY a"),
+            "SELECT l.*, r.* FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 ORDER BY a"
+                .to_string(),
+            "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 ORDER BY a"
+                .to_string(),
         ] {
             assert_eq!(
                 error(&db, &sql, ()).0,
@@ -3201,6 +3205,10 @@ fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by
                 "{sql}"
             );
         }
+        // The derived table names a star's columns over a join `l.a` and `r.a`
+        let sql = "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 \
+                   ORDER BY a, (SELECT 1)";
+        assert_eq!(error(&db, sql, ()).0, "column 'a' not found", "{sql}");
         let prepared = db.prepare(&format!("{DUP} ORDER BY a LIMIT $1")).unwrap();
         let err = prepared
             .query((2,))
@@ -3245,6 +3253,34 @@ fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by
                 (None, Some(1)),
             ]
         );
+        // A key computed as an item reads its column, whatever names it holds
+        for sql in [
+            "SELECT a + 1 AS z, k AS a, id AS a FROM t UNION ALL SELECT 0, 0, 0 ORDER BY a + 1",
+            "SELECT a + 1 AS z, k AS a, id AS a FROM t UNION ALL SELECT 0, 0, 0 \
+             ORDER BY a + 1, (SELECT 1)",
+        ] {
+            let got: Vec<Option<i64>> = pairs(sql).into_iter().map(|(z, _)| z).collect();
+            assert_eq!(
+                got,
+                [Some(0), Some(11), Some(11), Some(21), Some(31), None],
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_a_recursive_cte_ordered_by_a_subquery_keeps_its_members() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_recursive_order_subquery") {
+        for sql in [
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 \
+             ORDER BY (SELECT 1)) SELECT n FROM r ORDER BY n",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 \
+             ORDER BY 1) SELECT n FROM r ORDER BY n",
+        ] {
+            assert_eq!(ids(&db, sql, ()).0, vec![1, 2, 3], "{sql}");
+        }
     }
 }
 
