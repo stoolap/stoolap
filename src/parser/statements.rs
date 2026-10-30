@@ -2930,10 +2930,9 @@ impl Parser<'_> {
 
         let name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
-        self.next_token();
-
         // Check for optional value
-        let value = if self.cur_token_is(TokenType::Operator) && self.cur_token.literal == "=" {
+        let value = if self.peek_token_is_operator("=") {
+            self.next_token();
             self.next_token();
             Some(self.parse_expression(Precedence::Lowest)?)
         } else {
@@ -3067,27 +3066,17 @@ impl Parser<'_> {
     fn parse_analyze_statement(&mut self) -> Option<AnalyzeStatement> {
         let token = self.cur_token.clone();
 
-        // Move past ANALYZE keyword
-        self.next_token();
+        // ANALYZE TABLE table_name syntax
+        if self.peek_token_is_keyword(Keyword::Table) {
+            self.next_token();
+        }
 
         // Optional table name
-        let table_name = if self.cur_token_is(TokenType::Identifier)
-            || (self.cur_token_is(TokenType::Keyword)
-                && !self.cur_token.literal.eq_ignore_ascii_case("TABLE"))
+        let table_name = if self.peek_token_is(TokenType::Identifier)
+            || self.peek_token_is(TokenType::Keyword)
         {
-            let name = self.cur_token.literal.clone();
-            Some(name)
-        } else if self.cur_token_is(TokenType::Keyword)
-            && self.cur_token.literal.eq_ignore_ascii_case("TABLE")
-        {
-            // ANALYZE TABLE table_name syntax
             self.next_token();
-            if self.cur_token_is(TokenType::Identifier) || self.cur_token_is(TokenType::Keyword) {
-                let name = self.cur_token.literal.clone();
-                Some(name)
-            } else {
-                None
-            }
+            Some(self.cur_token.literal.clone())
         } else {
             None
         };
