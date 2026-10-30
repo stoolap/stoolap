@@ -1126,13 +1126,6 @@ fn test_classifier_rules() {
                 .to_string(),
             "a derived table's LIMIT or OFFSET naming a column",
         ),
-        (
-            format!(
-                "SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u \
-                 ORDER BY (SELECT v FROM u WHERE u.id = 2)"
-            ),
-            "an ORDER BY subquery over a set operation",
-        ),
     ];
     for (sql, reason) in &no {
         assert_eq!(
@@ -3068,6 +3061,54 @@ fn test_an_order_by_key_s_subquery_reads_a_select_alias_as_the_item_s_value() {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "column 't.z' not found");
+    }
+}
+
+#[test]
+fn test_a_set_operation_s_order_by_subquery_reads_the_whole_one_s_columns() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_subquery") {
+        for (sql, want) in [
+            (
+                "SELECT a AS z FROM t UNION SELECT v FROM u \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.v <= z), 1",
+                vec![
+                    None,
+                    Some(1),
+                    Some(5),
+                    Some(7),
+                    Some(10),
+                    Some(20),
+                    Some(30),
+                ],
+            ),
+            (
+                "SELECT k AS z FROM t UNION ALL SELECT k FROM u \
+                 ORDER BY EXISTS (SELECT 1 FROM u WHERE u.k = z + 1) DESC, 1 LIMIT 3 OFFSET 3",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            (
+                "WITH c AS (SELECT a FROM t WHERE a > 10) \
+                 SELECT a AS z FROM c UNION SELECT v FROM u \
+                 ORDER BY z IN (SELECT k * 10 FROM u) DESC, 1 DESC",
+                vec![None, Some(20), Some(30), Some(7), Some(5), Some(1)],
+            ),
+            (
+                "SELECT a AS z FROM t EXCEPT SELECT v FROM u \
+                 ORDER BY z IN (SELECT k * 10 FROM u) DESC, 1 DESC",
+                vec![Some(20), Some(10), Some(30)],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let before = general_hits();
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+            assert_eq!(general_hits(), before, "{sql} reached a general path");
+        }
     }
 }
 

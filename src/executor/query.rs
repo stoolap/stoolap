@@ -460,7 +460,9 @@ use super::planned_aggregate::{bounds, AggregateRead};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
-use super::prepared_select::{joined_aliases, Bound, JoinBlocks, OutOfFamily, PreparedProjection};
+use super::prepared_select::{
+    joined_aliases, set_operation_ordered, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
+};
 use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::{CachedPlanRef, CompiledExecution, NestedPlan};
@@ -1593,6 +1595,10 @@ impl Executor {
 
         // Check for cancellation at entry point
         ctx.check_cancelled()?;
+
+        if let Some(ordered) = set_operation_ordered(stmt) {
+            return self.execute_select_with_plan(&ordered, ctx, None, compiled, counts);
+        }
 
         // Validate: aggregate functions are not allowed in WHERE clause
         if let Some(ref where_clause) = stmt.where_clause {

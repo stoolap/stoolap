@@ -30,7 +30,7 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planned_dml::DmlStatement;
 use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
-use super::prepared_select::OutOfFamily;
+use super::prepared_select::{set_operation_ordered, OutOfFamily};
 use super::pushdown;
 use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
 use super::query_cache::NestedPlan;
@@ -53,9 +53,18 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let mut plan_lines: Vec<String> = Vec::new();
 
+        // A set operation ordered by a subquery runs as the statement ordering its rows
+        let ordered: Option<Box<Statement>> = match &*stmt.statement {
+            Statement::Select(select) => {
+                set_operation_ordered(select).map(|o| Box::new(Statement::Select(o)))
+            }
+            _ => None,
+        };
+        let run_statement = ordered.as_ref().unwrap_or(&stmt.statement);
+
         // For SELECT statements with CTEs, try to get the inlined version for accurate EXPLAIN
         let inlined_statement: Option<Box<Statement>> =
-            if let Statement::Select(select) = &*stmt.statement {
+            if let Statement::Select(select) = &**run_statement {
                 if let Some(ref with_clause) = select.with {
                     self.try_inline_ctes(select, with_clause)
                         .map(|inlined| Box::new(Statement::Select(inlined)))
@@ -67,7 +76,7 @@ impl Executor {
             };
 
         // Use inlined statement if available, otherwise original
-        let explain_stmt = inlined_statement.as_ref().unwrap_or(&stmt.statement);
+        let explain_stmt = inlined_statement.as_ref().unwrap_or(run_statement);
 
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
