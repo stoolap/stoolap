@@ -292,3 +292,48 @@ fn test_large_integer_without_decimal() {
 
     assert!(val > 1e29, "Value should be very large");
 }
+
+#[test]
+fn test_a_token_after_a_whole_statement_is_an_error() {
+    let db = Database::open("memory://parser_trailing_token").expect("Failed to create database");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, a INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'abc', 5), (2, 'xyz', 6)", ())
+        .unwrap();
+
+    for (sql, token) in [
+        ("SELECT id FROM t WHERE s ~ 'a'", "'~'"),
+        ("SELECT id FROM t WHERE a ~ 3", "'~'"),
+        ("SELECT id FROM t WHERE a 3", "'3'"),
+        ("SELECT id FROM t ORDER BY a ~ 3", "'~'"),
+        ("SELECT id FROM t LIMIT 1 2", "'2'"),
+        ("UPDATE t SET a = 1 WHERE id = 1 2", "'2'"),
+    ] {
+        let err = match db.query(sql, ()) {
+            Ok(_) => panic!("{sql} ran as two statements"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&format!("expected ';' or end of input, got {token}")),
+            "{sql}: {err}"
+        );
+    }
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT a FROM t WHERE id = 1", ())
+            .unwrap(),
+        5,
+        "a refused UPDATE wrote"
+    );
+
+    for sql in [
+        "SELECT 1; SELECT 2",
+        "SELECT 2;",
+        "SELECT 2;;",
+        "SELECT ~a + a + 3 FROM t WHERE id = 1",
+    ] {
+        assert_eq!(db.query_one::<i64, _>(sql, ()).unwrap(), 2, "{sql}");
+    }
+}

@@ -567,7 +567,7 @@ match db.execute("INSERT INTO users VALUES (1, 'Alice')", ()) {
 
 `Database` is `Send + Sync`. Clone to share across threads. Each clone has its own executor with independent transaction state but shares the same storage engine.
 
-Threads may also share one handle. Its statements run at the same time while the handle has no open transaction. `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `PRAGMA` and `EXPLAIN` wait for the running statements and run alone, as does every statement while a transaction is open, since those statements run inside that transaction. A multi-statement string runs as a whole.
+Threads may also share one handle. Its statements run at the same time while the handle has no open transaction. `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `PRAGMA` and `EXPLAIN` wait for the running statements and run alone, as does every statement while a transaction is open, since those statements run inside that transaction. A multi-statement string runs as a whole. Its statements are separated by `;`: a token after a whole statement that is not `;` is a parse error, so `SELECT id FROM t WHERE s ~ 'a'` fails at `~` instead of running `~ 'a'` as a second statement.
 
 ```rust
 use std::sync::Arc;

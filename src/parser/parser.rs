@@ -224,6 +224,16 @@ impl<'a> Parser<'a> {
             if let Some((stmt, slots)) = self.parse_statement_with_slots() {
                 params.push(slots);
                 statements.push(stmt);
+                if !self.peek_token_is_punctuator(";") && !self.peek_token_is(TokenType::Eof) {
+                    self.errors.push(ParseError::new(
+                        format!(
+                            "expected ';' or end of input, got {}",
+                            Self::format_token_for_error(&self.peek_token)
+                        ),
+                        self.peek_token.position,
+                    ));
+                    break;
+                }
             }
 
             // Skip optional semicolons (handles trailing `;;` etc.)
