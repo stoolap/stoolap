@@ -905,7 +905,8 @@ fn block_width(selected: usize, width: usize) -> Result<()> {
 }
 
 /// `items` with each star written as the columns of `scope`, a block's one
-/// source, read through its name; None when no item is a star
+/// source, each read by its position: names may repeat or read as a
+/// literal; None when no item is a star
 fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Expression>>> {
     let star =
         |item: &Expression| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_));
@@ -915,9 +916,9 @@ fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Exp
     let name = scope.tables.first().map_or("", |(name, _)| name.as_str());
     let mut written = Vec::with_capacity(items.len() + scope.lower.len());
     for item in items {
-        let token = match item {
-            Expression::Star(star) => &star.token,
-            Expression::QualifiedStar(star) if star.qualifier.to_lowercase() == name => &star.token,
+        match item {
+            Expression::Star(_) => {}
+            Expression::QualifiedStar(star) if star.qualifier.to_lowercase() == name => {}
             Expression::QualifiedStar(star) => {
                 return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)))
             }
@@ -925,19 +926,12 @@ fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Exp
                 written.push(item.clone());
                 continue;
             }
-        };
-        let named = |text: &str| {
-            Identifier::new(
-                Token::new(TokenType::Identifier, text, token.position),
-                text,
-            )
-        };
-        written.extend(scope.lower.iter().map(|column| match name {
-            "" => Expression::Identifier(named(column)),
-            name => Expression::QualifiedIdentifier(QualifiedIdentifier {
-                qualifier: named(name),
-                name: named(column),
-            }),
+        }
+        written.extend(scope.lower.iter().enumerate().map(|(index, column)| {
+            Expression::Column(ColumnRef {
+                index: index as u32,
+                name: ident(column, column),
+            })
         }));
     }
     Ok(Some(written))
@@ -3820,7 +3814,7 @@ impl PreparedSubquery {
     fn member_width(&self) -> usize {
         match &self.answer {
             Answer::Members(_, members) => members.width(),
-            Answer::Statement(_, block) => block.run.statement.columns.len(),
+            Answer::Statement(_, block) => block.width,
             _ => 1,
         }
     }
@@ -3964,6 +3958,8 @@ struct StatementBlock {
     tables: Option<Vec<SmartString>>,
     /// Whether it computes a window function
     windowed: bool,
+    /// The values each of its rows gives, its stars counted; 0 for an EXISTS
+    width: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4997,7 +4993,8 @@ impl Builder<'_> {
             visible: Vec::new(),
         }
         .statement(sq, outer, 0, Check::All)?;
-        if let Some(width) = form.width() {
+        let width = form.width().unwrap_or(0);
+        if form.width().is_some() {
             block_width(named(names)?.len(), width)?;
         }
         self.max_param = self.max_param.max(max_param);
@@ -5049,6 +5046,7 @@ impl Builder<'_> {
             },
             form,
             windowed: windowed_block(sq),
+            width,
         };
         let (holes, hole_exprs, hole_written) = self.compiled_holes(outer, parent, &work)?;
         self.subqueries[id as usize] = Some(PreparedSubquery {

@@ -3315,9 +3315,30 @@ fn test_a_block_selecting_a_star_reads_its_source_s_columns() {
             assert_eq!(got, want, "{sql}");
             assert_eq!(general_hits(), before, "{sql} reached a general path");
         }
-        let sql = "SELECT id FROM t WHERE k IN (SELECT * FROM (SELECT k FROM u) s) ORDER BY id";
-        assert_eq!(prepared_line(&db, sql), "Prepared: yes");
-        assert_eq!(ids(&db, sql, ()).0, vec![1, 2, 3, 5]);
+        // A star's columns are read by position, its width kept for the run
+        for (sql, want) in [
+            (
+                "SELECT id FROM t WHERE k IN (SELECT * FROM (SELECT k FROM u) s) ORDER BY id",
+                vec![1, 2, 3, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE (k, k) IN (SELECT * FROM (SELECT k, k AS j FROM u) s \
+                 ORDER BY (SELECT 1)) ORDER BY id",
+                vec![1, 2, 3, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE (SELECT * FROM (SELECT 7 AS \"true\")) = 7 ORDER BY id",
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                "SELECT id FROM t WHERE (1, 2) IN (SELECT * FROM (SELECT 1 AS x, 2 AS x) s) \
+                 ORDER BY id",
+                vec![1, 2, 3, 4, 5],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
+        }
         // A value or a member is never read from part of the block's row
         for (sql, want) in [
             (
