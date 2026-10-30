@@ -100,7 +100,7 @@ use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, InfixOperator};
 
 use super::expression::ExpressionEval;
-use super::utils::{expressions_equivalent, extract_and_conditions, extract_column_name};
+use super::utils::{column_name_of, expressions_equivalent, extract_and_conditions};
 
 /// Maximum number of cached query results per table+column combination.
 ///
@@ -988,11 +988,11 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
     };
 
     // Must be comparing same column to a literal
-    let cached_col = extract_column_name(&cached_infix.left)?;
-    let new_col = extract_column_name(&new_infix.left)?;
+    let cached_col = column_name_of(&cached_infix.left)?;
+    let new_col = column_name_of(&new_infix.left)?;
 
     // OPTIMIZATION: Use case-insensitive comparison instead of double to_lowercase()
-    if !cached_col.eq_ignore_ascii_case(&new_col) {
+    if !cached_col.eq_ignore_ascii_case(new_col) {
         return None;
     }
 

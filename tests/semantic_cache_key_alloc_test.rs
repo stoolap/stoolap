@@ -92,3 +92,37 @@ fn a_lookup_allocates_nothing_per_column() {
         "{wide} allocations over 66 columns, {narrow} over 2"
     );
 }
+
+fn where_of(sql: &str) -> Expression {
+    match parse_sql(sql).unwrap().remove(0) {
+        Statement::Select(select) => *select.where_clause.unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+/// The allocations of a lookup that matches none of `entries` ranges cached
+/// on `t`, each asked whether it holds the new one
+fn miss(entries: usize) -> usize {
+    let cache = SemanticCache::new();
+    let columns = vec!["a".to_string(), "b".to_string()];
+    for i in 0..entries {
+        let row = Row::from_values(vec![Value::integer(1); 2]);
+        let predicate = where_of(&format!("SELECT * FROM t WHERE b > {i}"));
+        cache.insert("t", columns.clone(), vec![row], Some(predicate), STAMP);
+    }
+    let predicate = where_of("SELECT * FROM t WHERE b < 0");
+    let before = ALLOCATIONS.with(Cell::get);
+    let found = cache.lookup("t", &columns, Some(&predicate), STAMP);
+    let allocations = ALLOCATIONS.with(Cell::get) - before;
+    assert!(matches!(found, CacheLookupResult::Miss));
+    allocations
+}
+
+#[test]
+fn a_miss_allocates_nothing_per_entry() {
+    let (one, many) = (miss(1), miss(32));
+    assert_eq!(
+        many, one,
+        "{many} allocations past 32 entries, {one} past one"
+    );
+}
