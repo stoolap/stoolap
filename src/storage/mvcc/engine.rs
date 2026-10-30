@@ -8720,6 +8720,63 @@ impl MVCCEngine {
         Ok(rows.map(crate::core::KeyRows::Many))
     }
 
+    /// The latest committed row whose `column` the unique index of that
+    /// column alone holds `value` in, read as [`Self::fetch_latest_row_in`]
+    /// reads a key: the hot index, else the volumes once no commit is
+    /// publishing. None when the index is gone or a commit is publishing.
+    /// The caller asks the row its WHERE again
+    pub(crate) fn fetch_latest_unique_in(
+        &self,
+        table_name: &str,
+        store: &Arc<VersionStore>,
+        (column, value): (usize, &Value),
+        token: crate::storage::mvcc::version_store::LayoutToken,
+    ) -> Result<Option<crate::core::KeyRows>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        let latest = (INVALID_TRANSACTION_ID + 1).into();
+        let Some(hot_row) = store.unique_row_id(column, value) else {
+            return Ok(None);
+        };
+        if let Some(row_id) = hot_row {
+            if let Some(hot) = store.get_visible_version(row_id, latest) {
+                store.check_token(token)?;
+                return Ok(Some(crate::core::KeyRows::One(row_id, hot.data)));
+            }
+        }
+        let epoch = store.publish_epoch_if_quiet();
+        if epoch.is_none() {
+            return Ok(None);
+        }
+        let mgr = self.get_or_create_segment_manager(table_name);
+        let schema = store.schema();
+        let default = schema
+            .columns
+            .get(column)
+            .map_or(Value::null_unknown(), |c| {
+                c.default_value
+                    .clone()
+                    .unwrap_or_else(|| Value::null(c.data_type))
+            });
+        let found = match mgr.has_segments() {
+            true => mgr.find_row_id_by_values_with_snapshot(
+                &mgr.cold_snapshot(),
+                None,
+                &[column],
+                &[value],
+                std::slice::from_ref(&default),
+            )?,
+            false => None,
+        };
+        let Some(row_id) = found else {
+            store.check_token(token)?;
+            return Ok(Some(crate::core::KeyRows::Many(crate::core::RowVec::new())));
+        };
+        let rows = self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, epoch)?;
+        Ok(rows.map(crate::core::KeyRows::Many))
+    }
+
     /// The rows `row_ids` name as `view` sees them in the hot store; None
     /// when one is not there, so the caller reads the cold rows too
     pub(crate) fn fetch_hot_rows_at(

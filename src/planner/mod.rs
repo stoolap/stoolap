@@ -64,6 +64,9 @@ pub enum Step {
 pub enum Read {
     /// The row the primary key equality names
     PkGet(KeyRead),
+    /// The row a unique index of one column holds for its equality, asked
+    /// the whole WHERE
+    UniqueGet(KeyRead),
     /// A scan, through the indexes the choice reads
     Scan(Option<ScanChoice>),
     /// The rows in ORDER BY order. When the table declines the read, its
@@ -89,7 +92,7 @@ impl Read {
     /// read; None for a scan the table chooses
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
-            Self::PkGet(key) => key.otherwise.scan(),
+            Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.scan(),
             Self::DistinctValues { otherwise, .. } => otherwise.scan(),
             Self::Source(_) => None,
             Self::Scan(scan)
@@ -103,7 +106,7 @@ impl Read {
     pub fn ordered(&self) -> Option<OrderedRead> {
         match self {
             Self::Ordered { read, .. } => Some(*read),
-            Self::PkGet(key) => key.otherwise.ordered(),
+            Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.ordered(),
             Self::DistinctValues { otherwise, .. } => otherwise.ordered(),
             _ => None,
         }
@@ -208,6 +211,13 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             alternative(
                 lines,
                 format!("PkGet {} {}", text.table, key.key.describe()),
+            );
+            read_lines(&key.otherwise, text, lines);
+        }
+        (Read::UniqueGet(key), _) => {
+            alternative(
+                lines,
+                format!("UniqueGet {} {}", text.table, key.key.describe()),
             );
             read_lines(&key.otherwise, text, lines);
         }

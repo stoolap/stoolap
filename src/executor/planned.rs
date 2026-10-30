@@ -288,32 +288,74 @@ impl Executor {
 
     /// The rows of `planned`'s key read for `params`, in the open
     /// transaction `in_txn` says and with the transaction id its programs
-    /// read; None when this execution's key names no row id, which the
-    /// plan's other read answers
+    /// read; None when this execution's key names no row, or a unique read
+    /// declines, which the plan's other read answers
     pub(crate) fn run_planned(
         &self,
         planned: &PreparedSelect,
         params: &[Value],
-        run: (bool, Option<u64>),
+        (in_txn, transaction): (bool, Option<u64>),
         view: Option<&StatementView>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Read through the statement, and `read_planned` inlined: a key read
         // borrowed as an argument has its fields loaded ahead of every row
-        let plan = planned.key_read()?;
-        let key = plan.key.integer(params)?;
-        or_normal_path(self.read_planned(plan, key, params, run, view))
+        let (plan, unique) = planned.key_read()?;
+        let rows = match unique {
+            false => {
+                let key = plan.key.integer(params)?;
+                self.fetch_pk_row(&plan.table, key, plan.token, in_txn, view, &plan.store)
+            }
+            true => self
+                .fetch_unique_row(plan, params, in_txn, view)
+                .transpose()?,
+        };
+        or_normal_path(rows.and_then(|rows| self.read_planned(plan, rows, params, transaction)))
+    }
+
+    /// The row `plan`'s unique index holds for its key's value, read as the
+    /// latest committed state; None outside an autocommit read committed
+    /// statement without a view, or when the index or the read declines
+    #[inline(never)]
+    fn fetch_unique_row(
+        &self,
+        plan: &KeyRead,
+        params: &[Value],
+        in_txn: bool,
+        view: Option<&StatementView>,
+    ) -> Result<Option<KeyRows>> {
+        if in_txn
+            || view.is_some()
+            || self.isolation_level() != crate::core::IsolationLevel::ReadCommitted
+        {
+            return Ok(None);
+        }
+        let Some(value) = plan.key.value(params).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let Some(store) = plan.store.upgrade().filter(|store| !store.is_closed()) else {
+            return Ok(None);
+        };
+        let rows = self.engine.fetch_latest_unique_in(
+            &plan.table,
+            &store,
+            (plan.key.column(), &value),
+            plan.token,
+        )?;
+        #[cfg(feature = "test-failpoints")]
+        if rows.is_some() {
+            crate::test_failpoints::note_read("exec.unique_get");
+        }
+        Ok(rows)
     }
 
     #[inline(always)]
     fn read_planned(
         &self,
         plan: &KeyRead,
-        key: i64,
+        rows: KeyRows,
         params: &[Value],
-        (in_txn, transaction): (bool, Option<u64>),
-        view: Option<&StatementView>,
+        transaction: Option<u64>,
     ) -> Result<Box<dyn QueryResult>> {
-        let rows = self.fetch_pk_row(&plan.table, key, plan.token, in_txn, view, &plan.store)?;
         let mut vm: Option<ExprVM> = None;
         let mut out = RowVec::with_capacity(1);
         let mut passed = 0;

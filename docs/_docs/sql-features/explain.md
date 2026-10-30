@@ -61,6 +61,26 @@ Project id, name, email
 
 A run whose key is not an integer, or one in a transaction with a timeout, takes the read after `else`.
 
+An equality on a column with a unique index of its own reads the one row that index names. The row is still judged by the whole WHERE:
+
+```sql
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE);
+EXPLAIN SELECT id, name FROM users WHERE email = 'alice@example.com';
+```
+
+Output:
+```
+plan
+----
+Project id, name
+  Filter
+    UniqueGet users email = 'alice@example.com'
+    else IndexScan users (email = 'alice@example.com')
+      Index unique_users_email (email =)
+```
+
+A run inside a transaction, or one while a commit is publishing to the table, takes the read after `else`.
+
 An UPDATE or DELETE whose WHERE is the primary key's equality reads its row the same way, when it has no RETURNING or WITH, keeps no foreign key, and runs no CHECK on a column it sets. Its SET values show in column order:
 
 ```sql
@@ -471,6 +491,7 @@ For a planned single-table SELECT:
 |-----------|-------------|
 | SeqScan | Full table scan; the condition after the table name is the one each row is judged by |
 | PkGet | Reads the one row the primary key names |
+| UniqueGet | Reads the one row a unique index of one column names for its equality |
 | IndexScan | Reads the rows the indexes under it name, each judged by the condition after the table name |
 | Index | One index and what it reads: an equality (`=`), an `IN` list, a `LIKE prefix` or a `range` |
 | CompositeIndex | A multi-column index: equalities on its leading columns, a range on the next one |
