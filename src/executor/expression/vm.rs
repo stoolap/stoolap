@@ -227,11 +227,18 @@ pub(crate) fn concat_values<'v>(parts: impl Iterator<Item = &'v Value> + Clone) 
 #[inline]
 pub(crate) fn read_param(value: &Value, read_as: Option<DataType>) -> Cow<'_, Value> {
     match read_as {
-        Some(column_type) if value.is_null() || value.data_type() != column_type => Cow::Owned(
+        Some(column_type) if reads_otherwise(value, column_type) => Cow::Owned(
             crate::executor::pushdown::read_as_column(column_type, value.clone()),
         ),
         _ => Cow::Borrowed(value),
     }
+}
+
+/// Whether a parameter read as `column_type` reads as another value than it
+/// is: a NULL, or a value of another type
+#[inline]
+pub(crate) fn reads_otherwise(value: &Value, column_type: DataType) -> bool {
+    value.is_null() || value.data_type() != column_type
 }
 
 /// `value IN (items)`: `value = item OR value = item ...`, with OR's

@@ -541,7 +541,25 @@ fn test_a_column_test_against_parameters_answers_as_its_unfused_ops() {
                     })
                     .collect::<Vec<_>>()
             }) {
+                let value = |slot: u32| params.get(slot as usize).cloned();
+                let known = fused
+                    .bind_with(|op| super::program::known_params(op, value))
+                    .expect("the test binds to its constant twin");
+                let reads = read_as
+                    .is_some_and(|t| params.iter().any(|v| v.is_null() || v.data_type() != t));
                 let bound = fused.bind(&params);
+                assert_eq!(
+                    bound.is_some(),
+                    reads,
+                    "{listing} {params:?} binds once a parameter reads as another value"
+                );
+                if let Some(bound) = &bound {
+                    let bound_listing = format!("{:?}", bound.ops());
+                    assert!(
+                        !bound_listing.contains("ColumnParam"),
+                        "{listing} {params:?} binds to {bound_listing}"
+                    );
+                }
                 for (r, row) in rows.iter().enumerate() {
                     let ctx = ExecuteContext::new(row).with_params(&params);
                     let case = format!("{listing} {params:?} on row {r}");
@@ -549,13 +567,22 @@ fn test_a_column_test_against_parameters_answers_as_its_unfused_ops() {
                     assert_eq!(vm.execute(&fused, &ctx).unwrap(), expected, "{case}");
                     let passes = ExprVM::passes(&expected);
                     assert_eq!(vm.execute_bool(&fused, &ctx), passes, "{case}, chain");
-                    if let Some(bound) = &bound {
-                        let bound_ctx = ExecuteContext::new(row);
-                        assert_eq!(
-                            vm.execute(bound, &bound_ctx).unwrap(),
-                            expected,
-                            "{case}, bound"
-                        );
+                    let alone = ExecuteContext::new(row);
+                    for (form, program) in
+                        [("constant twin", Some(&known)), ("bound", bound.as_ref())]
+                    {
+                        if let Some(program) = program {
+                            assert_eq!(
+                                vm.execute(program, &alone).unwrap(),
+                                expected,
+                                "{case}, {form}"
+                            );
+                            assert_eq!(
+                                vm.execute_bool(program, &alone),
+                                passes,
+                                "{case}, {form} chain"
+                            );
+                        }
                     }
                 }
             }

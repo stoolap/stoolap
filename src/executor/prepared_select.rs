@@ -3302,11 +3302,7 @@ impl WhereProgram {
                 .is_some_and(|sq| sq.uncorrelated),
             _ => false,
         });
-        let loads = asks_blocks
-            || program
-                .ops()
-                .iter()
-                .any(|op| matches!(op, Op::LoadParam(_)));
+        let loads = asks_blocks || program.binds_params();
         let binds = loads && (asks_blocks || !program.bind_never_shrinks());
         Self {
             program,
@@ -4627,18 +4623,19 @@ impl Computed {
         }
     }
 
-    /// Whether a run binds `program`: it loads a parameter or asks a block
+    /// Whether a run binds `program`: binding its parameters may change it,
+    /// or it asks a block
     fn binds(program: &SharedProgram) -> bool {
-        program.ops().iter().any(|op| {
-            matches!(
-                op,
-                Op::LoadParam(_)
-                    | Op::ExecScalarSubquery(_)
-                    | Op::ExecExists(_)
-                    | Op::ExecInSubquery(_)
-                    | Op::ExecQuantified(..)
-            )
-        })
+        program.binds_params()
+            || program.ops().iter().any(|op| {
+                matches!(
+                    op,
+                    Op::ExecScalarSubquery(_)
+                        | Op::ExecExists(_)
+                        | Op::ExecInSubquery(_)
+                        | Op::ExecQuantified(..)
+                )
+            })
     }
 }
 

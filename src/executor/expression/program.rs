@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 use super::ops::{CompareOp, Op};
-use super::vm::{read_param, ExprVM};
+use super::vm::{read_param, reads_otherwise, ExprVM};
 use crate::common::CompactArc;
 use crate::core::DataType;
 use crate::core::Value;
@@ -173,13 +173,16 @@ impl Program {
     /// at the cost of its value. A parameter `params` lacks keeps its error
     pub fn bind(&self, params: &[Value]) -> Option<Self> {
         let binding = self.binding.as_deref()?;
-        if binding.shrinks.get() == Some(&false) {
+        // A parameter read as another value is read once here, not per row
+        let reads = binding.reads && self.ops.iter().any(|op| reads_now(op, params));
+        if binding.shrinks.get() == Some(&false) && !reads {
             return None;
         }
         let value = |slot: u32| params.get(slot as usize).cloned();
         let bound = self.bind_with(|op| match op {
             Op::LoadParam(slot) => value(*slot).map(Op::LoadConst),
-            _ => known_params(op, value),
+            op if reads_now(op, params) => known_params(op, value),
+            _ => None,
         })?;
         let shrinks = bound.ops.len() < self.ops.len();
         // No value changes what fusion makes of a parameter no fold holds
@@ -191,7 +194,13 @@ impl Program {
         if settled {
             let _ = binding.shrinks.set(shrinks);
         }
-        shrinks.then_some(bound)
+        (shrinks || reads).then_some(bound)
+    }
+
+    /// Whether binding the program to its execution's parameters may change
+    /// it: it loads a parameter or reads one as a column's type
+    pub(crate) fn binds_params(&self) -> bool {
+        self.binding.is_some()
     }
 
     /// `program` bound to `params`, from the program it was bound from when
@@ -213,7 +222,7 @@ impl Program {
     pub fn bind_never_shrinks(&self) -> bool {
         self.binding
             .as_deref()
-            .is_some_and(|binding| binding.shrinks.get() == Some(&false))
+            .is_some_and(|binding| binding.shrinks.get() == Some(&false) && !binding.reads)
     }
 
     /// This program with each op `known` replaces taken as its replacement,
@@ -765,19 +774,53 @@ struct Binding {
     /// Whether binding the parameters shrinks the program, once a bind
     /// found it out for every value
     shrinks: std::sync::OnceLock<bool>,
+    /// Whether a column test reads its parameters as the column's type,
+    /// which binding does once when a value is of another type
+    reads: bool,
 }
 
 impl Binding {
-    /// The binding of a program of `ops`, when one loads a parameter
+    /// The binding of a program of `ops`, when one loads a parameter or
+    /// tests a column against parameters read as its type
     fn of(ops: &[Op], folds: Vec<(u16, u16)>) -> Option<Box<Self>> {
-        ops.iter()
-            .any(|op| matches!(op, Op::LoadParam(_)))
-            .then(|| {
-                Box::new(Self {
-                    folds,
-                    shrinks: std::sync::OnceLock::new(),
-                })
+        let reads = ops.iter().any(|op| read_as_of(op).is_some());
+        (reads || ops.iter().any(|op| matches!(op, Op::LoadParam(_)))).then(|| {
+            Box::new(Self {
+                folds,
+                shrinks: std::sync::OnceLock::new(),
+                reads,
             })
+        })
+    }
+}
+
+/// The type a column test against parameters reads them as, when it reads
+/// them as one
+fn read_as_of(op: &Op) -> Option<DataType> {
+    match op {
+        Op::CompareColumnParam(.., read_as)
+        | Op::BetweenColumnParams(.., read_as)
+        | Op::InColumnParams(.., read_as) => *read_as,
+        _ => None,
+    }
+}
+
+/// Whether `op` tests a column against a parameter of `params` that it
+/// reads as another value, which binding reads once for the execution
+fn reads_now(op: &Op, params: &[Value]) -> bool {
+    let Some(column_type) = read_as_of(op) else {
+        return false;
+    };
+    let read = |slot: &u32| {
+        params
+            .get(*slot as usize)
+            .is_some_and(|value| reads_otherwise(value, column_type))
+    };
+    match op {
+        Op::CompareColumnParam(_, slot, ..) => read(slot),
+        Op::BetweenColumnParams(_, low, high, _) => read(low) || read(high),
+        Op::InColumnParams(_, slots, _) => slots.iter().any(read),
+        _ => false,
     }
 }
 
