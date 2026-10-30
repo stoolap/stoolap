@@ -146,15 +146,15 @@ pub struct QueryClassification {
 
 impl QueryClassification {
     /// A `SELECT *` whose filtered rows the semantic cache may hold: no
-    /// parameters, subqueries or volatile functions, and nothing reshaping
-    /// the rows
-    pub fn semantic_cacheable(&self) -> bool {
+    /// parameters but the literals of its text when `literal_params`, no
+    /// subqueries or volatile functions, and nothing reshaping the rows
+    pub fn semantic_cacheable(&self, literal_params: bool) -> bool {
         self.is_select_star
             && !self.has_aggregation
             && !self.has_window_functions
             && !self.has_group_by
             && !self.where_has_subqueries
-            && !self.where_has_parameters
+            && (!self.where_has_parameters || literal_params)
             && !self.has_nondeterministic_functions
             && !self.has_order_by
             && !self.has_distinct

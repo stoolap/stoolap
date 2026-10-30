@@ -46,6 +46,7 @@ mod program;
 mod vm;
 
 pub(crate) use compiler::literal_value;
+pub(crate) use compiler::parameter_slot;
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
 pub(crate) use evaluator_bridge::{bind_params, compile_expression_with_params};
 pub use evaluator_bridge::{

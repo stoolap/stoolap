@@ -42,6 +42,7 @@ pub mod token;
 
 // Expression and statement parsing are implemented as impl blocks on Parser
 mod expressions;
+pub(crate) use expressions::{float_literal, integer_literal, string_literal};
 pub(crate) mod scope;
 mod statements;
 

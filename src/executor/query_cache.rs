@@ -39,7 +39,8 @@
 use crate::common::time_compat::Instant;
 use std::sync::{Arc, RwLock};
 
-use crate::common::SmartString;
+use crate::api::params::ParamVec;
+use crate::common::{CompactArc, SmartString};
 use rustc_hash::FxHashMap;
 
 use crate::parser::ast::{ParamSlots, SelectStatement, Statement, WithClause};
@@ -47,6 +48,8 @@ use crate::storage::mvcc::version_store::LayoutToken;
 
 use super::expr_key::ExprKey;
 use super::query_classification::QueryClassification;
+use super::shared_literals::SharedPlan;
+use smallvec::SmallVec;
 
 /// When a plan holds: at the schema epoch it last held at, or at a later
 /// one while each table and view it read last changed when it did; a plan
@@ -389,6 +392,20 @@ pub struct CachedPlanRef {
     pub counts: Option<Arc<CountsSlot>>,
 }
 
+impl CachedPlanRef {
+    /// A plan of `statement`, nothing compiled or classified yet
+    pub(crate) fn new(statement: Arc<Statement>, params: ParamSlots) -> Self {
+        let counts = counts_slot(&statement);
+        Self {
+            statement,
+            params,
+            compiled: Arc::new(NestedPlan::default()),
+            classification: Arc::new(std::sync::OnceLock::new()),
+            counts,
+        }
+    }
+}
+
 /// What a plan keeps for a SELECT whose LIMIT or OFFSET holds a subquery
 #[derive(Debug)]
 pub struct CountsSlot {
@@ -442,14 +459,47 @@ pub struct CachedQueryPlan {
 /// the overhead of parsing the same query multiple times.
 pub struct QueryCache {
     /// Cached plans indexed by normalized query text (FxHash for fast string hashing)
-    plans: RwLock<FxHashMap<SmartString, CachedQueryPlan>>,
+    plans: RwLock<FxHashMap<SmartString, TextPlan>>,
     /// Maximum number of cached plans
     max_size: usize,
     /// Factor to determine how many plans to prune when cache is full (0.0-1.0)
     prune_factor: f64,
     /// The plan of each SELECT run as a parsed tree, by its structure
     statements: parking_lot::Mutex<StatementPlans>,
+    /// The plans texts differing only in their shared literals run, by the
+    /// texts' skeleton
+    shared: parking_lot::Mutex<lru::LruCache<String, SmallVec<[Arc<SharedPlan>; 1]>>>,
 }
+
+/// The values a text's shared literals fill a shared plan's hidden slots with
+pub(crate) type SharedValues = CompactArc<ParamVec>;
+
+/// What the cache keeps for a text
+enum TextPlan {
+    Own(CachedQueryPlan),
+    /// A plan shared by its skeleton, with the values of this text
+    Shared(Arc<SharedPlan>, SharedValues, Instant),
+}
+
+impl TextPlan {
+    /// When it was kept and how often it was used, oldest and least used
+    /// pruned first
+    fn age(&self) -> (Instant, u64) {
+        match self {
+            TextPlan::Own(plan) => (plan.last_used, plan.usage_count),
+            TextPlan::Shared(_, _, kept) => (*kept, 1),
+        }
+    }
+}
+
+/// The plan a text runs
+pub(crate) enum CachedText {
+    Own(CachedPlanRef),
+    Shared(Arc<SharedPlan>, SharedValues),
+}
+
+/// The plans one skeleton keeps, each for other values of its fixed literals
+const SHARED_PER_SKELETON: usize = 8;
 
 /// The plans of SELECTs run as parsed trees: by the tree's address, with the
 /// tree they were made for, and by the tree's structure
@@ -470,6 +520,7 @@ impl QueryCache {
                 by_address: lru::LruCache::new(capacity),
                 by_structure: lru::LruCache::new(capacity),
             }),
+            shared: parking_lot::Mutex::new(lru::LruCache::new(capacity)),
         }
     }
 
@@ -509,18 +560,32 @@ impl QueryCache {
     /// OPTIMIZATION: Only uses read lock for cache hits (no write lock for stats).
     /// Stats are only updated on cache misses via put().
     pub fn get(&self, query: &str) -> Option<CachedPlanRef> {
+        match self.lookup(query)? {
+            CachedText::Own(plan) => Some(plan),
+            CachedText::Shared(..) => None,
+        }
+    }
+
+    /// The plan the text `query` ran before: its own, or a shared one with
+    /// the values of its shared literals
+    pub(crate) fn lookup(&self, query: &str) -> Option<CachedText> {
         // Only use read lock - skip stats update for performance
         let plans = self.plans.read().ok()?;
-        let plan = plans.get(normalize_query(query))?;
+        let plan = match plans.get(normalize_query(query))? {
+            TextPlan::Own(plan) => plan,
+            TextPlan::Shared(plan, values, _) => {
+                return Some(CachedText::Shared(Arc::clone(plan), values.clone()))
+            }
+        };
 
         // Only clone the Arc (cheap) and copy the small fields
-        Some(CachedPlanRef {
+        Some(CachedText::Own(CachedPlanRef {
             statement: plan.statement.clone(),
             params: plan.params.clone(),
             compiled: plan.compiled.clone(), // Share compiled state
             classification: plan.classification.clone(),
             counts: plan.counts.clone(),
-        })
+        }))
     }
 
     /// Add a plan to the cache
@@ -532,9 +597,7 @@ impl QueryCache {
         let normalized_key = SmartString::new(normalize_query(query));
 
         // Create the compiled state upfront - shared between stored plan and returned ref
-        let compiled = Arc::new(NestedPlan::default());
-        let classification = Arc::new(std::sync::OnceLock::new());
-        let counts = counts_slot(&statement);
+        let plan = CachedPlanRef::new(statement, params);
 
         if let Ok(mut plans) = self.plans.write() {
             // Check if we need to prune the cache
@@ -544,25 +607,63 @@ impl QueryCache {
 
             plans.insert(
                 normalized_key,
-                CachedQueryPlan {
-                    statement: statement.clone(),
+                TextPlan::Own(CachedQueryPlan {
+                    statement: plan.statement.clone(),
                     last_used: Instant::now(),
                     usage_count: 1,
-                    params: params.clone(),
-                    compiled: compiled.clone(), // Arc clone - cheap
-                    classification: classification.clone(),
-                    counts: counts.clone(),
-                },
+                    params: plan.params.clone(),
+                    compiled: plan.compiled.clone(), // Arc clone - cheap
+                    classification: plan.classification.clone(),
+                    counts: plan.counts.clone(),
+                }),
             );
         }
 
         // Return lightweight reference - only Arc clones, no SmartString clones
-        CachedPlanRef {
-            statement,
-            params,
-            compiled,
-            classification,
-            counts,
+        plan
+    }
+
+    /// The first plan kept for the texts of `skeleton` that `bind` binds,
+    /// with what it bound
+    pub(crate) fn find_shared<T>(
+        &self,
+        skeleton: &str,
+        mut bind: impl FnMut(&SharedPlan) -> Option<T>,
+    ) -> Option<(Arc<SharedPlan>, T)> {
+        let mut shared = self.shared.lock();
+        let plans = shared.get(skeleton)?;
+        plans
+            .iter()
+            .find_map(|plan| bind(plan).map(|bound| (Arc::clone(plan), bound)))
+    }
+
+    /// Keeps `plan` for the texts of `skeleton`, beside at most
+    /// [`SHARED_PER_SKELETON`] others whose fixed literals differ
+    pub(crate) fn put_shared(&self, skeleton: String, plan: SharedPlan) -> Arc<SharedPlan> {
+        let plan = Arc::new(plan);
+        let mut shared = self.shared.lock();
+        let plans = shared.get_or_insert_mut(skeleton, SmallVec::new);
+        if plans.len() == SHARED_PER_SKELETON {
+            plans.remove(0);
+        }
+        plans.push(Arc::clone(&plan));
+        plan
+    }
+
+    /// Keeps that the text `query` runs `plan` with `values`
+    pub(crate) fn put_shared_text(
+        &self,
+        query: &str,
+        plan: &Arc<SharedPlan>,
+        values: &SharedValues,
+    ) {
+        let key = SmartString::new(normalize_query(query));
+        if let Ok(mut plans) = self.plans.write() {
+            if plans.len() >= self.max_size {
+                self.prune_cache(&mut plans);
+            }
+            let text = TextPlan::Shared(Arc::clone(plan), values.clone(), Instant::now());
+            plans.insert(key, text);
         }
     }
 
@@ -574,6 +675,7 @@ impl QueryCache {
         let mut statements = self.statements.lock();
         statements.by_address.clear();
         statements.by_structure.clear();
+        self.shared.lock().clear();
     }
 
     /// Get the number of plans in the cache
@@ -596,7 +698,7 @@ impl QueryCache {
         };
 
         let size = plans.len();
-        let total_usage: u64 = plans.values().map(|p| p.usage_count).sum();
+        let total_usage: u64 = plans.values().map(|p| p.age().1).sum();
         let avg_usage = if size > 0 {
             total_usage as f64 / size as f64
         } else {
@@ -612,7 +714,7 @@ impl QueryCache {
     }
 
     /// Prune the least recently used entries when the cache is full
-    fn prune_cache(&self, plans: &mut FxHashMap<SmartString, CachedQueryPlan>) {
+    fn prune_cache(&self, plans: &mut FxHashMap<SmartString, TextPlan>) {
         // Calculate how many entries to remove
         let num_to_remove = ((self.max_size as f64) * self.prune_factor).ceil() as usize;
         let num_to_remove = num_to_remove.max(1);
@@ -625,7 +727,10 @@ impl QueryCache {
         // Use references to avoid cloning all keys
         let mut entries: Vec<(&SmartString, Instant, u64)> = plans
             .iter()
-            .map(|(k, p)| (k, p.last_used, p.usage_count))
+            .map(|(k, p)| {
+                let (last_used, usage_count) = p.age();
+                (k, last_used, usage_count)
+            })
             .collect();
 
         // The oldest first, then the least used: only which ones, not their order

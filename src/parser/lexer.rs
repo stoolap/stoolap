@@ -88,6 +88,11 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The byte offset just past the last token read
+    pub(crate) fn offset(&self) -> usize {
+        self.position
+    }
+
     /// Read the next character
     fn read_char(&mut self) {
         // Update position before changing character

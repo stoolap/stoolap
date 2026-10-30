@@ -32,6 +32,9 @@ pub static WAL_CUT_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// Run every text by its own plan, none shared by its literals
+pub static LITERAL_SHARING_OFF: AtomicBool = AtomicBool::new(false);
+
 /// Fail the search for the next WAL record past a damaged one with an I/O error
 pub static WAL_SCAN_READ_FAIL: AtomicBool = AtomicBool::new(false);
 
@@ -1725,6 +1728,50 @@ pub fn prepared_strategy_runs(strategy: PreparedStrategy) -> usize {
 
 pub(crate) fn prepared_strategy_ran(strategy: PreparedStrategy) {
     PREPARED_STRATEGY_RUNS[strategy as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every place a literal of a text is read as a hidden parameter of the
+/// plan its texts share. The equivalence test fails for a variant no case
+/// of it reaches
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedLiteral {
+    /// A comparison of a column with the literal
+    Comparison,
+    /// A bound of a BETWEEN on a column
+    Range,
+    /// A member of an IN list on a column
+    List,
+}
+
+impl SharedLiteral {
+    pub const ALL: [SharedLiteral; 3] = [
+        SharedLiteral::Comparison,
+        SharedLiteral::Range,
+        SharedLiteral::List,
+    ];
+}
+
+/// Process-wide: how many literals each place shared
+static SHARED_LITERALS: [std::sync::atomic::AtomicUsize; 3] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+pub fn shared_literals(place: SharedLiteral) -> usize {
+    SHARED_LITERALS[place as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn literal_shared(place: SharedLiteral) {
+    SHARED_LITERALS[place as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide: how many texts ran a plan shared by their literals
+static SHARED_PLAN_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn shared_plan_runs() -> usize {
+    SHARED_PLAN_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn shared_plan_ran() {
+    SHARED_PLAN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Every site of an UPDATE, DELETE or INSERT whose subqueries run prepared.
