@@ -514,9 +514,14 @@ impl Executor {
 
         // Try compiled fast paths based on statement type
         self.fast_path_until_held(&plan.statement, None, || match plan.statement.as_ref() {
-            Statement::Select(stmt) => {
-                self.run_select_plan(stmt, plan.compiled.slot(), None, params, false)
-            }
+            Statement::Select(stmt) => self.run_select_plan(
+                stmt,
+                plan.compiled.slot(),
+                Some(&plan.classification),
+                None,
+                params,
+                false,
+            ),
             Statement::Update(stmt) => {
                 let stmt = DmlStatement::Update(stmt);
                 self.run_dml_plan(stmt, plan.compiled.slot(), None, params, false)
@@ -664,10 +669,11 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
         compiled: &std::sync::RwLock<query_cache::CompiledExecution>,
+        classification: &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         self.fast_path_until_held(statement, Some(ctx), || {
-            self.try_compiled_fast_paths(statement, ctx, compiled, in_txn)
+            self.try_compiled_fast_paths(statement, ctx, compiled, classification, in_txn)
         })
     }
 
@@ -726,13 +732,19 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
         compiled: &std::sync::RwLock<query_cache::CompiledExecution>,
+        classification: &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         match statement {
             Statement::Select(stmt) => {
-                if let Some(result) =
-                    self.run_select_plan(stmt, compiled, Some(ctx), ctx.params(), in_txn)
-                {
+                if let Some(result) = self.run_select_plan(
+                    stmt,
+                    compiled,
+                    Some(classification),
+                    Some(ctx),
+                    ctx.params(),
+                    in_txn,
+                ) {
                     return Some(result);
                 }
                 // The aggregate plan reads committed state: a view the context
@@ -1084,7 +1096,7 @@ impl Executor {
                     let in_txn = self.active_transaction.is_open();
                     let params = ctx.params();
                     let planned =
-                        self.run_select_plan(stmt, plan.slot(), Some(ctx), params, in_txn);
+                        self.run_select_plan(stmt, plan.slot(), None, Some(ctx), params, in_txn);
                     if let Some(result) = planned {
                         return result;
                     }
@@ -1286,6 +1298,7 @@ impl Executor {
                 plan.statement.as_ref(),
                 &ctx,
                 plan.compiled.slot(),
+                &plan.classification,
                 active_txn_id.is_some(),
             ) {
                 return result;

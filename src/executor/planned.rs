@@ -14,7 +14,7 @@
 
 //! Runs a statement the planner planned: its access, then its steps
 
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use smallvec::SmallVec;
 
@@ -32,7 +32,7 @@ use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
 use super::prepared_select::{first_branch_of, PreparedSelect};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
-use super::query_classification::get_classification;
+use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::row_count::static_row_counts;
 use super::Executor;
@@ -41,11 +41,13 @@ impl Executor {
     /// `run` over the plan `compiled` holds for `stmt` when it reads a key,
     /// planned now in `ctx` when it holds none yet; None for a statement
     /// whose plan reads no key, or that is not planned and `ctx` is not
-    /// given for
+    /// given for. `classification` is the plan's slot for the statement's
+    /// classification, which planning fills
     pub(crate) fn with_planned<R>(
         &self,
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
+        classification: Option<&OnceLock<Arc<QueryClassification>>>,
         ctx: Option<&ExecutionContext>,
         run: impl FnOnce(&PreparedSelect) -> R,
     ) -> Option<R> {
@@ -75,7 +77,7 @@ impl Executor {
                 _ => return None,
             }
         }
-        let planned = self.plan_into(stmt, compiled, ctx?, epoch)?;
+        let planned = self.plan_into(stmt, compiled, classification, ctx?, epoch)?;
         planned.key_read()?;
         Some(run(&planned))
     }
@@ -86,10 +88,14 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
+        classification: Option<&OnceLock<Arc<QueryClassification>>>,
         ctx: &ExecutionContext,
         epoch: u64,
     ) -> Option<Arc<PreparedSelect>> {
-        let shape = get_classification(stmt);
+        let shape = match classification {
+            Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
+            None => get_classification(stmt),
+        };
         if shape.has_aggregation
             || shape.has_window_functions
             || shape.has_group_by
@@ -163,7 +169,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         let slot = RwLock::new(CompiledExecution::Unknown);
-        self.with_planned(stmt, &slot, Some(ctx), |_| ());
+        self.with_planned(stmt, &slot, None, Some(ctx), |_| ());
         if let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? {
             let Some(Expression::TableSource(source)) = stmt.table_expr.as_deref() else {
                 return None;
@@ -250,11 +256,12 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
+        classification: Option<&OnceLock<Arc<QueryClassification>>>,
         ctx: Option<&ExecutionContext>,
         params: &[Value],
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        self.with_planned(stmt, compiled, ctx, |planned| {
+        self.with_planned(stmt, compiled, classification, ctx, |planned| {
             if let Some(ctx) = ctx {
                 // In a transaction the normal path arms a timeout; every
                 // statement refuses a cancel

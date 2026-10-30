@@ -628,8 +628,10 @@ impl QueryCache {
             .map(|(k, p)| (k, p.last_used, p.usage_count))
             .collect();
 
-        // Sort by last used (oldest first), then by usage count (least used first)
-        entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+        // The oldest first, then the least used: only which ones, not their order
+        entries.select_nth_unstable_by(num_to_remove - 1, |a, b| {
+            a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2))
+        });
 
         // Collect only the keys to remove (clone only what we need)
         let keys_to_remove: Vec<SmartString> = entries

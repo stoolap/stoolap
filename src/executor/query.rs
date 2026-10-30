@@ -11798,10 +11798,13 @@ impl Executor {
     ) -> OrderByProjection<'e> {
         // Build column index map ONCE with FxHashMap for O(1) lookup
         let col_index_map_lower = build_column_index_map(all_columns);
+        // The names below are read for the keys only
+        let keyed = !order_by.is_empty() || !distinct_on.is_empty();
 
         // Get SELECT column names (lowercase) for checking duplicates
         let select_column_names: Vec<String> = select_exprs
             .iter()
+            .filter(|_| keyed)
             .flat_map(|expr| {
                 let mut names = Vec::new();
                 // Add unqualified name
@@ -11827,6 +11830,7 @@ impl Executor {
         // The names the projection alone brings into scope
         let select_aliases: FxHashSet<String> = select_exprs
             .iter()
+            .filter(|_| keyed)
             .filter_map(|e| match e {
                 Expression::Aliased(a) => Some(a.alias.value_lower.to_string()),
                 _ => None,
