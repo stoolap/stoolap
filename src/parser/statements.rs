@@ -143,6 +143,15 @@ impl Parser<'_> {
 
     /// Parse a SELECT statement
     pub fn parse_select_statement(&mut self) -> Option<SelectStatement> {
+        let stmt = self.parse_select_parts()?;
+        Some(crate::executor::prepared_select::set_operation_ordered(
+            stmt,
+        ))
+    }
+
+    /// A SELECT statement as written: a recursive CTE's body keeps its set
+    /// operation at the top, where the recursive run reads its members
+    fn parse_select_parts(&mut self) -> Option<SelectStatement> {
         let token = self.cur_token.clone();
 
         let mut stmt = SelectStatement {
@@ -909,7 +918,10 @@ impl Parser<'_> {
             return None;
         }
 
-        let query = self.parse_select_statement()?;
+        let query = match is_recursive {
+            true => self.parse_select_parts()?,
+            false => self.parse_select_statement()?,
+        };
 
         // Expect )
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {

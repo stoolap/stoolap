@@ -916,6 +916,95 @@ pub(crate) fn first_branch_of(stmt: &SelectStatement) -> std::borrow::Cow<'_, Se
     }
 }
 
+/// A set operation whose ORDER BY holds a subquery, as the statement that
+/// orders and limits its rows read as a derived table, whose columns the keys
+/// read; any other statement as it is
+pub(crate) fn set_operation_ordered(stmt: SelectStatement) -> SelectStatement {
+    if stmt.set_operations.is_empty()
+        || !stmt.distinct_on.is_empty()
+        || !stmt
+            .order_by
+            .iter()
+            .any(|ob| mentions_subquery(&ob.expression))
+    {
+        return stmt;
+    }
+    let mut rows = stmt;
+    let mut order_by = std::mem::take(&mut rows.order_by);
+    let registry = crate::functions::registry::global_registry();
+    for ob in order_by.iter_mut() {
+        if let Some(at) = set_operation_key_column(&ob.expression, &rows, registry) {
+            ob.expression = Expression::IntegerLiteral(IntegerLiteral {
+                token: rows.token.clone(),
+                value: at as i64 + 1,
+            });
+        }
+    }
+    let limit = rows.limit.take();
+    let offset = rows.offset.take();
+    let with = rows.with.take();
+    let param_count = std::mem::take(&mut rows.param_count);
+    let prepared = rows.prepared.take();
+    let token = rows.token.clone();
+    SelectStatement {
+        token: token.clone(),
+        param_count,
+        distinct: false,
+        distinct_on: Vec::new(),
+        columns: vec![Expression::Star(StarExpression {
+            token: token.clone(),
+        })],
+        with,
+        table_expr: Some(Box::new(Expression::SubquerySource(Box::new(
+            SubqueryTableSource {
+                token,
+                subquery: Box::new(rows),
+                alias: None,
+            },
+        )))),
+        where_clause: None,
+        group_by: GroupByClause::default(),
+        having: None,
+        window_defs: Vec::new(),
+        order_by,
+        limit,
+        offset,
+        set_operations: Vec::new(),
+        prepared,
+    }
+}
+
+/// The item of `stmt`'s first SELECT whose column its set operation's ORDER
+/// BY `key` reads, the key being computed as that item; None for a name, a
+/// position or a key no item computes
+pub(crate) fn set_operation_key_column(
+    key: &Expression,
+    stmt: &SelectStatement,
+    registry: &FunctionRegistry,
+) -> Option<usize> {
+    let star = stmt
+        .columns
+        .iter()
+        .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+    if star || !super::query::order_key_is_expression(key, stmt) {
+        return None;
+    }
+    let key = ExprKey::of(key);
+    stmt.columns
+        .iter()
+        .position(|item| set_operation_key_item(item, registry) && ExprKey::of(item) == key)
+}
+
+/// Whether a set operation's ORDER BY key that is `item` reads the item's
+/// column: an aliased item or an aggregate call, as the rows name no other
+pub(crate) fn set_operation_key_item(item: &Expression, registry: &FunctionRegistry) -> bool {
+    match item {
+        Expression::Aliased(_) => true,
+        Expression::FunctionCall(f) => registry.is_aggregate(&f.function),
+        _ => false,
+    }
+}
+
 /// A statement of the family's clauses: its WITH runs before it, as its own
 /// statements, and its DISTINCT, DISTINCT ON and set operation over the rows
 /// it gives, as the general path runs them; no grouping, HAVING or WINDOW
@@ -1480,13 +1569,15 @@ impl ScopeTable {
         spelled: &dyn std::fmt::Display,
     ) -> Result<()> {
         match rest.into_iter().any(|i| self.lower[i] == name) {
-            true => Err(Error::invalid_argument(format!(
-                "column reference '{}' is ambiguous",
-                spelled
-            ))),
+            true => Err(ambiguous_column(spelled)),
             false => Ok(()),
         }
     }
+}
+
+/// The refusal of a name two columns carry
+pub(crate) fn ambiguous_column(spelled: &dyn std::fmt::Display) -> Error {
+    Error::invalid_argument(format!("column reference '{}' is ambiguous", spelled))
 }
 
 /// What an expression reads, one bit per scope of the chain: bit 0 the

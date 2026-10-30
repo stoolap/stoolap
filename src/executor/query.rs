@@ -192,6 +192,12 @@ fn bind_order_key<'e>(expr: &'e Expression, stmt: &SelectStatement) -> OrderKey<
     }
 }
 
+/// Whether ORDER BY `expr` of `stmt` is read from a column computing it,
+/// not by a name or a position
+pub(crate) fn order_key_is_expression(expr: &Expression, stmt: &SelectStatement) -> bool {
+    matches!(bind_order_key(expr, stmt), OrderKey::Expression)
+}
+
 /// Whether a qualified name reads the input of a query whose FROM is `from`:
 /// one whose qualifier no entry shows is an enclosing query's column
 fn reads_input(from: Option<&Expression>, qid: &QualifiedIdentifier) -> bool {
@@ -460,7 +466,10 @@ use super::planned_aggregate::{bounds, AggregateRead};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
-use super::prepared_select::{joined_aliases, Bound, JoinBlocks, OutOfFamily, PreparedProjection};
+use super::prepared_select::{
+    ambiguous_column, joined_aliases, set_operation_key_column, set_operation_key_item, Bound,
+    JoinBlocks, OutOfFamily, PreparedProjection,
+};
 use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::{CachedPlanRef, CompiledExecution, NestedPlan};
@@ -2014,6 +2023,36 @@ impl Executor {
         // A DISTINCT ON key reads only where the first branch put its items,
         // which a set operation's rows keep
         let item_layout = layout.as_deref();
+        // A name two of a set operation's columns carry is ambiguous, as in a derived table
+        if !stmt.set_operations.is_empty() {
+            // Beside a star over a join the count is unknown: every column is shown
+            let shown = match expected_columns {
+                0 => &columns[..],
+                count => &columns[..count.min(columns.len())],
+            };
+            let reads = |c: &str, name: &str| {
+                eq_folded(c, name)
+                    || split_qualified(c).is_some_and(|(_, last)| eq_folded(last, name))
+            };
+            let mut twice = None;
+            let registry = &self.function_registry;
+            for ob in &stmt.order_by {
+                if set_operation_key_column(&ob.expression, stmt, registry).is_some() {
+                    continue;
+                }
+                visit_column_refs(&ob.expression, &mut |column| {
+                    if let Expression::Identifier(id) = column {
+                        let named = shown.iter().filter(|c| reads(c, &id.value_lower));
+                        if twice.is_none() && named.count() > 1 {
+                            twice = Some(id);
+                        }
+                    }
+                });
+            }
+            if let Some(id) = twice {
+                return Err(ambiguous_column(&id.value));
+            }
+        }
         if !stmt.order_by.is_empty() && !limit_offset_applied {
             // A set operation's rows come from other branches too: there a
             // column stands for a sort key only when aliased or an aggregate,
@@ -12253,10 +12292,7 @@ impl Executor {
             if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 continue;
             }
-            if set_operation
-                && !matches!(col, Expression::Aliased(_))
-                && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
-            {
+            if set_operation && !set_operation_key_item(col, &self.function_registry) {
                 continue;
             }
             // An item's column by the layout; without one, by its index

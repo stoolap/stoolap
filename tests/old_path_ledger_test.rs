@@ -308,6 +308,12 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "union_order_by",
+        "SELECT id FROM t UNION SELECT 9 ORDER BY (SELECT MAX(x) FROM u) - id LIMIT 2",
+        "SELECT id FROM t UNION SELECT 9 ORDER BY 3 - id LIMIT 2",
+        Prepared,
+    ),
+    (
         "window_where",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > (SELECT MAX(x) FROM u)",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > 3",

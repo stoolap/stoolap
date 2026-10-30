@@ -1126,13 +1126,6 @@ fn test_classifier_rules() {
                 .to_string(),
             "a derived table's LIMIT or OFFSET naming a column",
         ),
-        (
-            format!(
-                "SELECT id FROM t WHERE a > {sq} UNION SELECT id FROM u \
-                 ORDER BY (SELECT v FROM u WHERE u.id = 2)"
-            ),
-            "an ORDER BY subquery over a set operation",
-        ),
     ];
     for (sql, reason) in &no {
         assert_eq!(
@@ -3068,6 +3061,226 @@ fn test_an_order_by_key_s_subquery_reads_a_select_alias_as_the_item_s_value() {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "column 't.z' not found");
+    }
+}
+
+#[test]
+fn test_a_set_operation_s_order_by_subquery_reads_the_whole_one_s_columns() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_subquery") {
+        for (sql, want) in [
+            (
+                "SELECT a AS z FROM t UNION SELECT v FROM u \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.v <= z), 1",
+                vec![
+                    None,
+                    Some(1),
+                    Some(5),
+                    Some(7),
+                    Some(10),
+                    Some(20),
+                    Some(30),
+                ],
+            ),
+            (
+                "SELECT k AS z FROM t UNION ALL SELECT k FROM u \
+                 ORDER BY EXISTS (SELECT 1 FROM u WHERE u.k = z + 1) DESC, 1 LIMIT 3 OFFSET 3",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            (
+                "WITH c AS (SELECT a FROM t WHERE a > 10) \
+                 SELECT a AS z FROM c UNION SELECT v FROM u \
+                 ORDER BY z IN (SELECT k * 10 FROM u) DESC, 1 DESC",
+                vec![None, Some(20), Some(30), Some(7), Some(5), Some(1)],
+            ),
+            (
+                "SELECT a AS z FROM t EXCEPT SELECT v FROM u \
+                 ORDER BY z IN (SELECT k * 10 FROM u) DESC, 1 DESC",
+                vec![Some(20), Some(10), Some(30)],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let before = general_hits();
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+            assert_eq!(general_hits(), before, "{sql} reached a general path");
+        }
+    }
+}
+
+#[test]
+fn test_a_set_operation_s_key_beside_a_subquery_reads_the_item_it_repeats() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_item") {
+        let sql = "SELECT RANDOM() AS r FROM t UNION ALL SELECT 0.5 ORDER BY RANDOM(), (SELECT 1)";
+        let drawn: Vec<f64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<f64>(0).unwrap())
+            .collect();
+        assert_eq!(drawn.len(), 6);
+        assert!(drawn.windows(2).all(|w| w[0] <= w[1]), "{drawn:?}");
+        for (sql, want) in [
+            (
+                "SELECT MAX(a) AS m FROM t UNION SELECT 7 ORDER BY MAX(a) DESC, (SELECT 1)",
+                vec![Some(30), Some(7)],
+            ),
+            (
+                "SELECT a + 1 AS p FROM t UNION SELECT v FROM u ORDER BY a + 1 DESC, (SELECT 1)",
+                vec![
+                    None,
+                    Some(31),
+                    Some(21),
+                    Some(11),
+                    Some(7),
+                    Some(5),
+                    Some(1),
+                ],
+            ),
+        ] {
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+        }
+        // A name is read as a name, never as the item it repeats
+        for sql in [
+            "SELECT a AS p FROM t UNION SELECT v FROM u ORDER BY a DESC",
+            "SELECT a AS p FROM t UNION SELECT v FROM u ORDER BY a DESC, (SELECT 1)",
+        ] {
+            assert!(error(&db, sql, ()).0.contains("'a' not found"), "{sql}");
+        }
+    }
+}
+
+#[test]
+fn test_a_set_operation_s_order_by_subquery_reads_an_enclosing_table_of_a_branch_s_name() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_outer") {
+        let sql = "SELECT id FROM t WHERE k IN (SELECT k FROM t UNION SELECT k FROM u \
+                   ORDER BY (SELECT ABS(k - t.a / 10)), 1 LIMIT 1) ORDER BY id";
+        assert_eq!(ids(&db, sql, ()).0, vec![3], "{sql}");
+        let sql = "SELECT id, (SELECT k FROM t UNION SELECT k FROM u \
+                   ORDER BY (SELECT ABS(k - t.a / 10)), 1 LIMIT 1) FROM t ORDER BY id";
+        let got: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(1).unwrap())
+            .collect();
+        assert_eq!(got, vec![3, 1, 1, 2, 1], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by() {
+    let _guard = serial();
+    const DUP: &str = "SELECT a, k AS a FROM t UNION SELECT k, v FROM u";
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_ambiguous") {
+        for sql in [
+            format!("{DUP} ORDER BY a"),
+            format!("{DUP} ORDER BY a + 0 DESC"),
+            format!("{DUP} ORDER BY (SELECT a)"),
+            format!("{DUP} ORDER BY a, (SELECT 1)"),
+            "SELECT id AS a, k AS A FROM t UNION ALL SELECT k, v FROM u ORDER BY a".to_string(),
+            "WITH c AS (SELECT k, v FROM u) SELECT a, k AS a FROM t UNION SELECT k, v FROM c \
+             ORDER BY a"
+                .to_string(),
+            format!("SELECT * FROM ({DUP} ORDER BY a LIMIT 2) s"),
+            format!("SELECT (SELECT COUNT(*) FROM ({DUP} ORDER BY a) s)"),
+            format!("EXPLAIN ANALYZE {DUP} ORDER BY a"),
+            "SELECT l.*, r.* FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 ORDER BY a"
+                .to_string(),
+            "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 ORDER BY a"
+                .to_string(),
+        ] {
+            assert_eq!(
+                error(&db, &sql, ()).0,
+                "invalid argument: column reference 'a' is ambiguous",
+                "{sql}"
+            );
+        }
+        // The derived table names a star's columns over a join `l.a` and `r.a`
+        let sql = "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 \
+                   ORDER BY a, (SELECT 1)";
+        assert_eq!(error(&db, sql, ()).0, "column 'a' not found", "{sql}");
+        let prepared = db.prepare(&format!("{DUP} ORDER BY a LIMIT $1")).unwrap();
+        let err = prepared
+            .query((2,))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: column reference 'a' is ambiguous"
+        );
+        let pairs = |sql: &str| -> Vec<(Option<i64>, Option<i64>)> {
+            db.query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| {
+                    let row = row.unwrap();
+                    (row.get(0).unwrap(), row.get(1).unwrap())
+                })
+                .collect()
+        };
+        assert_eq!(
+            pairs(&format!("{DUP} ORDER BY 1, 2")),
+            [
+                (Some(1), Some(5)),
+                (Some(1), None),
+                (Some(2), Some(7)),
+                (Some(4), Some(1)),
+                (Some(10), Some(2)),
+                (Some(20), Some(3)),
+                (Some(30), Some(1)),
+                (None, Some(1)),
+            ]
+        );
+        assert_eq!(
+            pairs(&format!("{DUP} ORDER BY 2 DESC, (SELECT 1), 1")),
+            [
+                (Some(1), None),
+                (Some(2), Some(7)),
+                (Some(1), Some(5)),
+                (Some(20), Some(3)),
+                (Some(10), Some(2)),
+                (Some(4), Some(1)),
+                (Some(30), Some(1)),
+                (None, Some(1)),
+            ]
+        );
+        // A key computed as an item reads its column, whatever names it holds
+        for sql in [
+            "SELECT a + 1 AS z, k AS a, id AS a FROM t UNION ALL SELECT 0, 0, 0 ORDER BY a + 1",
+            "SELECT a + 1 AS z, k AS a, id AS a FROM t UNION ALL SELECT 0, 0, 0 \
+             ORDER BY a + 1, (SELECT 1)",
+        ] {
+            let got: Vec<Option<i64>> = pairs(sql).into_iter().map(|(z, _)| z).collect();
+            assert_eq!(
+                got,
+                [Some(0), Some(11), Some(11), Some(21), Some(31), None],
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_a_recursive_cte_ordered_by_a_subquery_keeps_its_members() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_recursive_order_subquery") {
+        for sql in [
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 \
+             ORDER BY (SELECT 1)) SELECT n FROM r ORDER BY n",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 \
+             ORDER BY 1) SELECT n FROM r ORDER BY n",
+        ] {
+            assert_eq!(ids(&db, sql, ()).0, vec![1, 2, 3], "{sql}");
+        }
     }
 }
 
