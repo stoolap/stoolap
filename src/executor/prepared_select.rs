@@ -8427,7 +8427,7 @@ impl Executor {
 /// one set of blocks
 #[derive(Debug)]
 pub struct PreparedDml {
-    validity: PlanValidity,
+    pub(crate) validity: PlanValidity,
     /// The CTEs its context bound
     cte_scope: CteScope,
     /// The target's columns at preparation
@@ -8765,6 +8765,12 @@ impl PreparedDml {
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
+        // Every slot is read for a row the statement writes: its error is raised there
+        for (slot, _) in &run_slots {
+            if !builder.where_slots.contains(slot) {
+                builder.where_slots.push(*slot);
+            }
+        }
         let (blocks, holes) = builder.finish(param_count, run_slots)?;
         let where_ = where_parts
             .zip(where_program)
@@ -9552,6 +9558,7 @@ pub(crate) struct DmlTables {
 }
 
 /// The rows an UPDATE may write, each asked its WHERE as it is written
+/// unless the scan took it whole
 pub(crate) enum Candidates {
     /// The scan proves that no row passes
     Pruned,
@@ -9559,6 +9566,8 @@ pub(crate) enum Candidates {
     Keyed(Vec<i64>),
     /// A scan narrowed by the conjuncts without a subquery
     Scan(Option<Box<dyn StorageExpr>>),
+    /// A scan that takes the whole WHERE: its rows pass it
+    Whole(Option<Box<dyn StorageExpr>>),
 }
 
 /// One execution of a prepared UPDATE or DELETE over its target's rows
@@ -9626,7 +9635,7 @@ impl<'a> DmlRunner<'a> {
         ctx: &ExecutionContext,
     ) -> Result<Candidates> {
         let Some(where_) = &self.prepared.where_ else {
-            return Ok(Candidates::Scan(None));
+            return Ok(Candidates::Whole(None));
         };
         let Some(scan) = self.runner.where_scan(where_, None, None, table, ctx)? else {
             return Ok(Candidates::Pruned);
@@ -9644,9 +9653,31 @@ impl<'a> DmlRunner<'a> {
             None => Some(scan),
         };
         Ok(match scan {
+            Some((storage_expr, true, ..)) => Candidates::Whole(storage_expr),
             Some((storage_expr, ..)) => Candidates::Scan(storage_expr),
             None => Candidates::Pruned,
         })
+    }
+
+    /// The scan of `table` that takes the whole WHERE, found without reading
+    /// a row: None when a narrowing reads the rows or the scan takes part
+    pub(crate) fn whole_scan(
+        &self,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Option<Box<dyn StorageExpr>>>> {
+        let Some(where_) = &self.prepared.where_ else {
+            return Ok(Some(None));
+        };
+        if where_.narrowing.is_some() {
+            return Ok(None);
+        }
+        Ok(
+            match self.runner.where_scan(where_, None, None, table, ctx)? {
+                Some((storage_expr, true, ..)) => Some(storage_expr),
+                _ => None,
+            },
+        )
     }
 
     /// Hand `keep` the row id and row of each row of `table` the WHERE
@@ -10597,13 +10628,17 @@ impl Executor {
     }
 
     /// Whether an UPDATE's or DELETE's WHERE and SET values run prepared:
-    /// they hold a subquery, and every form in them is the family's
+    /// every form in them is the family's
     pub(crate) fn dml_family<'e>(
         &self,
         where_clause: Option<&'e Expression>,
         sets: impl IntoIterator<Item = &'e Expression>,
         ctx: &'e ExecutionContext,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("the prepared families are off");
+        }
         if ctx.outer_row().is_some() {
             return Err("it runs for a row of an enclosing statement");
         }
@@ -10611,12 +10646,8 @@ impl Executor {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
         };
-        let mut found = false;
         for expr in where_clause.into_iter().chain(sets) {
-            family.expression(expr, 1, Site::Subqueries, &mut found)?;
-        }
-        if !found {
-            return Err("the statement holds no subquery");
+            family.expression(expr, 1, Site::Subqueries, &mut false)?;
         }
         family.catalog()
     }
@@ -12434,10 +12465,6 @@ impl<'a> PreparedRunner<'a> {
         let (mut listed, mut scanner, judged, passed) =
             match self.narrowed_rows(where_.narrowing, table, target)? {
                 Some((candidates, settled)) => {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::prepared_rows_narrowed_by_keys(
-                        where_.narrowing.is_some_and(|n| n.negated),
-                    );
                     // A named row needs no second look at the narrowing,
                     // nor at the pushed conjuncts the scan's filter took
                     rest = match (settled, rest) {
@@ -12649,7 +12676,12 @@ impl<'a> PreparedRunner<'a> {
         let index = id as usize;
         let sq = &self.prepared.subqueries[index];
         if members {
-            return self.rows_by_members(table, index, column, whole, negated, target);
+            let rows = self.rows_by_members(table, index, column, whole, negated, target)?;
+            #[cfg(feature = "test-failpoints")]
+            if rows.is_some() {
+                crate::test_failpoints::prepared_rows_narrowed_by_keys(negated);
+            }
+            return Ok(rows);
         }
         let Answer::Exists(existence) = &sq.answer else {
             return Ok(None);
@@ -12701,6 +12733,10 @@ impl<'a> PreparedRunner<'a> {
             let members = set.outcomes.keys().filter_map(|key| key.first());
             Executor::rows_of_members(table, column, members, target.is_some(), enough)?
         };
+        #[cfg(feature = "test-failpoints")]
+        if rows.is_some() {
+            crate::test_failpoints::prepared_rows_narrowed_by_keys(negated);
+        }
         Ok(rows.map(|rows| (rows, !set.failed)))
     }
 

@@ -318,3 +318,22 @@ fn a_keyed_update_after_a_write_of_its_transaction_reads_no_whole_table() {
         "a keyed update read the whole table: {paths:?}"
     );
 }
+
+#[test]
+fn a_delete_reads_the_rows_its_narrowing_names_once() {
+    let _turn = FORCED.lock().unwrap_or_else(|e| e.into_inner());
+    let db = setup("prepared_dml_delete_narrowed_once");
+    let before = stoolap::test_failpoints::prepared_rows_narrowed();
+    let deleted = db
+        .execute(
+            "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.id)",
+            (),
+        )
+        .unwrap();
+    let narrowed = stoolap::test_failpoints::prepared_rows_narrowed() - before;
+    assert_eq!(deleted, 3);
+    assert_eq!(
+        narrowed, 1,
+        "the delete read its narrowed rows {narrowed} times"
+    );
+}
