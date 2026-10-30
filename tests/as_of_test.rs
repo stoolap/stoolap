@@ -16,7 +16,7 @@
 //!
 //! Tests for temporal queries using AS OF TRANSACTION and AS OF TIMESTAMP syntax.
 
-use stoolap::Database;
+use stoolap::{Database, Value};
 
 // ============================================================================
 // Parser Tests
@@ -690,4 +690,106 @@ fn test_as_of_select_star() {
     // SELECT * with AS OF
     let result = db.query("SELECT * FROM star_test AS OF TRANSACTION 2", ());
     assert!(result.is_ok(), "AS OF with SELECT * should execute");
+}
+
+#[test]
+fn test_as_of_selects_the_columns_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    for dsn in ["memory://as_of_named_columns", file.as_str()] {
+        let db = Database::open(dsn).unwrap();
+        db.execute(
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER, s TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 1, 'a'), (2, 3, 'b')", ())
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before: String = db.query_one("SELECT CAST(NOW() AS TEXT)", ()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        db.execute("UPDATE u SET x = 30 WHERE id = 2", ()).unwrap();
+        db.execute("INSERT INTO u VALUES (3, 9, 'c')", ()).unwrap();
+        let answer = |sql: &str| -> (Vec<String>, Vec<Vec<Value>>) {
+            let rows = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{dsn}: {sql}: {e}"));
+            let columns = rows.columns().to_vec();
+            let values = rows
+                .map(|row| {
+                    let row = row.unwrap();
+                    (0..row.len())
+                        .map(|i| row.get::<Value>(i).unwrap())
+                        .collect()
+                })
+                .collect();
+            (columns, values)
+        };
+        let (int, text) = (Value::Integer, Value::text);
+        for (sql, columns, want) in [
+            (
+                "SELECT x, s FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY s".to_string(),
+                vec!["x", "s"],
+                vec![
+                    vec![int(1), text("a")],
+                    vec![int(30), text("b")],
+                    vec![int(9), text("c")],
+                ],
+            ),
+            (
+                "SELECT s, x FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY s".to_string(),
+                vec!["s", "x"],
+                vec![
+                    vec![text("a"), int(1)],
+                    vec![text("b"), int(30)],
+                    vec![text("c"), int(9)],
+                ],
+            ),
+            (
+                "SELECT h.x FROM u AS OF TIMESTAMP '2099-01-01' h ORDER BY x".to_string(),
+                vec!["x"],
+                vec![vec![int(1)], vec![int(9)], vec![int(30)]],
+            ),
+            (
+                "SELECT u.s FROM u AS OF TRANSACTION 1000000 ORDER BY s".to_string(),
+                vec!["s"],
+                vec![vec![text("a")], vec![text("b")], vec![text("c")]],
+            ),
+            (
+                format!("SELECT x, s FROM u AS OF TIMESTAMP '{before}' ORDER BY s"),
+                vec!["x", "s"],
+                vec![vec![int(1), text("a")], vec![int(3), text("b")]],
+            ),
+        ] {
+            let (got_columns, got) = answer(&sql);
+            assert_eq!(got_columns, columns, "{dsn}: {sql}");
+            assert_eq!(typed(got), typed(want), "{dsn}: {sql}");
+        }
+        // A version written before a column was added reads its default
+        db.execute("ALTER TABLE u ADD COLUMN z INTEGER", ())
+            .unwrap();
+        db.execute("ALTER TABLE u ADD COLUMN w INTEGER DEFAULT 7", ())
+            .unwrap();
+        let sql = "SELECT x, z, w FROM u AS OF TIMESTAMP '2099-01-01' ORDER BY x";
+        let (columns, rows) = answer(sql);
+        assert_eq!(columns, ["x", "z", "w"], "{dsn}: {sql}");
+        let xs: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
+        assert_eq!(xs, [&int(1), &int(9), &int(30)], "{dsn}: {sql}");
+        assert!(
+            rows.iter().all(|row| row[1].is_null()),
+            "{dsn}: {sql}: {rows:?}"
+        );
+        let ws = typed(rows.into_iter().map(|row| vec![row[2].clone()]).collect());
+        assert_eq!(ws, typed(vec![vec![int(7)]; 3]), "{dsn}: {sql}");
+    }
+}
+
+/// Each value beside its type: equality alone takes 1 and 1.0 for one value
+fn typed(rows: Vec<Vec<Value>>) -> Vec<Vec<(stoolap::DataType, Value)>> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(|v| (v.data_type(), v)).collect())
+        .collect()
 }

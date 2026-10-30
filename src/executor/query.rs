@@ -13402,9 +13402,6 @@ impl Executor {
         // Parse temporal value
         let temporal_value = self.parse_temporal_value(as_of, ctx)?;
 
-        // Build columns to fetch
-        let columns_to_fetch = self.build_columns_to_fetch(stmt, &all_columns)?;
-
         // Build storage expression if WHERE clause exists
         // Try to push down to storage, fall back to memory filter for complex expressions
         let (storage_expr, needs_memory_filter) = stmt
@@ -13413,10 +13410,11 @@ impl Executor {
             .map(|where_expr| pushdown::try_pushdown(where_expr, &schema, Some(ctx)))
             .unwrap_or((None, false));
 
-        // Execute temporal query
+        // Every column, in the table's order: the filter, the projection, the
+        // grouping and the sort below read the rows as the table lays them out
         let result = tx.select_as_of(
             table_name,
-            &columns_to_fetch,
+            &all_columns,
             storage_expr.as_deref(),
             &as_of.as_of_type,
             temporal_value,
@@ -13519,50 +13517,6 @@ impl Executor {
                 as_of.as_of_type
             ))),
         }
-    }
-
-    /// Build columns to fetch for temporal query
-    fn build_columns_to_fetch(
-        &self,
-        stmt: &SelectStatement,
-        all_columns: &[String],
-    ) -> Result<Vec<String>> {
-        // Check for SELECT * or t.*
-        if stmt.columns.len() == 1
-            && matches!(
-                &stmt.columns[0],
-                Expression::Star(_) | Expression::QualifiedStar(_)
-            )
-        {
-            return Ok(all_columns.to_vec());
-        }
-
-        // Extract column names from SELECT expressions
-        let mut columns = Vec::new();
-        for expr in &stmt.columns {
-            match expr {
-                Expression::Identifier(id) => columns.push(id.value.to_string()),
-                Expression::QualifiedIdentifier(qid) => columns.push(qid.name.value.to_string()),
-                Expression::Aliased(aliased) => match &*aliased.expression {
-                    Expression::Identifier(id) => columns.push(id.value.to_string()),
-                    Expression::QualifiedIdentifier(qid) => {
-                        columns.push(qid.name.value.to_string())
-                    }
-                    _ => return Ok(all_columns.to_vec()), // Complex expression - need all columns
-                },
-                Expression::Star(_) | Expression::QualifiedStar(_) => {
-                    return Ok(all_columns.to_vec())
-                }
-                _ => return Ok(all_columns.to_vec()), // Complex expression - need all columns
-            }
-        }
-
-        // If WHERE clause exists, we might need additional columns
-        if stmt.where_clause.is_some() {
-            return Ok(all_columns.to_vec());
-        }
-
-        Ok(columns)
     }
 
     /// Project rows for SELECT (helper for temporal queries)
