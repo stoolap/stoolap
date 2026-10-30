@@ -2320,17 +2320,72 @@ fn test_a_cte_runs_prepared_over_its_rows_and_keeps_its_plan() {
 }
 
 #[test]
-fn test_a_block_reading_a_cte_is_not_prepared() {
+fn test_a_block_reads_a_cte_of_the_statement_s_with() {
     let _guard = serial();
     let db = setup("prepared_cte_block");
+    const SQL: &str = "WITH s AS (SELECT id, a FROM t) SELECT x.id FROM s AS x \
+                       WHERE x.a > (SELECT MIN(a) FROM s) ORDER BY x.id";
+    assert_eq!(prepared_line(&db, SQL), "Prepared: yes");
     assert_eq!(
-        prepared_line(
+        ids(&db, SQL, ()).0,
+        ids(
             &db,
-            "WITH s AS (SELECT id, a FROM t) SELECT x.id FROM s AS x \
-             WHERE x.a > (SELECT MIN(a) FROM s)"
-        ),
-        "Prepared: no (a subquery's FROM names a CTE of the statement's WITH)"
+            "SELECT id FROM t WHERE a > (SELECT MIN(a) FROM t) ORDER BY id",
+            ()
+        )
+        .0
     );
+}
+
+#[test]
+fn test_a_block_and_a_derived_table_with_their_own_with_are_prepared() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_own_with") {
+        // Whether no general path mechanism runs: a statement block's own
+        // statement still runs on the general executor (7b Phase 3)
+        for (sql, at, want, whole) in [
+            (
+                "SELECT id, (WITH c AS (SELECT v FROM u WHERE v <= t.a / 5) SELECT MAX(v) FROM c) \
+                 FROM t ORDER BY id",
+                1,
+                vec![Some(5), Some(1), None, Some(1), Some(1)],
+                false,
+            ),
+            (
+                "SELECT id, (SELECT MAX(v) FROM (WITH c AS (SELECT v FROM u) SELECT v FROM c) s \
+                 WHERE s.v <= t.a / 5) FROM t ORDER BY id",
+                1,
+                vec![Some(5), Some(1), None, Some(1), Some(1)],
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE EXISTS (WITH c AS (SELECT k FROM u) \
+                 SELECT 1 FROM c WHERE c.k = t.k) ORDER BY id",
+                0,
+                vec![Some(1), Some(2), Some(3), Some(5)],
+                true,
+            ),
+            (
+                "WITH c AS (SELECT k FROM u) SELECT id FROM t WHERE k IN (SELECT k FROM c) \
+                 ORDER BY id",
+                0,
+                vec![Some(1), Some(2), Some(3), Some(5)],
+                true,
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let before = general_hits();
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(at).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+            if whole {
+                assert_eq!(general_hits(), before, "{sql} reached a general path");
+            }
+        }
+    }
 }
 
 #[test]

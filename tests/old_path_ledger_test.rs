@@ -631,6 +631,25 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "in_block_with_its_own_with",
+        "SELECT id FROM t WHERE a IN (WITH c AS (SELECT x FROM u WHERE x < 3) SELECT x FROM c)",
+        "SELECT id FROM t WHERE a IN (1, 2)",
+        Prepared,
+    ),
+    (
+        "in_block_over_a_derived_table_with_its_own_with",
+        "SELECT id FROM t WHERE a IN \
+         (SELECT x FROM (WITH c AS (SELECT x FROM u WHERE x < 3) SELECT x FROM c) AS s)",
+        "SELECT id FROM t WHERE a IN (1, 2)",
+        Prepared,
+    ),
+    (
+        "in_block_reading_the_statement_s_cte",
+        "WITH c AS (SELECT x FROM u WHERE x < 3) SELECT id FROM t WHERE a IN (SELECT x FROM c)",
+        "SELECT id FROM t WHERE a IN (1, 2)",
+        Prepared,
+    ),
+    (
         "in_block_selecting_star",
         "SELECT id FROM t WHERE a IN (SELECT * FROM (SELECT x FROM u WHERE x < 3) AS s)",
         "SELECT id FROM t WHERE a IN (1, 2)",

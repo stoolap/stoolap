@@ -444,9 +444,10 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for subquery
-        if self.peek_token_is_keyword(Keyword::Select) {
-            self.next_token(); // Move to SELECT
-            let subquery = self.parse_select_statement()?;
+        if self.peek_token_is_keyword(Keyword::Select) || self.peek_token_is_keyword(Keyword::With)
+        {
+            self.next_token(); // Move to SELECT or WITH
+            let subquery = self.parse_query()?;
 
             if !self.peek_token_is_punctuator(")") {
                 self.add_error(format!(
@@ -589,7 +590,8 @@ impl Parser<'_> {
         self.next_token();
 
         // Parse subquery
-        if !self.cur_token_is_keyword(Keyword::Select) {
+        if !self.cur_token_is_keyword(Keyword::Select) && !self.cur_token_is_keyword(Keyword::With)
+        {
             self.add_error(format!(
                 "expected SELECT in {} subquery at {}",
                 all_any_type, self.cur_token.position
@@ -597,7 +599,7 @@ impl Parser<'_> {
             return None;
         }
 
-        let subquery = self.parse_select_statement()?;
+        let subquery = self.parse_query()?;
 
         // Expect closing parenthesis
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
@@ -1270,9 +1272,10 @@ impl Parser<'_> {
         self.next_token();
 
         // Check for subquery
-        if self.peek_token_is_keyword(Keyword::Select) {
+        if self.peek_token_is_keyword(Keyword::Select) || self.peek_token_is_keyword(Keyword::With)
+        {
             self.next_token();
-            let subquery = self.parse_select_statement()?;
+            let subquery = self.parse_query()?;
 
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
                 self.add_error(format!(
@@ -1651,7 +1654,8 @@ impl Parser<'_> {
         }
 
         self.next_token();
-        if !self.cur_token_is_keyword(Keyword::Select) {
+        if !self.cur_token_is_keyword(Keyword::Select) && !self.cur_token_is_keyword(Keyword::With)
+        {
             self.add_error(format!(
                 "expected SELECT in EXISTS subquery at {}",
                 self.cur_token.position
@@ -1659,7 +1663,7 @@ impl Parser<'_> {
             return None;
         }
 
-        let subquery = self.parse_select_statement()?;
+        let subquery = self.parse_query()?;
 
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
             self.add_error(format!(

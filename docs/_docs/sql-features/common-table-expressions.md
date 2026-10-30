@@ -90,6 +90,19 @@ above_average_depts AS (
 SELECT * FROM above_average_depts;
 ```
 
+## WITH in a Subquery
+
+A subquery (scalar, `IN`, `ANY`, `ALL`, `EXISTS`) and a derived table may carry their own `WITH`. Its CTEs are read by that query and the queries inside it alone, ahead of any other name: one named like a table, a view or a CTE of an enclosing `WITH` hides it there, and outside the subquery the name reads nothing of it. A CTE of an enclosing `WITH` is read inside as anywhere else.
+
+```sql
+SELECT name,
+       (WITH recent AS (SELECT amount FROM orders WHERE orders.customer_id = c.id)
+        SELECT MAX(amount) FROM recent) AS largest_order
+FROM customers c;
+```
+
+A CTE of a subquery may read the enclosing query's columns, as `c.id` above, and so may a recursive one. Such a statement is answered where the statement is prepared, as described in [Prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries); in a statement those rules leave out, such as one whose `LIMIT` is computed, a CTE that reads the enclosing query fails with `column not found`.
+
 ## CTEs with Joins
 
 CTEs work seamlessly with JOIN operations. A CTE on a join side is joined as a derived table would be: `USING` and `NATURAL` join on the shared columns, `*` lists the sides in the order the query names them, and a table on the other side is probed by its primary key or index:
@@ -296,6 +309,7 @@ Stoolap provides comprehensive support for Common Table Expressions (CTEs) with 
 - CTE column aliases with custom names
 - WHERE clauses within CTEs
 - CTEs in subqueries (IN, NOT IN, EXISTS, NOT EXISTS, scalar subqueries)
+- A `WITH` of a subquery's or a derived table's own, read by that query alone
 - CTEs as table sources in JOINs
 - Aggregate functions on CTEs (MIN, MAX, COUNT, SUM, AVG)
 - HAVING clauses with aggregate functions
