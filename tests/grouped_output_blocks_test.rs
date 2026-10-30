@@ -26,8 +26,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    aggregate_paths_taken, before_grouped_table_opened, general_path_hits, reset_aggregate_paths,
-    GeneralPath,
+    aggregate_paths_taken, before_grouped_table_opened, general_path_hits, general_path_total,
+    reset_aggregate_paths, GeneralPath,
 };
 use stoolap::Database;
 
@@ -788,24 +788,6 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
             "an ORDER BY holding a subquery",
         ),
         (
-            "SELECT a, RANDOM() AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
-             ORDER BY (SELECT MIN(u.x) FROM u) + g",
-            "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
-        ),
-        // A nested statement's DISTINCT ON reads the volatile alias too
-        (
-            "SELECT DISTINCT ON ((SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
-             FROM u ORDER BY u.x LIMIT 1 OFFSET 1)) a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
-             ORDER BY a",
-            "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
-        ),
-        (
-            "SELECT a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
-             ORDER BY (SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
-             FROM u ORDER BY u.x LIMIT 1 OFFSET 1), 1",
-            "an ORDER BY or DISTINCT ON subquery key naming a SELECT alias of a subquery or a volatile item",
-        ),
-        (
             "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
             "a subquery outside WHERE and the subquery blocks",
         ),
@@ -816,6 +798,46 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn a_grouped_key_reading_an_alias_of_a_volatile_item_runs_on_the_general_path() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_volatile_alias").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a, RANDOM() AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+         ORDER BY (SELECT MIN(u.x) FROM u) + g",
+        "SELECT DISTINCT ON ((SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
+         FROM u ORDER BY u.x LIMIT 1 OFFSET 1)) a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
+         ORDER BY a",
+        "SELECT a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
+         ORDER BY (SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
+         FROM u ORDER BY u.x LIMIT 1 OFFSET 1), 1",
+    ] {
+        let before = general_path_total();
+        let _ = rows(&db, sql);
+        assert!(general_path_total() > before, "{sql} ran prepared");
+    }
+    // A column of the subquery's own table of the alias's name is no alias
+    let sql = "SELECT a, SUM(b) AS z, RANDOM() AS x FROM t GROUP BY a \
+               ORDER BY (SELECT DISTINCT ON (u.x) z FROM u LIMIT 1), a";
+    let twin = "SELECT a, SUM(b) AS z, RANDOM() AS x FROM t GROUP BY a ORDER BY z, a";
+    let before = general_path_total();
+    let got = rows(&db, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert_eq!(
+        general_path_total(),
+        before,
+        "{sql} ran on the general path"
+    );
+    // Each row without its volatile column
+    let shown = |rows: Vec<String>| -> Vec<String> {
+        rows.iter()
+            .map(|row| row.rsplit_once('|').map_or(row.as_str(), |(kept, _)| kept))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(shown(got), shown(rows(&db, twin).unwrap()), "{sql}");
 }
 
 #[test]
