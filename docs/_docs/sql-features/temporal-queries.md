@@ -138,7 +138,7 @@ This feature enables powerful use cases:
 
 4. **Deletion Handling**: Deleted rows are properly handled - if a row was deleted before the AS OF point, it won't appear in the results.
 
-5. **Columns**: Each version is read whole, so a query answers the columns it names, in any order and with or without a `WHERE`, as the row held them at that point. A column added after a version was written reads as NULL in it.
+5. **Columns**: Each version is read whole, so a query answers the columns it names, in any order and with or without a `WHERE`, as the row held them at that point. A column added after a version was written reads in it as the column's default, or NULL when it has none.
 
 ## Important Notes
 
