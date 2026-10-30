@@ -443,7 +443,7 @@ fn a_commit_failing_on_a_unique_key_keeps_its_removed_key_readable_across_the_ro
             assert!(done.recv_timeout(WAIT).unwrap(), "the commit failed");
         });
     });
-    let seen = ids(&db, "SELECT id FROM x WHERE u = 20");
+    let seen = ids(&db, "SELECT id FROM x WHERE u IN (20)");
     writer.join().unwrap();
     assert_eq!(seen, [2], "the row the view sees under its key");
 }
