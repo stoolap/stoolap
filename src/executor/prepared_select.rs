@@ -917,8 +917,9 @@ pub(crate) fn first_branch_of(stmt: &SelectStatement) -> std::borrow::Cow<'_, Se
 }
 
 /// A set operation whose ORDER BY holds a subquery, as the statement that
-/// orders and limits its rows read as a derived table, whose columns the keys read
-pub(crate) fn set_operation_ordered(stmt: &SelectStatement) -> Option<SelectStatement> {
+/// orders and limits its rows read as a derived table, whose columns the keys
+/// read; any other statement as it is
+pub(crate) fn set_operation_ordered(stmt: SelectStatement) -> SelectStatement {
     if stmt.set_operations.is_empty()
         || !stmt.distinct_on.is_empty()
         || !stmt
@@ -926,29 +927,28 @@ pub(crate) fn set_operation_ordered(stmt: &SelectStatement) -> Option<SelectStat
             .iter()
             .any(|ob| mentions_subquery(&ob.expression))
     {
-        return None;
+        return stmt;
     }
-    let rows = SelectStatement {
-        param_count: 0,
-        with: None,
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        prepared: None,
-        ..stmt.clone()
-    };
-    Some(SelectStatement {
-        token: stmt.token.clone(),
-        param_count: stmt.param_count,
+    let mut rows = stmt;
+    let order_by = std::mem::take(&mut rows.order_by);
+    let limit = rows.limit.take();
+    let offset = rows.offset.take();
+    let with = rows.with.take();
+    let param_count = std::mem::take(&mut rows.param_count);
+    let prepared = rows.prepared.take();
+    let token = rows.token.clone();
+    SelectStatement {
+        token: token.clone(),
+        param_count,
         distinct: false,
         distinct_on: Vec::new(),
         columns: vec![Expression::Star(StarExpression {
-            token: stmt.token.clone(),
+            token: token.clone(),
         })],
-        with: stmt.with.clone(),
+        with,
         table_expr: Some(Box::new(Expression::SubquerySource(Box::new(
             SubqueryTableSource {
-                token: stmt.token.clone(),
+                token,
                 subquery: Box::new(rows),
                 alias: None,
             },
@@ -957,12 +957,12 @@ pub(crate) fn set_operation_ordered(stmt: &SelectStatement) -> Option<SelectStat
         group_by: GroupByClause::default(),
         having: None,
         window_defs: Vec::new(),
-        order_by: stmt.order_by.clone(),
-        limit: stmt.limit.clone(),
-        offset: stmt.offset.clone(),
+        order_by,
+        limit,
+        offset,
         set_operations: Vec::new(),
-        prepared: stmt.prepared,
-    })
+        prepared,
+    }
 }
 
 /// A statement of the family's clauses: its WITH runs before it, as its own
@@ -1529,13 +1529,15 @@ impl ScopeTable {
         spelled: &dyn std::fmt::Display,
     ) -> Result<()> {
         match rest.into_iter().any(|i| self.lower[i] == name) {
-            true => Err(Error::invalid_argument(format!(
-                "column reference '{}' is ambiguous",
-                spelled
-            ))),
+            true => Err(ambiguous_column(spelled)),
             false => Ok(()),
         }
     }
+}
+
+/// The refusal of a name two columns carry
+pub(crate) fn ambiguous_column(spelled: &dyn std::fmt::Display) -> Error {
+    Error::invalid_argument(format!("column reference '{}' is ambiguous", spelled))
 }
 
 /// What an expression reads, one bit per scope of the chain: bit 0 the

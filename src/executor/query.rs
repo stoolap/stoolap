@@ -461,7 +461,7 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    joined_aliases, set_operation_ordered, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
+    ambiguous_column, joined_aliases, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -1596,10 +1596,6 @@ impl Executor {
         // Check for cancellation at entry point
         ctx.check_cancelled()?;
 
-        if let Some(ordered) = set_operation_ordered(stmt) {
-            return self.execute_select_with_plan(&ordered, ctx, None, compiled, counts);
-        }
-
         // Validate: aggregate functions are not allowed in WHERE clause
         if let Some(ref where_clause) = stmt.where_clause {
             if expression_contains_aggregate(where_clause) {
@@ -2020,6 +2016,24 @@ impl Executor {
         // A DISTINCT ON key reads only where the first branch put its items,
         // which a set operation's rows keep
         let item_layout = layout.as_deref();
+        // A name two of a set operation's columns carry is ambiguous, as in a derived table
+        if !stmt.set_operations.is_empty() {
+            let shown = &columns[..expected_columns.min(columns.len())];
+            let mut twice = None;
+            for ob in &stmt.order_by {
+                visit_column_refs(&ob.expression, &mut |column| {
+                    if let Expression::Identifier(id) = column {
+                        let named = shown.iter().filter(|c| eq_folded(c, &id.value_lower));
+                        if twice.is_none() && named.count() > 1 {
+                            twice = Some(id);
+                        }
+                    }
+                });
+            }
+            if let Some(id) = twice {
+                return Err(ambiguous_column(&id.value));
+            }
+        }
         if !stmt.order_by.is_empty() && !limit_offset_applied {
             // A set operation's rows come from other branches too: there a
             // column stands for a sort key only when aliased or an aggregate,

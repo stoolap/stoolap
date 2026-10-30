@@ -109,6 +109,15 @@ ORDER BY salary DESC
 LIMIT 10;
 ```
 
+An ORDER BY key reads the combined result's columns by the names the first query gives them, or by position. A name that two of those columns carry, compared without regard to case, is an error, `column reference 'a' is ambiguous`; sort by position instead:
+
+```sql
+SELECT a, b AS a FROM t UNION SELECT x, y FROM u ORDER BY a;  -- error: ambiguous
+SELECT a, b AS a FROM t UNION SELECT x, y FROM u ORDER BY 2;  -- sorts by the second column
+```
+
+A key may hold a subquery, which reads those columns by name too, as in `ORDER BY (SELECT COUNT(*) FROM v WHERE v.k <= salary)`.
+
 ## With WHERE Clauses
 
 Each SELECT in a set operation can have its own WHERE clause:

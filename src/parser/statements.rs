@@ -293,7 +293,9 @@ impl Parser<'_> {
         }
 
         self.current_clause = "";
-        Some(stmt)
+        Some(crate::executor::prepared_select::set_operation_ordered(
+            stmt,
+        ))
     }
 
     /// Parse a set operation (UNION, INTERSECT, EXCEPT)

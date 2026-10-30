@@ -3113,6 +3113,95 @@ fn test_a_set_operation_s_order_by_subquery_reads_the_whole_one_s_columns() {
 }
 
 #[test]
+fn test_a_set_operation_s_order_by_subquery_reads_an_enclosing_table_of_a_branch_s_name() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_outer") {
+        let sql = "SELECT id FROM t WHERE k IN (SELECT k FROM t UNION SELECT k FROM u \
+                   ORDER BY (SELECT ABS(k - t.a / 10)), 1 LIMIT 1) ORDER BY id";
+        assert_eq!(ids(&db, sql, ()).0, vec![3], "{sql}");
+        let sql = "SELECT id, (SELECT k FROM t UNION SELECT k FROM u \
+                   ORDER BY (SELECT ABS(k - t.a / 10)), 1 LIMIT 1) FROM t ORDER BY id";
+        let got: Vec<i64> = db
+            .query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| row.unwrap().get::<i64>(1).unwrap())
+            .collect();
+        assert_eq!(got, vec![3, 1, 1, 2, 1], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by() {
+    let _guard = serial();
+    const DUP: &str = "SELECT a, k AS a FROM t UNION SELECT k, v FROM u";
+    for (db, _dir) in alias_key_tables("prepared_set_operation_order_ambiguous") {
+        for sql in [
+            format!("{DUP} ORDER BY a"),
+            format!("{DUP} ORDER BY a + 0 DESC"),
+            format!("{DUP} ORDER BY (SELECT a)"),
+            format!("{DUP} ORDER BY a, (SELECT 1)"),
+            "SELECT id AS a, k AS A FROM t UNION ALL SELECT k, v FROM u ORDER BY a".to_string(),
+            "WITH c AS (SELECT k, v FROM u) SELECT a, k AS a FROM t UNION SELECT k, v FROM c \
+             ORDER BY a"
+                .to_string(),
+            format!("SELECT * FROM ({DUP} ORDER BY a LIMIT 2) s"),
+            format!("SELECT (SELECT COUNT(*) FROM ({DUP} ORDER BY a) s)"),
+            format!("EXPLAIN ANALYZE {DUP} ORDER BY a"),
+        ] {
+            assert_eq!(
+                error(&db, &sql, ()).0,
+                "invalid argument: column reference 'a' is ambiguous",
+                "{sql}"
+            );
+        }
+        let prepared = db.prepare(&format!("{DUP} ORDER BY a LIMIT $1")).unwrap();
+        let err = prepared
+            .query((2,))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: column reference 'a' is ambiguous"
+        );
+        let pairs = |sql: &str| -> Vec<(Option<i64>, Option<i64>)> {
+            db.query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| {
+                    let row = row.unwrap();
+                    (row.get(0).unwrap(), row.get(1).unwrap())
+                })
+                .collect()
+        };
+        assert_eq!(
+            pairs(&format!("{DUP} ORDER BY 1, 2")),
+            [
+                (Some(1), Some(5)),
+                (Some(1), None),
+                (Some(2), Some(7)),
+                (Some(4), Some(1)),
+                (Some(10), Some(2)),
+                (Some(20), Some(3)),
+                (Some(30), Some(1)),
+                (None, Some(1)),
+            ]
+        );
+        assert_eq!(
+            pairs(&format!("{DUP} ORDER BY 2 DESC, (SELECT 1), 1")),
+            [
+                (Some(1), None),
+                (Some(2), Some(7)),
+                (Some(1), Some(5)),
+                (Some(20), Some(3)),
+                (Some(10), Some(2)),
+                (Some(4), Some(1)),
+                (Some(30), Some(1)),
+                (None, Some(1)),
+            ]
+        );
+    }
+}
+
+#[test]
 fn test_an_uncorrelated_order_by_key_repeating_a_select_item_runs_once() {
     let _guard = serial();
     let db = setup("prepared_order_by_repeated_slot");
