@@ -16,10 +16,9 @@
 //!
 //! This module defines the token types used by the SQL lexer and parser.
 
+use crate::common::smart_string::MAX_INLINE_LEN;
 use crate::common::SmartString;
-use rustc_hash::FxHashSet;
 use std::fmt;
-use std::sync::LazyLock;
 
 /// Position represents a position in the input source
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -149,9 +148,18 @@ impl Token {
     /// Create a keyword token, spelled in upper case
     #[inline]
     pub fn from_keyword(keyword: Keyword, position: Position) -> Self {
+        let text = keyword.as_str();
+        let literal = match text.len() {
+            len if len <= MAX_INLINE_LEN => {
+                let mut data = [0; MAX_INLINE_LEN];
+                data.copy_from_slice(&SPELLINGS[keyword as usize][..MAX_INLINE_LEN]);
+                SmartString::inline_bytes(data, len)
+            }
+            _ => SmartString::new(text),
+        };
         Self {
             token_type: TokenType::Keyword,
-            literal: SmartString::new(keyword.as_str()),
+            literal,
             position,
             quoted: false,
             keyword: Some(keyword),
@@ -442,22 +450,82 @@ const fn keyword_bucket(word: &[u8]) -> usize {
     word.len() * 32 + (word[0] & 31) as usize
 }
 
-/// Keywords by bucket, built at compile time, so a lookup compares a few
-/// candidates in place
-static KEYWORD_BUCKETS: [[Option<Keyword>; KEYWORD_BUCKET_WIDTH]; (KEYWORD_MAX_LEN + 1) * 32] = {
-    let mut buckets = [[None; KEYWORD_BUCKET_WIDTH]; (KEYWORD_MAX_LEN + 1) * 32];
+/// Keywords by bucket, each with its spelling packed as `packed_upper`
+/// packs a word, built at compile time, so a lookup compares a few numbers
+static KEYWORD_BUCKETS: [[(u128, Option<Keyword>); KEYWORD_BUCKET_WIDTH];
+    (KEYWORD_MAX_LEN + 1) * 32] = {
+    let mut buckets = [[(0, None); KEYWORD_BUCKET_WIDTH]; (KEYWORD_MAX_LEN + 1) * 32];
     let mut i = 0;
     while i < Keyword::ALL.len() {
         let keyword = Keyword::ALL[i];
         let bucket = keyword_bucket(keyword.as_str().as_bytes());
         let mut slot = 0;
-        while buckets[bucket][slot].is_some() {
+        while buckets[bucket][slot].1.is_some() {
             slot += 1;
         }
-        buckets[bucket][slot] = Some(keyword);
+        buckets[bucket][slot] = (u128::from_le_bytes(SPELLINGS[i]), Some(keyword));
         i += 1;
     }
     buckets
+};
+
+/// The ASCII letters of the eight bytes of `x` in upper case, every other
+/// byte as it is
+#[inline]
+const fn upper8(x: u64) -> u64 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = ONES * 0x80;
+    // Below 0x80, a byte gains its high bit from b'a' on, and again past b'z'
+    let low = x & !HIGH;
+    let from_a = low + ONES * (0x80 - b'a' as u64);
+    let past_z = low + ONES * (0x80 - b'z' as u64 - 1);
+    x - ((from_a & !past_z & !x & HIGH) >> 2)
+}
+
+/// `bytes`, 1 to 16 of them, little-endian in a number and zero past their
+/// end, their ASCII letters in upper case; read in at most four loads
+#[inline]
+fn packed_upper(bytes: &[u8]) -> u128 {
+    let len = bytes.len();
+    let load = |at: usize, width: usize| {
+        let mut word = [0; 8];
+        word[..width].copy_from_slice(&bytes[at..at + width]);
+        u64::from_le_bytes(word)
+    };
+    let (low, high) = match len {
+        8.. => (
+            load(0, 8),
+            (load(len - 8, 8) >> (8 * (8 - (len - 8)) % 64)) * u64::from(len > 8),
+        ),
+        4.. => (
+            load(0, 4) | ((load(len - 4, 4) >> (8 * (8 - len))) << 32),
+            0,
+        ),
+        _ => (
+            bytes
+                .iter()
+                .rev()
+                .fold(0, |word, b| word << 8 | u64::from(*b)),
+            0,
+        ),
+    };
+    u128::from(upper8(high)) << 64 | u128::from(upper8(low))
+}
+
+/// Each keyword's upper-case spelling, by keyword, zero past its end
+static SPELLINGS: [[u8; KEYWORD_MAX_LEN]; Keyword::ALL.len()] = {
+    let mut spellings = [[0; KEYWORD_MAX_LEN]; Keyword::ALL.len()];
+    let mut i = 0;
+    while i < Keyword::ALL.len() {
+        let text = Keyword::ALL[i].as_str().as_bytes();
+        let mut j = 0;
+        while j < text.len() {
+            spellings[i][j] = text[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    spellings
 };
 
 /// The keyword `word` spells, in any letter case
@@ -467,37 +535,57 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
     if bytes.is_empty() || bytes.len() > KEYWORD_MAX_LEN {
         return None;
     }
-    KEYWORD_BUCKETS[keyword_bucket(bytes)]
-        .iter()
-        .map_while(|keyword| *keyword)
-        .find(|keyword| keyword.as_str().as_bytes().eq_ignore_ascii_case(bytes))
+    let word = packed_upper(bytes);
+    for &(spelled, keyword) in &KEYWORD_BUCKETS[keyword_bucket(bytes)] {
+        match keyword {
+            Some(keyword) if spelled == word => return Some(keyword),
+            Some(_) => {}
+            None => return None,
+        }
+    }
+    None
 }
 
-/// SQL operators
+/// SQL operators, the ones `spells_operator` matches
 pub static OPERATORS: &[&str] = &[
-    "=", ">", "<", ">=", "<=", "<>", "!=", "+", "-", "*", "/", "%",
-    "||", // String concatenation
-    "->", "->>", // JSON operators
-    "#>", "#>>", // JSON path operators
-    "@>", "<@", // JSON contains
-    "?", "?|", "?&", // JSON exists
-    "&", "|", "^", "~", "<<", ">>",  // Bitwise operators
-    "<=>", // Vector distance operator
+    "=", ">", "<", ">=", "<=", "<>", "!=", "+", "-", "*", "/", "%", "||", "->", "->>", "#>", "#>>",
+    "@>", "<@", "?", "?|", "?&", "&", "|", "^", "~", "<<", ">>", "<=>",
 ];
 
-/// Compiled operator set for O(1) lookups
-static OPERATOR_SET: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
-    let mut set = FxHashSet::with_capacity_and_hasher(OPERATORS.len(), Default::default());
-    for op in OPERATORS {
-        set.insert(*op);
+/// Whether `bytes` spell an SQL operator
+#[inline]
+fn spells_operator(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"=" | b">" | b"<" | b">=" | b"<=" | b"<>" | b"!=" | b"+" | b"-" | b"*" | b"/" | b"%"
+            // String concatenation
+            | b"||"
+            // JSON operators, paths, containment and existence
+            | b"->" | b"->>" | b"#>" | b"#>>" | b"@>" | b"<@" | b"?" | b"?|" | b"?&"
+            // Bitwise operators
+            | b"&" | b"|" | b"^" | b"~" | b"<<" | b">>"
+            // Vector distance operator
+            | b"<=>"
+    )
+}
+
+/// How many bytes of the operator `bytes` start with, read greedily: three
+/// when their first two and three spell operators, two when their first two
+/// do, one when their first does, else none
+#[inline]
+pub fn operator_len(bytes: &[u8]) -> usize {
+    let spells = |len: usize| bytes.len() >= len && spells_operator(&bytes[..len]);
+    match (spells(2), spells(3)) {
+        (true, true) => 3,
+        (true, false) => 2,
+        _ => usize::from(spells(1)),
     }
-    set
-});
+}
 
 /// Check if a string is an SQL operator
 #[inline]
 pub fn is_operator(s: &str) -> bool {
-    OPERATOR_SET.contains(s)
+    spells_operator(s.as_bytes())
 }
 
 /// SQL punctuators
@@ -556,6 +644,78 @@ mod tests {
     fn test_position_display() {
         let pos = Position::new(10, 2, 5);
         assert_eq!(pos.to_string(), "line 2, column 5");
+    }
+
+    #[test]
+    fn test_every_keyword_looks_up_in_any_case_and_no_near_word_does() {
+        for keyword in Keyword::ALL {
+            let text = keyword.as_str();
+            let mixed: String = text
+                .chars()
+                .enumerate()
+                .map(|(i, c)| match i % 2 {
+                    0 => c.to_ascii_lowercase(),
+                    _ => c,
+                })
+                .collect();
+            for spelled in [text.to_string(), text.to_ascii_lowercase(), mixed] {
+                assert_eq!(lookup_keyword(&spelled), Some(*keyword), "{spelled}");
+            }
+            let near = [
+                text[..text.len() - 1].to_string(),
+                format!("{text}X"),
+                format!("{}Q", &text[..text.len() - 1]),
+                format!("{text}é"),
+            ];
+            for word in near {
+                assert!(
+                    lookup_keyword(&word).is_none_or(|found| found.as_str() == word),
+                    "{word} looked up as a keyword"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_word_packs_its_bytes_in_order_in_upper_case() {
+        let text = "abcdefghijklmnop";
+        for len in 1..=16 {
+            let word = &text[..len];
+            let mut want = [0u8; 16];
+            want[..len].copy_from_slice(word.to_ascii_uppercase().as_bytes());
+            assert_eq!(
+                packed_upper(word.as_bytes()),
+                u128::from_le_bytes(want),
+                "{word}"
+            );
+        }
+        assert_eq!(
+            packed_upper("a_Z{@`".as_bytes()),
+            u128::from_le_bytes(*b"A_Z{@`\0\0\0\0\0\0\0\0\0\0")
+        );
+    }
+
+    #[test]
+    fn test_the_operator_match_spells_the_operators_listed() {
+        let chars = "=<>!+-*/%|&^~?@#:".as_bytes();
+        let mut spelled = Vec::new();
+        for len in 1..=3 {
+            let mut word = vec![0; len];
+            for code in 0..chars.len().pow(len as u32) {
+                let mut code = code;
+                for byte in word.iter_mut() {
+                    *byte = chars[code % chars.len()];
+                    code /= chars.len();
+                }
+                if spells_operator(&word) {
+                    spelled.push(String::from_utf8(word.clone()).unwrap());
+                }
+            }
+        }
+        let mut listed: Vec<String> = OPERATORS.iter().map(|s| s.to_string()).collect();
+        spelled.sort();
+        listed.sort();
+        assert_eq!(spelled, listed);
     }
 
     #[test]

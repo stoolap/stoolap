@@ -56,6 +56,27 @@ use std::sync::Arc;
 /// Maximum inline string length (15 bytes)
 pub const MAX_INLINE_LEN: usize = 15;
 
+/// An inline buffer holding `bytes`, at most 15 of them, the rest zero:
+/// two overlapping fixed-size copies, or three bytes, and no call to copy
+#[inline(always)]
+fn inline_data(bytes: &[u8]) -> [u8; MAX_INLINE_LEN] {
+    let mut data = [0u8; MAX_INLINE_LEN];
+    let len = bytes.len();
+    debug_assert!(len <= MAX_INLINE_LEN);
+    if len >= 8 {
+        data[..8].copy_from_slice(&bytes[..8]);
+        data[len - 8..len].copy_from_slice(&bytes[len - 8..]);
+    } else if len >= 4 {
+        data[..4].copy_from_slice(&bytes[..4]);
+        data[len - 4..len].copy_from_slice(&bytes[len - 4..]);
+    } else if len > 0 {
+        data[0] = bytes[0];
+        data[len / 2] = bytes[len / 2];
+        data[len - 1] = bytes[len - 1];
+    }
+    data
+}
+
 /// Bytes of a heap block before the string: its reference count
 const HEADER: usize = std::mem::size_of::<AtomicUsize>();
 
@@ -181,14 +202,21 @@ impl SmartString {
     pub fn new(s: &str) -> Self {
         let len = s.len();
         if len <= MAX_INLINE_LEN {
-            let mut data = [0u8; 15];
-            data[..len].copy_from_slice(s.as_bytes());
             SmartString {
                 tag: StringTag::inline(len),
-                data,
+                data: inline_data(s.as_bytes()),
             }
         } else {
             Self::new_heap(s)
+        }
+    }
+
+    /// An inline string of the first `len` bytes of `data`, the rest zero
+    #[inline]
+    pub(crate) const fn inline_bytes(data: [u8; MAX_INLINE_LEN], len: usize) -> Self {
+        SmartString {
+            tag: StringTag::inline(len),
+            data,
         }
     }
 

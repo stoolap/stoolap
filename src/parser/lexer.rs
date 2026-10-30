@@ -17,121 +17,156 @@
 //! This module provides the lexer for tokenizing SQL input strings.
 
 use super::token::{
-    is_operator, is_operator_char, is_punctuator, lookup_keyword, punctuator_str, Position, Token,
-    TokenType,
+    is_operator_char, lookup_keyword, operator_len, punctuator_str, Position, Token, TokenType,
 };
 use crate::common::SmartString;
 
 /// SQL Lexer for tokenizing input
 ///
-/// Uses byte-based indexing for efficiency. SQL is predominantly ASCII,
-/// so we can work with bytes directly and only decode UTF-8 when needed.
+/// Reads the input as bytes: every byte SQL gives a meaning is ASCII, so a
+/// character is decoded only where a non-ASCII byte is met
 pub struct Lexer<'a> {
     /// Input string as bytes, borrowed from the caller
     input: &'a [u8],
-    /// Current byte position in input
-    position: usize,
-    /// Next byte position in input (after current char)
-    read_position: usize,
-    /// Current character under examination
-    ch: char,
-    /// Current position tracking
-    pos: Position,
+    /// The byte the next token or character starts at
+    at: usize,
+    /// The line `at` is on, starting at 1
+    line: u32,
+    /// The byte the line starts at
+    line_start: usize,
+    /// The bytes between `line_start` and `at` that continue a character
+    continuing: usize,
     /// Last error encountered
     last_error: Option<String>,
+}
+
+/// A byte of an identifier: an ASCII letter, digit, `_` or `$`
+const WORD: u8 = 1;
+/// An ASCII digit
+const DIGIT: u8 = 2;
+
+/// The classes of each byte
+static BYTE_CLASS: [u8; 256] = {
+    let mut classes = [0; 256];
+    let mut b = 0;
+    while b < 256 {
+        let byte = b as u8;
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+            classes[b] |= WORD;
+        }
+        if byte.is_ascii_digit() {
+            classes[b] |= DIGIT;
+        }
+        b += 1;
+    }
+    classes
+};
+
+/// Lexer state saved for a peek
+#[derive(Clone, Copy)]
+struct Mark {
+    at: usize,
+    line: u32,
+    line_start: usize,
+    continuing: usize,
 }
 
 impl<'a> Lexer<'a> {
     /// Create a new lexer for the given input
     pub fn new(input: &'a str) -> Self {
-        let mut lexer = Self {
+        Self {
             input: input.as_bytes(),
-            position: 0,
-            read_position: 0,
-            ch: '\0',
-            pos: Position::new(0, 1, 1),
+            at: 0,
+            line: 1,
+            line_start: 0,
+            continuing: 0,
             last_error: None,
-        };
-        lexer.read_char();
-        lexer
+        }
     }
 
-    /// Decode UTF-8 character at given byte position
-    /// Returns (char, byte_length)
+    /// The byte at `i`, NUL past the end
     #[inline]
-    fn decode_char_at(&self, pos: usize) -> (char, usize) {
-        if pos >= self.input.len() {
-            return ('\0', 0);
-        }
+    fn byte(&self, i: usize) -> u8 {
+        self.input.get(i).copied().unwrap_or(0)
+    }
 
-        let b = self.input[pos];
-
-        // Fast path: ASCII (most common in SQL)
-        if b < 0x80 {
-            return (b as char, 1);
-        }
-
-        // Slow path: multi-byte UTF-8
-        let remaining = &self.input[pos..];
-        match std::str::from_utf8(remaining) {
-            Ok(s) => {
-                if let Some(c) = s.chars().next() {
-                    (c, c.len_utf8())
-                } else {
-                    ('\0', 0)
-                }
-            }
-            Err(_) => {
-                // Invalid UTF-8, treat as replacement character
-                ('\u{FFFD}', 1)
+    /// The character at byte `i` and its length, NUL past the end; read
+    /// only where a byte is not ASCII, so kept out of the hot paths
+    #[inline(never)]
+    fn char_at(&self, i: usize) -> (char, usize) {
+        match self.input.get(i) {
+            None => ('\0', 0),
+            Some(&b) if b < 0x80 => (char::from(b), 1),
+            Some(_) => {
+                let rest = self.text(i, self.input.len());
+                rest.chars().next().map_or(('\0', 0), |c| (c, c.len_utf8()))
             }
         }
+    }
+
+    /// The position of the byte `at`
+    #[inline]
+    fn position(&self) -> Position {
+        let column = self.at - self.line_start - self.continuing + 1;
+        Position::new(
+            u32::try_from(self.at).unwrap_or(u32::MAX),
+            self.line,
+            u32::try_from(column).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Step past `len` bytes of one character that is not a newline
+    #[inline]
+    fn step(&mut self, len: usize) {
+        self.at += len;
+        self.continuing += len - 1;
+    }
+
+    /// Step past one byte of any kind, counting a newline or a byte that
+    /// continues a character
+    #[inline]
+    fn step_byte(&mut self) {
+        match self.input[self.at] {
+            b'\n' => {
+                self.line = self.line.saturating_add(1);
+                self.line_start = self.at + 1;
+                self.continuing = 0;
+            }
+            b if b & 0xC0 == 0x80 => self.continuing += 1,
+            _ => {}
+        }
+        self.at += 1;
+    }
+
+    /// Step to byte `end` past every byte before it, see [`Self::step_byte`]
+    fn step_to(&mut self, end: usize) {
+        while self.at < end {
+            self.step_byte();
+        }
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            at: self.at,
+            line: self.line,
+            line_start: self.line_start,
+            continuing: self.continuing,
+        }
+    }
+
+    fn reset(&mut self, mark: Mark) {
+        (self.at, self.line, self.line_start, self.continuing) =
+            (mark.at, mark.line, mark.line_start, mark.continuing);
     }
 
     /// The byte offset just past the last token read
     pub(crate) fn offset(&self) -> usize {
-        self.position
+        self.at
     }
 
-    /// Read the next character
-    fn read_char(&mut self) {
-        // Update position before changing character
-        if self.ch == '\n' {
-            self.pos.line = self.pos.line.saturating_add(1);
-            self.pos.column = 1;
-        } else if self.ch != '\0' {
-            self.pos.column = self.pos.column.saturating_add(1);
-        }
-
-        if self.read_position >= self.input.len() {
-            self.ch = '\0'; // EOF
-            self.position = self.read_position;
-        } else {
-            let (ch, len) = self.decode_char_at(self.read_position);
-            self.ch = ch;
-            self.position = self.read_position;
-            self.read_position += len;
-        }
-
-        self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
-    }
-
-    /// Peek at the next character without advancing
-    #[inline]
-    fn peek_char(&self) -> char {
-        self.decode_char_at(self.read_position).0
-    }
-
-    /// The token that started at byte `start` and ends at the current char.
-    ///
-    /// Every reader below advances only through `read_char`, so `position`
-    /// is the first byte of the character that ended the token and the bytes
-    /// in between are the token, decoded once. Pushing char by char into a
-    /// `SmartString` re-allocated and re-copied the whole token on every
-    /// character past its inline buffer, which made a 400-character comment
-    /// cost more than ten short queries.
+    /// The token text from byte `start` to `at`, copied once
     fn token_since(&self, start: usize) -> SmartString {
-        SmartString::new(self.text(start, self.position))
+        SmartString::new(self.text(start, self.at))
     }
 
     /// The input from byte `start` to byte `end`, both the first byte of a char
@@ -145,13 +180,15 @@ impl<'a> Lexer<'a> {
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace();
 
-        let pos = self.pos;
+        let pos = self.position();
+        let next = self.byte(self.at + 1);
 
-        match self.ch {
-            '\0' => Token::eof(pos),
+        match self.byte(self.at) {
+            // The end, or a NUL, which ends the input wherever it stands
+            0 => Token::eof(pos),
 
             // String literal (single quotes)
-            '\'' => {
+            b'\'' => {
                 let literal = self.read_string_literal();
                 if let Some(err) = self.last_error.take() {
                     return Token::error(err, "", pos);
@@ -160,8 +197,8 @@ impl<'a> Lexer<'a> {
             }
 
             // Double-quoted identifier (identifier with string fallback)
-            '"' => {
-                let literal = self.read_quoted_identifier('"');
+            b'"' => {
+                let literal = self.read_quoted_identifier(b'"');
                 if let Some(err) = self.last_error.take() {
                     return Token::error(err, "", pos);
                 }
@@ -169,8 +206,8 @@ impl<'a> Lexer<'a> {
             }
 
             // Backtick-quoted identifier (MySQL style)
-            '`' => {
-                let literal = self.read_quoted_identifier('`');
+            b'`' => {
+                let literal = self.read_quoted_identifier(b'`');
                 if let Some(err) = self.last_error.take() {
                     return Token::error(err, "", pos);
                 }
@@ -180,287 +217,243 @@ impl<'a> Lexer<'a> {
             // Negative numbers: parser handles unary minus, not the lexer.
 
             // Number literal
-            c if c.is_ascii_digit() => {
-                let literal = self.read_number();
-                if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-                    Token::new(TokenType::Float, literal, pos)
-                } else {
-                    Token::new(TokenType::Integer, literal, pos)
-                }
-            }
+            b'0'..=b'9' => match self.read_number() {
+                (literal, true) => Token::new(TokenType::Float, literal, pos),
+                (literal, false) => Token::new(TokenType::Integer, literal, pos),
+            },
 
             // Single line comment (#)
-            '#' => {
-                let literal = self.read_line_comment();
+            b'#' => {
+                let literal = self.read_line_comment(1);
                 Token::new(TokenType::Comment, literal, pos)
             }
 
             // Single line comment (--) per SQL standard (SQL:2023 section 5.2)
             // Double negation should be written as `- -val` or `- (-val)`
-            '-' if self.peek_char() == '-' => {
-                let literal = self.read_line_comment();
+            b'-' if next == b'-' => {
+                let literal = self.read_line_comment(2);
                 Token::new(TokenType::Comment, literal, pos)
             }
 
             // Multi-line comment
-            '/' if self.peek_char() == '*' => {
+            b'/' if next == b'*' => {
                 let literal = self.read_block_comment();
                 Token::new(TokenType::Comment, literal, pos)
             }
 
             // Parameter ($1, $2, etc.)
-            '$' if self.peek_char().is_ascii_digit() => {
+            b'$' if next.is_ascii_digit() => {
                 let literal = self.read_parameter();
                 Token::new(TokenType::Parameter, literal, pos)
             }
 
             // Parameter (?)
-            '?' => {
-                self.read_char();
+            b'?' => {
+                self.at += 1;
                 Token::new(TokenType::Parameter, "?", pos)
             }
 
             // Named parameter (:name)
-            ':' if self.peek_char().is_alphabetic() || self.peek_char() == '_' => {
+            b':' if {
+                let (c, _) = self.char_at(self.at + 1);
+                c.is_alphabetic() || c == '_'
+            } =>
+            {
                 let literal = self.read_named_parameter();
                 Token::new(TokenType::Parameter, literal, pos)
             }
 
             // Star is always an operator (SELECT * handled by parser)
-            '*' => {
-                self.read_char();
+            b'*' => {
+                self.at += 1;
                 Token::new(TokenType::Operator, "*", pos)
             }
 
-            // Regular punctuator - use static string to avoid allocation
-            c if is_punctuator(c) => {
-                self.read_char();
-                // SAFETY: We already checked is_punctuator(c), so punctuator_str always returns Some
-                Token::new(TokenType::Punctuator, punctuator_str(c).unwrap(), pos)
-            }
-
-            // Operator
-            c if is_operator_char(c) => {
-                let literal = self.read_operator();
-                Token::new(TokenType::Operator, literal, pos)
-            }
-
-            // Identifier or keyword
-            c if c.is_alphabetic() || c == '_' => {
-                let word = self.read_identifier();
-                match lookup_keyword(word) {
-                    Some(keyword) => Token::from_keyword(keyword, pos),
-                    None => Token::new(TokenType::Identifier, word, pos),
+            b if b < 0x80 => {
+                let c = char::from(b);
+                // Regular punctuator - use static string to avoid allocation
+                if let Some(punctuator) = punctuator_str(c) {
+                    self.at += 1;
+                    return Token::new(TokenType::Punctuator, punctuator, pos);
                 }
+                if is_operator_char(c) {
+                    let start = self.at;
+                    self.at += operator_len(&self.input[start..]).max(1);
+                    return Token::new(TokenType::Operator, self.text(start, self.at), pos);
+                }
+                if c.is_ascii_alphabetic() || c == '_' {
+                    return self.word(pos);
+                }
+                self.at += 1;
+                Self::unrecognized(c, pos)
             }
 
-            // Unrecognized character
-            c => {
-                self.read_char();
-                Token::error(
-                    format!("unrecognized character: {:?}", c),
-                    c.to_string(),
-                    pos,
-                )
-            }
+            // A character of more than one byte: a letter starts a word
+            _ => match self.char_at(self.at) {
+                (c, _) if c.is_alphabetic() => self.word(pos),
+                (c, len) => {
+                    self.step(len);
+                    Self::unrecognized(c, pos)
+                }
+            },
         }
+    }
+
+    /// The identifier or keyword starting at the current byte
+    fn word(&mut self, pos: Position) -> Token {
+        let word = self.read_identifier();
+        match lookup_keyword(word) {
+            Some(keyword) => Token::from_keyword(keyword, pos),
+            None => Token::new(TokenType::Identifier, word, pos),
+        }
+    }
+
+    #[inline(never)]
+    fn unrecognized(c: char, pos: Position) -> Token {
+        Token::error(
+            format!("unrecognized character: {:?}", c),
+            c.to_string(),
+            pos,
+        )
     }
 
     /// Skip whitespace characters
     fn skip_whitespace(&mut self) {
-        while self.ch.is_whitespace() {
-            // Note: read_char() handles line/column tracking when it encounters '\n'
-            // So we don't need to update pos.line here
-            if self.ch == '\r' && self.peek_char() == '\n' {
-                // Skip \r in \r\n sequences (Windows line endings)
-                self.read_char(); // consume '\r'
+        loop {
+            match self.byte(self.at) {
+                b'\n' => self.step_to(self.at + 1),
+                b' ' | b'\t' | b'\r' | 0x0B | 0x0C => self.at += 1,
+                b if b < 0x80 => return,
+                _ => match self.char_at(self.at) {
+                    (c, len) if c.is_whitespace() => self.step(len),
+                    _ => return,
+                },
             }
-            self.read_char();
         }
     }
 
-    /// Read an identifier
-    fn read_identifier(&mut self) -> &'a str {
-        let start = self.position;
-        let ascii = self.input[start..]
+    /// Step past the bytes from `at` that `class` holds
+    #[inline]
+    fn skip_class(&mut self, class: u8) {
+        let rest = &self.input[self.at..];
+        self.at += rest
             .iter()
-            .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
-            .count();
-        if ascii > 0 {
-            self.skip_ascii(start + ascii);
-        } else {
-            self.read_char();
-        }
-
-        while self.ch.is_alphanumeric() || self.ch == '_' || self.ch == '$' {
-            self.read_char();
-        }
-
-        self.text(start, self.position)
+            .position(|&b| BYTE_CLASS[usize::from(b)] & class == 0)
+            .unwrap_or(rest.len());
     }
 
-    /// Move to byte `end` past ASCII chars that are not newlines, from the current one
-    fn skip_ascii(&mut self, end: usize) {
-        debug_assert!(end > self.position && self.input[self.position..end].is_ascii());
-        let before_last = u32::try_from(end - self.position - 1).unwrap_or(u32::MAX);
-        self.pos.column = self.pos.column.saturating_add(before_last);
-        self.ch = char::from(self.input[end - 1]);
-        self.read_position = end;
-        self.read_char();
-    }
-
-    /// Read a number (integer or float)
-    fn read_number(&mut self) -> SmartString {
-        let start = self.position;
-        self.read_char();
-
-        // Read all digits before decimal point
-        while self.ch.is_ascii_digit() {
-            self.read_char();
-        }
-
-        // Check for decimal point
-        if self.ch == '.' && self.peek_char().is_ascii_digit() {
-            self.read_char();
-
-            // Read all digits after decimal point
-            while self.ch.is_ascii_digit() {
-                self.read_char();
+    /// Read an identifier: letters, digits, `_` and `$`
+    fn read_identifier(&mut self) -> &'a str {
+        let start = self.at;
+        loop {
+            self.skip_class(WORD);
+            if self.byte(self.at) < 0x80 {
+                break;
             }
+            match self.char_at(self.at) {
+                (c, len) if c.is_alphanumeric() => self.step(len),
+                _ => break,
+            }
+        }
+        self.text(start, self.at)
+    }
+
+    /// Read a number, and whether it has a decimal point or an exponent
+    fn read_number(&mut self) -> (SmartString, bool) {
+        let start = self.at;
+        self.skip_class(DIGIT);
+        let mut float = false;
+
+        // A decimal point followed by a digit
+        if self.byte(self.at) == b'.' && self.byte(self.at + 1).is_ascii_digit() {
+            self.at += 1;
+            self.skip_class(DIGIT);
+            float = true;
         }
 
         // Check for exponent (E or e)
-        if self.ch == 'e' || self.ch == 'E' {
-            self.read_char();
+        if matches!(self.byte(self.at), b'e' | b'E') {
+            self.at += 1;
+            float = true;
 
             // Check for sign after exponent
-            if self.ch == '+' || self.ch == '-' {
-                self.read_char();
+            if matches!(self.byte(self.at), b'+' | b'-') {
+                self.at += 1;
             }
 
             // Must have at least one digit after exponent
-            if !self.ch.is_ascii_digit() {
+            if !self.byte(self.at).is_ascii_digit() {
                 self.last_error = Some("invalid number format: exponent has no digits".to_string());
-                return self.token_since(start);
+                return (self.token_since(start), float);
             }
-
-            // Read all digits in exponent
-            while self.ch.is_ascii_digit() {
-                self.read_char();
-            }
+            self.skip_class(DIGIT);
         }
 
-        self.token_since(start)
+        (self.token_since(start), float)
     }
 
     /// Read a string literal (single-quoted)
     fn read_string_literal(&mut self) -> SmartString {
-        let quote = self.ch;
-        let quote_byte = quote as u8;
-        let start_pos = self.position; // byte position of opening quote
+        let start = self.at;
 
-        // Fast path: scan raw bytes for closing quote.
-        // If no escape characters found, slice the input directly (zero allocation).
-        // This is safe for UTF-8: quote (0x27/0x22), backslash (0x5C), and NUL (0x00)
-        // are all single-byte ASCII and cannot appear as continuation bytes in multi-byte sequences.
-        let mut scan_pos = self.read_position; // byte after opening quote
-        let input_len = self.input.len();
-        let mut found_escape = false;
+        // Fast path: no doubled quote, backslash or NUL before the closing
+        // quote, so the token is the input's own text, quotes included
+        let mut end = start + 1;
+        loop {
+            match self.byte(end) {
+                b'\'' if self.byte(end + 1) != b'\'' => {
+                    self.step_to(end + 1);
+                    return SmartString::new(self.text(start, end + 1));
+                }
+                b'\'' | b'\\' | 0 => return self.read_escaped_string(start, end),
+                _ => end += 1,
+            }
+        }
+    }
 
-        while scan_pos < input_len {
-            let b = self.input[scan_pos];
-            if b == quote_byte {
-                // Check for doubled quote escape
-                if scan_pos + 1 < input_len && self.input[scan_pos + 1] == quote_byte {
-                    found_escape = true;
+    /// The string literal from byte `start`, whose fast path stopped at byte
+    /// `end`: escapes or edge cases, each run between them copied at once
+    #[inline(never)]
+    fn read_escaped_string(&mut self, start: usize, end: usize) -> SmartString {
+        let mut result = String::with_capacity(end - start + 2);
+        result.push('\'');
+        self.step_to(start + 1);
+        loop {
+            let run = self.at;
+            let mut end = run;
+            while !matches!(self.byte(end), b'\'' | b'\\' | 0) {
+                end += 1;
+            }
+            result.push_str(self.text(run, end));
+            self.step_to(end);
+            match self.byte(self.at) {
+                0 => {
+                    self.last_error = Some(match self.at >= self.input.len() {
+                        true => "unterminated string literal".to_string(),
+                        false => "NULL byte (0x00) is not allowed in string literals".to_string(),
+                    });
+                    result.push('\'');
                     break;
                 }
-                // Found unescaped closing quote — fast path succeeds
-                let end_pos = scan_pos + 1; // one past closing quote
-
-                // Step past each char from the opening quote through the closing one, as read_char does
-                for &byte in &self.input[start_pos..end_pos] {
-                    if byte == b'\n' {
-                        self.pos.line = self.pos.line.saturating_add(1);
-                        self.pos.column = 1;
-                    } else if byte & 0xC0 != 0x80 {
-                        self.pos.column = self.pos.column.saturating_add(1);
+                b'\'' if self.byte(self.at + 1) == b'\'' => {
+                    result.push('\'');
+                    self.at += 2;
+                }
+                b'\'' => {
+                    result.push('\'');
+                    self.at += 1;
+                    break;
+                }
+                // A backslash keeps the character after it, a quote too
+                _ => {
+                    result.push('\\');
+                    self.at += 1;
+                    let (c, len) = self.char_at(self.at);
+                    if c != '\0' {
+                        result.push(c);
+                        self.step_to(self.at + len);
                     }
                 }
-
-                // Advance lexer past closing quote
-                self.position = scan_pos;
-                self.read_position = end_pos;
-                self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
-
-                // Read next char after closing quote
-                if self.read_position >= input_len {
-                    self.ch = '\0';
-                    self.position = self.read_position;
-                } else {
-                    let (ch, len) = self.decode_char_at(self.read_position);
-                    self.ch = ch;
-                    self.position = self.read_position;
-                    self.read_position += len;
-                }
-                self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
-
-                // SAFETY: input was constructed from valid UTF-8 (String/&str).
-                // We only scanned for ASCII bytes, so all byte boundaries are valid.
-                let slice =
-                    unsafe { std::str::from_utf8_unchecked(&self.input[start_pos..end_pos]) };
-                return SmartString::new(slice);
-            } else if b == b'\\' || b == 0 {
-                found_escape = true;
-                break;
-            }
-            scan_pos += 1;
-        }
-
-        if !found_escape && scan_pos >= input_len {
-            // EOF without closing quote — fall through to slow path for error handling
-        }
-
-        // Slow path: escapes or edge cases. Build a String with pre-allocated capacity.
-        let estimated_len = if scan_pos > self.read_position {
-            scan_pos - start_pos + 2
-        } else {
-            32
-        };
-        let mut result = String::with_capacity(estimated_len);
-        result.push(quote);
-        self.read_char(); // consume opening quote
-
-        loop {
-            if self.ch == '\0' {
-                if self.position >= self.input.len() {
-                    self.last_error = Some("unterminated string literal".to_string());
-                } else {
-                    self.last_error =
-                        Some("NULL byte (0x00) is not allowed in string literals".to_string());
-                }
-                result.push(quote);
-                break;
-            } else if self.ch == quote {
-                if self.peek_char() == quote {
-                    result.push(self.ch);
-                    self.read_char();
-                    self.read_char();
-                } else {
-                    result.push(quote);
-                    self.read_char();
-                    break;
-                }
-            } else if self.ch == '\\' {
-                result.push(self.ch);
-                self.read_char();
-                if self.ch != '\0' {
-                    result.push(self.ch);
-                    self.read_char();
-                }
-            } else {
-                result.push(self.ch);
-                self.read_char();
             }
         }
 
@@ -468,48 +461,46 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read a quoted identifier (double quotes or backticks)
-    fn read_quoted_identifier(&mut self, quote: char) -> SmartString {
-        self.read_char(); // consume opening quote
-        let start = self.position;
+    #[inline(never)]
+    fn read_quoted_identifier(&mut self, quote: u8) -> SmartString {
+        self.at += 1; // consume opening quote
+        let start = self.at;
         // Only a doubled quote changes the text, so the body is sliced from the
-        // input unless one turns up, at which point the prefix is copied once
-        // and the rest is appended to that copy.
+        // input unless one turns up; then each run between them is copied once
         let mut unescaped: Option<String> = None;
+        let mut run = start;
 
-        while self.ch != '\0' {
-            // Handle doubled quotes as escape (e.g., "abc""def" -> abc"def)
-            if self.ch == quote && self.peek_char() == quote {
-                let buf = unescaped.get_or_insert_with(|| {
-                    // SAFETY: same char-boundary argument as `token_since`.
-                    unsafe { std::str::from_utf8_unchecked(&self.input[start..self.position]) }
-                        .to_string()
-                });
-                buf.push(quote);
-                self.read_char(); // consume first quote
-                self.read_char(); // consume second quote
-            } else if self.ch == quote {
-                // Found closing quote
-                break;
-            } else {
-                if let Some(buf) = unescaped.as_mut() {
-                    buf.push(self.ch);
+        loop {
+            match self.byte(self.at) {
+                0 => break,
+                // Handle doubled quotes as escape (e.g., "abc""def" -> abc"def)
+                b if b == quote && self.byte(self.at + 1) == quote => {
+                    let buf = unescaped.get_or_insert_with(String::new);
+                    buf.push_str(self.text(run, self.at));
+                    buf.push(char::from(quote));
+                    self.at += 2;
+                    run = self.at;
                 }
-                self.read_char();
+                b if b == quote => break,
+                _ => self.step_byte(),
             }
         }
 
         let result = match unescaped {
-            Some(buf) => SmartString::from_string(buf),
+            Some(mut buf) => {
+                buf.push_str(self.text(run, self.at));
+                SmartString::from_string(buf)
+            }
             None => self.token_since(start),
         };
 
         // Consume closing quote if not EOF
-        if self.ch == quote {
-            self.read_char();
-        } else if self.position >= self.input.len() {
+        if self.byte(self.at) == quote {
+            self.at += 1;
+        } else if self.at >= self.input.len() {
             self.last_error = Some(format!(
                 "unterminated quoted identifier starting with {}",
-                quote
+                char::from(quote)
             ));
         } else {
             // NULL byte encountered
@@ -527,98 +518,62 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read a single-line comment (-- or #)
-    fn read_line_comment(&mut self) -> SmartString {
-        let start = self.position;
-
-        // Skip the start of comment (-- or #)
-        if self.ch == '-' && self.peek_char() == '-' {
-            self.read_char(); // first -
-            self.read_char(); // move past second -
-        } else if self.ch == '#' {
-            self.read_char(); // move past #
+    /// Read a single-line comment (-- or #) whose start is `opening` bytes,
+    /// up to the end of its line
+    #[inline(never)]
+    fn read_line_comment(&mut self, opening: usize) -> SmartString {
+        let start = self.at;
+        self.at += opening;
+        while !matches!(self.byte(self.at), b'\n' | 0) {
+            self.step_byte();
         }
-
-        // Read until end of line or EOF
-        while self.ch != '\n' && self.ch != '\0' {
-            self.read_char();
-        }
-
         self.token_since(start)
     }
 
     /// Read a block comment (/* ... */)
+    #[inline(never)]
     fn read_block_comment(&mut self) -> SmartString {
-        let start = self.position;
-
-        // Skip the opening /* sequence
-        self.read_char(); // /
-        self.read_char(); // *
-
-        // Read until */ or EOF
-        while !(self.ch == '*' && self.peek_char() == '/') && self.ch != '\0' {
-            self.read_char();
-        }
-
-        // Handle closing */
-        if self.ch != '\0' {
-            self.read_char(); // *
-            self.read_char(); // /
-        } else {
-            self.last_error = Some("unterminated block comment".to_string());
-        }
-
-        self.token_since(start)
-    }
-
-    /// Read an operator
-    fn read_operator(&mut self) -> &'a str {
-        let start = self.position;
-        self.read_char();
-
-        // Check for two- and then three-character operators
-        if self.extends_operator(start) {
-            self.read_char();
-            if self.extends_operator(start) {
-                self.read_char();
+        let start = self.at;
+        self.at += 2;
+        loop {
+            match self.byte(self.at) {
+                0 => {
+                    self.last_error = Some("unterminated block comment".to_string());
+                    break;
+                }
+                b'*' if self.byte(self.at + 1) == b'/' => {
+                    self.at += 2;
+                    break;
+                }
+                _ => self.step_byte(),
             }
         }
-
-        self.text(start, self.position)
-    }
-
-    /// Whether the operator read from `start` plus the current char is an operator
-    fn extends_operator(&self, start: usize) -> bool {
-        self.ch != '\0' && is_operator(self.text(start, self.read_position))
+        self.token_since(start)
     }
 
     /// Read a parameter ($1, $2, etc.)
     fn read_parameter(&mut self) -> SmartString {
-        let start = self.position;
-        self.read_char(); // $
-
-        // Read all digits
-        while self.ch.is_ascii_digit() {
-            self.read_char();
-        }
-
-        // Validate parameter has digits
-        if self.position - start == 1 {
-            self.last_error = Some("parameter number expected after $".to_string());
-        }
-
+        let start = self.at;
+        self.at += 1;
+        self.skip_class(DIGIT);
         self.token_since(start)
     }
 
-    /// Read a named parameter (:name)
+    /// Read a named parameter (:name): letters, digits and `_` after the colon
+    #[inline(never)]
     fn read_named_parameter(&mut self) -> SmartString {
-        let start = self.position;
-        self.read_char(); // :
-
-        // Read identifier part (alphanumeric + underscore)
-        while self.ch.is_alphanumeric() || self.ch == '_' {
-            self.read_char();
+        let start = self.at;
+        self.at += 1;
+        loop {
+            match self.byte(self.at) {
+                b if b.is_ascii_alphanumeric() || b == b'_' => self.at += 1,
+                b if b < 0x80 => break,
+                _ => match self.char_at(self.at) {
+                    (c, len) if c.is_alphanumeric() => self.step(len),
+                    _ => break,
+                },
+            }
         }
-
         self.token_since(start)
     }
 
@@ -629,21 +584,9 @@ impl<'a> Lexer<'a> {
 
     /// Peek at the next token without advancing
     pub fn peek_token(&mut self) -> Token {
-        // Save current state
-        let saved_position = self.position;
-        let saved_read_position = self.read_position;
-        let saved_ch = self.ch;
-        let saved_pos = self.pos;
-
-        // Get the next token
+        let mark = self.mark();
         let token = self.next_token();
-
-        // Restore state
-        self.position = saved_position;
-        self.read_position = saved_read_position;
-        self.ch = saved_ch;
-        self.pos = saved_pos;
-
+        self.reset(mark);
         token
     }
 
@@ -653,13 +596,7 @@ impl<'a> Lexer<'a> {
             return Vec::new();
         }
 
-        // Save current state
-        let saved_position = self.position;
-        let saved_read_position = self.read_position;
-        let saved_ch = self.ch;
-        let saved_pos = self.pos;
-
-        // Get the next n tokens
+        let mark = self.mark();
         let mut tokens = Vec::with_capacity(n);
         for _ in 0..n {
             let token = self.next_token();
@@ -669,13 +606,7 @@ impl<'a> Lexer<'a> {
             }
             tokens.push(token);
         }
-
-        // Restore state
-        self.position = saved_position;
-        self.read_position = saved_read_position;
-        self.ch = saved_ch;
-        self.pos = saved_pos;
-
+        self.reset(mark);
         tokens
     }
 }
@@ -968,8 +899,7 @@ mod tests {
     fn test_position_saturates_at_the_counter_limit() {
         for sql in ["ab", "a\nb", "'ab'", "'a\nb'"] {
             let mut lexer = Lexer::new(sql);
-            lexer.pos.line = u32::MAX;
-            lexer.pos.column = u32::MAX;
+            lexer.line = u32::MAX;
             let mut token = lexer.next_token();
             while !token.is_eof() {
                 token = lexer.next_token();
