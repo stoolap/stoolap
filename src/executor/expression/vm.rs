@@ -2322,17 +2322,52 @@ impl ExprVM {
             // A chain runs only once every parameter it reads holds a value
             Op::CompareColumnParam(idx, slot, compare, read_as) => {
                 let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
-                compare.compare(cell, &read_param(ctx.params.get(*slot as usize)?, *read_as))
+                let param = ctx.params.get(*slot as usize)?;
+                match (cell, param) {
+                    // An integer read as an integer, or as it is, needs no reading
+                    (Value::Integer(v), Value::Integer(p))
+                        if read_as.is_none_or(|t| t == DataType::Integer) =>
+                    {
+                        Some(compare.integers(*v, *p))
+                    }
+                    _ => compare.compare(cell, &read_param(param, *read_as)),
+                }
             }
             Op::BetweenColumnParams(idx, low, high, read_as) => {
                 let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
-                let low = read_param(ctx.params.get(*low as usize)?, *read_as);
-                let high = read_param(ctx.params.get(*high as usize)?, *read_as);
-                between_cell(cell, &low, &high)
+                let (low, high) = (
+                    ctx.params.get(*low as usize)?,
+                    ctx.params.get(*high as usize)?,
+                );
+                match (cell, low, high) {
+                    (Value::Integer(v), Value::Integer(lo), Value::Integer(hi))
+                        if read_as.is_none_or(|t| t == DataType::Integer) =>
+                    {
+                        Some(CompareOp::Ge.integers(*v, *lo) && CompareOp::Le.integers(*v, *hi))
+                    }
+                    _ => between_cell(
+                        cell,
+                        &read_param(low, *read_as),
+                        &read_param(high, *read_as),
+                    ),
+                }
             }
             Op::InColumnParams(idx, slots, read_as) => {
                 let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
                 let params = ctx.params;
+                if let Value::Integer(v) = cell {
+                    if read_as.is_none_or(|t| t == DataType::Integer) {
+                        let mut members = slots.iter().map(|slot| params.get(*slot as usize));
+                        if let Some(found) = members.try_fold(false, |found, member| match member {
+                            Some(Value::Integer(p)) => {
+                                Some(found || CompareOp::Eq.integers(*v, *p))
+                            }
+                            _ => None,
+                        }) {
+                            return Some(found);
+                        }
+                    }
+                }
                 let items = slots.iter().filter_map(|slot| params.get(*slot as usize));
                 let items: SmallVec<[Cow<'_, Value>; 8]> =
                     items.map(|v| read_param(v, *read_as)).collect();

@@ -688,6 +688,20 @@ impl CompareOp {
         QuantifiedMembers::compares(*self, a, b)
     }
 
+    /// The comparison of two integers: their order is the SQL one
+    #[inline]
+    pub(crate) fn integers(self, a: i64, b: i64) -> bool {
+        let order = a.cmp(&b);
+        match self {
+            CompareOp::Eq => order.is_eq(),
+            CompareOp::Ne => order.is_ne(),
+            CompareOp::Lt => order.is_lt(),
+            CompareOp::Le => order.is_le(),
+            CompareOp::Gt => order.is_gt(),
+            CompareOp::Ge => order.is_ge(),
+        }
+    }
+
     /// `(a1, ..) op (b1, ..)` over two rows of one width: `=` holds when
     /// every pair is equal, `<>` when one is not; an ordering is the first
     /// unequal pair's, UNKNOWN when that pair's equality is
