@@ -314,6 +314,13 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "enclosing_values_and_table_function",
+        "SELECT id, (SELECT MAX(v) FROM (VALUES (t.a), (t.id)) x(v)), \
+         (SELECT SUM(value) FROM generate_series(1, t.a)) FROM t ORDER BY id",
+        "SELECT id, id, CASE a WHEN 2 THEN 3 ELSE 1 END FROM t ORDER BY id",
+        Prepared,
+    ),
+    (
         "union_order_by",
         "SELECT id FROM t UNION SELECT 9 ORDER BY (SELECT MAX(x) FROM u) - id LIMIT 2",
         "SELECT id FROM t UNION SELECT 9 ORDER BY 3 - id LIMIT 2",

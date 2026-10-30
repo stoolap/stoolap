@@ -157,8 +157,9 @@ impl<'a> Family<'a> {
     }
 
     /// A block's FROM: one table, view or CTE, a VALUES list or a table
-    /// function whose values name no column, read once per run; or none,
-    /// which reads one row without columns
+    /// function whose values hold no subquery, read once per run, or for
+    /// each call when they read an enclosing scope; or none, which reads one
+    /// row without columns
     fn block_from(
         &self,
         table_expr: Option<&'a Expression>,
@@ -166,14 +167,14 @@ impl<'a> Family<'a> {
         match table_expr {
             None => Ok(()),
             Some(Expression::ValuesSource(values)) => {
-                match values.rows.iter().flatten().any(mentions_column) {
-                    true => Err("a subquery's VALUES row naming a column or holding a subquery"),
+                match values.rows.iter().flatten().any(Executor::has_subqueries) {
+                    true => Err("a subquery's VALUES row holding a subquery"),
                     false => Ok(()),
                 }
             }
             Some(Expression::FunctionTableSource(function)) => {
-                match function.arguments.iter().any(mentions_column) {
-                    true => Err("a subquery's table function argument naming a column"),
+                match function.arguments.iter().any(Executor::has_subqueries) {
+                    true => Err("a subquery's table function argument holding a subquery"),
                     false => Ok(()),
                 }
             }
@@ -5612,6 +5613,18 @@ impl Builder<'_> {
             (None, Some(source), schema, scope)
         };
         let (table, source, schema, scope) = match sq.table_expr.as_deref() {
+            // Values naming a column read an enclosing scope: the block runs as
+            // one statement for each call
+            Some(Expression::ValuesSource(values))
+                if values.rows.iter().flatten().any(mentions_column) =>
+            {
+                return self.statement_block(sq, outer, parent, form);
+            }
+            Some(Expression::FunctionTableSource(function))
+                if function.arguments.iter().any(mentions_column) =>
+            {
+                return self.statement_block(sq, outer, parent, form);
+            }
             Some(Expression::TableSource(ts)) => {
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
                 match self.named_source(&ts.name.value_lower)? {

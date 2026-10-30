@@ -3469,6 +3469,99 @@ fn test_a_computed_limit_and_offset_are_read_once_before_the_rows() {
 }
 
 #[test]
+fn test_a_subquery_s_values_and_table_function_read_the_enclosing_row() {
+    let _guard = serial();
+    let table = |db: &Database, sql: &str, params: Vec<stoolap::Value>| -> Vec<String> {
+        db.query(sql, params)
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get::<stoolap::Value>(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect()
+    };
+    // (the statement, the same with its source read through a derived table)
+    let cases = [
+        (
+            "SELECT id, (SELECT MAX(v) FROM (VALUES (t.a), (t.k * 10)) x(v)) FROM t ORDER BY id",
+            "SELECT id, (SELECT MAX(v) FROM (SELECT v FROM (VALUES (t.a), (t.k * 10)) x(v)) x) \
+             FROM t ORDER BY id",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (VALUES (t.a), (t.k)) x(v) WHERE v > 15) \
+             ORDER BY id",
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM (VALUES (t.a), (t.k)) x(v)) x \
+             WHERE v > 15) ORDER BY id",
+        ),
+        (
+            "SELECT id FROM t WHERE a / 10 IN (SELECT value FROM generate_series(t.k - 1, t.k + 1)) \
+             ORDER BY id",
+            "SELECT id FROM t WHERE a / 10 IN (SELECT value FROM \
+             (SELECT value FROM generate_series(t.k - 1, t.k + 1)) g) ORDER BY id",
+        ),
+        (
+            "SELECT k, COUNT(*) FROM t GROUP BY k \
+             HAVING COUNT(*) >= (SELECT MIN(v) FROM (VALUES (k), (2)) x(v)) ORDER BY k",
+            "SELECT k, COUNT(*) FROM t GROUP BY k \
+             HAVING COUNT(*) >= (SELECT MIN(v) FROM (SELECT v FROM (VALUES (k), (2)) x(v)) x) \
+             ORDER BY k",
+        ),
+        (
+            "SELECT id, CASE WHEN EXISTS (SELECT 1 FROM generate_series(1, t.k) g WHERE g.value = 2) \
+             THEN 'y' ELSE 'n' END FROM t ORDER BY id",
+            "SELECT id, CASE WHEN EXISTS (SELECT 1 FROM (SELECT value FROM generate_series(1, t.k)) g \
+             WHERE g.value = 2) THEN 'y' ELSE 'n' END FROM t ORDER BY id",
+        ),
+        (
+            "SELECT id FROM t ORDER BY (SELECT MAX(v) FROM (VALUES (t.a), (t.k)) x(v)) DESC, id",
+            "SELECT id FROM t ORDER BY (SELECT MAX(v) FROM (SELECT v FROM (VALUES (t.a), (t.k)) x(v)) x) \
+             DESC, id",
+        ),
+        (
+            "SELECT id, (SELECT COUNT(*) FROM (VALUES (t.k), (t.k + 1)) x(v) \
+             WHERE v IN (SELECT k FROM u)) FROM t ORDER BY id",
+            "SELECT id, (SELECT COUNT(*) FROM (SELECT v FROM (VALUES (t.k), (t.k + 1)) x(v)) x \
+             WHERE v IN (SELECT k FROM u)) FROM t ORDER BY id",
+        ),
+    ];
+    const PARAMETER: &str =
+        "SELECT id, (SELECT SUM(value) FROM generate_series(1, t.k + $1)) FROM t ORDER BY id";
+    const PARAMETER_TWIN: &str = "SELECT id, (SELECT SUM(value) FROM \
+                                  (SELECT value FROM generate_series(1, t.k + $1)) g) FROM t ORDER BY id";
+    for (db, _dir) in alias_key_tables("prepared_enclosing_values") {
+        for (sql, twin) in cases {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let before = general_hits();
+            let got = table(&db, sql, vec![]);
+            assert_eq!(general_hits(), before, "{sql} reached a general path");
+            assert!(!got.is_empty(), "{sql}: no rows to compare");
+            assert_eq!(got, table(&db, twin, vec![]), "{sql}");
+        }
+        let prepared = db.prepare(PARAMETER).unwrap();
+        for param in [0, 2] {
+            let got: Vec<String> = prepared
+                .query((param,))
+                .unwrap()
+                .map(|row| {
+                    let row = row.unwrap();
+                    format!(
+                        "{:?},{:?}",
+                        row.get::<stoolap::Value>(0).unwrap(),
+                        row.get::<stoolap::Value>(1).unwrap()
+                    )
+                })
+                .collect();
+            let params = || vec![stoolap::Value::Integer(param)];
+            assert_eq!(got, table(&db, PARAMETER_TWIN, params()), "$1 = {param}");
+            assert_eq!(got, table(&db, PARAMETER, params()), "$1 = {param}");
+        }
+    }
+}
+
+#[test]
 fn test_an_uncorrelated_order_by_key_repeating_a_select_item_runs_once() {
     let _guard = serial();
     let db = setup("prepared_order_by_repeated_slot");
