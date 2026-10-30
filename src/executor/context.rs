@@ -1279,6 +1279,9 @@ pub struct ExecutionContext {
     table_use: TableUse,
     /// A semantic cache miss at the statement's start, for its scan
     semantic_miss: Option<SemanticMiss>,
+    /// Whether every parameter is a literal of the statement's text, which
+    /// the semantic cache reads as the literal it was
+    literal_params: bool,
     /// The LIMIT and OFFSET subqueries a statement read before its rows,
     /// behind an Arc, as few statements have one
     read_counts: Option<Arc<ReadCounts>>,
@@ -1376,6 +1379,7 @@ impl ExecutionContext {
             newest_target: None,
             table_use: TableUse::Write,
             semantic_miss: None,
+            literal_params: false,
             read_counts: None,
         }
     }
@@ -1416,6 +1420,21 @@ impl ExecutionContext {
     /// Set positional parameters
     pub fn set_params(&mut self, params: ParamVec) {
         self.params = CompactArc::new(params);
+    }
+
+    /// Set positional parameters shared with another holder
+    pub(crate) fn set_params_arc(&mut self, params: CompactArc<ParamVec>) {
+        self.params = params;
+    }
+
+    /// Marks every parameter as a literal of the statement's text, or not
+    pub(crate) fn set_literal_params(&mut self, literal: bool) {
+        self.literal_params = literal;
+    }
+
+    /// Whether every parameter is a literal of the statement's text
+    pub(crate) fn literal_params(&self) -> bool {
+        self.literal_params
     }
 
     /// Add a positional parameter
@@ -1517,6 +1536,7 @@ impl ExecutionContext {
             newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
+            literal_params: false,
             read_counts: None,
         }
     }
@@ -1542,6 +1562,7 @@ impl ExecutionContext {
             newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
+            literal_params: false,
             read_counts: None,
         }
     }
@@ -1592,6 +1613,7 @@ impl ExecutionContext {
             newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
+            literal_params: false,
             read_counts: None,
         }
     }
@@ -1668,6 +1690,7 @@ impl ExecutionContext {
             newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
+            literal_params: false,
             read_counts: self.read_counts.clone(),
         }
     }
@@ -1846,6 +1869,7 @@ impl ExecutionContext {
             newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: self.semantic_miss.clone(),
+            literal_params: self.literal_params,
             read_counts: self.read_counts.clone(),
         }
     }

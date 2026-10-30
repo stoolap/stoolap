@@ -55,9 +55,9 @@ use super::context::{
 };
 use super::expr_key::ExprKey;
 use super::expression::{
-    more_than_one_row, CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler,
-    ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter, RowMembers, RowTest, SharedProgram,
-    SubqueryExecutor,
+    more_than_one_row, parameter_slot, CompareOp, CompileContext, CompileError, ExecuteContext,
+    ExprCompiler, ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter, RowMembers, RowTest,
+    SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::prepared_join::{JoinSide, JoinSides};
@@ -2524,7 +2524,7 @@ fn for_each_child<'e>(
 }
 
 /// `expr` with each direct operand replaced by what `f` makes of it
-fn rebuild(
+pub(super) fn rebuild(
     expr: &Expression,
     f: &mut impl FnMut(&Expression) -> Result<Expression>,
 ) -> Result<Expression> {
@@ -2709,6 +2709,22 @@ fn rebuild(
         }
         other => other.clone(),
     })
+}
+
+/// `expr` with each parameter replaced by the literal its value in
+/// `params` is written as; None when a parameter has no value there
+pub(crate) fn parameters_as_literals(expr: &Expression, params: &[Value]) -> Option<Expression> {
+    fn bind(expr: &Expression, params: &[Value]) -> Result<Expression> {
+        match expr {
+            Expression::Parameter(param) => parameter_slot(param)
+                .ok()
+                .and_then(|slot| params.get(slot as usize))
+                .map(value_to_expression)
+                .ok_or_else(|| Error::internal("a parameter without a value")),
+            _ => rebuild(expr, &mut |child| bind(child, params)),
+        }
+    }
+    bind(expr, params).ok()
 }
 
 /// `expr`, bound over a side alone, with each of its columns read from

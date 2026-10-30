@@ -137,11 +137,9 @@ impl Executor {
         if classification.has_having {
             return Ok(None);
         }
-        // The table runs no WHERE over a parameter or a subquery: its rows are
-        // the scan's to read
-        if classification.has_where
-            && (classification.where_has_parameters || classification.where_has_subqueries)
-        {
+        // The table runs no WHERE over a subquery: its rows are the scan's to
+        // read
+        if classification.has_where && classification.where_has_subqueries {
             return Ok(None);
         }
         let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx))?;

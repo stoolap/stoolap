@@ -102,9 +102,25 @@ fn is_reserved(keyword: Keyword) -> bool {
     )
 }
 
+/// Where a parser reads its tokens: a lexer, or the tokens a lexer read
+/// before, up to its end of input
+enum Tokens<'a> {
+    Lexer(Lexer<'a>),
+    Read(std::vec::IntoIter<Token>, Token),
+}
+
+impl Tokens<'_> {
+    fn next_token(&mut self) -> Token {
+        match self {
+            Tokens::Lexer(lexer) => lexer.next_token(),
+            Tokens::Read(tokens, eof) => tokens.next().unwrap_or_else(|| eof.clone()),
+        }
+    }
+}
+
 /// The lexer's next token that is not a comment. An unterminated block
 /// comment is recorded as an error, so the program is not run.
-fn next_significant_token(lexer: &mut Lexer, errors: &mut Vec<ParseError>) -> Token {
+fn next_significant_token(lexer: &mut Tokens, errors: &mut Vec<ParseError>) -> Token {
     loop {
         let token = lexer.next_token();
         if token.token_type != TokenType::Comment {
@@ -135,7 +151,7 @@ fn creates_view(stmt: &Statement) -> bool {
 /// SQL Parser using Pratt parsing algorithm
 pub struct Parser<'a> {
     /// The lexer providing tokens
-    lexer: Lexer<'a>,
+    lexer: Tokens<'a>,
     /// Current token being examined
     pub(crate) cur_token: Token,
     /// Next token (peek)
@@ -161,7 +177,18 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     /// Create a new parser for the given input
     pub fn new(input: &'a str) -> Self {
-        let mut lexer = Lexer::new(input);
+        Self::reading(Tokens::Lexer(Lexer::new(input)))
+    }
+
+    /// A parser of the tokens a lexer read from a text, its end of input
+    /// last
+    pub(crate) fn from_tokens(tokens: Vec<Token>) -> Parser<'static> {
+        let eof = tokens.last().cloned();
+        let eof = eof.unwrap_or_else(|| Token::eof(Default::default()));
+        Parser::reading(Tokens::Read(tokens.into_iter(), eof))
+    }
+
+    fn reading(mut lexer: Tokens<'a>) -> Self {
         let mut errors = Vec::new();
         let cur_token = next_significant_token(&mut lexer, &mut errors);
         let peek_token = next_significant_token(&mut lexer, &mut errors);

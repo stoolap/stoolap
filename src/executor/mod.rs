@@ -55,6 +55,7 @@ pub mod planner;
 pub mod query_cache;
 pub mod result;
 pub mod semantic_cache;
+mod shared_literals;
 pub mod statistics;
 
 mod aggregation;
@@ -90,8 +91,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::api::params::ParamVec;
+use crate::common::CompactArc;
 use crate::core::{Error, Result, Value};
 use crate::functions::FunctionRegistry;
+use query_cache::CachedText;
 
 /// Default function registry - shared across all executors to avoid per-database allocation
 static DEFAULT_FUNCTION_REGISTRY: OnceLock<Arc<FunctionRegistry>> = OnceLock::new();
@@ -487,8 +490,22 @@ impl Executor {
         let _gate = self.enter_shared()?;
 
         // Try to get from cache
-        let cached = self.query_cache.get(sql)?;
-        self.param_fast_paths(&cached, params)
+        match self.query_cache.lookup(sql)? {
+            CachedText::Own(plan) => self.param_fast_paths(&plan, params),
+            CachedText::Shared(shared, values) if sharing_on() => {
+                if let Err(e) = check_param_count(&shared.user, params.len()) {
+                    return Some(Err(e));
+                }
+                // The caller's values fill the statement's own slots, the
+                // text's literals the hidden ones after them
+                let user = shared.user.count;
+                if user == 0 {
+                    return self.param_fast_paths(&shared.plan, &values);
+                }
+                self.param_fast_paths(&shared.plan, &hidden_after(&params[..user], &values))
+            }
+            CachedText::Shared(..) => None,
+        }
     }
 
     /// [`Self::try_fast_path_with_params`] for a plan the caller holds
@@ -600,10 +617,44 @@ impl Executor {
         sql: &str,
         ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
-        if let Some(plan) = self.query_cache.get(sql) {
-            return self.execute_plan_in(&plan, ctx);
+        match self.query_cache.lookup(sql) {
+            Some(CachedText::Own(plan)) => return self.execute_plan_in(&plan, ctx),
+            Some(CachedText::Shared(shared, values)) if sharing_on() => {
+                return self.execute_shared(&shared, values, ctx)
+            }
+            _ => {}
         }
-        match self.plan_or_program(sql)? {
+        let parsed = match sharing_on()
+            .then(|| shared_literals::skeleton(sql))
+            .flatten()
+        {
+            // A text differing only in its shared literals from one run
+            // before runs that one's plan
+            Some(mut skeleton) => {
+                if let Some((shared, values)) = self
+                    .query_cache
+                    .find_shared(&skeleton.key, |p| p.bind(&skeleton).map(CompactArc::new))
+                {
+                    self.query_cache.put_shared_text(sql, &shared, &values);
+                    return self.execute_shared(&shared, values, ctx);
+                }
+                let tokens = std::mem::take(&mut skeleton.tokens);
+                let parsed = parse_single(Parser::from_tokens(tokens))?;
+                if let Ok((stmt, params)) = &parsed {
+                    let shared = shared_literals::share(stmt, params, &skeleton);
+                    let bound = shared
+                        .and_then(|s| s.bind(&skeleton).map(|values| (s, CompactArc::new(values))));
+                    if let Some((shared, values)) = bound {
+                        let shared = self.query_cache.put_shared(skeleton.key, shared);
+                        self.query_cache.put_shared_text(sql, &shared, &values);
+                        return self.execute_shared(&shared, values, ctx);
+                    }
+                }
+                parsed.map(|(stmt, params)| self.query_cache.put(sql, Arc::new(stmt), params))
+            }
+            None => self.plan_or_program(sql)?,
+        };
+        match parsed {
             Ok(plan) => self.execute_plan_in(&plan, ctx),
             Err(program) => {
                 // One gate for the whole program, so no other statement on
@@ -612,6 +663,31 @@ impl Executor {
                 self.run_program(&program, &ctx)
             }
         }
+    }
+
+    /// Runs `shared` for a text whose shared literals hold `values`: the
+    /// caller's parameters fill the statement's own slots, the values the
+    /// hidden ones after them
+    fn execute_shared(
+        &self,
+        shared: &shared_literals::SharedPlan,
+        values: query_cache::SharedValues,
+        mut ctx: std::borrow::Cow<'_, ExecutionContext>,
+    ) -> Result<Box<dyn QueryResult>> {
+        check_param_count(&shared.user, ctx.params().len())?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::shared_plan_ran();
+        let user = shared.user.count;
+        let own = ctx.to_mut();
+        match user {
+            0 => own.set_params_arc(values),
+            _ => {
+                let params = hidden_after(&own.params()[..user], &values);
+                own.set_params(params);
+            }
+        }
+        own.set_literal_params(user == 0);
+        self.execute_plan_in(&shared.plan, ctx)
     }
 
     /// Current explicit-transaction id, if one is active.
@@ -1242,17 +1318,8 @@ impl Executor {
         if let Some(plan) = self.query_cache.get(sql) {
             return Ok(Ok(plan));
         }
-        let mut parser = Parser::new(sql);
-        let mut program = parser
-            .parse_program()
-            .map_err(|e| Error::parse(e.to_string()))?;
-        if program.statements.len() != 1 {
-            return Ok(Err(program));
-        }
-        let (Some(stmt), Some(params)) = (program.statements.pop(), program.params.pop()) else {
-            return Ok(Err(program));
-        };
-        Ok(Ok(self.query_cache.put(sql, Arc::new(stmt), params)))
+        Ok(parse_single(Parser::new(sql))?
+            .map(|(stmt, params)| self.query_cache.put(sql, Arc::new(stmt), params)))
     }
 
     /// Execute a pre-cached plan directly, skipping cache lookup.
@@ -1314,6 +1381,40 @@ impl Executor {
             plan.counts.as_deref(),
         )
     }
+}
+
+/// Whether texts share plans by their literals; a test turns it off to
+/// compare their answers
+#[inline]
+fn sharing_on() -> bool {
+    #[cfg(feature = "test-failpoints")]
+    if crate::test_failpoints::LITERAL_SHARING_OFF.load(Ordering::Relaxed) {
+        return false;
+    }
+    true
+}
+
+/// A shared plan's parameters: the statement's own values `own`, then the
+/// hidden ones `values` its text's literals fill
+fn hidden_after(own: &[Value], values: &[Value]) -> ParamVec {
+    own.iter().chain(values).cloned().collect()
+}
+
+/// The text `parser` reads, parsed: its one statement with its parameter
+/// slots, or the program of any other count of statements
+fn parse_single(
+    mut parser: Parser<'_>,
+) -> Result<std::result::Result<(Statement, ParamSlots), Program>> {
+    let mut program = parser
+        .parse_program()
+        .map_err(|e| Error::parse(e.to_string()))?;
+    if program.statements.len() != 1 {
+        return Ok(Err(program));
+    }
+    let (Some(stmt), Some(params)) = (program.statements.pop(), program.params.pop()) else {
+        return Ok(Err(program));
+    };
+    Ok(Ok((stmt, params)))
 }
 
 /// Refuses a statement taking `slots` that is given `provided` values: a

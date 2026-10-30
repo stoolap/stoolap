@@ -1909,7 +1909,15 @@ impl Executor {
                         }
                     };
                     let table_name = &source.name.value_lower;
-                    self.semantic_write(table_name, &columns, rows.rows(), predicate, stamp);
+                    let params = classification.where_has_parameters.then(|| ctx.params());
+                    self.semantic_write(
+                        table_name,
+                        &columns,
+                        rows.rows(),
+                        predicate,
+                        params,
+                        stamp,
+                    );
                     Box::new(ExecutorResult::with_arc_columns(columns.clone(), rows))
                 }
                 _ => result,
@@ -3440,7 +3448,7 @@ impl Executor {
         let Some(where_expr) = stmt.where_clause.as_deref() else {
             return Ok(EarlySemantic::NotTried);
         };
-        if !classification.semantic_cacheable()
+        if !classification.semantic_cacheable(ctx.literal_params())
             || classification.has_offset
             || classification.has_cte
             || classification.has_set_operations
@@ -3481,12 +3489,14 @@ impl Executor {
             .as_ref()
             .map_or(table_name, |alias| alias.value_lower.as_str());
         let predicate = miss.simplified.as_deref().unwrap_or(where_expr);
+        let params = classification.where_has_parameters.then(|| ctx.params());
         match self.semantic_cache_answer(
             table_name,
             stmt,
             &all_columns,
             Some(alias),
             predicate,
+            params,
             stamp,
         )? {
             Some((result, _)) => Ok(EarlySemantic::Hit(result)),
@@ -3508,7 +3518,7 @@ impl Executor {
             && ctx.outer_row().is_none()
             && source.as_of.is_none()
             && stmt.where_clause.is_some()
-            && classification.semantic_cacheable()
+            && classification.semantic_cacheable(ctx.literal_params())
     }
 
     /// Whether `table`'s rows may fit a semantic cache entry, so collecting
@@ -3531,24 +3541,38 @@ impl Executor {
     }
 
     /// Keeps `rows`, the answer over the columns `columns` of `table_name`
-    /// to a WHERE the cache's lookup reads as `predicate`, under `stamp`
+    /// to a WHERE the cache's lookup reads as `predicate`, under `stamp`;
+    /// `params` are the values of a predicate holding parameters
     pub(crate) fn semantic_write<'r>(
         &self,
         table_name: &str,
         columns: &[String],
         rows: impl Iterator<Item = &'r Row>,
         predicate: &Expression,
+        params: Option<&[Value]>,
         stamp: super::semantic_cache::CacheStamp,
     ) {
+        let predicate = match params {
+            Some(params) => match super::prepared_select::parameters_as_literals(predicate, params)
+            {
+                Some(bound) => bound,
+                None => return,
+            },
+            None => predicate.clone(),
+        };
         self.semantic_cache.insert(
             table_name,
             columns.to_vec(),
             rows.cloned().collect(),
-            Some(predicate.clone()),
+            Some(predicate),
             stamp,
         );
     }
 
+    /// The cached answer to `stmt` whose WHERE the cache reads as
+    /// `where_expr`; `params` are the values of one holding parameters,
+    /// which the cache reads as the literals they are written as
+    #[allow(clippy::too_many_arguments)]
     fn semantic_cache_answer(
         &self,
         table_name: &str,
@@ -3556,9 +3580,23 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         where_expr: &Expression,
+        params: Option<&[Value]>,
         stamp: super::semantic_cache::CacheStamp,
     ) -> Result<Option<CachedAnswer>> {
         use super::semantic_cache::{CacheLookupResult, SemanticCache};
+        let bound;
+        let where_expr = match params {
+            Some(params) => {
+                match super::prepared_select::parameters_as_literals(where_expr, params) {
+                    Some(expr) => {
+                        bound = expr;
+                        &bound
+                    }
+                    None => return Ok(None),
+                }
+            }
+            None => where_expr,
+        };
         let output_columns = || {
             CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias))
         };
@@ -3992,6 +4030,7 @@ impl Executor {
                     &all_columns,
                     table_alias.as_deref(),
                     where_expr,
+                    classification.where_has_parameters.then(|| ctx.params()),
                     stamp,
                 )? {
                     let shape = shape_of(&output_columns);
@@ -5311,6 +5350,7 @@ impl Executor {
                     &all_columns,
                     projected_rows.rows(),
                     where_expr,
+                    classification.where_has_parameters.then(|| ctx.params()),
                     stamp,
                 );
             }

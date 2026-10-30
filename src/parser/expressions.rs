@@ -143,112 +143,21 @@ impl Parser<'_> {
 
     /// Parse an integer literal
     fn parse_integer_literal(&mut self) -> Option<Expression> {
-        match self.cur_token.literal.parse::<i64>() {
-            Ok(value) => Some(Expression::IntegerLiteral(IntegerLiteral {
-                token: self.cur_token.clone(),
-                value,
-            })),
-            Err(_) => {
-                // Integer overflow - try parsing as float instead
-                // This handles very large numbers that don't fit in i64
-                match self.cur_token.literal.parse::<f64>() {
-                    Ok(value) => Some(Expression::FloatLiteral(FloatLiteral {
-                        token: self.cur_token.clone(),
-                        value,
-                    })),
-                    Err(e) => {
-                        self.add_error(format!(
-                            "could not parse {} as number: {}",
-                            self.cur_token.literal, e
-                        ));
-                        None
-                    }
-                }
-            }
-        }
+        integer_literal(&self.cur_token)
+            .map_err(|error| self.add_error(error))
+            .ok()
     }
 
     /// Parse a float literal
     fn parse_float_literal(&mut self) -> Option<Expression> {
-        match self.cur_token.literal.parse::<f64>() {
-            Ok(value) => Some(Expression::FloatLiteral(FloatLiteral {
-                token: self.cur_token.clone(),
-                value,
-            })),
-            Err(e) => {
-                self.add_error(format!(
-                    "could not parse {} as float: {}",
-                    self.cur_token.literal, e
-                ));
-                None
-            }
-        }
+        float_literal(&self.cur_token)
+            .map_err(|error| self.add_error(error))
+            .ok()
     }
 
     /// Parse a string literal
     fn parse_string_literal(&self) -> Expression {
-        let literal = &self.cur_token.literal;
-        // Remove surrounding quotes
-        let value = if literal.len() >= 2 {
-            let inner = &literal[1..literal.len() - 1];
-            // Handle escape sequences - optimized to avoid allocations when no escapes present
-            // Note: We don't convert \" to " because:
-            // 1. In SQL, double quotes don't need escaping inside single-quoted strings
-            // 2. Converting \" to " breaks JSON content like {"key":"value with \"quotes\""}
-            if inner.contains('\\') {
-                // Has escapes - do single-pass replacement
-                let mut result = String::with_capacity(inner.len());
-                let mut chars = inner.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        match chars.peek() {
-                            Some('n') => {
-                                result.push('\n');
-                                chars.next();
-                            }
-                            Some('t') => {
-                                result.push('\t');
-                                chars.next();
-                            }
-                            Some('r') => {
-                                result.push('\r');
-                                chars.next();
-                            }
-                            Some('\'') => {
-                                result.push('\'');
-                                chars.next();
-                            }
-                            Some('\\') => {
-                                result.push('\\');
-                                chars.next();
-                            }
-                            _ => result.push(c), // Keep backslash for unknown escapes
-                        }
-                    } else {
-                        result.push(c);
-                    }
-                }
-                SmartString::from_string(result)
-            } else {
-                // No escapes - zero allocation path
-                SmartString::new(inner)
-            }
-        } else {
-            literal.clone()
-        };
-
-        // Check for JSON type hint
-        let type_hint = if value.starts_with('{') && value.ends_with('}') {
-            Some(SmartString::const_new("JSON"))
-        } else {
-            None
-        };
-
-        Expression::StringLiteral(StringLiteral {
-            token: self.cur_token.clone(),
-            value,
-            type_hint,
-        })
+        string_literal(&self.cur_token)
     }
 
     /// Parse a parameter ($1, ?, :name)
@@ -2209,6 +2118,107 @@ impl Parser<'_> {
 
         list
     }
+}
+
+/// The literal an Integer token is: an integer, or a float when it does
+/// not fit; the error a parser reports when it is neither
+pub(crate) fn integer_literal(token: &Token) -> Result<Expression, String> {
+    match token.literal.parse::<i64>() {
+        Ok(value) => Ok(Expression::IntegerLiteral(IntegerLiteral {
+            token: token.clone(),
+            value,
+        })),
+        // Integer overflow - try parsing as float instead
+        // This handles very large numbers that don't fit in i64
+        Err(_) => match token.literal.parse::<f64>() {
+            Ok(value) => Ok(Expression::FloatLiteral(FloatLiteral {
+                token: token.clone(),
+                value,
+            })),
+            Err(e) => Err(format!(
+                "could not parse {} as number: {}",
+                token.literal, e
+            )),
+        },
+    }
+}
+
+/// The literal a Float token is; the error a parser reports when it is none
+pub(crate) fn float_literal(token: &Token) -> Result<Expression, String> {
+    match token.literal.parse::<f64>() {
+        Ok(value) => Ok(Expression::FloatLiteral(FloatLiteral {
+            token: token.clone(),
+            value,
+        })),
+        Err(e) => Err(format!("could not parse {} as float: {}", token.literal, e)),
+    }
+}
+
+/// The literal a String token is: its text unquoted and unescaped, with a
+/// JSON type hint for text shaped like an object
+pub(crate) fn string_literal(token: &Token) -> Expression {
+    let literal = &token.literal;
+    // Remove surrounding quotes
+    let value = if literal.len() >= 2 {
+        let inner = &literal[1..literal.len() - 1];
+        // Handle escape sequences - optimized to avoid allocations when no escapes present
+        // Note: We don't convert \" to " because:
+        // 1. In SQL, double quotes don't need escaping inside single-quoted strings
+        // 2. Converting \" to " breaks JSON content like {"key":"value with \"quotes\""}
+        if inner.contains('\\') {
+            // Has escapes - do single-pass replacement
+            let mut result = String::with_capacity(inner.len());
+            let mut chars = inner.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.peek() {
+                        Some('n') => {
+                            result.push('\n');
+                            chars.next();
+                        }
+                        Some('t') => {
+                            result.push('\t');
+                            chars.next();
+                        }
+                        Some('r') => {
+                            result.push('\r');
+                            chars.next();
+                        }
+                        Some('\'') => {
+                            result.push('\'');
+                            chars.next();
+                        }
+                        Some('\\') => {
+                            result.push('\\');
+                            chars.next();
+                        }
+                        _ => result.push(c), // Keep backslash for unknown escapes
+                    }
+                } else {
+                    result.push(c);
+                }
+            }
+            SmartString::from_string(result)
+        } else {
+            // No escapes - zero allocation path
+            SmartString::new(inner)
+        }
+    } else {
+        literal.clone()
+    };
+
+    // Check for JSON type hint
+    let type_hint = if value.starts_with('{') && value.ends_with('}') {
+        Some(SmartString::const_new("JSON"))
+    } else {
+        None
+    };
+
+    Expression::StringLiteral(StringLiteral {
+        token: token.clone(),
+        value,
+        type_hint,
+    })
 }
 
 #[cfg(test)]

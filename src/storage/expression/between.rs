@@ -488,7 +488,8 @@ impl Expression for BetweenExpr {
     }
 
     fn is_conjunctive_simple(&self) -> bool {
-        true
+        // NOT BETWEEN collects no comparisons to stand for it
+        !self.not
     }
 
     fn clone_box(&self) -> Box<dyn Expression> {
