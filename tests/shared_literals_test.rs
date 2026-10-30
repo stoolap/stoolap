@@ -71,6 +71,11 @@ const RUN: &[&str] = &[
     "SELECT id FROM u WHERE id NOT IN (1, 2, 3) AND id < 6 ORDER BY id",
     "SELECT id FROM u WHERE name IN ('n1', 'n9') ORDER BY id",
     "SELECT id FROM u WHERE name IN ('n2', 'n3') ORDER BY id",
+    "SELECT id FROM u WHERE id = -0",
+    "SELECT id FROM u WHERE id = -1",
+    "SELECT id FROM u WHERE v = -0.0",
+    "SELECT id FROM u WHERE v = -1.5",
+    "SELECT id FROM u WHERE id = 1 AND id = $18446744073709551615",
     "SELECT id FROM u WHERE id = -5",
     "SELECT id FROM u WHERE id = 5",
     "SELECT id FROM u WHERE id = 99999999999999999999",
@@ -191,10 +196,16 @@ fn answers(name: &str, on: bool, cold: bool, in_transaction: bool) -> Vec<String
     for (sql, id) in [
         ("SELECT id FROM u WHERE id = $1 AND age = 19", 11),
         ("SELECT id FROM u WHERE id = $1 AND age = 21", 13),
+        ("SELECT id FROM u WHERE id = $1 AND age = 21", 3),
         ("SELECT id FROM u WHERE age = 21", 5),
     ] {
         answers.push(answer(&db, sql, Some((id,))));
     }
+    for v in [7.5, 8.5] {
+        let changed = db.execute("UPDATE u SET v = $1 WHERE id = 2", (v,));
+        answers.push(format!("{changed:?}"));
+    }
+    answers.push(answer(&db, "SELECT v FROM u WHERE id = 2", None));
     if in_transaction {
         db.execute("COMMIT", ()).unwrap();
     }
@@ -204,10 +215,15 @@ fn answers(name: &str, on: bool, cold: bool, in_transaction: bool) -> Vec<String
 fn compare(name: &str, cold: bool, in_transaction: bool) {
     let own = answers(&format!("{name}_own"), false, cold, in_transaction);
     let shared = answers(&format!("{name}_shared"), true, cold, in_transaction);
-    let statements =
-        RUN.iter()
-            .copied()
-            .chain(["param 11 age 19", "param 13 age 21", "extra param age 21"]);
+    let statements = RUN.iter().copied().chain([
+        "param 11 age 19",
+        "param 13 age 21",
+        "param 3 age 21",
+        "extra param age 21",
+        "set v 7.5",
+        "set v 8.5",
+        "v of 2",
+    ]);
     let differ: Vec<String> = statements
         .zip(own.iter().zip(&shared))
         .filter(|(_, (own, shared))| own != shared)

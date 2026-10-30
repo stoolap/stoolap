@@ -490,8 +490,22 @@ impl Executor {
         let _gate = self.enter_shared()?;
 
         // Try to get from cache
-        let cached = self.query_cache.get(sql)?;
-        self.param_fast_paths(&cached, params)
+        match self.query_cache.lookup(sql)? {
+            CachedText::Own(plan) => self.param_fast_paths(&plan, params),
+            CachedText::Shared(shared, values) if sharing_on() => {
+                if let Err(e) = check_param_count(&shared.user, params.len()) {
+                    return Some(Err(e));
+                }
+                // The caller's values fill the statement's own slots, the
+                // text's literals the hidden ones after them
+                let user = shared.user.count;
+                if user == 0 {
+                    return self.param_fast_paths(&shared.plan, &values);
+                }
+                self.param_fast_paths(&shared.plan, &hidden_after(&params[..user], &values))
+            }
+            CachedText::Shared(..) => None,
+        }
     }
 
     /// [`Self::try_fast_path_with_params`] for a plan the caller holds
@@ -668,8 +682,7 @@ impl Executor {
         match user {
             0 => own.set_params_arc(values),
             _ => {
-                let mut params: ParamVec = own.params()[..user].iter().cloned().collect();
-                params.extend(values.iter().cloned());
+                let params = hidden_after(&own.params()[..user], &values);
                 own.set_params(params);
             }
         }
@@ -1379,6 +1392,12 @@ fn sharing_on() -> bool {
         return false;
     }
     true
+}
+
+/// A shared plan's parameters: the statement's own values `own`, then the
+/// hidden ones `values` its text's literals fill
+fn hidden_after(own: &[Value], values: &[Value]) -> ParamVec {
+    own.iter().chain(values).cloned().collect()
 }
 
 /// The text `parser` reads, parsed: its one statement with its parameter

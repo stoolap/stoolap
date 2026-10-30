@@ -40,6 +40,9 @@ use super::query_cache::CachedPlanRef;
 pub(crate) struct Skeleton {
     pub(crate) key: String,
     literals: SmallVec<[Token; 4]>,
+    /// Whether each literal follows a minus sign, which the parser folds
+    /// into it
+    negated: SmallVec<[bool; 4]>,
     pub(crate) tokens: Vec<Token>,
 }
 
@@ -77,10 +80,12 @@ pub(crate) fn skeleton(sql: &str) -> Option<Skeleton> {
     let mut lexer = Lexer::new(sql);
     let mut key = String::with_capacity(sql.len() + 8);
     let mut literals = SmallVec::new();
+    let mut negated = SmallVec::new();
     let mut tokens = Vec::with_capacity(sql.len() / 4 + 2);
     // Where the text after the last literal starts
     let mut rest = 0;
     let mut first = true;
+    let mut minus = false;
     loop {
         let token = lexer.next_token();
         match token.token_type {
@@ -109,16 +114,21 @@ pub(crate) fn skeleton(sql: &str) -> Option<Skeleton> {
                 });
                 rest = lexer.offset();
                 literals.push(token.clone());
+                negated.push(minus);
             }
             TokenType::Parameter if token.literal.starts_with(':') => return None,
             _ => {}
         }
-        first &= token.token_type == TokenType::Comment;
+        if token.token_type != TokenType::Comment {
+            first = false;
+            minus = token.token_type == TokenType::Operator && token.literal == "-";
+        }
         tokens.push(token);
     }
     Some(Skeleton {
         key,
         literals,
+        negated,
         tokens,
     })
 }
@@ -217,19 +227,20 @@ pub(crate) fn share(
         .enumerate()
         .map(|(i, token)| (token.position.offset, i))
         .collect();
-    // A literal is shared when the parser read its token alone the same way:
-    // a negated or typed one is kept as written
+    // A literal is shared when it follows no minus sign and the parser read
+    // its token alone the same way: a typed one is kept as written
     let mut shared = vec![false; skeleton.literals.len()];
     compared_literals(where_clause, &mut |literal, _place| {
         let Some(&i) = literal_offset(literal).and_then(|offset| at.get(&offset)) else {
             return;
         };
         let alone = literal_of(&skeleton.literals[i]);
-        shared[i] = alone.as_ref().is_some_and(|alone| {
-            kind_of(alone).is_some()
-                && kind_of(alone) == kind_of(literal)
-                && literal_value(alone) == literal_value(literal)
-        });
+        shared[i] = !skeleton.negated[i]
+            && alone.as_ref().is_some_and(|alone| {
+                kind_of(alone).is_some()
+                    && kind_of(alone) == kind_of(literal)
+                    && literal_value(alone) == literal_value(literal)
+            });
         #[cfg(feature = "test-failpoints")]
         if shared[i] {
             use crate::test_failpoints::SharedLiteral;
@@ -248,7 +259,8 @@ pub(crate) fn share(
     for (token, shared) in skeleton.literals.iter().zip(shared) {
         literals.push(match shared {
             true => {
-                slots.insert(token.position.offset, user.count + slots.len() + 1);
+                let slot = user.count.checked_add(slots.len() + 1)?;
+                slots.insert(token.position.offset, slot);
                 LiteralUse::Shared(literal_of(token).as_ref().and_then(kind_of)?)
             }
             false => LiteralUse::Fixed(token.literal.clone()),
