@@ -1081,8 +1081,7 @@ impl Executor {
         // A set operation's ORDER BY, LIMIT and OFFSET are the whole one's,
         // read over its rows once the blocks gave the first branch's
         let whole = stmt.set_operations.is_empty();
-        // A grouped key holding a subquery is computed for each group, where
-        // a SELECT alias reads its item again over the group's row
+        // A grouped key holding a subquery is computed for each group
         let keys: SmallVec<[&Expression; 2]> = stmt
             .order_by
             .iter()
@@ -1091,28 +1090,6 @@ impl Executor {
             .collect();
         if !keys.is_empty() && windowed {
             return Err("an ORDER BY holding a subquery");
-        }
-        // which gives the item's value only where computing it again does
-        let unrepeatable: SmallVec<[&str; 4]> = stmt
-            .columns
-            .iter()
-            .filter_map(|c| match c {
-                Expression::Aliased(a)
-                    if mentions_subquery(&a.expression)
-                        || volatile(&a.expression, &self.function_registry) =>
-                {
-                    Some(a.alias.value_lower.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        if keys
-            .iter()
-            .any(|key| names_anywhere(key, &|name| unrepeatable.contains(&name)))
-        {
-            return Err(
-                "an ORDER BY subquery key naming a SELECT alias of a subquery or a volatile item",
-            );
         }
         // A GROUP BY item naming a SELECT alias or position groups that item
         self.parse_group_by(stmt, &[])
@@ -7293,6 +7270,14 @@ impl PreparedGrouped {
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
+        // A DISTINCT ON key rides as an item named by its identity, here or
+        // where a caller keyed the statement, and reads as an ORDER BY key does
+        let key_names: SmallVec<[String; 1]> = stmt
+            .distinct_on
+            .iter()
+            .map(|key| ExprKey::of(key).hidden_column_name())
+            .collect();
+        let key_item = |column: &Expression| matches!(column, Expression::Aliased(a) if key_names.iter().any(|n| a.alias.value == *n));
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -7423,10 +7408,40 @@ impl PreparedGrouped {
         // each as its item computed again over the group's row
         let width = scope.columns.len();
         let aliases = projected_aliases(stmt, &scope.lower, |_| width);
+        // The SELECT item at a position of the projected row
+        let item_at = |position: usize| {
+            let mut at = 0;
+            for column in &stmt.columns {
+                let wide = matches!(column, Expression::Star(_) | Expression::QualifiedStar(_));
+                let next = at + if wide { width } else { 1 };
+                if position < next {
+                    return (!wide).then(|| unaliased(column));
+                }
+                at = next;
+            }
+            None
+        };
+        // An alias of an item holding a subquery or a volatile one needs the
+        // value the row returns, which computing it again would not give: a
+        // statement whose key reads one runs on the general path
+        let registry = &executor.function_registry;
+        let unrepeatable = |position: usize| {
+            item_at(position)
+                .is_some_and(|item| mentions_subquery(item) || volatile(item, registry))
+        };
+        let unrepeatable_names: SmallVec<[&str; 2]> = (0..aliases.len())
+            .filter(|&position| unrepeatable(position))
+            .filter_map(|position| aliases[position].as_ref().map(|name| name.as_str()))
+            .collect();
+        // A bare name outside the key's subqueries that is such an alias binds it
+        let reads_unrepeatable =
+            |key: &Expression| names_any(key, &|name| unrepeatable_names.contains(&name));
         let keyed = stmt
             .order_by
             .iter()
-            .any(|ob| mentions_subquery(&ob.expression));
+            .map(|ob| &ob.expression)
+            .chain(stmt.columns.iter().filter(|c| key_item(c)).map(unaliased))
+            .any(mentions_subquery);
         let key_scope = keyed.then(|| scope.with_items(&aliases));
         let key_scopes = [key_scope.as_ref().unwrap_or(&scope)];
         let key_chain = Chain {
@@ -7467,6 +7482,23 @@ impl PreparedGrouped {
             let key = key.as_ref();
             columns.push(match column {
                 column if !mentions_subquery(unaliased(column)) => column.clone(),
+                Expression::Aliased(aliased) if key_item(column) => {
+                    if reads_unrepeatable(&aliased.expression) {
+                        return Ok(None);
+                    }
+                    let read = alias_blocks(
+                        &aliased.expression,
+                        &key_chain,
+                        width,
+                        &stmt.columns,
+                        &scope.lower,
+                    )?;
+                    Expression::Aliased(AliasedExpression {
+                        token: aliased.token.clone(),
+                        expression: Box::new(output(&key_chain, &read, key, false)?),
+                        alias: aliased.alias.clone(),
+                    })
+                }
                 Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
                     token: aliased.token.clone(),
                     expression: Box::new(output(&chain, &aliased.expression, key, false)?),
@@ -7506,6 +7538,9 @@ impl PreparedGrouped {
                 .iter()
                 .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == column.value))
             {
+                if reads_unrepeatable(&ob.expression) {
+                    return Ok(None);
+                }
                 let key = alias_blocks(
                     &ob.expression,
                     &key_chain,
@@ -7576,19 +7611,6 @@ impl PreparedGrouped {
         // in the order it parses them from the statement it runs; found once
         // a hole reads an alias
         let mut slots = None;
-        // The SELECT item at a position of the projected row
-        let item_at = |position: usize| {
-            let mut at = 0;
-            for column in &stmt.columns {
-                let wide = matches!(column, Expression::Star(_) | Expression::QualifiedStar(_));
-                let next = at + if wide { width } else { 1 };
-                if position < next {
-                    return (!wide).then(|| unaliased(column));
-                }
-                at = next;
-            }
-            None
-        };
         // A group's row holds its GROUP BY items first, each holding the
         // column its key binds to when it is one. A hole reads an item holding
         // the column it binds to: between several, the one the grouped output
@@ -7638,6 +7660,9 @@ impl PreparedGrouped {
                 // Each alias's item over the group's row, its group items and
                 // aggregates read from their slots
                 let mut item = |position: usize| -> Result<Expression> {
+                    if unrepeatable(position) {
+                        return Err(Error::internal("an alias of an unrepeatable item"));
+                    }
                     let item = item_at(position)
                         .ok_or_else(|| Error::internal("an alias without its item"))?;
                     if slots.is_none() {
@@ -9300,42 +9325,6 @@ fn function_range(where_clause: Option<&Expression>, name: &str) -> Option<Box<E
         .cloned()
         .collect();
     combine_predicates_with_and(range).map(Box::new)
-}
-
-/// Whether a name anywhere in `expr`, its subqueries' clauses included, bare,
-/// as the part after a dotted name's last dot or as the column of a qualified
-/// name, passes `matches`
-fn names_anywhere(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
-    let statement = |sq: &SelectStatement| {
-        sq.columns
-            .iter()
-            .chain(sq.where_clause.as_deref())
-            .chain(sq.having.as_deref())
-            .chain(&sq.group_by.columns)
-            .chain(sq.order_by.iter().map(|o| &o.expression))
-            .any(|e| names_anywhere(e, matches))
-    };
-    match expr {
-        Expression::Identifier(id) => {
-            matches(&id.value_lower)
-                || split_qualified(&id.value_lower).is_some_and(|(_, column)| matches(column))
-        }
-        Expression::QualifiedIdentifier(qid) => matches(&qid.name.value_lower),
-        Expression::Aliased(aliased) => names_anywhere(&aliased.expression, matches),
-        Expression::ScalarSubquery(sq) => statement(&sq.subquery),
-        Expression::Exists(exists) => statement(&exists.subquery),
-        Expression::AllAny(all_any) => {
-            names_anywhere(&all_any.left, matches) || statement(&all_any.subquery)
-        }
-        other => {
-            let mut found = false;
-            let _ = for_each_child(other, &mut |child| {
-                found |= names_anywhere(child, matches);
-                Ok(())
-            });
-            found
-        }
-    }
 }
 
 /// Whether `expr`, rewritten with its blocks in `blocks`, asks one of them
