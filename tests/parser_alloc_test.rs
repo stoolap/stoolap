@@ -22,7 +22,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use stoolap::parser::Parser;
+use stoolap::parser::token::TokenType;
+use stoolap::parser::{Lexer, Parser};
 
 struct ThreadCounting;
 
@@ -82,5 +83,16 @@ fn test_parse_allocates_only_for_the_tree() {
             allocations <= most,
             "{allocations} allocations, at most {most} expected, parsing {sql}"
         );
+    }
+}
+
+#[test]
+fn test_a_short_string_escaped_at_its_start_allocates_once() {
+    for sql in ["SELECT '''abcdef'", "SELECT '\\abcdef'"] {
+        let before = ALLOCATIONS.with(Cell::get);
+        let mut lexer = Lexer::new(sql);
+        while lexer.next_token().token_type != TokenType::Eof {}
+        let allocations = ALLOCATIONS.with(Cell::get) - before;
+        assert!(allocations <= 1, "{allocations} allocations lexing {sql}");
     }
 }
