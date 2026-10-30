@@ -55,9 +55,9 @@ use super::context::{
 };
 use super::expr_key::ExprKey;
 use super::expression::{
-    more_than_one_row, parameter_slot, CompareOp, CompileContext, CompileError, ExecuteContext,
-    ExprCompiler, ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter, RowMembers, RowTest,
-    SharedProgram, SubqueryExecutor,
+    known_params, more_than_one_row, parameter_slot, CompareOp, CompileContext, CompileError,
+    ExecuteContext, ExprCompiler, ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter,
+    RowMembers, RowTest, SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::prepared_join::{JoinSide, JoinSides};
@@ -14083,17 +14083,18 @@ impl PreparedRunner<'_> {
     /// parameter or run slot, an uncorrelated block's value or members read.
     /// A slot whose value failed stays read, which raises its error
     fn known_op(&self, op: &Op) -> Option<Op> {
-        match *op {
-            Op::LoadParam(slot) => {
-                if self
-                    .slot_failures()
-                    .iter()
-                    .any(|(at, _)| *at == slot as usize)
-                {
-                    return None;
-                }
-                self.base.get(slot as usize).cloned().map(Op::LoadConst)
+        let value = |slot: u32| {
+            if self
+                .slot_failures()
+                .iter()
+                .any(|(at, _)| *at == slot as usize)
+            {
+                return None;
             }
+            self.base.get(slot as usize).cloned()
+        };
+        match *op {
+            Op::LoadParam(slot) => value(slot).map(Op::LoadConst),
             Op::ExecScalarSubquery(index) | Op::ExecExists(index) => {
                 if !self.prepared.subqueries.get(index as usize)?.uncorrelated {
                     return None;
@@ -14104,7 +14105,7 @@ impl PreparedRunner<'_> {
             Op::ExecInSubquery(index) | Op::ExecQuantified(index, ..) => {
                 self.members_op(index as usize)
             }
-            _ => None,
+            _ => known_params(op, value),
         }
     }
 

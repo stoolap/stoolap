@@ -21,9 +21,12 @@
 
 use smallvec::SmallVec;
 
-use super::ops::Op;
-use super::vm::ExprVM;
+use std::sync::Arc;
+
+use super::ops::{CompareOp, Op};
+use super::vm::{read_param, ExprVM};
 use crate::common::CompactArc;
+use crate::core::DataType;
 use crate::core::Value;
 
 /// Compiled expression program
@@ -49,6 +52,9 @@ pub struct Program {
     /// Whether the ops are single-op predicates joined by AND and OR, which
     /// a filter answers without the stack
     predicate_chain: bool,
+
+    /// How many parameter slots the chain reads, one past the highest
+    chain_params: usize,
 
     /// What binding the program to its execution's parameters reads, for a
     /// program that loads one
@@ -86,6 +92,7 @@ impl Program {
 
         let binding = Binding::of(&ops, folds);
         let predicate_chain = ExprVM::is_predicate_chain(&ops);
+        let chain_params = ExprVM::chain_params(&ops);
 
         Self {
             ops,
@@ -93,6 +100,7 @@ impl Program {
             needs_second_row,
             has_subqueries,
             predicate_chain,
+            chain_params,
             binding,
             bound_from: None,
         }
@@ -121,6 +129,7 @@ impl Program {
 
         let binding = Binding::of(&ops, Vec::new());
         let predicate_chain = ExprVM::is_predicate_chain(&ops);
+        let chain_params = ExprVM::chain_params(&ops);
 
         Self {
             ops,
@@ -128,6 +137,7 @@ impl Program {
             needs_second_row,
             has_subqueries,
             predicate_chain,
+            chain_params,
             binding,
             bound_from: None,
         }
@@ -166,9 +176,10 @@ impl Program {
         if binding.shrinks.get() == Some(&false) {
             return None;
         }
+        let value = |slot: u32| params.get(slot as usize).cloned();
         let bound = self.bind_with(|op| match op {
-            Op::LoadParam(slot) => params.get(*slot as usize).cloned().map(Op::LoadConst),
-            _ => None,
+            Op::LoadParam(slot) => value(*slot).map(Op::LoadConst),
+            _ => known_params(op, value),
         })?;
         let shrinks = bound.ops.len() < self.ops.len();
         // No value changes what fusion makes of a parameter no fold holds
@@ -457,6 +468,11 @@ impl Program {
         self.predicate_chain
     }
 
+    /// How many parameter slots the predicate chain reads
+    pub(crate) fn chain_params(&self) -> usize {
+        self.chain_params
+    }
+
     /// Get the number of operations
     #[inline]
     pub fn len(&self) -> usize {
@@ -485,6 +501,7 @@ impl Program {
         self.ops = Self::peephole_optimize(self.ops, &mut folds);
         self.binding = Binding::of(&self.ops, folds);
         self.predicate_chain = ExprVM::is_predicate_chain(&self.ops);
+        self.chain_params = ExprVM::chain_params(&self.ops);
         self
     }
 
@@ -600,6 +617,17 @@ impl Program {
                 }
             }
 
+            // Pattern 4: LoadColumn + parameters + their test → one op
+            let at = i;
+            if let Some((fused_op, taken)) =
+                Self::param_test(&ops[i..], |k| jump_targets.contains(&(at + k)))
+            {
+                result.push(fused_op);
+                position_map.extend(std::iter::repeat_n(new_pos, taken));
+                i += taken;
+                continue;
+            }
+
             // No fusion, copy the op
             result.push(std::mem::replace(&mut ops[i], Op::Nop));
             position_map.push(new_pos);
@@ -613,6 +641,44 @@ impl Program {
         }
 
         result
+    }
+
+    /// The op testing a column against the parameters loaded after it that
+    /// `ops` start with, each read as one type or each as it is, and how
+    /// many ops it stands for; None when one of them is a jump `target` or
+    /// the test is no comparison, BETWEEN or short IN list
+    fn param_test(ops: &[Op], target: impl Fn(usize) -> bool) -> Option<(Op, usize)> {
+        let (Op::LoadColumn(col) | Op::LoadAggregateResult(col)) = *ops.first()? else {
+            return None;
+        };
+        let mut slots: SmallVec<[u32; IN_PARAMS_FUSED]> = SmallVec::new();
+        let mut read_as = None;
+        let mut at = 1;
+        while let Some(Op::LoadParam(slot)) = ops.get(at) {
+            let read = match ops.get(at + 1) {
+                Some(Op::ReadAsColumn(column_type)) => Some(*column_type),
+                _ => None,
+            };
+            if !slots.is_empty() && read != read_as {
+                return None;
+            }
+            (read_as, at) = (read, at + 1 + usize::from(read.is_some()));
+            slots.push(*slot);
+        }
+        let fused = match (&slots[..], ops.get(at)?) {
+            ([low, high], Op::Between) => Op::BetweenColumnParams(col, *low, *high, read_as),
+            (slots, Op::InList(count))
+                if !slots.is_empty()
+                    && slots.len() == *count as usize
+                    && slots.len() <= IN_PARAMS_FUSED =>
+            {
+                Op::InColumnParams(col, Arc::from(slots), read_as)
+            }
+            ([slot], test) => Op::CompareColumnParam(col, *slot, compare_of(test)?, read_as),
+            _ => return None,
+        };
+        let taken = at + 1;
+        (0..taken).all(|k| !target(k)).then_some((fused, taken))
     }
 
     /// The fold ranges at their positions after fusion; a range an op fused
@@ -636,6 +702,58 @@ impl Program {
             }
         }
     }
+}
+
+/// The longest IN list of parameters tested in one op; a longer one is
+/// bound into a hash set
+const IN_PARAMS_FUSED: usize = 8;
+
+/// The comparison the stack op `op` makes
+fn compare_of(op: &Op) -> Option<CompareOp> {
+    Some(match op {
+        Op::Eq => CompareOp::Eq,
+        Op::Ne => CompareOp::Ne,
+        Op::Lt => CompareOp::Lt,
+        Op::Le => CompareOp::Le,
+        Op::Gt => CompareOp::Gt,
+        Op::Ge => CompareOp::Ge,
+        _ => return None,
+    })
+}
+
+/// `op` with the parameters it tests a column against known by `value`, as
+/// the op fused from them written as literals; None for any other op or a
+/// slot `value` lacks
+pub(crate) fn known_params(op: &Op, value: impl Fn(u32) -> Option<Value>) -> Option<Op> {
+    let read = |slot: u32, read_as: Option<DataType>| -> Option<Value> {
+        let value = value(slot)?;
+        Some(read_param(&value, read_as).into_owned())
+    };
+    Some(match op {
+        Op::CompareColumnParam(col, slot, compare, read_as) => {
+            let (col, value) = (*col, read(*slot, *read_as)?);
+            match compare {
+                CompareOp::Eq => Op::EqColumnConst(col, value),
+                CompareOp::Ne => Op::NeColumnConst(col, value),
+                CompareOp::Lt => Op::LtColumnConst(col, value),
+                CompareOp::Le => Op::LeColumnConst(col, value),
+                CompareOp::Gt => Op::GtColumnConst(col, value),
+                CompareOp::Ge => Op::GeColumnConst(col, value),
+            }
+        }
+        Op::BetweenColumnParams(col, low, high, read_as) => {
+            Op::BetweenColumnConst(*col, read(*low, *read_as)?, read(*high, *read_as)?)
+        }
+        Op::InColumnParams(col, slots, read_as) => {
+            let values: SmallVec<[Value; IN_PARAMS_FUSED]> = slots
+                .iter()
+                .map(|slot| read(*slot, *read_as))
+                .collect::<Option<_>>()?;
+            let members: SmallVec<[&Value; IN_PARAMS_FUSED]> = values.iter().collect();
+            Op::InSetColumn(*col, super::compiler::member_set(&members))
+        }
+        _ => return None,
+    })
 }
 
 /// What binding a program to its execution's parameters reads beside its ops
@@ -1118,7 +1236,7 @@ mod tests {
 
     #[test]
     fn a_worker_copy_of_a_bound_program_binds_new_values() {
-        let program = CompactArc::new(Program::new(vec![
+        let program = CompactArc::new(Program::new_unoptimized(vec![
             Op::LoadColumn(0),
             Op::LoadParam(0),
             Op::Eq,

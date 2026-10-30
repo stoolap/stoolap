@@ -480,6 +480,96 @@ fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
     }
 }
 
+#[test]
+fn test_a_column_test_against_parameters_answers_as_its_unfused_ops() {
+    use crate::core::DataType;
+    let rows = [
+        Row::from_values(vec![Value::Integer(5)]),
+        Row::from_values(vec![Value::Float(5.5)]),
+        Row::from_values(vec![Value::text("5")]),
+        Row::from_values(vec![Value::text("b")]),
+        Row::from_values(vec![Value::null_unknown()]),
+        Row::new(),
+    ];
+    let values = [
+        Value::Integer(5),
+        Value::Integer(-3),
+        Value::Float(5.5),
+        Value::text("5"),
+        Value::text("a"),
+        Value::null_unknown(),
+    ];
+    let tests: Vec<(usize, Op)> = vec![
+        (1, Op::Eq),
+        (1, Op::Ne),
+        (1, Op::Lt),
+        (1, Op::Le),
+        (1, Op::Gt),
+        (1, Op::Ge),
+        (2, Op::Between),
+        (2, Op::InList(2)),
+        (3, Op::InList(3)),
+    ];
+    let reads = [
+        None,
+        Some(DataType::Integer),
+        Some(DataType::Float),
+        Some(DataType::Text),
+    ];
+    let mut vm = ExprVM::new();
+    for (count, test) in &tests {
+        for read_as in reads {
+            let mut ops = vec![Op::LoadColumn(0)];
+            for slot in 0..*count as u32 {
+                ops.push(Op::LoadParam(slot));
+                ops.extend(read_as.map(Op::ReadAsColumn));
+            }
+            ops.extend([test.clone(), Op::Return]);
+            let fused = Program::new(ops.clone());
+            let unfused = Program::new_unoptimized(ops);
+            let listing = format!("{:?}", fused.ops());
+            assert!(
+                listing.contains("ColumnParam") && fused.is_predicate_chain(),
+                "{test:?} read as {read_as:?} fuses into a chain: {listing}"
+            );
+            for params in (0..values.len().pow(*count as u32)).map(|mut code| {
+                (0..*count)
+                    .map(|_| {
+                        let value = values[code % values.len()].clone();
+                        code /= values.len();
+                        value
+                    })
+                    .collect::<Vec<_>>()
+            }) {
+                let bound = fused.bind(&params);
+                for (r, row) in rows.iter().enumerate() {
+                    let ctx = ExecuteContext::new(row).with_params(&params);
+                    let case = format!("{listing} {params:?} on row {r}");
+                    let expected = vm.execute(&unfused, &ctx).unwrap();
+                    assert_eq!(vm.execute(&fused, &ctx).unwrap(), expected, "{case}");
+                    let passes = ExprVM::passes(&expected);
+                    assert_eq!(vm.execute_bool(&fused, &ctx), passes, "{case}, chain");
+                    if let Some(bound) = &bound {
+                        let bound_ctx = ExecuteContext::new(row);
+                        assert_eq!(
+                            vm.execute(bound, &bound_ctx).unwrap(),
+                            expected,
+                            "{case}, bound"
+                        );
+                    }
+                }
+            }
+            let row = &rows[0];
+            let missing = ExecuteContext::new(row).with_params(&[]);
+            assert!(
+                vm.execute_bool_checked(&fused, &missing).is_err()
+                    && vm.execute_bool_checked(&unfused, &missing).is_err(),
+                "{listing} without its parameters is an error"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Compiler Tests
 // ============================================================================

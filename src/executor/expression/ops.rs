@@ -160,6 +160,18 @@ pub enum Op {
     /// Stack: [] -> [bool]
     BetweenColumnConst(u16, Value, Value), // col_idx, low, high
 
+    /// Fused: column compared with a parameter, read as the type given
+    /// Stack: [] -> [bool]
+    CompareColumnParam(u16, u32, CompareOp, Option<DataType>), // col_idx, slot, operator, read as
+
+    /// Fused: column BETWEEN two parameters, read as the type given
+    /// Stack: [] -> [bool]
+    BetweenColumnParams(u16, u32, u32, Option<DataType>), // col_idx, low, high, read as
+
+    /// Fused: column IN a list of parameters, read as the type given
+    /// Stack: [] -> [bool]
+    InColumnParams(u16, Arc<[u32]>, Option<DataType>), // col_idx, slots, read as
+
     // =========================================================================
     // LOGICAL OPERATIONS
     // =========================================================================
@@ -899,6 +911,15 @@ impl std::fmt::Debug for Op {
             }
             Op::BetweenColumnConst(col, low, high) => {
                 write!(f, "BetweenColumnConst({}, {:?}, {:?})", col, low, high)
+            }
+            Op::CompareColumnParam(col, slot, op, read_as) => {
+                write!(f, "CompareColumnParam({col}, {slot}, {op:?}, {read_as:?})")
+            }
+            Op::BetweenColumnParams(col, low, high, read_as) => {
+                write!(f, "BetweenColumnParams({col}, {low}, {high}, {read_as:?})")
+            }
+            Op::InColumnParams(col, slots, read_as) => {
+                write!(f, "InColumnParams({col}, {slots:?}, {read_as:?})")
             }
             Op::And(target) => write!(f, "And(jump={})", target),
             Op::Or(target) => write!(f, "Or(jump={})", target),
