@@ -95,7 +95,7 @@ fn cold_table_with_index(dir: &Path, snapshot: bool, indexed: bool) -> (Segmente
 }
 
 #[test]
-fn snapshot_count_propagates_reload_failure_and_keeps_local_rows() {
+fn snapshot_rows_propagate_reload_failure_while_the_count_reads_the_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let (table, path) = cold_table(dir.path(), true);
     let bytes = std::fs::read(&path).unwrap();
@@ -111,7 +111,11 @@ fn snapshot_count_propagates_reload_failure_and_keeps_local_rows() {
             format!("{:?}", table.collect_all_rows(None).map(|rows| rows.len())),
             format!("{expected:?}")
         );
-        assert_eq!(format!("{:?}", table.row_count()), format!("{expected:?}"));
+        assert_eq!(
+            table.row_count().unwrap(),
+            3,
+            "the two sealed ids and the local row, counted without the volume's data"
+        );
     }
     std::fs::write(&path, bytes).unwrap();
     assert_eq!(table.collect_all_rows(None).unwrap().len(), 3);
