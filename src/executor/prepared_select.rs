@@ -2073,12 +2073,12 @@ struct Chain<'a> {
 
 /// An identifier spelled `value`, matched as `lower`
 fn ident(value: &str, lower: &str) -> Identifier {
-    let mut id = Identifier::new(
-        Token::new(TokenType::Identifier, value, Position::default()),
-        value,
-    );
-    id.value_lower = SmartString::from(lower);
-    id
+    Identifier {
+        value: SmartString::from(value),
+        value_lower: SmartString::from(lower),
+        position: Position::default(),
+        quoted: false,
+    }
 }
 
 impl Chain<'_> {
@@ -3176,7 +3176,8 @@ enum Passing {
 /// A statement's WHERE rewritten for its blocks, before it compiles
 struct WhereParts {
     clause: Expression,
-    pushed: Vec<Expression>,
+    /// The conjuncts the scan takes, None when it takes the whole clause
+    pushed: Option<Vec<Expression>>,
     /// The clause without the pushed conjuncts, when some are pushed and
     /// some are not
     scanned: Option<Expression>,
@@ -3312,8 +3313,10 @@ impl WhereParts {
                     scanned.map(|p| WhereProgram::of(p, WhereRest::NarrowedScanned, blocks)),
                 )
             });
-        let pushed = self.pushed.len();
-        let pushdown = conjunction(self.pushed);
+        let (pushed, pushdown) = match self.pushed {
+            None => (self.conjuncts, Some(self.clause)),
+            Some(parts) => (parts.len(), conjunction(parts)),
+        };
         PreparedWhere {
             point: self.point.map(|(key, _)| (key, programs.pointed)),
             needed: None,
@@ -6887,7 +6890,7 @@ impl PreparedSelect {
             // No conjunct: the scan reads every row with no filter, and takes it whole
             None => WhereParts {
                 clause: true_literal(),
-                pushed: Vec::new(),
+                pushed: Some(Vec::new()),
                 scanned: None,
                 narrowed: Vec::new(),
                 set_tests: Vec::new(),
@@ -9428,15 +9431,11 @@ impl Builder<'_> {
         let mut parts = Vec::new();
         conjuncts(where_clause, &mut parts);
         let mut rewritten = Vec::with_capacity(parts.len());
-        let mut pushed = Vec::new();
         let mut set_tests = Vec::new();
         for (at, part) in parts.into_iter().enumerate() {
             let part = self.statement_conjunct(chain, part, false, work, run_slots)?;
             let scanned =
                 !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema);
-            if scanned {
-                pushed.push(part.clone());
-            }
             let set_test = match &part {
                 Expression::Exists(mark) => Some((&mark.subquery, false, None)),
                 Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Not => {
@@ -9461,8 +9460,7 @@ impl Builder<'_> {
             rewritten.push((part, scanned));
         }
         let conjuncts = rewritten.len();
-        let clause = conjunction(rewritten.iter().map(|(part, _)| part.clone()).collect())
-            .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
+        let pushed_count = rewritten.iter().filter(|&&(_, pushed)| pushed).count();
         // The conjuncts the `kept` test keeps; TRUE for none
         let rest = |kept: &dyn Fn(usize, bool) -> bool| {
             let parts = rewritten
@@ -9473,7 +9471,7 @@ impl Builder<'_> {
                 .collect();
             conjunction(parts).unwrap_or_else(true_literal)
         };
-        let scanned = match pushed.len() {
+        let scanned = match pushed_count {
             0 => None,
             n if n == conjuncts => None,
             _ => Some(rest(&|_, pushed| !pushed)),
@@ -9481,7 +9479,7 @@ impl Builder<'_> {
         let narrowed = set_tests
             .iter()
             .map(|&(.., at)| {
-                let scanned = (!pushed.is_empty()).then(|| rest(&|i, pushed| i != at && !pushed));
+                let scanned = (pushed_count > 0).then(|| rest(&|i, pushed| i != at && !pushed));
                 (rest(&|i, _| i != at), scanned)
             })
             .collect();
@@ -9493,6 +9491,16 @@ impl Builder<'_> {
             }),
             _ => None,
         };
+        // A WHERE pushed whole is its own pushdown: the clause stands for it
+        let pushed = (pushed_count < conjuncts).then(|| {
+            rewritten
+                .iter()
+                .filter(|&&(_, pushed)| pushed)
+                .map(|(part, _)| part.clone())
+                .collect()
+        });
+        let clause = conjunction(rewritten.into_iter().map(|(part, _)| part).collect())
+            .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
         Ok(WhereParts {
             clause,
             pushed,
