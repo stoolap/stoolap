@@ -3480,4 +3480,42 @@ mod tests {
             _ => panic!("expected SelectStatement"),
         }
     }
+
+    #[test]
+    fn a_set_operation_prints_as_text_that_parses_to_the_same_statement() {
+        let select = |sql: &str| match parse_stmt(sql) {
+            Some(Statement::Select(select)) => select,
+            other => panic!("{sql} parsed as {other:?}"),
+        };
+        let shape = |s: &SelectStatement| {
+            let operations: Vec<_> = s
+                .set_operations
+                .iter()
+                .map(|op| op.operation.clone())
+                .collect();
+            (
+                operations,
+                s.order_by.len(),
+                s.limit.is_some(),
+                s.offset.is_some(),
+            )
+        };
+        for sql in [
+            "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1",
+            "SELECT a FROM t UNION ALL SELECT x FROM u ORDER BY 1 DESC LIMIT 2",
+            "SELECT a FROM t INTERSECT SELECT x FROM u LIMIT 2 OFFSET 1",
+            "SELECT a FROM t EXCEPT SELECT x FROM u OFFSET 1",
+            "SELECT a FROM t UNION SELECT x FROM u FETCH FIRST 2 ROWS ONLY",
+            "SELECT a FROM t UNION SELECT x FROM u INTERSECT SELECT a FROM t ORDER BY 1 LIMIT 3",
+            "SELECT a FROM t INTERSECT SELECT x FROM u EXCEPT SELECT a FROM t ORDER BY a",
+            "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION SELECT x FROM u ORDER BY 1",
+            "SELECT * FROM (SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 LIMIT 2) AS s",
+        ] {
+            let first = select(sql);
+            let printed = first.to_string();
+            let again = select(&printed);
+            assert_eq!(again.to_string(), printed, "{sql}");
+            assert_eq!(shape(&again), shape(&first), "{sql} printed as {printed}");
+        }
+    }
 }
