@@ -596,11 +596,7 @@ impl SegmentedTable {
 
                 while let Some(i) = next_position()? {
                     let row_id = row_ids[i];
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if self.is_row_tombstoned(tombstones_arc, row_id) || hot_skip.contains(&row_id)
-                    {
+                    if !self.shows_cold_row(cs, i, row_id, tombstones_arc, &hot_skip) {
                         continue;
                     }
                     // For rows with a WHERE clause, we must evaluate the filter
@@ -695,6 +691,73 @@ impl SegmentedTable {
             }
             Ok(Some(all_rows))
         })
+    }
+
+    /// How many rows `collect_cold_and_hot(None, None)` returns: the hot
+    /// rows, and the sealed rows counted by their ids, no row built for them
+    fn count_cold_and_hot(&self) -> Result<usize> {
+        if let Some(result) = self.unsealed(|hot| hot.collect_all_rows(None).map(|r| r.len())) {
+            return result;
+        }
+
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            let hot_rows = self.hot_rows(None, None)?;
+
+            let mut skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            for &(id, _) in &hot_rows {
+                skip.insert(id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+
+            let Some(cold) = self.count_cold_rows(&skip, generation)? else {
+                return Ok(None);
+            };
+            Ok(Some(cold + hot_rows.len()))
+        })
+    }
+
+    /// The sealed rows `collect_cold_rows(None, ..)` returns, counted from
+    /// the volumes' row ids; None when a seal moved past `generation`
+    fn count_cold_rows(&self, hot_skip: &FxHashSet<i64>, generation: u64) -> Result<Option<usize>> {
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        let view = self.segment_mgr.cold_snapshot();
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::merged_read_collected();
+        if self.seal_moved(generation) {
+            return Ok(None);
+        }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_volumes_taken();
+
+        let tombstones = &view.ts;
+        let volumes: Vec<_> = view.volumes().collect();
+        let count_volume = |(_, cs): &(u64, &super::manifest::ColdSegment)| -> Result<usize> {
+            let row_ids = cs.volume.row_ids()?;
+            Ok((0..row_ids.len())
+                .filter(|&i| self.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip))
+                .count())
+        };
+        #[cfg(feature = "parallel")]
+        if volumes.len() >= 4 {
+            use rayon::prelude::*;
+            return volumes
+                .par_iter()
+                .map(count_volume)
+                .sum::<Result<usize>>()
+                .map(Some);
+        }
+        volumes
+            .iter()
+            .map(count_volume)
+            .sum::<Result<usize>>()
+            .map(Some)
     }
 
     /// Create a segmented table from a hot buffer and a segment manager.
@@ -1052,6 +1115,23 @@ impl SegmentedTable {
         tombstones
             .get(&row_id)
             .is_some_and(|&seq| self.is_tombstone_visible(seq))
+    }
+
+    /// Whether this handle shows the sealed row at position `i` of `cs`,
+    /// row `row_id`: live in its volume, not tombstoned for its reads, and
+    /// not left to a hot copy or a pending delete in `hot_skip`
+    #[inline]
+    fn shows_cold_row(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        i: usize,
+        row_id: i64,
+        tombstones: &FxHashMap<i64, u64>,
+        hot_skip: &FxHashSet<i64>,
+    ) -> bool {
+        cs.is_visible(i)
+            && !self.is_row_tombstoned(tombstones, row_id)
+            && !hot_skip.contains(&row_id)
     }
 
     /// Get the schema default for a column, or typed NULL if no default.
@@ -1676,11 +1756,7 @@ impl SegmentedTable {
             let mapping = cs.mapping.clone();
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, row_id)
-                    || hot_skip.contains(&row_id)
+                if !self.shows_cold_row(cs, i, row_id, &tombstones_arc, &hot_skip)
                     || prep.visited.contains_key(&row_id)
                 {
                     continue;
@@ -3383,13 +3459,8 @@ impl SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let mut vol_rows = RowVec::new();
                 while let Some(i) = next_row()? {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
                     let row_id = row_ids[i];
-                    if self.is_row_tombstoned(tombstones_ref, row_id)
-                        || hot_skip_ref.contains(&row_id)
-                    {
+                    if !self.shows_cold_row(cs, i, row_id, tombstones_ref, hot_skip_ref) {
                         continue;
                     }
 
@@ -3719,11 +3790,7 @@ impl SegmentedTable {
             // groups decoded across the rows
             let mut old_rows: Option<super::writer::RowReader> = None;
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                if self.is_row_tombstoned(&snap.tombstones, row_id)
-                    || hot_skip.contains(&row_id)
+                if !self.shows_cold_row(cs, i, row_id, &snap.tombstones, &hot_skip)
                     || (!prep.prepared.is_empty() && prep.prepared.contains(&row_id))
                 {
                     continue;
@@ -4304,10 +4371,7 @@ impl Table for SegmentedTable {
             for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 for (i, &id) in vol.row_ids()?.iter().enumerate() {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if !self.is_row_tombstoned(&tombstones_arc, id) && !hot_skip.contains(&id) {
+                    if self.shows_cold_row(cs, i, id, &tombstones_arc, &hot_skip) {
                         ids.push(id);
                     }
                 }
@@ -4829,7 +4893,7 @@ impl Table for SegmentedTable {
             if let Some(count) = self.fast_row_count()? {
                 return Ok(count);
             }
-            return self.collect_all_rows(None).map(|rows| rows.len());
+            return self.count_cold_and_hot();
         }
         // During seal, rows temporarily exist in both hot and cold.
         // Use the same O(1) formula with overlap correction. The count
@@ -4861,7 +4925,7 @@ impl Table for SegmentedTable {
         })?;
         match counted {
             Some(count) => Ok(count),
-            None => self.collect_all_rows(None).map(|rows| rows.len()),
+            None => self.count_cold_and_hot(),
         }
     }
 
@@ -5035,11 +5099,8 @@ impl Table for SegmentedTable {
                 };
                 let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
                 for i in start..vol.meta.row_count {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
                     let rid = row_ids[i];
-                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                    if !self.shows_cold_row(cs, i, rid, &tombstones_arc, &hot_skip) {
                         continue;
                     }
                     if let Some(col) = column {
