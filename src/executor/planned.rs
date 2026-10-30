@@ -175,7 +175,11 @@ impl Executor {
                 return None;
             };
             let table = &source.name.value_lower;
-            let first = prepared.explain(&first_branch_of(stmt), table, Vec::new())?;
+            let first = prepared.explain(
+                &first_branch_of(stmt),
+                (table, &self.function_registry),
+                Vec::new(),
+            )?;
             return Some(self.explain_set_operations(stmt, first, ctx));
         }
         self.explain_over_source(stmt, ctx)
@@ -284,7 +288,7 @@ impl Executor {
                         &held
                     }
                 };
-                if planned.keeps_no_row(stmt, terms_ctx) {
+                if planned.keeps_no_row(stmt, terms_ctx, &self.function_registry) {
                     let (plan, _) = planned.key_read()?;
                     let empty = ExecutorResult::with_arc_columns(plan.names.clone(), RowVec::new());
                     return Some(Ok(Box::new(empty) as Box<dyn QueryResult>));

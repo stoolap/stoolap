@@ -20,6 +20,7 @@ use super::program::Program;
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::{Error, Result, Row, Value};
 use crate::executor::context::ExecutionContext;
+use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::Expression;
 
 fn compile_error(e: CompileError) -> Error {
@@ -28,10 +29,15 @@ fn compile_error(e: CompileError) -> Error {
 
 /// Compile `expr` over no columns, as a one-shot evaluation does
 pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
+    compile_once_in(expr, global_registry())
+}
+
+/// [`compile_once`] with the functions of `registry`
+fn compile_once_in(expr: &Expression, registry: &FunctionRegistry) -> Result<Program> {
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::one_shot_compiled();
     let empty: &[String] = &[];
-    ExprCompiler::new(&CompileContext::with_global_registry(empty))
+    ExprCompiler::new(&CompileContext::new(empty, registry))
         .compile(expr)
         .map_err(compile_error)
 }
@@ -39,6 +45,15 @@ pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
 /// The value of `expr` over no row, with `ctx`'s parameters, outer row and
 /// transaction
 pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -> Result<Value> {
+    evaluate_once_in(expr, ctx, global_registry())
+}
+
+/// [`evaluate_once`] with the functions of `registry`
+pub(crate) fn evaluate_once_in(
+    expr: &Expression,
+    ctx: Option<&ExecutionContext>,
+    registry: &FunctionRegistry,
+) -> Result<Value> {
     // A literal or a parameter is the value its program would load
     if let Some(value) = literal_value(expr) {
         #[cfg(feature = "test-failpoints")]
@@ -51,7 +66,7 @@ pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -
         let index = parameter_slot(param).map_err(compile_error)?;
         return exec.param_ref(index as usize).cloned();
     }
-    run(&compile_once(expr)?, &exec)
+    run(&compile_once_in(expr, registry)?, &exec)
 }
 
 /// What [`evaluate_once`] does after compiling

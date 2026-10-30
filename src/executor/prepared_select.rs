@@ -3357,12 +3357,13 @@ pub struct PreparedSelect {
 
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table` or
-    /// over a source whose statement's plan is `body`, as EXPLAIN shows it;
-    /// None when the table chooses how it reads
+    /// over a source whose statement's plan is `body`, as EXPLAIN shows it,
+    /// its constant terms by the functions of `registry`; None when the
+    /// table chooses how it reads
     pub(crate) fn explain(
         &self,
         stmt: &SelectStatement,
-        table: &str,
+        (table, registry): (&str, &FunctionRegistry),
         body: Vec<String>,
     ) -> Option<Vec<String>> {
         let plan = self.plan.as_ref().filter(|plan| {
@@ -3391,7 +3392,7 @@ impl PreparedSelect {
             .filter(|_| self.constant_where)
             .map(|where_clause| {
                 let mut terms = Vec::new();
-                any_constant_term(where_clause, &mut |term| {
+                any_constant_term(where_clause, registry, &mut |term| {
                     terms.push(term.to_string());
                     false
                 });
@@ -3485,14 +3486,20 @@ impl PreparedSelect {
     }
 
     /// Whether a run of `stmt` in `ctx` keeps no row: a constant AND term
-    /// of its WHERE is false or NULL, which no read reaches a row before
-    pub(crate) fn keeps_no_row(&self, stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
+    /// of its WHERE is false or NULL with the functions of `registry`, which
+    /// no read reaches a row before
+    pub(crate) fn keeps_no_row(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        registry: &FunctionRegistry,
+    ) -> bool {
         self.has_constant_where()
             && ctx.outer_row().is_none()
             && stmt
                 .where_clause
                 .as_deref()
-                .is_some_and(|w| true_for_no_row(w, ctx))
+                .is_some_and(|w| true_for_no_row(w, ctx, registry))
     }
 
     /// Whether the WHERE holds a constant AND term, which a run asks first
@@ -7169,10 +7176,9 @@ impl PreparedSelect {
             layout,
             order_keys,
             plan,
-            constant_where: stmt
-                .where_clause
-                .as_deref()
-                .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w)),
+            constant_where: stmt.where_clause.as_deref().is_some_and(|w| {
+                !Executor::has_subqueries(w) && has_constant_term(w, &executor.function_registry)
+            }),
         })
     }
 }
@@ -9914,7 +9920,7 @@ impl Executor {
         let params = ctx.params().len();
         let prepared =
             PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch).ok()?;
-        prepared.explain(stmt, &scope, body)
+        prepared.explain(stmt, (&scope, &self.function_registry), body)
     }
 
     /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
@@ -10048,7 +10054,7 @@ impl Executor {
                     let offset = offset.as_deref().map(|o| row_count(o, ctx, "OFFSET"));
                     Some(limit.saturating_add(offset.transpose().ok()?.unwrap_or(0)))
                 });
-                let (rows, columns) = Self::tvf_rows(function, range.as_deref(), first, ctx)?;
+                let (rows, columns) = self.tvf_rows(function, range.as_deref(), first, ctx)?;
                 (columns, rows)
             }
         };
@@ -10403,7 +10409,7 @@ impl Executor {
             ),
             Some(Expression::FunctionTableSource(function)) => {
                 let (rows, columns) =
-                    Self::tvf_rows(function, stmt.where_clause.as_deref(), first, ctx)?;
+                    self.tvf_rows(function, stmt.where_clause.as_deref(), first, ctx)?;
                 let scope = function
                     .alias
                     .as_ref()
@@ -10604,7 +10610,7 @@ impl Executor {
             target.is_none_or(|target| rows.len() < target)
         };
         // A WHERE that keeps no row reads no row
-        let keeps_none = prepared.keeps_no_row(stmt, ctx);
+        let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
         // A DISTINCT of one column answers with the values the table keeps
         let column = stmt
             .distinct

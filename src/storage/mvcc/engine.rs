@@ -8633,7 +8633,9 @@ impl MVCCEngine {
             let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
             // Hot rows found before the truncate count are read again after
-            // it, and a truncate around the cold read is waited out and retried
+            // it, and a truncate around the cold read is waited out and retried;
+            // a settled read retries a seal around it too, which removes the
+            // hot rows before it clears their tombstones
             let mut stale = !result.is_empty();
             loop {
                 let begun = mgr.destructions_begun();
@@ -8646,6 +8648,7 @@ impl MVCCEngine {
                     stale = true;
                     continue;
                 }
+                let generation = settled.then(|| mgr.settled_seal_generation());
                 if stale {
                     result = store.get_visible_versions_batch(row_ids, read_txn_id.into());
                 }
@@ -8661,7 +8664,10 @@ impl MVCCEngine {
                         }
                     }
                 }
-                if !mgr.is_destruction_in_progress() && mgr.destructions_begun() == begun {
+                if !mgr.is_destruction_in_progress()
+                    && mgr.destructions_begun() == begun
+                    && generation.is_none_or(|generation| mgr.seal_generation() == generation)
+                {
                     break;
                 }
             }
@@ -8771,6 +8777,9 @@ impl MVCCEngine {
         epoch: u64,
     ) -> Result<Option<crate::core::KeyRows>> {
         let mgr = self.get_or_create_segment_manager(table_name);
+        // A seal removes its hot rows before it clears their tombstones: the
+        // value is looked up in a settled state, and one a seal moved is let go
+        let generation = mgr.settled_seal_generation();
         let found = match mgr.has_segments() {
             true => {
                 let default =
@@ -8799,11 +8808,15 @@ impl MVCCEngine {
             }
             false => None,
         };
-        let Some(row_id) = found else {
-            return Ok(Some(crate::core::KeyRows::Many(crate::core::RowVec::new())));
+        let rows = match found {
+            Some(row_id) => {
+                self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, Some(epoch))?
+            }
+            None => Some(crate::core::RowVec::new()),
         };
-        let rows =
-            self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, Some(epoch))?;
+        if mgr.seal_generation() != generation {
+            return Ok(None);
+        }
         Ok(rows.map(crate::core::KeyRows::Many))
     }
 
