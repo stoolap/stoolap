@@ -415,7 +415,12 @@ impl<'a> Lexer<'a> {
     /// `end`: escapes or edge cases, each run between them copied at once
     #[inline(never)]
     fn read_escaped_string(&mut self, start: usize, end: usize) -> SmartString {
-        let mut result = String::with_capacity(end - start + 2);
+        // Room for the text before the first escape and the quotes, or for a
+        // short literal when the escape opens it
+        let mut result = String::with_capacity(match end > start + 1 {
+            true => end - start + 2,
+            false => 32,
+        });
         result.push('\'');
         self.step_to(start + 1);
         loop {
