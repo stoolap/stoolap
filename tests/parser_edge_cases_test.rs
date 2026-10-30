@@ -292,3 +292,138 @@ fn test_large_integer_without_decimal() {
 
     assert!(val > 1e29, "Value should be very large");
 }
+
+#[test]
+fn test_a_token_after_a_whole_statement_is_an_error() {
+    let db = Database::open("memory://parser_trailing_token").expect("Failed to create database");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, a INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'abc', 5), (2, 'xyz', 6)", ())
+        .unwrap();
+
+    for (sql, token) in [
+        ("SELECT id FROM t WHERE s ~ 'a'", "'~'"),
+        ("SELECT id FROM t WHERE a ~ 3", "'~'"),
+        ("SELECT id FROM t WHERE a 3", "'3'"),
+        ("SELECT id FROM t ORDER BY a ~ 3", "'~'"),
+        ("SELECT id FROM t LIMIT 1 2", "'2'"),
+        ("UPDATE t SET a = 1 WHERE id = 1 2", "'2'"),
+    ] {
+        let err = match db.query(sql, ()) {
+            Ok(_) => panic!("{sql} ran as two statements"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&format!("expected ';' or end of input, got {token}")),
+            "{sql}: {err}"
+        );
+    }
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT a FROM t WHERE id = 1", ())
+            .unwrap(),
+        5,
+        "a refused UPDATE wrote"
+    );
+
+    for sql in [
+        "SELECT 1; SELECT 2",
+        "SELECT 2;",
+        "SELECT 2;;",
+        "SELECT ~a + a + 3 FROM t WHERE id = 1",
+    ] {
+        assert_eq!(db.query_one::<i64, _>(sql, ()).unwrap(), 2, "{sql}");
+    }
+}
+
+#[test]
+fn test_every_statement_kind_is_followed_by_the_next_after_a_semicolon() {
+    let forms = [
+        "SELECT 1",
+        "SELECT id FROM t WHERE a > 1 ORDER BY a DESC NULLS LAST LIMIT 2 OFFSET 1",
+        "SELECT a FROM t UNION ALL SELECT x FROM u",
+        "SELECT * FROM t AS OF TRANSACTION 1",
+        "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+        "INSERT INTO t VALUES (1, 2)",
+        "INSERT INTO t (id, a) SELECT id, a FROM u",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET a = 3",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (1, 2) RETURNING id",
+        "UPDATE t SET a = 1 WHERE id = 1",
+        "UPDATE t SET a = 1 RETURNING *",
+        "DELETE FROM t WHERE id = 1",
+        "DELETE FROM t",
+        "TRUNCATE TABLE t",
+        "TRUNCATE t",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c AS SELECT id FROM t",
+        "CREATE INDEX i ON t (a)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)",
+        "CREATE INDEX i ON t (a) USING HASH",
+        "CREATE VIEW v AS SELECT id FROM t",
+        "DROP TABLE t",
+        "DROP TABLE IF EXISTS t",
+        "DROP INDEX i ON t",
+        "DROP VIEW IF EXISTS v",
+        "ALTER TABLE t ADD COLUMN b INTEGER",
+        "ALTER TABLE t DROP COLUMN b",
+        "ALTER TABLE t RENAME COLUMN a TO b",
+        "ALTER TABLE t RENAME TO u",
+        "ALTER TABLE t MODIFY COLUMN a TEXT NOT NULL",
+        "BEGIN",
+        "BEGIN TRANSACTION",
+        "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        "COMMIT",
+        "ROLLBACK",
+        "ROLLBACK TO SAVEPOINT s",
+        "ROLLBACK TO s",
+        "SAVEPOINT s",
+        "RELEASE SAVEPOINT s",
+        "RELEASE s",
+        "SET isolation_level = 'SNAPSHOT'",
+        "PRAGMA sync_mode",
+        "PRAGMA sync_mode = 1",
+        "PRAGMA CHECKPOINT",
+        "VACUUM",
+        "VACUUM t",
+        "ANALYZE",
+        "ANALYZE t",
+        "ANALYZE TABLE t",
+        "SHOW TABLES",
+        "SHOW VIEWS",
+        "SHOW CREATE TABLE t",
+        "SHOW INDEXES FROM t",
+        "DESCRIBE t",
+        "DESC t",
+        "EXPLAIN SELECT 1",
+        "EXPLAIN ANALYZE SELECT 1",
+        "COPY t FROM 'f.csv' WITH (FORMAT CSV, HEADER true)",
+        "COPY t (id, a) FROM 'f.json' WITH (FORMAT JSON)",
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        let alone = match stoolap::parser::parse_sql(form) {
+            Ok(statements) => statements[0].to_string(),
+            Err(e) => {
+                wrong.push(format!("{form}: {e}"));
+                continue;
+            }
+        };
+        for (sql, at, count) in [
+            (format!("{form}; SELECT 1"), 0, 2),
+            (format!("{form};SELECT 1;"), 0, 2),
+            (format!("SELECT 1; {form}; SELECT 1"), 1, 3),
+        ] {
+            match stoolap::parser::parse_sql(&sql) {
+                Ok(statements)
+                    if statements.len() == count && statements[at].to_string() == alone => {}
+                Ok(statements) => wrong.push(format!("{sql}: {statements:?}")),
+                Err(e) => wrong.push(format!("{sql}: {e}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
