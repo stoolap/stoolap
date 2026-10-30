@@ -3446,12 +3446,25 @@ fn test_a_computed_limit_and_offset_are_read_once_before_the_rows() {
                  ORDER BY k LIMIT ABS(-2)",
                 vec![1, 2],
             ),
+            (
+                "SELECT id FROM t WHERE a < (SELECT MAX(v) FROM u) * 10 ORDER BY id \
+                 LIMIT LENGTH(\"xx\") + (SELECT 0)",
+                vec![1, 2],
+            ),
         ] {
             assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
             let before = general_hits();
             assert_eq!(ids(&db, sql, ()).0, want, "{sql}");
             assert_eq!(general_hits(), before, "{sql} reached a general path");
         }
+        const GROUPED: &str = "SELECT COUNT(*) FROM generate_series(1, 3, 0) \
+                               HAVING COUNT(*) > (SELECT 0) LIMIT 0 - 1";
+        let err = db.query(GROUPED, ()).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("LIMIT must be non-negative")),
+            "the count is read before the source: {err:?}"
+        );
     }
 }
 

@@ -1322,11 +1322,14 @@ impl Executor {
 }
 
 /// Whether the LIMIT and OFFSET read no column outside their subqueries:
-/// each is then a count read once per run, before the statement's rows
+/// each is then a count read once per run, before the statement's rows. A
+/// count's scope has no column, so a double-quoted bare name reads as text
 fn counts_fit(stmt: &SelectStatement) -> std::result::Result<(), OutOfFamily> {
     for count in stmt.limit.iter().chain(&stmt.offset) {
         let mut names = false;
-        visit_column_refs(count, &mut |_| names = true);
+        visit_column_refs(count, &mut |column| {
+            names |= !matches!(column, Expression::Identifier(id) if id.quoted)
+        });
         if names {
             return Err("a LIMIT or OFFSET naming a column");
         }
