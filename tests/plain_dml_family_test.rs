@@ -148,15 +148,20 @@ fn answers(name: &str, family: bool, cold: bool, in_transaction: bool) -> Vec<St
 #[test]
 fn a_plain_update_or_delete_answers_in_the_family_as_on_the_general_path() {
     let _serial = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
-    let set_before = prepared_dml_site_runs(PreparedDmlSite::UpdateSet);
+    let sites = [
+        PreparedDmlSite::UpdateSet,
+        PreparedDmlSite::InsertValues,
+        PreparedDmlSite::ConflictUpdate,
+    ];
+    let first = sites.map(prepared_dml_site_runs);
     for (cold, in_transaction) in [(false, false), (true, false), (false, true), (true, true)] {
         let name = format!("plain_dml_family_{cold}_{in_transaction}");
-        let general_before = prepared_dml_site_runs(PreparedDmlSite::UpdateSet);
+        let general_before = sites.map(prepared_dml_site_runs);
         let general = answers(&format!("{name}_general"), false, cold, in_transaction);
         assert_eq!(
-            prepared_dml_site_runs(PreparedDmlSite::UpdateSet),
+            sites.map(prepared_dml_site_runs),
             general_before,
-            "the general path runs no prepared SET"
+            "the general path runs no prepared site"
         );
         let family = answers(&format!("{name}_family"), true, cold, in_transaction);
         let differ: Vec<String> = general
@@ -172,7 +177,57 @@ fn a_plain_update_or_delete_answers_in_the_family_as_on_the_general_path() {
         );
     }
     assert!(
-        prepared_dml_site_runs(PreparedDmlSite::UpdateSet) > set_before,
+        prepared_dml_site_runs(PreparedDmlSite::UpdateSet) > first[0],
         "a plain UPDATE ran its SET in the family"
     );
+}
+
+/// The count or error of each statement on a fresh table, the family on
+fn upsert_answers(name: &str, statements: &[&str]) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let db = table(name, false, &dir);
+    statements
+        .iter()
+        .map(|sql| match db.execute(sql, ()) {
+            Ok(changed) => format!("changed {changed}"),
+            Err(error) => format!("error {error}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_prepared_upsert_raises_its_update_value_error_only_at_a_conflict() {
+    let _serial = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    let upsert = |id: i64, one: &str| {
+        format!(
+            "INSERT INTO t VALUES ({id}, 1, 1, 1.0, 'n', 1, {}, 1) \
+             ON CONFLICT (id) DO UPDATE SET b = 9223372036854775807 + {one}",
+            id + 900
+        )
+    };
+    // No conflict, then a conflict: the update value fails only at the second
+    let prepared = [upsert(99, "(SELECT 1)"), upsert(1, "(SELECT 1)")];
+    let literal = [upsert(99, "1"), upsert(1, "1")];
+    let sites = [PreparedDmlSite::ConflictUpdate];
+    let before = sites.map(prepared_dml_site_runs);
+    let got = upsert_answers(
+        "prepared_upsert_value_error",
+        &prepared.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let ran = sites.map(prepared_dml_site_runs);
+    let want = upsert_answers(
+        "literal_upsert_value_error",
+        &literal.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert!(
+        want[0] == "changed 1" && want[1].contains("overflow"),
+        "the literal twins insert, then fail at the conflict: {want:?}"
+    );
+    assert_eq!(
+        got, want,
+        "the prepared upserts answer as their literal twins"
+    );
+    for ((site, before), ran) in sites.iter().zip(before).zip(ran) {
+        assert!(ran > before, "the prepared upserts reached {site:?}");
+    }
 }
