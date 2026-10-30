@@ -2456,28 +2456,21 @@ impl Executor {
             }
         }
 
-        // Subqueries of the prepared family run through one runner, which
-        // reads the tables as the statement found them
-        let where_has_subqueries = stmt
-            .where_clause
-            .as_deref()
-            .is_some_and(Self::has_subqueries);
+        // A statement of the prepared family runs through one runner, whose
+        // subqueries read the tables as the statement found them
         let returning_has_subqueries = stmt.returning.iter().any(Self::has_subqueries);
         let returning_values = returning_has_subqueries
             .then(|| super::prepared_select::returning_values(&stmt.returning))
             .into_iter()
             .flatten();
-        let in_family = (where_has_subqueries
-            || stmt.updates.values().any(Self::has_subqueries)
-            || returning_has_subqueries)
-            && self
-                .dml_family(
-                    stmt.where_clause.as_deref(),
-                    stmt.updates.values().chain(returning_values),
-                    ctx,
-                )
-                .is_ok();
-        let where_prepared = in_family && where_has_subqueries;
+        let in_family = self
+            .dml_family(
+                stmt.where_clause.as_deref(),
+                stmt.updates.values().chain(returning_values),
+                ctx,
+            )
+            .is_ok();
+        let where_prepared = in_family && stmt.where_clause.is_some();
         let held_dml;
         let dml_run = if in_family {
             let col_map = schema.column_index_map();
@@ -2972,6 +2965,7 @@ impl Executor {
             // CRITICAL: Pre-compile update expressions ONCE before the loop
             // Compile directly from source expressions (no intermediate cloning!)
             use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+            use super::prepared_select::Candidates;
 
             let col_map = schema.column_index_map();
             let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
@@ -3078,31 +3072,62 @@ impl Executor {
             };
             let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                 FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
+            let candidates = match dml_run.as_ref().filter(|_| where_prepared) {
+                Some(run) => Some(run.candidates(&*table, ctx)?),
+                None => None,
+            };
+            // Who asks each row its WHERE, chosen once for the statement
+            enum RowWhere<'w, 'r> {
+                Passed,
+                Runner(&'w super::prepared_select::DmlRunner<'r>),
+                Program(&'w SharedProgram),
+                Clause(&'w Expression),
+            }
+            let row_where = match (&dml_run, &candidates) {
+                (Some(run), Some(Candidates::Keyed(_) | Candidates::Scan(_))) => {
+                    RowWhere::Runner(run)
+                }
+                (_, Some(_)) => RowWhere::Passed,
+                (_, None) => match (&memory_where_program, &memory_where_clause) {
+                    (Some(program), _) => RowWhere::Program(program),
+                    (None, Some(clause)) => RowWhere::Clause(clause),
+                    (None, None) => RowWhere::Passed,
+                },
+            };
+            // The context each row's programs read, built once over no row
+            let no_row = Row::new();
+            let row_ctx = match &dml_run {
+                Some(run) => run.context(&no_row),
+                None => ExecuteContext::new(&no_row)
+                    .with_params(params)
+                    .with_transaction_id(transaction_id),
+            };
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
-                    let exec_ctx = match &dml_run {
-                        Some(run) => run.context(&row),
-                        None => ExecuteContext::new(&row)
-                            .with_params(params)
-                            .with_transaction_id(transaction_id),
+                    let exec_ctx = ExecuteContext {
+                        row: &row,
+                        ..row_ctx
                     };
 
                     // In-memory WHERE filtering shares the row context
-                    if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
-                        #[cfg(feature = "test-failpoints")]
-                        crate::test_failpoints::prepared_dml_site_ran(
-                            crate::test_failpoints::PreparedDmlSite::UpdateWhere,
-                        );
-                        if !run.matches(&mut vm, &exec_ctx)? {
-                            return Ok((row, false));
+                    match row_where {
+                        RowWhere::Passed => {}
+                        RowWhere::Runner(run) => {
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::prepared_dml_site_ran(
+                                crate::test_failpoints::PreparedDmlSite::UpdateWhere,
+                            );
+                            if !run.matches(&mut vm, &exec_ctx)? {
+                                return Ok((row, false));
+                            }
                         }
-                    } else if needs_memory_filter {
-                        if let Some(ref program) = memory_where_program {
+                        RowWhere::Program(program) => {
                             if !vm.execute_bool_checked(program, &exec_ctx)? {
                                 return Ok((row, false));
                             }
-                        } else if let Some(ref where_expr) = memory_where_clause {
+                        }
+                        RowWhere::Clause(where_expr) => {
                             evaluator.set_row_array(&row);
                             let held = if where_is_correlated {
                                 outer_row_map.clear();
@@ -3213,15 +3238,14 @@ impl Executor {
 
             // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch update.
             // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
-            let rows = if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
-                // The setter asks each candidate the WHERE once, as it is written
-                match run.candidates(&*table, ctx)? {
-                    super::prepared_select::Candidates::Pruned => 0,
-                    super::prepared_select::Candidates::Keyed(mut row_ids) => {
+            let rows = if let Some(candidates) = candidates {
+                match candidates {
+                    Candidates::Pruned => 0,
+                    Candidates::Keyed(mut row_ids) => {
                         row_ids.sort_unstable();
                         table.update_by_row_ids(&row_ids, &mut setter)?
                     }
-                    super::prepared_select::Candidates::Scan(expr) => {
+                    Candidates::Scan(expr) | Candidates::Whole(expr) => {
                         table.update(expr.as_deref(), &mut setter)?
                     }
                 }
@@ -3341,8 +3365,8 @@ impl Executor {
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
-        // A WHERE and a RETURNING whose subqueries are of the prepared family
-        // run through one runner, which reads the tables as the statement found them
+        // A statement of the prepared family runs through one runner, whose
+        // subqueries read the tables as the statement found them
         let where_has_subqueries = stmt
             .where_clause
             .as_deref()
@@ -3352,20 +3376,14 @@ impl Executor {
             .then(|| super::prepared_select::returning_values(&stmt.returning))
             .into_iter()
             .flatten();
-        let in_family = (where_has_subqueries || returning_has_subqueries)
-            && self
-                .dml_family(
-                    stmt.where_clause
-                        .as_deref()
-                        .filter(|_| where_has_subqueries),
-                    returning_values,
-                    ctx,
-                )
-                .is_ok();
-        let where_prepared = in_family && where_has_subqueries;
+        let in_family = self
+            .dml_family(stmt.where_clause.as_deref(), returning_values, ctx)
+            .is_ok();
+        let where_prepared = in_family && stmt.where_clause.is_some();
         // Without a view the prepared subqueries read a snapshot taken before the write
         let snapshot_ctx;
         let ctx = if in_family
+            && (where_has_subqueries || returning_has_subqueries)
             && active_tx.is_none()
             && ctx.statement_view().is_none()
             && ctx.statement_snapshot().is_none()
@@ -3468,8 +3486,15 @@ impl Executor {
             Option<Expression>,
         ) = if let Some(ref where_clause) = stmt.where_clause {
             if where_prepared {
-                // The runner reads the rows a prepared WHERE passes
-                (None, true, None)
+                // A scan that takes the whole WHERE deletes as it reads; else
+                // the runner reads the rows a prepared WHERE passes
+                match dml_run.as_ref().filter(|_| !has_returning) {
+                    Some(run) => match run.candidates(&*table, ctx)? {
+                        super::prepared_select::Candidates::Whole(expr) => (expr, false, None),
+                        _ => (None, true, None),
+                    },
+                    None => (None, true, None),
+                }
             } else if has_correlated {
                 // Try semi-join optimization for correlated EXISTS/IN
                 // Avoid cloning upfront - only clone if no optimization succeeds

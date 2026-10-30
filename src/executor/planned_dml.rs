@@ -130,10 +130,16 @@ impl Executor {
                 {
                     return None
                 }
+                CompiledExecution::PreparedDml(prepared)
+                    if prepared.validity.holds(&*self.engine, epoch) =>
+                {
+                    return None
+                }
                 // One planned for tables since changed is planned again
                 CompiledExecution::Unknown
                 | CompiledExecution::NotOptimizable(_)
-                | CompiledExecution::PlannedDml(_) => {}
+                | CompiledExecution::PlannedDml(_)
+                | CompiledExecution::PreparedDml(_) => {}
                 _ => return None,
             }
         }
@@ -147,9 +153,15 @@ impl Executor {
             CompiledExecution::NotOptimizable(validity) if validity.holds(&*self.engine, epoch) => {
                 return None
             }
+            CompiledExecution::PreparedDml(prepared)
+                if prepared.validity.holds(&*self.engine, epoch) =>
+            {
+                return None
+            }
             CompiledExecution::Unknown
             | CompiledExecution::NotOptimizable(_)
-            | CompiledExecution::PlannedDml(_) => {}
+            | CompiledExecution::PlannedDml(_)
+            | CompiledExecution::PreparedDml(_) => {}
             _ => return None,
         }
         // Read before the schema: a change in between leaves this behind

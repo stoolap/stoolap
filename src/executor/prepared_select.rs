@@ -8427,7 +8427,7 @@ impl Executor {
 /// one set of blocks
 #[derive(Debug)]
 pub struct PreparedDml {
-    validity: PlanValidity,
+    pub(crate) validity: PlanValidity,
     /// The CTEs its context bound
     cte_scope: CteScope,
     /// The target's columns at preparation
@@ -9552,6 +9552,7 @@ pub(crate) struct DmlTables {
 }
 
 /// The rows an UPDATE may write, each asked its WHERE as it is written
+/// unless the scan took it whole
 pub(crate) enum Candidates {
     /// The scan proves that no row passes
     Pruned,
@@ -9559,6 +9560,8 @@ pub(crate) enum Candidates {
     Keyed(Vec<i64>),
     /// A scan narrowed by the conjuncts without a subquery
     Scan(Option<Box<dyn StorageExpr>>),
+    /// A scan that takes the whole WHERE: its rows pass it
+    Whole(Option<Box<dyn StorageExpr>>),
 }
 
 /// One execution of a prepared UPDATE or DELETE over its target's rows
@@ -9626,7 +9629,7 @@ impl<'a> DmlRunner<'a> {
         ctx: &ExecutionContext,
     ) -> Result<Candidates> {
         let Some(where_) = &self.prepared.where_ else {
-            return Ok(Candidates::Scan(None));
+            return Ok(Candidates::Whole(None));
         };
         let Some(scan) = self.runner.where_scan(where_, None, None, table, ctx)? else {
             return Ok(Candidates::Pruned);
@@ -9644,6 +9647,7 @@ impl<'a> DmlRunner<'a> {
             None => Some(scan),
         };
         Ok(match scan {
+            Some((storage_expr, true, ..)) => Candidates::Whole(storage_expr),
             Some((storage_expr, ..)) => Candidates::Scan(storage_expr),
             None => Candidates::Pruned,
         })
@@ -10597,13 +10601,17 @@ impl Executor {
     }
 
     /// Whether an UPDATE's or DELETE's WHERE and SET values run prepared:
-    /// they hold a subquery, and every form in them is the family's
+    /// every form in them is the family's
     pub(crate) fn dml_family<'e>(
         &self,
         where_clause: Option<&'e Expression>,
         sets: impl IntoIterator<Item = &'e Expression>,
         ctx: &'e ExecutionContext,
     ) -> std::result::Result<(), OutOfFamily> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::prepared_families_off() {
+            return Err("the prepared families are off");
+        }
         if ctx.outer_row().is_some() {
             return Err("it runs for a row of an enclosing statement");
         }
@@ -10611,12 +10619,8 @@ impl Executor {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
         };
-        let mut found = false;
         for expr in where_clause.into_iter().chain(sets) {
-            family.expression(expr, 1, Site::Subqueries, &mut found)?;
-        }
-        if !found {
-            return Err("the statement holds no subquery");
+            family.expression(expr, 1, Site::Subqueries, &mut false)?;
         }
         family.catalog()
     }
