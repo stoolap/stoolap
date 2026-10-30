@@ -1341,12 +1341,9 @@ impl SegmentedTable {
     /// Uses zone maps, bloom filters, dictionary pre-filters, and binary search
     /// on sorted columns for fast rejection. No index population needed.
     /// Check cold unique constraints for UPDATE, excluding the row being updated.
-    /// The seal generation of a settled state, read under the fence: a
-    /// seal halfway through its publication, its segment registered and
-    /// its hot rows not yet removed, is never taken for done
+    /// See [`super::manifest::SegmentManager::settled_seal_generation`]
     fn settled_generation(mgr: &super::manifest::SegmentManager) -> u64 {
-        let _fence = mgr.acquire_seal_read();
-        mgr.seal_generation()
+        mgr.settled_seal_generation()
     }
 
     /// The generation and the volumes of a settled state, read together

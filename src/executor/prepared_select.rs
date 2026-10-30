@@ -76,7 +76,8 @@ use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
-    order_by_names_an_alias, split_qualified, strip_table_qualifier, QUALIFIER_SEP,
+    order_by_names_an_alias, split_qualified, strip_table_qualifier, value_to_expression,
+    QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
@@ -3122,6 +3123,9 @@ struct PreparedWhere {
     /// The first conjunct equating the primary key, and the WHERE without
     /// it when it has another conjunct
     point: Option<(PreparedComparison, Option<SharedProgram>)>,
+    /// Each conjunct equating a column with a value, which a unique index
+    /// of the column reads the row by; none beside a primary key equality
+    equalities: Vec<PreparedComparison>,
     /// The table columns a statement without blocks reads, for a table
     /// that reads by need to leave the others out
     needed: Option<Vec<bool>>,
@@ -3258,6 +3262,9 @@ struct WhereParts {
     /// The first conjunct equating the primary key, and the clause without
     /// it; None for the clause when it is the only conjunct
     point: Option<(PreparedComparison, Option<Expression>)>,
+    /// Each conjunct equating a column with a value; none beside a primary
+    /// key equality
+    equalities: Vec<PreparedComparison>,
     conjuncts: usize,
 }
 
@@ -3387,6 +3394,7 @@ impl WhereParts {
         };
         PreparedWhere {
             point: self.point.map(|(key, _)| (key, programs.pointed)),
+            equalities: self.equalities,
             needed: None,
             push: pushdown.as_ref().and_then(|p| PreparedPush::of(p, schema)),
             whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
@@ -3440,16 +3448,21 @@ pub struct PreparedSelect {
 
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table` or
-    /// over a source whose statement's plan is `body`, as EXPLAIN shows it;
-    /// None when the table chooses how it reads
+    /// over a source whose statement's plan is `body`, as EXPLAIN shows it,
+    /// its constant terms by the functions of `registry`; None when the
+    /// table chooses how it reads
     pub(crate) fn explain(
         &self,
         stmt: &SelectStatement,
-        table: &str,
+        (table, registry): (&str, &FunctionRegistry),
         body: Vec<String>,
     ) -> Option<Vec<String>> {
         let plan = self.plan.as_ref().filter(|plan| {
-            plan.read.scan().is_some() || matches!(plan.read, Read::Source(_) | Read::PkGet(_))
+            plan.read.scan().is_some()
+                || matches!(
+                    plan.read,
+                    Read::Source(_) | Read::PkGet(_) | Read::UniqueGet(_)
+                )
         })?;
         // A source's rows are each judged by the whole WHERE
         let pushed = match plan.read {
@@ -3464,14 +3477,13 @@ impl PreparedSelect {
             let keys: Vec<String> = stmt.distinct_on.iter().map(|k| k.to_string()).collect();
             keys.join(", ")
         });
-        // A key read judges each row by the whole WHERE
         let empty_unless = stmt
             .where_clause
             .as_deref()
-            .filter(|_| self.constant_where && !matches!(plan.read, Read::PkGet(_)))
+            .filter(|_| self.constant_where)
             .map(|where_clause| {
                 let mut terms = Vec::new();
-                any_constant_term(where_clause, &mut |term| {
+                any_constant_term(where_clause, registry, &mut |term| {
                     terms.push(term.to_string());
                     false
                 });
@@ -3500,10 +3512,11 @@ impl PreparedSelect {
         )
     }
 
-    /// Reads the statement's row by its primary key equality, skipping
+    /// Reads the statement's row by its primary key equality, else by an
+    /// equality a unique index of its column alone answers, skipping
     /// `offset` rows and keeping `limit`, for a statement that asks no block,
     /// takes no set and computes no sort or DISTINCT ON key; a run whose key
-    /// names no row id reads as the plan did
+    /// names no row reads as the plan did
     pub(crate) fn read_by_key(
         &mut self,
         (table, store): (SmartString, &Arc<VersionStore>),
@@ -3513,9 +3526,22 @@ impl PreparedSelect {
         if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() {
             return;
         }
-        let (Some((key, filter)), Some(items)) = (self.where_.point.clone(), self.output_items())
-        else {
+        let Some(items) = self.output_items() else {
             return;
+        };
+        // A unique read is asked the whole WHERE, its own equality too
+        let (key, filter, unique) = match self.where_.point.clone() {
+            Some((key, filter)) => (key, filter, false),
+            None => match self
+                .where_
+                .equalities
+                .iter()
+                .find(|key| store.has_unique_index_on(key.index))
+                .filter(|_| !self.asks_blocks())
+            {
+                Some(key) => (key.clone(), Some(self.where_.whole.program.clone()), true),
+                None => return,
+            },
         };
         let projection = Projection::of(items);
         let mut steps = SmallVec::new();
@@ -3543,14 +3569,40 @@ impl PreparedSelect {
         };
         self.plan = Some(Plan {
             steps,
-            read: Read::PkGet(read),
+            read: match unique {
+                true => Read::UniqueGet(read),
+                false => Read::PkGet(read),
+            },
         });
     }
 
-    /// The key read the plan chose
-    pub(crate) fn key_read(&self) -> Option<&KeyRead> {
+    /// Whether a run of `stmt` in `ctx` keeps no row: a constant AND term
+    /// of its WHERE is false or NULL with the functions of `registry`, which
+    /// no read reaches a row before
+    pub(crate) fn keeps_no_row(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        registry: &FunctionRegistry,
+    ) -> bool {
+        self.has_constant_where()
+            && ctx.outer_row().is_none()
+            && stmt
+                .where_clause
+                .as_deref()
+                .is_some_and(|w| true_for_no_row(w, ctx, registry))
+    }
+
+    /// Whether the WHERE holds a constant AND term, which a run asks first
+    pub(crate) fn has_constant_where(&self) -> bool {
+        self.constant_where
+    }
+
+    /// The key read the plan chose, and whether a unique index reads it
+    pub(crate) fn key_read(&self) -> Option<(&KeyRead, bool)> {
         match self.plan.as_ref().map(|plan| &plan.read) {
-            Some(Read::PkGet(read)) => Some(read),
+            Some(Read::PkGet(read)) => Some((read, false)),
+            Some(Read::UniqueGet(read)) => Some((read, true)),
             _ => None,
         }
     }
@@ -4166,6 +4218,11 @@ impl PreparedComparison {
         self.index == index && self.operator == Operator::Eq
     }
 
+    /// The position of the column compared
+    pub(crate) fn column(&self) -> usize {
+        self.index
+    }
+
     /// The integer this call compares against, by [`Self::value`]'s rule;
     /// an integer is read as it is
     pub(crate) fn integer(&self, params: &[Value]) -> Option<i64> {
@@ -4185,7 +4242,9 @@ impl PreparedComparison {
     /// The comparison as EXPLAIN shows it
     pub(crate) fn describe(&self) -> String {
         match &self.value {
-            PreparedValue::Const(value) => format!("{} = {value}", self.column),
+            PreparedValue::Const(value) => {
+                format!("{} = {}", self.column, value_to_expression(value))
+            }
             PreparedValue::Slot(slot) => format!("{} = ${}", self.column, slot + 1),
         }
     }
@@ -6963,6 +7022,7 @@ impl PreparedSelect {
                 narrowed: Vec::new(),
                 set_tests: Vec::new(),
                 point: None,
+                equalities: Vec::new(),
                 conjuncts: 0,
             },
         };
@@ -7207,10 +7267,9 @@ impl PreparedSelect {
             layout,
             order_keys,
             plan,
-            constant_where: stmt
-                .where_clause
-                .as_deref()
-                .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w)),
+            constant_where: stmt.where_clause.as_deref().is_some_and(|w| {
+                !Executor::has_subqueries(w) && has_constant_term(w, &executor.function_registry)
+            }),
         })
     }
 }
@@ -9563,14 +9622,27 @@ impl Builder<'_> {
                 (rest(&|i, _| i != at), scanned)
             })
             .collect();
-        let point = match schema.primary_key_indices() {
-            [pk] => rewritten.iter().enumerate().find_map(|(at, (part, _))| {
-                let key = PreparedComparison::from_conjunct(part, schema)
-                    .filter(|key| key.equates(*pk))?;
-                Some((key, (conjuncts > 1).then(|| rest(&|i, _| i != at))))
-            }),
+        // The first primary key equality, else every equality; a primary key
+        // read leaves the others unread
+        let pk = match schema.primary_key_indices() {
+            [pk] => Some(*pk),
             _ => None,
         };
+        let mut point = None;
+        let mut equalities = Vec::new();
+        for (at, (part, _)) in rewritten.iter().enumerate() {
+            let Some(key) = PreparedComparison::from_conjunct(part, schema)
+                .filter(|key| key.operator == Operator::Eq)
+            else {
+                continue;
+            };
+            if pk.is_some_and(|pk| key.equates(pk)) {
+                point = Some((key, (conjuncts > 1).then(|| rest(&|i, _| i != at))));
+                equalities = Vec::new();
+                break;
+            }
+            equalities.push(key);
+        }
         // A WHERE pushed whole is its own pushdown: the clause stands for it
         let pushed = (pushed_count < conjuncts).then(|| {
             rewritten
@@ -9588,6 +9660,7 @@ impl Builder<'_> {
             narrowed,
             set_tests,
             point,
+            equalities,
             conjuncts,
         })
     }
@@ -9938,7 +10011,7 @@ impl Executor {
         let params = ctx.params().len();
         let prepared =
             PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch).ok()?;
-        prepared.explain(stmt, &scope, body)
+        prepared.explain(stmt, (&scope, &self.function_registry), body)
     }
 
     /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
@@ -10072,7 +10145,7 @@ impl Executor {
                     let offset = offset.as_deref().map(|o| row_count(o, ctx, "OFFSET"));
                     Some(limit.saturating_add(offset.transpose().ok()?.unwrap_or(0)))
                 });
-                let (rows, columns) = Self::tvf_rows(function, range.as_deref(), first, ctx)?;
+                let (rows, columns) = self.tvf_rows(function, range.as_deref(), first, ctx)?;
                 (columns, rows)
             }
         };
@@ -10427,7 +10500,7 @@ impl Executor {
             ),
             Some(Expression::FunctionTableSource(function)) => {
                 let (rows, columns) =
-                    Self::tvf_rows(function, stmt.where_clause.as_deref(), first, ctx)?;
+                    self.tvf_rows(function, stmt.where_clause.as_deref(), first, ctx)?;
                 let scope = function
                     .alias
                     .as_ref()
@@ -10628,12 +10701,7 @@ impl Executor {
             target.is_none_or(|target| rows.len() < target)
         };
         // A WHERE that keeps no row reads no row
-        let keeps_none = prepared.constant_where
-            && ctx.outer_row().is_none()
-            && stmt
-                .where_clause
-                .as_deref()
-                .is_some_and(|w| true_for_no_row(w, ctx));
+        let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
         // A DISTINCT of one column answers with the values the table keeps
         let column = stmt
             .distinct

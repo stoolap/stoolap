@@ -319,6 +319,11 @@ fn count_chain_depth(entry: &VersionChainEntry) -> usize {
     depth
 }
 
+/// Whether `index` is a unique index of `column` alone
+fn unique_on(index: &Arc<dyn Index>, column: usize) -> bool {
+    index.is_unique() && index.column_ids() == [column as i32]
+}
+
 /// Convert arena index (usize) to compact representation (Option<NonZeroU64>)
 /// Stores `idx + 1` so that 0 can represent None via niche optimization
 #[inline(always)]
@@ -5285,6 +5290,30 @@ impl VersionStore {
             }
         }
         Ok(())
+    }
+
+    /// Whether a unique index of `column` alone exists
+    pub(crate) fn has_unique_index_on(&self, column: usize) -> bool {
+        self.indexes
+            .read()
+            .values()
+            .any(|entry| unique_on(&entry.index, column))
+    }
+
+    /// The hot row the unique index of `column` alone holds for `value`:
+    /// None without such an index, Some(None) when it holds no row
+    pub(crate) fn unique_row_id(&self, column: usize, value: &Value) -> Option<Option<i64>> {
+        let indexes = self.indexes.read();
+        let index = indexes
+            .values()
+            .map(|entry| &entry.index)
+            .find(|index| unique_on(index, column))?;
+        Some(
+            index
+                .get_row_ids_equal(std::slice::from_ref(value))
+                .first()
+                .copied(),
+        )
     }
 
     /// Acquire the per-table upsert mutex. Returns an owned guard.

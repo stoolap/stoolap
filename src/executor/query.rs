@@ -495,7 +495,7 @@ use super::utils::{
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
-use crate::functions::{global_registry, Volatility};
+use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
@@ -1142,31 +1142,38 @@ fn is_star_item(expr: &Expression) -> bool {
 }
 
 /// Whether `each` holds for one of a WHERE's AND terms that is a statement
-/// constant, so no column reads as the text of its name; asked in order
+/// constant over the functions of `registry`, so no column reads as the
+/// text of its name; asked in order
 pub(crate) fn any_constant_term<'e>(
     expr: &'e Expression,
+    registry: &FunctionRegistry,
     each: &mut impl FnMut(&'e Expression) -> bool,
 ) -> bool {
     if let Expression::Infix(infix) = expr {
         if infix.op_type == InfixOperator::And {
-            return any_constant_term(&infix.left, each) || any_constant_term(&infix.right, each);
+            return any_constant_term(&infix.left, registry, each)
+                || any_constant_term(&infix.right, registry, each);
         }
     }
-    statement_constant(expr, global_registry()) && each(expr)
+    statement_constant(expr, registry) && each(expr)
 }
 
 /// Whether one of a WHERE's AND terms is a statement constant: only such a
 /// WHERE can be [`true_for_no_row`]
-pub(crate) fn has_constant_term(expr: &Expression) -> bool {
-    any_constant_term(expr, &mut |_| true)
+pub(crate) fn has_constant_term(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    any_constant_term(expr, registry, &mut |_| true)
 }
 
 /// Whether a WHERE `expr` keeps no row: one of its constant AND terms
-/// evaluates to false or NULL
-pub(crate) fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
-    any_constant_term(expr, &mut |term| {
+/// evaluates to false or NULL with the functions of `registry`
+pub(crate) fn true_for_no_row(
+    expr: &Expression,
+    ctx: &ExecutionContext,
+    registry: &FunctionRegistry,
+) -> bool {
+    any_constant_term(expr, registry, &mut |term| {
         matches!(
-            super::expression::evaluate_once(term, Some(ctx)),
+            super::expression::evaluate_once_in(term, Some(ctx), registry),
             Ok(Value::Boolean(false) | Value::Null(_))
         )
     })
@@ -2736,6 +2743,7 @@ impl Executor {
     /// and apply an optional filter. Shared by execute_table_expression_with_filter
     /// and execute_table_expression_with_filter_limit.
     fn execute_tvf_for_join(
+        &self,
         tvf_source: &FunctionTableSource,
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
@@ -2748,7 +2756,7 @@ impl Executor {
         // limit and offset were applied here. A filter that keeps no row
         // generates none.
         let tvf_limit = match filter {
-            Some(filter) if true_for_no_row(filter, ctx) => Some(0),
+            Some(filter) if true_for_no_row(filter, ctx, &self.function_registry) => Some(0),
             Some(_) => None,
             None => limit.map(|l| l.saturating_add(offset)),
         };
@@ -2827,7 +2835,7 @@ impl Executor {
         };
 
         let (result_rows, columns) =
-            Self::tvf_rows(tvf_source, stmt.where_clause.as_deref(), limit_hint, ctx)?;
+            self.tvf_rows(tvf_source, stmt.where_clause.as_deref(), limit_hint, ctx)?;
 
         // Delegate to execute_query_on_memory_result which handles
         // WHERE, ORDER BY, LIMIT, GROUP BY, aggregation, window functions
@@ -2838,6 +2846,7 @@ impl Executor {
     /// `where_clause`: none when it holds for no row, else the range its
     /// conjuncts on the TVF's column allow, up to `limit`
     pub(super) fn tvf_rows(
+        &self,
         tvf_source: &FunctionTableSource,
         where_clause: Option<&Expression>,
         limit: Option<usize>,
@@ -2846,7 +2855,7 @@ impl Executor {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
         if let Some(where_clause) = where_clause {
-            if true_for_no_row(where_clause, ctx) {
+            if true_for_no_row(where_clause, ctx, &self.function_registry) {
                 return Ok((RowVec::new(), Self::tvf_columns(tvf_source)?));
             }
         }
@@ -3866,7 +3875,7 @@ impl Executor {
         if let Some(where_clause) = stmt.where_clause.as_deref().filter(|w| {
             !classification.where_has_subqueries
                 && ctx.outer_row().is_none()
-                && true_for_no_row(w, ctx)
+                && true_for_no_row(w, ctx, &self.function_registry)
         }) {
             Self::bind_empty_where(stmt, where_clause, &all_columns)?;
             return self.finish_without_rows(
@@ -6102,7 +6111,7 @@ impl Executor {
         let never = where_for_join
             .as_ref()
             .filter(|_| !classification.where_has_subqueries)
-            .is_some_and(|w| true_for_no_row(w, ctx));
+            .is_some_and(|w| true_for_no_row(w, ctx, &self.function_registry));
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -9102,10 +9111,9 @@ impl Executor {
                 };
                 Ok((result, columns))
             }
-            Expression::FunctionTableSource(tvf_source) => {
-                Self::execute_tvf_for_join(tvf_source, ctx, filter, None, 0)
-                    .map(|(result, columns, _)| (result, columns))
-            }
+            Expression::FunctionTableSource(tvf_source) => self
+                .execute_tvf_for_join(tvf_source, ctx, filter, None, 0)
+                .map(|(result, columns, _)| (result, columns)),
             _ => Err(Error::NotSupported(
                 "Unsupported table expression type".to_string(),
             )),
@@ -9279,7 +9287,8 @@ impl Executor {
             _ => None,
         };
         if let Some(tvf_source) = tvf_source {
-            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit, row_offset)
+            return self
+                .execute_tvf_for_join(tvf_source, ctx, filter, row_limit, row_offset)
                 .map(|(result, columns, bounded)| (result, columns, bounded, None));
         }
 

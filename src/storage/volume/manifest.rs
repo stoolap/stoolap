@@ -3834,6 +3834,14 @@ impl SegmentManager {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The seal generation of a settled state, read under the fence: a
+    /// seal halfway through its publication, its segment registered and
+    /// its hot rows not yet removed, is never taken for done
+    pub fn settled_seal_generation(&self) -> u64 {
+        let _fence = self.acquire_seal_read();
+        self.seal_generation()
+    }
+
     /// Record the current seal generation for a transaction. Called under
     /// the seal read fence during INSERT so the value is consistent.
     /// Stores the minimum (earliest) generation seen by this txn, so that
