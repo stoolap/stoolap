@@ -383,7 +383,7 @@ fn a_cte_over_a_join_keeps_its_plan_unless_its_names_wait_for_its_run() {
             "WITH c AS (SELECT * FROM u JOIN w ON w.id = u.id) ",
             "SELECT t2.id FROM t AS t2 JOIN c ON TRUE \
              WHERE EXISTS (SELECT 1 FROM t WHERE t.id = t2.id)",
-            "Prepared: no (a side read with AS OF or not named before it is read)",
+            "Prepared: no (a side not named before it is read)",
         ),
     ] {
         let sql = &format!("{with}{join}");
