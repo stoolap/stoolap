@@ -9143,13 +9143,9 @@ impl JoinBlocks {
                 continue;
             };
             let filter = &*written[i].insert(filter);
-            if !rows_sides[i] {
+            // A joined side runs all of its conditions as a join of its own
+            let Some(schema) = sides[i].schema().filter(|_| rows_sides[i]) else {
                 kept[i] = Some(filter.clone());
-                continue;
-            }
-            // Only a side of one source is given conditions of its own
-            let Some(schema) = sides[i].schema() else {
-                moved.push(filter.clone());
                 continue;
             };
             let side = table(&sides[i].leaves[0]);

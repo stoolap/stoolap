@@ -23,6 +23,7 @@ use crate::planner::join::{IndexProbe, JoinPlan, ProbeIndex};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::Engine;
 
+use super::aggregation::grouped_item;
 use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::query::{CteNames, HOT_INNER_ROWS_PER_KEY, SMALL_OUTER_ROWS};
 use super::query_classification::QueryClassification;
@@ -150,7 +151,20 @@ impl Executor {
             return None;
         }
         // Each group must come from one left row, or a partial chunk would
-        // give partial aggregates: GROUP BY has to cover the left primary key
+        // give partial aggregates: GROUP BY has to cover the left primary key.
+        // A key naming a SELECT item groups by that item's expression
+        let keys: Vec<&Expression> = stmt
+            .group_by
+            .columns
+            .iter()
+            .map(
+                |key| match grouped_item(stmt, key).map(|at| &stmt.columns[at]) {
+                    Some(Expression::Aliased(aliased)) => &*aliased.expression,
+                    Some(item) => item,
+                    None => key,
+                },
+            )
+            .collect();
         let left_alias = shape.aliases[0]?;
         let left_table = match shape.join.left.as_ref() {
             Expression::TableSource(ts) => ts.name.value.as_str(),
@@ -160,7 +174,7 @@ impl Executor {
         let pk_columns = left_schema.primary_key_columns();
         let pk_covered = !pk_columns.is_empty()
             && pk_columns.iter().all(|pk| {
-                stmt.group_by.columns.iter().any(|col| match col {
+                keys.iter().any(|col| match col {
                     Expression::QualifiedIdentifier(qid) => {
                         qid.qualifier.value.eq_ignore_ascii_case(left_alias)
                             && qid.name.value.eq_ignore_ascii_case(&pk.name)
@@ -181,7 +195,7 @@ impl Executor {
             Expression::Identifier(_) => true,
             _ => false,
         };
-        if !stmt.group_by.columns.iter().all(of_left) {
+        if !keys.iter().all(|key| of_left(key)) {
             return None;
         }
         let (left_key, right_key) = simple_join_key(shape.join.condition.as_deref()?)?;

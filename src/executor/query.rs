@@ -570,6 +570,18 @@ fn same_outer_source(
     })
 }
 
+/// The next left chunk of a GROUP BY + LIMIT join after `fetched` rows gave
+/// `found` of the `want` groups: twice what the rate so far needs, from 32
+/// rows up to three times those fetched
+fn next_left_chunk(fetched: usize, found: usize, want: usize) -> usize {
+    let missing = want.saturating_sub(found);
+    let estimate = match found {
+        0 => usize::MAX,
+        _ => ((missing as f64 * fetched as f64 / found as f64) * 2.0).ceil() as usize,
+    };
+    estimate.clamp(32, fetched.saturating_mul(3).max(32))
+}
+
 /// The CTE names that hide tables of the same name for a join's sides: the
 /// ones execution registered, or the ones EXPLAIN reads off the WITH
 #[derive(Clone, Copy)]
@@ -832,20 +844,91 @@ fn natural_join_condition(
     }
 }
 
+/// A join side as its WHERE is split over it: one source by its name, with
+/// its columns when they are known, or a joined side by the name and the
+/// columns of each table it joins
+#[derive(Clone, Copy)]
+pub(crate) enum SplitSide<'a> {
+    Source(Option<&'a str>, Option<&'a Schema>),
+    Joined(&'a [(SmartString, CompactArc<Schema>)]),
+}
+
+impl<'a> SplitSide<'a> {
+    /// `side` as the blocks read it, `alias` its name when it is one source
+    pub(crate) fn of(alias: Option<&'a str>, side: &'a JoinSide) -> Self {
+        match side.leaves.as_slice() {
+            [(_, schema)] => SplitSide::Source(alias, Some(schema)),
+            leaves => SplitSide::Joined(leaves),
+        }
+    }
+
+    /// Both sides of a join: as `sides` reads them when known, else each by
+    /// its name, with its columns when it is a base table
+    pub(crate) fn both(
+        sides: Option<&'a JoinSides>,
+        aliases: [Option<&'a str>; 2],
+        schemas: [Option<&'a Schema>; 2],
+    ) -> [Self; 2] {
+        match sides {
+            Some([left, right]) => [
+                SplitSide::of(aliases[0], left),
+                SplitSide::of(aliases[1], right),
+            ],
+            None => [
+                SplitSide::Source(aliases[0], schemas[0]),
+                SplitSide::Source(aliases[1], schemas[1]),
+            ],
+        }
+    }
+
+    fn named(&self) -> bool {
+        !matches!(self, SplitSide::Source(None, _))
+    }
+
+    /// Whether `qualifier`, lowercase, names a table of the side
+    fn qualified_by(&self, qualifier: &str) -> bool {
+        let names = |name: &str| {
+            name.chars()
+                .flat_map(char::to_lowercase)
+                .eq(qualifier.chars())
+        };
+        match self {
+            SplitSide::Source(alias, _) => alias.is_some_and(names),
+            SplitSide::Joined(leaves) => leaves.iter().any(|(name, _)| names(name)),
+        }
+    }
+
+    /// Whether the side has a column `name`; None when its columns are not
+    /// known
+    fn has_column(&self, name: &str) -> Option<bool> {
+        match self {
+            SplitSide::Source(_, schema) => schema.map(|s| s.has_column(name)),
+            SplitSide::Joined(leaves) => Some(leaves.iter().any(|(_, s)| s.has_column(name))),
+        }
+    }
+
+    /// A filter pushed to the side as its read takes it: one source reads
+    /// its columns by their bare names, a joined side by its tables'
+    fn pushed(&self, filter: &Expression) -> Expression {
+        match self {
+            SplitSide::Source(Some(alias), _) => strip_table_qualifier(filter, alias),
+            _ => filter.clone(),
+        }
+    }
+}
+
 /// A join's WHERE split as execution pushes it: a filter for each side it
 /// may narrow, never the side an outer join pads with NULLs, and the rest,
-/// asked of the joined rows. The schemas are the sides that are base tables
+/// asked of the joined rows
 pub(crate) fn split_join_where(
     where_clause: &Expression,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-    schemas: (Option<&Schema>, Option<&Schema>),
+    [left, right]: [SplitSide<'_>; 2],
     join_type: &str,
 ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
-    let (Some(left_a), Some(right_a)) = (left_alias, right_alias) else {
+    if !left.named() || !right.named() {
         return (None, None, Some(where_clause.clone()));
-    };
-    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a, schemas);
+    }
+    let (l, r, c) = partition_where_for_join(where_clause, [left, right]);
 
     // For OUTER JOINs, we can't push filters to the NULL-padded side
     // because rows that don't match need to appear with NULLs
@@ -853,13 +936,13 @@ pub(crate) fn split_join_where(
     let can_push_right = !join_type.contains("LEFT") && !join_type.contains("FULL");
 
     let safe_left = if can_push_left {
-        l.as_ref().map(|f| strip_table_qualifier(f, left_a))
+        l.as_ref().map(|f| left.pushed(f))
     } else {
         None
     };
 
     let safe_right = if can_push_right {
-        r.as_ref().map(|f| strip_table_qualifier(f, right_a))
+        r.as_ref().map(|f| right.pushed(f))
     } else {
         None
     };
@@ -1197,17 +1280,12 @@ pub(crate) fn true_for_no_row(
 /// - right_filter: predicates referencing only right table
 /// - cross_table_filter: predicates referencing both tables (must be applied post-join)
 ///
-/// An unqualified column belongs to a side only when both sides are base
-/// tables and only that one has it; otherwise its predicate stays post-join
+/// An unqualified column belongs to a side only when both sides' columns
+/// are known and only that one has it; otherwise its predicate stays post-join
 fn partition_where_for_join(
     where_clause: &Expression,
-    left_alias: &str,
-    right_alias: &str,
-    (left_schema, right_schema): (Option<&Schema>, Option<&Schema>),
+    [left, right]: [SplitSide<'_>; 2],
 ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
-    let left_alias_lower = left_alias.to_lowercase();
-    let right_alias_lower = right_alias.to_lowercase();
-
     // Collect AND-ed predicates
     let predicates = flatten_and_predicates(where_clause);
 
@@ -1220,14 +1298,11 @@ fn partition_where_for_join(
         let mut unqualified = FxHashSet::default();
         collect_unqualified_columns(&pred, &mut unqualified);
 
-        let mut refs_left = qualifiers.contains(&left_alias_lower);
-        let mut refs_right = qualifiers.contains(&right_alias_lower);
+        let mut refs_left = qualifiers.iter().any(|q| left.qualified_by(q));
+        let mut refs_right = qualifiers.iter().any(|q| right.qualified_by(q));
         let mut unowned = false;
         for column in &unqualified {
-            match (
-                left_schema.map(|s| s.has_column(column)),
-                right_schema.map(|s| s.has_column(column)),
-            ) {
+            match (left.has_column(column), right.has_column(column)) {
                 (Some(true), Some(false)) => refs_left = true,
                 (Some(false), Some(true)) => refs_right = true,
                 _ => unowned = true,
@@ -1285,13 +1360,39 @@ struct SemijoinReduction {
     right_key_col: String,
 }
 
-/// The left chunk the last reduction pass used; execute_join_source retries
-/// with twice the chunk when the final rows stop short of the limit
-#[derive(Clone, Copy)]
+/// The left chunk a reduction pass read: `read` of the `cap` rows it asked
+/// for, the last of them, the layout it read them in and the groups the
+/// statement wants; `moved` when a commit moved the rows passes before read
 struct ReductionPass {
     cap: usize,
-    chunk_full: bool,
-    limit: usize,
+    read: usize,
+    bounded: bool,
+    last: Option<Row>,
+    token: Option<LayoutToken>,
+    want: usize,
+    moved: bool,
+}
+
+impl ReductionPass {
+    fn moved() -> Self {
+        ReductionPass {
+            cap: 0,
+            read: 0,
+            bounded: false,
+            last: None,
+            token: None,
+            want: 0,
+            moved: true,
+        }
+    }
+}
+
+/// The left chunk a GROUP BY + LIMIT join reads: `cap` rows after the
+/// `offset` the chunks before it read, the last of which was `boundary`
+struct LeftWindow {
+    offset: usize,
+    cap: usize,
+    boundary: Option<Row>,
 }
 
 /// The most rows an outer side may hold for a join without a LIMIT to
@@ -5319,10 +5420,11 @@ impl Executor {
         Ok((Box::new(result), output_columns, applied, Some(shape)))
     }
 
-    /// Execute a JOIN source. A GROUP BY + LIMIT join fetches its left side in
-    /// a limited chunk; when the final rows stop short of the limit and the
-    /// chunk was full, the join runs again with a larger chunk. Run `apart`,
-    /// it and each join it holds keep both columns of a pair they merge
+    /// Execute a JOIN source. A GROUP BY + LIMIT join reads its left side in
+    /// chunks, each group from one left row: while the groups fall short of
+    /// the ones the statement wants and a chunk came full, the next chunk is
+    /// joined and its groups follow. Run `apart`, it and each join it holds
+    /// keep both columns of a pair they merge
     fn execute_join_source(
         &self,
         join_source: &JoinTableSource,
@@ -5333,39 +5435,91 @@ impl Executor {
         apart: bool,
     ) -> SelectResult {
         let reduction = std::cell::Cell::new(None);
-        let mut left_cap = None;
+        let mut window: Option<(LeftWindow, bool)> = None;
+        // After a commit moved the chunks' boundary, under a snapshot that
+        // keeps the rows
+        let mut consistent_ctx = None;
+        // The first chunk's columns, flag and shape, the groups so far and
+        // the layout the chunks read the left table in
+        type Head = (CompactArc<Vec<String>>, bool, Option<SelectShape>);
+        let mut groups: Option<(Head, RowVec, Option<LayoutToken>)> = None;
+        let mut fetched = 0usize;
         loop {
-            let (result, columns, flag, deferred) = self.execute_join_source_capped(
+            let run_ctx = consistent_ctx.as_ref().unwrap_or(ctx);
+            let sent = window.take();
+            let asked = sent.as_ref().map_or(0, |(window, _)| window.cap);
+            let output = self.execute_join_source_capped(
                 join_source,
                 stmt,
-                ctx,
+                run_ctx,
                 classification,
                 compiled,
-                (left_cap, apart),
+                (sent, apart),
                 &reduction,
             )?;
-            let pass = match reduction.get() {
-                Some(pass) if pass.chunk_full => pass,
-                _ => return Ok((result, columns, flag, deferred)),
+            let Some(pass) = reduction.take() else {
+                return Ok(output);
             };
-            let (result, short) = match result.exact_len() {
-                Some(len) => (result, len < pass.limit),
-                None => {
-                    let result_columns = result
-                        .columns_arc()
-                        .unwrap_or_else(|| CompactArc::new(result.columns().to_vec()));
-                    let rows = Self::materialize_result_arc(result)?;
-                    let short = rows.len() < pass.limit;
-                    let result: Box<dyn QueryResult> = Box::new(
-                        ExecutorResult::with_arc_columns_shared_rows(result_columns, rows),
-                    );
-                    (result, short)
+            if pass.moved {
+                let all = fetched.saturating_add(asked);
+                let in_transaction = self.active_transaction.lock().is_ok_and(|tx| tx.is_some());
+                let cap = match in_transaction {
+                    true => i64::MAX as usize,
+                    false => {
+                        let snapshot = self.new_statement_snapshot(
+                            crate::core::IsolationLevel::SnapshotIsolation,
+                            ctx.statement_view(),
+                        )?;
+                        consistent_ctx = Some(ctx.with_statement_snapshot(snapshot));
+                        all.min(i64::MAX as usize)
+                    }
+                };
+                let restart = LeftWindow {
+                    offset: 0,
+                    cap,
+                    boundary: None,
+                };
+                window = Some((restart, consistent_ctx.is_some()));
+                groups = None;
+                fetched = 0;
+                continue;
+            }
+            fetched = fetched.saturating_add(pass.read);
+            let full = pass.bounded && pass.read == pass.cap;
+            let (result, columns, flag, shape) = output;
+            let (head, mut rows, token) = match groups.take() {
+                // A first chunk that ends the read or gives enough groups is
+                // the answer as it came
+                None if !full || result.exact_len().is_some_and(|n| n >= pass.want) => {
+                    return Ok((result, columns, flag, shape));
+                }
+                None => (
+                    (columns, flag, shape),
+                    Self::materialize_result(result)?,
+                    pass.token,
+                ),
+                Some((head, mut rows, token)) => {
+                    same_outer_source(&join_source.left, token, pass.token, true)?;
+                    for (_, row) in Self::materialize_result(result)? {
+                        rows.push((rows.len() as i64, row));
+                    }
+                    (head, rows, token)
                 }
             };
-            if !short {
-                return Ok((result, columns, flag, deferred));
+            if !full || rows.len() >= pass.want {
+                let (columns, flag, shape) = head;
+                let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
+                return Ok((Box::new(result), columns, flag, shape));
             }
-            left_cap = Some(pass.cap.saturating_mul(2).min(i64::MAX as usize));
+            let next = LeftWindow {
+                offset: fetched,
+                cap: next_left_chunk(fetched, rows.len(), pass.want).min(i64::MAX as usize),
+                boundary: pass.last,
+            };
+            window = Some((next, consistent_ctx.is_some()));
+            groups = Some((head, std::mem::take(&mut rows), token));
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::join_next_chunk();
         }
     }
 
@@ -5462,6 +5616,20 @@ impl Executor {
             Some(held) => held.ctes_named(|| self.join_keeps_plan(stmt, with, true)),
             None => self.join_keeps_plan(stmt, with, true),
         }
+    }
+
+    /// `join_side_schemas` without running anything, its CTEs `with` named
+    /// by their bodies, for a caller that reports a join and does not run it
+    pub(crate) fn unrun_join_sides(
+        &self,
+        join: &JoinTableSource,
+        with: Option<&WithClause>,
+    ) -> Option<JoinSides> {
+        let ctx = match with {
+            Some(with) => self.named_ctes(with, false).ok()?,
+            None => ExecutionContext::new(),
+        };
+        self.join_side_schemas(join, &ctx, false)
     }
 
     /// Each side's columns as the join's blocks read them, a base table's
@@ -5571,7 +5739,10 @@ impl Executor {
         if !named(left_alias, left) || !named(right_alias, right) {
             return Err("a side without a name");
         }
-        let schemas = (left.schema(), right.schema());
+        let split = [
+            SplitSide::of(left_alias, left),
+            SplitSide::of(right_alias, right),
+        ];
         if let Some(on) = join_source
             .condition
             .as_deref()
@@ -5618,8 +5789,7 @@ impl Executor {
         let Some(where_clause) = stmt.where_clause.as_deref() else {
             return Ok(());
         };
-        let (left, right, cross) =
-            split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
+        let (left, right, cross) = split_join_where(where_clause, split, join_type);
         let opened = |part: Option<Expression>| {
             part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
         };
@@ -5788,14 +5958,17 @@ impl Executor {
                 Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
             });
             // A side's conditions come without their qualifier; it is put
-            // back, as the index join puts it back on its inner side's
+            // back, as the index join puts it back on its inner side's. A
+            // joined side's keep their tables'
+            let qualified = |filter: Option<&Expression>, alias: Option<&str>| {
+                filter.map(|f| match alias {
+                    Some(alias) => add_table_qualifier(f, alias),
+                    None => f.clone(),
+                })
+            };
             let [left_filter, right_filter] = side_filters;
-            let left_filter = left_filter
-                .zip(left_alias)
-                .map(|(f, alias)| add_table_qualifier(f, alias));
-            let right_filter = right_filter
-                .zip(right_alias)
-                .map(|(f, alias)| add_table_qualifier(f, alias));
+            let left_filter = qualified(left_filter, left_alias);
+            let right_filter = qualified(right_filter, right_alias);
             // The SELECT items and sort keys whose subqueries the blocks run
             let output = !Self::grouped_join_output(stmt);
             let select: Vec<Option<&Expression>> = stmt
@@ -5867,7 +6040,7 @@ impl Executor {
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
-        (left_cap_override, apart): (Option<usize>, bool),
+        (left_window, apart): (Option<(LeftWindow, bool)>, bool),
         reduction: &std::cell::Cell<Option<ReductionPass>>,
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
@@ -5987,8 +6160,9 @@ impl Executor {
         // join path sees a plain predicate, and a correlated one left after
         // the join is evaluated per joined row
         let correlated_where = classification.where_has_correlated_subqueries;
+        let where_folds = classification.where_has_subqueries && !blocks_where;
         let where_for_join: Option<Expression> = match &stmt.where_clause {
-            Some(where_clause) if classification.where_has_subqueries && !blocks_where => {
+            Some(where_clause) if where_folds => {
                 // Each conjunct folds on its own, so an uncorrelated one folds
                 // next to a correlated one
                 let mut folded = Vec::new();
@@ -6012,19 +6186,15 @@ impl Executor {
             ),
             where_for_join => where_for_join,
         };
-        // The blocks split the WHERE over the columns they read each side with
-        let split_schemas = match block_sides.as_ref().filter(|_| blocks_where) {
-            Some([left, right]) => (left.schema(), right.schema()),
-            None => (left_schema.as_deref(), right_schema.as_deref()),
-        };
+        // The WHERE splits over the columns each side is read with, a joined
+        // side's by its tables'
+        let split = SplitSide::both(
+            block_sides.as_ref(),
+            [left_alias.as_deref(), right_alias.as_deref()],
+            [left_schema.as_deref(), right_schema.as_deref()],
+        );
         let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
-            Some(where_clause) => split_join_where(
-                where_clause,
-                left_alias.as_deref(),
-                right_alias.as_deref(),
-                split_schemas,
-                &join_type,
-            ),
+            Some(where_clause) => split_join_where(where_clause, split, &join_type),
             None => (None, None, None),
         };
         // The statement's blocks, and the one run of them every site calls
@@ -6052,6 +6222,16 @@ impl Executor {
         // blocks ask those of its others that bind as it is read, and the
         // rest of the joined row with the WHERE's conditions on both sides
         let rows_sides = blocks.as_deref().map_or([false; 2], |held| held.rows_sides);
+        // A joined side runs all of its conditions as a join of its own, not
+        // under the plan it holds when the values this run read are in them
+        let joined = [&join_source.left, &join_source.right]
+            .map(|side| matches!(**side, Expression::JoinSource(_)));
+        let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i]);
+        let side_plan = |side: usize| {
+            plan.as_deref()
+                .map(|plan| plan.side_plan(side))
+                .filter(|_| !(joined[side] && where_folds))
+        };
         let plain = |filter: &Option<Expression>, rows: bool| match rows {
             true => filter.as_ref().and_then(|filter| {
                 combine_predicates_with_and(
@@ -6064,8 +6244,8 @@ impl Executor {
             false => None,
         };
         let (left_plain, right_plain) = (
-            plain(&left_filter, rows_sides[0]),
-            plain(&right_filter, rows_sides[1]),
+            plain(&left_filter, reads_plain[0]),
+            plain(&right_filter, reads_plain[1]),
         );
         // As the blocks prepared them: an INNER join's ON with them, else its
         // WHERE on the joined row
@@ -6100,21 +6280,21 @@ impl Executor {
             .as_deref()
             .is_some_and(|held| held.side_merges().next().is_some());
         let left_read = SideRead {
-            filter: match rows_sides[0] {
+            filter: match reads_plain[0] {
                 true => left_plain.as_ref(),
                 false => left_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 0)),
-            plan: plan.as_deref().map(|plan| plan.side_plan(0)),
+            plan: side_plan(0),
             apart,
         };
         let right_read = SideRead {
-            filter: match rows_sides[1] {
+            filter: match reads_plain[1] {
                 true => right_plain.as_ref(),
                 false => right_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 1)),
-            plan: plan.as_deref().map(|plan| plan.side_plan(1)),
+            plan: side_plan(1),
             apart,
         };
         let where_blocks = statement_run.and_then(|run| run.site(false));
@@ -6200,9 +6380,10 @@ impl Executor {
                 right_cols,
             )
         } else if let Some(plan) = semijoin_limit {
+            // A later chunk goes on with the reduction an earlier one took
             let grouped_probe = join_plan.probes[0]
                 .as_ref()
-                .filter(|_| join_plan.grouped_index);
+                .filter(|_| join_plan.grouped_index && left_window.is_none());
             if let Some(probe) = grouped_probe {
                 if let Some(result) = self.try_grouped_index_join(
                     stmt,
@@ -6224,17 +6405,38 @@ impl Executor {
             // the join key (uses the index)
             let SemijoinReduction {
                 cap,
-                limit,
+                want,
                 left_key_col,
                 right_key_col,
                 ..
             } = plan;
-            let left_cap = left_cap_override.unwrap_or(cap);
+            let (window, consistent) = left_window.unwrap_or((
+                LeftWindow {
+                    offset: 0,
+                    cap,
+                    boundary: None,
+                },
+                false,
+            ));
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::join_side_ran();
-            let (left_result, left_cols, left_bounded, _) =
-                self.read_join_side(&join_source.left, ctx, left_read, None, Some(left_cap), 0)?;
-            let left_rows = Self::materialize_result_arc(left_result)?;
+            let Some((left_result, left_cols, left_bounded, left_token)) =
+                self.left_chunk(&join_source.left, ctx, left_read, &window, consistent)?
+            else {
+                reduction.set(Some(ReductionPass::moved()));
+                let none = ExecutorResult::new(Vec::new(), RowVec::new());
+                return Ok((Box::new(none), CompactArc::new(Vec::new()), false, None));
+            };
+            // A read after its boundary row goes on from where it stands
+            let left_rows = match window.offset {
+                0 => Self::materialize_result_arc(left_result)?,
+                _ => CompactArc::new(
+                    Self::materialize_result(left_result)?
+                        .into_iter()
+                        .map(|(_, row)| row)
+                        .collect(),
+                ),
+            };
             let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
             let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
                 left_rows
@@ -6261,9 +6463,13 @@ impl Executor {
             )?;
             let right_rows = Self::materialize_result_arc(right_result)?;
             reduction.set(Some(ReductionPass {
-                cap: left_cap,
-                chunk_full: left_bounded && left_rows.len() == left_cap,
-                limit,
+                cap: window.cap,
+                read: left_rows.len(),
+                bounded: left_bounded,
+                last: left_rows.last().cloned(),
+                token: left_token,
+                want,
+                moved: false,
             }));
             (left_rows, left_cols, right_rows, right_cols)
         } else {
@@ -8887,8 +9093,12 @@ impl Executor {
         ))
     }
 
-    /// The statement a joined side runs as: a SELECT * of its join
-    pub(crate) fn joined_side_statement(join: &JoinTableSource) -> SelectStatement {
+    /// The statement a joined side runs as: a SELECT * of its join, with
+    /// `filter` as its WHERE
+    fn joined_side_statement(
+        join: &JoinTableSource,
+        filter: Option<&Expression>,
+    ) -> SelectStatement {
         SelectStatement {
             param_count: 0,
             token: dummy_token("SELECT", TokenType::Keyword),
@@ -8899,7 +9109,7 @@ impl Executor {
             })],
             with: None,
             table_expr: Some(Box::new(Expression::JoinSource(Box::new(join.clone())))),
-            where_clause: None,
+            where_clause: filter.cloned().map(Box::new),
             group_by: GroupByClause::default(),
             having: None,
             window_defs: vec![],
@@ -8912,16 +9122,18 @@ impl Executor {
     }
 
     /// The rows of `join`, a side that is itself a join, each table's columns
-    /// in turn: a SELECT * of it, held in `compiled` when it has a plan. Read
-    /// `apart`, a NATURAL or USING join in it keeps both columns of a pair
+    /// in turn: a SELECT * of it where `filter` holds, held in `compiled`
+    /// when it has a plan. Read `apart`, a NATURAL or USING join in it keeps
+    /// both columns of a pair
     fn joined_side_rows(
         &self,
         join: &JoinTableSource,
         ctx: &ExecutionContext,
+        filter: Option<&Expression>,
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
         apart: bool,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        let select_all = Self::joined_side_statement(join);
+        let select_all = Self::joined_side_statement(join, filter);
         let classification = get_classification(&select_all);
         let (result, columns, _, _) =
             self.execute_join_source(join, &select_all, ctx, &classification, compiled, apart)?;
@@ -9065,7 +9277,7 @@ impl Executor {
 
                 Ok((result, qualified_columns))
             }
-            Expression::JoinSource(js) => self.joined_side_rows(js, ctx, None, false),
+            Expression::JoinSource(js) => self.joined_side_rows(js, ctx, filter, None, false),
             Expression::SubquerySource(ss) => self.derived_side_rows(ss, ctx, filter, None),
             Expression::ValuesSource(vs) => {
                 // A SELECT * of the VALUES, with the filter pushed to this side
@@ -9107,6 +9319,33 @@ impl Executor {
                 "Unsupported table expression type".to_string(),
             )),
         }
+    }
+
+    /// The `window` of a GROUP BY + LIMIT join's left side `expr`. Unless
+    /// read `consistent`, its boundary row is read again first, and a commit
+    /// that moved it gives None
+    fn left_chunk(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        side: SideRead<'_>,
+        window: &LeftWindow,
+        consistent: bool,
+    ) -> Result<Option<OuterFetch>> {
+        if consistent || window.offset == 0 {
+            let read = Some(window.cap);
+            return self
+                .read_join_side(expr, ctx, side, None, read, window.offset)
+                .map(Some);
+        }
+        let Some(boundary) = &window.boundary else {
+            return Ok(None);
+        };
+        let read = Some(window.cap.saturating_add(1));
+        let (mut more, columns, bounded, token) =
+            self.read_join_side(expr, ctx, side, None, read, window.offset - 1)?;
+        let unmoved = more.next() && more.row().as_slice() == boundary.as_slice();
+        Ok(unmoved.then_some((more, columns, bounded, token)))
     }
 
     /// Execute a table expression with optional filter, row limit and row offset.
@@ -9184,7 +9423,8 @@ impl Executor {
         let fetched = match (nested, derived) {
             (Some((join, apart)), _) => {
                 let compiled = side.plan.map(NestedPlan::slot);
-                let (result, columns) = self.joined_side_rows(join, ctx, compiled, apart)?;
+                let (result, columns) =
+                    self.joined_side_rows(join, ctx, side.filter, compiled, apart)?;
                 (result, columns, false, None)
             }
             (None, Some((ss, plan))) => {
@@ -10253,46 +10493,19 @@ impl Executor {
             };
             let boundary = op.last_outer_row().cloned();
             fetched = fetched.saturating_add(cap);
-            let missing = want - groups.len();
-            let rate = groups.len() as f64 / fetched as f64;
-            let estimate = if rate > 0.0 {
-                ((missing as f64 / rate) * 2.0).ceil() as usize
-            } else {
-                usize::MAX
-            };
-            let next = estimate.clamp(32, fetched.saturating_mul(3).max(32));
+            let next = next_left_chunk(fetched, groups.len(), want);
             outer_limit = Some(next);
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::join_next_chunk();
-            if consistent {
-                let (more, _, bounded, token) = self.read_join_side(
-                    &join_source.left,
-                    &ctx_join,
-                    left,
-                    None,
-                    Some(next),
-                    fetched,
-                )?;
+            let window = LeftWindow {
+                offset: fetched,
+                cap: next,
+                boundary,
+            };
+            if let Some((more, _, bounded, token)) =
+                self.left_chunk(&join_source.left, &ctx_join, left, &window, consistent)?
+            {
                 same_outer_source(&join_source.left, outer_token, token, bounded)?;
-                outer_result = more;
-                continue;
-            }
-            // Read committed: one row of overlap tells whether a commit moved the
-            // boundary; if it did, restart on snapshot isolation
-            let (mut more, _, bounded, token) = self.read_join_side(
-                &join_source.left,
-                &ctx_join,
-                left,
-                None,
-                Some(next + 1),
-                fetched - 1,
-            )?;
-            same_outer_source(&join_source.left, outer_token, token, bounded)?;
-            let unmoved = more.next()
-                && boundary
-                    .as_ref()
-                    .is_some_and(|row| row.as_slice() == more.row().as_slice());
-            if unmoved {
                 outer_result = more;
                 continue;
             }
@@ -13786,12 +13999,15 @@ impl Executor {
             .map(|side| self.base_table_side_schema(side, CteNames::Listed(&ctes)));
         let rows = [0, 1].map(|side| blocks && schemas[side].is_none());
         let aliases = [&join.left, &join.right].map(|side| get_table_alias_from_expr(side));
+        let sides = self.unrun_join_sides(join, stmt.with.as_ref());
         let (left, right, cross) = match stmt.where_clause.as_deref() {
             Some(where_clause) => split_join_where(
                 where_clause,
-                aliases[0].as_deref(),
-                aliases[1].as_deref(),
-                (schemas[0].as_deref(), schemas[1].as_deref()),
+                SplitSide::both(
+                    sides.as_ref(),
+                    [aliases[0].as_deref(), aliases[1].as_deref()],
+                    [schemas[0].as_deref(), schemas[1].as_deref()],
+                ),
                 &join_type,
             ),
             None => (None, None, None),

@@ -1,0 +1,864 @@
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE b > 20
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x IS NULL
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE b > 20
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x IS NULL
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t  JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+4	7f79fe8ef6be367c	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE b > 20
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+4	7f79fe8ef6be367c	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x IS NULL
+4	7f79fe8ef6be367c	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE x IS NULL
+4	66ed97dac095f8d6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE b > 20
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+4	66ed97dac095f8d6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x IS NULL
+4	66ed97dac095f8d6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+3	6d302354d309c7d7	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE b > 20
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+3	6d302354d309c7d7	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x IS NULL
+3	6d302354d309c7d7	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE x IS NULL
+3	be8a2d911e1fae09	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE b > 20
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+3	be8a2d911e1fae09	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x IS NULL
+3	be8a2d911e1fae09	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+2	73c481a8d186ba2b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+2	73c481a8d186ba2b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x IS NULL
+2	73c481a8d186ba2b	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t FULL JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+3	112a85eb33f03a67	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE b > 20
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+3	112a85eb33f03a67	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x IS NULL
+3	112a85eb33f03a67	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE x IS NULL
+3	e268c2717770752d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE b > 20
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+3	e268c2717770752d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x IS NULL
+3	e268c2717770752d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+3	b89df1662cfb3f10	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	cee7c042c0f19588	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+2	7e9db046244b8b0c	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE b > 20
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+5	4f44068403736c21	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	79eab81e4078c859	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+2	7e9db046244b8b0c	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x IS NULL
+2	7e9db046244b8b0c	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE x IS NULL
+2	bf1b7af6f445f182	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE b > 20
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+5	156da6549c815d01	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+4	fab07f1f09616a19	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+2	bf1b7af6f445f182	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x IS NULL
+2	bf1b7af6f445f182	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+2	73c481a8d186ba2b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE b > 20
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE id > 1
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+2	511acf85a3e6bfa0	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	2f02a5c55cfd9288	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+2	73c481a8d186ba2b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x IS NULL
+2	73c481a8d186ba2b	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t LEFT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = t.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a  JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+3	e0a35731bcb4b77a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE b > 20
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+3	e0a35731bcb4b77a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE u.x IS NULL
+3	e0a35731bcb4b77a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = t.id WHERE x IS NULL
+2	7e17ad7c0e168621	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+2	7e17ad7c0e168621	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE u.x IS NULL
+2	7e17ad7c0e168621	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a FULL JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+2	a5acdf469e0217f3	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+1	e6216e93414d56db	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+3	87803cf37bf688ae	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+1	91944ff6f344f32e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE b > 20
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+3	2988c1641f7fa0e4	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	f3df8e2c486d1b5c	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	c349810c233a018b	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+1	91944ff6f344f32e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE u.x IS NULL
+1	91944ff6f344f32e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = t.id WHERE x IS NULL
+1	91944ff6f344f32e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+1	91944ff6f344f32e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE u.x IS NULL
+1	91944ff6f344f32e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a LEFT JOIN r ON r.id = u.id WHERE x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x > 7 AND t.b < 40
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE u.x IS NULL
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id JOIN p ON p.id = t.id WHERE x IS NULL
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE COALESCE(u.x, 0) = 0
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE b > 20
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE id > 1
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE r.id > 1 AND t.a IS NOT NULL
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.a = u.id OR t.b > 50
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > $1 [$1 = 20]
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+2	62c620748fc9c25e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.id IN (SELECT x FROM w)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x > 7 AND t.b < 40
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE u.x IS NULL
+2	7e25ab4f45283339	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = t.id WHERE x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE COALESCE(u.x, 0) = 0
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE b > 20
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE id > 1
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE r.id > 1 AND t.a IS NOT NULL
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.a = u.id OR t.b > 50
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b + r.id > 25
+1	8a27129c1748a21a	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > $1 [$1 = 20]
+3	79638de3cf91de0e	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > (SELECT MIN(y) * 10 FROM w)
+2	56e458fb72080706	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20
+1	da50a50794a5e7e6	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT b)
+0	cbf29ce484222325	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE t.id = 1 AND r.id = (SELECT t.b)
+4	022e6c73f204b255	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.id IN (SELECT x FROM w)
+2	2f37f3acc130f0de	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)
+1	19302d8c6f63d52d	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x > 7 AND t.b < 40
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE u.x IS NULL
+1	99fe9c0ab3bdb0aa	SELECT t.id, u.id, r.id FROM t RIGHT JOIN u ON u.id = t.a RIGHT JOIN r ON r.id = u.id WHERE x IS NULL

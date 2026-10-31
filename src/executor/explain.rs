@@ -19,28 +19,25 @@
 
 use crate::common::SmartString;
 use crate::core::{Result, Row, RowVec, Value};
-use crate::functions::registry::global_registry;
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
 use crate::planner::join::{pair_method, PairMethod};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
-use crate::storage::traits::{Engine, QueryResult, ScanPlan};
+use crate::storage::traits::{QueryResult, ScanPlan};
 
 use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planned_dml::DmlStatement;
 use super::planned_join::pick_index_join_side;
+use super::prepared_join::JoinSides;
 use super::prepared_select::OutOfFamily;
 use super::pushdown;
-use super::query::{split_join_where, CteNames, JoinIndexUse};
+use super::query::{split_join_where, CteNames, JoinIndexUse, SplitSide};
 use super::query_cache::NestedPlan;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
-use super::utils::{
-    collect_table_qualifiers, collect_unqualified_columns, combine_predicates_with_and,
-    flatten_and_predicates, get_table_alias_from_expr,
-};
+use super::utils::get_table_alias_from_expr;
 use super::Executor;
 
 impl Executor {
@@ -482,6 +479,7 @@ impl Executor {
                 self.explain_select(&subquery.subquery, lines, indent + 1, plans.0);
             }
             Expression::JoinSource(join) => {
+                let sides = self.unrun_join_sides(join, plans.1);
                 // Determine join algorithm including INLJ check
                 let (join_algorithm, _) = self.determine_join_algorithm_for_explain(
                     &join.left,
@@ -492,6 +490,7 @@ impl Executor {
                     where_clause,
                     index_use,
                     ctes,
+                    sides.as_ref(),
                 );
 
                 lines.push(format!(
@@ -507,16 +506,9 @@ impl Executor {
                     lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
                 }
                 // Partition WHERE predicates by which table they reference
-                let (left_where, right_where, join_filter) = if let Some(wc) = where_clause {
-                    partition_where_for_explain(
-                        wc,
-                        &join.left,
-                        &join.right,
-                        &join.join_type,
-                        self.engine.as_ref(),
-                    )
-                } else {
-                    (None, None, None)
+                let (left_where, right_where, join_filter) = match where_clause {
+                    Some(wc) => self.explain_where_split(wc, join, sides.as_ref(), ctes),
+                    None => (None, None, None),
                 };
                 if let Some(ref jf) = join_filter {
                     lines.push(format!("{}   Join Filter: {}", prefix, jf));
@@ -973,6 +965,7 @@ impl Executor {
                 self.explain_select(&subquery.subquery, lines, indent + 1, from_plan);
             }
             Expression::JoinSource(join) => {
+                let sides = self.unrun_join_sides(join, with);
                 // Determine join algorithm including INLJ check
                 let (join_algorithm, _) = self.determine_join_algorithm_for_explain(
                     &join.left,
@@ -983,6 +976,7 @@ impl Executor {
                     where_clause,
                     index_use,
                     ctes,
+                    sides.as_ref(),
                 );
 
                 if show_join_cost {
@@ -1059,16 +1053,9 @@ impl Executor {
                     lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
                 }
                 // Partition WHERE predicates by which table they reference
-                let (left_where, right_where, join_filter) = if let Some(wc) = where_clause {
-                    partition_where_for_explain(
-                        wc,
-                        &join.left,
-                        &join.right,
-                        &join.join_type,
-                        self.engine.as_ref(),
-                    )
-                } else {
-                    (None, None, None)
+                let (left_where, right_where, join_filter) = match where_clause {
+                    Some(wc) => self.explain_where_split(wc, join, sides.as_ref(), ctes),
+                    None => (None, None, None),
                 };
                 if let Some(ref jf) = join_filter {
                     lines.push(format!("{}   Join Filter: {}", prefix, jf));
@@ -1127,6 +1114,29 @@ impl Executor {
         }
     }
 
+    /// The WHERE of a join over `join` split as its run splits it, over
+    /// `sides` as its blocks read them when they are known
+    fn explain_where_split(
+        &self,
+        where_clause: &Expression,
+        join: &JoinTableSource,
+        sides: Option<&JoinSides>,
+        ctes: &[String],
+    ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
+        let schemas = [&join.left, &join.right]
+            .map(|side| self.base_table_side_schema(side, CteNames::Listed(ctes)));
+        let aliases = [&join.left, &join.right].map(|side| get_table_alias_from_expr(side));
+        split_join_where(
+            where_clause,
+            SplitSide::both(
+                sides,
+                [aliases[0].as_deref(), aliases[1].as_deref()],
+                [schemas[0].as_deref(), schemas[1].as_deref()],
+            ),
+            &join.join_type.to_uppercase(),
+        )
+    }
+
     /// Determine the join algorithm for EXPLAIN output
     /// This uses the same rules as actual execution for consistency
     #[allow(clippy::too_many_arguments)]
@@ -1140,6 +1150,7 @@ impl Executor {
         where_clause: Option<&Expression>,
         index_use: JoinIndexUse,
         ctes: &[String],
+        sides: Option<&JoinSides>,
     ) -> (String, Option<IndexLookupStrategy>) {
         // The index join is reported only where execution takes it: never
         // for a shape the reduction plan takes without the grouped operator,
@@ -1193,11 +1204,14 @@ impl Executor {
             } else {
                 let (left_filtered, right_filtered) = match where_clause {
                     Some(where_clause) => {
+                        let aliases = [join_left, join_right].map(get_table_alias_from_expr);
                         let (left, right, _) = split_join_where(
                             where_clause,
-                            get_table_alias_from_expr(join_left).as_deref(),
-                            get_table_alias_from_expr(join_right).as_deref(),
-                            (left_schema.as_deref(), right_schema.as_deref()),
+                            SplitSide::both(
+                                sides,
+                                [aliases[0].as_deref(), aliases[1].as_deref()],
+                                [left_schema.as_deref(), right_schema.as_deref()],
+                            ),
                             &join_type_upper,
                         );
                         (left.is_some(), right.is_some())
@@ -1452,251 +1466,6 @@ fn extract_table_alias(expr: &Expression) -> Option<String> {
         Expression::Aliased(aliased) => Some(aliased.alias.value.to_string()),
         _ => None,
     }
-}
-
-/// Collect all table aliases (lowercase) from a table expression tree.
-/// Handles nested JoinSource by recursing into both sides.
-fn collect_table_aliases(expr: &Expression, aliases: &mut rustc_hash::FxHashSet<String>) {
-    match expr {
-        Expression::TableSource(simple) => {
-            let alias = simple
-                .alias
-                .as_ref()
-                .map(|a| a.value.to_string().to_lowercase())
-                .unwrap_or_else(|| simple.name.value.to_string().to_lowercase());
-            aliases.insert(alias);
-        }
-        Expression::JoinSource(join) => {
-            collect_table_aliases(&join.left, aliases);
-            collect_table_aliases(&join.right, aliases);
-        }
-        Expression::SubquerySource(ss) => {
-            if let Some(ref alias) = ss.alias {
-                aliases.insert(alias.value.to_string().to_lowercase());
-            }
-        }
-        Expression::CteReference(cr) => {
-            let alias = cr
-                .alias
-                .as_ref()
-                .map(|a| a.value.to_string().to_lowercase())
-                .unwrap_or_else(|| cr.name.value.to_string().to_lowercase());
-            aliases.insert(alias);
-        }
-        Expression::FunctionTableSource(fts) => {
-            let alias = fts
-                .alias
-                .as_ref()
-                .map(|a| a.value.to_string().to_lowercase())
-                .unwrap_or_else(|| fts.function.value.to_string().to_lowercase());
-            aliases.insert(alias);
-        }
-        Expression::ValuesSource(vs) => {
-            if let Some(ref alias) = vs.alias {
-                aliases.insert(alias.value.to_string().to_lowercase());
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collect all output column names (lowercase) from a table expression tree.
-/// Handles real tables (via engine schema lookup), subqueries (via SELECT list),
-/// and nested joins (via recursion).
-fn collect_side_columns(
-    expr: &Expression,
-    engine: &dyn Engine,
-    columns: &mut rustc_hash::FxHashSet<String>,
-) {
-    match expr {
-        Expression::TableSource(simple) => {
-            let table_name = simple.name.value.to_string();
-            if let Ok(schema) = engine.get_table_schema(&table_name) {
-                for col in schema.column_names() {
-                    columns.insert(col.to_lowercase());
-                }
-            }
-        }
-        Expression::SubquerySource(ss) => {
-            let has_star = ss
-                .subquery
-                .columns
-                .iter()
-                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
-            if has_star {
-                // SELECT * inherits all columns from the subquery's source
-                if let Some(ref table_expr) = ss.subquery.table_expr {
-                    collect_side_columns(table_expr, engine, columns);
-                }
-            } else {
-                extract_select_column_names(&ss.subquery.columns, columns);
-            }
-        }
-        Expression::CteReference(cr) => {
-            // CTE output columns match the CTE's SELECT list, but the WITH
-            // clause is not available here. Fall back to the CTE name as a
-            // table lookup — works when the CTE shares a name with a real table
-            // or when the engine has materialized CTE metadata.
-            let table_name = cr.name.value.to_string();
-            if let Ok(schema) = engine.get_table_schema(&table_name) {
-                for col in schema.column_names() {
-                    columns.insert(col.to_lowercase());
-                }
-            }
-        }
-        Expression::FunctionTableSource(fts) => {
-            if !fts.column_aliases.is_empty() {
-                for ca in &fts.column_aliases {
-                    columns.insert(ca.value_lower.to_string());
-                }
-            } else {
-                // Fall back to TVF's default column names from the registry
-                let fn_name = fts.function.value.to_uppercase();
-                if let Some(tvf) = global_registry().get_tvf(&fn_name) {
-                    for col in tvf.column_names() {
-                        columns.insert(col.to_lowercase());
-                    }
-                }
-            }
-        }
-        Expression::ValuesSource(vs) => {
-            if !vs.column_aliases.is_empty() {
-                for ca in &vs.column_aliases {
-                    columns.insert(ca.value_lower.to_string());
-                }
-            } else if let Some(first_row) = vs.rows.first() {
-                // Auto-generate column1, column2, ... based on row width
-                for i in 0..first_row.len() {
-                    columns.insert(format!("column{}", i + 1));
-                }
-            }
-        }
-        Expression::JoinSource(join) => {
-            collect_side_columns(&join.left, engine, columns);
-            collect_side_columns(&join.right, engine, columns);
-        }
-        _ => {}
-    }
-}
-
-/// Extract output column names from a SELECT column list.
-/// Handles aliases, qualified identifiers, and bare identifiers.
-fn extract_select_column_names(
-    select_columns: &[Expression],
-    out: &mut rustc_hash::FxHashSet<String>,
-) {
-    for col in select_columns {
-        match col {
-            Expression::Aliased(a) => {
-                out.insert(a.alias.value_lower.to_string());
-            }
-            Expression::Identifier(id) => {
-                out.insert(id.value_lower.to_string());
-            }
-            Expression::QualifiedIdentifier(qi) => {
-                out.insert(qi.name.value_lower.to_string());
-            }
-            // Star or complex expressions — can't determine column names
-            _ => {}
-        }
-    }
-}
-
-/// Partition a WHERE clause into predicates belonging to the left side,
-/// right side, or the join level (cross-table / outer-join nullable-side predicates).
-/// When a predicate uses unqualified column names, resolves them against
-/// table schemas via the engine to determine the correct side.
-///
-/// For outer joins, predicates on the nullable side are post-join filters
-/// (they test NULL-padded rows), so they are shown at join level, not under
-/// the child scan. LEFT JOIN: right side is nullable. RIGHT JOIN: left side.
-/// FULL JOIN: both sides.
-pub(crate) fn partition_where_for_explain(
-    where_clause: &Expression,
-    left_expr: &Expression,
-    right_expr: &Expression,
-    join_type: &str,
-    engine: &dyn Engine,
-) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
-    let jt = join_type.to_uppercase();
-    let left_nullable = jt == "RIGHT" || jt == "FULL" || jt == "NATURAL RIGHT";
-    let right_nullable = jt == "LEFT" || jt == "FULL" || jt == "NATURAL LEFT";
-    let mut left_aliases = rustc_hash::FxHashSet::default();
-    let mut right_aliases = rustc_hash::FxHashSet::default();
-    collect_table_aliases(left_expr, &mut left_aliases);
-    collect_table_aliases(right_expr, &mut right_aliases);
-
-    // Collect column names for each side: real tables via schema lookup,
-    // subqueries via their SELECT list, nested joins via recursion.
-    let mut left_columns = rustc_hash::FxHashSet::default();
-    let mut right_columns = rustc_hash::FxHashSet::default();
-    collect_side_columns(left_expr, engine, &mut left_columns);
-    collect_side_columns(right_expr, engine, &mut right_columns);
-
-    let predicates = flatten_and_predicates(where_clause);
-    let mut left_preds = Vec::new();
-    let mut right_preds = Vec::new();
-    let mut join_preds = Vec::new();
-
-    for pred in predicates {
-        let qualifiers = collect_table_qualifiers(&pred);
-        // Also collect unqualified columns — a predicate can mix qualified and
-        // unqualified refs (e.g., `o.status = name` has qualifier "o" AND
-        // unqualified "name"). Both must be checked to determine side ownership.
-        let mut unqual_cols = rustc_hash::FxHashSet::default();
-        collect_unqualified_columns(&pred, &mut unqual_cols);
-        let unqual_in_left = unqual_cols
-            .iter()
-            .any(|c| left_columns.contains(c.as_str()));
-        let unqual_in_right = unqual_cols
-            .iter()
-            .any(|c| right_columns.contains(c.as_str()));
-
-        let (targets_left, targets_right) = if !qualifiers.is_empty() {
-            let qual_targets_left = qualifiers.iter().any(|q| left_aliases.contains(q));
-            let qual_targets_right = qualifiers.iter().any(|q| right_aliases.contains(q));
-            (
-                qual_targets_left || unqual_in_left,
-                qual_targets_right || unqual_in_right,
-            )
-        } else {
-            // Fully unqualified predicate: resolve column names against schemas
-            (
-                unqual_in_left && !unqual_in_right,
-                unqual_in_right && !unqual_in_left,
-            )
-        };
-        // A predicate drawing a new value per row runs on the joined rows
-        let draws =
-            super::volatility::expression_volatility(&pred, crate::functions::global_registry())
-                == crate::functions::Volatility::PerCall;
-        let (targets_left, targets_right) = (targets_left && !draws, targets_right && !draws);
-
-        if targets_left && !targets_right {
-            if left_nullable {
-                // Left side is nullable (RIGHT/FULL JOIN): post-join filter
-                join_preds.push(pred);
-            } else {
-                left_preds.push(pred);
-            }
-        } else if targets_right && !targets_left {
-            if right_nullable {
-                // Right side is nullable (LEFT/FULL JOIN): post-join filter
-                join_preds.push(pred);
-            } else {
-                right_preds.push(pred);
-            }
-        } else {
-            // Cross-table, ambiguous, or no schema info: join level
-            join_preds.push(pred);
-        }
-    }
-
-    (
-        combine_predicates_with_and(left_preds),
-        combine_predicates_with_and(right_preds),
-        combine_predicates_with_and(join_preds),
-    )
 }
 
 // ============================================================================
