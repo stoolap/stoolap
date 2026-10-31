@@ -12,9 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::Database;
 
 const REFUSED: &str = "is allowed only in an aggregate call";
+
+// The general path counters are process-wide
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn setup(name: &str, dir: &tempfile::TempDir, sealed: bool) -> Database {
     let dsn = match sealed {
@@ -28,6 +37,11 @@ fn setup(name: &str, dir: &tempfile::TempDir, sealed: bool) -> Database {
         "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
         "INSERT INTO u VALUES (1, 1, 5), (2, 2, 7)",
         "CREATE INDEX t_a ON t (a)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, v VECTOR(2))",
+        "INSERT INTO w VALUES (1, '[1,0]'), (2, '[0,1]')",
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, v VECTOR(2))",
+        "INSERT INTO h VALUES (1, '[1,0]'), (2, '[0,1]')",
+        "CREATE INDEX h_v ON h (v) USING HNSW",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -52,6 +66,7 @@ fn error(db: &Database, sql: &str) -> Option<String> {
 
 #[test]
 fn a_modifier_on_a_call_to_no_aggregate_is_an_error_everywhere() {
+    let _guard = serial();
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = setup("aggregate_modifier_everywhere", &dir, sealed);
@@ -76,6 +91,10 @@ fn a_modifier_on_a_call_to_no_aggregate_is_an_error_everywhere() {
                     "SELECT id FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.k = u.k AND {call} > 0)"
                 ),
                 format!("SELECT id FROM u WHERE v IN (SELECT {call} FROM t)"),
+                format!("SELECT id FROM u WHERE EXISTS (SELECT {call} FROM t)"),
+                format!("SELECT EXISTS (SELECT {call} AS x FROM t WHERE t.k = 1)"),
+                format!("SELECT id FROM u WHERE EXISTS (SELECT {call} FROM t ORDER BY id LIMIT 1)"),
+                format!("SELECT EXISTS (SELECT {call} FROM t JOIN u ON u.k = t.k)"),
                 format!("SELECT id, SUM(k) OVER (PARTITION BY {call}) FROM t"),
                 format!("WITH c AS (SELECT {call} AS x FROM t) SELECT x FROM c"),
                 format!("SELECT x FROM (SELECT {call} AS x FROM t) d"),
@@ -95,6 +114,11 @@ fn a_modifier_on_a_call_to_no_aggregate_is_an_error_everywhere() {
             "SELECT COALESCE(DISTINCT a, 0) FROM t",
             "SELECT UPPER(s ORDER BY id) FROM t",
             "SELECT ROW_NUMBER(DISTINCT a) OVER () FROM t",
+            "SELECT id FROM u WHERE EXISTS (SELECT ROW_NUMBER(DISTINCT a) OVER () FROM t)",
+            "SELECT id FROM w ORDER BY VEC_DISTANCE_L2(DISTINCT v, '[0,0]') LIMIT 1",
+            "SELECT id FROM h ORDER BY VEC_DISTANCE_L2(DISTINCT v, '[0,0]') LIMIT 1",
+            "SELECT id FROM h ORDER BY VEC_DISTANCE_L2(v, '[0,0]') FILTER (WHERE id > 0) LIMIT 1",
+            "SELECT id, VEC_DISTANCE_L2(v, '[0,0]' ORDER BY id) AS d FROM h ORDER BY d LIMIT 1",
             "INSERT INTO u VALUES (50, 1, ABS(DISTINCT 3))",
             "CREATE TABLE c1 (id INTEGER PRIMARY KEY, a INTEGER CHECK (ABS(DISTINCT a) > 0))",
         ] {
@@ -109,6 +133,7 @@ fn a_modifier_on_a_call_to_no_aggregate_is_an_error_everywhere() {
 
 #[test]
 fn a_parameter_a_prepared_statement_and_a_default_refuse_it_too() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = setup("aggregate_modifier_parameter", &dir, false);
     let refused = |result: Result<usize, String>, what: &str| {
@@ -150,6 +175,7 @@ fn a_parameter_a_prepared_statement_and_a_default_refuse_it_too() {
 
 #[test]
 fn an_aggregate_call_keeps_its_modifiers() {
+    let _guard = serial();
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = setup("aggregate_modifier_kept", &dir, sealed);
@@ -224,6 +250,7 @@ const ERRORS: &[(&str, &str)] = &[
 
 #[test]
 fn a_statement_the_families_used_to_refuse_gives_its_error() {
+    let _guard = serial();
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = setup("aggregate_modifier_errors", &dir, sealed);
@@ -238,11 +265,13 @@ fn a_statement_the_families_used_to_refuse_gives_its_error() {
 #[test]
 fn a_statement_the_families_used_to_refuse_runs_no_general_path_mechanism() {
     use stoolap::test_failpoints::general_path_total;
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = setup("aggregate_modifier_general_path", &dir, false);
     let refused = [
         "SELECT id FROM t WHERE COALESCE(DISTINCT a, 0) > (SELECT 1)",
         "SELECT id, (SELECT ABS(DISTINCT v) FROM u WHERE u.id = t.id) FROM t",
+        "SELECT id FROM u WHERE EXISTS (SELECT ABS(DISTINCT a) FROM t WHERE t.k = u.k)",
     ];
     // An aggregate where no group is read is still the general path's to refuse
     let prepared = ERRORS

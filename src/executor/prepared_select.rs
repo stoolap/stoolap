@@ -75,9 +75,9 @@ use super::result::{
 use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
-    order_by_names_an_alias, split_qualified, strip_table_qualifier, value_to_expression,
-    visit_column_refs, QUALIFIER_SEP,
+    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name,
+    modifier_outside_aggregate, needed_columns, order_by_names_an_alias, split_qualified,
+    strip_table_qualifier, value_to_expression, visit_column_refs, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::window::WindowRows;
@@ -3129,6 +3129,20 @@ fn compile_error(error: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", error))
 }
 
+/// The error the compile of `expr` gives for a modifier on a call to no
+/// aggregate, for an expression the statement drops unrun
+fn modifier_error(expr: &Expression, registry: &FunctionRegistry) -> Result<()> {
+    let call = match expr {
+        Expression::FunctionCall(call) => Some(&**call),
+        Expression::Window(window) => Some(&*window.function),
+        _ => None,
+    };
+    if let Some(error) = call.and_then(|call| modifier_outside_aggregate(call, registry)) {
+        return Err(compile_error(CompileError::InvalidExpression(error)));
+    }
+    for_each_child(expr, &mut |child| modifier_error(child, registry))
+}
+
 /// The error of a LIMIT or OFFSET of `stmt` that names a column outside its
 /// subqueries: a count reads no column, and a double-quoted bare name in one
 /// reads as text
@@ -5870,6 +5884,12 @@ impl Builder<'_> {
                 }
         );
         let registry = &self.executor.function_registry;
+        // An EXISTS may never compile its SELECT list, which holds the rule all the same
+        if matches!(form, Form::Exists(_)) {
+            for item in &sq.columns {
+                modifier_error(unaliased(item), registry)?;
+            }
+        }
         if statement_form_block(sq, counts_rows, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
