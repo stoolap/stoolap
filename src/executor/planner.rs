@@ -32,7 +32,6 @@ use crate::storage::traits::transaction::{StatementTable, TableUse};
 
 use crate::core::{Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
-use crate::optimizer::workload::{EdgeAwarePlanner, EdgeJoinRecommendation};
 use crate::parser::ast::Expression;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::mvcc::zonemap::TableZoneMap;
@@ -1022,196 +1021,6 @@ pub enum StatsHealth {
     Missing,
 }
 
-/// Runtime join algorithm selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeJoinAlgorithm {
-    /// Hash join: O(N + M) - best for large inputs with equality keys
-    HashJoin,
-    /// Nested loop: O(N * M) - best for small tables or no equality keys
-    NestedLoop,
-}
-
-/// Runtime join decision result
-#[derive(Debug, Clone)]
-pub struct RuntimeJoinDecision {
-    /// Selected join algorithm
-    pub algorithm: RuntimeJoinAlgorithm,
-    /// Should swap build/probe sides for better performance (hash join)
-    /// or outer/inner sides (nested loop)
-    pub swap_sides: bool,
-    /// Explanation for logging/debugging
-    pub explanation: String,
-}
-
-impl RuntimeJoinDecision {
-    /// Check if hash join was selected
-    pub fn use_hash_join(&self) -> bool {
-        self.algorithm == RuntimeJoinAlgorithm::HashJoin
-    }
-
-    /// Check if nested loop was selected
-    pub fn use_nested_loop(&self) -> bool {
-        self.algorithm == RuntimeJoinAlgorithm::NestedLoop
-    }
-}
-
-impl QueryPlanner {
-    /// Make a runtime join algorithm decision based on actual row counts
-    ///
-    /// This is called during execution with the actual materialized row counts,
-    /// enabling adaptive decisions that account for runtime conditions.
-    /// Also consults the EdgeAwarePlanner for workload-learned hints.
-    ///
-    /// # Arguments
-    /// * `left_rows` - Actual row count from left side
-    /// * `right_rows` - Actual row count from right side
-    /// * `has_equality_keys` - Whether join has equality conditions (a.x = b.x)
-    ///
-    /// # Returns
-    /// Decision on which algorithm to use and whether to swap sides
-    pub fn plan_runtime_join(
-        left_rows: usize,
-        right_rows: usize,
-        has_equality_keys: bool,
-    ) -> RuntimeJoinDecision {
-        // For small tables, nested loop is faster (no hash table overhead)
-        // PostgreSQL uses similar thresholds
-        const NESTED_LOOP_MAX: usize = 200;
-        const HASH_JOIN_MIN_BENEFIT: usize = 50;
-        const ESTIMATED_BYTES_PER_ROW: u64 = 100;
-
-        let total_rows = left_rows + right_rows;
-        let product = left_rows.saturating_mul(right_rows);
-
-        // Case 1: No equality keys - must use nested loop
-        if !has_equality_keys {
-            return RuntimeJoinDecision {
-                algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                swap_sides: false,
-                explanation: "Nested loop: no equality join keys".to_string(),
-            };
-        }
-
-        // Consult EdgeAwarePlanner for workload-learned hints
-        let edge_planner = EdgeAwarePlanner::from_global();
-        let (build_rows_u64, probe_rows_u64) = if right_rows < left_rows {
-            (right_rows as u64, left_rows as u64)
-        } else {
-            (left_rows as u64, right_rows as u64)
-        };
-
-        let edge_recommendation = edge_planner.recommend_join_for_edge(
-            build_rows_u64,
-            probe_rows_u64,
-            ESTIMATED_BYTES_PER_ROW,
-        );
-
-        // Check if edge constraints force a specific algorithm
-        match edge_recommendation {
-            EdgeJoinRecommendation::ForceNestedLoop { reason } => {
-                return RuntimeJoinDecision {
-                    algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                    swap_sides: false,
-                    explanation: format!("Nested loop (edge constraint): {}", reason),
-                };
-            }
-            EdgeJoinRecommendation::PreferNestedLoop { reason } => {
-                // Edge mode prefers nested loop - use lower threshold
-                if left_rows <= NESTED_LOOP_MAX * 2 && right_rows <= NESTED_LOOP_MAX * 2 {
-                    return RuntimeJoinDecision {
-                        algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                        swap_sides: false,
-                        explanation: format!("Nested loop (edge hint): {}", reason),
-                    };
-                }
-            }
-            EdgeJoinRecommendation::PreferHashJoin { .. } => {
-                // Edge mode prefers hash join - skip nested loop checks for medium tables
-                if total_rows > NESTED_LOOP_MAX {
-                    let swap = right_rows < left_rows;
-                    let (build, probe) = if swap {
-                        (right_rows, left_rows)
-                    } else {
-                        (left_rows, right_rows)
-                    };
-                    return RuntimeJoinDecision {
-                        algorithm: RuntimeJoinAlgorithm::HashJoin,
-                        swap_sides: swap,
-                        explanation: format!(
-                            "Hash join (batch workload): build {} rows, probe {} rows",
-                            build, probe
-                        ),
-                    };
-                }
-            }
-            EdgeJoinRecommendation::UseDefault => {
-                // Fall through to standard cost-based decision
-            }
-        }
-
-        // Case 2: Both sides tiny - use hash join (still faster than nested loop)
-        // RATIONALE: Even for small datasets, hash join with equality keys is O(N+M)
-        // while nested loop is O(N*M) with JoinFilter VM evaluation per comparison.
-        // The hash table overhead is minimal for small tables, and we avoid expensive
-        // per-comparison expression evaluation.
-        if left_rows <= NESTED_LOOP_MAX && right_rows <= NESTED_LOOP_MAX {
-            let swap = right_rows < left_rows;
-            return RuntimeJoinDecision {
-                algorithm: RuntimeJoinAlgorithm::HashJoin,
-                swap_sides: swap,
-                explanation: format!(
-                    "Hash join: small tables ({} + {} = {} ops vs {} comparisons)",
-                    left_rows, right_rows, total_rows, product
-                ),
-            };
-        }
-
-        // Case 3: One side empty - no benefit from a hash join
-        if left_rows == 0 || right_rows == 0 {
-            return RuntimeJoinDecision {
-                algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                swap_sides: false,
-                explanation: "Nested loop: one side empty".to_string(),
-            };
-        }
-
-        // Case 4: Hash join cost analysis
-        // Hash join is O(N + M) vs nested loop O(N * M)
-        // But hash join has setup cost, so only use when beneficial
-        let hash_cost = total_rows as f64;
-        let nested_cost = product as f64;
-
-        if nested_cost < hash_cost + HASH_JOIN_MIN_BENEFIT as f64 {
-            // Nested loop is cheaper even accounting for setup
-            return RuntimeJoinDecision {
-                algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                swap_sides: false,
-                explanation: format!(
-                    "Nested loop: cheaper than hash ({} < {} + setup)",
-                    product, total_rows
-                ),
-            };
-        }
-
-        // Case 5: Use hash join with smaller side as build side
-        let swap = right_rows < left_rows;
-        let (build_rows, probe_rows) = if swap {
-            (right_rows, left_rows)
-        } else {
-            (left_rows, right_rows)
-        };
-
-        RuntimeJoinDecision {
-            algorithm: RuntimeJoinAlgorithm::HashJoin,
-            swap_sides: swap,
-            explanation: format!(
-                "Hash join: build {} rows, probe {} rows (swap={})",
-                build_rows, probe_rows, swap
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,30 +1126,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_join_decision_hash_join() {
-        // For equality joins with reasonable sizes, hash join should be selected
-        let decision = QueryPlanner::plan_runtime_join(1000, 1000, true);
-        assert!(decision.use_hash_join());
-        assert!(!decision.use_nested_loop());
-    }
-
-    #[test]
-    fn test_runtime_join_decision_nested_loop() {
-        // Non-equality joins should use nested loop
-        let decision = QueryPlanner::plan_runtime_join(100, 100, false);
-        assert!(decision.use_nested_loop());
-        assert!(!decision.use_hash_join());
-    }
-
-    #[test]
-    fn test_runtime_join_decision_small_tables() {
-        // Very small tables might still use hash join for equality
-        let decision = QueryPlanner::plan_runtime_join(10, 10, true);
-        // Small tables with equality should still use efficient algorithm
-        assert!(decision.use_hash_join() || decision.use_nested_loop());
-    }
-
-    #[test]
     fn test_selectivity_range_operators() {
         let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
 
@@ -1409,13 +1194,6 @@ mod tests {
             &Value::Float(100.0),
         );
         assert!((pos - 0.75).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_runtime_join_decision_explanation() {
-        let decision = QueryPlanner::plan_runtime_join(1000, 1000, true);
-        // Explanation should not be empty
-        assert!(!decision.explanation.is_empty());
     }
 
     #[test]

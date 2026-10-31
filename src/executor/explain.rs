@@ -22,6 +22,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::registry::global_registry;
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
+use crate::planner::join::{pair_method, PairMethod};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult, ScanPlan};
 
@@ -29,10 +30,10 @@ use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planned_dml::DmlStatement;
-use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
+use super::planned_join::pick_index_join_side;
 use super::prepared_select::OutOfFamily;
 use super::pushdown;
-use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
+use super::query::{split_join_where, CteNames, JoinIndexUse};
 use super::query_cache::NestedPlan;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
@@ -1124,7 +1125,7 @@ impl Executor {
     }
 
     /// Determine the join algorithm for EXPLAIN output
-    /// This uses the same QueryPlanner logic as actual execution for consistency
+    /// This uses the same rules as actual execution for consistency
     #[allow(clippy::too_many_arguments)]
     fn determine_join_algorithm_for_explain(
         &self,
@@ -1169,21 +1170,17 @@ impl Executor {
             let right_schema = self.base_table_side_schema(join_right, CteNames::Listed(ctes));
             let left_is_table = left_schema.is_some();
             let right_is_table = right_schema.is_some();
-            // Check if INLJ is possible (right side has index/PK for join column)
-            let inlj_info = match rows[1] {
-                true => None,
-                false => self.check_index_nested_loop_opportunity(
-                    CteNames::Listed(ctes),
-                    join_right,
-                    Some(cond),
-                    &join_type_upper,
-                    left_alias.as_deref(),
-                    right_alias.as_deref(),
-                    bounded,
-                    small_outer,
-                    !left_is_table,
-                ),
-            };
+            let [right_probe, left_probe] = self.join_probes(
+                CteNames::Listed(ctes),
+                [join_left, join_right],
+                Some(cond),
+                &join_type_upper,
+                [left_alias.as_deref(), right_alias.as_deref()],
+                rows,
+            );
+            let inlj_info = right_probe
+                .as_ref()
+                .and_then(|probe| self.probe_strategy(probe, bounded, small_outer, !left_is_table));
 
             // The side execution probes, by the rule it picks it with. The
             // executor swaps a small outer in only from a right side that is
@@ -1210,19 +1207,10 @@ impl Executor {
                     right_filtered,
                     left_filtered,
                     inlj_info,
-                    || match rows[0] {
-                        true => None,
-                        false => self.check_index_nested_loop_opportunity(
-                            CteNames::Listed(ctes),
-                            join_left,
-                            Some(cond),
-                            &join_type_upper,
-                            right_alias.as_deref(),
-                            left_alias.as_deref(),
-                            bounded,
-                            small_outer && !right_is_table,
-                            !right_is_table,
-                        ),
+                    || {
+                        left_probe.as_ref().and_then(|probe| {
+                            self.probe_strategy(probe, bounded, small_outer, !right_is_table)
+                        })
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
@@ -1233,7 +1221,7 @@ impl Executor {
             }
         }
 
-        // Use QueryPlanner for algorithm selection (same as execution path)
+        // The rule a run picks the method by, over the tables' statistics
         let planner = self.get_query_planner();
         let left_table_name = extract_table_name(join_left);
         let right_table_name = extract_table_name(join_right);
@@ -1257,19 +1245,15 @@ impl Executor {
             !using_columns.is_empty()
         };
 
-        // Get the runtime join decision from QueryPlanner
-        let decision = QueryPlanner::plan_runtime_join(left_rows, right_rows, has_equality_keys);
-
-        // Format the algorithm name with details
-        let algo_name = match decision.algorithm {
-            RuntimeJoinAlgorithm::HashJoin => {
-                if decision.swap_sides {
-                    "Hash Join (build: right)".to_string()
-                } else {
-                    "Hash Join (build: left)".to_string()
-                }
-            }
-            RuntimeJoinAlgorithm::NestedLoop => "Nested Loop".to_string(),
+        let algo_name = match pair_method(
+            left_rows,
+            right_rows,
+            has_equality_keys,
+            &join_type.to_uppercase(),
+        ) {
+            PairMethod::Hash { build_left: true } => "Hash Join (build: left)".to_string(),
+            PairMethod::Hash { build_left: false } => "Hash Join (build: right)".to_string(),
+            PairMethod::NestedLoop => "Nested Loop".to_string(),
         };
 
         (algo_name, None)

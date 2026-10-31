@@ -30,6 +30,8 @@ use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::VersionStore;
 use smallvec::SmallVec;
 
+pub(crate) mod join;
+
 /// What the planner decided for one statement: its steps, outermost first,
 /// over its read of the table. EXPLAIN prints it and nothing else
 #[derive(Debug)]

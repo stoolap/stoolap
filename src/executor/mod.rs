@@ -72,6 +72,7 @@ mod plan_reads;
 pub(crate) mod planned;
 pub(crate) mod planned_aggregate;
 pub(crate) mod planned_dml;
+mod planned_join;
 mod prepared_join;
 pub(crate) mod prepared_select;
 pub(crate) mod projection;
@@ -141,9 +142,7 @@ pub use parallel::{
     DEFAULT_PARALLEL_JOIN_THRESHOLD,
     DEFAULT_PARALLEL_SORT_THRESHOLD,
 };
-pub use planner::{
-    ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
-};
+pub use planner::{ColumnStatsCache, QueryPlanner, StatsHealth};
 pub use query_cache::{
     CacheStats, CachedPlanRef, CachedQueryPlan, NestedPlan, QueryCache, DEFAULT_CACHE_SIZE,
 };

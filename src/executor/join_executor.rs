@@ -91,12 +91,12 @@ use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
 use crate::executor::parallel::{
     parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
-use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::prepared_join::{BuiltPrograms, Held, JoinProgramKey, PreparedJoin};
 use crate::executor::prepared_select::{JoinBlocks, PreparedRunner, SiteRunner};
 use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
+use crate::planner::join::{pair_method, PairMethod};
 
 /// Every operator that produces a join's rows. Each notes, under
 /// test-failpoints, that it ran, for the join path equivalence test
@@ -171,16 +171,6 @@ pub struct JoinAnalysis {
     pub join_type: JoinType,
     /// Join type as string (for compatibility).
     pub join_type_str: String,
-}
-
-/// Configuration for join execution.
-/// This combines the algorithm choice with execution-specific config.
-#[derive(Debug, Clone)]
-struct JoinConfig {
-    /// The algorithm to use.
-    algorithm: RuntimeJoinAlgorithm,
-    /// For hash joins: whether to build on the left side.
-    build_left: bool,
 }
 
 /// Request to execute a join operation.
@@ -407,14 +397,14 @@ impl JoinExecutor {
             );
         }
 
-        // The one place a join's algorithm is chosen, on the keys it runs with
-        let decision = QueryPlanner::plan_runtime_join(
+        // The plan's rule for read sides, on the keys the join runs with
+        let method = pair_method(
             request.left_rows.len(),
             request.right_rows.len(),
             !analysis.left_key_indices.is_empty(),
+            &analysis.join_type_str,
         );
-        let config = self.convert_runtime_decision(&decision, &analysis);
-        let rows = self.run(&config, request, &analysis)?;
+        let rows = self.run(method, request, &analysis)?;
 
         Ok(JoinResult {
             rows,
@@ -422,27 +412,27 @@ impl JoinExecutor {
         })
     }
 
-    /// Run the join with the algorithm `config` names (takes ownership of rows)
+    /// Run the join by `method` (takes ownership of rows)
     fn run(
         &self,
-        config: &JoinConfig,
+        method: PairMethod,
         request: JoinRequest<'_>,
         analysis: &JoinAnalysis,
     ) -> Result<RowVec> {
-        match config.algorithm {
-            RuntimeJoinAlgorithm::HashJoin => self.execute_hash_join(
+        match method {
+            PairMethod::Hash { build_left } => self.execute_hash_join(
                 request.left_rows,
                 request.right_rows,
                 analysis,
                 request.left_columns,
                 request.right_columns,
-                config.build_left,
+                build_left,
                 request.limit,
                 request.ctx,
                 request.prepared,
                 request.blocks,
             ),
-            RuntimeJoinAlgorithm::NestedLoop => self.execute_nested_loop(
+            PairMethod::NestedLoop => self.execute_nested_loop(
                 request.left_rows,
                 request.right_rows,
                 request.condition,
@@ -655,43 +645,6 @@ impl JoinExecutor {
             residual_conditions,
             join_type,
             join_type_str: join_type_str.to_uppercase(),
-        }
-    }
-
-    /// Convert a RuntimeJoinDecision from QueryPlanner to JoinConfig.
-    ///
-    /// This bridges the gap between the QueryPlanner's cost-based decisions and
-    /// the executor's algorithm implementation.
-    fn convert_runtime_decision(
-        &self,
-        decision: &RuntimeJoinDecision,
-        analysis: &JoinAnalysis,
-    ) -> JoinConfig {
-        let build_left = match decision.algorithm {
-            RuntimeJoinAlgorithm::HashJoin => {
-                // Use swap_sides hint from QueryPlanner, but respect OUTER join constraints
-                let join_type = &analysis.join_type_str;
-                if join_type.contains("LEFT") || join_type.contains("FULL") {
-                    // LEFT/FULL OUTER: must build on right (left rows must be preserved)
-                    false
-                } else if join_type.contains("RIGHT") {
-                    // RIGHT OUTER: must build on left (right rows must be preserved)
-                    true
-                } else {
-                    // INNER/CROSS: use QueryPlanner's decision based on cost analysis
-                    // swap_sides=true means swap, so if left was smaller, build_left=true normally
-                    // QueryPlanner computes swap_sides = right < left, so:
-                    // - swap_sides=false means left <= right, build on left
-                    // - swap_sides=true means right < left, build on right (inverted)
-                    !decision.swap_sides
-                }
-            }
-            _ => false, // build_left not used for merge/nested loop
-        };
-
-        JoinConfig {
-            algorithm: decision.algorithm,
-            build_left,
         }
     }
 
@@ -1281,11 +1234,9 @@ mod tests {
 
     #[test]
     fn every_join_algorithm_returns_the_rows_of_the_nested_loop() {
-        use RuntimeJoinAlgorithm::{HashJoin, NestedLoop};
-        let all = [HashJoin, NestedLoop];
-        // A new algorithm fails to compile here until it joins `all`
-        match all[0] {
-            HashJoin | NestedLoop => {}
+        // A new method fails to compile here until the cases below take it
+        match PairMethod::NestedLoop {
+            PairMethod::Hash { .. } | PairMethod::NestedLoop => {}
         }
         let left: Vec<Row> = [
             (1, Value::integer(1)),
@@ -1325,13 +1276,7 @@ mod tests {
                     join_type,
                     &|_, _| true,
                 );
-                let rows_of = |algorithm: RuntimeJoinAlgorithm, swap_sides: bool| {
-                    let decision = RuntimeJoinDecision {
-                        algorithm,
-                        swap_sides,
-                        explanation: String::new(),
-                    };
-                    let config = executor.convert_runtime_decision(&decision, &analysis);
+                let rows_of = |method: PairMethod| {
                     let request = JoinRequest {
                         left_rows: CompactArc::new(left.clone()),
                         right_rows: CompactArc::new(right.clone()),
@@ -1346,7 +1291,7 @@ mod tests {
                         prepared: None,
                         blocks: None,
                     };
-                    let rows = executor.run(&config, request, &analysis).unwrap();
+                    let rows = executor.run(method, request, &analysis).unwrap();
                     let mut rows: Vec<String> = rows
                         .iter()
                         .map(|(_, row)| format!("{:?}", row.as_slice()))
@@ -1354,19 +1299,23 @@ mod tests {
                     rows.sort();
                     rows
                 };
-                let expected = rows_of(NestedLoop, false);
-                for algorithm in all {
-                    for swap_sides in [false, true] {
-                        assert_eq!(
-                            rows_of(algorithm, swap_sides),
-                            expected,
-                            "{algorithm:?} (swap {swap_sides}) on {join_type} JOIN ON {condition}"
-                        );
-                        cases += 1;
-                    }
+                let expected = rows_of(PairMethod::NestedLoop);
+                // Every method the rule picks for the join type, a hash table
+                // on either side an inner join may build
+                let methods = [
+                    pair_method(3, 500, true, join_type),
+                    pair_method(500, 3, true, join_type),
+                ];
+                for method in methods {
+                    assert_eq!(
+                        rows_of(method),
+                        expected,
+                        "{method:?} on {join_type} JOIN ON {condition}"
+                    );
+                    cases += 1;
                 }
             }
         }
-        assert_eq!(cases, 2 * 4 * all.len() * 2);
+        assert_eq!(cases, 2 * 4 * 2);
     }
 }
