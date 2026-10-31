@@ -3590,6 +3590,33 @@ fn test_a_read_past_its_timeout_fails() {
 }
 
 #[test]
+fn test_a_collected_index_read_cancelled_before_its_rows_fails() {
+    let _guard = serial();
+    let db = setup("prepared_collected_cancel");
+    db.execute("CREATE INDEX t_a ON t(a)", ()).unwrap();
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    for sql in [
+        "SELECT * FROM t WHERE a > 0 ORDER BY b",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY b) FROM t WHERE a > 0",
+    ] {
+        let ctx = stoolap::ExecutionContext::new();
+        let handle = ctx.clone();
+        after_prepared_plan_taken(move || handle.cancel());
+        let read = executor
+            .execute_with_context(sql, &ctx)
+            .and_then(|mut rows| {
+                while rows.next() {}
+                rows.last_error().map_or(Ok(()), Err)
+            });
+        assert!(
+            matches!(read, Err(stoolap::Error::QueryCancelled)),
+            "{sql}: {:?}",
+            read
+        );
+    }
+}
+
+#[test]
 fn test_a_read_cancelled_before_its_rows_fails() {
     let _guard = serial();
     let db = setup("prepared_read_cancel");

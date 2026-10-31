@@ -5078,18 +5078,19 @@ impl Table for MVCCTable {
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
         // The index keys are the values only while it holds what this
-        // statement sees
-        let Some(epoch) = self.index_view_epoch() else {
-            return Ok(None);
-        };
-
-        // Get index for the column
-        let Some(index) = self.version_store.get_index_by_column(column_name) else {
-            return Ok(None);
-        };
-        // Return all distinct values from the index
-        let values = index.get_all_values();
-        Ok((self.index_view_epoch() == Some(epoch)).then_some(values))
+        // statement sees; a commit that moved it during the read reads again
+        loop {
+            let Some(epoch) = self.index_view_epoch() else {
+                return Ok(None);
+            };
+            let Some(index) = self.version_store.get_index_by_column(column_name) else {
+                return Ok(None);
+            };
+            let values = index.get_all_values();
+            if self.index_view_epoch() == Some(epoch) {
+                return Ok(Some(values));
+            }
+        }
     }
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {

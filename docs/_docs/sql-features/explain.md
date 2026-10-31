@@ -420,6 +420,38 @@ DistinctOn category
       SeqScan products
 ```
 
+Window functions are computed over every row the read passes, and the SELECT list with them. With no WHERE, a read through an index may give the rows already grouped by the one PARTITION BY column every window shares, or ordered by the first window's ORDER BY column when that column holds no NULL. Under a LIMIT with no ORDER BY, DISTINCT or DISTINCT ON, the partitions are read one at a time until the LIMIT has its rows:
+
+```sql
+EXPLAIN SELECT name, RANK() OVER (PARTITION BY category ORDER BY value DESC) AS r FROM products LIMIT 5;
+```
+
+Output:
+```
+plan
+----
+Limit 5
+  Window RANK() OVER (PARTITION BY category ORDER BY value DESC)
+    PartitionsByIndex products (category) one at a time to the LIMIT
+    else SeqScan products
+```
+
+The ORDER BY, DISTINCT and LIMIT are taken over the window step's rows:
+
+```sql
+EXPLAIN SELECT name, SUM(value) OVER (PARTITION BY category) AS total FROM products WHERE value > 10 ORDER BY total DESC;
+```
+
+Output:
+```
+plan
+----
+Sort total DESC
+  Window SUM(value) OVER (PARTITION BY category)
+    IndexScan products (value > 10)
+      Index idx_value (value range)
+```
+
 A set operation over a table shows its first branch's plan and, beside it, each other branch as EXPLAIN shows that statement on its own. The ORDER BY and LIMIT above it are the whole statement's:
 
 ```sql
@@ -497,8 +529,9 @@ For a planned single-table SELECT:
 | CompositeIndex | A multi-column index: equalities on its leading columns, a range on the next one |
 | PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
 | Intersect, Union | The rows every index under it names, or any of them names |
-| IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row |
+| IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row; for window functions, rows in their ORDER BY column's order |
 | DistinctValues | The distinct values the table keeps for one column, for a DISTINCT of that column with no WHERE |
+| PartitionsByIndex | Rows grouped by the window functions' PARTITION BY column through its index, or a partition at a time to the LIMIT |
 | Derived, View, Cte | The rows of a derived table, a view or a CTE, each judged by the condition after its name; the plan of its query is under it |
 | Values, Function | The rows of a VALUES list or a table function, each judged by the condition after its name |
 | OneRow | The one row a SELECT without FROM reads |
@@ -513,6 +546,7 @@ For a planned single-table SELECT:
 | else | The read a run takes when the table cannot answer the line above it |
 | Filter | The part of the WHERE judged after the scan |
 | Project | The output columns |
+| Window | The window functions over the rows the read passes, and the SELECT list over them |
 | Distinct | The first row of each output value |
 | DistinctOn | The first row of each DISTINCT ON key, over the sorted rows |
 | UNION, UNION ALL, INTERSECT, EXCEPT | A set operation over its first branch's rows and each other branch's |
