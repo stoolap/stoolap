@@ -1131,6 +1131,16 @@ fn view_parameters() -> Error {
     Error::InvalidArgument(crate::parser::parser::VIEW_TAKES_NO_PARAMETERS.to_string())
 }
 
+/// A view's query reads no table AS OF
+fn check_view_reads_now(statement: &Statement) -> Result<()> {
+    match statement {
+        Statement::Select(select) if super::prepared_select::holds_as_of(select) => Err(
+            Error::invalid_argument("a view's query cannot read a table AS OF"),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// A SELECT item without its aliases
 fn unaliased_item(mut expr: &Expression) -> &Expression {
     while let Expression::Aliased(aliased) = expr {
@@ -2666,6 +2676,9 @@ impl Executor {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
                 let table_name = &table_source.name.value_lower;
                 if let Some((columns, rows)) = ctx.get_cte_by_lower(table_name) {
+                    if table_source.as_of.is_some() {
+                        return Err(Self::as_of_not_a_table(table_name));
+                    }
                     // Execute query against CTE data
                     // Dereference Arc to get &Vec<(i64, Row)>, then wrap in RowVec
                     return self.execute_query_on_memory_result(
@@ -2678,6 +2691,9 @@ impl Executor {
 
                 // Check if this is actually a view (single lookup, no double RwLock acquisition)
                 if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
+                    if table_source.as_of.is_some() {
+                        return Err(Self::as_of_not_a_table(table_name));
+                    }
                     return self.execute_view_query(&view_def, stmt, ctx, classification);
                 }
                 self.execute_simple_table_scan(table_source, stmt, ctx, classification, None, None)
@@ -3743,6 +3759,11 @@ impl Executor {
         read_out: Option<&mut Option<ReadSchema>>,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> SelectResult {
+        // A table read AS OF is a row source, read once for the statement
+        if let Some(as_of) = &table_source.as_of {
+            let (columns, rows) = self.as_of_rows(&table_source.name.value_lower, as_of, ctx)?;
+            return self.execute_query_on_memory_result(stmt, ctx, columns, rows);
+        }
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
 
@@ -3784,17 +3805,6 @@ impl Executor {
                              // statement carries one, keeps every fetch on one transaction;
                              // otherwise a standalone transaction
             if let Some(snapshot) = ctx.statement_snapshot() {
-                if let Some(ref as_of) = table_source.as_of {
-                    let tx = self.begin_transaction()?;
-                    return self.execute_temporal_query(
-                        table_name,
-                        as_of,
-                        stmt,
-                        ctx,
-                        &*tx,
-                        classification,
-                    );
-                }
                 let table = snapshot
                     .statement_table_at(table_name, ctx.scan_view(table_name))
                     .map_err(|e| {
@@ -3807,18 +3817,6 @@ impl Executor {
                 (table, None)
             } else {
                 let tx = self.begin_transaction()?;
-
-                // Check for AS OF (temporal query)
-                if let Some(ref as_of) = table_source.as_of {
-                    return self.execute_temporal_query(
-                        table_name,
-                        as_of,
-                        stmt,
-                        ctx,
-                        &*tx,
-                        classification,
-                    );
-                }
 
                 // The transaction is this read's own
                 let table = tx
@@ -8043,6 +8041,7 @@ impl Executor {
             if cached.params.count > 0 {
                 return Err(view_parameters());
             }
+            check_view_reads_now(&cached.statement)?;
             return Ok(cached);
         }
 
@@ -8067,6 +8066,7 @@ impl Executor {
         if statements[0].param_count() > 0 {
             return Err(view_parameters());
         }
+        check_view_reads_now(&statements[0])?;
 
         // Wrap in Arc and cache (single allocation, no clone)
         let stmt_arc = Arc::new(statements.into_iter().next().unwrap());
@@ -8913,6 +8913,9 @@ impl Executor {
                 // Check if this is a CTE from context (for subqueries referencing outer CTEs)
                 let table_name = &ts.name.value_lower;
                 if let Some((columns, rows)) = ctx.get_cte_by_lower(table_name) {
+                    if ts.as_of.is_some() {
+                        return Err(Self::as_of_not_a_table(table_name));
+                    }
                     // Get the alias for column prefixing
                     let table_alias = ts
                         .alias
@@ -8957,6 +8960,9 @@ impl Executor {
 
                 // Check if this is actually a view (for JOINs that reference views)
                 if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
+                    if ts.as_of.is_some() {
+                        return Err(Self::as_of_not_a_table(table_name));
+                    }
                     let result = self.execute_view_body(&view_def, ctx)?;
                     let columns = result.columns().to_vec();
 
@@ -13298,139 +13304,93 @@ impl Executor {
         Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
-    /// Execute a temporal query (AS OF TRANSACTION or AS OF TIMESTAMP)
-    ///
-    /// This enables time-travel queries to see historical data.
-    fn execute_temporal_query(
+    /// Every row of table `name` read AS OF, every column in the table's
+    /// order, read through the statement's transaction at the point `as_of`
+    /// names under the statement's cut
+    pub(crate) fn as_of_rows(
         &self,
-        table_name: &str,
+        name: &str,
         as_of: &AsOfClause,
-        stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        tx: &dyn crate::storage::traits::Transaction,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> SelectResult {
-        // classification is passed from caller to avoid redundant cache lookups
-
-        // Get table schema
-        let table = tx.get_read_table_at(table_name, None, ctx.table_use())?;
-        let schema = table.schema().clone();
-        let all_columns: Vec<String> = schema.column_names_owned().to_vec();
-        // The name the statement gives the source: its alias, or the table's
-        let source_alias = stmt
-            .table_expr
-            .as_deref()
-            .and_then(get_table_alias_from_expr);
-        let source_alias = source_alias.as_deref().unwrap_or(table_name);
-
-        // The point the AS OF value names, and every row as it stood there,
-        // every column in the table's order: the filter, the projection, the
-        // grouping and the sort below read the rows as the table lays them out
-        let temporal_value = self.parse_temporal_value(as_of, ctx)?;
-        let point = tx.read_point(&as_of.as_of_type, temporal_value)?;
-        let mut rows = tx.rows_at(table_name, &point)?;
-        if let Some(where_expr) = &stmt.where_clause {
-            let where_filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
-            where_filter.retain_checked(&mut rows)?;
-        }
-
-        // The shape of what this read answers, for its ORDER BY
-        let shape_of = |columns: &[String]| {
-            SelectShape::laid_out(Self::result_layout(
-                stmt,
-                &all_columns,
-                Some(source_alias),
-                columns,
-            ))
+    ) -> Result<(Vec<String>, RowVec)> {
+        let point = self.as_of_point(as_of, ctx)?;
+        let columns = self
+            .engine
+            .get_table_schema(name)
+            .map_err(|e| match e {
+                Error::TableNotFound(_) => Error::TableOrViewNotFound(name.to_string()),
+                other => other,
+            })?
+            .column_names_owned()
+            .to_vec();
+        let active = self
+            .active_transaction
+            .lock()
+            .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+        let rows = match (active.as_ref(), ctx.statement_snapshot()) {
+            (Some(tx), _) => tx.transaction.rows_at(name, &point)?,
+            (None, Some(snapshot)) => {
+                drop(active);
+                snapshot.rows_at(name, &point)?
+            }
+            (None, None) => {
+                drop(active);
+                self.begin_transaction()?.rows_at(name, &point)?
+            }
         };
+        Ok((columns, rows))
+    }
 
-        if classification.has_aggregation || classification.has_window_functions {
-            return self.grouped_select(
-                stmt,
-                ctx,
-                classification,
-                rows,
-                &all_columns,
-                Some(source_alias),
-            );
-        }
-
-        // Project rows
-        let (projected_rows, final_columns) =
-            self.project_rows_for_select(stmt, rows, &all_columns, Some(source_alias), ctx)?;
-
-        let shape = shape_of(&final_columns);
-        let final_columns_arc = CompactArc::new(final_columns);
-        Ok((
-            Box::new(ExecutorResult::with_arc_columns(
-                CompactArc::clone(&final_columns_arc),
-                projected_rows,
-            )),
-            final_columns_arc,
-            false,
-            shape,
+    /// The error for AS OF on `name`, a view or a CTE: AS OF reads a table
+    pub(crate) fn as_of_not_a_table(name: &str) -> Error {
+        Error::invalid_argument(format!(
+            "AS OF reads a table, and '{name}' is a view or a CTE"
         ))
     }
 
-    /// Parse temporal value from AS OF clause
-    fn parse_temporal_value(&self, as_of: &AsOfClause, ctx: &ExecutionContext) -> Result<i64> {
+    /// The point an AS OF value names, resolved against the statement's cut
+    fn as_of_point(
+        &self,
+        as_of: &AsOfClause,
+        ctx: &ExecutionContext,
+    ) -> Result<crate::storage::mvcc::commit_log::ReadPoint> {
         let value = super::expression::evaluate_once(&as_of.value, Some(ctx))?;
-
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::as_of_resolving();
+        let registry = self.engine.registry();
+        // A statement entered without one, through a caller's own plan, takes its own
+        let cut = ctx
+            .historical_cut()
+            .unwrap_or_else(|| registry.historical_cut());
         match as_of.as_of_type.to_uppercase().as_str() {
-            "TRANSACTION" => {
-                // Expect integer transaction ID
-                match value {
-                    Value::Integer(txn_id) => Ok(txn_id),
-                    _ => Err(Error::invalid_argument(
-                        "AS OF TRANSACTION requires integer value",
-                    )),
-                }
-            }
+            "TRANSACTION" => match value {
+                Value::Integer(txn_id) => registry.point_of_transaction(txn_id, cut),
+                _ => Err(Error::invalid_argument(
+                    "AS OF TRANSACTION requires integer value",
+                )),
+            },
             "TIMESTAMP" => {
-                // Expect timestamp string or timestamp value; a time outside
-                // the TIMESTAMP range is an error, not an empty answer
-                match value {
-                    Value::Timestamp(ts) => crate::core::value::timestamp_nanos(&ts),
+                // A time outside the TIMESTAMP range is an error, not an empty answer
+                let nanos = match value {
+                    Value::Timestamp(ts) => crate::core::value::timestamp_nanos(&ts)?,
                     Value::Text(s) => {
-                        crate::core::value::timestamp_nanos(&crate::core::parse_timestamp(&s)?)
+                        crate::core::value::timestamp_nanos(&crate::core::parse_timestamp(&s)?)?
                     }
-                    Value::Integer(i) => {
-                        // Interpret as nanoseconds since epoch
-                        Ok(i)
+                    // Nanoseconds since the epoch
+                    Value::Integer(i) => i,
+                    _ => {
+                        return Err(Error::invalid_argument(
+                            "AS OF TIMESTAMP requires timestamp or string value",
+                        ))
                     }
-                    _ => Err(Error::invalid_argument(
-                        "AS OF TIMESTAMP requires timestamp or string value",
-                    )),
-                }
+                };
+                registry.point_at_time(nanos, cut)
             }
             _ => Err(Error::invalid_argument(format!(
                 "Unsupported AS OF type: {}",
                 as_of.as_of_type
             ))),
         }
-    }
-
-    /// Project rows for SELECT (helper for temporal queries)
-    fn project_rows_for_select(
-        &self,
-        stmt: &SelectStatement,
-        rows: RowVec,
-        all_columns: &[String],
-        table_alias: Option<&str>,
-        ctx: &ExecutionContext,
-    ) -> Result<(RowVec, Vec<String>)> {
-        // Check for SELECT * or a t.* that takes every column
-        if stmt.columns.len() == 1
-            && star_takes_every_column(&stmt.columns[0], all_columns, table_alias)
-        {
-            return Ok((rows, all_columns.to_vec()));
-        }
-
-        let projected =
-            self.project_rows_with_alias(&stmt.columns, rows, all_columns, None, ctx, table_alias)?;
-        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-
-        Ok((projected, output_columns))
     }
 
     /// The WHERE a table scan reads `stmt`'s rows by when resolving the

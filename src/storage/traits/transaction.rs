@@ -253,10 +253,6 @@ pub trait Transaction: Send {
         original_columns: Option<&[String]>,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// The point AS OF `temporal_type` ("TRANSACTION" or "TIMESTAMP")
-    /// `temporal_value` (an id, or nanoseconds) reads at
-    fn read_point(&self, temporal_type: &str, temporal_value: i64) -> Result<ReadPoint>;
-
     /// Every row of `table_name` as it stood at `point`, every column in
     /// the table's order
     fn rows_at(&self, table_name: &str, point: &ReadPoint) -> Result<RowVec>;

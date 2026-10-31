@@ -276,6 +276,107 @@ fn reads_through_a_view(statement: &Statement) -> bool {
     }
 }
 
+/// Whether `statement` reads a table AS OF anywhere
+pub(crate) fn statement_holds_as_of(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(stmt) => prepared_select::holds_as_of(stmt),
+        Statement::CreateTable(stmt) => stmt
+            .as_select
+            .as_deref()
+            .is_some_and(prepared_select::holds_as_of),
+        other => dml_holds_as_of(other),
+    }
+}
+
+/// Whether DML `statement` reads a table AS OF in its query, a subquery or a CTE
+fn dml_holds_as_of(statement: &Statement) -> bool {
+    use prepared_select::{expr_holds_as_of, holds_as_of};
+    let any = |exprs: &[crate::parser::ast::Expression]| exprs.iter().any(expr_holds_as_of);
+    let maybe = |expr: &Option<Box<crate::parser::ast::Expression>>| {
+        expr.as_deref().is_some_and(expr_holds_as_of)
+    };
+    let with = |with: &Option<crate::parser::ast::WithClause>| {
+        with.iter()
+            .flat_map(|with| &with.ctes)
+            .any(|cte| holds_as_of(&cte.query))
+    };
+    match statement {
+        Statement::Insert(stmt) => {
+            stmt.select.as_deref().is_some_and(holds_as_of)
+                || stmt.values.iter().any(|row| any(row))
+                || any(&stmt.update_expressions)
+                || maybe(&stmt.update_where)
+                || any(&stmt.returning)
+        }
+        Statement::Update(stmt) => {
+            with(&stmt.with)
+                || maybe(&stmt.where_clause)
+                || stmt.updates.values().any(expr_holds_as_of)
+                || any(&stmt.returning)
+        }
+        Statement::Delete(stmt) => {
+            with(&stmt.with) || maybe(&stmt.where_clause) || any(&stmt.returning)
+        }
+        _ => false,
+    }
+}
+
+/// A CTE `statement` reads AS OF, where each of its WITH names is read
+fn cte_read_as_of(statement: &Statement) -> Option<crate::common::SmartString> {
+    use prepared_select::{ctes_read_as_of, expr_cte_read_as_of};
+    fn first<'e>(
+        mut exprs: impl Iterator<Item = &'e crate::parser::ast::Expression>,
+        names: &[&str],
+    ) -> Option<crate::common::SmartString> {
+        exprs.find_map(|expr| expr_cte_read_as_of(expr, names))
+    }
+    match statement {
+        Statement::Select(stmt) => prepared_select::cte_read_as_of(stmt, &[]),
+        Statement::CreateTable(stmt) => stmt
+            .as_select
+            .as_deref()
+            .and_then(|select| prepared_select::cte_read_as_of(select, &[])),
+        Statement::Insert(stmt) => stmt
+            .select
+            .as_deref()
+            .and_then(|select| prepared_select::cte_read_as_of(select, &[]))
+            .or_else(|| {
+                let mut exprs = stmt
+                    .values
+                    .iter()
+                    .flatten()
+                    .chain(&stmt.update_expressions)
+                    .chain(stmt.update_where.as_deref())
+                    .chain(&stmt.returning);
+                first(&mut exprs, &[])
+            }),
+        Statement::Update(stmt) => {
+            let (found, names) = ctes_read_as_of(stmt.with.as_ref(), &[]);
+            found.or_else(|| {
+                let mut exprs = stmt
+                    .where_clause
+                    .as_deref()
+                    .into_iter()
+                    .chain(stmt.updates.values())
+                    .chain(&stmt.returning);
+                first(&mut exprs, &names)
+            })
+        }
+        Statement::Delete(stmt) => {
+            let (found, names) = ctes_read_as_of(stmt.with.as_ref(), &[]);
+            found.or_else(|| {
+                let mut exprs = stmt
+                    .where_clause
+                    .as_deref()
+                    .into_iter()
+                    .chain(&stmt.returning);
+                first(&mut exprs, &names)
+            })
+        }
+        _ => None,
+    }
+}
+
 /// [`reads_through_a_view`] for an INSERT: a query source, or a subquery in
 /// its values, its conflict update or its RETURNING
 pub(crate) fn insert_reads_through_a_view(stmt: &crate::parser::ast::InsertStatement) -> bool {
@@ -989,14 +1090,30 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_statement_inner(
-            statement,
-            std::borrow::Cow::Borrowed(ctx),
-            self.active_txn_id(),
-            None,
-            None,
-            None,
-        )
+        let holds = statement_holds_as_of(statement);
+        let ctx = self.with_statement_cut(statement, std::borrow::Cow::Borrowed(ctx), holds)?;
+        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None, None)
+    }
+
+    /// `ctx` with the bounds every AS OF of `statement`, which `holds` one,
+    /// resolves against, taken as it starts, before any path reads a row. A
+    /// CTE read AS OF is refused here, before a path inlines it
+    pub(crate) fn with_statement_cut<'c>(
+        &self,
+        statement: &Statement,
+        ctx: std::borrow::Cow<'c, ExecutionContext>,
+        holds: bool,
+    ) -> Result<std::borrow::Cow<'c, ExecutionContext>> {
+        if !holds || ctx.historical_cut().is_some() {
+            return Ok(ctx);
+        }
+        if let Some(name) = cte_read_as_of(statement) {
+            return Err(Self::as_of_not_a_table(&name));
+        }
+        let cut = self.engine.registry().historical_cut();
+        Ok(std::borrow::Cow::Owned(
+            ctx.into_owned().into_historical_cut(cut),
+        ))
     }
 
     /// Execute a single statement with pre-captured transaction state.
@@ -1355,6 +1472,7 @@ impl Executor {
         // The fast paths read tables by name: CTEs the context brings are
         // read by the plans, which hold the CTE names they bound
         let held = !ctx.brings_ctes();
+        let ctx = self.with_statement_cut(&plan.statement, ctx, plan.holds_as_of)?;
         if let (Statement::Insert(stmt), true) = (plan.statement.as_ref(), held) {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }

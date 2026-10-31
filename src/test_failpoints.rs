@@ -61,6 +61,23 @@ pub(crate) fn as_of_hot_read() {
 }
 
 thread_local! {
+    static AS_OF_RESOLVING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next AS OF value is about to resolve
+/// to a point, after the statement it belongs to started
+pub fn before_as_of_resolved(hook: impl FnOnce() + 'static) {
+    AS_OF_RESOLVING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn as_of_resolving() {
+    let hook = AS_OF_RESOLVING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMMIT_LOG_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -3523,6 +3540,7 @@ pub fn reset_all() {
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     AS_OF_HOT_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_LOG_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    AS_OF_RESOLVING_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);

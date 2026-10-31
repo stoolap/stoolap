@@ -18,6 +18,7 @@
 //! parameter handling, transaction state, and query options.
 
 use crate::common::time_compat::Instant;
+use crate::storage::mvcc::commit_log::HistoricalCut;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use lru::LruCache;
@@ -1183,6 +1184,15 @@ impl StatementSnapshot {
             .get_read_table_at(name, view, self.0.table_use)
     }
 
+    /// Every row of `name` as it stood at `point`
+    pub(crate) fn rows_at(
+        &self,
+        name: &str,
+        point: &crate::storage::mvcc::commit_log::ReadPoint,
+    ) -> crate::core::Result<crate::core::RowVec> {
+        self.0.transaction.lock().rows_at(name, point)
+    }
+
     /// Runs `f` on the table every correlated probe of the statement reads,
     /// taken on the first. None when there is no such table, as for a view
     pub(crate) fn with_probe_table<T>(
@@ -1285,6 +1295,9 @@ pub struct ExecutionContext {
     /// The LIMIT and OFFSET subqueries a statement read before its rows,
     /// behind an Arc, as few statements have one
     read_counts: Option<Arc<ReadCounts>>,
+    /// The bounds every AS OF of the statement resolves against, taken at
+    /// its start; behind an Arc, as few statements have one
+    historical_cut: Option<Arc<HistoricalCut>>,
 }
 
 /// The counts a statement at `depth` read before its rows
@@ -1381,6 +1394,7 @@ impl ExecutionContext {
             semantic_miss: None,
             literal_params: false,
             read_counts: None,
+            historical_cut: None,
         }
     }
 
@@ -1538,6 +1552,7 @@ impl ExecutionContext {
             semantic_miss: None,
             literal_params: false,
             read_counts: None,
+            historical_cut: None,
         }
     }
 
@@ -1564,6 +1579,7 @@ impl ExecutionContext {
             semantic_miss: None,
             literal_params: false,
             read_counts: None,
+            historical_cut: self.historical_cut.clone(),
         }
     }
 
@@ -1615,6 +1631,7 @@ impl ExecutionContext {
             semantic_miss: None,
             literal_params: false,
             read_counts: None,
+            historical_cut: self.historical_cut.clone(),
         }
     }
 
@@ -1692,6 +1709,7 @@ impl ExecutionContext {
             semantic_miss: None,
             literal_params: false,
             read_counts: self.read_counts.clone(),
+            historical_cut: self.historical_cut.clone(),
         }
     }
 
@@ -1740,6 +1758,17 @@ impl ExecutionContext {
     /// This context, a statement's own copy, with its reads seeing `view`
     pub(crate) fn into_statement_view(mut self, view: StatementView) -> Self {
         self.statement_view = Some(view);
+        self
+    }
+
+    /// The bounds the statement's AS OF reads resolve against, if it took them
+    pub(crate) fn historical_cut(&self) -> Option<HistoricalCut> {
+        self.historical_cut.as_deref().copied()
+    }
+
+    /// This context with the statement's AS OF bounds
+    pub(crate) fn into_historical_cut(mut self, cut: HistoricalCut) -> Self {
+        self.historical_cut = Some(Arc::new(cut));
         self
     }
 
@@ -1871,6 +1900,7 @@ impl ExecutionContext {
             semantic_miss: self.semantic_miss.clone(),
             literal_params: self.literal_params,
             read_counts: self.read_counts.clone(),
+            historical_cut: self.historical_cut.clone(),
         }
     }
 
