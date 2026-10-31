@@ -7507,6 +7507,7 @@ impl PreparedSelect {
             .columns
             .iter()
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on)
             .any(QueryClassification::expression_has_window_function);
         let rows_stmt;
         let written = stmt;
@@ -11453,7 +11454,11 @@ impl Executor {
                     (rows, (None, None))
                 }
             };
-            let (result, layout) = self.window_over(stmt, ctx, (&rows, &names), order, None)?;
+            // A DISTINCT ON key rides along as a hidden item, as on the
+            // general path, which the visible width trims after
+            let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
+            let computed = keyed.as_ref().unwrap_or(stmt);
+            let (result, layout) = self.window_over(computed, ctx, (&rows, &names), order, None)?;
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
             let layout = layout.map(CompactArc::new);
@@ -12972,6 +12977,8 @@ impl<'a> PreparedRunner<'a> {
                                     Some(access) => table.collect_access_rows(access, filter)?,
                                     None => table.collect_all_rows(filter)?,
                                 };
+                                // A read that checks for no cancel is the statement's all the same
+                                ctx.check_cancelled()?;
                                 return Ok(Passing::Answers(rows));
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();

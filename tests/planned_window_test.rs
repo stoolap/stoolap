@@ -105,6 +105,10 @@ const SHAPES: &[(&str, &[i64])] = &[
         &[4, 9],
     ),
     ("SELECT id, {w} AS x FROM t LIMIT 6", &[]),
+    (
+        "SELECT DISTINCT ON ({w}) id, COUNT(*) OVER () AS n FROM t ORDER BY id",
+        &[],
+    ),
 ];
 
 /// The rows of `sql` as text, in the order given
