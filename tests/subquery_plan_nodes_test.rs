@@ -126,6 +126,15 @@ fn explain_analyze_says_how_each_block_answers() {
             ],
         ),
         (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0) \
+             LIMIT (SELECT COUNT(*) FROM u) OFFSET (SELECT MIN(rid) - 1 FROM r)",
+            &[
+                "1: EXISTS over w, per call: a keyed set",
+                "2: scalar over u, once per run",
+                "3: scalar over r, once per run",
+            ],
+        ),
+        (
             "SELECT id, (SELECT v FROM w WHERE w.id = t.k) FROM t",
             &["1: scalar over w, per call: the row its key names"],
         ),

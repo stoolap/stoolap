@@ -425,7 +425,7 @@ pub struct CountsSlot {
 }
 
 /// The slot of `statement`, for a SELECT whose LIMIT or OFFSET holds a subquery
-fn counts_slot(statement: &Statement) -> Option<Arc<CountsSlot>> {
+pub(crate) fn counts_slot(statement: &Statement) -> Option<Arc<CountsSlot>> {
     let Statement::Select(select) = statement else {
         return None;
     };

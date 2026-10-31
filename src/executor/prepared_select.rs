@@ -3986,11 +3986,15 @@ impl PreparedBlocks {
     }
 }
 
-/// The lines of the blocks the plan `plan` holds, under a heading; none for
-/// a plan holding no block
-pub(crate) fn explain_held_blocks(plan: &NestedPlan, indent: usize) -> Vec<String> {
+/// The lines of the blocks the plans `plans` hold, numbered on as one list
+/// under a heading; none for plans holding no block
+pub(crate) fn explain_held_blocks(plans: &[&NestedPlan], indent: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    held_blocks(plan, (&"  ".repeat(indent + 1), ""), 0, &mut lines);
+    let prefix = "  ".repeat(indent + 1);
+    let mut next = 0;
+    for plan in plans {
+        next = held_blocks(plan, (&prefix, ""), next, &mut lines);
+    }
     if !lines.is_empty() {
         lines.insert(0, format!("{}Subqueries:", "  ".repeat(indent)));
     }
