@@ -415,7 +415,7 @@ fn test_where_over_a_source_outside_the_family() {
         ("s.b > (SELECT MAX(x) FROM u) * 10", "s.b > 30"),
         ("s.a = ANY (SELECT x FROM u)", "s.a IN (1, 2, 3)"),
     ];
-    // Each keeps the statement out of the prepared family
+    // Each changes no answer: an unused named window, a row IN that holds
     let outside = [
         (" WINDOW unused AS ()", ""),
         (" AND (s.id, s.a) IN (SELECT id, a FROM t)", ""),

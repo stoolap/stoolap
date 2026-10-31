@@ -1089,9 +1089,10 @@ pub(crate) fn set_operation_key_item(item: &Expression, registry: &FunctionRegis
 /// A statement of the family's clauses: its WITH runs before it, as its own
 /// statements, and its DISTINCT, DISTINCT ON and set operation over the rows
 /// it gives, as the general path runs them; no grouping, HAVING or WINDOW
+/// definition a window function reads: one nothing reads is never read
 fn plain_statement(stmt: &SelectStatement) -> bool {
     matches!(stmt.group_by.modifier, GroupByModifier::None)
-        && stmt.window_defs.is_empty()
+        && Executor::used_window_defs(stmt).is_empty()
         && stmt.group_by.columns.is_empty()
         && stmt.having.is_none()
 }

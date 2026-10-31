@@ -175,7 +175,7 @@ fn a_subquery_reads_its_own_ctes() {
 #[test]
 fn a_with_inside_hides_and_reads_the_ctes_around_it_on_every_path() {
     for (db, _dir) in tables("own_with_scopes") {
-        // An unused named window leaves the statement to the general path
+        // An unused named window is never read: it changes no answer
         for window in ["", " WINDOW unused AS ()"] {
             for (sql, at, want) in [
                 (
