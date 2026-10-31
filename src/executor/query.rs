@@ -494,10 +494,11 @@ use super::utils::{
     visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
-use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
+use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
 use super::Executor;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
+use crate::planner::distinct_values_column;
 use crate::planner::join::IndexProbe;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
@@ -2740,7 +2741,7 @@ impl Executor {
     }
 
     /// Count the number of columns in the SELECT clause
-    fn count_select_columns(&self, stmt: &SelectStatement) -> usize {
+    pub(crate) fn count_select_columns(&self, stmt: &SelectStatement) -> usize {
         // Check for SELECT * or SELECT t.* anywhere in the select list
         // If there's any Star or QualifiedStar, we can't determine the exact count
         // without knowing the table columns, so return 0 to disable projection truncation
@@ -2885,7 +2886,7 @@ impl Executor {
     /// LIMIT + OFFSET of a positive LIMIT, for fetch paths that stop early and
     /// leave OFFSET to be applied afterwards; None when either is not a count,
     /// which the general path reports
-    fn fetch_limit(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
+    pub(crate) fn fetch_limit(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
         let counts = row_counts(stmt, ctx).ok()?;
         let limit = counts.limit.filter(|limit| *limit > 0)?;
         Some(limit.saturating_add(counts.offset))
@@ -3391,99 +3392,27 @@ impl Executor {
         Some((indices, output_names))
     }
 
-    /// Try to get distinct values directly from an index
-    ///
-    /// This optimization works for queries like:
-    /// - SELECT DISTINCT col FROM table (where col is indexed)
-    ///
-    /// Conditions:
-    /// - Single column in SELECT (not *, not expression)
-    /// - No WHERE clause
-    /// - No GROUP BY, HAVING
-    /// - No ORDER BY (could be extended later)
-    /// - No LIMIT/OFFSET (could be extended later)
-    /// - The column must have an index
-    fn try_distinct_pushdown(
-        &self,
+    /// The answer of a DISTINCT statement the plan's rule reads the distinct
+    /// values of, for one run without a plan; None when the rule does not
+    /// take it or the table keeps no values to read
+    fn distinct_values_answer(
         table: &dyn crate::storage::traits::Table,
         stmt: &SelectStatement,
-        all_columns: &[String],
-        classification: &std::sync::Arc<QueryClassification>,
+        classification: &QueryClassification,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
-        // Must be DISTINCT
-        if !stmt.distinct {
+        let Some(column) = distinct_values_column(stmt, classification, table.schema()) else {
             return Ok(None);
-        }
-
-        // DISTINCT ON uses key-based dedup, not full-row dedup — cannot use index pushdown
-        if !stmt.distinct_on.is_empty() {
-            return Ok(None);
-        }
-
-        // Quick eligibility checks using cached classification
-        if classification.has_where {
-            return Ok(None);
-        }
-        if classification.has_group_by {
-            return Ok(None);
-        }
-        if classification.has_having {
-            return Ok(None);
-        }
-        if classification.has_aggregation {
-            return Ok(None);
-        }
-        if classification.has_window_functions {
-            return Ok(None);
-        }
-        // ORDER BY is OK - we can sort the distinct values after
-
-        // Must have exactly one column
-        if stmt.columns.len() != 1 {
-            return Ok(None);
-        }
-
-        // Get the column name (must be a simple identifier, not an expression)
-        let column_name = match &stmt.columns[0] {
-            Expression::Identifier(id) => id.value_lower.to_string(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
-            Expression::Aliased(aliased) => match &*aliased.expression {
-                Expression::Identifier(id) => id.value_lower.to_string(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
         };
-
-        // Verify this column exists in the table
-        let column_exists = all_columns
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&column_name));
-        if !column_exists {
+        let Some(values) = Self::distinct_column_values(table, &column)? else {
             return Ok(None);
-        }
-
-        if let Some(distinct_values) = Self::distinct_column_values(table, &column_name)? {
-            // Build output column name (use alias if present)
-            let output_name = match &stmt.columns[0] {
-                Expression::Aliased(aliased) => aliased.alias.value.to_string(),
-                Expression::Identifier(id) => id.value.to_string(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-                _ => column_name,
-            };
-
-            // Convert values to rows
-            let rows: RowVec = distinct_values
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| (i as i64, Row::from_values(vec![v])))
-                .collect();
-
-            let result = ExecutorResult::new(vec![output_name], rows);
-            return Ok(Some(Box::new(result)));
-        }
-
-        Ok(None)
+        };
+        let rows: RowVec = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (i as i64, Row::from_values(vec![v])))
+            .collect();
+        let name = item_name(&stmt.columns[0]);
+        Ok(Some(Box::new(ExecutorResult::new(vec![name], rows))))
     }
 
     /// The distinct values of `column`, lowercase, the table keeps in its
@@ -4012,13 +3941,10 @@ impl Executor {
             }
         }
 
-        // DISTINCT PUSHDOWN: Try to get distinct values directly from index
-        // This avoids all row materialization for queries like:
-        // - SELECT DISTINCT col FROM table (where col is indexed)
-        // Returns distinct values in O(unique values) instead of O(rows)
+        // A DISTINCT the plan's rule takes reads its column's distinct values
         if classification.has_distinct {
             if let Some(result) =
-                self.try_distinct_pushdown(table.as_ref(), stmt, &all_columns, classification)?
+                Self::distinct_values_answer(table.as_ref(), stmt, classification)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
                 let shape = shape_of(&columns);
@@ -5125,155 +5051,31 @@ impl Executor {
             // Path 3: Full scan without WHERE - use collect_all_rows
             // Projection is handled later by the executor which is more efficient
             //
-            // OPTIMIZATION: For window functions, check if we can use index-based fetching:
-            // 1. PARTITION BY on indexed column -> fetch rows grouped by partition
-            // 2. ORDER BY on indexed column -> fetch rows in sorted order
-            let has_window = classification.has_window_functions;
-            let has_agg = classification.has_aggregation;
-
-            if has_window && !has_agg {
-                // First try PARTITION BY optimization (bigger speedup, avoids O(n) hashing)
-                if let Some(partition_col) = Self::extract_window_partition_info(stmt) {
-                    let col_lower = partition_col.to_lowercase();
-                    let schema = table.schema();
-                    let pk_columns = schema.primary_key_columns();
-                    let is_pk = pk_columns.len() == 1 && pk_columns[0].name_lower == col_lower;
-                    let has_index = is_pk || table.get_index_on_column(&partition_col).is_some();
-
-                    if has_index {
-                        // OPTIMIZATION: If we have LIMIT without ORDER BY, use lazy partition fetching
-                        // This avoids fetching all partitions when only a few are needed
-                        // NOTE: Cannot use this optimization if there's a top-level ORDER BY
-                        // because we need all rows to sort before applying LIMIT
-                        let has_order_by = !stmt.order_by.is_empty();
-                        // DISTINCT runs after the fetch, so it keeps the LIMIT out too
-                        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
-                        if !has_order_by
-                            && !distinct
-                            && blocks.is_none()
-                            && !Self::windows_hold_subquery(stmt)
-                        {
-                            if let Some(limit_val) = Self::fetch_limit(stmt, ctx) {
-                                // Use lazy partition fetching - returns early!
-                                let result = self
-                                    .execute_select_with_window_functions_lazy_partition(
-                                        stmt,
-                                        ctx,
-                                        table.as_ref(),
-                                        &all_columns,
-                                        &partition_col,
-                                        limit_val,
-                                    )?;
-                                if let Some(query_result) = result {
-                                    let columns = CompactArc::new(query_result.columns().to_vec());
-                                    return Ok((query_result, columns, false, None));
-                                }
-                                // Fall through when the optimization is unavailable.
-                            }
-                        }
-
-                        // Regular path: Fetch rows grouped by partition (no hash grouping needed)
-                        if let Some(grouped_data) =
-                            table.collect_rows_grouped_by_partition(&partition_col)?
-                        {
-                            // Flatten rows and build partition map
-                            let mut all_rows = RowVec::new();
-                            let mut partition_map: rustc_hash::FxHashMap<
-                                smallvec::SmallVec<[Value; 4]>,
-                                Vec<usize>,
-                            > = rustc_hash::FxHashMap::default();
-
-                            for (partition_value, partition_rows) in grouped_data {
-                                let start_idx = all_rows.len();
-                                let partition_size = partition_rows.len();
-                                // Extend RowVec with (row_id, Row) tuples
-                                for item in partition_rows {
-                                    all_rows.push(item);
-                                }
-
-                                // Build partition key and indices
-                                let key: smallvec::SmallVec<[Value; 4]> =
-                                    smallvec::smallvec![partition_value];
-                                let indices: Vec<usize> =
-                                    (start_idx..start_idx + partition_size).collect();
-                                partition_map.insert(key, indices);
-                            }
-
-                            (
-                                all_rows,
-                                None,
-                                Some(WindowPreGroupedState {
-                                    partition_map,
-                                    partition_column: col_lower.clone(),
-                                }),
-                            )
-                        } else {
-                            (table.collect_all_rows(None)?, None, None)
-                        }
-                    } else {
-                        (table.collect_all_rows(None)?, None, None)
-                    }
+            // Window functions read through an index as the plan's rule
+            // chooses, else every row
+            let read = (classification.has_window_functions && !classification.has_aggregation)
+                .then(|| {
+                    Self::window_read(
+                        stmt,
+                        table.schema(),
+                        |column| table.get_index_on_column(column).is_some(),
+                        blocks.is_some(),
+                    )
+                })
+                .flatten();
+            let rows = match read {
+                Some(read) => {
+                    self.read_window_rows(&read, stmt, ctx, table.as_ref(), &all_columns)?
                 }
-                // Then try ORDER BY optimization (avoids sorting)
-                else if let Some((col_name, ascending)) = Self::extract_window_order_info(stmt) {
-                    let col_lower = col_name.to_lowercase();
-                    let schema = table.schema();
-                    let pk_columns = schema.primary_key_columns();
-                    let is_pk = pk_columns.len() == 1 && pk_columns[0].name_lower == col_lower;
-                    // Rows fetched in index order are taken as sorted, but the index
-                    // orders NULLs its own way, so only a column without NULLs may
-                    // skip the window's own sort
-                    let no_nulls = is_pk
-                        || schema
-                            .columns
-                            .iter()
-                            .any(|c| c.name_lower == col_lower && !c.nullable);
-                    let has_index =
-                        no_nulls && (is_pk || table.get_index_on_column(&col_name).is_some());
-
-                    if has_index {
-                        // OPTIMIZATION: If we have LIMIT without top-level ORDER BY,
-                        // push the limit down to fetch only needed rows.
-                        // This is safe ONLY for window functions that don't depend on total row count.
-                        // Safe: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE
-                        // Unsafe: NTILE, PERCENT_RANK, CUME_DIST (need total count)
-                        let has_order_by = !stmt.order_by.is_empty();
-                        let is_window_safe =
-                            Self::is_window_safe_for_limit_pushdown(stmt, &col_name, ascending);
-                        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
-                        let fetch_limit = if !has_order_by && !distinct && is_window_safe {
-                            Self::fetch_limit(stmt, ctx).unwrap_or(usize::MAX)
-                        } else {
-                            usize::MAX
-                        };
-
-                        // Fetch rows in sorted order from the index (no re-fetch needed)
-                        if let Some(sorted_rows) = table.collect_rows_ordered_by_index(
-                            &col_name,
-                            ascending,
-                            !ascending,
-                            fetch_limit,
-                            0,
-                        )? {
-                            (
-                                sorted_rows,
-                                Some(WindowPreSortedState {
-                                    column: col_lower,
-                                    ascending,
-                                }),
-                                None,
-                            )
-                        } else {
-                            (table.collect_all_rows(None)?, None, None)
-                        }
-                    } else {
-                        (table.collect_all_rows(None)?, None, None)
-                    }
-                } else {
-                    (table.collect_all_rows(None)?, None, None)
+                None => None,
+            };
+            match rows {
+                Some(WindowRows::Answer(result)) => {
+                    let columns = CompactArc::new(result.columns().to_vec());
+                    return Ok((result, columns, false, None));
                 }
-            } else {
-                (table.collect_all_rows(None)?, None, None)
+                Some(WindowRows::Rows(rows, sorted, grouped)) => (rows, sorted, grouped),
+                None => (table.collect_all_rows(None)?, None, None),
             }
         };
 
@@ -5326,31 +5128,13 @@ impl Executor {
 
         // Check if we need window functions only (no aggregation)
         if has_window {
-            // Use optimized paths if rows were pre-fetched with index optimization
-            let (result, layout) = if let Some(pregrouped) = window_pregrouped_state {
-                // PARTITION BY optimization: rows are already grouped by partition
-                self.execute_select_with_window_functions_pregrouped(
-                    stmt,
-                    ctx,
-                    &rows,
-                    &all_columns,
-                    pregrouped,
-                    blocks,
-                )?
-            } else if window_presorted_state.is_some() {
-                // ORDER BY optimization: rows are already sorted
-                self.execute_select_with_window_functions_presorted(
-                    stmt,
-                    ctx,
-                    &rows,
-                    &all_columns,
-                    window_presorted_state,
-                    blocks,
-                )?
-            } else {
-                // Default path: no optimization
-                self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns, blocks)?
-            };
+            let (result, layout) = self.window_over(
+                stmt,
+                ctx,
+                (&rows, &all_columns),
+                (window_presorted_state, window_pregrouped_state),
+                blocks,
+            )?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }

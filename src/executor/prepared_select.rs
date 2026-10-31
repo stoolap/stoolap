@@ -80,9 +80,11 @@ use super::utils::{
     visit_column_refs, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
+use super::window::WindowRows;
 use super::Executor;
 use crate::planner::{
-    ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
+    distinct_values_column, ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read,
+    ScanChoice, Step,
 };
 use crate::storage::mvcc::VersionStore;
 
@@ -3646,6 +3648,9 @@ pub struct PreparedSelect {
     /// The WHERE holds no subquery and a term that is a statement constant,
     /// which a run reads to tell whether it keeps no row
     constant_where: bool,
+    /// The statement has window functions: its rows are read whole and the
+    /// window step computes its SELECT list over them
+    windowed: bool,
 }
 
 impl PreparedSelect {
@@ -3696,6 +3701,18 @@ impl PreparedSelect {
             .as_deref()
             .filter(|offset| !matches!(offset, Expression::IntegerLiteral(lit) if lit.value == 0))
             .map(Expression::to_string);
+        let windows = self.windowed.then(|| {
+            let mut windows = Vec::new();
+            for expr in stmt
+                .columns
+                .iter()
+                .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            {
+                Executor::collect_all_windows_in_expression(expr, &mut windows);
+            }
+            let windows: Vec<String> = windows.iter().map(|w| w.to_string()).collect();
+            windows.join(", ")
+        });
         Some(
             plan.explain(PlanText {
                 table,
@@ -3704,6 +3721,7 @@ impl PreparedSelect {
                 keys,
                 distinct_on,
                 having: None,
+                windows,
                 names: &self.output_columns[..self.visible],
                 pushed,
                 ordered: Executor::ordered_read_column(stmt)
@@ -7483,6 +7501,22 @@ impl PreparedSelect {
         epoch: u64,
     ) -> Result<Self> {
         let registry = &executor.function_registry;
+        // A statement with window functions reads its rows as a SELECT * of
+        // them would, and its window step computes the SELECT list over them
+        let windowed = stmt
+            .columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .any(QueryClassification::expression_has_window_function);
+        let rows_stmt;
+        let written = stmt;
+        let stmt = match windowed {
+            true => {
+                rows_stmt = Self::rows_of(stmt);
+                &rows_stmt
+            }
+            false => stmt,
+        };
         let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
@@ -7725,27 +7759,41 @@ impl PreparedSelect {
                     },
                     None => Read::Scan(scan),
                 };
-                // A DISTINCT of one column and no WHERE reads its distinct values
-                let distinct_column = (stmt.distinct
-                    && stmt.distinct_on.is_empty()
-                    && stmt.where_clause.is_none()
-                    && projection.outputs.len() == 1)
-                    .then_some(projection.columns.as_deref())
-                    .flatten()
-                    .and_then(<[usize]>::first)
-                    .and_then(|&column| schema.column_names_lower_arc().get(column).cloned());
-                let read = match distinct_column {
+                let classification = get_classification(stmt);
+                let read = match distinct_values_column(stmt, &classification, schema) {
                     Some(column) => Read::DistinctValues {
-                        column: SmartString::from(column.as_str()),
+                        column,
                         otherwise: Box::new(read),
                     },
                     None => read,
                 };
+                // Window functions over every row read them through an index
+                // as the window rule chooses
+                let window = (windowed && written.where_clause.is_none())
+                    .then(|| {
+                        Executor::window_read(
+                            written,
+                            schema,
+                            |column| store.get_index_by_column(column).is_some(),
+                            false,
+                        )
+                    })
+                    .flatten();
+                let read = match window {
+                    Some(window) => Read::Window {
+                        read: window,
+                        otherwise: Box::new(read),
+                    },
+                    None => read,
+                };
+                if windowed {
+                    steps = Self::window_steps(written, where_.conjuncts > where_.pushed);
+                }
                 plan = Some(Plan { steps, read });
             }
         }
         Ok(Self {
-            validity: executor.select_validity(stmt, epoch),
+            validity: executor.select_validity(written, epoch),
             cte_scope: ctx.cte_scope(),
             columns: scope.columns.clone(),
             blocks,
@@ -7761,7 +7809,53 @@ impl PreparedSelect {
             constant_where: stmt.where_clause.as_deref().is_some_and(|w| {
                 !Executor::has_subqueries(w) && has_constant_term(w, &executor.function_registry)
             }),
+            windowed,
         })
+    }
+
+    /// The statement a windowed `stmt` reads its rows by: every column of
+    /// its table where its WHERE holds
+    fn rows_of(stmt: &SelectStatement) -> SelectStatement {
+        SelectStatement {
+            distinct: false,
+            distinct_on: Vec::new(),
+            columns: vec![Expression::Star(StarExpression {
+                token: Token::new(TokenType::Operator, "*", Position::default()),
+            })],
+            window_defs: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            set_operations: Vec::new(),
+            ..stmt.clone()
+        }
+    }
+
+    /// The steps of a windowed `stmt` over its read, outermost first: the
+    /// finishing steps over the window step, over the conjuncts the read
+    /// did not take when `filter`
+    fn window_steps(stmt: &SelectStatement, filter: bool) -> SmallVec<[Step; 4]> {
+        let mut steps = SmallVec::new();
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            steps.push(Step::Limit);
+        }
+        if !stmt.distinct_on.is_empty() {
+            steps.push(Step::DistinctOn);
+        }
+        if !stmt.order_by.is_empty() {
+            steps.push(match stmt.limit.is_some() && stmt.distinct_on.is_empty() {
+                true => Step::TopN,
+                false => Step::Sort,
+            });
+        }
+        if stmt.distinct && stmt.distinct_on.is_empty() {
+            steps.push(Step::Distinct);
+        }
+        steps.push(Step::Window);
+        if filter {
+            steps.push(Step::Filter);
+        }
+        steps
     }
 }
 
@@ -11304,6 +11398,67 @@ impl Executor {
             runner.fill_run_slots()?;
         }
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
+        // The window step computes the SELECT list over every row the read
+        // passes; the finishing steps follow it
+        if prepared.windowed {
+            let StatementSource::Table(table) = &source else {
+                return Err(Error::internal("a windowed statement over a source"));
+            };
+            let names = table.schema().column_names_arc();
+            let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
+            // The plan's index read, else the scan it falls back to
+            let indexed = match prepared.plan.as_ref().and_then(|plan| plan.read.window()) {
+                Some(read) if !keeps_none => {
+                    self.read_window_rows(read, stmt, ctx, &**table, &names)?
+                }
+                _ => None,
+            };
+            let (rows, order) = match indexed {
+                Some(WindowRows::Answer(result)) => {
+                    let output_columns = CompactArc::new(result.columns().to_vec());
+                    let visible = self.count_select_columns(stmt);
+                    return Ok((result, output_columns, false, visible, None, false));
+                }
+                Some(WindowRows::Rows(rows, sorted, grouped)) => (rows, (sorted, grouped)),
+                // Without a WHERE the table hands over every row at once
+                None if prepared.where_.conjuncts == 0 => {
+                    (table.collect_all_rows(None)?, (None, None))
+                }
+                None => {
+                    let mut rows = RowVec::new();
+                    if !keeps_none {
+                        let chosen = prepared.plan.as_ref().and_then(|plan| plan.read.scan());
+                        let keep = |id: i64, _: u64, row: Row| {
+                            rows.push((id, row));
+                            true
+                        };
+                        let read = (&prepared.where_, chosen);
+                        match runner.passing_rows(
+                            read,
+                            None,
+                            &**table,
+                            ctx,
+                            None,
+                            Take::Collected,
+                            keep,
+                        )? {
+                            Passing::Pruned | Passing::Read => {}
+                            Passing::Answers(answers) => rows = answers,
+                            Passing::Scan(scan) => rows = runner.drain(scan, None)?,
+                            Passing::Filtered(scan, bound) => {
+                                rows = runner.drain(scan, Some(bound))?
+                            }
+                        }
+                    }
+                    (rows, (None, None))
+                }
+            };
+            let (result, layout) = self.window_over(stmt, ctx, (&rows, &names), order, None)?;
+            let output_columns = CompactArc::new(result.columns().to_vec());
+            let visible = self.count_select_columns(stmt);
+            let layout = layout.map(CompactArc::new);
+            return Ok((result, output_columns, false, visible, layout, false));
+        }
         let output_columns = CompactArc::clone(&prepared.output_columns);
         // Every value of a VALUES list is evaluated, as the general path does
         let target = limit
@@ -12812,9 +12967,12 @@ impl<'a> PreparedRunner<'a> {
                                 && scanned_whole
                                 && extra_whole
                                 && needed.is_none()
-                                && !matches!(access, Some(ScanAccess::Index(_)))
                             {
-                                return Ok(Passing::Answers(table.collect_all_rows(filter)?));
+                                let rows = match access {
+                                    Some(access) => table.collect_access_rows(access, filter)?,
+                                    None => table.collect_all_rows(filter)?,
+                                };
+                                return Ok(Passing::Answers(rows));
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();
                             let scan = match (access, needed) {

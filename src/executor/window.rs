@@ -36,7 +36,7 @@ use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 
-use crate::common::{CompactVec, StringMap};
+use crate::common::{CompactVec, SmartString, StringMap};
 use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
 
@@ -643,6 +643,17 @@ pub struct WindowFunctionInfo {
 /// A window result, with the layout its ORDER BY reads when it has one
 pub(crate) type WindowOutput = (Box<dyn QueryResult>, Option<OutputLayout>);
 
+/// What a window index read gives: the rows, sorted or grouped as it read
+/// them, or a partition-at-a-time read's whole answer
+pub(crate) enum WindowRows {
+    Answer(Box<dyn QueryResult>),
+    Rows(
+        RowVec,
+        Option<WindowPreSortedState>,
+        Option<WindowPreGroupedState>,
+    ),
+}
+
 /// Information about a SELECT list item for window function processing
 pub struct SelectItem {
     pub output_name: String,
@@ -806,6 +817,146 @@ impl Executor {
             .collect()
     }
 
+    /// The index read the window functions of `stmt`, reading every row of
+    /// a table of `schema`, take where `indexed` says a column has an index:
+    /// grouped by the one PARTITION BY column every window shares, else in
+    /// the order of the first window's one ORDER BY column when it holds no
+    /// NULL. A statement whose subqueries run as `blocks` reads no partition
+    /// at a time
+    pub(crate) fn window_read(
+        stmt: &SelectStatement,
+        schema: &crate::core::Schema,
+        indexed: impl Fn(&str) -> bool,
+        blocks: bool,
+    ) -> Option<crate::planner::WindowRead> {
+        use crate::planner::WindowRead;
+        let pk_columns = schema.primary_key_columns();
+        let is_pk = |lower: &str| pk_columns.len() == 1 && pk_columns[0].name_lower == lower;
+        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
+        if let Some(column) = Self::extract_window_partition_info(stmt) {
+            if !is_pk(&column.to_lowercase()) && !indexed(&column) {
+                return None;
+            }
+            let lazy = stmt.order_by.is_empty()
+                && !distinct
+                && !blocks
+                && stmt.limit.is_some()
+                && !Self::windows_hold_subquery(stmt);
+            let column = SmartString::from(column.as_str());
+            return Some(WindowRead::Partitions { column, lazy });
+        }
+        let (column, ascending) = Self::extract_window_order_info(stmt)?;
+        let lower = column.to_lowercase();
+        // The index orders NULLs its own way, so only a column without them
+        // gives rows the window takes as sorted
+        let no_nulls = is_pk(&lower)
+            || schema
+                .columns
+                .iter()
+                .any(|c| c.name_lower == lower && !c.nullable);
+        if !no_nulls || !is_pk(&lower) && !indexed(&column) {
+            return None;
+        }
+        let limited = stmt.order_by.is_empty()
+            && !distinct
+            && Self::is_window_safe_for_limit_pushdown(stmt, &column, ascending);
+        let column = SmartString::from(column.as_str());
+        Some(WindowRead::Ordered {
+            column,
+            ascending,
+            limited,
+        })
+    }
+
+    /// The rows `read` takes of `table`, holding `columns`, for the window
+    /// functions of `stmt`, or a partition-at-a-time read's whole answer;
+    /// None when the table cannot read them so in this run
+    pub(crate) fn read_window_rows(
+        &self,
+        read: &crate::planner::WindowRead,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        table: &dyn Table,
+        columns: &[String],
+    ) -> Result<Option<WindowRows>> {
+        use crate::planner::WindowRead;
+        match read {
+            WindowRead::Partitions { column, lazy } => {
+                if let Some(limit) = lazy.then(|| Self::fetch_limit(stmt, ctx)).flatten() {
+                    let answer = self.execute_select_with_window_functions_lazy_partition(
+                        stmt, ctx, table, columns, column, limit,
+                    )?;
+                    if let Some(answer) = answer {
+                        return Ok(Some(WindowRows::Answer(answer)));
+                    }
+                }
+                let Some(grouped) = table.collect_rows_grouped_by_partition(column)? else {
+                    return Ok(None);
+                };
+                let mut rows = RowVec::new();
+                let mut partition_map: FxHashMap<SmallVec<[Value; 4]>, Vec<usize>> =
+                    FxHashMap::default();
+                for (value, partition) in grouped {
+                    let start = rows.len();
+                    rows.extend(partition);
+                    partition_map.insert(smallvec::smallvec![value], (start..rows.len()).collect());
+                }
+                let grouped = WindowPreGroupedState {
+                    partition_map,
+                    partition_column: column.as_str().to_lowercase(),
+                };
+                Ok(Some(WindowRows::Rows(rows, None, Some(grouped))))
+            }
+            WindowRead::Ordered {
+                column,
+                ascending,
+                limited,
+            } => {
+                let limit = limited
+                    .then(|| Self::fetch_limit(stmt, ctx))
+                    .flatten()
+                    .unwrap_or(usize::MAX);
+                let sorted = table.collect_rows_ordered_by_index(
+                    column,
+                    *ascending,
+                    !*ascending,
+                    limit,
+                    0,
+                )?;
+                Ok(sorted.map(|rows| {
+                    let sorted = WindowPreSortedState {
+                        column: column.as_str().to_lowercase(),
+                        ascending: *ascending,
+                    };
+                    WindowRows::Rows(rows, Some(sorted), None)
+                }))
+            }
+        }
+    }
+
+    /// Window functions over `rows` of `columns`, read in the order or the
+    /// partitions `sorted` or `grouped` says, the statement's subqueries
+    /// answered by its `blocks`
+    pub(crate) fn window_over(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        (rows, columns): (&[(i64, Row)], &[String]),
+        (sorted, grouped): (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<WindowOutput> {
+        self.execute_select_with_window_functions_internal(
+            stmt,
+            ctx,
+            rows,
+            columns,
+            &FxHashMap::default(),
+            sorted,
+            grouped,
+            blocks,
+        )
+    }
+
     /// Window functions over the rows, the statement's subqueries answered
     /// by its `blocks`
     pub(crate) fn execute_select_with_window_functions(
@@ -847,54 +998,6 @@ impl Executor {
             group_slots,
             None,
             None,
-            blocks,
-        )
-    }
-
-    /// Execute SELECT with window functions, with optional pre-sorted state
-    /// When pre_sorted is Some, rows are already sorted by the specified column,
-    /// allowing us to skip sorting for window functions that ORDER BY the same column
-    pub(crate) fn execute_select_with_window_functions_presorted(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        base_rows: &[(i64, Row)],
-        base_columns: &[String],
-        pre_sorted: Option<WindowPreSortedState>,
-        blocks: Option<&dyn SubqueryExecutor>,
-    ) -> Result<WindowOutput> {
-        self.execute_select_with_window_functions_internal(
-            stmt,
-            ctx,
-            base_rows,
-            base_columns,
-            &FxHashMap::default(),
-            pre_sorted,
-            None,
-            blocks,
-        )
-    }
-
-    /// Execute SELECT with window functions, with pre-grouped partitions
-    /// When pre_grouped is provided, rows are already grouped by partition column,
-    /// allowing us to skip hash-based grouping for window functions
-    pub(crate) fn execute_select_with_window_functions_pregrouped(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        base_rows: &[(i64, Row)],
-        base_columns: &[String],
-        pre_grouped: WindowPreGroupedState,
-        blocks: Option<&dyn SubqueryExecutor>,
-    ) -> Result<WindowOutput> {
-        self.execute_select_with_window_functions_internal(
-            stmt,
-            ctx,
-            base_rows,
-            base_columns,
-            &FxHashMap::default(),
-            None,
-            Some(pre_grouped),
             blocks,
         )
     }
@@ -2221,7 +2324,7 @@ impl Executor {
     /// Recursively find a window expression inside an expression
     /// Returns the first Window expression found, if any
     /// Collect all window expressions found anywhere in an expression tree (depth-first order).
-    fn collect_all_windows_in_expression<'a>(
+    pub(crate) fn collect_all_windows_in_expression<'a>(
         expr: &'a Expression,
         out: &mut Vec<&'a WindowExpression>,
     ) {

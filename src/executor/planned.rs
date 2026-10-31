@@ -98,6 +98,7 @@ impl Executor {
         };
         if shape.has_aggregation
             || shape.has_window_functions
+                && (shape.has_set_operations || shape.grouped_has_subqueries)
             || shape.has_group_by
             || shape.has_having
             || shape.has_cte
@@ -115,8 +116,11 @@ impl Executor {
         if ts.as_of.is_some() || ctx.get_cte_by_lower(table).is_some() {
             return None;
         }
-        // DISTINCT, DISTINCT ON and set operations as the runner's family takes them
-        if shape.has_distinct || shape.has_distinct_on || shape.has_set_operations {
+        // DISTINCT, DISTINCT ON and set operations as the runner's family
+        // takes them; over a window step they finish the window's rows
+        if !shape.has_window_functions
+            && (shape.has_distinct || shape.has_distinct_on || shape.has_set_operations)
+        {
             self.planned_family(stmt, Some(ctx)).ok()?;
         }
         // Read before the schema: a change in between leaves this behind
@@ -135,8 +139,11 @@ impl Executor {
                     // A LIMIT or OFFSET read per run leaves the statement to a
                     // scan, and so do a DISTINCT, which the key read does not
                     // take, and a set operation, whose rows are its branches' too
-                    let counts = static_row_counts(stmt)
-                        .filter(|_| stmt.set_operations.is_empty() && !stmt.distinct);
+                    let counts = static_row_counts(stmt).filter(|_| {
+                        stmt.set_operations.is_empty()
+                            && !stmt.distinct
+                            && !shape.has_window_functions
+                    });
                     if let Some(counts) = counts {
                         prepared.read_by_key(
                             (table.clone(), &store),
@@ -246,6 +253,7 @@ impl Executor {
             keys: Some(keys.join(", ")),
             distinct_on: None,
             having: stmt.having.as_deref().map(Expression::to_string),
+            windows: None,
             names: &[],
             pushed: None,
             ordered: None,

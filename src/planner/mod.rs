@@ -23,8 +23,9 @@ use crate::core::{Operator, Schema};
 use crate::executor::expression::SharedProgram;
 use crate::executor::prepared_select::PreparedComparison;
 use crate::executor::projection::Projection;
+use crate::executor::query_classification::QueryClassification;
 use crate::executor::utils::{extract_literal_value, flip_operator, infix_to_operator};
-use crate::parser::ast::{Expression, InfixOperator};
+use crate::parser::ast::{Expression, InfixOperator, SelectStatement};
 use crate::storage::mvcc::index_plan::{self, IndexPlan, IndexTerm, Term};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::VersionStore;
@@ -55,6 +56,9 @@ pub enum Step {
     Distinct,
     /// The groups the HAVING keeps
     Having,
+    /// The window functions over the rows the read passes, and the SELECT
+    /// list over them
+    Window,
     Project,
     /// The WHERE's conjuncts the read did not take
     Filter,
@@ -87,6 +91,28 @@ pub enum Read {
         column: SmartString,
         otherwise: Box<Read>,
     },
+    /// The rows a window step reads through an index; `otherwise` when the
+    /// table cannot read them so in this run
+    Window {
+        read: WindowRead,
+        otherwise: Box<Read>,
+    },
+}
+
+/// How a statement's window functions read their table's rows through an
+/// index on one column, lowercase
+#[derive(Debug, Clone)]
+pub enum WindowRead {
+    /// Grouped by every window's one PARTITION BY column; `lazy` reads a
+    /// partition at a time until the LIMIT is met
+    Partitions { column: SmartString, lazy: bool },
+    /// In the order of the first window's one ORDER BY column, which holds
+    /// no NULL; `limited` reads only the rows the LIMIT keeps
+    Ordered {
+        column: SmartString,
+        ascending: bool,
+        limited: bool,
+    },
 }
 
 impl Read {
@@ -95,7 +121,9 @@ impl Read {
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
             Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.scan(),
-            Self::DistinctValues { otherwise, .. } => otherwise.scan(),
+            Self::DistinctValues { otherwise, .. } | Self::Window { otherwise, .. } => {
+                otherwise.scan()
+            }
             Self::Source(_) => None,
             Self::Scan(scan)
             | Self::Ordered {
@@ -119,6 +147,37 @@ impl Read {
         match self {
             Self::DistinctValues { column, .. } => Some(column),
             _ => None,
+        }
+    }
+
+    /// The index read of a plan whose window functions read through one
+    pub fn window(&self) -> Option<&WindowRead> {
+        match self {
+            Self::Window { read, .. } => Some(read),
+            _ => None,
+        }
+    }
+}
+
+impl WindowRead {
+    /// The read as EXPLAIN shows it over `table`
+    fn explain(&self, table: &str) -> String {
+        match self {
+            Self::Partitions { column, lazy } => match lazy {
+                true => format!("PartitionsByIndex {table} ({column}) one at a time to the LIMIT"),
+                false => format!("PartitionsByIndex {table} ({column})"),
+            },
+            Self::Ordered {
+                column,
+                ascending,
+                limited,
+            } => {
+                let direction = if *ascending { "ASC" } else { "DESC" };
+                match limited {
+                    true => format!("IndexOrder {table} ({column} {direction}) to the LIMIT"),
+                    false => format!("IndexOrder {table} ({column} {direction})"),
+                }
+            }
         }
     }
 }
@@ -156,6 +215,8 @@ pub struct PlanText<'a> {
     pub distinct_on: Option<String>,
     /// The HAVING condition
     pub having: Option<String>,
+    /// The window functions
+    pub windows: Option<String>,
     pub names: &'a [String],
     /// The conjuncts the read takes
     pub pushed: Option<&'a Expression>,
@@ -227,6 +288,10 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             alternative(lines, format!("DistinctValues {} ({column})", text.table));
             read_lines(otherwise, text, lines);
         }
+        (Read::Window { read, otherwise }, _) => {
+            alternative(lines, read.explain(text.table));
+            read_lines(otherwise, text, lines);
+        }
         (
             Read::Ordered {
                 read: ordered,
@@ -282,6 +347,7 @@ fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
         Step::DistinctOn => format!("DistinctOn {}", text.distinct_on.as_deref()?),
         Step::Distinct => "Distinct".to_string(),
         Step::Having => format!("Having {}", text.having.as_deref()?),
+        Step::Window => format!("Window {}", text.windows.as_deref()?),
         Step::Project => format!("Project {}", text.names.join(", ")),
         Step::Filter => "Filter".to_string(),
     })
@@ -294,6 +360,41 @@ pub enum ScanChoice {
     Seq,
     /// The rows the indexes give for the conjuncts
     Index(IndexPlan),
+}
+
+/// The column of `schema` a DISTINCT statement reads the distinct values of
+/// instead of its rows: one plain column selected, and no DISTINCT ON, WHERE,
+/// grouping, aggregate or window
+pub(crate) fn distinct_values_column(
+    stmt: &SelectStatement,
+    classification: &QueryClassification,
+    schema: &Schema,
+) -> Option<SmartString> {
+    if !stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || classification.has_where
+        || classification.has_group_by
+        || classification.has_having
+        || classification.has_aggregation
+        || classification.has_window_functions
+    {
+        return None;
+    }
+    let [item] = stmt.columns.as_slice() else {
+        return None;
+    };
+    let item = match item {
+        Expression::Aliased(aliased) => &*aliased.expression,
+        item => item,
+    };
+    let column = match item {
+        Expression::Identifier(id) => &id.value_lower,
+        Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
+        _ => return None,
+    };
+    schema
+        .has_column(column)
+        .then(|| SmartString::from(column.as_str()))
 }
 
 /// The scan for `pushed`, the conjuncts a scan takes of a WHERE, over a

@@ -52,7 +52,7 @@ use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
 #[cfg(feature = "parallel")]
 use super::expression::RowFilter;
-use super::utils::{hash_composite_key, hash_row, rows_equal, verify_composite_key_equality};
+use super::utils::{hash_composite_key, verify_composite_key_equality};
 
 /// Get number of parallel threads (1 when parallel feature is disabled)
 #[inline]
@@ -360,110 +360,6 @@ where
     }
     let _ = config; // suppress unused warning when parallel feature is disabled
     rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-}
-
-/// Parallel DISTINCT processing using hash map with proper equality checking
-///
-/// Removes duplicate rows in parallel by:
-/// 1. Splitting rows into chunks
-/// 2. Each chunk builds a local hash map (hash -> list of rows)
-/// 3. Final merge pass removes cross-chunk duplicates with full equality check
-///
-/// This implementation correctly handles hash collisions by storing actual rows
-/// and comparing them for equality, not just their hashes.
-pub fn parallel_distinct(rows: RowVec, config: &ParallelConfig) -> RowVec {
-    #[cfg(feature = "parallel")]
-    {
-        let row_count = rows.len();
-        if config.should_parallel_filter(row_count) {
-            // For parallel distinct, we use a two-phase approach:
-            // Phase 1: Filter locally within chunks (parallel) - uses hash map with collision lists
-            // Phase 2: Final dedup across chunks (sequential) - verifies equality for hash matches
-
-            let n_threads = num_threads();
-            let chunk_size = config.chunk_size.max(row_count / n_threads).max(1000);
-
-            // Phase 1: Parallel local dedup within chunks
-            // Note: We must convert to Vec for into_par_iter (RowVec doesn't impl IntoParallelIterator)
-            // Each chunk produces unique rows (within that chunk) along with their hashes
-            let row_vec: Vec<(i64, Row)> = rows.into_vec();
-            let deduped_chunks: Vec<Vec<(u64, i64, Row)>> = row_vec
-                .into_par_iter()
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    // Use hash map: hash -> list of indices into unique_with_hashes
-                    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-                    // Store (hash, row_id, row) tuples
-                    let mut unique_with_hashes: Vec<(u64, i64, Row)> =
-                        Vec::with_capacity(chunk.len());
-
-                    for (row_id, row) in chunk {
-                        let hash = hash_row(&row);
-                        let indices = hash_to_indices.entry(hash).or_default();
-
-                        // Check if this exact row already exists (handle hash collisions)
-                        let is_duplicate = indices
-                            .iter()
-                            .any(|&idx| rows_equal(&unique_with_hashes[idx].2, &row));
-
-                        if !is_duplicate {
-                            indices.push(unique_with_hashes.len());
-                            unique_with_hashes.push((hash, row_id, row));
-                        }
-                    }
-
-                    unique_with_hashes
-                })
-                .collect();
-
-            // Phase 2: Sequential final dedup across chunks with full equality verification
-            let total_size: usize = deduped_chunks.iter().map(|chunk| chunk.len()).sum();
-            let estimated_size = (total_size * 3) / 4;
-            let mut result = RowVec::with_capacity(estimated_size);
-            let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-
-            for chunk in deduped_chunks {
-                for (hash, row_id, row) in chunk {
-                    let indices = hash_to_indices.entry(hash).or_default();
-
-                    // Check if this exact row already exists globally (handle hash collisions)
-                    let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx].1, &row));
-
-                    if !is_duplicate {
-                        indices.push(result.len());
-                        result.push((row_id, row));
-                    }
-                }
-            }
-
-            return result;
-        }
-    }
-
-    // Sequential fallback (always compiled)
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    sequential_distinct(rows)
-}
-
-/// Sequential DISTINCT with proper equality checking for hash collisions
-fn sequential_distinct(rows: RowVec) -> RowVec {
-    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-    let mut result = RowVec::with_capacity(rows.len());
-
-    for (row_id, row) in rows {
-        let hash = hash_row(&row);
-        let indices = hash_to_indices.entry(hash).or_default();
-
-        // Check if this exact row already exists (handle hash collisions)
-        let is_duplicate = indices.iter().any(|&idx| rows_equal(&result[idx].1, &row));
-
-        if !is_duplicate {
-            indices.push(result.len());
-            result.push((row_id, row));
-        }
-    }
-
-    result
 }
 
 /// Parallel projection - evaluate expressions on rows in parallel
@@ -1477,6 +1373,7 @@ pub fn parallel_topn_vector_search(
 mod tests {
     use super::*;
     use crate::core::Value;
+    use crate::executor::utils::rows_equal;
 
     fn make_test_rows(count: usize) -> RowVec {
         (0..count)
@@ -1490,26 +1387,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    #[test]
-    fn test_parallel_distinct() {
-        // Create rows with duplicates
-        let mut rows = RowVec::new();
-        for i in 0i64..1000 {
-            // Each value appears 10 times
-            rows.push((i, Row::from_values(vec![Value::Integer(i % 100)])));
-        }
-
-        let config = ParallelConfig {
-            min_rows_for_parallel_filter: 100, // Lower threshold for test
-            ..Default::default()
-        };
-
-        let result = parallel_distinct(rows, &config);
-
-        // Should have 100 unique values
-        assert_eq!(result.len(), 100);
     }
 
     #[test]
@@ -1785,84 +1662,6 @@ mod tests {
     // ========================================================================
     // Edge Case Tests for Hash Collisions and OUTER Joins
     // ========================================================================
-
-    /// Test that DISTINCT handles hash collisions correctly
-    /// Two different rows with the same hash should both be preserved
-    #[test]
-    fn test_distinct_hash_collision_handling() {
-        // Create rows that might have hash collisions by having different values
-        // that could theoretically hash to the same value
-        let mut rows = RowVec::new();
-        rows.push((
-            0,
-            Row::from_values(vec![Value::Integer(1), Value::Text("a".into())]),
-        ));
-        rows.push((
-            1,
-            Row::from_values(vec![Value::Integer(1), Value::Text("b".into())]),
-        )); // Different from above
-        rows.push((
-            2,
-            Row::from_values(vec![Value::Integer(1), Value::Text("a".into())]),
-        )); // Duplicate of first
-        rows.push((
-            3,
-            Row::from_values(vec![Value::Integer(2), Value::Text("a".into())]),
-        )); // Different from all
-        rows.push((
-            4,
-            Row::from_values(vec![Value::Integer(2), Value::Text("a".into())]),
-        )); // Duplicate
-
-        let config = ParallelConfig {
-            min_rows_for_parallel_filter: 1, // Force parallel path
-            ..Default::default()
-        };
-
-        let result = parallel_distinct(rows, &config);
-
-        // Should have 3 unique rows:
-        // (1, "a"), (1, "b"), (2, "a")
-        assert_eq!(result.len(), 3, "Should have 3 unique rows");
-
-        // Verify all three distinct combinations are present
-        let has_1_a = result.iter().any(|(_, r)| {
-            r.get(0) == Some(&Value::Integer(1)) && r.get(1) == Some(&Value::Text("a".into()))
-        });
-        let has_1_b = result.iter().any(|(_, r)| {
-            r.get(0) == Some(&Value::Integer(1)) && r.get(1) == Some(&Value::Text("b".into()))
-        });
-        let has_2_a = result.iter().any(|(_, r)| {
-            r.get(0) == Some(&Value::Integer(2)) && r.get(1) == Some(&Value::Text("a".into()))
-        });
-
-        assert!(has_1_a, "Should contain (1, 'a')");
-        assert!(has_1_b, "Should contain (1, 'b')");
-        assert!(has_2_a, "Should contain (2, 'a')");
-    }
-
-    /// Test sequential distinct also handles hash collisions
-    #[test]
-    fn test_sequential_distinct_hash_collision() {
-        let mut rows = RowVec::new();
-        rows.push((0, Row::from_values(vec![Value::Integer(100)])));
-        rows.push((1, Row::from_values(vec![Value::Integer(200)])));
-        rows.push((2, Row::from_values(vec![Value::Integer(100)]))); // Duplicate
-        rows.push((3, Row::from_values(vec![Value::Integer(300)])));
-
-        // Use high threshold to force sequential path
-        let config = ParallelConfig {
-            min_rows_for_parallel_filter: 10000,
-            ..Default::default()
-        };
-
-        let result = parallel_distinct(rows, &config);
-        assert_eq!(
-            result.len(),
-            3,
-            "Should have 3 unique values: 100, 200, 300"
-        );
-    }
 
     /// Test parallel hash join with hash collisions on join keys
     #[test]
