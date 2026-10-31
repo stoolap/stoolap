@@ -4358,10 +4358,12 @@ impl Grouping {
         prefix: usize,
         mut call: Option<(&mut ExprVM, &ExecuteContext, &FunctionRegistry)>,
     ) -> Result<GroupedAggregates> {
-        let calls = self.calls.iter().enumerate().map(|(i, template)| {
+        let mut calls = Vec::with_capacity(self.calls.len());
+        for (i, template) in self.calls.iter().enumerate() {
             let extra = self.extra.iter().find(|(at, _)| *at == i);
             let (Some((vm, exec, registry)), Some((_, programs))) = (call.as_mut(), extra) else {
-                return Ok(template.duplicate());
+                calls.push(template.duplicate());
+                continue;
             };
             let mut failed = None;
             let values: SmallVec<[Value; 1]> = programs
@@ -4373,9 +4375,8 @@ impl Grouping {
                     })
                 })
                 .collect();
-            self.aggregations[i].template_reading(registry, &values, failed)
-        });
-        let calls = calls.collect::<Result<_>>()?;
+            calls.push(self.aggregations[i].template_reading(registry, &values, failed)?);
+        }
         Ok(match prefix + self.items.len() {
             0 => GroupedAggregates::global(calls),
             width => GroupedAggregates::new(calls, width),
