@@ -31,8 +31,9 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// t: (id, k), u: (id, k, v), and w: (id, k, v) with an index on k and the
-/// smallest integer, which ABS cannot negate; sealed into volumes when `sealed`
+/// t: (id, k), u: (id, k, v), r: (rid) naming u's first rows, and w: (id, k, v)
+/// with an index on k and the smallest integer, which ABS cannot negate;
+/// sealed into volumes when `sealed`
 fn setup(dir: &tempfile::TempDir, sealed: bool) -> Database {
     let dsn = match sealed {
         true => format!("file://{}/db", dir.path().display()),
@@ -44,6 +45,8 @@ fn setup(dir: &tempfile::TempDir, sealed: bool) -> Database {
         "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
         "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
         "CREATE INDEX w_k ON w (k)",
+        "CREATE TABLE r (rid INTEGER PRIMARY KEY)",
+        "INSERT INTO r VALUES (1), (2), (3), (4)",
         "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4)",
         "INSERT INTO u VALUES (1, 1, 5), (2, 1, NULL), (3, 2, 7), (4, 3, 1), (5, 3, 2)",
         "INSERT INTO w VALUES (1, 1, -9223372036854775808), (2, 1, 3), (3, 2, 5)",
@@ -178,6 +181,51 @@ fn a_grouped_block_with_a_subquery_in_its_aggregation_answers_in_every_site() {
 }
 
 #[test]
+fn a_grouped_block_over_a_join_binds_its_keys_over_its_groups() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup(&dir, sealed);
+        let mode = if sealed { "sealed" } else { "hot" };
+        let from = "FROM u JOIN r ON r.rid = u.id";
+        for (sql, twin) in [
+            (
+                format!(
+                    "SELECT id, (SELECT u.k {from} WHERE u.k = t.k GROUP BY u.k \
+                     ORDER BY SUM(u.v) LIMIT 1) FROM t ORDER BY id"
+                ),
+                format!("SELECT id, (SELECT u.k {from} WHERE u.k = t.k GROUP BY u.k) FROM t ORDER BY id"),
+            ),
+            (
+                format!(
+                    "SELECT id FROM t WHERE k IN \
+                     (SELECT u.k {from} GROUP BY u.k ORDER BY SUM(u.v) DESC LIMIT 1) ORDER BY id"
+                ),
+                "SELECT id FROM t WHERE k IN (2) ORDER BY id".to_string(),
+            ),
+            (
+                format!("SELECT id, (SELECT COUNT(*) + (SELECT 1) {from} WHERE u.k = t.k) FROM t ORDER BY id"),
+                format!("SELECT id, (SELECT COUNT(*) + 1 {from} WHERE u.k = t.k) FROM t ORDER BY id"),
+            ),
+            (
+                format!(
+                    "SELECT id, (SELECT COUNT(*) {from} WHERE u.k = t.k GROUP BY u.k \
+                     HAVING COUNT(*) > (SELECT 0)) FROM t ORDER BY id"
+                ),
+                format!(
+                    "SELECT id, (SELECT COUNT(*) {from} WHERE u.k = t.k GROUP BY u.k \
+                     HAVING COUNT(*) > 0) FROM t ORDER BY id"
+                ),
+            ),
+        ] {
+            holds(&db, &sql, &twin, mode, &mut wrong);
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
 fn an_exists_computes_no_order_by_key() {
     let _guard = serial();
     let mut wrong = Vec::new();
@@ -242,6 +290,16 @@ fn an_exists_computes_no_order_by_key() {
             let literal = format!("SELECT id FROM t WHERE EXISTS ({groups}) ORDER BY id");
             holds(&db, &sql, &literal, mode, &mut wrong);
         }
+        // Over a join the keys bind with the block, as the join reads it
+        let joined = "SELECT u.k FROM u JOIN r ON r.rid = u.id WHERE u.k = t.k GROUP BY u.k";
+        for block in [
+            format!("{joined} ORDER BY SUM(u.v)"),
+            format!("{joined} HAVING COUNT(*) > (SELECT 0) ORDER BY SUM(u.v)"),
+        ] {
+            let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
+            let literal = format!("SELECT id FROM t WHERE EXISTS ({joined}) ORDER BY id");
+            holds(&db, &sql, &literal, mode, &mut wrong);
+        }
         // Its keys are still bound, as the same ORDER BY is anywhere else
         for (block, error) in [
             (
@@ -255,6 +313,23 @@ fn an_exists_computes_no_order_by_key() {
             (
                 "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY v",
                 "Column 'v' not found",
+            ),
+            (
+                "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY v",
+                "Column 'v' not found",
+            ),
+            (
+                "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY nofn(k)",
+                "Function not found: NOFN",
+            ),
+            (
+                "SELECT k FROM w WHERE w.k = t.k GROUP BY k \
+                 HAVING COUNT(*) > (SELECT 0) ORDER BY nofn(k)",
+                "Function not found: NOFN",
+            ),
+            (
+                "SELECT u.k FROM u JOIN r ON r.rid = u.id WHERE u.k = t.k GROUP BY u.k ORDER BY u.v",
+                "Column 'u.v' not found",
             ),
         ] {
             let sql = format!("SELECT id FROM t WHERE EXISTS ({block})");

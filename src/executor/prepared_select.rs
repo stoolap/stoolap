@@ -4990,7 +4990,8 @@ impl Builder<'_> {
     }
 
     /// Bind the ORDER BY the EXISTS block `sq` runs without, as a block binds
-    /// a key that chooses no row, over the scope `own` its FROM gives it
+    /// a key that chooses no row, over the scope `own` its FROM gives it: a
+    /// grouped block's keys over its groups, as `grouping` binds its items
     fn bind_dropped_order(
         &mut self,
         sq: &SelectStatement,
@@ -5004,14 +5005,69 @@ impl Builder<'_> {
         scopes.push(own);
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
-        let registry = &self.executor.function_registry;
-        let compile = CompileContext::bound(registry).with_prepared_subqueries();
+        let mut keys = Vec::with_capacity(sq.order_by.len());
         for ob in &sq.order_by {
             let key = with_aliases(&ob.expression, &sq.columns, &own.columns);
-            let key = self.trial_rewrite(&chain, id, &key, &work.outer)?;
-            compile_with(&compile, &key)?;
+            keys.push(self.trial_rewrite(&chain, id, &key, &work.outer)?);
         }
-        Ok(())
+        if grouped_block(sq) {
+            return self.bind_grouped_keys(&chain, id, sq, &keys, true, Some(&own.lower), work);
+        }
+        let registry = &self.executor.function_registry;
+        let compile = CompileContext::bound(registry).with_prepared_subqueries();
+        keys.iter()
+            .try_for_each(|key| compile_with(&compile, key).map(drop))
+    }
+
+    /// Bind `values` over the groups of the grouped block `sq`, as its SELECT
+    /// list is bound, keeping no slot or block; `exists` binds the list an
+    /// EXISTS never reads, `source` its one source's columns. Grouping
+    /// compiles no subquery: a block grouped by one is checked for its
+    /// ungrouped reads alone, and a value holding one by its names
+    #[allow(clippy::too_many_arguments)]
+    fn bind_grouped_keys(
+        &mut self,
+        chain: &Chain<'_>,
+        id: u16,
+        sq: &SelectStatement,
+        values: &[Expression],
+        exists: bool,
+        source: Option<&[String]>,
+        work: &Rewritten,
+    ) -> Result<()> {
+        // Over one source the general path's check names an ungrouped column
+        if let Some(source) = source {
+            check_grouped_reads(self.executor, sq, source, self.ctx)?;
+        }
+        if sq.group_by.columns.iter().any(mentions_subquery) {
+            return Ok(());
+        }
+        let values: Vec<Expression> = values
+            .iter()
+            .filter(|value| !mentions_subquery(value))
+            .cloned()
+            .collect();
+        // A HAVING subquery is bound by the statement's run; no key reads it
+        let without_having;
+        let sq = match sq.having.as_deref().is_some_and(mentions_subquery) {
+            true => {
+                without_having = SelectStatement {
+                    having: None,
+                    ..sq.clone()
+                };
+                &without_having
+            }
+            false => sq,
+        };
+        let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
+        let mut trial = Rewritten {
+            outer: work.outer.clone(),
+            ..Rewritten::default()
+        };
+        let grouping = self.grouping(chain, id, sq, &values, exists, &mut trial);
+        self.next_slot = next_slot;
+        self.subqueries.truncate(blocks);
+        grouping.map(drop)
     }
 
     /// Bind the block `sq` over a join as a block over one table is bound
@@ -5060,9 +5116,18 @@ impl Builder<'_> {
         let named = |expr: &Expression| with_aliases(expr, &sq.columns, &scope.lower).into_owned();
         let mut bound: Vec<Expression> =
             sq.where_clause.as_deref().map(named).into_iter().collect();
-        if !windowed {
-            bound.extend(sq.order_by.iter().map(|ob| named(&ob.expression)));
-            bound.extend(sq.distinct_on.iter().map(named));
+        // A grouped block's keys read its groups, bound with its items
+        let keys: Vec<Expression> = match windowed {
+            true => Vec::new(),
+            false => sq
+                .order_by
+                .iter()
+                .map(|ob| named(&ob.expression))
+                .chain(sq.distinct_on.iter().map(named))
+                .collect(),
+        };
+        if !grouped {
+            bound.extend(keys.iter().cloned());
         }
         if !grouped && !windowed {
             bound.extend(items.iter().map(|item| (*item).clone()));
@@ -5072,22 +5137,16 @@ impl Builder<'_> {
             compile_with(&compile, &expr)?;
         }
         if grouped {
-            let values = match exists {
-                true => Vec::new(),
-                false => items
-                    .iter()
-                    .map(|item| self.trial_rewrite(&chain, id, item, &work.outer))
-                    .collect::<Result<Vec<_>>>()?,
-            };
-            let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
-            let mut trial = Rewritten {
-                outer: work.outer.clone(),
-                ..Rewritten::default()
-            };
-            let grouping = self.grouping(&chain, id, sq, &values, exists, &mut trial);
-            self.next_slot = next_slot;
-            self.subqueries.truncate(blocks);
-            grouping?;
+            // An item holding a subquery is bound by the block's run
+            let listed = items
+                .iter()
+                .copied()
+                .filter(|item| !exists && !mentions_subquery(item));
+            let values = listed
+                .chain(&keys)
+                .map(|value| self.trial_rewrite(&chain, id, value, &work.outer))
+                .collect::<Result<Vec<_>>>()?;
+            self.bind_grouped_keys(&chain, id, sq, &values, exists, None, work)?;
         }
         Ok(())
     }
@@ -5114,10 +5173,15 @@ impl Builder<'_> {
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
         // An EXISTS counts its rows, which no ORDER BY changes: it runs
-        // without one, whose names are still bound, but for a position its
-        // run counts. Unless its items choose its rows, by a window, a
+        // without one, bound as its keys bind, but where a window function,
+        // a set operation's columns or a position over a merged star are
+        // what only its run binds. Unless its items choose its rows, by a
         // DISTINCT ON or the clauses of a statement block, it reads no item
-        let dropped = matches!(form, Form::Exists(_)) && !orders_by_merged_star_position(sq);
+        let dropped = matches!(form, Form::Exists(_))
+            && !windowed_block(sq)
+            && sq.window_defs.is_empty()
+            && sq.set_operations.is_empty()
+            && !orders_by_merged_star_position(sq);
         let counted = dropped && !clause_block(sq, false) && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
@@ -5167,20 +5231,17 @@ impl Builder<'_> {
             self.ctes = around;
             bound?;
         }
-        // A join's run names its columns, so it binds what it reads
+        // A join's keys are bound with its block, and its run names its columns
+        if dropped && !joined {
+            self.bind_dropped_order(sq, &own, outer, id, &work)?;
+        }
         let statement = match (dropped, counted && !joined) {
             (false, _) => statement,
             (true, false) => SelectStatement {
                 order_by: Vec::new(),
                 ..statement
             },
-            // A grouped block's keys read its groups, bound by its walk
-            (true, true) => {
-                if !grouped_block(sq) {
-                    self.bind_dropped_order(sq, &own, outer, id, &work)?;
-                }
-                existence(executor, statement, &own.lower, ctx)?
-            }
+            (true, true) => existence(executor, statement, &own.lower, ctx)?,
         };
         let (identity, signature, _) = block_identity(sq, form);
         // One that binds nothing beyond itself keeps its answer across
