@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A join whose side is a NATURAL or USING join runs its subqueries as the
-//! plan's blocks and reads that side as a join at the top does: `t.id` and
-//! `u.id` are each their table's column, the bare `id` the merged one, and a
-//! star shows the pair once
+//! A join whose side is a NATURAL or USING join reads that side as a join at
+//! the top does, with a subquery or without: `t.id` and `u.id` are each
+//! their table's column, the bare `id` the merged one, and a star shows the
+//! pair once. Its subqueries run as the plan's blocks
 
 use stoolap::Database;
 
@@ -116,6 +116,17 @@ const SHAPES: &[&str] = &[
     "SELECT {id}, u.id, r.x FROM {f} WHERE r.x IS NULL OR r.x < (SELECT MAX(y) FROM w) + 100 ORDER BY u.id, {id}, r.x",
 ];
 
+/// The same statements without a subquery, and a CASE over the pair
+const PLAIN_SHAPES: &[&str] = &[
+    "SELECT {id}, t.id, u.id, u.x, r.x FROM {f} WHERE COALESCE(u.x, 0) < 107",
+    "SELECT * FROM {f} WHERE COALESCE(t.b, 0) < 700",
+    "SELECT u.*, t.* FROM {f}",
+    "SELECT {id}, COUNT(*), SUM(t.b) FROM {f} WHERE COALESCE(u.x, 0) < 107 GROUP BY {id}",
+    "SELECT u.id, COUNT(*) FROM {f} GROUP BY u.id",
+    "SELECT {id}, u.id, r.x FROM {f} WHERE r.x IS NULL OR r.x < 107 ORDER BY u.id, {id}, r.x",
+    "SELECT CASE WHEN u.id IS NULL THEN -1 ELSE u.id END, {id} FROM {f} WHERE u.id IS NULL OR t.id > 1",
+];
+
 /// The rows of `sql` in the order it gives them, sorted unless it orders them
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
@@ -148,6 +159,12 @@ fn prepared_line(db: &Database, sql: &str) -> String {
 }
 
 fn check(db: &Database, context: &str, wrong: &mut Vec<String>) -> usize {
+    check_shapes(db, context, SHAPES, wrong)
+}
+
+/// `shapes` over each joined side against the ON joins they stand for; a
+/// statement holding a subquery is to say `Prepared: yes`
+fn check_shapes(db: &Database, context: &str, shapes: &[&str], wrong: &mut Vec<String>) -> usize {
     let mut count = 0;
     for (merging, as_on, kinds) in MERGING {
         for kind in kinds.iter() {
@@ -155,7 +172,7 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) -> usize {
             for (around, around_on, others) in AROUND {
                 let from = around.replace("{m}", &merging);
                 let from_on = around_on.replace("{m}", &as_on);
-                for shape in SHAPES {
+                for shape in shapes {
                     let sql = shape.replace("{f}", &from).replace("{id}", "id");
                     let star = format!("t.id, t.a, t.b, u.x{others}");
                     let want = shape
@@ -168,7 +185,7 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) -> usize {
                         wrong.push(format!("{context}: {sql}: {got:?}, want {want:?}"));
                     }
                     let line = prepared_line(db, &sql);
-                    if line != "Prepared: yes" {
+                    if sql.contains("(SELECT") && line != "Prepared: yes" {
                         wrong.push(format!("{context}: {sql}: EXPLAIN {line}"));
                     }
                 }
@@ -191,6 +208,54 @@ fn a_joined_side_that_merges_columns_runs_its_blocks_and_answers_as_at_the_top()
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+#[test]
+fn a_joined_side_that_merges_columns_answers_as_at_the_top_without_a_subquery() {
+    let mut wrong = Vec::new();
+    let count = check_shapes(&hot("plain"), "hot", PLAIN_SHAPES, &mut wrong);
+    let dir = tempfile::tempdir().unwrap();
+    check_shapes(&sealed(&dir), "sealed", PLAIN_SHAPES, &mut wrong);
+    assert!(count > 150, "{count} statements");
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_prepared_join_over_a_merging_side_reads_its_parameters_by_the_same_rule() {
+    let db = hot("parameters");
+    let stmt = db
+        .prepare(
+            "SELECT id, t.id, u.id FROM t LEFT JOIN u USING (id) JOIN s AS r ON r.id = t.id \
+             WHERE COALESCE(u.id, $1) > $2 ORDER BY t.id",
+        )
+        .unwrap();
+    let rows = |a: i64, b: i64| -> Vec<String> {
+        stmt.query((a, b))
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..3)
+                    .map(|i| {
+                        row.get::<Option<i64>>(i)
+                            .unwrap()
+                            .map_or("NULL".into(), |v| v.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    assert_eq!(
+        rows(0, 0),
+        ["1|1|1", "2|2|2"],
+        "a missing u row is NULL in u.id"
+    );
+    assert_eq!(rows(10, 1), ["2|2|2", "4|4|NULL", "6|6|NULL"]);
 }
 
 #[test]

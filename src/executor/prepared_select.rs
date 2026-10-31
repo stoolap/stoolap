@@ -1632,6 +1632,46 @@ impl ScopeTable {
     }
 }
 
+/// The scope of each side of `join` over `sides`, its tables side by side,
+/// read by position in the joined row
+fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable; 2]> {
+    let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
+        ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
+    };
+    let side_scope = |expr: &Expression, side: &JoinSide| {
+        ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
+    };
+    Some([
+        side_scope(&join.left, &sides[0])?,
+        side_scope(&join.right, &sides[1])?,
+    ])
+}
+
+/// Whether an unqualified name in `clauses` is one two columns of `join`
+/// over `sides` have and no NATURAL or USING join merges, which its blocks
+/// refuse as ambiguous
+pub(crate) fn join_names_ambiguous(
+    join: &JoinTableSource,
+    sides: &JoinSides,
+    clauses: &[&Expression],
+) -> bool {
+    let Some([left, right]) = side_scopes(join, sides) else {
+        return false;
+    };
+    let scope = ScopeTable::joined(join, left, right);
+    let scopes = [&scope];
+    let chain = Chain { scopes: &scopes };
+    let mut names = FxHashSet::<String>::default();
+    for clause in clauses {
+        crate::executor::utils::collect_unqualified_columns(clause, &mut names);
+    }
+    names.iter().any(|name| {
+        chain
+            .bare(&ident(name, name))
+            .is_err_and(|err| err.to_string().contains("is ambiguous"))
+    })
+}
+
 /// The refusal of a name two columns carry
 pub(crate) fn ambiguous_column(spelled: &dyn std::fmt::Display) -> Error {
     Error::invalid_argument(format!("column reference '{}' is ambiguous", spelled))
@@ -8807,8 +8847,11 @@ pub(crate) struct JoinBlocks {
     /// The same conditions as written, which the sides' reads are given,
     /// when a subquery that reads the other side moved one to the joined row
     pub(crate) written: Option<[Option<Expression>; 2]>,
-    /// The same conditions as their side's scan reads them
+    /// The same conditions as their side's scan reads them, TRUE for a
+    /// table side without any
     side_wheres: [Option<PreparedWhere>; 2],
+    /// The scan each table side's conditions plan, when they hold no subquery
+    side_scans: [Option<ScanChoice>; 2],
     /// The columns of each side the clauses were prepared over
     side_columns: [Vec<SchemaColumn>; 2],
     /// The schema each side was found to hold those columns with; held, any
@@ -8859,6 +8902,12 @@ impl JoinBlocks {
         Err(Error::SchemaChanged {
             table: schema.table_name.clone(),
         })
+    }
+
+    /// Whether the statement's rows are asked through a site: a block runs
+    /// there, or a value the run computes once, a run slot, is read there
+    pub(crate) fn asks_sites(&self) -> bool {
+        !self.blocks.subqueries.is_empty() || !self.blocks.run_slots.is_empty()
     }
 
     /// Whether the statement holds a condition on side `side` alone
@@ -8919,14 +8968,7 @@ impl JoinBlocks {
         let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
             ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
         };
-        // Each side's tables side by side, read by position in the joined row
-        let side_scope = |expr: &Expression, side: &JoinSide| {
-            ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
-        };
-        let (Some(left_scope), Some(right_scope)) = (
-            side_scope(&join.left, &sides[0]),
-            side_scope(&join.right, &sides[1]),
-        ) else {
+        let Some([left_scope, right_scope]) = side_scopes(join, sides) else {
             return Ok(None);
         };
         let left_width = left_scope.columns.len();
@@ -9066,9 +9108,19 @@ impl JoinBlocks {
         // is compared with a run slot; the joined row reads the same blocks
         let registry = &executor.function_registry;
         let mut side_parts = [None, None];
+        // A table side without conditions is read by its scan all the same
+        let none = Expression::BooleanLiteral(BooleanLiteral {
+            token: Token::new(TokenType::Keyword, "TRUE", Position::default()),
+            value: true,
+        });
         for (i, filter) in side_filters.into_iter().enumerate() {
-            let (Some(filter), Some(schema)) = (filter, sides[i].schema()) else {
+            let Some(schema) = sides[i].schema() else {
                 continue;
+            };
+            let (filter, implicit) = match filter {
+                Some(filter) => (filter, false),
+                None if !rows_sides[i] => (&none, true),
+                None => continue,
             };
             let side = table(&sides[i].leaves[0]);
             let side_scopes = [&side];
@@ -9089,7 +9141,10 @@ impl JoinBlocks {
                 .with_read_as(&read_as);
             let program = parts.programs(|expr| compile_with(&own, expr))?;
             let offset = if i == 0 { 0 } else { left_width };
-            let joined_clause = in_joined(&parts.clause, offset)?;
+            let joined_clause = match implicit {
+                true => None,
+                false => Some(in_joined(&parts.clause, offset)?),
+            };
             side_parts[i] = Some((parts, program, joined_clause));
         }
         let values = CompileContext::bound(registry).with_prepared_subqueries();
@@ -9107,6 +9162,7 @@ impl JoinBlocks {
             .collect::<Result<Vec<_>>>()?;
         let mut side_filters = [None, None];
         let mut side_wheres = [None, None];
+        let mut side_scans = [None, None];
         let side_columns = sides.each_ref().map(|side| {
             let columns = side.leaves.iter().flat_map(|(_, schema)| &schema.columns);
             columns.cloned().collect()
@@ -9114,8 +9170,23 @@ impl JoinBlocks {
         for (i, part) in side_parts.into_iter().enumerate() {
             if let (Some((parts, program, joined_clause)), Some(schema)) = (part, sides[i].schema())
             {
-                side_wheres[i] = Some(parts.prepare(program, &blocks, schema));
-                side_filters[i] = Some(joined_clause);
+                let blockless = !mentions_subquery(&parts.clause);
+                let mut where_ = parts.prepare(program, &blocks, schema);
+                // A side without conditions has no conjunct for its scan to take
+                if joined_clause.is_none() {
+                    where_.pushdown = None;
+                    where_.push = None;
+                    where_.pushed = 0;
+                    where_.conjuncts = 0;
+                }
+                // As a statement over the table plans its scan
+                if blockless {
+                    if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
+                        side_scans[i] = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
+                    }
+                }
+                side_wheres[i] = Some(where_);
+                side_filters[i] = joined_clause;
             }
         }
         let left = scope.columns[..left_width].to_vec();
@@ -9154,6 +9225,7 @@ impl JoinBlocks {
             sides: side_filters,
             written: crossed.then_some(written),
             side_wheres,
+            side_scans,
             side_columns,
             fitted: Default::default(),
             rows_sides,
@@ -9355,6 +9427,7 @@ impl Executor {
         // set, when it has one, is a filter like the others
         let Some(where_) = held.side_wheres[side]
             .as_ref()
+            .filter(|_| held.sides[side].is_some())
             .filter(|w| w.narrowing.is_none() || w.narrowing_set.is_some())
         else {
             return Ok(None);
@@ -9371,8 +9444,8 @@ impl Executor {
     /// The rows of table `name`, side `side` of the join `held` prepared,
     /// that its conditions on that side pass and the `extra` ones too, read
     /// as `run` reads a prepared statement's rows: from the `offset`-th up
-    /// to `limit` of them, with the table's layout. None when the statement
-    /// holds no condition on that side alone
+    /// to `limit` of them, with the table's layout, by the scan the side's
+    /// conditions plan. None when the side is no table
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn join_side_rows(
         &self,
@@ -9390,14 +9463,28 @@ impl Executor {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
-        let table = self.prepared_table(name, ctx, None)?;
+        // A table the side was prepared for and is gone changed under it
+        let table = self
+            .prepared_table(name, ctx, None)
+            .map_err(|err| match err {
+                Error::TableNotFound(_) | Error::TableOrViewNotFound(_) => Error::SchemaChanged {
+                    table: name.to_string(),
+                },
+                err => err,
+            })?;
         held.side_fits(side, &table.schema_arc())?;
         let token = table.layout_token();
         let columns = table.schema().column_names_arc();
         let extra = extra.map(|extra| strip_table_qualifier(extra, alias));
         let filter = extra
             .as_ref()
-            .map(|extra| RowFilter::new(extra, &columns).map(|f| f.with_context(ctx)))
+            .map(
+                |extra| match pushdown::try_pushdown(extra, table.schema(), Some(ctx)) {
+                    (Some(expr), false) => Ok(SideFilter::Storage(expr)),
+                    _ => RowFilter::new(extra, &columns)
+                        .map(|f| SideFilter::Row(f.with_context(ctx))),
+                },
+            )
             .transpose()?;
         let mut kept = SideKeep::new(filter.as_ref(), offset, limit);
         if limit != Some(0) {
@@ -9411,8 +9498,23 @@ impl Executor {
             let target = limit
                 .filter(|_| extra.is_none())
                 .map(|limit| limit.saturating_add(offset));
+            // With extra conditions, the scan the same rule plans for both
+            let with_extra;
+            let chosen = match (&held.side_scans[side], extra.as_ref()) {
+                (Some(_), Some(extra)) => {
+                    let both =
+                        conjunction(where_.pushdown.iter().chain([extra]).cloned().collect());
+                    with_extra = self
+                        .engine
+                        .get_version_store(name)
+                        .ok()
+                        .map(|store| scan_choice(&store, table.schema(), both.as_ref()));
+                    with_extra.as_ref()
+                }
+                (chosen, _) => chosen.as_ref(),
+            };
             match run.passing_rows(
-                (where_, None),
+                (where_, chosen),
                 extra.as_ref(),
                 &*table,
                 ctx,
@@ -9502,8 +9604,24 @@ impl Executor {
 
 /// The rows a join side's read keeps: those its `filter` passes, from the
 /// `offset`-th up to `limit` of them; an error the filter raises stops it
+/// A side read's extra conditions: as the storage evaluates them when it
+/// takes them whole, else compiled over the side's columns
+enum SideFilter {
+    Storage(Box<dyn StorageExpr>),
+    Row(RowFilter),
+}
+
+impl SideFilter {
+    fn matches(&self, row: &Row) -> Result<bool> {
+        match self {
+            SideFilter::Storage(expr) => expr.evaluate(row),
+            SideFilter::Row(filter) => filter.matches_checked(row),
+        }
+    }
+}
+
 struct SideKeep<'f> {
-    filter: Option<&'f RowFilter>,
+    filter: Option<&'f SideFilter>,
     offset: usize,
     limit: Option<usize>,
     skipped: usize,
@@ -9512,7 +9630,7 @@ struct SideKeep<'f> {
 }
 
 impl<'f> SideKeep<'f> {
-    fn new(filter: Option<&'f RowFilter>, offset: usize, limit: Option<usize>) -> Self {
+    fn new(filter: Option<&'f SideFilter>, offset: usize, limit: Option<usize>) -> Self {
         Self {
             filter,
             offset,
@@ -9525,7 +9643,7 @@ impl<'f> SideKeep<'f> {
 
     /// Whether the read goes on past `row`
     fn keep(&mut self, id: i64, row: Row) -> bool {
-        match self.filter.map(|filter| filter.matches_checked(&row)) {
+        match self.filter.map(|filter| filter.matches(&row)) {
             Some(Ok(false)) => return true,
             Some(Err(err)) => {
                 self.failed = Some(err);
@@ -12485,8 +12603,10 @@ impl<'a> PreparedRunner<'a> {
                     }
                     let filter = storage_expr.as_deref();
                     // An index reads the values a failed slot does not have
-                    let scan = chosen.filter(|_| extra.is_none() && self.failed_slots.is_none());
-                    if let Some(ScanChoice::Index(_)) = scan {
+                    let scan = chosen.filter(|_| self.failed_slots.is_none());
+                    // A planned scan reads an IN list's members by keys
+                    // where the table can, an index or not
+                    if scan.is_some() {
                         let enough = target.filter(|_| scanned_whole);
                         if let Some(rows) = member_rows(table, filter, target.is_some(), enough)? {
                             break 'read (Some(rows.into_iter()), None, true, scanned_whole);

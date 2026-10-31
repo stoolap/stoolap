@@ -1854,8 +1854,8 @@ impl Executor {
         self.execute_cte_query(&modified_stmt, plan, ctx, cte_registry)
     }
 
-    /// Whether the CTE body `stmt` holds a subquery its plan runs as a block,
-    /// a set operation branch's, a derived FROM's or a join side's included
+    /// Whether the CTE body `stmt` runs blocks under its plan: a subquery,
+    /// a set operation branch's and a derived FROM's included, or a join
     fn body_runs_blocks(stmt: &SelectStatement) -> bool {
         let classification = get_classification(stmt);
         classification.where_has_subqueries
@@ -1871,15 +1871,12 @@ impl Executor {
                 .any(|op| Self::body_runs_blocks(&op.right))
     }
 
-    /// Whether a FROM source holds a subquery its statement's plan runs as a
-    /// block: in a join's ONs or in a derived table's statement
+    /// Whether a FROM source runs blocks under its statement's plan: a join,
+    /// which reads its sides through them, or a derived table's statement
+    /// holding a subquery
     fn source_runs_blocks(source: &Expression) -> bool {
         match source {
-            Expression::JoinSource(join) => {
-                Self::ons_hold_subqueries(join)
-                    || Self::source_runs_blocks(&join.left)
-                    || Self::source_runs_blocks(&join.right)
-            }
+            Expression::JoinSource(_) => true,
             Expression::SubquerySource(derived) => Self::body_runs_blocks(&derived.subquery),
             _ => false,
         }

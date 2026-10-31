@@ -468,8 +468,8 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    ambiguous_column, joined_aliases, set_operation_key_column, set_operation_key_item, Bound,
-    JoinBlocks, OutOfFamily, PreparedProjection,
+    ambiguous_column, join_names_ambiguous, joined_aliases, set_operation_key_column,
+    set_operation_key_item, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -5424,23 +5424,16 @@ impl Executor {
                 .any(|kind| join_type.contains(kind))
     }
 
-    /// Whether a join with a subquery in a clause keeps its plan, its CTEs
-    /// bound or inlined, so its blocks may run; a join with a CTE not named
-    /// before it runs stays there; a view only its run names runs when the
-    /// caller `runs`
+    /// Whether a join keeps its plan, its CTEs bound or inlined, so its
+    /// blocks may run; a join with a CTE not named before it runs stays
+    /// there; a view only its run names runs when the caller `runs`
     pub(crate) fn join_keeps_plan(
         &self,
         stmt: &SelectStatement,
         with: &WithClause,
         runs: bool,
     ) -> bool {
-        let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
-            return false;
-        };
-        let classification = get_classification(stmt);
-        (classification.where_has_subqueries
-            || classification.output_has_subqueries
-            || Self::ons_hold_subqueries(join))
+        matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)))
             && self.named_ctes(with, runs).is_ok()
     }
 
@@ -5526,9 +5519,10 @@ impl Executor {
             || nested(&join.right)
     }
 
-    /// Whether a join, `sides` as `join_side_schemas` finds them, holds
-    /// subqueries in its ONs, a joined side's included, or its WHERE, all of
-    /// the forms the prepared blocks run, or why not
+    /// Whether a join, `sides` as `join_side_schemas` finds them, runs on its
+    /// prepared blocks: named sides read without AS OF, and subqueries in
+    /// its ONs, a joined side's included, its WHERE and its output all of the
+    /// forms the blocks run; or why not
     pub(crate) fn join_blocks_family(
         &self,
         stmt: &SelectStatement,
@@ -5551,69 +5545,82 @@ impl Executor {
             return Err("a side without a name");
         }
         let schemas = (left.schema(), right.schema());
-        let on = join_source.condition.as_deref();
-        let mut on_subqueries = on.is_some_and(Self::has_subqueries);
-        if let Some(on) = on.filter(|_| on_subqueries) {
+        if let Some(on) = join_source
+            .condition
+            .as_deref()
+            .filter(|on| Self::has_subqueries(on))
+        {
             self.join_where_family(on)?;
         }
         // A joined side runs as a join of its own, its ON's subqueries as
         // its blocks
         for side in [&*join_source.left, &*join_source.right] {
             if let Expression::JoinSource(join) = side {
-                on_subqueries |= self.joined_side_family(join)?;
+                self.joined_side_family(join)?;
             }
         }
-        let output_subqueries = self.join_output_family(stmt, join_source, join_type)?;
-        let Some(where_clause) = stmt.where_clause.as_deref() else {
-            return match on_subqueries || output_subqueries {
-                true => Ok(()),
-                false => Err("no ON, WHERE, SELECT list or ORDER BY holds a subquery"),
-            };
-        };
-        let (left, right, cross) =
-            split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
-        // Each part as its site reads it, the SELECT aliases it names opened
-        // over the joined columns the sides lay out
+        self.join_output_family(stmt, join_source, join_type)?;
+        // A join without a subquery reads a name both sources have from its
+        // left source, which its blocks refuse as ambiguous
+        let classification = get_classification(stmt);
+        let holds_subquery = classification.where_has_subqueries
+            || classification.output_has_subqueries
+            || Self::ons_hold_subqueries(join_source);
+        // Each WHERE part as its site reads it, the SELECT aliases it names
+        // opened over the joined columns the sides lay out
         let columns: Vec<String> = sides
             .iter()
             .flat_map(|side| side.columns())
             .map(|(table, name)| qualified(table, name))
             .collect();
+        if !holds_subquery {
+            let opened_where = stmt
+                .where_clause
+                .as_deref()
+                .map(|w| Self::with_select_aliases(stmt, w, &columns).unwrap_or_else(|| w.clone()));
+            let clauses: smallvec::SmallVec<[&Expression; 2]> = join_source
+                .condition
+                .as_deref()
+                .into_iter()
+                .chain(opened_where.as_ref())
+                .collect();
+            if join_names_ambiguous(join_source, sides, &clauses) {
+                return Err("a join without a subquery naming a column both sources have");
+            }
+        }
+        let Some(where_clause) = stmt.where_clause.as_deref() else {
+            return Ok(());
+        };
+        let (left, right, cross) =
+            split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
         let opened = |part: Option<Expression>| {
             part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
         };
         let parts = [opened(left), opened(right), opened(cross)];
-        let mut subqueries = on_subqueries || output_subqueries;
         for part in parts.iter().flatten() {
             if Self::has_subqueries(part) {
                 self.join_where_family(part)?;
-                subqueries = true;
             }
         }
-        match subqueries {
-            true => Ok(()),
-            false => Err("no ON, WHERE, SELECT list or ORDER BY holds a subquery"),
-        }
+        Ok(())
     }
 
-    /// Whether the ON of `join`, a joined side, or of a join it holds holds
-    /// subqueries, all of the forms the prepared blocks run, or why not
-    fn joined_side_family(&self, join: &JoinTableSource) -> std::result::Result<bool, OutOfFamily> {
-        let mut found = false;
+    /// Why the subqueries of the ON of `join`, a joined side, or of a join it
+    /// holds are not all of the forms the prepared blocks run
+    fn joined_side_family(&self, join: &JoinTableSource) -> std::result::Result<(), OutOfFamily> {
         if let Some(on) = join
             .condition
             .as_deref()
             .filter(|on| Self::has_subqueries(on))
         {
             self.join_where_family(on)?;
-            found = true;
         }
         for side in [&*join.left, &*join.right] {
             if let Expression::JoinSource(join) = side {
-                found |= self.joined_side_family(join)?;
+                self.joined_side_family(join)?;
             }
         }
-        Ok(found)
+        Ok(())
     }
 
     /// Whether a join's output groups its rows, so the grouped blocks or the
@@ -5623,17 +5630,17 @@ impl Executor {
         classification.has_aggregation && !classification.has_window_functions
     }
 
-    /// Whether the SELECT list, the ORDER BY or the DISTINCT ON of a join
-    /// holds subqueries, all of the forms the prepared blocks run over the
-    /// joined rows, or why the blocks cannot run them
+    /// Why the subqueries of the SELECT list, the ORDER BY or the DISTINCT ON
+    /// of a join are not all of the forms the prepared blocks run over the
+    /// joined rows
     fn join_output_family(
         &self,
         stmt: &SelectStatement,
         join_source: &JoinTableSource,
         join_type: &str,
-    ) -> std::result::Result<bool, OutOfFamily> {
+    ) -> std::result::Result<(), OutOfFamily> {
         if Self::grouped_join_output(stmt) {
-            return Ok(false);
+            return Ok(());
         }
         let classification = get_classification(stmt);
         let items = stmt
@@ -5654,7 +5661,7 @@ impl Executor {
             }
         }
         if !found {
-            return Ok(false);
+            return Ok(());
         }
         if join_type.contains("NATURAL")
             || !join_source.using_columns.is_empty()
@@ -5670,7 +5677,7 @@ impl Executor {
         {
             return Err("a grouped statement whose output holds a subquery");
         }
-        Ok(true)
+        Ok(())
     }
 
     /// The program of the WHERE `cross` a join asks at `site` of its joined
@@ -5891,26 +5898,22 @@ impl Executor {
         let plan = compiled
             .filter(|_| ctx.outer_row().is_none())
             .and_then(|slot| self.prepared_join(slot, stmt, ctx));
-        let asks_blocks = classification.where_has_subqueries
-            || Self::ons_hold_subqueries(join_source)
-            || classification.output_has_subqueries;
-        let block_sides = plan.as_ref().filter(|_| asks_blocks).and_then(|plan| {
+        let block_sides = plan.as_ref().and_then(|plan| {
             plan.sides(|| self.join_side_schemas(join_source, ctx, true))
                 .cloned()
         });
-        let blocks_where = asks_blocks
-            && plan.as_ref().is_some_and(|plan| {
-                plan.blocks_where(|| {
-                    self.join_blocks_family(
-                        stmt,
-                        join_source,
-                        &join_type,
-                        (left_alias.as_deref(), right_alias.as_deref()),
-                        block_sides.as_ref(),
-                    )
-                    .is_ok()
-                })
-            });
+        let blocks_where = plan.as_ref().is_some_and(|plan| {
+            plan.blocks_where(|| {
+                self.join_blocks_family(
+                    stmt,
+                    join_source,
+                    &join_type,
+                    (left_alias.as_deref(), right_alias.as_deref()),
+                    block_sides.as_ref(),
+                )
+                .is_ok()
+            })
+        });
         // Outside the blocks, an uncorrelated subquery in the ON clause is read
         // once, the way the WHERE clause reads one, so every path below
         // compares each pair against a value rather than against something it
@@ -6087,11 +6090,11 @@ impl Executor {
             plan: plan.as_deref().map(|plan| plan.side_plan(1)),
             apart,
         };
-        let where_blocks = statement_run.map(|run| run.site(false));
+        let where_blocks = statement_run.and_then(|run| run.site(false));
         let where_blocks = where_blocks
             .as_ref()
             .map(|site| site as &dyn SubqueryExecutor);
-        let pair_blocks = statement_run.map(|run| run.site(true));
+        let pair_blocks = statement_run.and_then(|run| run.site(true));
         let pair_blocks = pair_blocks
             .as_ref()
             .map(|site| site as &dyn SubqueryExecutor);
@@ -10015,11 +10018,11 @@ impl Executor {
             }
             None => None,
         };
-        let cross_site = run.map(|run| run.site(false));
+        let cross_site = run.and_then(|run| run.site(false));
         let cross_blocks = cross_site
             .as_ref()
             .map(|site| site as &dyn SubqueryExecutor);
-        let pair_site = run.map(|run| run.site(true));
+        let pair_site = run.and_then(|run| run.site(true));
         let pair_blocks = pair_site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         // A right-side filter the storage layer takes whole runs inside the
         // inner fetch, built once so every chunk sees the same predicate; a
