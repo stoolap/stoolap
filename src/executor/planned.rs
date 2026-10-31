@@ -105,7 +105,6 @@ impl Executor {
             || shape.output_has_subqueries
             || shape.where_has_subqueries
             || shape.has_joins
-            || Self::vector_distance_order(stmt).is_some()
         {
             return None;
         }

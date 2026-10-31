@@ -4133,28 +4133,6 @@ impl Executor {
             }
         }
 
-        // FAST PATH: Vector search optimization (HNSW index or parallel brute-force)
-        // For queries like `SELECT id, VEC_DISTANCE_L2(embedding, '...') AS dist
-        //   FROM documents ORDER BY dist LIMIT 10`
-        // Supports WHERE: brute-force pre-filters rows; HNSW oversamples then post-filters
-        // Skip when transaction has local changes — HNSW index and collect_rows_by_ids
-        // only see committed data, so local INSERTs/UPDATEs would be missed.
-        if classification.has_limit
-            && stmt.order_by.len() == 1
-            && !classification.has_group_by
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !classification.has_distinct
-            && !table.has_local_changes()
-        {
-            if let Some((result, columns)) =
-                self.try_vector_search_optimization(stmt, &*table, &all_columns, ctx)?
-            {
-                OrderLimitPath::VectorSearch.taken();
-                return Ok((result, columns, true, None));
-            }
-        }
-
         // FAST PATH: Keyset pagination optimization
         // For queries like `SELECT * FROM table WHERE id > X ORDER BY id LIMIT Y`,
         // use the PK's ordering to start iteration from X directly.

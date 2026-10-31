@@ -84,8 +84,8 @@ use super::window::WindowRows;
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
 use crate::planner::{
-    distinct_values_column, ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read,
-    ScanChoice, Step,
+    distinct_values_column, nearest_read, ordered_read, scan_choice, KeyRead, NearestRead,
+    OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
 };
 use crate::storage::mvcc::VersionStore;
 
@@ -1113,9 +1113,6 @@ impl Executor {
     ) -> std::result::Result<(), OutOfFamily> {
         if matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_))) {
             return Err("a join");
-        }
-        if Self::vector_distance_order(stmt).is_some() {
-            return Err("an ORDER BY of a vector distance");
         }
         self.family(stmt, ctx, false)
     }
@@ -7946,6 +7943,17 @@ impl PreparedSelect {
                             stmt.offset.is_some(),
                         )
                     });
+                // An ORDER BY of a vector distance under a LIMIT reads the
+                // nearest rows first; the key is the item the ORDER BY binds
+                let bound = order_keys.as_deref().and_then(|keys| {
+                    let (column, ..) = keys.first()?;
+                    let item = layout.as_deref()?.sources.get((*column)?)?.item;
+                    Some(item)
+                });
+                let nearest = bound
+                    .filter(|_| ordered.is_none() && stmt.limit.is_some() && !stmt.distinct)
+                    .and_then(|item| Executor::vector_distance_order(stmt, item))
+                    .and_then(|call| nearest_read(&store, schema, &call));
                 if ordered.is_none() && !stmt.order_by.is_empty() {
                     steps.push(sort);
                 }
@@ -7956,13 +7964,17 @@ impl PreparedSelect {
                 if where_.conjuncts > where_.pushed {
                     steps.push(Step::Filter);
                 }
-                let read = match ordered {
-                    Some(read) => Read::Ordered {
+                let read = match (ordered, nearest) {
+                    (Some(read), _) => Read::Ordered {
                         read,
                         otherwise: scan,
                         sort,
                     },
-                    None => Read::Scan(scan),
+                    (None, Some(read)) => Read::Nearest {
+                        read,
+                        otherwise: scan,
+                    },
+                    (None, None) => Read::Scan(scan),
                 };
                 let classification = get_classification(stmt);
                 let read = match distinct_values_column(stmt, &classification, schema) {
@@ -11751,6 +11763,24 @@ impl Executor {
         // An ORDER BY of one column under a LIMIT reads the rows it keeps in
         // order, as the plan chose
         let planned_order = prepared.plan.as_ref().and_then(|plan| plan.read.ordered());
+        // An ORDER BY of a vector distance reads the nearest rows, which the
+        // statement's sort then orders
+        let planned_nearest = prepared
+            .plan
+            .as_ref()
+            .and_then(|plan| Some((plan.read.nearest()?, plan.read.scan())));
+        let nearest = match (&source, limit, planned_nearest) {
+            _ if keeps_none => None,
+            (StatementSource::Table(table), Some(limit), Some((read, chosen))) => runner
+                .nearest_rows(
+                    (&prepared.where_, chosen),
+                    read,
+                    &**table,
+                    ctx,
+                    limit.saturating_add(offset),
+                )?,
+            _ => None,
+        };
         let ordered = match (&source, limit, planned_order) {
             _ if keeps_none => None,
             (StatementSource::Table(table), Some(limit), Some(read)) => {
@@ -11931,7 +11961,7 @@ impl Executor {
                 true,
             ))
         };
-        let read = match (ordered, source) {
+        let read = match (ordered.or(nearest), source) {
             _ if keeps_none => Ok(Passing::Pruned),
             (Some(rows), _) => Ok(Passing::Answers(rows)),
             (None, StatementSource::Table(table)) => runner.passing_rows(
@@ -13141,6 +13171,138 @@ impl<'a> PreparedRunner<'a> {
             super::result::OrderLimitPath::PreparedTopK.taken();
         }
         Ok(rows)
+    }
+
+    /// The `k` rows of `table` nearest the query vector of the distance
+    /// `read` names, in no order the output keeps: the statement's sort
+    /// orders them. None when the query value is no vector, or the HNSW
+    /// index cannot answer in this run: the graph is not the view the
+    /// statement reads, or it gave fewer rows the WHERE passes than `k`
+    fn nearest_rows(
+        &self,
+        (where_, chosen): (&PreparedWhere, Option<&ScanChoice>),
+        read: &NearestRead,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+        k: usize,
+    ) -> Result<Option<RowVec>> {
+        let query = match super::expression::evaluate_once(&read.query, Some(ctx)).ok() {
+            Some(Value::Text(text)) => match crate::core::value::parse_vector_str(&text) {
+                Some(floats) => Value::vector(floats),
+                None => return Ok(None),
+            },
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let Value::Extension(data) = &query else {
+            return Ok(None);
+        };
+        if data.first() != Some(&(DataType::Vector as u8)) {
+            return Ok(None);
+        }
+        let Some((column, _)) = table.schema().find_column(&read.column) else {
+            return Ok(None);
+        };
+        let mut vm = ExprVM::new();
+        let nearest = match read.hnsw {
+            true => {
+                let Some(index) = table.get_index_on_column(&read.column).filter(|index| {
+                    index.index_type() == crate::core::IndexType::Hnsw
+                        && index.hnsw_distance_metric() == Some(read.hnsw_metric())
+                }) else {
+                    return Ok(None);
+                };
+                // The graph is the committed table now: an older snapshot, a
+                // commit publishing or the transaction's own rows make it
+                // the wrong view, and the scan answers
+                let Some(epoch) = table.index_view_epoch() else {
+                    return Ok(None);
+                };
+                // A WHERE leaves some of the nearest out: more are asked for
+                let asked = match where_.conjuncts {
+                    0 => k,
+                    _ => k.saturating_mul(4),
+                };
+                let ef_search = asked
+                    .saturating_mul(2)
+                    .max(index.default_ef_search().unwrap_or(64));
+                let Some(found) = index.search_nearest(&query, asked, ef_search) else {
+                    return Ok(None);
+                };
+                // The graph holds no NULL vector: fewer answers than asked
+                // for leave the rest of the order to the rows
+                if found.len() < k {
+                    return Ok(None);
+                }
+                let ids: Vec<i64> = found.iter().map(|&(id, _)| id).collect();
+                let fetched = table.collect_rows_by_ids(&ids)?;
+                let mut rows = crate::common::I64Map::with_capacity(fetched.len());
+                for (id, row) in fetched {
+                    rows.insert(id, row);
+                }
+                // A commit between the search and the fetch may have moved a
+                // vector: the order and the rows would disagree
+                if table.index_view_epoch() != Some(epoch) {
+                    return Ok(None);
+                }
+                let mut nearest = RowVec::with_capacity(k);
+                for (id, _) in found {
+                    if nearest.len() == k {
+                        break;
+                    }
+                    let Some(row) = rows.remove(id) else {
+                        continue;
+                    };
+                    let exec = self
+                        .exec_over(&row, &self.base)
+                        .with_subquery_executor(self);
+                    if self.passes(&mut vm, &where_.whole, &exec)? {
+                        nearest.push((id, row));
+                    }
+                }
+                if nearest.len() < k {
+                    return Ok(None);
+                }
+                nearest
+            }
+            false => {
+                let mut passing = RowVec::new();
+                let keep = |id: i64, _: u64, row: Row| {
+                    passing.push((id, row));
+                    true
+                };
+                let rows = match self.passing_rows(
+                    (where_, chosen),
+                    None,
+                    table,
+                    ctx,
+                    None,
+                    Take::Collected,
+                    keep,
+                )? {
+                    Passing::Pruned | Passing::Read => passing,
+                    Passing::Answers(answers) => answers,
+                    Passing::Scan(scan) => self.drain(scan, None)?,
+                    Passing::Filtered(scan, bound) => self.drain(scan, Some(bound))?,
+                };
+                let config = super::parallel::ParallelConfig::default();
+                super::parallel::parallel_topn_vector_search(
+                    rows,
+                    column,
+                    &data[1..],
+                    k,
+                    read.metric,
+                    &config,
+                )
+                .into_iter()
+                .map(|(id, row, _)| (id, row))
+                .collect()
+            }
+        };
+        // A read that checks for no cancel is the statement's all the same
+        ctx.check_cancelled()?;
+        super::result::OrderLimitPath::VectorSearch.taken();
+        Ok(Some(nearest))
     }
 
     /// Hand `keep` each row of `table` that passes `where_`, with its row

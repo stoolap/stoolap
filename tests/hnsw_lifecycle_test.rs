@@ -327,7 +327,7 @@ fn the_index_is_found_whatever_the_columns_spelling_in_the_query() {
             .map(|r| r.unwrap().get::<String>(0).unwrap())
             .collect();
         assert!(
-            plan.iter().any(|line| line.contains("HNSW Index Scan")),
+            plan.iter().any(|line| line.contains("NearestHnsw")),
             "{column}: {plan:?}"
         );
         assert_eq!(

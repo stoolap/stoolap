@@ -99,6 +99,28 @@ pub enum Read {
         read: WindowRead,
         otherwise: Box<Read>,
     },
+    /// The rows nearest the query vector of an ORDER BY of a vector
+    /// distance, as many as the LIMIT and OFFSET keep, for the statement's
+    /// sort to order; `otherwise` when the table cannot read them so in
+    /// this run
+    Nearest {
+        read: NearestRead,
+        otherwise: Option<ScanChoice>,
+    },
+}
+
+/// How the rows an ORDER BY of a vector distance under a LIMIT keeps are
+/// read nearest first, with no sort of every row
+#[derive(Debug, Clone)]
+pub struct NearestRead {
+    /// The vector column, as the schema spells it
+    pub column: SmartString,
+    pub metric: crate::executor::parallel::DistanceMetric,
+    /// The column's HNSW index of the metric answers, its rows asked the
+    /// WHERE; else every row the WHERE passes, the nearest kept
+    pub hnsw: bool,
+    /// The query vector as written: a literal or a parameter
+    pub query: Expression,
 }
 
 /// How a statement's window functions read their table's rows through an
@@ -130,7 +152,18 @@ impl Read {
             Self::Scan(scan)
             | Self::Ordered {
                 otherwise: scan, ..
+            }
+            | Self::Nearest {
+                otherwise: scan, ..
             } => scan.as_ref(),
+        }
+    }
+
+    /// The nearest-vectors read, for a plan that reads nearest first
+    pub fn nearest(&self) -> Option<&NearestRead> {
+        match self {
+            Self::Nearest { read, .. } => Some(read),
+            _ => None,
         }
     }
 
@@ -294,6 +327,15 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             alternative(lines, read.explain(text.table));
             read_lines(otherwise, text, lines);
         }
+        (Read::Nearest { read, otherwise }, _) => {
+            alternative(lines, read.explain(text.table, text.pushed));
+            for (at, line) in scan(otherwise.as_ref()).into_iter().enumerate() {
+                match at {
+                    0 => alternative(lines, line),
+                    _ => lines.push(line),
+                }
+            }
+        }
         (
             Read::Ordered {
                 read: ordered,
@@ -448,6 +490,86 @@ pub enum OrderedRead {
     Keyset,
     /// The table's top-k scan over the column, judging rows by the WHERE
     TopK,
+}
+
+/// The nearest-vectors read for an ORDER BY of `call`, a vector distance of
+/// a column of `schema` from a literal or a parameter, over a table whose
+/// indexes `store` holds: the column's HNSW index of the call's metric,
+/// else every row. None when the call reads no vector column so
+pub fn nearest_read(
+    store: &VersionStore,
+    schema: &Schema,
+    call: &crate::parser::ast::FunctionCall,
+) -> Option<NearestRead> {
+    use crate::executor::parallel::DistanceMetric;
+    let [column, query] = call.arguments.as_slice() else {
+        return None;
+    };
+    let column = match column {
+        Expression::Identifier(id) => &id.value,
+        Expression::QualifiedIdentifier(qid) => &qid.name.value,
+        _ => return None,
+    };
+    if !matches!(
+        query,
+        Expression::StringLiteral(_) | Expression::Parameter(_)
+    ) {
+        return None;
+    }
+    let (_, def) = schema.find_column(column)?;
+    if def.data_type != crate::core::DataType::Vector {
+        return None;
+    }
+    let metric = match call.function.to_uppercase().as_str() {
+        "VEC_DISTANCE_L2" => DistanceMetric::L2,
+        "VEC_DISTANCE_COSINE" => DistanceMetric::Cosine,
+        "VEC_DISTANCE_IP" => DistanceMetric::InnerProduct,
+        _ => return None,
+    };
+    let hnsw = store.get_index_by_column(&def.name).is_some_and(|index| {
+        index.index_type() == crate::core::IndexType::Hnsw
+            && index.hnsw_distance_metric() == Some(hnsw_metric(metric))
+    });
+    Some(NearestRead {
+        column: SmartString::from(def.name.as_str()),
+        metric,
+        hnsw,
+        query: query.clone(),
+    })
+}
+
+/// `metric` as an HNSW index reports the one it was built for
+fn hnsw_metric(metric: crate::executor::parallel::DistanceMetric) -> u8 {
+    use crate::executor::parallel::DistanceMetric;
+    match metric {
+        DistanceMetric::L2 => 0,
+        DistanceMetric::Cosine => 1,
+        DistanceMetric::InnerProduct => 2,
+    }
+}
+
+impl NearestRead {
+    /// The metric as an HNSW index reports the one it was built for
+    pub fn hnsw_metric(&self) -> u8 {
+        hnsw_metric(self.metric)
+    }
+
+    /// The read as EXPLAIN shows it, in place of the scan
+    fn explain(&self, table: &str, pushed: Option<&Expression>) -> String {
+        let name = match self.hnsw {
+            true => "NearestHnsw",
+            false => "NearestScan",
+        };
+        let metric = match self.metric {
+            crate::executor::parallel::DistanceMetric::L2 => "L2",
+            crate::executor::parallel::DistanceMetric::Cosine => "Cosine",
+            crate::executor::parallel::DistanceMetric::InnerProduct => "InnerProduct",
+        };
+        match pushed {
+            Some(pushed) => format!("{name} {table} {} {metric} {pushed}", self.column),
+            None => format!("{name} {table} {} {metric}", self.column),
+        }
+    }
 }
 
 /// The ordered read for an ORDER BY of `column` in `ascending` order over a

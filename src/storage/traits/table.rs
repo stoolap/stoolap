@@ -55,24 +55,6 @@ pub enum ScanPlan {
         filter: Option<String>,
         workers: usize,
     },
-    /// HNSW approximate nearest neighbor search
-    VectorSearch {
-        table: String,
-        index_name: String,
-        vector_column: String,
-        metric: String,
-        k: usize,
-        ef_search: usize,
-        filter: Option<String>,
-    },
-    /// Brute-force parallel vector distance scan
-    VectorBruteForce {
-        table: String,
-        vector_column: String,
-        metric: String,
-        k: usize,
-        filter: Option<String>,
-    },
 }
 
 impl fmt::Display for ScanPlan {
@@ -91,42 +73,6 @@ impl fmt::Display for ScanPlan {
                 workers,
             } => {
                 write!(f, "Parallel Seq Scan on {} (workers={})", table, workers)?;
-                if let Some(flt) = filter {
-                    write!(f, "\n  Filter: {}", flt)?;
-                }
-                Ok(())
-            }
-            ScanPlan::VectorSearch {
-                table,
-                index_name,
-                vector_column,
-                metric,
-                k,
-                ef_search,
-                filter,
-            } => {
-                write!(
-                    f,
-                    "HNSW Index Scan using {} on {}\n  Column: {}\n  Metric: {}\n  K: {}\n  EF Search: {}",
-                    index_name, table, vector_column, metric, k, ef_search
-                )?;
-                if let Some(flt) = filter {
-                    write!(f, "\n  Filter: {}", flt)?;
-                }
-                Ok(())
-            }
-            ScanPlan::VectorBruteForce {
-                table,
-                vector_column,
-                metric,
-                k,
-                filter,
-            } => {
-                write!(
-                    f,
-                    "Vector Scan on {}\n  Column: {}\n  Metric: {}\n  K: {}",
-                    table, vector_column, metric, k
-                )?;
                 if let Some(flt) = filter {
                     write!(f, "\n  Filter: {}", flt)?;
                 }
