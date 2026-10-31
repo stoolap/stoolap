@@ -106,10 +106,28 @@ const SHAPES: &[&str] = &[
     "SELECT x.id, ROW_NUMBER() OVER (ORDER BY x.id) FROM {u} x ORDER BY x.id",
 ];
 
+/// Each join whose side, or a join in whose subquery, is `{u}`
+const JOIN_SHAPES: &[&str] = &[
+    "SELECT x.id, t.id FROM {u} x JOIN t ON t.k = x.k ORDER BY x.id, t.id",
+    "SELECT t.id, x.v FROM t RIGHT JOIN {u} x ON x.k = t.k ORDER BY x.id, t.id",
+    "SELECT t.id, x.v FROM t FULL JOIN {u} x ON x.k = t.k ORDER BY t.id, x.id",
+    "SELECT t.id, x.v FROM t JOIN {u} x ON x.k = t.k WHERE x.v > 5 ORDER BY t.id, x.id",
+    "SELECT t.id, x.v FROM t JOIN {u} x ON x.k = t.k \
+     WHERE EXISTS (SELECT 1 FROM t s WHERE s.id = x.id) ORDER BY t.id, x.id",
+    "SELECT a.id, b.id FROM {u} a JOIN {u} b ON b.k = a.k ORDER BY a.id, b.id",
+    "SELECT s.id, x.v FROM t s JOIN t r ON r.id = s.id JOIN {u} x ON x.k = s.k \
+     ORDER BY s.id, x.id",
+    "SELECT x.k, COUNT(*), MAX(x.v) FROM t JOIN {u} x ON x.k = t.k GROUP BY x.k ORDER BY x.k",
+    "SELECT t.id, (SELECT COUNT(*) FROM {u} x JOIN t s ON s.k = x.k WHERE x.k = t.k) \
+     FROM t ORDER BY t.id",
+    "SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM {u} x JOIN t s ON s.id = x.id \
+     WHERE x.k = t.k) ORDER BY t.id",
+];
+
 /// Every shape over `u` AS OF `before` answers as over `u0`
 fn matrix(db: &Database, before: &str, mode: &str) {
     let as_of = format!("u AS OF TIMESTAMP '{before}'");
-    for shape in SHAPES {
+    for shape in SHAPES.iter().chain(JOIN_SHAPES) {
         let read = shape.replace("{u}", &as_of);
         let copy = shape.replace("{u}", "u0");
         assert_eq!(rows(db, &read), rows(db, &copy), "{mode}: {read}");
@@ -126,6 +144,52 @@ fn every_shape_reads_the_table_as_it_stood() {
     db.execute("UPDATE u SET v = 0", ()).unwrap();
     matrix(&db, &before, "explicit transaction with a local write");
     db.execute("ROLLBACK", ()).unwrap();
+}
+
+#[test]
+fn a_join_reading_a_table_as_of_runs_on_its_plan() {
+    use fp::GeneralPath::*;
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://as_of_sources_join_plan").unwrap();
+    let before = setup(&db, false);
+    let as_of = format!("u AS OF TIMESTAMP '{before}'");
+    let mechanisms = [
+        CorrelatedScan,
+        CorrelatedWhere,
+        OuterBinding,
+        OuterSubstitution,
+        PushdownConstant,
+        ProjectionEvaluator,
+        OrderByEvaluator,
+        AntiJoin,
+        ExistsSemiJoin,
+        ExistsSubquery,
+        InSubquery,
+        ScalarSubquery,
+        SelectFold,
+        CorrelatedExpression,
+        LiftedSubqueries,
+    ];
+    let hits = || -> usize { mechanisms.iter().map(|m| fp::general_path_hits(*m)).sum() };
+    let mut wrong = Vec::new();
+    for shape in JOIN_SHAPES {
+        let sql = shape.replace("{u}", &as_of);
+        let prepared: Vec<String> = rows(&db, &format!("EXPLAIN {sql}"))
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].trim().to_string())
+            .filter(|line| line.starts_with("Prepared:"))
+            .collect();
+        if prepared.iter().any(|line| line != "Prepared: yes") {
+            wrong.push(format!("{sql}: {prepared:?}"));
+        }
+        let before = hits();
+        rows(&db, &sql).unwrap();
+        if hits() != before {
+            wrong.push(format!("{sql}: ran a general path mechanism"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[test]

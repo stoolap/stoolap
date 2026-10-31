@@ -202,7 +202,6 @@ impl<'a> Family<'a> {
                     .iter()
                     .for_each(|e| nested_statements(e, &mut nested)),
                 side => match Self::one_table(Some(side)) {
-                    Ok(ts) if ts.as_of.is_some() => return Err("a join side read AS OF"),
                     Ok(ts) => self.blocks.borrow_mut().push(ts),
                     Err(_) => return Err("a join side the family does not read"),
                 },

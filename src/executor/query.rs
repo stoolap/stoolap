@@ -5635,9 +5635,9 @@ impl Executor {
     /// Each side's columns as the join's blocks read them, a base table's
     /// schema or the names a FROM gives any other source, and whether it is
     /// read as rows; a side that is a join, read as rows, has its tables'
-    /// columns side by side. None when a table is read with AS OF or a source
-    /// is not named without reading it; a view only its run names runs when
-    /// the caller `runs`
+    /// columns side by side; a table read AS OF is read as rows. None when a
+    /// source is not named without reading it; a view only its run names
+    /// runs when the caller `runs`
     pub(crate) fn join_side_schemas(
         &self,
         join_source: &JoinTableSource,
@@ -5652,7 +5652,16 @@ impl Executor {
 
     fn join_side(&self, expr: &Expression, ctx: &ExecutionContext, runs: bool) -> Option<JoinSide> {
         match expr {
-            Expression::TableSource(ts) if ts.as_of.is_some() => None,
+            // A table read AS OF is a row source in the table's columns; a
+            // view or a CTE of the name has no history to read
+            Expression::TableSource(ts) if ts.as_of.is_some() => {
+                let schema = self.base_table_side_schema(expr, CteNames::Context(ctx))?;
+                let name = SmartString::from(get_table_alias_from_expr(expr).unwrap_or_default());
+                Some(JoinSide {
+                    leaves: smallvec::smallvec![(name, schema)],
+                    rows: true,
+                })
+            }
             Expression::TableSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
@@ -5715,7 +5724,7 @@ impl Executor {
     }
 
     /// Whether a join, `sides` as `join_side_schemas` finds them, runs on its
-    /// prepared blocks: named sides read without AS OF, and subqueries in
+    /// prepared blocks: named sides, and subqueries in
     /// its ONs, a joined side's included, its WHERE and its output all of the
     /// forms the blocks run; or why not
     pub(crate) fn join_blocks_family(
@@ -5731,7 +5740,7 @@ impl Executor {
             return Err("a test refusing the prepared families");
         }
         let Some(sides @ [left, right]) = sides else {
-            return Err("a side read with AS OF or not named before it is read");
+            return Err("a side not named before it is read");
         };
         // The blocks qualify each side's columns by its name, a joined
         // side's by its tables'
