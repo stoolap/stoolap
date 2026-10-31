@@ -691,11 +691,11 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         (format!("{join} UNION ALL SELECT 0, 0"), vec![yes]),
         (format!("SELECT d.id, d.k FROM ({join}) d"), vec![yes]),
         (
-            format!(
-                "SELECT d.id, (SELECT MAX(id) FROM s) FROM ({join}) d \
-                 WHERE COALESCE(DISTINCT 1, 1) = 1"
-            ),
-            vec!["Prepared: no (DISTINCT, ORDER BY or FILTER in a call)", yes],
+            format!("SELECT d.id, (SELECT id FROM s ORDER BY 1 DESC LIMIT 1) FROM ({join}) d"),
+            vec![
+                "Prepared: no (an ORDER BY position in a subquery block)",
+                yes,
+            ],
         ),
         (
             format!("SELECT d.id, d.k FROM ({join}) d WHERE d.id > (SELECT MIN(id) FROM s)"),

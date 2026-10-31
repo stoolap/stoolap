@@ -224,14 +224,6 @@ impl<'a> Family<'a> {
         for cte in stmt.with.iter().flat_map(|with| &with.ctes) {
             self.derived(&cte.query)?;
         }
-        if stmt
-            .limit
-            .iter()
-            .chain(&stmt.offset)
-            .any(|c| mentions_column(c))
-        {
-            return Err("a derived table's LIMIT or OFFSET naming a column");
-        }
         let mut nested = Vec::new();
         match stmt.table_expr.as_deref() {
             None => {}
@@ -391,6 +383,7 @@ impl<'a> Family<'a> {
             Expression::Cast(cast) => walk(&cast.expr),
             Expression::List(list) => list.elements.iter().try_for_each(walk),
             Expression::ExpressionList(list) => list.expressions.iter().try_for_each(walk),
+            // A modifier on a call to no aggregate was refused before the walk
             Expression::FunctionCall(call) => {
                 if is_aggregate_function(&call.function) {
                     if !matches!(
@@ -400,9 +393,6 @@ impl<'a> Family<'a> {
                         return Err("an aggregate outside a subquery block");
                     }
                     return self.aggregate_call(call, scopes, site, found);
-                }
-                if call.is_distinct || !call.order_by.is_empty() || call.filter.is_some() {
-                    return Err("DISTINCT, ORDER BY or FILTER in a call");
                 }
                 call.arguments.iter().try_for_each(walk)
             }
@@ -1188,7 +1178,6 @@ impl Executor {
         if needs_subquery && !found {
             return Err("no WHERE, SELECT list, ORDER BY or DISTINCT ON subquery");
         }
-        counts_fit(stmt)?;
         family.statement_from(stmt.table_expr.as_deref())?;
         family.catalog()
     }
@@ -1260,9 +1249,6 @@ impl Executor {
         if !keys.is_empty() && windowed {
             return Err("an ORDER BY holding a subquery");
         }
-        // A GROUP BY item naming a SELECT alias or position groups that item
-        self.parse_group_by(stmt, &[])
-            .map_err(|_| "a GROUP BY position outside the SELECT list")?;
         let windows = Executor::used_window_defs(stmt);
         let family = Family {
             executor: self,
@@ -1311,9 +1297,6 @@ impl Executor {
         if !found {
             return Err("no clause the blocks run holds a subquery");
         }
-        if whole {
-            counts_fit(stmt)?;
-        }
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
             Some(Expression::JoinSource(join)) => {
@@ -1337,22 +1320,6 @@ impl Executor {
         }
         family.catalog()
     }
-}
-
-/// Whether the LIMIT and OFFSET read no column outside their subqueries:
-/// each is then a count read once per run, before the statement's rows. A
-/// count's scope has no column, so a double-quoted bare name reads as text
-fn counts_fit(stmt: &SelectStatement) -> std::result::Result<(), OutOfFamily> {
-    for count in stmt.limit.iter().chain(&stmt.offset) {
-        let mut names = false;
-        visit_column_refs(count, &mut |column| {
-            names |= !matches!(column, Expression::Identifier(id) if id.quoted)
-        });
-        if names {
-            return Err("a LIMIT or OFFSET naming a column");
-        }
-    }
-    Ok(())
 }
 
 /// One scope of a chain: the tables it reads, each by the name that
@@ -1883,6 +1850,13 @@ impl StatementWalk<'_> {
             check: check != Check::Off,
             ..level.clone()
         };
+        // A count is read before any row: no row is in its scope, an
+        // enclosing one included
+        let counted = Level {
+            scopes: Vec::new(),
+            aliases: Vec::new(),
+            ..level.clone()
+        };
         let names = output_names(stmt, &own)?;
         // Its ORDER BY positions count the columns it shows, whether or not
         // it ever runs
@@ -1902,6 +1876,11 @@ impl StatementWalk<'_> {
         let one = |walk: &mut Self, expr: &Option<Box<Expression>>| {
             expr.as_deref()
                 .map(|e| walk.expr(e, &level).map(Box::new))
+                .transpose()
+        };
+        let count = |walk: &mut Self, expr: &Option<Box<Expression>>| {
+            expr.as_deref()
+                .map(|e| walk.expr(e, &counted).map(Box::new))
                 .transpose()
         };
         let order = |walk: &mut Self, order: &[OrderByExpression], at: &Level<'_>| {
@@ -1954,8 +1933,8 @@ impl StatementWalk<'_> {
                 })
                 .collect::<Result<_>>()?,
             order_by: order(self, &stmt.order_by, &sorted)?,
-            limit: one(self, &stmt.limit)?,
-            offset: one(self, &stmt.offset)?,
+            limit: count_reads_column(stmt).and_then(|()| count(self, &stmt.limit))?,
+            offset: count(self, &stmt.offset)?,
             set_operations: stmt
                 .set_operations
                 .iter()
@@ -3148,6 +3127,23 @@ fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
 
 fn compile_error(error: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", error))
+}
+
+/// The error of a LIMIT or OFFSET of `stmt` that names a column outside its
+/// subqueries: a count reads no column, and a double-quoted bare name in one
+/// reads as text
+fn count_reads_column(stmt: &SelectStatement) -> Result<()> {
+    let mut named = None;
+    for count in stmt.limit.iter().chain(&stmt.offset) {
+        visit_column_refs(count, &mut |column| {
+            if named.is_none() && !matches!(column, Expression::Identifier(id) if id.quoted) {
+                named = Some(column.to_string());
+            }
+        });
+    }
+    named.map_or(Ok(()), |column| {
+        Err(compile_error(CompileError::ColumnNotFound(column)))
+    })
 }
 
 /// That each ORDER BY position of the block `sq`, whose FROM gives `columns`
