@@ -1625,7 +1625,7 @@ impl Executor {
                     && self.reads_source(stmt, ctx)
                     && self.planned_family(stmt, Some(ctx)).is_ok())
                 && !grouped()
-                && !self.join_keeps_plan(stmt, with, true)
+                && !self.run_keeps_join_plan(slot, stmt, with, ctx)
             {
                 return self.execute_select_with_ctes(stmt, ctx, compiled);
             }
@@ -3479,14 +3479,17 @@ impl Executor {
     /// The cached rows of `SELECT *` over `table_name` filtered by
     /// `where_expr` under `stamp`, with their output columns; None on a miss
     /// Whether the semantic cache keeps the answer of `stmt`, a SELECT * read
-    /// from `source` outside an explicit transaction
+    /// from `source` outside an explicit transaction, by reads no older than
+    /// a stamp taken before them, as a cached subquery's are; a CTE of the
+    /// same name is not the table the stamp names
     pub(crate) fn semantic_writable(
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &QueryClassification,
         source: &SimpleTableSource,
     ) -> bool {
-        ctx.statement_snapshot().is_none()
+        Self::reads_cacheable_rows(ctx)
+            && !ctx.has_cte_by_lower(&source.name.value_lower)
             && ctx.outer_row().is_none()
             && source.as_of.is_none()
             && stmt.where_clause.is_some()
@@ -5433,6 +5436,32 @@ impl Executor {
     ) -> bool {
         matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)))
             && self.named_ctes(with, runs).is_ok()
+    }
+
+    /// `join_keeps_plan` for a run, found once by the join `slot` holds for
+    /// this context
+    fn run_keeps_join_plan(
+        &self,
+        slot: Option<&std::sync::RwLock<CompiledExecution>>,
+        stmt: &SelectStatement,
+        with: &WithClause,
+        ctx: &ExecutionContext,
+    ) -> bool {
+        let epoch = self.engine.schema_epoch();
+        let held = slot
+            .and_then(|slot| slot.read().ok())
+            .and_then(|guard| match &*guard {
+                CompiledExecution::PreparedJoin(held)
+                    if held.validity.holds(&*self.engine, epoch) && held.cte_scope.holds(ctx) =>
+                {
+                    Some(std::sync::Arc::clone(held))
+                }
+                _ => None,
+            });
+        match held {
+            Some(held) => held.ctes_named(|| self.join_keeps_plan(stmt, with, true)),
+            None => self.join_keeps_plan(stmt, with, true),
+        }
     }
 
     /// Each side's columns as the join's blocks read them, a base table's
