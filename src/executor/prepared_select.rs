@@ -7948,12 +7948,17 @@ impl PreparedSelect {
                         )
                     });
                 // An ORDER BY of a vector distance under a LIMIT reads the
-                // nearest rows first
-                let nearest = (ordered.is_none() && stmt.limit.is_some() && !stmt.distinct)
-                    .then(|| Executor::vector_distance_order(stmt))
-                    .flatten()
+                // nearest rows first; the key is the item the ORDER BY binds
+                let bound = order_keys.as_deref().and_then(|keys| {
+                    let (column, ..) = keys.first()?;
+                    let item = layout.as_deref()?.sources.get((*column)?)?.item;
+                    Some(item)
+                });
+                let nearest = bound
+                    .filter(|_| ordered.is_none() && stmt.limit.is_some() && !stmt.distinct)
+                    .and_then(|item| Executor::vector_distance_order(stmt, item))
                     .and_then(|call| nearest_read(&store, schema, &call));
-                if ordered.is_none() && nearest.is_none() && !stmt.order_by.is_empty() {
+                if ordered.is_none() && !stmt.order_by.is_empty() {
                     steps.push(sort);
                 }
                 if distinct {
@@ -7972,7 +7977,6 @@ impl PreparedSelect {
                     (None, Some(read)) => Read::Nearest {
                         read,
                         otherwise: scan,
-                        sort,
                     },
                     (None, None) => Read::Scan(scan),
                 };
@@ -11763,24 +11767,27 @@ impl Executor {
         // An ORDER BY of one column under a LIMIT reads the rows it keeps in
         // order, as the plan chose
         let planned_order = prepared.plan.as_ref().and_then(|plan| plan.read.ordered());
-        // An ORDER BY of a vector distance reads the nearest rows first
-        let nearest = prepared.plan.as_ref().and_then(|plan| {
-            let read = plan.read.nearest()?;
-            Some((read, plan.read.scan(), Self::vector_distance_order(stmt)?))
-        });
-        let ordered = match (&source, limit, planned_order, nearest) {
+        // An ORDER BY of a vector distance reads the nearest rows, which the
+        // statement's sort then orders
+        let planned_nearest = prepared
+            .plan
+            .as_ref()
+            .and_then(|plan| Some((plan.read.nearest()?, plan.read.scan())));
+        let nearest = match (&source, limit, planned_nearest) {
             _ if keeps_none => None,
-            (StatementSource::Table(table), Some(limit), _, Some((read, chosen, call))) => runner
+            (StatementSource::Table(table), Some(limit), Some((read, chosen))) => runner
                 .nearest_rows(
-                (&prepared.where_, chosen),
-                read,
-                &call,
-                &**table,
-                ctx,
-                limit,
-                offset,
-            )?,
-            (StatementSource::Table(table), Some(limit), Some(read), None) => {
+                    (&prepared.where_, chosen),
+                    read,
+                    &**table,
+                    ctx,
+                    limit.saturating_add(offset),
+                )?,
+            _ => None,
+        };
+        let ordered = match (&source, limit, planned_order) {
+            _ if keeps_none => None,
+            (StatementSource::Table(table), Some(limit), Some(read)) => {
                 match Self::ordered_read_column(stmt) {
                     Some(key) => runner.ordered_rows(
                         &prepared.where_,
@@ -11958,7 +11965,7 @@ impl Executor {
                 true,
             ))
         };
-        let read = match (ordered, source) {
+        let read = match (ordered.or(nearest), source) {
             _ if keeps_none => Ok(Passing::Pruned),
             (Some(rows), _) => Ok(Passing::Answers(rows)),
             (None, StatementSource::Table(table)) => runner.passing_rows(
@@ -13170,23 +13177,20 @@ impl<'a> PreparedRunner<'a> {
         Ok(rows)
     }
 
-    /// The rows of `table` an ORDER BY of the vector distance `call` keeps
-    /// past `offset`, at most `limit`, nearest first, read as `read` says.
-    /// None when the query value is no vector, or the HNSW index cannot
-    /// answer in this run: the graph is not the view the statement reads,
-    /// or it gave fewer rows the WHERE passes than the LIMIT asks
-    #[allow(clippy::too_many_arguments)]
+    /// The `k` rows of `table` nearest the query vector of the distance
+    /// `read` names, in no order the output keeps: the statement's sort
+    /// orders them. None when the query value is no vector, or the HNSW
+    /// index cannot answer in this run: the graph is not the view the
+    /// statement reads, or it gave fewer rows the WHERE passes than `k`
     fn nearest_rows(
         &self,
         (where_, chosen): (&PreparedWhere, Option<&ScanChoice>),
         read: &NearestRead,
-        call: &FunctionCall,
         table: &dyn Table,
         ctx: &ExecutionContext,
-        limit: usize,
-        offset: usize,
+        k: usize,
     ) -> Result<Option<RowVec>> {
-        let query = match super::expression::evaluate_once(&call.arguments[1], Some(ctx)).ok() {
+        let query = match super::expression::evaluate_once(&read.query, Some(ctx)).ok() {
             Some(Value::Text(text)) => match crate::core::value::parse_vector_str(&text) {
                 Some(floats) => Value::vector(floats),
                 None => return Ok(None),
@@ -13200,7 +13204,9 @@ impl<'a> PreparedRunner<'a> {
         if data.first() != Some(&(DataType::Vector as u8)) {
             return Ok(None);
         }
-        let k = limit.saturating_add(offset);
+        let Some((column, _)) = table.schema().find_column(&read.column) else {
+            return Ok(None);
+        };
         let mut vm = ExprVM::new();
         let nearest = match read.hnsw {
             true => {
@@ -13264,9 +13270,6 @@ impl<'a> PreparedRunner<'a> {
                 nearest
             }
             false => {
-                let Some((column, _)) = table.schema().find_column(&read.column) else {
-                    return Ok(None);
-                };
                 let mut passing = RowVec::new();
                 let keep = |id: i64, _: u64, row: Row| {
                     passing.push((id, row));
@@ -13303,7 +13306,7 @@ impl<'a> PreparedRunner<'a> {
         // A read that checks for no cancel is the statement's all the same
         ctx.check_cancelled()?;
         super::result::OrderLimitPath::VectorSearch.taken();
-        Ok(Some(nearest.into_iter().skip(offset).take(limit).collect()))
+        Ok(Some(nearest))
     }
 
     /// Hand `keep` each row of `table` that passes `where_`, with its row

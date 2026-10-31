@@ -2068,10 +2068,12 @@ impl Executor {
     }
 
     /// The VEC_DISTANCE call a nearest-vectors search answers: the one
-    /// ascending ORDER BY key of a statement with a LIMIT, as a call, an
-    /// output alias of one, or `<=>` read as VEC_DISTANCE_L2
+    /// ascending ORDER BY key of a statement with a LIMIT, as the ORDER BY
+    /// binding chose it (the SELECT item at `item`, else the key as
+    /// written), with `<=>` read as VEC_DISTANCE_L2
     pub(crate) fn vector_distance_order(
         stmt: &SelectStatement,
+        item: Option<usize>,
     ) -> Option<std::borrow::Cow<'_, FunctionCall>> {
         use std::borrow::Cow;
         // Must have exactly 1 ORDER BY + LIMIT, ascending order
@@ -2091,17 +2093,15 @@ impl Executor {
             order_by: Vec::new(),
             filter: None,
         };
-        let func_call = match &order_by.expression {
+        let key = match item {
+            Some(item) => match stmt.columns.get(item)? {
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                expr => expr,
+            },
+            None => &order_by.expression,
+        };
+        let func_call = match key {
             Expression::FunctionCall(fc) => Cow::Borrowed(fc.as_ref()),
-            Expression::Identifier(id) => {
-                match Self::find_vec_distance_alias(&id.value_lower, &stmt.columns) {
-                    Some(fc) => Cow::Borrowed(fc),
-                    None => Cow::Owned(l2(Self::find_vec_distance_infix_alias(
-                        &id.value_lower,
-                        &stmt.columns,
-                    )?)),
-                }
-            }
             Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
                 Cow::Owned(l2(infix))
             }
@@ -2111,49 +2111,5 @@ impl Executor {
             .iter()
             .any(|name| func_call.function.eq_ignore_ascii_case(name));
         (is_vec_distance && func_call.arguments.len() == 2).then_some(func_call)
-    }
-
-    /// Find a VEC_DISTANCE function call (or <=> operator) that's aliased in SELECT columns.
-    /// For <=> operator, returns None and the caller handles it via the synthesized_fc path.
-    fn find_vec_distance_alias<'a>(
-        alias_lower: &str,
-        columns: &'a [Expression],
-    ) -> Option<&'a FunctionCall> {
-        for col_expr in columns {
-            if let Expression::Aliased(aliased) = col_expr {
-                if aliased.alias.value_lower == alias_lower {
-                    if let Expression::FunctionCall(fc) = &*aliased.expression {
-                        let fn_upper = fc.function.to_uppercase();
-                        if matches!(
-                            fn_upper.as_str(),
-                            "VEC_DISTANCE_L2" | "VEC_DISTANCE_COSINE" | "VEC_DISTANCE_IP"
-                        ) {
-                            return Some(fc.as_ref());
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Check if an alias in SELECT points to a <=> infix operator.
-    /// Returns the InfixExpression if found, to synthesize a FunctionCall from.
-    fn find_vec_distance_infix_alias<'a>(
-        alias_lower: &str,
-        columns: &'a [Expression],
-    ) -> Option<&'a InfixExpression> {
-        for col_expr in columns {
-            if let Expression::Aliased(aliased) = col_expr {
-                if aliased.alias.value_lower == alias_lower {
-                    if let Expression::Infix(infix) = &*aliased.expression {
-                        if infix.op_type == InfixOperator::VectorDistance {
-                            return Some(infix);
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 }

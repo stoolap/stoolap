@@ -2232,3 +2232,58 @@ fn test_nearest_dimension_mismatch_is_the_functions_error() {
         );
     }
 }
+
+#[test]
+fn test_nearest_hnsw_rows_in_the_functions_order() {
+    let db = Database::open("memory://nearest_hnsw_function_order").expect("db");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3))", ())
+        .expect("create");
+    db.execute(
+        "INSERT INTO t VALUES (1, '[16777216, 1, -16777216]'), (2, '[0, 0.5, 0]')",
+        (),
+    )
+    .expect("insert");
+    db.execute(
+        "CREATE INDEX t_v ON t(v) USING HNSW WITH (metric = 'ip')",
+        (),
+    )
+    .expect("index");
+    for (sql, want) in [
+        (
+            "SELECT id FROM t ORDER BY VEC_DISTANCE_IP(v, '[1, 1, 1]') LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "SELECT id FROM t ORDER BY VEC_DISTANCE_IP(v, '[1, 1, 1]') LIMIT 1 OFFSET 1",
+            vec![2],
+        ),
+    ] {
+        assert_eq!(
+            nearest_ids(db.query(sql, ()).expect("query")),
+            want,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn test_nearest_key_is_the_item_the_order_by_binds() {
+    let db = Database::open("memory://nearest_bound_key").expect("db");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(1))", ())
+        .expect("create");
+    db.execute("INSERT INTO t VALUES (1, '[10]'), (2, '[0]')", ())
+        .expect("insert");
+    for sql in [
+        "SELECT id + 0 AS d, VEC_DISTANCE_L2(v, '[0]') AS d, (SELECT 1) AS q FROM t \
+         ORDER BY d LIMIT 1",
+        "SELECT id + 0 AS d, VEC_DISTANCE_L2(v, '[0]') AS d FROM t ORDER BY d LIMIT 1",
+    ] {
+        assert_eq!(
+            nearest_ids(db.query(sql, ()).expect("query")),
+            vec![1],
+            "{sql}"
+        );
+        let plan = get_plan(&db, &format!("EXPLAIN {sql}"));
+        assert!(!plan.contains("Nearest"), "{sql}:\n{plan}");
+    }
+}

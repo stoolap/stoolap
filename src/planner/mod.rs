@@ -100,12 +100,12 @@ pub enum Read {
         otherwise: Box<Read>,
     },
     /// The rows nearest the query vector of an ORDER BY of a vector
-    /// distance, nearest first. When the table cannot read them so in this
-    /// run, `otherwise` sorted by `sort`
+    /// distance, as many as the LIMIT and OFFSET keep, for the statement's
+    /// sort to order; `otherwise` when the table cannot read them so in
+    /// this run
     Nearest {
         read: NearestRead,
         otherwise: Option<ScanChoice>,
-        sort: Step,
     },
 }
 
@@ -119,6 +119,8 @@ pub struct NearestRead {
     /// The column's HNSW index of the metric answers, its rows asked the
     /// WHERE; else every row the WHERE passes, the nearest kept
     pub hnsw: bool,
+    /// The query vector as written: a literal or a parameter
+    pub query: Expression,
 }
 
 /// How a statement's window functions read their table's rows through an
@@ -325,23 +327,14 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             alternative(lines, read.explain(text.table));
             read_lines(otherwise, text, lines);
         }
-        (
-            Read::Nearest {
-                read,
-                otherwise,
-                sort,
-            },
-            _,
-        ) => {
+        (Read::Nearest { read, otherwise }, _) => {
             alternative(lines, read.explain(text.table, text.pushed));
-            if let Some(line) = step_line(*sort, text) {
-                alternative(lines, line);
+            for (at, line) in scan(otherwise.as_ref()).into_iter().enumerate() {
+                match at {
+                    0 => alternative(lines, line),
+                    _ => lines.push(line),
+                }
             }
-            lines.extend(
-                scan(otherwise.as_ref())
-                    .into_iter()
-                    .map(|l| format!("  {l}")),
-            );
         }
         (
             Read::Ordered {
@@ -541,6 +534,7 @@ pub fn nearest_read(
         column: SmartString::from(def.name.as_str()),
         metric,
         hnsw,
+        query: query.clone(),
     })
 }
 
