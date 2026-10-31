@@ -43,10 +43,11 @@ use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value, NULL_VALUE}
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
-use crate::storage::mvcc::get_fast_timestamp;
-use crate::storage::mvcc::registry::StatementView;
+use crate::storage::mvcc::commit_log::ReadPoint;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
+use crate::storage::mvcc::registry::{HistoryEvent, StatementView};
+use crate::storage::mvcc::{get_fast_timestamp, next_write_order};
 use crate::storage::traits::PlannedUpdate;
 use crate::storage::volume::side_index::SideIndexDef;
 use crate::storage::Index;
@@ -70,7 +71,9 @@ pub struct RowVersion {
     pub deleted_at_txn_id: i64,
     /// Complete row data
     pub data: Row,
-    /// Timestamp when this version was created
+    /// In a transaction's own store the order it was written in; once
+    /// published, the sequence of the commit that published it, 0 for a
+    /// recovered version
     pub create_time: i64,
 }
 
@@ -555,6 +558,25 @@ pub trait VisibilityChecker: Send + Sync {
     /// them in, false refuses a transaction that already ended
     fn admit_publication(&self, _txn_id: i64) -> bool {
         true
+    }
+
+    /// The commit sequence of `txn_id` while it commits, the stamp its
+    /// published versions carry; 0 when it is not committing
+    fn committing_sequence(&self, _txn_id: i64) -> i64 {
+        0
+    }
+
+    /// The point a retention pass takes for `time` (nanoseconds): a version
+    /// it sees is older than the retention. None: no history is kept for
+    /// AS OF, so every version is older
+    fn retention_point(&self, _time: i64) -> Option<ReadPoint> {
+        None
+    }
+
+    /// The time (nanoseconds) of the oldest point that has completed
+    /// through `seq`, for an error naming it
+    fn oldest_time_through(&self, _seq: i64) -> Option<i64> {
+        None
     }
 }
 
@@ -1222,6 +1244,9 @@ pub struct VersionStore {
     /// This limits memory growth during write-heavy operations.
     /// Default is 10 - enough for most concurrent transaction scenarios.
     max_version_history: usize,
+    /// A point AS OF reads at must have completed through this: raised by
+    /// everything that discards state such a point may need
+    history_mark: AtomicI64,
     /// Count of committed non-deleted rows for O(1) COUNT(*) queries.
     /// Updated on commit: +1 for INSERT, -1 for DELETE.
     /// This is an optimization for the common case of autocommit queries.
@@ -1399,6 +1424,10 @@ impl VersionStore {
         expected_rows: usize,
     ) -> Self {
         let versions = new_cow_btree_map();
+        // No point taken before the table existed reads it
+        let created = checker
+            .as_ref()
+            .map_or(0, |registry| registry.begin_history_event().seq());
 
         Self {
             versions,
@@ -1412,6 +1441,7 @@ impl VersionStore {
             arena: RowArena::with_capacity(expected_rows),
             zone_maps: RwLock::new(None),
             max_version_history: 10, // Default: keep up to 10 previous versions
+            history_mark: AtomicI64::new(created),
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
@@ -1451,6 +1481,7 @@ impl VersionStore {
             arena: RowArena::with_capacity(expected_rows),
             zone_maps: RwLock::new(None),
             max_version_history: 10,
+            history_mark: AtomicI64::new(0),
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
@@ -1492,17 +1523,21 @@ impl VersionStore {
     /// a version the maintenance limit sees within the first `limit`
     /// versions, since every reader walking from the head stops there;
     /// kept whole when the oldest reader reads further back. Both walks
-    /// stop at the limit, so a write does not traverse a long chain
-    fn history_kept(&self, existing: &VersionChainEntry) -> KeptHistory {
+    /// stop at the limit, so a write does not traverse a long chain. A cut
+    /// raises the history mark to the oldest version kept, `head_stamp`
+    /// being the new head's
+    fn history_kept(&self, existing: &VersionChainEntry, head_stamp: i64) -> KeptHistory {
         let limit = self.max_version_history;
         if limit == 0 || !chain_reaches(existing, limit) {
             return KeptHistory::Whole;
         }
         let Some(checker) = self.visibility_checker.as_ref() else {
+            self.raise_history_mark(head_stamp);
             return KeptHistory::Nothing;
         };
         // The writer holds the row, so every version of the chain is complete
         let Some(bound) = checker.history_limit() else {
+            self.raise_history_mark(head_stamp);
             return KeptHistory::Nothing;
         };
         let mut walked: SmallVec<[&VersionChainEntry; 16]> = SmallVec::new();
@@ -1528,6 +1563,9 @@ impl VersionStore {
             } else {
                 low = mid + 1;
             }
+        }
+        if chain_reaches(walked[high], 2) {
+            self.raise_history_mark(walked[high].version.create_time);
         }
         KeptHistory::Prefix(high + 1)
     }
@@ -1632,6 +1670,7 @@ impl VersionStore {
     /// `lay_out_rows`, which opens it, once the change is durable; a change
     /// that fails to record reopens at `reopen_after_refused_add`
     pub fn add_column(&self, column: crate::core::SchemaColumn) -> Result<(), Error> {
+        let _history = self.begin_history_event();
         let mut schema = self.schema.write();
         CompactArc::make_mut(&mut *schema).add_column(column)?;
         self.layout.fetch_add(1, Ordering::AcqRel);
@@ -1731,6 +1770,7 @@ impl VersionStore {
     /// versions lock, and the table stays closed for the cold mappings to
     /// follow. The layout moves on, so no layout stands for two schemas
     pub fn publish_drop(&self, without: CompactArc<Schema>) {
+        let _history = self.begin_history_event();
         let width = without.columns.len();
         let cut = self.pending_cut.lock().take();
         let padded = CompactArc::clone(&without);
@@ -1962,6 +2002,7 @@ impl VersionStore {
     /// The layout moves on, so no layout stands for two schemas
     pub fn publish_cast(&self, cast: HotCast) {
         debug_assert!(is_closed(self.layout()), "cast published on an open table");
+        let _history = self.begin_history_event();
         let HotCast {
             schema,
             heads,
@@ -2063,6 +2104,104 @@ impl VersionStore {
             .is_none_or(|checker| checker.admit_publication(txn_id))
     }
 
+    /// Raises the mark a historical point must pass: called before the
+    /// discard it guards becomes visible
+    pub fn raise_history_mark(&self, seq: i64) {
+        self.history_mark.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    /// The sequence a historical point must have completed through
+    pub fn history_mark(&self) -> i64 {
+        self.history_mark.load(Ordering::Acquire)
+    }
+
+    /// Every row as it stood at `point`: per chain the newest version the
+    /// point sees, unless that is a delete marker. `authority` collects every
+    /// row with such a version, a delete marker included. Fails when the
+    /// table no longer holds what the point needs, checked before and after
+    /// the read
+    pub fn rows_at(
+        &self,
+        point: &ReadPoint,
+        mut authority: Option<&mut FxHashSet<i64>>,
+    ) -> Result<RowVec, Error> {
+        self.check_history(point)?;
+        let versions = self.versions.read().clone();
+        let mut rows = RowVec::new();
+        for (&row_id, head) in versions.iter() {
+            let mut current = Some(head);
+            while let Some(entry) = current {
+                if point.sees(entry.version.create_time) {
+                    if let Some(authority) = authority.as_deref_mut() {
+                        authority.insert(row_id);
+                    }
+                    if !entry.version.is_deleted() {
+                        rows.push((row_id, entry.version.data.clone()));
+                    }
+                    break;
+                }
+                current = entry.prev.as_deref();
+            }
+        }
+        self.check_history(point)?;
+        Ok(rows)
+    }
+
+    /// Whether this table still holds everything `point` needs
+    fn check_history(&self, point: &ReadPoint) -> Result<(), Error> {
+        let mark = self.history_mark();
+        if point.completed_through() >= mark {
+            return Ok(());
+        }
+        let oldest = self
+            .visibility_checker
+            .as_ref()
+            .and_then(|checker| checker.oldest_time_through(mark))
+            .map_or_else(
+                || "no earlier point than the next commit".to_string(),
+                |nanos| {
+                    let time = chrono::DateTime::from_timestamp_nanos(nanos);
+                    format!("its oldest point is {time}")
+                },
+            );
+        Err(Error::invalid_argument(format!(
+            "AS OF point is older than table '{}' still holds: {oldest}",
+            self.table_name
+        )))
+    }
+
+    /// Begins a change that destroys this table's history, held until the
+    /// change is done or undone: no point taken before it reads past it
+    pub fn begin_history_event(&self) -> Option<HistoryEvent> {
+        #[cfg(not(test))]
+        let event = self
+            .visibility_checker
+            .as_ref()
+            .map(|registry| registry.begin_history_event());
+        #[cfg(test)]
+        let event: Option<HistoryEvent> = None;
+        if let Some(event) = &event {
+            self.raise_history_mark(event.seq());
+        }
+        event
+    }
+
+    /// The point a retention pass for `retention` takes: a version it sees
+    /// is older. Without a registry nothing keeps history, so None
+    fn retention_point(&self, retention: std::time::Duration) -> Option<ReadPoint> {
+        let time = super::commit_log::wall_clock() - retention.as_nanos() as i64;
+        self.visibility_checker
+            .as_ref()
+            .and_then(|checker| checker.retention_point(time))
+    }
+
+    /// The stamp versions of `txn_id` carry as it publishes them
+    fn committing_sequence(&self, txn_id: i64) -> i64 {
+        self.visibility_checker
+            .as_ref()
+            .map_or(0, |checker| checker.committing_sequence(txn_id))
+    }
+
     /// Adds a new version for a row
     pub fn add_version(&self, row_id: i64, version: RowVersion) {
         if self.closed.load(Ordering::Acquire) {
@@ -2093,7 +2232,7 @@ impl VersionStore {
 
                 // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop old chain AND reuse arena slot
-                let kept = self.history_kept(existing);
+                let kept = self.history_kept(existing, version.create_time);
                 let can_reuse_arena = kept == KeptHistory::Nothing;
 
                 // Only clone existing version data when needed:
@@ -2255,7 +2394,7 @@ impl VersionStore {
 
                     // O(k) chain management - depth computed by traversal
                     // When limit exceeded: drop the chain below the displaced version
-                    let kept = self.history_kept(existing);
+                    let kept = self.history_kept(existing, version.create_time);
 
                     // Only clone existing version data when needed:
                     // 1. For delete operations that need to preserve data
@@ -2438,7 +2577,7 @@ impl VersionStore {
 
                 // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop the chain below the displaced version
-                let kept = self.history_kept(existing);
+                let kept = self.history_kept(existing, version.create_time);
 
                 // Only clone existing version data when needed:
                 // 1. For delete operations that need to preserve data
@@ -2647,8 +2786,7 @@ impl VersionStore {
                         data,
                         // Arena metadata doesn't store create_time (saves 8 bytes/row).
                         // All callers of get_visible_version() only use .data, .is_deleted(),
-                        // and .txn_id. AS OF queries use get_visible_version_as_of_timestamp()
-                        // which goes through CowBTree and has the real create_time.
+                        // and .txn_id. AS OF reads the stamps through the CowBTree (rows_at).
                         create_time: 0,
                     });
                 }
@@ -3200,69 +3338,6 @@ impl VersionStore {
             .as_ref()
             .map(|c| c.get_current_sequence())
             .unwrap_or(0)
-    }
-
-    /// Gets the visible version as of a specific transaction
-    pub fn get_visible_version_as_of_transaction(
-        &self,
-        row_id: i64,
-        as_of_txn_id: i64,
-    ) -> Option<RowVersion> {
-        if self.closed.load(Ordering::Acquire) {
-            return None;
-        }
-
-        // No need to clone tree for single-row lookup - just hold read guard
-        let versions = self.versions.read();
-        let chain = versions.get(row_id)?;
-
-        // Traverse version chain from newest to oldest
-        let mut current: Option<&VersionChainEntry> = Some(chain);
-        while let Some(e) = current {
-            // Check if this version was created before or at the asOf transaction
-            if e.version.txn_id <= as_of_txn_id {
-                // Check if deleted before or at asOfTxnID
-                if e.version.deleted_at_txn_id != 0 && e.version.deleted_at_txn_id <= as_of_txn_id {
-                    return None;
-                }
-                return Some(e.version.clone());
-            }
-            current = e.prev.as_ref().map(|b| b.as_ref());
-        }
-
-        None
-    }
-
-    /// Gets the visible version as of a specific timestamp
-    pub fn get_visible_version_as_of_timestamp(
-        &self,
-        row_id: i64,
-        as_of_timestamp: i64,
-    ) -> Option<RowVersion> {
-        if self.closed.load(Ordering::Acquire) {
-            return None;
-        }
-
-        // No need to clone tree for single-row lookup - just hold read guard
-        let versions = self.versions.read();
-        let chain = versions.get(row_id)?;
-
-        // Traverse version chain from newest to oldest
-        let mut current: Option<&VersionChainEntry> = Some(chain);
-        while let Some(e) = current {
-            // Check if this version was created before or at the asOf timestamp
-            if e.version.create_time <= as_of_timestamp {
-                // Check if deleted (we can't easily determine timestamp of deletion in this model)
-                // For now, check if DeletedAtTxnID is set
-                if e.version.deleted_at_txn_id != 0 {
-                    return None;
-                }
-                return Some(e.version.clone());
-            }
-            current = e.prev.as_ref().map(|b| b.as_ref());
-        }
-
-        None
     }
 
     /// Returns all row IDs in the version store (sorted)
@@ -3823,6 +3898,7 @@ impl VersionStore {
     /// `truncate_all`, running `after_check` once no claim refuses it and
     /// before any row goes, with the claims still shut out
     pub fn truncate_all_then(&self, after_check: impl FnOnce()) -> crate::core::Result<i32> {
+        let _history = self.begin_history_event();
         // Hold uncommitted_writes(W) for the ENTIRE check-and-clear sequence
         // to prevent TOCTOU race: without this, a concurrent try_claim_row()
         // could add a claim between the check and the clear, and truncate would
@@ -5701,7 +5777,9 @@ impl VersionStore {
     /// the version is skipped to avoid duplicate entries in the version chain. This can
     /// occur when snapshot and WAL both contain the same committed data due to race
     /// conditions during snapshot creation.
-    pub fn apply_recovered_version(&self, row_id: i64, version: RowVersion) {
+    pub fn apply_recovered_version(&self, row_id: i64, mut version: RowVersion) {
+        // Recovered state is the open point's, before every stamp of this run
+        version.create_time = 0;
         let is_deleted = version.is_deleted();
         let row_data = version.data.clone();
 
@@ -5778,10 +5856,7 @@ impl VersionStore {
             txn_id,
             deleted_at_txn_id: txn_id,
             data: Row::new(),
-            create_time: crate::common::time_compat::SystemTime::now()
-                .duration_since(crate::common::time_compat::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0),
+            create_time: 0,
         };
         self.add_version(row_id, deleted_version);
 
@@ -6403,8 +6478,8 @@ impl VersionStore {
             return 0;
         };
 
-        let now = get_fast_timestamp();
-        let cutoff_time = now - retention_period.as_nanos() as i64;
+        let point = self.retention_point(retention_period);
+        let old = |stamp: i64| point.as_ref().is_none_or(|point| point.sees(stamp));
 
         let mut rows_to_delete = Vec::new();
         // A delete committed below the bound is complete and seen by every reader
@@ -6422,7 +6497,7 @@ impl VersionStore {
 
         // First pass: identify deleted rows older than retention period
         for (&row_id, chain) in versions.iter() {
-            if chain.version.create_time < cutoff_time && removable(&chain.version) {
+            if old(chain.version.create_time) && removable(&chain.version) {
                 rows_to_delete.push(row_id);
             }
         }
@@ -6449,6 +6524,8 @@ impl VersionStore {
                         if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                             actual_arena_indices.push(idx);
                         }
+                        // A point before the delete would need the row
+                        self.raise_history_mark(entry.version.create_time);
                         versions.remove(row_id);
                         actually_deleted.push(row_id);
                     }
@@ -6594,6 +6671,15 @@ impl VersionStore {
             if keep >= depth {
                 continue;
             }
+            // A point before the oldest kept version would need a dropped one
+            let mut oldest = entry;
+            for _ in 1..keep {
+                match oldest.prev.as_deref() {
+                    Some(prev) => oldest = prev,
+                    None => break,
+                }
+            }
+            self.raise_history_mark(oldest.version.create_time);
             let prefix = entry
                 .prev
                 .as_deref()
@@ -6619,8 +6705,8 @@ impl VersionStore {
             None => return 0, // Need visibility checker for cleanup
         };
 
-        let now = get_fast_timestamp();
-        let retention_cutoff = now - retention_period.as_nanos() as i64;
+        let point = self.retention_point(retention_period);
+        let old = |stamp: i64| point.as_ref().is_none_or(|point| point.sees(stamp));
 
         // A version committed below the bound is seen by every reader
         let cutoff = checker.maintenance_limit() - 1;
@@ -6679,13 +6765,19 @@ impl VersionStore {
             };
             // Versions within the retention period stay, with all newer ones
             for (i, prev_entry) in prev_versions.iter().enumerate() {
-                if prev_entry.version.create_time >= retention_cutoff {
+                if !old(prev_entry.version.create_time) {
                     keep_count = keep_count.max(i + 1);
                 }
             }
 
             // If we need to prune some versions, modify the live entry
             if keep_count < prev_versions.len() {
+                // A point before the oldest kept version would need a dropped one
+                let oldest_kept = match keep_count {
+                    0 => &chain_entry.version,
+                    n => &prev_versions[n - 1].version,
+                };
+                self.raise_history_mark(oldest_kept.create_time);
                 let to_remove = prev_versions.len() - keep_count;
                 cleaned += to_remove as i32;
 
@@ -7347,8 +7439,8 @@ impl TransactionVersionStore {
         // - into_arc() at commit time returns the existing Arc (no clone)
         let data = Row::from_arc(data.into_arc());
 
-        // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
-        let timestamp = get_fast_timestamp();
+        // One write order for the call (RowVersion::new would read the clock)
+        let timestamp = next_write_order();
         self.note_layout(timestamp)?;
 
         // Create the row version with pre-computed timestamp
@@ -7444,8 +7536,8 @@ impl TransactionVersionStore {
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing
         let data = Row::from_arc(data.into_arc());
 
-        // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
-        let timestamp = get_fast_timestamp();
+        // One write order for the call (RowVersion::new would read the clock)
+        let timestamp = next_write_order();
         self.note_layout(timestamp)?;
 
         // Create the new row version with pre-computed timestamp
@@ -7515,15 +7607,14 @@ impl TransactionVersionStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let now = get_fast_timestamp();
+        let now = next_write_order();
         self.note_layout(now)?;
 
         for (row_id, data, original_version) in rows {
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
             let data = Row::from_arc(data.into_arc());
 
-            // Create the new row version with pre-computed timestamp (avoids wasteful
-            // get_fast_timestamp() call inside RowVersion::new that would be overwritten)
+            // The call's write order, not RowVersion::new's clock read
             let rv = RowVersion::new_with_timestamp(self.txn_id, data, now);
 
             // Check if already in local versions (already processed in this transaction)
@@ -7612,7 +7703,7 @@ impl TransactionVersionStore {
         if plan.is_empty() {
             return;
         }
-        let now = get_fast_timestamp();
+        let now = next_write_order();
         self.bind_layout(layout, now);
         let read_version_seq = self
             .parent_store
@@ -7681,7 +7772,7 @@ impl TransactionVersionStore {
             return Ok(());
         }
         // Get timestamp once for all rows in the batch
-        let timestamp = get_fast_timestamp();
+        let timestamp = next_write_order();
         self.note_layout(timestamp)?;
 
         for (row_id, data) in rows {
@@ -7756,7 +7847,7 @@ impl TransactionVersionStore {
             return Ok(());
         }
         // Get timestamp once for all rows in the batch
-        let timestamp = get_fast_timestamp();
+        let timestamp = next_write_order();
         self.note_layout(timestamp)?;
 
         for (row_id, data, original_version) in rows {
@@ -7992,14 +8083,22 @@ impl TransactionVersionStore {
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::indexes_published();
 
-        // Commit local versions to parent store
+        // Commit local versions to parent store, each stamped with the
+        // commit's sequence in place of its write time
+        let stamp = self.parent_store.committing_sequence(self.txn_id);
+        let stamped = |mut version: RowVersion| {
+            version.create_time = stamp;
+            version
+        };
         if let Some(local_versions) = self.local_versions.as_mut() {
             if local_versions.len() == 1 {
                 // Single-row fast path: avoid Vec allocation
                 let single = local_versions
                     .drain()
                     .next()
-                    .and_then(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)));
+                    .and_then(|(row_id, mut versions)| {
+                        versions.pop().map(|v| (row_id, stamped(v)))
+                    });
                 if let Some((row_id, version)) = single {
                     match self
                         .parent_store
@@ -8016,7 +8115,9 @@ impl TransactionVersionStore {
                 // Multi-row path: collect into Vec
                 let mut batch: Vec<(i64, RowVersion)> = local_versions
                     .drain()
-                    .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
+                    .filter_map(|(row_id, mut versions)| {
+                        versions.pop().map(|v| (row_id, stamped(v)))
+                    })
                     .collect();
 
                 // Sort by row_id to ensure deterministic locking order
@@ -9950,74 +10051,6 @@ mod tests {
     }
 
     #[test]
-    fn test_version_store_as_of_transaction() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Add version from transaction 5
-        let row = Row::from(vec![Value::from(100)]);
-        let version = RowVersion::new(5, row);
-        store.add_version(1, version);
-
-        // Add updated version from transaction 10
-        let row2 = Row::from(vec![Value::from(200)]);
-        let version2 = RowVersion::new(10, row2);
-        store.add_version(1, version2);
-
-        // AS OF transaction 7 should see the first version
-        let result = store.get_visible_version_as_of_transaction(1, 7);
-        assert!(result.is_some());
-        let rv = result.unwrap();
-        assert_eq!(rv.txn_id, 5);
-
-        // AS OF transaction 15 should see the second version
-        let result = store.get_visible_version_as_of_transaction(1, 15);
-        assert!(result.is_some());
-        let rv = result.unwrap();
-        assert_eq!(rv.txn_id, 10);
-
-        // AS OF transaction 3 should see nothing
-        let result = store.get_visible_version_as_of_transaction(1, 3);
-        assert!(result.is_none());
-
-        // Non-existent row
-        let result = store.get_visible_version_as_of_transaction(999, 10);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_version_store_as_of_timestamp() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Add version with specific timestamp
-        let row = Row::from(vec![Value::from(100)]);
-        let version = RowVersion::new_with_timestamp(1, row, 1000);
-        store.add_version(1, version);
-
-        // Add version with later timestamp
-        let row2 = Row::from(vec![Value::from(200)]);
-        let version2 = RowVersion::new_with_timestamp(2, row2, 2000);
-        store.add_version(1, version2);
-
-        // AS OF timestamp 1500 should see first version
-        let result = store.get_visible_version_as_of_timestamp(1, 1500);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().create_time, 1000);
-
-        // AS OF timestamp 2500 should see second version
-        let result = store.get_visible_version_as_of_timestamp(1, 2500);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().create_time, 2000);
-
-        // AS OF timestamp 500 should see nothing
-        let result = store.get_visible_version_as_of_timestamp(1, 500);
-        assert!(result.is_none());
-    }
-
-    #[test]
     fn test_version_store_sum_column() {
         let checker = Arc::new(TestVisibilityChecker::new());
         let store =
@@ -10498,7 +10531,8 @@ mod tests {
 
     #[test]
     fn test_cleanup_respects_retention_period() {
-        let checker = Arc::new(TestVisibilityChecker::new());
+        // Retention keeps history for AS OF, which the registry's log times
+        let checker = Arc::new(crate::storage::mvcc::TransactionRegistry::new());
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
 

@@ -17,8 +17,9 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::core::{IsolationLevel, Result, Schema, SchemaColumn};
+use crate::core::{IsolationLevel, Result, RowVec, Schema, SchemaColumn};
 use crate::storage::expression::Expression;
+use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::{QueryResult, Table};
 
@@ -252,24 +253,13 @@ pub trait Transaction: Send {
         original_columns: Option<&[String]>,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// Executes a temporal SELECT query as of a specific transaction or timestamp
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table to query
-    /// * `columns_to_fetch` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    /// * `temporal_type` - Either "TRANSACTION" or "TIMESTAMP"
-    /// * `temporal_value` - Transaction ID or timestamp in nanoseconds
-    /// * `original_columns` - Optional original column names
-    fn select_as_of(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-        original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>>;
+    /// The point AS OF `temporal_type` ("TRANSACTION" or "TIMESTAMP")
+    /// `temporal_value` (an id, or nanoseconds) reads at
+    fn read_point(&self, temporal_type: &str, temporal_value: i64) -> Result<ReadPoint>;
+
+    /// Every row of `table_name` as it stood at `point`, every column in
+    /// the table's order
+    fn rows_at(&self, table_name: &str, point: &ReadPoint) -> Result<RowVec>;
 }
 
 /// What only this crate can make: the key to a table without the write

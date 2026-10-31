@@ -38,6 +38,7 @@ use crate::core::{
 use crate::functions::aggregate::{CompiledAggregate, GroupedAggregates};
 use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
@@ -683,7 +684,8 @@ impl SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-            let Some(mut all_rows) = self.collect_cold_rows(where_expr, skip, generation)? else {
+            let Some(mut all_rows) = self.collect_cold_rows(where_expr, skip, generation, None)?
+            else {
                 return Ok(None);
             };
             for entry in hot_rows {
@@ -3231,6 +3233,7 @@ impl SegmentedTable {
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
         generation: u64,
+        at: Option<&ReadPoint>,
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.collect_cold_rows");
@@ -3460,7 +3463,18 @@ impl SegmentedTable {
                 let mut vol_rows = RowVec::new();
                 while let Some(i) = next_row()? {
                     let row_id = row_ids[i];
-                    if !self.shows_cold_row(cs, i, row_id, tombstones_ref, hot_skip_ref) {
+                    let shown = match at {
+                        // At a historical point a tombstone counts once the point sees it
+                        Some(point) => {
+                            cs.is_visible(i)
+                                && !tombstones_ref
+                                    .get(&row_id)
+                                    .is_some_and(|&seq| point.sees(seq as i64))
+                                && !hot_skip_ref.contains(&row_id)
+                        }
+                        None => self.shows_cold_row(cs, i, row_id, tombstones_ref, hot_skip_ref),
+                    };
+                    if !shown {
                         continue;
                     }
 
@@ -4491,7 +4505,7 @@ impl Table for SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-            let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation)? else {
+            let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation, None)? else {
                 return Ok(None);
             };
             for entry in hot_rows {
@@ -7408,137 +7422,44 @@ impl Table for SegmentedTable {
         self.select(columns, expr)
     }
 
-    fn select_as_of(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-    ) -> Result<Box<dyn QueryResult>> {
+    fn rows_at(&self, point: &ReadPoint, authority: Option<&mut FxHashSet<i64>>) -> Result<RowVec> {
         // A table without volumes answers from the hot store; a truncate
         // that refused this attempt is waited out, not taken for a volume
+        let mut authority = authority;
         while !self.segment_mgr.has_segments() {
-            if let Some(result) =
-                self.unsealed(|hot| hot.select_as_of(columns, expr, temporal_type, temporal_value))
+            if let Some(result) = self.unsealed(|hot| hot.rows_at(point, authority.as_deref_mut()))
             {
                 return result;
             }
             self.wait_out_destruction();
         }
-
-        // Historical point-in-time queries on segment-backed tables are not
-        // supported because cold rows lack version chains and create_time.
-        let is_current_query = temporal_type.eq_ignore_ascii_case("CURRENT");
-        if !is_current_query {
-            return Err(crate::core::Error::internal(
-                "AS OF temporal queries are not supported on tables with sealed segments. \
-                 Sealed rows lack version history for point-in-time reconstruction.",
-            ));
-        }
-
+        // The hot chains and the cold view of one settled generation: the
+        // hot rows decide every row they hold a version of at the point
         self.across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
-            // Hot buffer handles temporal filtering via version chains.
-            let mut hot_result =
-                self.hot
-                    .select_as_of(columns, expr, temporal_type, temporal_value)?;
-
-            let schema = self.hot.schema().clone();
-            let pk_idx = schema.columns.iter().position(|c| c.primary_key);
-            let mut hot_pks: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            let mut all_rows = RowVec::new();
-
-            while hot_result.next() {
-                let row = hot_result.take_row();
-                if let Some(pi) = pk_idx {
-                    if let Some(Value::Integer(pk)) = row.get(pi) {
-                        hot_pks.insert(*pk);
-                    }
-                }
-                all_rows.push((0, row));
+            let mut decided = FxHashSet::default();
+            let hot_rows = self.hot.rows_at(point, Some(&mut decided))?;
+            if let Some(authority) = authority.as_deref_mut() {
+                authority.extend(decided.iter().copied());
             }
-
-            // Cold rows in segments have no version chain and no create_time,
-            // so they cannot participate in SYSTEM_TIME temporal queries.
-            // Cold segments store raw data without version chains, so they're valid
-            // only for "CURRENT" temporal queries. Historical queries return early above.
-            if is_current_query {
-                // Build hot_skip from hot row_ids + pending tombstones.
-                // Committed tombstones are kept as a shared Arc (no clone).
-                let volumes = self.segment_mgr.get_volumes_newest_first()?;
-                let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-                let mut hot_skip: FxHashSet<i64> =
-                    FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-                self.hot.collect_hot_row_ids_into(&mut hot_skip);
-                self.segment_mgr
-                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-                #[cfg(any(test, feature = "test-failpoints"))]
-                crate::test_failpoints::merged_read_collected();
-                if self.seal_moved(generation) {
-                    return Ok(None);
-                }
-
-                let fallible = expr.is_some_and(|e| e.can_fail());
-                for (seg_id, cs) in volumes.iter() {
-                    let vol = &cs.volume;
-                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
-                    let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-                    for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                        if !cs.is_visible(i) {
-                            continue;
-                        }
-                        if self.is_row_tombstoned(&tombstones_arc, row_id)
-                            || hot_skip.contains(&row_id)
-                        {
-                            continue;
-                        }
-                        if let Some(si) = pk_idx {
-                            // Resolve PK schema index to physical volume index via mapping
-                            let phys_pk = if si < mapping.sources.len() {
-                                match &mapping.sources[si] {
-                                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                                    super::writer::ColSource::Default(_) => None,
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some(pi) = phys_pk {
-                                if pi < vol.meta.column_types.len()
-                                    && matches!(
-                                        vol.meta.column_types[pi],
-                                        DataType::Integer | DataType::Timestamp
-                                    )
-                                    && pi < vol.columns.len()
-                                    && !vol.columns.get(pi)?.is_null(i)
-                                {
-                                    let pk_val = vol.columns.get(pi)?.get_i64(i);
-                                    if hot_pks.contains(&pk_val) {
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        let row = reader.row(i, &mapping)?;
-                        if let Some(e) = expr {
-                            if !passes(e, fallible, &row)? {
-                                continue;
-                            }
-                        }
-                        all_rows.push((row_id, row));
-                    }
-                }
-            }
-            // For historical temporal queries (SYSTEM_TIME AS OF <timestamp>),
-            // cold rows are excluded since they lack version history.
-            // The hot buffer's AS OF result is the authoritative source.
-
+            let Some(cold_rows) = self.collect_cold_rows(None, decided, generation, Some(point))?
+            else {
+                return Ok(None);
+            };
             self.check_cold()?;
-            let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
-            Ok(Some(Box::new(crate::executor::result::ExecutorResult::new(
-                col_names, all_rows,
-            )) as Box<dyn QueryResult>))
+            // Newest volume first: a row id answers once
+            let mut seen = FxHashSet::default();
+            let mut rows = RowVec::with_capacity(hot_rows.len() + cold_rows.len());
+            for (row_id, row) in cold_rows {
+                if seen.insert(row_id) {
+                    rows.push((row_id, row));
+                }
+            }
+            for entry in hot_rows {
+                rows.push(entry);
+            }
+            Ok(Some(rows))
         })
     }
 
@@ -8666,15 +8587,6 @@ mod tests {
             _: &[&str],
             _: Option<&dyn Expression>,
             _: &FxHashMap<String, String>,
-        ) -> Result<Box<dyn QueryResult>> {
-            Err(crate::core::Error::internal("not implemented"))
-        }
-        fn select_as_of(
-            &self,
-            _: &[&str],
-            _: Option<&dyn Expression>,
-            _: &str,
-            _: i64,
         ) -> Result<Box<dyn QueryResult>> {
             Err(crate::core::Error::internal("not implemented"))
         }

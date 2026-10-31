@@ -25,9 +25,18 @@ use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 /// Global state for timestamp generation - tracks last issued timestamp
 static LAST_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 
-/// Latest issued timestamp for a serialized statement boundary.
-pub(crate) fn last_timestamp() -> i64 {
-    LAST_TIMESTAMP.load(Ordering::Acquire)
+/// The order transaction-local writes are made in, which savepoints and
+/// statement rollback cut at: a counter, so a write reads no clock
+static WRITE_ORDER: AtomicI64 = AtomicI64::new(0);
+
+/// The order of the next transaction-local write
+pub(crate) fn next_write_order() -> i64 {
+    WRITE_ORDER.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// The order of the latest transaction-local write, for a statement boundary
+pub(crate) fn last_write_order() -> i64 {
+    WRITE_ORDER.load(Ordering::Acquire)
 }
 
 /// Returns a monotonically increasing timestamp suitable for transaction

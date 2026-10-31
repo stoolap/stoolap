@@ -297,11 +297,11 @@ fn three_hot(dir: &Path) -> Database {
 }
 
 #[test]
-fn a_historical_read_of_a_table_without_volumes_waits_out_a_truncate() {
-    let (answer, waited) =
-        read_inside_a_truncate_of(three_hot, "SELECT * FROM t AS OF TRANSACTION 1");
-    assert!(answer.is_ok(), "{answer:?}");
-    assert!(waited, "the read answered inside the truncate");
+fn a_historical_read_from_before_a_truncate_is_refused_inside_it() {
+    let (answer, _) =
+        read_inside_a_truncate_of(three_hot, "SELECT * FROM t AS OF TIMESTAMP '2200-01-01'");
+    let error = answer.expect_err("a point before the truncate");
+    assert!(error.contains("AS OF"), "{error}");
 }
 
 #[test]

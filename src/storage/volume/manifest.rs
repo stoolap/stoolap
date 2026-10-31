@@ -31,7 +31,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::storage::mvcc::get_fast_timestamp;
+use crate::storage::mvcc::next_write_order;
 
 use crate::common::SmartString;
 use crate::core::{Result, Value};
@@ -3414,7 +3414,7 @@ impl SegmentManager {
             .entry(txn_id)
             .or_default()
             .entry(row_id)
-            .or_insert_with(get_fast_timestamp);
+            .or_insert_with(next_write_order);
     }
 
     /// Get pending tombstone row_ids for a transaction (for WAL recording).

@@ -969,7 +969,7 @@ PRAGMA vacuum;
 
 Returns a result row with `deleted_rows_cleaned`, `old_versions_cleaned`, and `transactions_cleaned` counts.
 
-**Warning:** VACUUM uses zero retention, meaning all historical row versions not needed by currently active transactions are permanently removed. This destroys [AS OF TIMESTAMP]({% link _docs/sql-features/temporal-queries.md %}) history. Temporal queries referencing timestamps before the VACUUM will no longer return results.
+**Warning:** VACUUM uses zero retention, meaning all historical row versions not needed by currently active transactions are permanently removed. This destroys [AS OF TIMESTAMP]({% link _docs/sql-features/temporal-queries.md %}) history. A temporal query naming a point before the VACUUM fails with an error naming the oldest point still readable.
 
 VACUUM is especially useful on WASM where the background cleanup thread is unavailable.
 

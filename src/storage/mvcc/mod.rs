@@ -36,6 +36,7 @@
 //!
 
 pub mod arena;
+pub mod commit_log;
 pub mod engine;
 pub mod file_lock;
 pub mod index_plan;
@@ -70,7 +71,7 @@ pub use scanner::{EmptyScanner, MVCCScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
 pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;
-pub(crate) use timestamp::last_timestamp;
+pub(crate) use timestamp::{last_write_order, next_write_order};
 pub use transaction::{
     MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
 };

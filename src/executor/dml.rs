@@ -56,8 +56,12 @@ impl<'a> StatementRollback<'a> {
     ) -> Self {
         Self {
             engine,
-            checkpoint: active
-                .map(|tx| (tx.transaction.id(), crate::storage::mvcc::last_timestamp())),
+            checkpoint: active.map(|tx| {
+                (
+                    tx.transaction.id(),
+                    crate::storage::mvcc::last_write_order(),
+                )
+            }),
         }
     }
 

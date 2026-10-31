@@ -15,7 +15,7 @@
 //! Table trait for database tables
 //!
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use crate::common::CompactArc;
@@ -23,6 +23,7 @@ use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value
 use crate::functions::aggregate::GroupedAggregates;
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::IndexPlan;
 use crate::storage::mvcc::version_store::{AggregateOp, LayoutToken};
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
@@ -1518,23 +1519,17 @@ pub trait Table: Send + Sync {
         aliases: &FxHashMap<String, String>,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// Executes a temporal SELECT query as of a specific point in time
-    ///
-    /// # Arguments
-    /// * `columns` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    /// * `temporal_type` - Either "TRANSACTION" or "TIMESTAMP"
-    /// * `temporal_value` - Transaction ID or timestamp in nanoseconds
-    ///
-    /// # Returns
-    /// A QueryResult with rows as they were at the specified point
-    fn select_as_of(
+    /// Every row as it stood at `point`, every column in the table's order.
+    /// `authority` collects the rows whose hot chain decides them at the
+    /// point, a delete included. Fails when the table no longer holds what
+    /// the point needs
+    fn rows_at(
         &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-    ) -> Result<Box<dyn QueryResult>>;
+        _point: &ReadPoint,
+        _authority: Option<&mut FxHashSet<i64>>,
+    ) -> Result<RowVec> {
+        Err(Error::internal("this table keeps no history"))
+    }
 
     /// Explains what access method would be used for a scan
     ///
