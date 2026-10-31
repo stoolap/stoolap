@@ -24,7 +24,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use stoolap::core::Error;
-use stoolap::storage::traits::Engine;
+use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::test_failpoints::{
     after_cold_round_prepared, in_pending_set_lock, in_recheck_fence_section, FailpointGuard,
 };
@@ -240,7 +240,7 @@ fn a_delete_finds_the_rows_its_transaction_changed_with_no_allocation_under_the_
         slot.set(other.update_by_row_ids(&[1, 2, 3, 4, 5, 6], &mut set).ok());
     });
     let before = UNDER_PENDING_LOCK.with(Cell::get);
-    let deleted = deleter.delete(None);
+    let deleted = deleter.delete(ScanAccess::Seq, None);
     let under = UNDER_PENDING_LOCK.with(Cell::get) - before;
     drop(deleter);
     txn.commit().unwrap();
