@@ -31,7 +31,7 @@ use super::parallel;
 use super::planned_dml::DmlStatement;
 use super::planned_join::pick_index_join_side;
 use super::prepared_join::JoinSides;
-use super::prepared_select::OutOfFamily;
+use super::prepared_select::{explain_held_blocks, OutOfFamily};
 use super::pushdown;
 use super::query::{split_join_where, CteNames, JoinIndexUse, SplitSide};
 use super::query_cache::NestedPlan;
@@ -79,7 +79,6 @@ impl Executor {
                 self.active_txn_id(),
                 None,
                 plan.and_then(NestedPlan::source),
-                None,
             )?;
 
             // Count rows by iterating through the result
@@ -142,9 +141,13 @@ impl Executor {
             }
 
             // A SELECT run as a parsed tree held the plan its structure keys
-            let held = plan.is_some()
-                || matches!(&*stmt.statement, Statement::Select(select)
-                    if self.query_cache.statement_plan(select).is_some());
+            let statement_plan = match &*stmt.statement {
+                Statement::Select(select) if plan.is_none() => {
+                    self.query_cache.statement_plan(select)
+                }
+                _ => None,
+            };
+            let held = plan.is_some() || statement_plan.is_some();
             // Generate plan with actual statistics (using inlined version if available)
             self.explain_statement_with_stats(
                 explain_stmt,
@@ -153,6 +156,13 @@ impl Executor {
                 (row_count, &time_str),
                 held,
             );
+            // The blocks as the plan the run held prepared them
+            let ran = plan
+                .and_then(NestedPlan::source)
+                .or(statement_plan.as_deref());
+            if let Some(ran) = ran {
+                plan_lines.extend(explain_held_blocks(ran, 1));
+            }
 
             // Return the plan as a result
             let columns = vec!["plan".to_string()];

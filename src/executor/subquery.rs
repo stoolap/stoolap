@@ -28,6 +28,7 @@ use crate::storage::traits::transaction::StatementTable;
 use crate::core::{Error, Result, Row, RowVec, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
+use crate::planner::block;
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, QueryResult, Table};
@@ -4283,11 +4284,11 @@ impl Executor {
         }
 
         // For pure correlation (no additional predicate), check if index NL is worth it
-        if !Self::small_probe_limit(outer_limit) && outer_rows.is_none() {
+        if !block::small_probe_limit(outer_limit) && outer_rows.is_none() {
             return false;
         }
         self.with_correlated_probe_table(ctx, &info.inner_table, |table| {
-            Ok(Some(Self::probe_cheaper(
+            Ok(Some(block::probe_cheaper(
                 table,
                 &info.inner_column,
                 outer_limit,
@@ -4297,58 +4298,6 @@ impl Executor {
         .ok()
         .flatten()
         .unwrap_or(false)
-    }
-
-    /// Whether an EXISTS on `column` probes the table the statement sees
-    /// Whether a LIMIT is small enough that probing per outer row stops early
-    fn small_probe_limit(limit: Option<i64>) -> bool {
-        limit.is_some_and(|limit| (1..=500).contains(&limit))
-    }
-
-    /// Whether an EXISTS on `column` of `table` probes it per outer row more
-    /// cheaply than it builds a set: for a small LIMIT or few outer rows,
-    /// since a probe per outer row costs about what a set pays for sixteen
-    /// inner rows, and only when an index answers the probe
-    pub(crate) fn probe_cheaper(
-        table: &dyn Table,
-        column: &str,
-        outer_limit: Option<i64>,
-        outer_rows: Option<usize>,
-    ) -> bool {
-        let few_outer =
-            outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
-        (Self::small_probe_limit(outer_limit) || few_outer) && Self::exists_probes(table, column)
-    }
-
-    fn exists_probes(table: &dyn Table, column: &str) -> bool {
-        // The table vouches for its indexes; one with local changes or an
-        // older snapshot refuses every probe
-        if table.index_view_epoch().is_none() {
-            return false;
-        }
-        // An index the table keeps whole
-        if table.lookup_index_on_column(column).is_some() {
-            return true;
-        }
-        // Sealed rows answer through side files
-        let Some(at) = table
-            .schema()
-            .columns
-            .iter()
-            .position(|c| c.name_lower.eq_ignore_ascii_case(column))
-        else {
-            return false;
-        };
-        // A key probe asks an ordered i64 entry, or a single-column TEXT one
-        table.side_index_defs().iter().any(|def| {
-            use crate::storage::volume::side_index::{Domain, KeyKind};
-            match def.components.as_slice() {
-                [only] if only.column as usize == at => {
-                    def.kind == KeyKind::OrderedI64 || only.domain == Domain::Text
-                }
-                _ => false,
-            }
-        })
     }
 
     /// Execute the semi-join optimization for an EXISTS subquery.

@@ -1092,7 +1092,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let holds = statement_holds_as_of(statement);
         let ctx = self.with_statement_cut(statement, std::borrow::Cow::Borrowed(ctx), holds)?;
-        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None, None)
+        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None)
     }
 
     /// `ctx` with the bounds every AS OF of `statement`, which `holds` one,
@@ -1132,7 +1132,6 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&NestedPlan>,
-        counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // A SELECT clears them where its top level starts
         if !matches!(statement, Statement::Select(_)) {
@@ -1191,10 +1190,9 @@ impl Executor {
                 started,
                 plan_classification,
                 compiled,
-                counts,
             );
         }
-        self.dispatch_statement(statement, &ctx, plan_classification, compiled, None)
+        self.dispatch_statement(statement, &ctx, plan_classification, compiled)
     }
 
     /// A SELECT, run again with a fresh view when a truncate or drop
@@ -1213,12 +1211,10 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&NestedPlan>,
-        counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut _deadline = None;
         for attempt in 1..=STATEMENT_RUNS {
-            let result =
-                self.dispatch_statement(statement, &ctx, plan_classification, compiled, counts);
+            let result = self.dispatch_statement(statement, &ctx, plan_classification, compiled);
             // A result read whole through an overtaken view may hold what went
             let overtaken = match &result {
                 Err(Error::ViewOvertaken) => true,
@@ -1259,7 +1255,6 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&NestedPlan>,
-        counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         match statement {
             // DDL statements
@@ -1294,7 +1289,7 @@ impl Executor {
                     }
                 }
                 let compiled = compiled.or(tree_plan.as_deref());
-                self.execute_select_with_plan(stmt, ctx, plan_classification, compiled, counts)
+                self.execute_select_with_plan(stmt, ctx, plan_classification, compiled)
             }
 
             // Transaction control
@@ -1495,7 +1490,6 @@ impl Executor {
             active_txn_id,
             Some(&plan.classification),
             Some(&*plan.compiled),
-            plan.counts.as_deref(),
         )
     }
 }

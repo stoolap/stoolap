@@ -428,4 +428,15 @@ impl PreparedJoin {
         }
         Ok(Some(built))
     }
+
+    /// The join's blocks and a grouped statement's blocks its runs prepared
+    pub(crate) fn held_blocks(
+        &self,
+    ) -> (
+        Option<Arc<JoinBlocks>>,
+        Option<Arc<Option<PreparedGrouped>>>,
+    ) {
+        let join = self.join_blocks.read().ok().and_then(|held| held.clone());
+        (join, self.grouped_blocks.find(|_| true))
+    }
 }

@@ -501,6 +501,35 @@ SELECT (actual time=1.53ms, rows=2)
 | actual rows | Rows processed at each step |
 | Filter | WHERE condition applied |
 
+### Subqueries
+
+For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with a `Subqueries:` section: one line per subquery, numbered from 1, nested ones included, and so are the subqueries of its `LIMIT` and `OFFSET` and of its derived tables, set operation branches, CTEs and join sides that the run prepared. A view keeps its subqueries in its own plan, which EXPLAIN ANALYZE of the view's query lists. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
+
+```sql
+EXPLAIN ANALYZE SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k);
+```
+
+```
+SELECT (actual time=1.58ms, rows=2)
+  Columns: id
+  -> Seq Scan on t (actual rows=2)
+       Filter: EXISTS (SELECT 1 FROM w WHERE (w.k = t.k))
+  Subqueries:
+    1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions
+```
+
+| Answer | Meaning |
+|--------|---------|
+| once per run | It reads no enclosing query: computed once per execution |
+| once per row of N | It reads only values of subquery N's enclosing row: computed once for each such row |
+| per call | Computed for each row that asks it |
+| a statement | It runs as a statement of its own, such as one over a join |
+| a keyed set | The rows of every key are read once per execution, and each call looks its key up |
+| a keyed set, or where the index on k makes probing cheaper: ... | Each execution chooses on its first call: a probe per call when an index on `k` answers it and the enclosing rows are few or its `LIMIT` is small, else the keyed set |
+| the count the index on k holds, else a scan | A `COUNT(*)` of one equality is counted from the index where it answers for the call |
+| the row its key names | The equality on the primary key reads that one row |
+| its pushed conditions, a scan | The rows the conditions the scan takes pass, or every row |
+
 ### Comparing Estimated vs Actual
 
 EXPLAIN ANALYZE helps identify inaccurate estimates:

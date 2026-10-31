@@ -31,6 +31,7 @@ use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::VersionStore;
 use smallvec::SmallVec;
 
+pub(crate) mod block;
 pub(crate) mod join;
 
 /// What the planner decided for one statement: its steps, outermost first,

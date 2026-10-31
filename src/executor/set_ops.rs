@@ -98,7 +98,7 @@ impl Executor {
             let set_ctx = ctx.with_incremented_query_depth();
             let branch = plan.and_then(|plan| plan.branch(stmt, index));
             let right_result =
-                self.execute_select_with_plan(&set_op.right, &set_ctx, None, branch, None)?;
+                self.execute_select_with_plan(&set_op.right, &set_ctx, None, branch)?;
 
             // Validate column count matches (SQL standard requirement)
             let right_col_count = right_result.columns().len();

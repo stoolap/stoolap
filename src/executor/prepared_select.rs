@@ -82,6 +82,7 @@ use super::utils::{
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::window::WindowRows;
 use super::Executor;
+use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
 use crate::planner::{
     distinct_values_column, ordered_read, scan_choice, KeyRead, OrderedRead, Plan, PlanText, Read,
     ScanChoice, Step,
@@ -3359,7 +3360,7 @@ impl WhereProgram {
             | Op::ExecQuantified(id, ..) => blocks
                 .subqueries
                 .get(id as usize)
-                .is_some_and(|sq| sq.uncorrelated),
+                .is_some_and(|sq| sq.uncorrelated()),
             _ => false,
         });
         let loads = asks_blocks || program.binds_params();
@@ -3563,7 +3564,7 @@ impl WhereParts {
         let narrowing = narrowing_test.map(|(_, narrowing)| narrowing);
         let slot = |&(id, negated, column, _): &(u16, bool, Option<usize>, usize)| {
             let sq = &blocks.subqueries[id as usize];
-            let column = column.filter(|_| sq.uncorrelated)?;
+            let column = column.filter(|_| sq.uncorrelated())?;
             sq.member_set_test().is_some().then_some(SetSlot {
                 id,
                 column,
@@ -3900,8 +3901,7 @@ struct PreparedSubquery {
     /// A grouped statement's own block's holes as the block wrote them,
     /// which choose between group items holding one column
     hole_written: Vec<(usize, Expression)>,
-    /// Reads no enclosing scope: its value is computed once per run
-    uncorrelated: bool,
+    runs: BlockRuns,
 }
 
 /// A block's LIMIT and OFFSET over the rows its WHERE passes, in the order
@@ -3969,11 +3969,166 @@ impl PartialEq for HeldRow<'_> {
 
 impl Eq for HeldRow<'_> {}
 
+impl PreparedBlocks {
+    /// One line for each block, labelled `label` and its number counted on
+    /// from `first`; a block run as a statement lists that statement's blocks
+    /// under it, labelled by its own number
+    fn explain(&self, prefix: &str, (label, first): (&str, usize), lines: &mut Vec<String>) {
+        for (at, sq) in self.subqueries.iter().enumerate() {
+            let number = format!("{label}{}", first + at + 1);
+            lines.push(format!("{prefix}{number}: {}", sq.explain(label, first)));
+            let (inner, label) = (format!("{prefix}  "), format!("{number}."));
+            let mut next = 0;
+            for run in sq.statement_runs() {
+                next = held_blocks(&run.compiled, (&inner, &label), next, lines);
+            }
+        }
+    }
+}
+
+/// The lines of the blocks the plan `plan` holds, under a heading; none for
+/// a plan holding no block
+pub(crate) fn explain_held_blocks(plan: &NestedPlan, indent: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    held_blocks(plan, (&"  ".repeat(indent + 1), ""), 0, &mut lines);
+    if !lines.is_empty() {
+        lines.insert(0, format!("{}Subqueries:", "  ".repeat(indent)));
+    }
+    lines
+}
+
+/// The lines of the blocks `plan` and every plan a run made in it hold (a
+/// derived FROM's, a set operation branch's, a CTE's, a join side's, the
+/// LIMIT's and OFFSET's), numbered on from `first`; the number after the last
+fn held_blocks(
+    plan: &NestedPlan,
+    (prefix, label): (&str, &str),
+    first: usize,
+    lines: &mut Vec<String>,
+) -> usize {
+    let mut next = first;
+    let mut list = |blocks: &PreparedBlocks, lines: &mut Vec<String>| {
+        blocks.explain(prefix, (label, next), lines);
+        next += blocks.subqueries.len();
+    };
+    let held = plan.slot().read().ok();
+    let mut sides: SmallVec<[&NestedPlan; 2]> = SmallVec::new();
+    match held.as_deref() {
+        Some(CompiledExecution::PreparedSelect(p)) => list(&p.blocks, lines),
+        Some(CompiledExecution::PreparedGrouped(p)) => list(&p.blocks, lines),
+        Some(CompiledExecution::PreparedDml(p)) => list(&p.blocks, lines),
+        Some(CompiledExecution::PreparedJoin(p)) => {
+            let (join, grouped) = p.held_blocks();
+            if let Some(join) = join {
+                list(&join.blocks, lines);
+            }
+            if let Some(grouped) = grouped.as_deref().and_then(Option::as_ref) {
+                list(&grouped.blocks, lines);
+            }
+            sides.extend([p.side_plan(0), p.side_plan(1)]);
+        }
+        _ => {}
+    }
+    for nested in sides.into_iter().chain(plan.made()) {
+        next = held_blocks(nested, (prefix, label), next, lines);
+    }
+    next
+}
+
 impl PreparedSubquery {
+    /// Reads no enclosing scope: its value is computed once per run
+    fn uncorrelated(&self) -> bool {
+        self.runs == BlockRuns::Once
+    }
+
+    /// The statements the block runs whose plans hold blocks of their own:
+    /// its own, an uncorrelated grouped one's, a derived table's
+    fn statement_runs(&self) -> impl Iterator<Item = &StatementRun> {
+        let own = match &self.answer {
+            Answer::Statement(_, block) => Some(&block.run),
+            _ => None,
+        };
+        let grouped = self.grouping.as_ref().and_then(|g| g.statement.as_deref());
+        let derived = match &self.source {
+            Some(BlockSource::Derived(run, _)) => Some(&**run),
+            _ => None,
+        };
+        [own, grouped, derived].into_iter().flatten()
+    }
+
+    /// What the block tests, what it reads and how its nodes answer a call;
+    /// its statement's blocks are labelled `label` and numbered from `first` + 1
+    fn explain(&self, label: &str, first: usize) -> String {
+        let member = |test: &MemberTest| match test {
+            MemberTest::In => "IN",
+            MemberTest::Quantified(_, true) => "ALL",
+            MemberTest::Quantified(_, false) => "ANY",
+            MemberTest::One(_) => "row comparison",
+        };
+        let (test, kept) = match &self.answer {
+            Answer::Value(_, kept) => ("scalar", kept),
+            Answer::Exists(kept) => ("EXISTS", kept),
+            Answer::Members(kept, members) => (member(&members.test), kept),
+            Answer::Statement(kept, block) => match &block.form {
+                StatementForm::Value => ("scalar", kept),
+                StatementForm::Exists => ("EXISTS", kept),
+                StatementForm::Members(_, test) => (member(test), kept),
+            },
+        };
+        let over = match (&self.answer, &self.source, &self.table) {
+            (Answer::Statement(..), ..) => "a statement".to_string(),
+            (_, Some(BlockSource::View(name, ..) | BlockSource::Cte(name)), _) => name.to_string(),
+            (_, Some(BlockSource::Derived(..)), _) => "a derived table".to_string(),
+            (_, Some(BlockSource::Values(_)), _) => "VALUES".to_string(),
+            (_, Some(BlockSource::AsOf(name, _)), _) => format!("{name} AS OF"),
+            (_, Some(BlockSource::Function(..)), _) => "a table function".to_string(),
+            (_, None, Some(table)) => table.to_string(),
+            (_, None, None) => "no table".to_string(),
+        };
+        let runs = match (self.runs, self.parent) {
+            (BlockRuns::Once, _) => return format!("{test} over {over}, once per run"),
+            (BlockRuns::PerParentRow, Some(parent)) => {
+                let parent = first + usize::from(parent) + 1;
+                return format!("{test} over {over}, once per row of {label}{parent}");
+            }
+            _ => "per call",
+        };
+        if matches!(self.answer, Answer::Statement(..)) {
+            return format!("{test} over {over}, {runs}");
+        }
+        let column = |at: usize| self.schema.columns.get(at).map_or("", |c| c.name.as_str());
+        let call = match (self.grouping.as_deref().map(|g| g.read), &self.pushdown[..]) {
+            (Some(CallRead::CountByIndex), [equality]) => {
+                format!(
+                    "the count the index on {} holds, else a scan",
+                    equality.column
+                )
+            }
+            _ if self.point.is_some() => "the row its key names".to_string(),
+            (_, []) => "a scan".to_string(),
+            _ => "its pushed conditions".to_string(),
+        };
+        let keyed = kept
+            .keyed
+            .as_ref()
+            .or(self.grouping.as_deref().and_then(|g| g.keyed.as_ref()));
+        let read = match keyed {
+            None => call,
+            Some(plan) => match plan.read {
+                KeyedRead::Set => "a keyed set".to_string(),
+                KeyedRead::ProbeOrSet => format!(
+                    "a keyed set, or where the index on {} makes probing cheaper: {call}",
+                    plan.keys.first().map_or("", |key| column(key.0))
+                ),
+            },
+        };
+        format!("{test} over {over}, {runs}: {read}")
+    }
+
     /// The test an uncorrelated block's members answer, read once per run
     /// as a set: of a block over one source, or of one run as a statement
     fn member_set_test(&self) -> Option<MemberTest> {
-        if !self.uncorrelated {
+        if !self.uncorrelated() {
             return None;
         }
         match &self.answer {
@@ -4166,8 +4321,7 @@ struct Grouping {
     /// An uncorrelated block without subqueries, as written: run once as a
     /// statement, so every aggregate path the general path admits answers it
     statement: Option<Box<StatementRun>>,
-    /// One group whose every call counts rows, which an index can answer
-    counts_rows: bool,
+    read: CallRead,
 }
 
 /// A block run as a statement of its own, with the plan its runs keep, as
@@ -4393,8 +4547,7 @@ struct KeyedPlan {
     /// The comparisons of what the keys leave of the WHERE that the scan takes
     pushdown: Vec<PreparedComparison>,
     pushed_whole: bool,
-    /// The WHERE is the keys alone, which is when a probe may be cheaper
-    pure: bool,
+    read: KeyedRead,
     /// A parent column has no type: a call whose key value is not of its
     /// own column's type is asked without the keys
     checked: bool,
@@ -5272,10 +5425,14 @@ impl Builder<'_> {
             grouping: None,
             order: None,
             parent,
+            // Its run keeps no answer for its parent's row
+            runs: match uncorrelated {
+                true => BlockRuns::Once,
+                false => BlockRuns::PerCall,
+            },
             holes,
             hole_exprs,
             hole_written,
-            uncorrelated,
         });
         Ok((id, work.delegated, work.reads_parent))
     }
@@ -5404,7 +5561,7 @@ impl Builder<'_> {
         let once = block
             .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
             .is_some_and(|sq| {
-                sq.uncorrelated
+                sq.uncorrelated()
                     && sq.parent.is_none()
                     && match &sq.answer {
                         Answer::Value(..) | Answer::Exists(_) => true,
@@ -6092,12 +6249,20 @@ impl Builder<'_> {
             Some(Grouped {
                 mut grouping,
                 reads: grouping_reads,
+                counts_rows,
                 ..
             }) => {
                 for slot in grouping_reads {
                     if !reads.contains(&slot) {
                         reads.push(slot);
                     }
+                }
+                let one_equality = matches!(
+                    (pushdown.as_slice(), pushed_whole),
+                    ([equality], true) if equality.operator == Operator::Eq
+                );
+                if counts_rows && one_equality && table.is_some() && source.is_none() {
+                    grouping.read = CallRead::CountByIndex;
                 }
                 if self.keyed(&chain, &keys, &work, sq, &others) {
                     grouping.keyed = Some(keyed_plan(&chain, &keys, filter.as_ref(), &schema));
@@ -6189,10 +6354,15 @@ impl Builder<'_> {
             grouping,
             order,
             parent,
+            // One reading none of its parent's row answers once per parent row
+            runs: match (correlated, parent) {
+                (false, _) => BlockRuns::Once,
+                (true, Some(_)) if holes.is_empty() => BlockRuns::PerParentRow,
+                (true, _) => BlockRuns::PerCall,
+            },
             holes,
             hole_exprs,
             hole_written,
-            uncorrelated: !correlated,
         });
         Ok((id, work.delegated, work.reads_parent))
     }
@@ -6346,10 +6516,11 @@ impl Builder<'_> {
                 having: having_program,
                 keyed: None,
                 statement: None,
-                counts_rows,
+                read: CallRead::Rows,
             },
             projection,
             reads,
+            counts_rows,
         })
     }
 
@@ -6398,6 +6569,8 @@ struct Grouped {
     /// Each SELECT value over a slot row
     projection: Vec<SharedProgram>,
     reads: SmallVec<[usize; 2]>,
+    /// One group whose every call counts rows, which an index can answer
+    counts_rows: bool,
 }
 
 /// The block's own column that `expr` reads outside every aggregate call
@@ -6449,7 +6622,10 @@ fn keyed_plan(
             .collect(),
         pushdown,
         pushed_whole,
-        pure: filter.is_none(),
+        read: match filter {
+            None => KeyedRead::ProbeOrSet,
+            Some(_) => KeyedRead::Set,
+        },
         checked: keys
             .iter()
             .any(|((_, _, parent), _)| chain.scopes[1].types[*parent] == DataType::Null),
@@ -10184,7 +10360,7 @@ fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool 
     };
     let members =
         |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.member_set_test().is_some());
-    let once = |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.uncorrelated);
+    let once = |mark: &SelectStatement| block(mark).is_some_and(|sq| sq.uncorrelated());
     match expr {
         Expression::In(in_expr) => match in_expr.right.as_ref() {
             Expression::ScalarSubquery(mark) => {
@@ -10786,7 +10962,6 @@ impl Executor {
             ctx,
             Some(&run.classification),
             Some(&run.compiled),
-            None,
         )?;
         let columns = result.columns().to_vec();
         Ok((columns, Self::materialize_result(result)?))
@@ -11195,8 +11370,7 @@ impl Executor {
             }
             Some(Expression::SubquerySource(ss)) => {
                 let plan = plan.and_then(|plan| plan.from(stmt));
-                let result =
-                    self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan, None)?;
+                let result = self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan)?;
                 let columns = result.columns().to_vec();
                 (
                     Some(StatementSource::Stream(columns, result)),
@@ -13216,9 +13390,7 @@ impl<'a> PreparedRunner<'a> {
     /// The parent's fill a correlated block reading no row of its parent
     /// answers for: one answer holds until the parent is filled again
     fn parent_call(&self, sq: &PreparedSubquery) -> Option<u64> {
-        let parent = sq
-            .parent
-            .filter(|_| !sq.uncorrelated && sq.holes.is_empty())?;
+        let parent = sq.parent.filter(|_| sq.runs == BlockRuns::PerParentRow)?;
         Some(self.blocks[parent as usize].fills.get())
     }
 
@@ -13383,7 +13555,10 @@ impl<'a> PreparedRunner<'a> {
         let forced = crate::test_failpoints::forced_exists_strategy();
         #[cfg(not(feature = "test-failpoints"))]
         let forced: Option<bool> = None;
-        let keyed = forced.unwrap_or_else(|| !(plan.pure && self.probe_cheaper(index, plan)));
+        let keyed = forced.unwrap_or_else(|| match plan.read {
+            KeyedRead::Set => true,
+            KeyedRead::ProbeOrSet => !self.probe_cheaper(index, plan),
+        });
         self.blocks[index].keyed_choice.set(Some(keyed));
         keyed
     }
@@ -13419,7 +13594,7 @@ impl<'a> PreparedRunner<'a> {
         let Some(table) = self.tables[index].as_ref().and_then(BlockInput::table) else {
             return true;
         };
-        Executor::probe_cheaper(
+        block_plan::probe_cheaper(
             table,
             &sq.schema.columns[plan.keys[0].0].name,
             self.statement_limit.filter(|_| sq.parent.is_none()),
@@ -13757,7 +13932,7 @@ impl PreparedRunner<'_> {
             .subqueries
             .get(index)
             .ok_or_else(|| Error::internal("unknown prepared subquery"))?;
-        if sq.uncorrelated {
+        if sq.uncorrelated() {
             if let Some(value) = self.blocks[index].value.borrow().as_ref() {
                 return Ok(value.clone());
             }
@@ -13784,7 +13959,7 @@ impl PreparedRunner<'_> {
                 }
                 Ok(value.unwrap_or_else(Value::null_unknown))
             };
-            if !sq.uncorrelated {
+            if !sq.uncorrelated() {
                 return read();
             }
             let answer =
@@ -13798,7 +13973,7 @@ impl PreparedRunner<'_> {
         let Answer::Value(projection, kept) = &sq.answer else {
             return Err(Error::internal("an EXISTS block run for a value"));
         };
-        if !sq.uncorrelated {
+        if !sq.uncorrelated() {
             let value = self.scalar_value(index, sq, projection, caller, site)?;
             self.answer_call(index, call, || BlockAnswer::Value(value.clone()));
             return Ok(value);
@@ -14118,7 +14293,7 @@ impl PreparedRunner<'_> {
                     None => Ok(exists),
                 }
             };
-            if !sq.uncorrelated {
+            if !sq.uncorrelated() {
                 return read();
             }
             if let Some(Value::Boolean(exists)) = self.blocks[index].value.borrow().as_ref() {
@@ -14135,7 +14310,7 @@ impl PreparedRunner<'_> {
         let Answer::Exists(existence) = &sq.answer else {
             return Err(Error::internal("a scalar block run for EXISTS"));
         };
-        if sq.uncorrelated {
+        if sq.uncorrelated() {
             if let Some(Value::Boolean(exists)) = self.blocks[index].value.borrow().as_ref() {
                 return Ok(*exists);
             }
@@ -14144,7 +14319,7 @@ impl PreparedRunner<'_> {
         if let Some(BlockAnswer::Once(exists)) = self.answered(index, call) {
             return Ok(exists);
         }
-        let exists = match (&sq.grouping, sq.uncorrelated) {
+        let exists = match (&sq.grouping, sq.uncorrelated()) {
             (Some(grouping), false) => {
                 self.with_groups(index, grouping, caller, site, |rows, params, vm| {
                     self.any_group_passes(grouping, rows, params, vm)
@@ -14191,7 +14366,7 @@ impl PreparedRunner<'_> {
                 }
             }
         };
-        if sq.uncorrelated {
+        if sq.uncorrelated() {
             *self.blocks[index].value.borrow_mut() = Some(Value::Boolean(exists));
         }
         self.answer_call(index, call, || BlockAnswer::Once(exists));
@@ -14263,7 +14438,7 @@ impl PreparedRunner<'_> {
             }
             _ => false,
         };
-        if !one || sq.uncorrelated {
+        if !one || sq.uncorrelated() {
             return self.members_answer(index, row, caller, site);
         }
         let set = match &sq.answer {
@@ -14312,7 +14487,7 @@ impl PreparedRunner<'_> {
                 return Err(Error::internal("a block run for its members that has none"));
             };
             // One that binds nothing beyond itself reads its members once
-            if sq.uncorrelated {
+            if sq.uncorrelated() {
                 self.read_member_set(index, caller, site)?;
                 let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
                     return Err(Error::internal("a value block's members not kept"));
@@ -14335,7 +14510,7 @@ impl PreparedRunner<'_> {
         let Answer::Members(kept, members) = &sq.answer else {
             return Err(Error::internal("a block run for its members that has none"));
         };
-        if sq.uncorrelated {
+        if sq.uncorrelated() {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::kept_member_called();
             // Read on the first row; every row after takes the kept members
@@ -14430,7 +14605,7 @@ impl PreparedRunner<'_> {
             Answer::Members(kept, members) => {
                 return self.read_members(index, kept, members, caller, site)
             }
-            Answer::Statement(kept, block) if sq.uncorrelated => match block.form {
+            Answer::Statement(kept, block) if sq.uncorrelated() => match block.form {
                 StatementForm::Members(read_as, test) => (kept, block, read_as, test),
                 _ => return Err(Error::internal("a block run for its members that has none")),
             },
@@ -14561,7 +14736,7 @@ impl PreparedRunner<'_> {
     /// The test over the members uncorrelated block `index` has read in
     /// this run; None before the read, or when it failed for a candidate
     fn members_op(&self, index: usize) -> Option<Op> {
-        if !self.prepared.subqueries.get(index)?.uncorrelated {
+        if !self.prepared.subqueries.get(index)?.uncorrelated() {
             return None;
         }
         let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
@@ -14594,7 +14769,7 @@ impl PreparedRunner<'_> {
         match *op {
             Op::LoadParam(slot) => value(slot).map(Op::LoadConst),
             Op::ExecScalarSubquery(index) | Op::ExecExists(index) => {
-                if !self.prepared.subqueries.get(index as usize)?.uncorrelated {
+                if !self.prepared.subqueries.get(index as usize)?.uncorrelated() {
                     return None;
                 }
                 let value = self.blocks[index as usize].value.borrow();
@@ -14630,7 +14805,7 @@ impl PreparedRunner<'_> {
                 .prepared
                 .subqueries
                 .get(index as usize)
-                .is_some_and(|sq| sq.uncorrelated),
+                .is_some_and(|sq| sq.uncorrelated()),
             _ => false,
         }
     }
@@ -15276,7 +15451,6 @@ impl PreparedRunner<'_> {
             &ctx,
             Some(&block.run.classification),
             Some(&block.run.compiled),
-            None,
         )
     }
 
@@ -15290,7 +15464,6 @@ impl PreparedRunner<'_> {
             &self.ctx,
             Some(&run.classification),
             Some(&run.compiled),
-            None,
         )?;
         let mut values = Vec::new();
         while result.next() {
@@ -15478,15 +15651,11 @@ impl PreparedRunner<'_> {
     /// equality an index holds, counted from the index's ids as the
     /// statement sees them; None when the index cannot answer for this call
     fn index_count(&self, index: usize, grouping: &Grouping) -> Result<Option<Vec<Row>>> {
-        if !grouping.counts_rows {
-            return Ok(None);
-        }
         let sq = &self.prepared.subqueries[index];
-        let ([equality], true) = (sq.pushdown.as_slice(), sq.pushed_whole) else {
+        let (CallRead::CountByIndex, [equality]) = (grouping.read, sq.pushdown.as_slice()) else {
             return Ok(None);
         };
-        let table = self.tables[index].as_ref().and_then(BlockInput::table);
-        let Some(table) = table.filter(|_| equality.operator == Operator::Eq) else {
+        let Some(table) = self.tables[index].as_ref().and_then(BlockInput::table) else {
             return Ok(None);
         };
         let params = self.blocks[index].buffer.borrow();
