@@ -34,7 +34,7 @@ use super::prepared_join::JoinSides;
 use super::prepared_select::{explain_held_blocks, OutOfFamily};
 use super::pushdown;
 use super::query::{split_join_where, CteNames, JoinIndexUse, SplitSide};
-use super::query_cache::{counts_slot, NestedPlan};
+use super::query_cache::NestedPlan;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::utils::get_table_alias_from_expr;
@@ -73,15 +73,12 @@ impl Executor {
             let holds = super::statement_holds_as_of(&stmt.statement);
             let ctx =
                 self.with_statement_cut(&stmt.statement, std::borrow::Cow::Borrowed(ctx), holds)?;
-            // Its LIMIT's and OFFSET's subqueries keep their plan for the listing
-            let counts = counts_slot(&stmt.statement);
             let mut result = self.execute_statement_inner(
                 &stmt.statement,
                 ctx,
                 self.active_txn_id(),
                 None,
                 plan.and_then(NestedPlan::source),
-                counts.as_deref(),
             )?;
 
             // Count rows by iterating through the result
@@ -163,10 +160,9 @@ impl Executor {
             let ran = plan
                 .and_then(NestedPlan::source)
                 .or(statement_plan.as_deref());
-            let counted = counts.as_deref().map(|counts| &counts.compiled);
-            let plans: smallvec::SmallVec<[&NestedPlan; 2]> =
-                ran.into_iter().chain(counted).collect();
-            plan_lines.extend(explain_held_blocks(&plans, 1));
+            if let Some(ran) = ran {
+                plan_lines.extend(explain_held_blocks(ran, 1));
+            }
 
             // Return the plan as a result
             let columns = vec!["plan".to_string()];

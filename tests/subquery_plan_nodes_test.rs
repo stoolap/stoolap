@@ -135,6 +135,14 @@ fn explain_analyze_says_how_each_block_answers() {
             ],
         ),
         (
+            "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT (SELECT COUNT(*) FROM w)",
+            &["1: scalar over w, once per run"],
+        ),
+        (
+            "SELECT q.id FROM (SELECT id FROM t LIMIT (SELECT COUNT(*) FROM w)) AS q",
+            &["1: scalar over w, once per run"],
+        ),
+        (
             "SELECT id, (SELECT v FROM w WHERE w.id = t.k) FROM t",
             &["1: scalar over w, per call: the row its key names"],
         ),

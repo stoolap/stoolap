@@ -212,7 +212,7 @@ impl Executor {
         // Get the WITH clause
         let with_clause = match &stmt.with {
             Some(with) => with,
-            None => return self.execute_select_with_plan(stmt, ctx, None, plan, None),
+            None => return self.execute_select_with_plan(stmt, ctx, None, plan),
         };
 
         // CTE INLINING OPTIMIZATION:
@@ -222,7 +222,7 @@ impl Executor {
         // This is similar to PostgreSQL 12+'s CTE inlining behavior
         if let Some(inlined_stmt) = self.try_inline_ctes(stmt, with_clause) {
             // Execute the rewritten query (without WITH clause or with fewer CTEs)
-            return self.execute_select_with_plan(&inlined_stmt, ctx, None, plan, None);
+            return self.execute_select_with_plan(&inlined_stmt, ctx, None, plan);
         }
 
         self.run_over_cut_ctes(stmt, with_clause, plan, ctx, |cte_registry| {
@@ -377,7 +377,7 @@ impl Executor {
             // Clone Arc data into RowVec for processing
             // A subquery in the statement reads the earlier
             // CTEs through the context
-            let counted = self.read_volatile_counts(stmt, ctx, None)?;
+            let counted = self.read_volatile_counts(stmt, ctx)?;
             let ctx = counted.as_ref().unwrap_or(ctx);
             return self.execute_query_on_cte_result(
                 stmt,
@@ -390,7 +390,7 @@ impl Executor {
         // Execute as a normal SELECT and materialize
         // Create context with CTE data so tables can resolve CTE references
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
-        let result = self.execute_select_with_plan(stmt, &ctx_with_ctes, None, plan, None)?;
+        let result = self.execute_select_with_plan(stmt, &ctx_with_ctes, None, plan)?;
         let columns = result.columns().to_vec();
         let rows = Self::materialize_result(result)?;
 
@@ -452,7 +452,7 @@ impl Executor {
 
         // Taken first, so the body's plans are laid out for the whole body
         let branches = plan.map_or(&[][..], |plan| plan.branches(stmt));
-        let result = self.execute_select_with_plan(&anchor_stmt, ctx, None, plan, None)?;
+        let result = self.execute_select_with_plan(&anchor_stmt, ctx, None, plan)?;
         let anchor_columns = result.columns().to_vec();
 
         // Apply column aliases if provided (for recursive CTE column naming)
@@ -621,7 +621,7 @@ impl Executor {
             prepared: None,
         };
 
-        self.execute_select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan, None)
+        self.execute_select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan)
     }
 
     /// Execute a query on CTE result data

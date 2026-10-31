@@ -3986,15 +3986,11 @@ impl PreparedBlocks {
     }
 }
 
-/// The lines of the blocks the plans `plans` hold, numbered on as one list
-/// under a heading; none for plans holding no block
-pub(crate) fn explain_held_blocks(plans: &[&NestedPlan], indent: usize) -> Vec<String> {
+/// The lines of the blocks the plan `plan` holds, under a heading; none for
+/// a plan holding no block
+pub(crate) fn explain_held_blocks(plan: &NestedPlan, indent: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    let prefix = "  ".repeat(indent + 1);
-    let mut next = 0;
-    for plan in plans {
-        next = held_blocks(plan, (&prefix, ""), next, &mut lines);
-    }
+    held_blocks(plan, (&"  ".repeat(indent + 1), ""), 0, &mut lines);
     if !lines.is_empty() {
         lines.insert(0, format!("{}Subqueries:", "  ".repeat(indent)));
     }
@@ -4002,8 +3998,8 @@ pub(crate) fn explain_held_blocks(plans: &[&NestedPlan], indent: usize) -> Vec<S
 }
 
 /// The lines of the blocks `plan` and every plan a run made in it hold (a
-/// derived FROM's, a set operation branch's, a CTE's, a join side's),
-/// numbered on from `first` as one list; the number after the last
+/// derived FROM's, a set operation branch's, a CTE's, a join side's, the
+/// LIMIT's and OFFSET's), numbered on from `first`; the number after the last
 fn held_blocks(
     plan: &NestedPlan,
     (prefix, label): (&str, &str),
@@ -10966,7 +10962,6 @@ impl Executor {
             ctx,
             Some(&run.classification),
             Some(&run.compiled),
-            None,
         )?;
         let columns = result.columns().to_vec();
         Ok((columns, Self::materialize_result(result)?))
@@ -11375,8 +11370,7 @@ impl Executor {
             }
             Some(Expression::SubquerySource(ss)) => {
                 let plan = plan.and_then(|plan| plan.from(stmt));
-                let result =
-                    self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan, None)?;
+                let result = self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan)?;
                 let columns = result.columns().to_vec();
                 (
                     Some(StatementSource::Stream(columns, result)),
@@ -15457,7 +15451,6 @@ impl PreparedRunner<'_> {
             &ctx,
             Some(&block.run.classification),
             Some(&block.run.compiled),
-            None,
         )
     }
 
@@ -15471,7 +15464,6 @@ impl PreparedRunner<'_> {
             &self.ctx,
             Some(&run.classification),
             Some(&run.compiled),
-            None,
         )?;
         let mut values = Vec::new();
         while result.next() {

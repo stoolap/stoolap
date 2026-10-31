@@ -289,6 +289,8 @@ pub struct NestedPlan {
     /// then its CTEs'; a DML statement's CTEs'; or the one statement an
     /// INSERT, a CREATE TABLE or an EXPLAIN ANALYZE runs. Made when one first runs
     nested: std::sync::OnceLock<Box<[NestedPlan]>>,
+    /// A SELECT's LIMIT and OFFSET subqueries; made when one is first read
+    counts: std::sync::OnceLock<Box<CountsSlot>>,
 }
 
 impl NestedPlan {
@@ -343,9 +345,25 @@ impl NestedPlan {
         self.nested(1).first()
     }
 
-    /// The plans nested in this one that a run has made; none before one
-    pub(crate) fn made(&self) -> &[NestedPlan] {
-        self.nested.get().map_or(&[], |nested| &nested[..])
+    /// The plans nested in this one that a run has made, its LIMIT's and
+    /// OFFSET's last; none before one
+    pub(crate) fn made(&self) -> impl Iterator<Item = &NestedPlan> {
+        let nested = self.nested.get().map_or(&[][..], |nested| &nested[..]);
+        nested
+            .iter()
+            .chain(self.counts.get().map(|counts| &counts.compiled))
+    }
+
+    /// The plan of the subqueries of `stmt`'s LIMIT and OFFSET, this being
+    /// `stmt`'s plan
+    pub(crate) fn counts(&self, stmt: &SelectStatement) -> &CountsSlot {
+        self.counts.get_or_init(|| {
+            let counts = [stmt.limit.as_deref(), stmt.offset.as_deref()];
+            Box::new(CountsSlot {
+                compiled: NestedPlan::default(),
+                keys: counts.map(|count| count.map(super::expr_key::ExprKey::of)),
+            })
+        })
     }
 }
 
@@ -392,9 +410,6 @@ pub struct CachedPlanRef {
     pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
-    /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
-    /// without one
-    pub counts: Option<Arc<CountsSlot>>,
     /// Whether the statement reads a table AS OF anywhere
     pub holds_as_of: bool,
 }
@@ -402,44 +417,24 @@ pub struct CachedPlanRef {
 impl CachedPlanRef {
     /// A plan of `statement`, nothing compiled or classified yet
     pub(crate) fn new(statement: Arc<Statement>, params: ParamSlots) -> Self {
-        let counts = counts_slot(&statement);
         let holds_as_of = super::statement_holds_as_of(&statement);
         Self {
             statement,
             params,
             compiled: Arc::new(NestedPlan::default()),
             classification: Arc::new(std::sync::OnceLock::new()),
-            counts,
             holds_as_of,
         }
     }
 }
 
-/// What a plan keeps for a SELECT whose LIMIT or OFFSET holds a subquery
+/// What a SELECT's plan keeps for the subqueries of its LIMIT and OFFSET
 #[derive(Debug)]
 pub struct CountsSlot {
     /// The subqueries' prepared blocks
     pub(crate) compiled: NestedPlan,
     /// The identity of the LIMIT and of the OFFSET expression
     pub(crate) keys: [Option<super::expr_key::ExprKey>; 2],
-}
-
-/// The slot of `statement`, for a SELECT whose LIMIT or OFFSET holds a subquery
-pub(crate) fn counts_slot(statement: &Statement) -> Option<Arc<CountsSlot>> {
-    let Statement::Select(select) = statement else {
-        return None;
-    };
-    let counts = [select.limit.as_deref(), select.offset.as_deref()];
-    counts
-        .into_iter()
-        .flatten()
-        .any(super::Executor::has_subqueries)
-        .then(|| {
-            Arc::new(CountsSlot {
-                compiled: NestedPlan::default(),
-                keys: counts.map(|count| count.map(super::expr_key::ExprKey::of)),
-            })
-        })
 }
 
 /// Represents a parsed and prepared statement stored in the cache
@@ -457,9 +452,6 @@ pub struct CachedQueryPlan {
     pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
-    /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
-    /// without one
-    pub counts: Option<Arc<CountsSlot>>,
     /// Whether the statement reads a table AS OF anywhere
     pub holds_as_of: bool,
 }
@@ -595,7 +587,6 @@ impl QueryCache {
             params: plan.params.clone(),
             compiled: plan.compiled.clone(), // Share compiled state
             classification: plan.classification.clone(),
-            counts: plan.counts.clone(),
             holds_as_of: plan.holds_as_of,
         }))
     }
@@ -626,7 +617,6 @@ impl QueryCache {
                     params: plan.params.clone(),
                     compiled: plan.compiled.clone(), // Arc clone - cheap
                     classification: plan.classification.clone(),
-                    counts: plan.counts.clone(),
                     holds_as_of: plan.holds_as_of,
                 }),
             );

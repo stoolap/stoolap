@@ -1497,7 +1497,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_select_with_plan(stmt, ctx, None, None, None)
+        self.execute_select_with_plan(stmt, ctx, None, None)
     }
 
     /// `ctx` with the snapshot a statement reading its LIMIT or OFFSET
@@ -1525,7 +1525,6 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        slot: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Option<ExecutionContext>> {
         let counts = [stmt.limit.as_deref(), stmt.offset.as_deref()];
         let volatile = counts.into_iter().flatten().any(|count| {
@@ -1537,19 +1536,19 @@ impl Executor {
         if !volatile || counts.into_iter().flatten().any(Self::has_subqueries) {
             return Ok(None);
         }
-        self.read_row_counts(stmt, ctx, slot).map(Some)
+        self.read_row_counts(stmt, ctx, None).map(Some)
     }
 
     /// `ctx` with the counts the subqueries of `stmt`'s LIMIT and OFFSET
     /// answer, read once before the statement reads a row, under its
-    /// snapshot; their blocks are held in `slot`
+    /// snapshot; their blocks are held in `stmt`'s plan `compiled`
     #[cold]
     #[inline(never)]
     fn read_row_counts(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        slot: Option<&super::query_cache::CountsSlot>,
+        compiled: Option<&NestedPlan>,
     ) -> Result<ExecutionContext> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::row_counts_read();
@@ -1582,6 +1581,7 @@ impl Executor {
             )));
         }
         // A count is read before any row: its scope is a table without columns
+        let slot = compiled.map(|plan| plan.counts(stmt));
         let values = clauses.map(|(count, _)| count.map_or(&[][..], std::slice::from_ref));
         let (prepared, tables) = self.open_prepared_dml(
             slot.map(|slot| slot.compiled.slot()),
@@ -1633,9 +1633,8 @@ impl Executor {
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&NestedPlan>,
-        counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
-        let result = self.select_with_plan(stmt, ctx, plan_classification, compiled, counts)?;
+        let result = self.select_with_plan(stmt, ctx, plan_classification, compiled)?;
         // A column read through a FROM entry shows as `entry.name`
         if !result
             .columns()
@@ -1658,7 +1657,6 @@ impl Executor {
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&NestedPlan>,
-        counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // Start timeout guard ONLY at the top level (query_depth == 0).
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
@@ -1701,7 +1699,7 @@ impl Executor {
         };
         // Without a subquery a count reads no CTE, so it is read before the
         // CTEs, whose statement may take a path of its own
-        let volatile_ctx = self.read_volatile_counts(stmt, ctx, counts)?;
+        let volatile_ctx = self.read_volatile_counts(stmt, ctx)?;
         let ctx = volatile_ctx.as_ref().unwrap_or(ctx);
 
         // Check for CTEs (WITH clause). A statement with one keeps every
@@ -1732,7 +1730,7 @@ impl Executor {
                 return self.execute_select_with_ctes(stmt, ctx, compiled);
             }
             if let Some(inlined) = self.try_inline_ctes(stmt, with) {
-                return self.execute_select_with_plan(&inlined, ctx, None, compiled, None);
+                return self.execute_select_with_plan(&inlined, ctx, None, compiled);
             }
             let snapshot = match ctx.statement_snapshot() {
                 Some(_) => None,
@@ -1741,24 +1739,10 @@ impl Executor {
             let ctx = snapshot.as_ref().unwrap_or(ctx);
             return self.run_over_cut_ctes(stmt, with, compiled, ctx, |ctes| {
                 let ctx = ctx.with_cte_data(ctes.data());
-                self.select_rows_with_plan(
-                    stmt,
-                    &ctx,
-                    reads_blocks,
-                    plan_classification,
-                    compiled,
-                    counts,
-                )
+                self.select_rows_with_plan(stmt, &ctx, reads_blocks, plan_classification, compiled)
             });
         }
-        self.select_rows_with_plan(
-            stmt,
-            ctx,
-            reads_blocks,
-            plan_classification,
-            compiled,
-            counts,
-        )
+        self.select_rows_with_plan(stmt, ctx, reads_blocks, plan_classification, compiled)
     }
 
     /// `select_with_plan` past its CTEs, which `ctx` holds
@@ -1769,13 +1753,12 @@ impl Executor {
         reads_blocks: bool,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&NestedPlan>,
-        counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // The subquery is read once, before any path reads a row, with the
         // CTEs of the statement bound
         let counts_ctx;
         let ctx = if reads_blocks {
-            counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
+            counts_ctx = self.read_row_counts(stmt, ctx, compiled)?;
             &counts_ctx
         } else {
             ctx
@@ -7858,7 +7841,7 @@ impl Executor {
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let body = &subquery_source.subquery;
-        let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan, None)?;
+        let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan)?;
         let columns = result.columns().to_vec();
 
         // OPTIMIZATION: For simple GROUP BY aggregation without WHERE clause, try streaming
@@ -7886,7 +7869,7 @@ impl Executor {
             }
             // Streaming not applicable - need to re-execute the subquery
             // (the streaming function consumed the result iterator)
-            let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan, None)?;
+            let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan)?;
 
             // Fall through to materialization path
             let mut rows = RowVec::new();
@@ -8138,7 +8121,6 @@ impl Executor {
             &nested_ctx,
             Some(&view_plan.classification),
             Some(&view_plan.compiled),
-            view_plan.counts.as_deref(),
         )?;
         let columns = match view_def.columns() {
             Some(columns) => columns,
@@ -9253,8 +9235,7 @@ impl Executor {
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
-        let result =
-            self.execute_select_with_plan(&ss.subquery, &subquery_ctx, None, plan, None)?;
+        let result = self.execute_select_with_plan(&ss.subquery, &subquery_ctx, None, plan)?;
         let columns = result.columns().to_vec();
 
         // Prefix column names with subquery alias (required for proper ON condition resolution)

@@ -605,7 +605,7 @@ impl Executor {
 
         // Execute the SELECT query to get the result
         // Use execute_select for full query processing (DISTINCT, ORDER BY, etc.)
-        let mut result = self.execute_select_with_plan(select_stmt, ctx, None, plan, None)?;
+        let mut result = self.execute_select_with_plan(select_stmt, ctx, None, plan)?;
         let columns: Vec<String> = result.columns().to_vec();
 
         // Materialize the result to get the rows

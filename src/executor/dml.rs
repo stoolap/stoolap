@@ -1065,7 +1065,7 @@ impl Executor {
             // stream rows directly since the standalone transaction rolls back on drop.
             let source = plan.and_then(NestedPlan::source);
             let mut select_result =
-                self.execute_select_with_plan(select_stmt, ctx, None, source, None)?;
+                self.execute_select_with_plan(select_stmt, ctx, None, source)?;
             if !should_auto_commit {
                 // Explicit tx: fully materialize before writes for atomicity.
                 // A late runtime error (e.g., invalid REGEXP) will fail here
@@ -2021,7 +2021,7 @@ impl Executor {
         // Check if this is INSERT ... SELECT
         if let Some(ref select_stmt) = stmt.select {
             let mut select_result =
-                self.execute_select_with_plan(select_stmt, ctx, None, plan.source(), None)?;
+                self.execute_select_with_plan(select_stmt, ctx, None, plan.source())?;
             if !should_auto_commit {
                 // Explicit tx: fully materialize before writes for atomicity
                 let columns = select_result.columns().to_vec();
