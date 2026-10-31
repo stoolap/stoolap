@@ -6505,6 +6505,16 @@ pub(crate) fn holds_as_of(stmt: &SelectStatement) -> bool {
 /// A CTE `stmt` reads AS OF, by the names the statements around it,
 /// `enclosing`, and its own WITH define where each is read
 pub(crate) fn cte_read_as_of(stmt: &SelectStatement, enclosing: &[&str]) -> Option<SmartString> {
+    scoped_cte_read_as_of(stmt, enclosing, None)
+}
+
+/// [`cte_read_as_of`] for the body of a recursive CTE named `recursive`,
+/// which its UNION branches read and its anchor does not
+fn scoped_cte_read_as_of<'a>(
+    stmt: &'a SelectStatement,
+    enclosing: &[&'a str],
+    recursive: Option<&'a str>,
+) -> Option<SmartString> {
     fn from(source: &Expression, names: &[&str]) -> Option<SmartString> {
         match source {
             Expression::TableSource(ts)
@@ -6522,18 +6532,24 @@ pub(crate) fn cte_read_as_of(stmt: &SelectStatement, enclosing: &[&str]) -> Opti
     if found.is_none() {
         found = stmt.table_expr.as_deref().and_then(|s| from(s, &names));
     }
+    let branch_names: Vec<&str> = names.iter().copied().chain(recursive).collect();
     let ctes = stmt.with.iter().flat_map(|with| &with.ctes);
     each_statement_inside(stmt, &mut |inside| {
         let body = ctes.clone().any(|cte| std::ptr::eq(&*cte.query, inside));
+        let branch = stmt
+            .set_operations
+            .iter()
+            .any(|op| std::ptr::eq(&*op.right, inside));
         if found.is_none() && !body {
-            found = cte_read_as_of(inside, &names);
+            found = cte_read_as_of(inside, if branch { &branch_names } else { &names });
         }
     });
     found
 }
 
 /// A CTE the bodies of `with` read AS OF, each body seeing the CTEs before
-/// it, and itself when recursive; and the names the statement then sees
+/// it, and a recursive one itself in its UNION branches; and the names the
+/// statement then sees
 pub(crate) fn ctes_read_as_of<'w>(
     with: Option<&'w WithClause>,
     enclosing: &[&'w str],
@@ -6543,15 +6559,10 @@ pub(crate) fn ctes_read_as_of<'w>(
     for cte in with.iter().flat_map(|with| &with.ctes) {
         let recursive = cte.is_recursive || with.is_some_and(|with| with.is_recursive);
         let own = cte.name.value_lower.as_str();
-        if recursive {
-            names.push(own);
-        }
         if found.is_none() {
-            found = cte_read_as_of(&cte.query, &names);
+            found = scoped_cte_read_as_of(&cte.query, &names, recursive.then_some(own));
         }
-        if !recursive {
-            names.push(own);
-        }
+        names.push(own);
     }
     (found, names)
 }

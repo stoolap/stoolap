@@ -243,6 +243,10 @@ fn as_of_names_a_table_and_no_view_reads_one() {
         "WITH c AS (SELECT * FROM u) SELECT * FROM c AS OF TIMESTAMP '{before}'"
     ));
     refused(format!(
+        "WITH RECURSIVE r AS (SELECT 1 AS id UNION ALL \
+         SELECT id + 1 FROM r AS OF TIMESTAMP '{before}' WHERE id < 3) SELECT * FROM r"
+    ));
+    refused(format!(
         "SELECT t.id FROM t JOIN v AS OF TIMESTAMP '{before}' x ON x.k = t.k"
     ));
     for sql in [
@@ -290,6 +294,15 @@ fn a_cte_body_reads_the_table_its_name_shadows_only_after_it() {
     ] {
         assert_eq!(rows(&db, &sql), want, "{sql}");
     }
+    let recursive = format!(
+        "WITH RECURSIVE u AS (SELECT id FROM u AS OF TIMESTAMP '{before}' WHERE id = 4 \
+         UNION ALL SELECT id + 1 FROM u WHERE id < 6) SELECT id FROM u ORDER BY id"
+    );
+    assert_eq!(
+        rows(&db, &recursive),
+        Ok(vec![vec!["4".into()], vec!["5".into()], vec!["6".into()]]),
+        "a recursive CTE's anchor reads the table: {recursive}"
+    );
 }
 
 /// `sql` while another handle commits `u.v = 20` just before the
@@ -311,11 +324,26 @@ fn with_commit_before_resolution(sql: &str, name: &str) -> Rows {
             .execute("UPDATE u SET v = 20 WHERE id = 1", ())
             .unwrap();
     });
-    if sql.starts_with("INSERT") {
+    // A statement that writes is read back from the table it fills
+    let written = match sql.split_whitespace().take(3).collect::<Vec<_>>()[..] {
+        ["INSERT", "INTO", table] | ["CREATE", "TABLE", table] => Some(table),
+        _ => None,
+    };
+    if let Some(table) = written {
         db.execute(sql, ()).map_err(|e| e.to_string())?;
-        return rows(&db, "SELECT * FROM w");
+        return rows(&db, &format!("SELECT * FROM {table}"));
     }
     rows(&db, sql)
+}
+
+#[test]
+fn a_table_created_from_a_query_reads_it_at_its_start() {
+    let _guard = FailpointGuard::new();
+    let got = with_commit_before_resolution(
+        "CREATE TABLE c AS SELECT * FROM u AS OF TIMESTAMP '2099-01-01'",
+        "as_of_sources_ctas_cut",
+    );
+    assert_eq!(got, Ok(vec![vec!["1".into(), "10".into()]]));
 }
 
 #[test]

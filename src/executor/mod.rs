@@ -280,6 +280,10 @@ fn reads_through_a_view(statement: &Statement) -> bool {
 pub(crate) fn statement_holds_as_of(statement: &Statement) -> bool {
     match statement {
         Statement::Select(stmt) => prepared_select::holds_as_of(stmt),
+        Statement::CreateTable(stmt) => stmt
+            .as_select
+            .as_deref()
+            .is_some_and(prepared_select::holds_as_of),
         other => dml_holds_as_of(other),
     }
 }
@@ -328,6 +332,10 @@ fn cte_read_as_of(statement: &Statement) -> Option<crate::common::SmartString> {
     }
     match statement {
         Statement::Select(stmt) => prepared_select::cte_read_as_of(stmt, &[]),
+        Statement::CreateTable(stmt) => stmt
+            .as_select
+            .as_deref()
+            .and_then(|select| prepared_select::cte_read_as_of(select, &[])),
         Statement::Insert(stmt) => stmt
             .select
             .as_deref()
