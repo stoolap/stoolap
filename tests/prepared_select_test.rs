@@ -1092,15 +1092,29 @@ fn test_classifier_rules() {
             "SELECT id FROM t WHERE a > (SELECT v, id FROM u WHERE u.id = t.id)",
             "a subquery selects 2 values where its place takes 1",
         ),
+        // A count reads no column, at any depth
+        (
+            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id) LIMIT a",
+            "Column 'a' not found",
+        ),
+        (
+            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT t.a)",
+            "Column 't.a' not found",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u LIMIT t.a) AS q)",
+            "Column 't.a' not found",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u WHERE v IN \
+             (SELECT x.v FROM u AS x LIMIT t.a)) AS q)",
+            "Column 't.a' not found",
+        ),
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
         assert!(error(&db, sql, ()).0.contains(want), "{sql}");
     }
     let no = [
-        (
-            format!("SELECT id FROM t WHERE a > {sq} LIMIT a"),
-            "a LIMIT or OFFSET naming a column",
-        ),
         (
             format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),
             "a NATURAL or USING join whose output holds a subquery",
@@ -1111,25 +1125,10 @@ fn test_classifier_rules() {
             "an ORDER BY position in a subquery block",
         ),
         (
-            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT t.a)".to_string(),
-            "a derived table's LIMIT or OFFSET naming a column",
-        ),
-        (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
              AS q WHERE q.v = t.a)"
                 .to_string(),
             "a derived table selecting * over a join",
-        ),
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u LIMIT t.a) AS q)"
-                .to_string(),
-            "a derived table's LIMIT or OFFSET naming a column",
-        ),
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT v FROM u WHERE v IN \
-             (SELECT x.v FROM u AS x LIMIT t.a)) AS q)"
-                .to_string(),
-            "a derived table's LIMIT or OFFSET naming a column",
         ),
     ];
     for (sql, reason) in &no {

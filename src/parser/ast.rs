@@ -1127,6 +1127,17 @@ pub struct FunctionCall {
 }
 
 impl FunctionCall {
+    /// The first of DISTINCT, ORDER BY and FILTER the call is written with,
+    /// which shape the rows an aggregate reads
+    pub fn aggregate_modifier(&self) -> Option<&'static str> {
+        match () {
+            _ if self.is_distinct => Some("DISTINCT"),
+            _ if !self.order_by.is_empty() => Some("ORDER BY"),
+            _ if self.filter.is_some() => Some("FILTER"),
+            _ => None,
+        }
+    }
+
     /// `Expression::rename_references` over the call's arguments, FILTER and ORDER BY
     pub fn rename_references(&mut self, binds: &dyn Fn(&Expression) -> bool, new: &str) {
         self.arguments

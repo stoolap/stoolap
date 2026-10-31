@@ -1807,6 +1807,22 @@ pub fn is_aggregate_function(name: &str) -> bool {
     crate::functions::registry::global_registry().is_aggregate(name)
 }
 
+/// The error of `call` written with DISTINCT, ORDER BY or FILTER to a
+/// function `registry` holds no aggregate of: those modifiers shape the
+/// rows an aggregate reads, and no other call reads rows
+pub(crate) fn modifier_outside_aggregate(
+    call: &FunctionCall,
+    registry: &crate::functions::FunctionRegistry,
+) -> Option<String> {
+    let modifier = call.aggregate_modifier()?;
+    (!registry.is_aggregate(&call.function)).then(|| {
+        format!(
+            "{modifier} is allowed only in an aggregate call, and {} is not an aggregate function",
+            call.function.to_uppercase()
+        )
+    })
+}
+
 /// Check if an expression contains an aggregate function.
 /// Used for detecting nested aggregates and determining query structure.
 pub fn expression_contains_aggregate(expr: &Expression) -> bool {

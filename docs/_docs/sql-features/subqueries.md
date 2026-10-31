@@ -431,7 +431,7 @@ LIMIT (SELECT COUNT(*) FROM categories WHERE featured = true);
 SELECT * FROM products LIMIT (SELECT MAX(id) FROM categories WHERE 1 = 0);
 ```
 
-A subquery block that runs once for each row of its enclosing query, because its `WHERE` reads that row, cannot hold a `LIMIT` or `OFFSET` subquery. A `LIMIT` or `OFFSET` subquery may read a CTE of the statement's `WITH`, which comes before a table of its name.
+A subquery block that runs once for each row of its enclosing query, because its `WHERE` reads that row, may hold a `LIMIT` or `OFFSET` subquery as well: that subquery reads no row, of the block or of an enclosing query, so `(SELECT x FROM u WHERE u.k = t.k ORDER BY x LIMIT (SELECT COUNT(*) FROM v))` cuts each row's answer by the one count. Such a subquery reading `t.k` is an error, `unknown table or alias 't'`, and so is a `LIMIT` or `OFFSET` naming a column. In a statement outside the prepared rules described below, a block run for each row holding a `LIMIT` or `OFFSET` subquery is still an error. A `LIMIT` or `OFFSET` subquery may read a CTE of the statement's `WITH`, which comes before a table of its name.
 
 ## How Subqueries Work
 
