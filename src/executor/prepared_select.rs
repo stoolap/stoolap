@@ -46,8 +46,8 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
-    extra_arg_constant, grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs,
-    GroupByItem, Modifiers, SqlAggregateFunction, COUNT_STAR,
+    grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
+    Modifiers, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -4356,15 +4356,15 @@ impl Grouping {
     fn groups(
         &self,
         prefix: usize,
-        mut call: Option<(&mut ExprVM, &ExecuteContext)>,
-    ) -> GroupedAggregates {
+        mut call: Option<(&mut ExprVM, &ExecuteContext, &FunctionRegistry)>,
+    ) -> Result<GroupedAggregates> {
         let calls = self.calls.iter().enumerate().map(|(i, template)| {
             let extra = self.extra.iter().find(|(at, _)| *at == i);
-            let (Some((vm, exec)), Some((_, programs))) = (call.as_mut(), extra) else {
-                return template.duplicate();
+            let (Some((vm, exec, registry)), Some((_, programs))) = (call.as_mut(), extra) else {
+                return Ok(template.duplicate());
             };
             let mut failed = None;
-            let values = programs
+            let values: SmallVec<[Value; 1]> = programs
                 .iter()
                 .map(|program| {
                     vm.execute(program, exec).unwrap_or_else(|error| {
@@ -4373,13 +4373,13 @@ impl Grouping {
                     })
                 })
                 .collect();
-            template.with_extra_args(values, failed)
+            self.aggregations[i].template_reading(registry, &values, failed)
         });
-        let calls = calls.collect();
-        match prefix + self.items.len() {
+        let calls = calls.collect::<Result<_>>()?;
+        Ok(match prefix + self.items.len() {
             0 => GroupedAggregates::global(calls),
             width => GroupedAggregates::new(calls, width),
-        }
+        })
     }
 
     /// Feeds `row` to the runs of every call in `group`
@@ -6462,7 +6462,7 @@ impl Builder<'_> {
             set_operations: Vec::new(),
             prepared: None,
         };
-        let (mut aggregations, _) = executor.parse_aggregations(&calls_of, None)?;
+        let mut aggregations = executor.parse_block_aggregations(&calls_of)?;
         // A call whose argument is one bound column reads that column
         let columns = aggregations
             .iter_mut()
@@ -6486,14 +6486,8 @@ impl Builder<'_> {
             .enumerate()
             .filter_map(|(at, agg)| Some((at, agg.extra_exprs.as_deref()?)))
             .map(|(at, args)| {
-                let programs = args
-                    .iter()
-                    .map(|arg| {
-                        extra_arg_constant(arg)?;
-                        compile_with(&own, arg)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((at, programs))
+                let programs = args.iter().map(|arg| compile_with(&own, arg));
+                Ok((at, programs.collect::<Result<Vec<_>>>()?))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -15653,7 +15647,9 @@ impl PreparedRunner<'_> {
         let decided = pushed && sq.pushed_whole;
         let no_row = Row::new();
         let call = (!grouping.extra.is_empty()).then(|| self.exec_over(&no_row, &params));
-        let mut groups = grouping.groups(0, call.as_ref().map(|exec| (&mut *vm, exec)));
+        let registry = &self.executor.function_registry;
+        let mut groups =
+            grouping.groups(0, call.as_ref().map(|exec| (&mut *vm, exec, &**registry)))?;
         let mut key = KeyReader::new(grouping, Vec::new());
         let mut scanned = 0u64;
         'rows: while scanner.next() {
@@ -15712,7 +15708,7 @@ impl PreparedRunner<'_> {
         let count = CompiledAggregate::CountStar {
             count: i64::try_from(count).map_err(|_| Error::internal("a count past i64"))?,
         };
-        let mut groups = grouping.groups(0, None);
+        let mut groups = grouping.groups(0, None)?;
         for run in groups.aggregates(0) {
             run.merge(&count);
         }
@@ -15793,7 +15789,7 @@ impl PreparedRunner<'_> {
         let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
         let decided = sq.filter.is_none() || (bound.is_some() && plan.pushed_whole);
         let prefix: Vec<usize> = plan.keys.iter().map(|(own, _, _)| *own).collect();
-        let mut groups = grouping.groups(prefix.len(), None);
+        let mut groups = grouping.groups(prefix.len(), None)?;
         let mut key = KeyReader::new(grouping, prefix.clone());
         let mut failed: FxHashMap<SmallVec<[Value; 1]>, Error> = FxHashMap::default();
         let mut scanned = 0u64;
@@ -15859,7 +15855,7 @@ impl PreparedRunner<'_> {
             by_key.insert(at, Err(e));
         }
         let missing = if grouping.items.is_empty() {
-            let none = grouping.groups(0, None).into_rows()?;
+            let none = grouping.groups(0, None)?.into_rows()?;
             none.into_iter().map(|(_, row)| row).collect()
         } else {
             Vec::new()

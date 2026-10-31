@@ -608,6 +608,17 @@ impl SqlAggregateFunction {
         &self,
         registry: &crate::functions::FunctionRegistry,
     ) -> Result<CallTemplate> {
+        self.template_reading(registry, &self.extra_args, self.extra_error.clone())
+    }
+
+    /// How every group runs this call with the extra arguments `extra_args`
+    /// a block read for one call, and `failed` the error one of them gave
+    pub(crate) fn template_reading(
+        &self,
+        registry: &crate::functions::FunctionRegistry,
+        extra_args: &[Value],
+        failed: Option<crate::core::Error>,
+    ) -> Result<CallTemplate> {
         let function = registry.get_aggregate(&self.name).ok_or_else(|| {
             crate::core::Error::internal(format!("unknown aggregate function {}", self.name))
         })?;
@@ -615,9 +626,9 @@ impl SqlAggregateFunction {
             function,
             self.name == "COUNT" && self.column == "*",
             self.distinct,
-            &self.extra_args,
+            extra_args,
             Executor::aggregate_order_keys(&self.order_by),
-            self.extra_error.clone(),
+            failed,
         ))
     }
 
@@ -729,8 +740,21 @@ pub(crate) type ExtraArgs = (Vec<Value>, Option<crate::core::Error>);
 enum ExtraArgsRead<'a> {
     /// Reads them, a parameter bound by the context
     With(Option<&'a ExecutionContext>),
+    /// Reads the literal ones and keeps them as written, for a subquery
+    /// block that reads the others for each call
+    Block,
     /// Leaves them unread, the calls wanted for their identities alone
     Unread,
+}
+
+impl ExtraArgsRead<'_> {
+    /// The extra arguments of a call to `args` as a block keeps them
+    fn written(self, args: &[Expression]) -> Option<Box<[Expression]>> {
+        match self {
+            ExtraArgsRead::Block => written_extra_args(args),
+            ExtraArgsRead::With(_) | ExtraArgsRead::Unread => None,
+        }
+    }
 }
 
 /// The error an extra argument of one of `aggregations` gave, which a path
@@ -768,11 +792,25 @@ pub(crate) fn aggregate_extra_args(
     Ok((values, failed))
 }
 
-/// An aggregate's extra argument written as its value: a literal, or a
-/// quoted name, which reads as text
+/// Whether an aggregate's extra argument is written as its value: a
+/// literal, or a quoted name, which reads as text
+fn is_literal_extra_arg(arg: &Expression) -> bool {
+    match arg {
+        Expression::Identifier(id) => id.quoted,
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => true,
+        _ => false,
+    }
+}
+
+/// The value of an extra argument written as its value
 fn literal_extra_arg(arg: &Expression) -> Option<Value> {
     match arg {
-        Expression::Identifier(id) if id.quoted => Some(Value::text(id.value.as_str())),
+        _ if !is_literal_extra_arg(arg) => None,
+        Expression::Identifier(id) => Some(Value::text(id.value.as_str())),
         arg => super::utils::extract_literal_value(arg),
     }
 }
@@ -781,15 +819,12 @@ fn literal_extra_arg(arg: &Expression) -> Option<Value> {
 /// not a literal
 fn written_extra_args(args: &[Expression]) -> Option<Box<[Expression]>> {
     let extra = args.get(1..)?;
-    extra
-        .iter()
-        .any(|arg| literal_extra_arg(arg).is_none())
-        .then(|| extra.into())
+    (!extra.iter().all(is_literal_extra_arg)).then(|| extra.into())
 }
 
 /// An error unless `arg`, an aggregate argument after the first, is one
 /// value for the call: it reads no row the aggregate reads
-pub(crate) fn extra_arg_constant(arg: &Expression) -> Result<()> {
+fn extra_arg_constant(arg: &Expression) -> Result<()> {
     if super::volatility::statement_constant(arg, crate::functions::registry::global_registry()) {
         return Ok(());
     }
@@ -2320,6 +2355,15 @@ impl Executor {
         Ok(self.parse_calls(stmt, ExtraArgsRead::Unread)?.0)
     }
 
+    /// The aggregate calls of a subquery block's bound `stmt`, each keeping
+    /// its extra arguments as written when one is not a literal
+    pub(crate) fn parse_block_aggregations(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Vec<SqlAggregateFunction>> {
+        Ok(self.parse_calls(stmt, ExtraArgsRead::Block)?.0)
+    }
+
     fn parse_calls(
         &self,
         stmt: &SelectStatement,
@@ -2439,7 +2483,7 @@ impl Executor {
                         distinct: distinct || func.is_distinct,
                         extra_args,
                         extra_error,
-                        extra_exprs: written_extra_args(&func.arguments),
+                        extra_exprs: ctx.written(&func.arguments),
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2576,7 +2620,7 @@ impl Executor {
                         distinct: distinct || func.is_distinct,
                         extra_args,
                         extra_error,
-                        extra_exprs: written_extra_args(&func.arguments),
+                        extra_exprs: ctx.written(&func.arguments),
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2667,6 +2711,7 @@ impl Executor {
 
         let extra = match ctx {
             ExtraArgsRead::With(ctx) => aggregate_extra_args(args, ctx)?,
+            ExtraArgsRead::Block => aggregate_extra_args(args, None)?,
             ExtraArgsRead::Unread => (Vec::new(), None),
         };
         Ok((column, distinct, extra, expression))

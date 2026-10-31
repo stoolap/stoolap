@@ -173,3 +173,27 @@ fn a_separator_reading_the_block_row_is_an_error() {
         "{error}"
     );
 }
+
+#[test]
+fn an_error_from_an_extra_argument_is_the_call_s_on_a_compiled_aggregate() {
+    let db = Database::open("memory://block_later_arguments_compiled_error").unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO a VALUES (1, 1, -9223372036854775808)",
+        "INSERT INTO b VALUES (1, 1, 5)",
+        "BEGIN",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT a.id, (SELECT SUM(b.v, CASE WHEN CURRENT_TRANSACTION_ID() IS NULL \
+               THEN 0 ELSE ABS(a.x) END) FROM b WHERE b.k = a.k) FROM a";
+    let answer = db
+        .query(sql, ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+    db.execute("ROLLBACK", ()).unwrap();
+    let error = answer
+        .expect_err("the extra argument's overflow")
+        .to_string();
+    assert!(error.to_lowercase().contains("overflow"), "{error}");
+}
