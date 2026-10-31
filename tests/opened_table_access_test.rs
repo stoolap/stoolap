@@ -35,8 +35,9 @@ fn ids(result: stoolap::Result<stoolap::Rows>) -> Result<Vec<i64>, String> {
 
 #[test]
 fn a_select_reads_the_table_it_opened_by_its_own_indexes() {
-    for prepared in [false, true] {
-        let db = Database::open(&format!("memory://opened_table_access_{prepared}")).unwrap();
+    let sql = "SELECT id FROM t WHERE k = 7";
+    for run in ["unprepared", "prepared", "prepared again"] {
+        let db = Database::open(&format!("memory://opened_table_access_{run}")).unwrap();
         db.execute(
             "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
             (),
@@ -44,8 +45,8 @@ fn a_select_reads_the_table_it_opened_by_its_own_indexes() {
         .unwrap();
         db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
         db.execute("INSERT INTO t VALUES (1, 7, 0)", ()).unwrap();
-        let statement = db.prepare("SELECT id FROM t WHERE k = 7").unwrap();
-        if prepared {
+        let statement = db.prepare(sql).unwrap();
+        if run == "prepared again" {
             assert_eq!(ids(statement.query(())), Ok(vec![1]));
         }
         let other = db.clone();
@@ -62,12 +63,18 @@ fn a_select_reads_the_table_it_opened_by_its_own_indexes() {
             }
             hook_fired.set(true);
         });
-        let answer = ids(statement.query(()));
-        assert!(fired.get(), "the rename ran between the open and the read");
+        let answer = match run {
+            "unprepared" => ids(db.query(sql, ())),
+            _ => ids(statement.query(())),
+        };
+        assert!(
+            fired.get(),
+            "{run}: the rename ran between the open and the read"
+        );
         // The opened table's row, the new table's, or a refusal; never no row
         assert!(
             matches!(answer.as_deref(), Ok([1]) | Ok([2]) | Err(_)),
-            "prepared {prepared}: {answer:?}"
+            "{run}: {answer:?}"
         );
     }
 }
