@@ -1172,3 +1172,28 @@ fn a_series_past_the_row_cap_is_refused_not_cut_short() {
         vec![9]
     );
 }
+
+#[test]
+fn a_last_argument_ending_in_a_parenthesis_closes_no_call() {
+    let db = create_test_db("gs_last_argument_paren");
+    for sql in [
+        "SELECT value FROM generate_series(1, ABS(-3))",
+        "SELECT value FROM generate_series(1, (3))",
+        "SELECT value FROM generate_series(1, CAST(3 AS INTEGER))",
+        "SELECT value FROM generate_series(ABS(-1), ABS(-3))",
+        "SELECT value FROM generate_series(1, 3, ABS(-1))",
+        "SELECT value FROM generate_series(1, ABS(-3)) AS g",
+        "SELECT g.n FROM generate_series(1, ABS(-3)) AS g(n)",
+        "SELECT value FROM generate_series(1, ABS(-3)) WHERE value > 0 ORDER BY value",
+    ] {
+        assert_eq!(collect_i64(&db, sql), vec![1, 2, 3], "{sql}");
+    }
+    assert_eq!(
+        collect_i64(
+            &db,
+            "SELECT a.value FROM generate_series(1, ABS(-3)) a \
+             JOIN generate_series(2, (4)) b ON a.value = b.value ORDER BY a.value"
+        ),
+        vec![2, 3]
+    );
+}
