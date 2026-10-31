@@ -351,13 +351,18 @@ impl Executor {
 
     /// The CTE of `registry` the CTE body `stmt` reads when the CTE path can
     /// finish it on its own; None for a body execute_select runs, which
-    /// handles set operations and the rest
+    /// handles set operations and the rest, and, when it runs under a plan
+    /// (`planned`), the subqueries it holds
     pub(super) fn cte_result_source<'r>(
         &self,
         stmt: &SelectStatement,
         registry: &'r CteRegistry,
+        planned: bool,
     ) -> Option<&'r CteData> {
-        if !Self::cte_result_path_finishes(stmt) {
+        // One holding a subquery runs as a statement under the plan it keeps
+        if !Self::cte_result_path_finishes(stmt)
+            || (planned && Self::cte_result_path_reads_subquery(stmt))
+        {
             return None;
         }
         let name = self.extract_cte_name_for_lookup(stmt.table_expr.as_deref()?)?;
@@ -372,7 +377,7 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
     ) -> Result<(Vec<String>, RowVec)> {
-        if let Some((columns, rows)) = self.cte_result_source(stmt, cte_registry) {
+        if let Some((columns, rows)) = self.cte_result_source(stmt, cte_registry, plan.is_some()) {
             // Execute query against CTE result
             // Clone Arc data into RowVec for processing
             // A subquery in the statement reads the earlier
@@ -1002,6 +1007,23 @@ impl Executor {
                 .any(Self::has_subqueries)
     }
 
+    /// Whether a clause the query-on-CTE-result path runs holds a subquery,
+    /// which that path asks through the general path's mechanisms
+    fn cte_result_path_reads_subquery(stmt: &SelectStatement) -> bool {
+        let windows = stmt
+            .window_defs
+            .iter()
+            .flat_map(WindowDefinition::expressions);
+        stmt.columns
+            .iter()
+            .chain(stmt.where_clause.as_deref())
+            .chain(&stmt.group_by.columns)
+            .chain(stmt.having.as_deref())
+            .chain(&stmt.distinct_on)
+            .chain(windows)
+            .any(Self::has_subqueries)
+    }
+
     // =========================================================================
     // CTE INLINING OPTIMIZATION
     // =========================================================================
@@ -1290,12 +1312,10 @@ impl Executor {
         stmt: &SelectStatement,
         ref_counts: &mut StringMap<usize>,
     ) {
-        let windows = stmt.window_defs.iter().flat_map(|w| {
-            w.partition_by
-                .iter()
-                .chain(w.order_by.iter().map(|o| &o.expression))
-                .chain(Self::frame_bounds(w.frame.as_ref()))
-        });
+        let windows = stmt
+            .window_defs
+            .iter()
+            .flat_map(WindowDefinition::expressions);
         let grouping_sets = match &stmt.group_by.modifier {
             GroupByModifier::GroupingSets(sets) => sets.as_slice(),
             _ => &[],
@@ -1321,19 +1341,6 @@ impl Executor {
         for set_op in &stmt.set_operations {
             self.count_cte_references_in_stmt(&set_op.right, ref_counts);
         }
-    }
-
-    /// The offset expressions of a window frame
-    fn frame_bounds(frame: Option<&WindowFrame>) -> impl Iterator<Item = &Expression> {
-        frame
-            .into_iter()
-            .flat_map(|f| std::iter::once(&f.start).chain(f.end.as_ref()))
-            .filter_map(|bound| match bound {
-                WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
-                    Some(expr.as_ref())
-                }
-                _ => None,
-            })
     }
 
     /// Count the CTE references in a function call's arguments, ORDER BY and FILTER
@@ -1465,7 +1472,7 @@ impl Executor {
                     .partition_by
                     .iter()
                     .chain(window.order_by.iter().map(|o| &o.expression))
-                    .chain(Self::frame_bounds(window.frame.as_ref()))
+                    .chain(window.frame_offsets())
                 {
                     self.count_cte_references_in_expr(expr, ref_counts);
                 }
