@@ -126,6 +126,13 @@ JOIN returns USING (order_id, product_id);
 
 When a side is itself a join holding two columns of the name, a `USING` or `NATURAL` join merges the first of them, the one its bare name reads: in `t LEFT JOIN u ON u.id = t.id JOIN s USING (id)` the condition is `s.id = t.id`, so a `t` row without a `u` row still joins.
 
+A `USING` or `NATURAL` join that is a side of another join keeps its tables' columns their own. In `t LEFT JOIN u USING (id) JOIN s ON s.id = t.id`, `t.id` and `u.id` are each their table's column, `u.id` is NULL where `u` has no row, the bare `id` is the merged column, `u.*` and `t.*` each hold their table's `id`, and `*` shows the merged column once:
+
+```sql
+SELECT id, t.id, u.id FROM t LEFT JOIN u USING (id) JOIN s ON s.id = t.id;
+-- a t row with no u row: id = t.id, u.id = NULL
+```
+
 ## Examples
 
 ### Basic JOIN Example

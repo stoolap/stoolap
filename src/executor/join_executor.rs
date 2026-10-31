@@ -262,9 +262,12 @@ pub(crate) struct StatementRun<'a> {
 }
 
 impl<'a> StatementRun<'a> {
-    /// The run as a site over the joined row, or over the pair when `pair`
-    pub(crate) fn site(self, pair: bool) -> SiteRunner<'a> {
-        SiteRunner::new(self.run, self.blocks.holes(pair))
+    /// The run as a site over the joined row, or over the pair when `pair`;
+    /// none when the statement holds no subquery for a site to run
+    pub(crate) fn site(self, pair: bool) -> Option<SiteRunner<'a>> {
+        self.blocks
+            .holds_subqueries()
+            .then(|| SiteRunner::new(self.run, self.blocks.holes(pair)))
     }
 }
 
@@ -558,7 +561,7 @@ impl JoinExecutor {
             request.prepared,
             request.blocks,
         )?;
-        let site = request.blocks.map(|blocks| blocks.site(false));
+        let site = request.blocks.and_then(|blocks| blocks.site(false));
         let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
 
         // OUTER joins have to reject a pair inside the operator so the row it
@@ -799,7 +802,7 @@ impl JoinExecutor {
 
         // Only INNER joins reach this path: execute_hash_join() routes OUTER
         // joins carrying a residual to the streaming operator.
-        let site = blocks.map(|blocks| blocks.site(false));
+        let site = blocks.and_then(|blocks| blocks.site(false));
         let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         for filter in residual_filters(analysis, all_columns, ctx, prepared, blocks)? {
             filter.retain_checked_with(&mut rows, site)?;
@@ -860,7 +863,7 @@ impl JoinExecutor {
             && !analysis.join_type_str.contains("FULL");
 
         let residual_filters = residual_filters(analysis, all_columns, ctx, prepared, blocks)?;
-        let site = blocks.map(|blocks| blocks.site(false));
+        let site = blocks.and_then(|blocks| blocks.site(false));
         let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
 
         // OUTER joins have to reject a pair inside the operator so the row it
@@ -914,7 +917,7 @@ impl JoinExecutor {
             JoinType::Inner
         };
 
-        let site = blocks.map(|blocks| blocks.site(true));
+        let site = blocks.and_then(|blocks| blocks.site(true));
         let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         let mut filter = None;
         if let Some(cond) = condition {
