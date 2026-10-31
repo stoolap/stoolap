@@ -294,7 +294,10 @@ fn a_read_at_the_newest_point_inside_a_seal_keeps_a_cold_row_updated_before_it()
     reader.query("SELECT * FROM t", ()).unwrap();
     let mut tx = db.engine().begin_transaction().unwrap();
     let table = tx.get_table("t").unwrap();
-    let point = tx.read_point("TIMESTAMP", i64::MAX).unwrap();
+    let registry = db.engine().registry();
+    let point = registry
+        .point_at_time(i64::MAX, registry.historical_cut())
+        .unwrap();
     let rows = inside_seal(&db, Hold::IndexesCleaned, None, || {
         row_pairs(&table.rows_at(&point, None).unwrap())
     });

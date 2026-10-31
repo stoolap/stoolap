@@ -142,6 +142,12 @@ A point is a moment in the order commits complete, the order in which they becom
 
 5. **Stable answers**: The answer for a given transaction, and for a time that has passed, never changes: a commit that completes later is never part of an earlier point.
 
+6. **One statement, one start**: Every `AS OF` in a statement resolves against the moment the statement started, wherever it stands: the `FROM`, a join, a subquery (correlated or not), a derived table, a CTE, or the query of an `INSERT`, `UPDATE` or `DELETE`. Two tables read at the same time not yet passed read the same point.
+
+7. **Inside a transaction**: A table read `AS OF` in an explicit transaction reads committed history; the transaction's own uncommitted writes are not part of it.
+
+8. **Tables only**: `AS OF` names a table. On a view or a CTE it is an error, and a view's query cannot read a table `AS OF`.
+
 ## History Window
 
 Stoolap answers a point exactly or not at all. When it no longer holds what a point needs, the statement fails with an error that names the oldest point it can still read. A point is out of reach when it is:
@@ -168,6 +174,7 @@ The window is a property of each table: 24 hours is the longest it keeps, not a 
 ### Performance Considerations
 
 - An AS OF query reads every row version of the table and the volumes it holds; it uses no index
+- A table read AS OF is read once per statement, and a correlated subquery over it filters those rows for each outer row
 - A transaction-based point is found by scanning the commit log, a timestamp-based one by a binary search in it
 
 ### VACUUM Warning
@@ -176,8 +183,7 @@ Running `VACUUM` (or `PRAGMA vacuum`) permanently removes all historical row ver
 
 ### Limitations
 
-- Subqueries with AS OF are not yet supported
-- Inside an explicit transaction, a table read AS OF in a statement without subqueries is read at its current state
+- A view cannot read a table AS OF, and AS OF on a view or a CTE is an error
 - The timestamp resolution depends on the system clock precision
 
 ## Use Cases

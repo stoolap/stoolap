@@ -276,6 +276,39 @@ fn reads_through_a_view(statement: &Statement) -> bool {
     }
 }
 
+/// Whether DML `statement` reads a table AS OF in its query, a subquery or a CTE
+fn dml_holds_as_of(statement: &Statement) -> bool {
+    use prepared_select::{expr_holds_as_of, holds_as_of};
+    let any = |exprs: &[crate::parser::ast::Expression]| exprs.iter().any(expr_holds_as_of);
+    let maybe = |expr: &Option<Box<crate::parser::ast::Expression>>| {
+        expr.as_deref().is_some_and(expr_holds_as_of)
+    };
+    let with = |with: &Option<crate::parser::ast::WithClause>| {
+        with.iter()
+            .flat_map(|with| &with.ctes)
+            .any(|cte| holds_as_of(&cte.query))
+    };
+    match statement {
+        Statement::Insert(stmt) => {
+            stmt.select.as_deref().is_some_and(holds_as_of)
+                || stmt.values.iter().any(|row| any(row))
+                || any(&stmt.update_expressions)
+                || maybe(&stmt.update_where)
+                || any(&stmt.returning)
+        }
+        Statement::Update(stmt) => {
+            with(&stmt.with)
+                || maybe(&stmt.where_clause)
+                || stmt.updates.values().any(expr_holds_as_of)
+                || any(&stmt.returning)
+        }
+        Statement::Delete(stmt) => {
+            with(&stmt.with) || maybe(&stmt.where_clause) || any(&stmt.returning)
+        }
+        _ => false,
+    }
+}
+
 /// [`reads_through_a_view`] for an INSERT: a query source, or a subquery in
 /// its values, its conflict update or its RETURNING
 pub(crate) fn insert_reads_through_a_view(stmt: &crate::parser::ast::InsertStatement) -> bool {
@@ -1042,7 +1075,18 @@ impl Executor {
                 query::EarlySemantic::NotTried => {}
             }
         }
-        let view = self.statement_view(reads_through_a_view(statement), &ctx, active_txn_id);
+        let reads = reads_through_a_view(statement);
+        let holds_as_of = match statement {
+            Statement::Select(stmt) => match plan_classification {
+                Some(slot) => {
+                    slot.get_or_init(|| query_classification::get_classification(stmt))
+                        .holds_as_of
+                }
+                None => query_classification::get_classification(stmt).holds_as_of,
+            },
+            other => reads && dml_holds_as_of(other),
+        };
+        let view = self.statement_view(reads, &ctx, active_txn_id);
         let took_view = view.is_some();
         let ctx = match (active_txn_id, view) {
             (None, None) => ctx,
@@ -1064,6 +1108,26 @@ impl Executor {
                 }
                 std::borrow::Cow::Owned(owned)
             }
+        };
+        // A CTE the statement inlines would read its rows at no point
+        let query = match statement {
+            Statement::Select(stmt) => Some(stmt),
+            Statement::Insert(stmt) => stmt.select.as_deref(),
+            _ => None,
+        };
+        if let Some(name) = query
+            .filter(|_| holds_as_of)
+            .and_then(|stmt| prepared_select::cte_read_as_of(stmt, &[]))
+        {
+            return Err(Self::as_of_not_a_table(&name));
+        }
+        // Every AS OF of the statement resolves against bounds taken before it reads a row
+        let ctx = match holds_as_of {
+            true => std::borrow::Cow::Owned(
+                ctx.into_owned()
+                    .into_historical_cut(self.engine.registry().historical_cut()),
+            ),
+            false => ctx,
         };
         if select {
             let started = started.filter(|_| took_view);

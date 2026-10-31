@@ -1050,17 +1050,6 @@ impl Transaction for MvccTransaction {
         table.select_with_aliases(&col_refs, expr, aliases)
     }
 
-    fn read_point(&self, temporal_type: &str, temporal_value: i64) -> Result<ReadPoint> {
-        let cut = self.registry.historical_cut();
-        match temporal_type.to_uppercase().as_str() {
-            "TIMESTAMP" => self.registry.point_at_time(temporal_value, cut),
-            "TRANSACTION" => self.registry.point_of_transaction(temporal_value, cut),
-            other => Err(Error::invalid_argument(format!(
-                "Unsupported AS OF type: {other}"
-            ))),
-        }
-    }
-
     fn rows_at(&self, table_name: &str, point: &ReadPoint) -> Result<RowVec> {
         self.check_active()?;
         self.get_table(table_name)?.rows_at(point, None)

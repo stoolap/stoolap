@@ -116,16 +116,13 @@ struct Family<'a> {
 }
 
 impl<'a> Family<'a> {
-    /// One name, read without AS OF
+    /// One name
     fn one_table(
         table_expr: Option<&'a Expression>,
     ) -> std::result::Result<&'a SimpleTableSource, OutOfFamily> {
         let Some(Expression::TableSource(ts)) = table_expr else {
             return Err("FROM is not one table");
         };
-        if ts.as_of.is_some() {
-            return Err("FROM reads AS OF");
-        }
         Ok(ts)
     }
 
@@ -151,7 +148,6 @@ impl<'a> Family<'a> {
                     false => Ok(()),
                 }
             }
-            Some(Expression::TableSource(ts)) if ts.as_of.is_none() => Ok(()),
             other => Self::one_table(other).map(drop),
         }
     }
@@ -206,8 +202,8 @@ impl<'a> Family<'a> {
                     .iter()
                     .for_each(|e| nested_statements(e, &mut nested)),
                 side => match Self::one_table(Some(side)) {
+                    Ok(ts) if ts.as_of.is_some() => return Err("a join side read AS OF"),
                     Ok(ts) => self.blocks.borrow_mut().push(ts),
-                    Err("FROM reads AS OF") => return Err("a join side read AS OF"),
                     Err(_) => return Err("a join side the family does not read"),
                 },
             }
@@ -264,7 +260,6 @@ impl<'a> Family<'a> {
             }
             some => match Self::one_table(some) {
                 Ok(ts) => self.blocks.borrow_mut().push(ts),
-                Err("FROM reads AS OF") => return Err("a derived table read AS OF"),
                 Err(_) => return Err("a derived table over a source the family does not read"),
             },
         }
@@ -3947,6 +3942,8 @@ enum BlockSource {
     Derived(Box<StatementRun>, Option<Vec<SmartString>>),
     Cte(SmartString),
     Values(Box<ValuesTableSource>),
+    /// A table read AS OF
+    AsOf(SmartString, Box<AsOfClause>),
     /// A table function, with the WHERE's conjuncts that narrow its range,
     /// and the LIMIT and OFFSET of a block whose first rows are its answer
     Function(
@@ -5627,9 +5624,12 @@ impl Builder<'_> {
             }
             Some(Expression::TableSource(ts)) => {
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
-                match self.named_source(&ts.name.value_lower)? {
-                    Some((source, columns)) => over_source(name, source, columns),
-                    None => {
+                match (self.named_source(&ts.name.value_lower)?, &ts.as_of) {
+                    (Some(_), Some(_)) => {
+                        return Err(Executor::as_of_not_a_table(&ts.name.value_lower))
+                    }
+                    (Some((source, columns)), None) => over_source(name, source, columns),
+                    (None, as_of) => {
                         let schema = executor
                             .engine
                             .get_table_schema(&ts.name.value_lower)
@@ -5639,8 +5639,21 @@ impl Builder<'_> {
                                 }
                                 other => other,
                             })?;
-                        let scope = ScopeTable::of(name, &schema);
-                        (Some(ts.name.value_lower.clone()), None, schema, scope)
+                        match as_of {
+                            // A table read AS OF is a source read once per run
+                            Some(as_of) => over_source(
+                                name,
+                                BlockSource::AsOf(
+                                    ts.name.value_lower.clone(),
+                                    Box::new(as_of.clone()),
+                                ),
+                                schema.column_names_owned().to_vec(),
+                            ),
+                            None => {
+                                let scope = ScopeTable::of(name, &schema);
+                                (Some(ts.name.value_lower.clone()), None, schema, scope)
+                            }
+                        }
                     }
                 }
             }
@@ -6412,31 +6425,36 @@ fn needs_folding(expr: &Expression) -> bool {
 /// Each statement `stmt` holds, not those inside them: its derived tables,
 /// subqueries, set operation branches and CTE bodies
 fn statements_inside<'s>(stmt: &'s SelectStatement, out: &mut Vec<&'s SelectStatement>) {
-    fn from<'s>(source: &'s Expression, out: &mut Vec<&'s SelectStatement>) {
+    each_statement_inside(stmt, &mut |inside| out.push(inside));
+}
+
+/// [`statements_inside`], each given to `f`
+fn each_statement_inside<'s>(stmt: &'s SelectStatement, f: &mut dyn FnMut(&'s SelectStatement)) {
+    fn from<'s>(source: &'s Expression, f: &mut dyn FnMut(&'s SelectStatement)) {
         match source {
-            Expression::SubquerySource(derived) => out.push(&derived.subquery),
+            Expression::SubquerySource(derived) => f(&derived.subquery),
             Expression::JoinSource(join) => {
-                from(&join.left, out);
-                from(&join.right, out);
+                from(&join.left, f);
+                from(&join.right, f);
                 if let Some(on) = join.condition.as_deref() {
-                    nested_statements(on, out);
+                    each_nested_statement(on, f);
                 }
             }
             Expression::ValuesSource(values) => {
                 for value in values.rows.iter().flatten() {
-                    nested_statements(value, out);
+                    each_nested_statement(value, f);
                 }
             }
             Expression::FunctionTableSource(function) => {
                 for argument in &function.arguments {
-                    nested_statements(argument, out);
+                    each_nested_statement(argument, f);
                 }
             }
             _ => {}
         }
     }
     if let Some(source) = stmt.table_expr.as_deref() {
-        from(source, out);
+        from(source, f);
     }
     let grouping_sets = match &stmt.group_by.modifier {
         GroupByModifier::GroupingSets(sets) => sets.as_slice(),
@@ -6460,15 +6478,67 @@ fn statements_inside<'s>(stmt: &'s SelectStatement, out: &mut Vec<&'s SelectStat
         .chain(stmt.offset.as_deref())
         .chain(windows)
     {
-        nested_statements(expr, out);
+        each_nested_statement(expr, f);
     }
-    out.extend(stmt.set_operations.iter().map(|op| &*op.right));
-    out.extend(
+    stmt.set_operations.iter().for_each(|op| f(&op.right));
+    stmt.with
+        .iter()
+        .flat_map(|with| &with.ctes)
+        .for_each(|cte| f(&cte.query));
+}
+
+/// Whether `stmt` reads a table AS OF anywhere: its FROM, a join side, or
+/// any statement inside it
+pub(crate) fn holds_as_of(stmt: &SelectStatement) -> bool {
+    fn from(source: &Expression) -> bool {
+        match source {
+            Expression::TableSource(ts) => ts.as_of.is_some(),
+            Expression::JoinSource(join) => from(&join.left) || from(&join.right),
+            _ => false,
+        }
+    }
+    let mut holds = stmt.table_expr.as_deref().is_some_and(from);
+    each_statement_inside(stmt, &mut |inside| holds = holds || holds_as_of(inside));
+    holds
+}
+
+/// A CTE `stmt` reads AS OF, by the names its WITH and those of the
+/// statements around it, `enclosing`, define
+pub(crate) fn cte_read_as_of(stmt: &SelectStatement, enclosing: &[&str]) -> Option<SmartString> {
+    fn from(source: &Expression, names: &[&str]) -> Option<SmartString> {
+        match source {
+            Expression::TableSource(ts)
+                if ts.as_of.is_some() && names.contains(&ts.name.value_lower.as_str()) =>
+            {
+                Some(ts.name.value_lower.clone())
+            }
+            Expression::JoinSource(join) => {
+                from(&join.left, names).or_else(|| from(&join.right, names))
+            }
+            _ => None,
+        }
+    }
+    let mut names = enclosing.to_vec();
+    names.extend(
         stmt.with
             .iter()
             .flat_map(|with| &with.ctes)
-            .map(|cte| &*cte.query),
+            .map(|cte| cte.name.value_lower.as_str()),
     );
+    let mut found = stmt.table_expr.as_deref().and_then(|s| from(s, &names));
+    each_statement_inside(stmt, &mut |inside| {
+        if found.is_none() {
+            found = cte_read_as_of(inside, &names);
+        }
+    });
+    found
+}
+
+/// Whether a subquery of `expr` reads a table AS OF
+pub(crate) fn expr_holds_as_of(expr: &Expression) -> bool {
+    let mut holds = false;
+    each_nested_statement(expr, &mut |inside| holds = holds || holds_as_of(inside));
+    holds
 }
 
 /// Whether a statement inside `stmt`, at any depth, has its own WITH with
@@ -6488,18 +6558,23 @@ pub(crate) fn redefines_cte(stmt: &SelectStatement, names: &dyn Fn(&str) -> bool
 
 /// Each statement `expr` holds as a subquery, not those inside them
 fn nested_statements<'e>(expr: &'e Expression, out: &mut Vec<&'e SelectStatement>) {
+    each_nested_statement(expr, &mut |nested| out.push(nested));
+}
+
+/// [`nested_statements`], each given to `f`
+fn each_nested_statement<'e>(expr: &'e Expression, f: &mut dyn FnMut(&'e SelectStatement)) {
     match expr {
-        Expression::ScalarSubquery(sq) => out.push(&sq.subquery),
-        Expression::Exists(exists) => out.push(&exists.subquery),
+        Expression::ScalarSubquery(sq) => f(&sq.subquery),
+        Expression::Exists(exists) => f(&exists.subquery),
         Expression::AllAny(all_any) => {
-            nested_statements(&all_any.left, out);
-            out.push(&all_any.subquery);
+            each_nested_statement(&all_any.left, f);
+            f(&all_any.subquery);
         }
-        Expression::Aliased(aliased) => nested_statements(&aliased.expression, out),
-        Expression::Distinct(distinct) => nested_statements(&distinct.expr, out),
+        Expression::Aliased(aliased) => each_nested_statement(&aliased.expression, f),
+        Expression::Distinct(distinct) => each_nested_statement(&distinct.expr, f),
         other => {
             let _ = for_each_child(other, &mut |child| {
-                nested_statements(child, out);
+                each_nested_statement(child, f);
                 Ok(())
             });
         }
@@ -8262,7 +8337,9 @@ impl Executor {
             });
         // A table held a plan that still holds, so no view took its name since
         let base_table = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) if !ctx.has_cte_by_lower(&ts.name.value_lower) => {
+            Some(Expression::TableSource(ts))
+                if ts.as_of.is_none() && !ctx.has_cte_by_lower(&ts.name.value_lower) =>
+            {
                 Some(ts)
             }
             _ => None,
@@ -10190,7 +10267,8 @@ impl Executor {
                     .with
                     .as_ref()
                     .is_some_and(|with| with.ctes.iter().any(|cte| cte.name.value_lower == *name));
-                own || !matches!(self.named(ctx, name), Ok(Named::Table) | Err(_))
+                own || ts.as_of.is_some()
+                    || !matches!(self.named(ctx, name), Ok(Named::Table) | Err(_))
             }
             Some(Expression::JoinSource(_)) => false,
             _ => true,
@@ -10212,6 +10290,7 @@ impl Executor {
             Some(Expression::TableSource(ts)) => match self.named(ctx, &ts.name.value_lower)? {
                 Named::Cte(_) => format!("Cte {}", ts.name.value_lower),
                 Named::View(_) => format!("View {}", ts.name.value_lower),
+                Named::Table if ts.as_of.is_some() => format!("AsOf {}", ts.name.value_lower),
                 Named::Table => return Ok(None),
             },
             Some(Expression::SubquerySource(derived)) => named("Derived", &derived.alias),
@@ -10311,6 +10390,10 @@ impl Executor {
                         let body =
                             self.explain_lines(select, &inner_ctx.with_incremented_view_depth());
                         (names, scope, body)
+                    }
+                    Named::Table if ts.as_of.is_some() => {
+                        let schema = self.engine.get_table_schema(name).ok()?;
+                        (schema.column_names_owned().to_vec(), scope, Vec::new())
                     }
                     Named::Table => return None,
                 }
@@ -10458,6 +10541,7 @@ impl Executor {
                 (columns, Self::materialize_result(result)?)
             }
             BlockSource::Derived(run, ..) => self.statement_rows(run, ctx)?,
+            BlockSource::AsOf(name, as_of) => self.as_of_rows(name, as_of, ctx)?,
             BlockSource::Values(values) => {
                 let mut rows = RowVec::with_capacity(values.rows.len());
                 for (id, exprs) in (0i64..).zip(&values.rows) {
@@ -10797,13 +10881,20 @@ impl Executor {
         Ok(match stmt.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let name = &ts.name.value_lower;
-                let source = match self.named(ctx, name)? {
-                    Named::Cte(cte) => Some(StatementSource::Cte(cte)),
-                    Named::View(view) => {
+                let source = match (self.named(ctx, name)?, &ts.as_of) {
+                    (Named::Cte(_) | Named::View(_), Some(_)) => {
+                        return Err(Self::as_of_not_a_table(name))
+                    }
+                    (Named::Cte(cte), None) => Some(StatementSource::Cte(cte)),
+                    (Named::View(view), None) => {
                         let result = self.execute_view_body(&view, inner_ctx)?;
                         Some(StatementSource::Stream(result.columns().to_vec(), result))
                     }
-                    Named::Table => None,
+                    (Named::Table, Some(as_of)) => {
+                        let (columns, rows) = self.as_of_rows(name, as_of, ctx)?;
+                        Some(StatementSource::Rows(columns, rows))
+                    }
+                    (Named::Table, None) => None,
                 };
                 let scope = ts.alias.as_ref().map_or(name, |alias| &alias.value_lower);
                 (source, Some(scope))

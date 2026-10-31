@@ -170,7 +170,7 @@ fn test_limit_and_offset() {
 fn test_as_of_where() {
     site(
         "site_as_of",
-        Fails("step 1"),
+        Right,
         "SELECT id FROM t AS OF TIMESTAMP '2262-01-01 00:00:00' WHERE a IN (SELECT x FROM u) ORDER BY id",
         "SELECT id FROM t AS OF TIMESTAMP '2262-01-01 00:00:00' WHERE a IN (1, 2, 3) ORDER BY id",
     );

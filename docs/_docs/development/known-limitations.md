@@ -32,8 +32,7 @@ See [Date and Time Handling]({{ '/docs/data-types/date-and-time/' | relative_url
 
 ## Temporal Queries (AS OF)
 
-- **No subqueries with AS OF**: AS OF clauses cannot be combined with subqueries.
-- **Explicit transactions**: Inside an explicit transaction, a table read AS OF in a statement without subqueries is read at its current state.
+- **Tables only**: AS OF names a table; on a view or a CTE it is an error, and a view's query cannot read a table AS OF.
 - **System clock dependency**: Timestamp resolution depends on the system clock precision.
 - **A bounded history window**: History starts at the last open and ends where a table's version limit, the 24-hour background cleanup, a checkpoint, a compaction, a TRUNCATE, a column change, a VACUUM or the 262,144-commit log cut it. A point outside it is an error naming the oldest point still readable, never a partial answer.
 
