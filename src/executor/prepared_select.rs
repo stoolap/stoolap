@@ -10861,7 +10861,7 @@ impl Executor {
                     .map(|c| c.value.to_string())
                     .collect();
             }
-            let body = match self.cte_result_source(&cte.query, &registry) {
+            let body = match self.cte_result_source(&cte.query, &registry, true) {
                 Some(_) => self.general_explain(&cte.query),
                 None => self.explain_lines(&cte.query, &ctes),
             };

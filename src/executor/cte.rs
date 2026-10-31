@@ -351,13 +351,18 @@ impl Executor {
 
     /// The CTE of `registry` the CTE body `stmt` reads when the CTE path can
     /// finish it on its own; None for a body execute_select runs, which
-    /// handles set operations and the rest
+    /// handles set operations and the rest, and, when it runs under a plan
+    /// (`planned`), the subqueries it holds
     pub(super) fn cte_result_source<'r>(
         &self,
         stmt: &SelectStatement,
         registry: &'r CteRegistry,
+        planned: bool,
     ) -> Option<&'r CteData> {
-        if !Self::cte_result_path_finishes(stmt) {
+        // One holding a subquery runs as a statement under the plan it keeps
+        if !Self::cte_result_path_finishes(stmt)
+            || (planned && Self::cte_result_path_reads_subquery(stmt))
+        {
             return None;
         }
         let name = self.extract_cte_name_for_lookup(stmt.table_expr.as_deref()?)?;
@@ -372,7 +377,7 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
     ) -> Result<(Vec<String>, RowVec)> {
-        if let Some((columns, rows)) = self.cte_result_source(stmt, cte_registry) {
+        if let Some((columns, rows)) = self.cte_result_source(stmt, cte_registry, plan.is_some()) {
             // Execute query against CTE result
             // Clone Arc data into RowVec for processing
             // A subquery in the statement reads the earlier
@@ -1000,6 +1005,24 @@ impl Executor {
                 .into_iter()
                 .flatten()
                 .any(Self::has_subqueries)
+    }
+
+    /// Whether a clause the query-on-CTE-result path runs holds a subquery,
+    /// which that path asks through the general path's mechanisms
+    fn cte_result_path_reads_subquery(stmt: &SelectStatement) -> bool {
+        let windows = stmt.window_defs.iter().flat_map(|def| {
+            def.partition_by
+                .iter()
+                .chain(def.order_by.iter().map(|o| &o.expression))
+        });
+        stmt.columns
+            .iter()
+            .chain(stmt.where_clause.as_deref())
+            .chain(&stmt.group_by.columns)
+            .chain(stmt.having.as_deref())
+            .chain(&stmt.distinct_on)
+            .chain(windows)
+            .any(Self::has_subqueries)
     }
 
     // =========================================================================
