@@ -1396,9 +1396,7 @@ impl ExprVM {
                 | Op::ExecInSubquery(_)
                 | Op::ExecQuantified(..)
                 | Op::ExecRowMembers(..)
-                | Op::VectorDistanceL2
-                | Op::VectorDistanceCosine
-                | Op::VectorDistanceIP) => {
+                | Op::VectorDistanceL2) => {
                     self.execute_rare(op, &mut stack, ctx)?;
                     pc += 1;
                 }
@@ -1962,67 +1960,10 @@ impl ExprVM {
 
             Op::ExecRowMembers(idx, width) => self.row_members(stack, *idx, *width, ctx)?,
 
-            // =================================================================
-            // VECTOR DISTANCE OPERATIONS
-            // =================================================================
             Op::VectorDistanceL2 => {
                 let b = stack.pop();
                 let a = stack.pop();
-                let mut buf_a = Vec::new();
-                let mut buf_b = Vec::new();
-                match (
-                    extract_vector_bytes(&a, &mut buf_a),
-                    extract_vector_bytes(&b, &mut buf_b),
-                ) {
-                    (Some(ba), Some(bb)) if ba.len() == bb.len() => {
-                        stack.push(Value::Float(
-                            crate::functions::scalar::vector::l2_distance_bytes(ba, bb),
-                        ));
-                    }
-                    _ => {
-                        stack.push(Value::null_unknown());
-                    }
-                }
-            }
-
-            Op::VectorDistanceCosine => {
-                let b = stack.pop();
-                let a = stack.pop();
-                let mut buf_a = Vec::new();
-                let mut buf_b = Vec::new();
-                match (
-                    extract_vector_bytes(&a, &mut buf_a),
-                    extract_vector_bytes(&b, &mut buf_b),
-                ) {
-                    (Some(ba), Some(bb)) if ba.len() == bb.len() => {
-                        stack.push(Value::Float(
-                            crate::functions::scalar::vector::cosine_distance_bytes(ba, bb),
-                        ));
-                    }
-                    _ => {
-                        stack.push(Value::null_unknown());
-                    }
-                }
-            }
-
-            Op::VectorDistanceIP => {
-                let b = stack.pop();
-                let a = stack.pop();
-                let mut buf_a = Vec::new();
-                let mut buf_b = Vec::new();
-                match (
-                    extract_vector_bytes(&a, &mut buf_a),
-                    extract_vector_bytes(&b, &mut buf_b),
-                ) {
-                    (Some(ba), Some(bb)) if ba.len() == bb.len() => {
-                        stack.push(Value::Float(
-                            crate::functions::scalar::vector::ip_distance_bytes(ba, bb),
-                        ));
-                    }
-                    _ => {
-                        stack.push(Value::null_unknown());
-                    }
-                }
+                stack.push(crate::functions::scalar::vector::vec_distance_l2(&a, &b)?);
             }
 
             // The op loop answers every other op itself
@@ -3017,27 +2958,6 @@ impl ExprVM {
 impl Default for ExprVM {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Extract raw LE f32 bytes from a vector Value, zero-copy for Extension.
-/// For Text values, parses and writes into `buf` as fallback.
-#[inline]
-fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u8]> {
-    match v {
-        Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
-            Some(&data[1..])
-        }
-        Value::Text(s) => {
-            let floats = crate::core::value::parse_vector_str(s.as_ref())?;
-            buf.clear();
-            buf.reserve(floats.len() * 4);
-            for f in &floats {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-            Some(buf.as_slice())
-        }
-        _ => None,
     }
 }
 

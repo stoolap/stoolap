@@ -318,17 +318,9 @@ pub enum Op {
     // =========================================================================
     // VECTOR DISTANCE OPERATIONS
     // =========================================================================
-    /// L2 (Euclidean) distance between two vectors
+    /// `<=>`: VEC_DISTANCE_L2 of the two values, by the function's own rule
     /// Stack: [vector1, vector2] -> [float]
     VectorDistanceL2,
-
-    /// Cosine distance between two vectors (1 - cosine_similarity)
-    /// Stack: [vector1, vector2] -> [float]
-    VectorDistanceCosine,
-
-    /// Negative inner product distance between two vectors
-    /// Stack: [vector1, vector2] -> [float]
-    VectorDistanceIP,
 
     // =========================================================================
     // SET OPERATIONS
@@ -990,8 +982,6 @@ impl std::fmt::Debug for Op {
                 step, subtract, count
             ),
             Op::VectorDistanceL2 => write!(f, "VectorDistanceL2"),
-            Op::VectorDistanceCosine => write!(f, "VectorDistanceCosine"),
-            Op::VectorDistanceIP => write!(f, "VectorDistanceIP"),
             Op::InSet(set) => {
                 write!(f, "InSet(len={}, has_null={})", set.len(), set.has_null())
             }
