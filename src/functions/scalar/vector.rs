@@ -228,28 +228,35 @@ impl ScalarFunction for VecDistanceL2Function {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         crate::validate_arg_count!(args, "VEC_DISTANCE_L2", 2);
-        if args[0].is_null() || args[1].is_null() {
-            return Ok(Value::null_unknown());
-        }
-        let mut buf_a = Vec::new();
-        let mut buf_b = Vec::new();
-        let ba = extract_vector_bytes(&args[0], &mut buf_a);
-        let bb = extract_vector_bytes(&args[1], &mut buf_b);
-        match (ba, bb) {
-            (Some(a), Some(b)) => {
-                if a.len() != b.len() {
-                    return Err(Error::invalid_argument(format!(
-                        "VEC_DISTANCE_L2: dimension mismatch ({} vs {})",
-                        a.len() / 4,
-                        b.len() / 4
-                    )));
-                }
-                Ok(Value::Float(l2_distance_bytes(a, b)))
+        vec_distance_l2(&args[0], &args[1])
+    }
+}
+
+/// VEC_DISTANCE_L2(a, b), which `a <=> b` is too: NULL for a NULL argument,
+/// an error for vectors of different dimensions or an argument that is no
+/// vector
+pub(crate) fn vec_distance_l2(a: &Value, b: &Value) -> Result<Value> {
+    if a.is_null() || b.is_null() {
+        return Ok(Value::null_unknown());
+    }
+    let mut buf_a = Vec::new();
+    let mut buf_b = Vec::new();
+    let ba = extract_vector_bytes(a, &mut buf_a);
+    let bb = extract_vector_bytes(b, &mut buf_b);
+    match (ba, bb) {
+        (Some(a), Some(b)) => {
+            if a.len() != b.len() {
+                return Err(Error::invalid_argument(format!(
+                    "VEC_DISTANCE_L2: dimension mismatch ({} vs {})",
+                    a.len() / 4,
+                    b.len() / 4
+                )));
             }
-            _ => Err(Error::invalid_argument(
-                "VEC_DISTANCE_L2 requires two VECTOR arguments".to_string(),
-            )),
+            Ok(Value::Float(l2_distance_bytes(a, b)))
         }
+        _ => Err(Error::invalid_argument(
+            "VEC_DISTANCE_L2 requires two VECTOR arguments".to_string(),
+        )),
     }
 }
 

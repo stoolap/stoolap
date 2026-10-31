@@ -80,6 +80,8 @@ SELECT embedding <=> '[0.1, 0.2, 0.3]' AS dist FROM embeddings;
 SELECT VEC_DISTANCE_L2(embedding, '[0.1, 0.2, 0.3]') AS dist FROM embeddings;
 ```
 
+`a <=> b` is `VEC_DISTANCE_L2(a, b)` in every way: a NULL argument gives NULL, and vectors of different dimensions or an argument that is no vector raise the function's error.
+
 For cosine or inner product distance, use the explicit `VEC_DISTANCE_COSINE` or `VEC_DISTANCE_IP` functions.
 
 ## k-Nearest Neighbor (k-NN) Search
