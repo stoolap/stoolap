@@ -836,9 +836,10 @@ impl FunctionRule {
         operator: crate::core::Operator,
         ctx: &PushdownContext<'_>,
     ) -> Option<(Box<dyn StorageExpr>, bool)> {
-        // Check if func_side is a function call
+        // Check if func_side is a function call; one with an aggregate's
+        // modifier is left to the executor, whose compile refuses it
         let func_call = match func_side {
-            ast::Expression::FunctionCall(fc) => fc,
+            ast::Expression::FunctionCall(fc) if fc.aggregate_modifier().is_none() => fc,
             _ => return None,
         };
 
@@ -884,6 +885,7 @@ impl FunctionRule {
 
         // Nested function call
         if let ast::Expression::FunctionCall(fc) = expr {
+            fc.aggregate_modifier().is_none().then_some(())?;
             let func_name = fc.function.to_uppercase();
             if let Some(scalar_func) = global_registry().get_scalar(&func_name) {
                 let mut nested_args = Vec::with_capacity(fc.arguments.len());

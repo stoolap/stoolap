@@ -1841,6 +1841,11 @@ impl<'a> ExprCompiler<'a> {
         func: &FunctionCall,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        if let Some(error) =
+            crate::executor::utils::modifier_outside_aggregate(func, self.ctx.functions)
+        {
+            return Err(CompileError::InvalidExpression(error));
+        }
         let func_name = func.function.to_uppercase();
 
         // Special handling for certain functions
@@ -1940,9 +1945,12 @@ impl<'a> ExprCompiler<'a> {
                 arg_count: func.arguments.len() as u8,
             });
             Ok(())
+        } else if self.ctx.functions.is_aggregate(&func_name) {
+            // An aggregate the grouping did not take reads no group here
+            Err(CompileError::InvalidExpression(format!(
+                "aggregate function {func_name} is not allowed where the rows are not grouped"
+            )))
         } else {
-            // Check if it's an aggregate being referenced post-aggregation
-            // This would be handled via LoadAggregateResult in a real implementation
             Err(CompileError::FunctionNotFound(func_name.to_string()))
         }
     }

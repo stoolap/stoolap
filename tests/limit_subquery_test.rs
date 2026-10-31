@@ -164,6 +164,63 @@ fn a_limit_subquery_answers_as_its_literal() {
 }
 
 #[test]
+fn a_block_run_for_each_row_reads_its_limit_subquery_as_a_count() {
+    let n = "Null(Null)";
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "SELECT id FROM t WHERE id IN (SELECT x FROM u WHERE u.x = t.a ORDER BY x \
+             LIMIT (SELECT 1)) ORDER BY id",
+            &["Integer(1)", "Integer(2)"],
+        ),
+        (
+            "SELECT (SELECT u.id FROM u WHERE u.x = t.a ORDER BY u.id LIMIT 1 OFFSET (SELECT 1)) \
+             FROM t ORDER BY id",
+            &["Integer(3)", n, n, "Integer(3)"],
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a LIMIT (SELECT 0))",
+            &[],
+        ),
+        (
+            "SELECT (SELECT COUNT(*) FROM (SELECT u.id FROM u WHERE u.x = t.a \
+             LIMIT (SELECT COUNT(*) FROM r) - 2) d) FROM t ORDER BY id",
+            &["Integer(1)", "Integer(1)", "Integer(0)", "Integer(1)"],
+        ),
+        (
+            "SELECT (SELECT u.id FROM u JOIN r ON r.rid = u.id WHERE u.x = t.a ORDER BY u.id \
+             LIMIT (SELECT 1)) FROM t ORDER BY id",
+            &["Integer(1)", "Integer(2)", n, "Integer(1)"],
+        ),
+    ];
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = match sealed {
+            true => Database::open(&format!("file://{}/db", dir.path().display())).unwrap(),
+            false => Database::open("memory://limit_subquery_per_row_block").unwrap(),
+        };
+        setup(&db);
+        for sql in [
+            "INSERT INTO u VALUES (3, 1)",
+            "CREATE TABLE r (rid INTEGER PRIMARY KEY)",
+            "INSERT INTO r VALUES (1), (2), (3)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for (sql, want) in cases {
+            let want: Vec<String> = want.iter().map(|v| v.to_string()).collect();
+            assert_eq!(
+                answer(db.query(sql, ())),
+                Ok(want),
+                "sealed {sealed}: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_limit_subquery_takes_the_rule_of_a_count() {
     let db = Database::open("memory://limit_subquery_errors").unwrap();
     setup(&db);
@@ -176,8 +233,14 @@ fn a_limit_subquery_takes_the_rule_of_a_count() {
             "SELECT id FROM t LIMIT (SELECT x FROM u WHERE id = 9)",
             "LIMIT must be an integer",
         ),
-        ("SELECT id FROM t LIMIT (SELECT 'a')", "LIMIT must be an integer"),
-        ("SELECT id FROM t LIMIT (SELECT 2.5)", "LIMIT must be an integer"),
+        (
+            "SELECT id FROM t LIMIT (SELECT 'a')",
+            "LIMIT must be an integer",
+        ),
+        (
+            "SELECT id FROM t LIMIT (SELECT 2.5)",
+            "LIMIT must be an integer",
+        ),
         (
             "SELECT id FROM t OFFSET (SELECT -1)",
             "OFFSET must be non-negative",
@@ -185,10 +248,6 @@ fn a_limit_subquery_takes_the_rule_of_a_count() {
         (
             "SELECT id FROM t WHERE id IN (SELECT x FROM u ORDER BY x LIMIT (SELECT t.a))",
             "unknown table or alias 't'",
-        ),
-        (
-            "SELECT id FROM t WHERE id IN (SELECT x FROM u WHERE u.x = t.a ORDER BY x LIMIT (SELECT 1))",
-            "a row of an enclosing statement",
         ),
         ("SELECT id FROM t LIMIT (SELECT a)", "column 'a' not found"),
     ] {

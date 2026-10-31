@@ -563,8 +563,8 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, qualified_index, qualified_key_index,
-    split_qualified,
+    get_table_alias_from_expr, item_name, modifier_outside_aggregate, qualified, qualified_index,
+    qualified_key_index, split_qualified,
 };
 use super::volatility::expression_volatility;
 use super::Executor;
@@ -2724,6 +2724,9 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
+        if let Some(error) = modifier_outside_aggregate(func, &self.function_registry) {
+            return Err(Error::invalid_argument(error));
+        }
 
         let (partition_by_exprs, order_by, frame) = match window_expr.resolved(window_defs) {
             Some((partition_by, order_by, frame)) => {
