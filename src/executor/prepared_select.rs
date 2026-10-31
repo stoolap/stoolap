@@ -642,9 +642,11 @@ impl<'a> Family<'a> {
             return Err("more than 32 scopes in a chain");
         }
         let registry = &self.executor.function_registry;
-        // An EXISTS computes no ORDER BY key, which only a statement's run binds here
-        if !sq.order_by.is_empty() && (statement_order(sq, registry) || grouped_with_subquery(sq)) {
-            return Err("an EXISTS block ordered where only a statement reads it");
+        // An EXISTS computes no ORDER BY key nor SELECT item, which a statement
+        // run with its ORDER BY or its DISTINCT ON would
+        let keyed = !sq.order_by.is_empty() || !sq.distinct_on.is_empty();
+        if keyed && (statement_order(sq, registry) || grouped_with_subquery(sq)) {
+            return Err("an EXISTS block ordered or distinct where only a statement reads it");
         }
         if statement_form_block(sq, false, registry) {
             return self.derived(sq);

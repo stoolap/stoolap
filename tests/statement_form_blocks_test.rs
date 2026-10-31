@@ -13,9 +13,9 @@
 // limitations under the License.
 
 //! A grouped block whose SELECT list, HAVING or GROUP BY holds a subquery,
-//! and an EXISTS whose DISTINCT ON, LIMIT or OFFSET only a statement reads,
-//! run prepared as statements; an EXISTS ordered where only a statement
-//! reads its ORDER BY stays on the general path.
+//! and an EXISTS whose LIMIT or OFFSET only a statement reads, run prepared
+//! as statements; an EXISTS whose ORDER BY or DISTINCT ON only a statement
+//! reads stays on the general path.
 
 #![cfg(feature = "test-failpoints")]
 
@@ -239,10 +239,6 @@ fn an_exists_statement_block_without_an_order_by_runs_prepared() {
             (format!("{groups} LIMIT 1"), groups),
             (format!("{groups} LIMIT 0"), none),
             (format!("{groups} OFFSET 1"), none),
-            (
-                "SELECT DISTINCT ON ((SELECT 1)) k FROM w WHERE w.k = t.k OFFSET 1".to_string(),
-                none,
-            ),
             // Its SELECT list is never computed, so this subquery of two rows raises nothing
             (
                 "SELECT k, (SELECT v FROM u) FROM w WHERE w.k = t.k GROUP BY k".to_string(),
@@ -262,12 +258,13 @@ fn an_exists_statement_block_without_an_order_by_runs_prepared() {
 }
 
 #[test]
-fn an_exists_ordered_where_only_a_statement_reads_it_stays_on_the_general_path() {
+fn an_exists_ordered_or_distinct_where_only_a_statement_reads_it_stays_on_the_general_path() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = setup(&dir, false);
     let mut wrong = Vec::new();
-    let reason = "Prepared: no (an EXISTS block ordered where only a statement reads it)";
+    let reason =
+        "Prepared: no (an EXISTS block ordered or distinct where only a statement reads it)";
     let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
     let joined = "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k";
     let rows_of = "SELECT 1 FROM w WHERE w.k = t.k";
@@ -287,6 +284,15 @@ fn an_exists_ordered_where_only_a_statement_reads_it_stays_on_the_general_path()
             rows_of.to_string(),
         ),
         (format!("{joined} ORDER BY SUM(w.v)"), joined.to_string()),
+        // ABS of the smallest integer fails where the SELECT list is computed
+        (
+            "SELECT DISTINCT ON ((SELECT 1)) ABS(v) FROM w WHERE w.k = t.k".to_string(),
+            rows_of.to_string(),
+        ),
+        (
+            "SELECT DISTINCT ON ((SELECT 1)) k FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+            "SELECT 1 FROM w WHERE 1 = 0".to_string(),
+        ),
     ] {
         let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
         let line = prepared_line(&db, &sql);
