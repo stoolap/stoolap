@@ -5075,7 +5075,7 @@ impl Executor {
                 .flatten();
             let rows = match read {
                 Some(read) => {
-                    self.read_window_rows(&read, stmt, ctx, table.as_ref(), &all_columns)?
+                    self.read_window_rows(&read, (stmt, None), ctx, table.as_ref(), &all_columns)?
                 }
                 None => None,
             };

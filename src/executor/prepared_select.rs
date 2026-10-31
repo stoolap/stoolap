@@ -3644,6 +3644,9 @@ pub struct PreparedSelect {
     /// The statement has window functions: its rows are read whole and the
     /// window step computes its SELECT list over them
     windowed: bool,
+    /// The window step's plan, made once when no run changes it; None makes
+    /// it on each run
+    window: Option<super::window::WindowPlan<'static>>,
 }
 
 impl PreparedSelect {
@@ -7999,6 +8002,16 @@ impl PreparedSelect {
                 plan = Some(Plan { steps, read });
             }
         }
+        let window = windowed
+            .then(|| {
+                let keyed = Executor::with_distinct_on_items(written, &get_classification(written));
+                let computed = keyed.as_ref().unwrap_or(written);
+                executor
+                    .prepared_window_plan(computed, &schema.column_names_arc(), ctx)
+                    .ok()
+                    .filter(|plan| plan.fixed())
+            })
+            .flatten();
         Ok(Self {
             validity: executor.select_validity(written, epoch),
             cte_scope: ctx.cte_scope(),
@@ -8017,6 +8030,7 @@ impl PreparedSelect {
                 !Executor::has_subqueries(w) && has_constant_term(w, &executor.function_registry)
             }),
             windowed,
+            window,
         })
     }
 
@@ -11614,7 +11628,8 @@ impl Executor {
             // The plan's index read, else the scan it falls back to
             let indexed = match prepared.plan.as_ref().and_then(|plan| plan.read.window()) {
                 Some(read) if !keeps_none => {
-                    self.read_window_rows(read, stmt, ctx, &**table, &names)?
+                    let plan = prepared.window.as_ref();
+                    self.read_window_rows(read, (stmt, plan), ctx, &**table, &names)?
                 }
                 _ => None,
             };
@@ -11658,11 +11673,16 @@ impl Executor {
                     (rows, (None, None))
                 }
             };
-            // A DISTINCT ON key rides along as a hidden item, as on the
-            // general path, which the visible width trims after
-            let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
-            let computed = keyed.as_ref().unwrap_or(stmt);
-            let (result, layout) = self.window_over(computed, ctx, (&rows, &names), order, None)?;
+            let (result, layout) = match &prepared.window {
+                Some(plan) => self.window_by_plan(plan, ctx, (&rows, &names), order)?,
+                None => {
+                    // A DISTINCT ON key rides along as a hidden item, as on
+                    // the general path, which the visible width trims after
+                    let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
+                    let computed = keyed.as_ref().unwrap_or(stmt);
+                    self.window_over(computed, ctx, (&rows, &names), order, None)?
+                }
+            };
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
             let layout = layout.map(CompactArc::new);
