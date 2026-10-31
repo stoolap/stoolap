@@ -4460,6 +4460,10 @@ impl Table for SegmentedTable {
         self.hot.limited_index_plan(where_expr)
     }
 
+    fn reads_store(&self, store: &std::sync::Weak<crate::storage::mvcc::VersionStore>) -> bool {
+        self.hot.reads_store(store)
+    }
+
     fn scan_access(
         &self,
         access: ScanAccess<'_>,

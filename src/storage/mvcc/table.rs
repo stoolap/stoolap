@@ -3501,6 +3501,10 @@ impl Table for MVCCTable {
         index_plan::decide(&self.version_store, &self.cached_schema, where_expr, true)
     }
 
+    fn reads_store(&self, store: &std::sync::Weak<VersionStore>) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.version_store), store.as_ptr())
+    }
+
     fn scan_access(
         &self,
         access: ScanAccess<'_>,
