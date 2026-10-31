@@ -1382,6 +1382,17 @@ pub struct WindowDefinition {
     pub frame: Option<WindowFrame>,
 }
 
+impl WindowDefinition {
+    /// Every expression it holds: its PARTITION BY and ORDER BY keys and its
+    /// frame's offsets
+    pub fn expressions(&self) -> impl Iterator<Item = &Expression> {
+        self.partition_by
+            .iter()
+            .chain(self.order_by.iter().map(|ob| &ob.expression))
+            .chain(self.frame.iter().flat_map(WindowFrame::offsets))
+    }
+}
+
 impl fmt::Display for WindowDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut result = format!("{} AS (", self.name);

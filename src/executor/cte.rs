@@ -1010,11 +1010,10 @@ impl Executor {
     /// Whether a clause the query-on-CTE-result path runs holds a subquery,
     /// which that path asks through the general path's mechanisms
     fn cte_result_path_reads_subquery(stmt: &SelectStatement) -> bool {
-        let windows = stmt.window_defs.iter().flat_map(|def| {
-            def.partition_by
-                .iter()
-                .chain(def.order_by.iter().map(|o| &o.expression))
-        });
+        let windows = stmt
+            .window_defs
+            .iter()
+            .flat_map(WindowDefinition::expressions);
         stmt.columns
             .iter()
             .chain(stmt.where_clause.as_deref())
@@ -1313,12 +1312,10 @@ impl Executor {
         stmt: &SelectStatement,
         ref_counts: &mut StringMap<usize>,
     ) {
-        let windows = stmt.window_defs.iter().flat_map(|w| {
-            w.partition_by
-                .iter()
-                .chain(w.order_by.iter().map(|o| &o.expression))
-                .chain(Self::frame_bounds(w.frame.as_ref()))
-        });
+        let windows = stmt
+            .window_defs
+            .iter()
+            .flat_map(WindowDefinition::expressions);
         let grouping_sets = match &stmt.group_by.modifier {
             GroupByModifier::GroupingSets(sets) => sets.as_slice(),
             _ => &[],
@@ -1344,19 +1341,6 @@ impl Executor {
         for set_op in &stmt.set_operations {
             self.count_cte_references_in_stmt(&set_op.right, ref_counts);
         }
-    }
-
-    /// The offset expressions of a window frame
-    fn frame_bounds(frame: Option<&WindowFrame>) -> impl Iterator<Item = &Expression> {
-        frame
-            .into_iter()
-            .flat_map(|f| std::iter::once(&f.start).chain(f.end.as_ref()))
-            .filter_map(|bound| match bound {
-                WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
-                    Some(expr.as_ref())
-                }
-                _ => None,
-            })
     }
 
     /// Count the CTE references in a function call's arguments, ORDER BY and FILTER
@@ -1488,7 +1472,7 @@ impl Executor {
                     .partition_by
                     .iter()
                     .chain(window.order_by.iter().map(|o| &o.expression))
-                    .chain(Self::frame_bounds(window.frame.as_ref()))
+                    .chain(window.frame_offsets())
                 {
                     self.count_cte_references_in_expr(expr, ref_counts);
                 }

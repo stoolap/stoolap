@@ -272,11 +272,10 @@ impl<'a> Family<'a> {
             GroupByModifier::GroupingSets(sets) => sets.as_slice(),
             _ => &[],
         };
-        let windows = stmt.window_defs.iter().flat_map(|def| {
-            def.partition_by
-                .iter()
-                .chain(def.order_by.iter().map(|o| &o.expression))
-        });
+        let windows = stmt
+            .window_defs
+            .iter()
+            .flat_map(WindowDefinition::expressions);
         stmt.columns
             .iter()
             .chain(&stmt.distinct_on)
@@ -6769,11 +6768,10 @@ fn each_statement_inside<'s>(stmt: &'s SelectStatement, f: &mut dyn FnMut(&'s Se
         GroupByModifier::GroupingSets(sets) => sets.as_slice(),
         _ => &[],
     };
-    let windows = stmt.window_defs.iter().flat_map(|def| {
-        def.partition_by
-            .iter()
-            .chain(def.order_by.iter().map(|o| &o.expression))
-    });
+    let windows = stmt
+        .window_defs
+        .iter()
+        .flat_map(WindowDefinition::expressions);
     for expr in stmt
         .columns
         .iter()

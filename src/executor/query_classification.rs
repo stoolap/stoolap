@@ -34,7 +34,7 @@ use rustc_hash::FxHasher;
 use crate::executor::volatility::expression_volatility;
 use crate::functions::Volatility;
 use crate::parser::ast::{
-    Expression, FunctionCall, GroupByModifier, SelectStatement, WindowDefinition, WindowFrame,
+    Expression, FunctionCall, GroupByModifier, SelectStatement, WindowDefinition,
 };
 
 /// Maximum number of cached query classifications (LRU eviction)
@@ -1062,12 +1062,7 @@ fn grouping_set_items(stmt: &SelectStatement) -> impl Iterator<Item = &Expressio
 
 /// The PARTITION BY and ORDER BY keys and frame offsets of named windows
 fn window_def_items(defs: &[WindowDefinition]) -> impl Iterator<Item = &Expression> {
-    defs.iter().flat_map(|def| {
-        def.partition_by
-            .iter()
-            .chain(def.order_by.iter().map(|ob| &ob.expression))
-            .chain(def.frame.iter().flat_map(WindowFrame::offsets))
-    })
+    defs.iter().flat_map(WindowDefinition::expressions)
 }
 
 /// Hash a call's name case-insensitively, without allocating, and every

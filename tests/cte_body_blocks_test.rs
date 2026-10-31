@@ -77,6 +77,12 @@ const SHAPES: &[(&str, &[&[i64]])] = &[
          (SELECT COUNT(*) FROM u WHERE u.k = a.k) AS c FROM a) SELECT id, c FROM b ORDER BY id",
         &[&[1, 1], &[2, 1], &[3, 0], &[4, 1]],
     ),
+    (
+        "WITH a(n) AS (SELECT 1 UNION ALL SELECT 2), b AS (SELECT SUM(n) OVER w AS s FROM a \
+         WINDOW w AS (ORDER BY n ROWS BETWEEN (SELECT 1) PRECEDING AND CURRENT ROW)) \
+         SELECT s FROM b ORDER BY s",
+        &[&[1], &[3]],
+    ),
 ];
 
 #[test]

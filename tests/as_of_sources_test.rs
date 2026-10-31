@@ -336,6 +336,10 @@ fn as_of_names_a_table_and_no_view_reads_one() {
         format!("SELECT * FROM u AS OF TIMESTAMP '{before}'"),
         format!("SELECT * FROM t WHERE k IN (SELECT k FROM u AS OF TIMESTAMP '{before}')"),
         format!("SELECT * FROM (SELECT * FROM u AS OF TIMESTAMP '{before}') d"),
+        format!(
+            "SELECT k, SUM(k) OVER w FROM t WINDOW w AS (ORDER BY k ROWS BETWEEN \
+             (SELECT COUNT(*) FROM u AS OF TIMESTAMP '{before}') PRECEDING AND CURRENT ROW)"
+        ),
     ] {
         let sql = format!("CREATE VIEW w AS {body}");
         let err = db.execute(&sql, ()).expect_err(&sql).to_string();
