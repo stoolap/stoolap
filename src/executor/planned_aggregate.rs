@@ -618,7 +618,9 @@ impl Executor {
                     let scan = super::pushdown::try_pushdown(scan_where, &schema, Some(ctx))
                         .0
                         .and_then(|pushed| index_plan::decide(&store, &schema, &*pushed, false))
-                        .map_or(ScanChoice::Seq, ScanChoice::Index);
+                        .map_or(ScanChoice::Seq, |plan| {
+                            ScanChoice::Index(plan, std::sync::Arc::downgrade(&store))
+                        });
                     let lines = scan.explain(table, Some(scan_where));
                     for (at, line) in lines.into_iter().enumerate() {
                         reads.push(if at == 0 {

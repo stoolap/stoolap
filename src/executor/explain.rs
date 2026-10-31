@@ -25,6 +25,7 @@ use crate::planner::join::{pair_method, PairMethod};
 use crate::planner::ScanChoice;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{QueryResult, ScanPlan};
+use std::sync::Weak;
 
 use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
@@ -439,7 +440,7 @@ impl Executor {
                                 .to_string()
                             }
                             _ => match plan {
-                                Some(plan) => ScanChoice::Index(plan)
+                                Some(plan) => ScanChoice::Index(plan, Weak::new())
                                     .explain(&tbl, where_clause)
                                     .join("\n"),
                                 None => ScanPlan::SeqScan {
@@ -932,7 +933,7 @@ impl Executor {
                         let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
                         let table = table.schema().table_name.clone();
                         let plan_str = match plan {
-                            Some(plan) => ScanChoice::Index(plan)
+                            Some(plan) => ScanChoice::Index(plan, Weak::new())
                                 .explain(&table, where_clause)
                                 .join("\n"),
                             // For SeqScan, use the AST expression's Display format instead of storage expr Debug

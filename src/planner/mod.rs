@@ -29,6 +29,7 @@ use crate::parser::ast::{Expression, InfixOperator, SelectStatement};
 use crate::storage::mvcc::index_plan::{self, IndexPlan, IndexTerm, Term};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::VersionStore;
+use crate::storage::traits::{ScanAccess, Table};
 use smallvec::SmallVec;
 
 pub(crate) mod block;
@@ -359,8 +360,8 @@ fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
 pub enum ScanChoice {
     /// Every row, each one judged
     Seq,
-    /// The rows the indexes give for the conjuncts
-    Index(IndexPlan),
+    /// The rows the indexes of `store` give for the conjuncts
+    Index(IndexPlan, Weak<VersionStore>),
 }
 
 /// The column of `schema` a DISTINCT statement reads the distinct values of
@@ -401,26 +402,36 @@ pub(crate) fn distinct_values_column(
 /// The scan for `pushed`, the conjuncts a scan takes of a WHERE, over a
 /// table of `schema` whose indexes `store` holds
 pub fn scan_choice(
-    store: &VersionStore,
+    store: &std::sync::Arc<VersionStore>,
     schema: &Schema,
     pushed: Option<&Expression>,
 ) -> ScanChoice {
     match pushed.and_then(|pushed| index_plan::decide(store, schema, pushed, false)) {
-        Some(plan) => ScanChoice::Index(plan),
+        Some(plan) => ScanChoice::Index(plan, std::sync::Arc::downgrade(store)),
         None => ScanChoice::Seq,
     }
 }
 
 impl ScanChoice {
+    /// The access a scan of `table` reads by; None when the indexes were
+    /// chosen over another store than the one `table` reads, which leaves
+    /// the choice to the run
+    pub(crate) fn access(&self, table: &dyn Table) -> Option<ScanAccess<'_>> {
+        match self {
+            Self::Seq => Some(ScanAccess::Seq),
+            Self::Index(plan, store) => table.reads_store(store).then_some(ScanAccess::Index(plan)),
+        }
+    }
+
     /// The scan as EXPLAIN shows it: its line, then the plan's reads
     /// indented under it
     pub fn explain(&self, table: &str, pushed: Option<&Expression>) -> Vec<String> {
         let mut lines = vec![match (self, pushed) {
-            (Self::Index(_), Some(pushed)) => format!("IndexScan {table} {pushed}"),
+            (Self::Index(..), Some(pushed)) => format!("IndexScan {table} {pushed}"),
             (_, Some(pushed)) => format!("SeqScan {table} {pushed}"),
             (_, None) => format!("SeqScan {table}"),
         }];
-        if let Self::Index(plan) = self {
+        if let Self::Index(plan, _) = self {
             lines.extend(plan.explain().into_iter().map(|read| format!("  {read}")));
         }
         lines
