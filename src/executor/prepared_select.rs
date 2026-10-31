@@ -641,7 +641,12 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        if statement_form_block(sq, false, &self.executor.function_registry) {
+        let registry = &self.executor.function_registry;
+        // An EXISTS computes no ORDER BY key, which only a statement's run binds here
+        if !sq.order_by.is_empty() && (statement_order(sq, registry) || grouped_with_subquery(sq)) {
+            return Err("an EXISTS block ordered where only a statement reads it");
+        }
+        if statement_form_block(sq, false, registry) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
@@ -667,84 +672,6 @@ impl<'a> Family<'a> {
             None => Ok(()),
         }
     }
-}
-
-/// Fails as the compiler does for the first function `expr` calls, in its
-/// subqueries too, that `registry` does not hold
-fn check_function_names(expr: &Expression, registry: &FunctionRegistry) -> Result<()> {
-    let called = match expr {
-        Expression::FunctionCall(call) => Some(&call.function),
-        Expression::Window(window) => Some(&window.function.function),
-        _ => None,
-    };
-    if let Some(name) = called.filter(|name| !registry.exists(name)) {
-        return Err(compile_error(CompileError::FunctionNotFound(
-            name.as_str().to_uppercase(),
-        )));
-    }
-    match expr {
-        Expression::ScalarSubquery(sq) => statement_function_names(&sq.subquery, registry),
-        Expression::Exists(exists) => statement_function_names(&exists.subquery, registry),
-        Expression::AllAny(all_any) => {
-            check_function_names(&all_any.left, registry)?;
-            statement_function_names(&all_any.subquery, registry)
-        }
-        Expression::Aliased(aliased) => check_function_names(&aliased.expression, registry),
-        Expression::Distinct(distinct) => check_function_names(&distinct.expr, registry),
-        other => for_each_child(other, &mut |child| check_function_names(child, registry)),
-    }
-}
-
-/// [`check_function_names`] for every clause, source, branch and CTE of `stmt`
-fn statement_function_names(stmt: &SelectStatement, registry: &FunctionRegistry) -> Result<()> {
-    fn source(from: &Expression, registry: &FunctionRegistry) -> Result<()> {
-        match from {
-            Expression::SubquerySource(derived) => {
-                statement_function_names(&derived.subquery, registry)
-            }
-            Expression::JoinSource(join) => {
-                source(&join.left, registry)?;
-                source(&join.right, registry)?;
-                join.condition
-                    .as_deref()
-                    .map_or(Ok(()), |on| check_function_names(on, registry))
-            }
-            Expression::ValuesSource(values) => values
-                .rows
-                .iter()
-                .flatten()
-                .try_for_each(|value| check_function_names(value, registry)),
-            Expression::FunctionTableSource(function) => function
-                .arguments
-                .iter()
-                .try_for_each(|argument| check_function_names(argument, registry)),
-            _ => Ok(()),
-        }
-    }
-    let clauses = stmt
-        .columns
-        .iter()
-        .chain(stmt.where_clause.as_deref())
-        .chain(&stmt.group_by.columns)
-        .chain(stmt.having.as_deref())
-        .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-        .chain(&stmt.distinct_on);
-    for expr in clauses {
-        check_function_names(expr, registry)?;
-    }
-    if let Some(from) = stmt.table_expr.as_deref() {
-        source(from, registry)?;
-    }
-    let inside = stmt.set_operations.iter().map(|op| &*op.right).chain(
-        stmt.with
-            .iter()
-            .flat_map(|with| &with.ctes)
-            .map(|cte| &*cte.query),
-    );
-    for nested in inside {
-        statement_function_names(nested, registry)?;
-    }
-    Ok(())
 }
 
 /// Whether `sq` orders by position over a star a NATURAL or USING join
@@ -822,8 +749,7 @@ fn windowed_block(sq: &SelectStatement) -> bool {
 }
 
 /// A block that runs as one statement: one `clause_block` names, or one
-/// whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads. An
-/// EXISTS among them runs without its ORDER BY, as every EXISTS does
+/// whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads
 fn statement_form_block(
     sq: &SelectStatement,
     counts_rows: bool,
@@ -832,30 +758,36 @@ fn statement_form_block(
     clause_block(sq, counts_rows) || statement_order(sq, registry)
 }
 
-/// A block a statement runs for its clauses: a windowed one, or one holding
-/// its own WITH, a set operation, ROLLUP, CUBE, grouping sets, a WINDOW
-/// clause or a DISTINCT that changes its answer, which it does only where
-/// something counts its rows: a value block (`counts_rows`), a LIMIT or an
-/// OFFSET; or a grouped one whose SELECT list, HAVING or GROUP BY holds a
-/// subquery, which a block's aggregation does not run
+/// A block a statement runs for its clauses: one `clause_form` names, or
+/// one `grouped_with_subquery` names
 fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
+    clause_form(sq, counts_rows) || grouped_with_subquery(sq)
+}
+
+/// A block whose rows its clauses choose: a windowed one, or one holding its
+/// own WITH, a set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause
+/// or a DISTINCT that changes its answer, which it does only where something
+/// counts its rows: a value block (`counts_rows`), a LIMIT or an OFFSET
+fn clause_form(sq: &SelectStatement, counts_rows: bool) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
-    let grouped_subquery = || {
-        grouped_block(sq)
-            && sq
-                .columns
-                .iter()
-                .chain(sq.having.as_deref())
-                .chain(&sq.group_by.columns)
-                .any(mentions_subquery)
-    };
     windowed_block(sq)
         || sq.with.is_some()
         || !sq.set_operations.is_empty()
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
-        || grouped_subquery()
+}
+
+/// A grouped block whose SELECT list, HAVING or GROUP BY holds a subquery,
+/// which a block's aggregation does not run
+fn grouped_with_subquery(sq: &SelectStatement) -> bool {
+    grouped_block(sq)
+        && sq
+            .columns
+            .iter()
+            .chain(sq.having.as_deref())
+            .chain(&sq.group_by.columns)
+            .any(mentions_subquery)
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
@@ -5067,32 +4999,22 @@ impl Builder<'_> {
         Ok((reads, named(names)?))
     }
 
-    /// Bind the ORDER BY the EXISTS block `sq` runs without, computing
-    /// nothing: the functions it calls, then for a grouped block the reads
-    /// outside its groups, as the general path checks them in `walked`, the
-    /// statement its walk bound; for another, each key over the scope `own`
-    /// its FROM gives it, compiled as a block's key that chooses no row
+    /// Bind the ORDER BY the EXISTS block `sq` runs without, as a block binds
+    /// a key that chooses no row, over the scope `own` its FROM gives it
     fn bind_dropped_order(
         &mut self,
         sq: &SelectStatement,
-        walked: &SelectStatement,
         own: &ScopeTable,
         outer: &[&ScopeTable],
         id: u16,
         work: &Rewritten,
     ) -> Result<()> {
         check_block_positions(sq, own.columns.len())?;
-        let registry = &self.executor.function_registry;
-        for ob in &sq.order_by {
-            check_function_names(&ob.expression, registry)?;
-        }
-        if grouped_block(sq) {
-            return check_grouped_reads(self.executor, walked, &own.lower, self.ctx);
-        }
         let mut scopes = Vec::with_capacity(outer.len() + 1);
         scopes.push(own);
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
+        let registry = &self.executor.function_registry;
         let compile = CompileContext::bound(registry).with_prepared_subqueries();
         for ob in &sq.order_by {
             let key = with_aliases(&ob.expression, &sq.columns, &own.columns);
@@ -5102,64 +5024,14 @@ impl Builder<'_> {
         Ok(())
     }
 
-    /// Bind `values` over the groups of the grouped block `sq` over a join,
-    /// as its SELECT list is bound, keeping no slot or block; `exists` binds
-    /// the list an EXISTS never reads. Grouping compiles no subquery: groups
-    /// holding one get the general path's ungrouped check of `walked` over
-    /// the join's columns, and a value holding one is bound by its names
-    #[allow(clippy::too_many_arguments)]
-    fn bind_grouped_keys(
-        &mut self,
-        chain: &Chain<'_>,
-        id: u16,
-        sq: &SelectStatement,
-        values: &[Expression],
-        exists: bool,
-        (walked, columns): (&SelectStatement, &[String]),
-        work: &Rewritten,
-    ) -> Result<()> {
-        let items = group_by_expressions(self.executor, sq, &chain.scopes[0].columns)?;
-        if items.iter().any(mentions_subquery) {
-            return check_grouped_reads(self.executor, walked, columns, self.ctx);
-        }
-        let values: Vec<Expression> = values
-            .iter()
-            .filter(|value| !mentions_subquery(value))
-            .cloned()
-            .collect();
-        // A HAVING subquery is bound by the statement's run; no key reads it
-        let without_having;
-        let sq = match sq.having.as_deref().is_some_and(mentions_subquery) {
-            true => {
-                without_having = SelectStatement {
-                    having: None,
-                    ..sq.clone()
-                };
-                &without_having
-            }
-            false => sq,
-        };
-        let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
-        let mut trial = Rewritten {
-            outer: work.outer.clone(),
-            ..Rewritten::default()
-        };
-        let grouping = self.grouping(chain, id, sq, &values, exists, &mut trial);
-        self.next_slot = next_slot;
-        self.subqueries.truncate(blocks);
-        grouping.map(drop)
-    }
-
     /// Bind the block `sq` over a join as a block over one table is bound
     /// when prepared, computing nothing: its clauses over its FROM's scope
-    /// `own` read by position, its grouping checked as `grouping` checks it.
-    /// A window function, or a bare name two of its tables have, binds when
-    /// the block runs, which binds that name as the prepared side cannot know
-    #[allow(clippy::too_many_arguments)]
+    /// `own` read by position, its grouping and keys checked as `grouping`
+    /// checks them. A window function, a bare name two of its tables have, or
+    /// a grouped block's subquery binds when the block runs
     fn bind_join_block(
         &mut self,
         sq: &SelectStatement,
-        walked: &SelectStatement,
         own: &ScopeTable,
         outer: &[&ScopeTable],
         id: u16,
@@ -5198,14 +5070,6 @@ impl Builder<'_> {
         let named = |expr: &Expression| with_aliases(expr, &sq.columns, &scope.lower).into_owned();
         let mut bound: Vec<Expression> =
             sq.where_clause.as_deref().map(named).into_iter().collect();
-        for key in sq
-            .order_by
-            .iter()
-            .map(|ob| &ob.expression)
-            .chain(&sq.distinct_on)
-        {
-            check_function_names(key, registry)?;
-        }
         // A grouped block's keys read its groups, bound with its items
         let keys: Vec<Expression> = match windowed {
             true => Vec::new(),
@@ -5226,18 +5090,27 @@ impl Builder<'_> {
             let expr = self.trial_rewrite(&chain, id, expr, &work.outer)?;
             compile_with(&compile, &expr)?;
         }
-        if grouped {
-            // An item holding a subquery is bound by the block's run
-            let listed = items
+        // Its grouping compiles no subquery: a key holding one binds when it runs
+        if grouped && !grouped_with_subquery(sq) {
+            let listed = match exists {
+                true => &[][..],
+                false => &items[..],
+            };
+            let values = listed
                 .iter()
                 .copied()
-                .filter(|item| !exists && !mentions_subquery(item));
-            let values = listed
-                .chain(&keys)
+                .chain(keys.iter().filter(|key| !mentions_subquery(key)))
                 .map(|value| self.trial_rewrite(&chain, id, value, &work.outer))
                 .collect::<Result<Vec<_>>>()?;
-            let source = (walked, &own.lower[..]);
-            self.bind_grouped_keys(&chain, id, sq, &values, exists, source, work)?;
+            let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
+            let mut trial = Rewritten {
+                outer: work.outer.clone(),
+                ..Rewritten::default()
+            };
+            let grouping = self.grouping(&chain, id, sq, &values, exists, &mut trial);
+            self.next_slot = next_slot;
+            self.subqueries.truncate(blocks);
+            grouping?;
         }
         Ok(())
     }
@@ -5263,17 +5136,14 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
-        // An EXISTS counts its rows, which no ORDER BY changes: it runs
-        // without one, bound as its keys bind, but where a window function,
-        // a set operation's columns or a position over a merged star are
-        // what only its run binds. Unless its items choose its rows, by a
-        // DISTINCT ON or the clauses of a statement block, it reads no item
+        // An EXISTS runs without its ORDER BY, which is still bound, and its
+        // SELECT list; one whose rows its items choose, by a window, a
+        // DISTINCT ON or the clauses `clause_form` names, runs as written, and
+        // so does one ordered by a position its run counts, reading a column
         let dropped = matches!(form, Form::Exists(_))
-            && !windowed_block(sq)
-            && sq.window_defs.is_empty()
-            && sq.set_operations.is_empty()
+            && !clause_form(sq, false)
+            && sq.distinct_on.is_empty()
             && !orders_by_merged_star_position(sq);
-        let counted = dropped && !clause_block(sq, false) && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
@@ -5313,33 +5183,26 @@ impl Builder<'_> {
         self.max_param = self.max_param.max(max_param);
         let joined = own.tables.len() > 1;
         if joined {
-            if counted {
+            if dropped {
                 check_block_positions(sq, own.columns.len())?;
             }
             let around = std::mem::replace(&mut self.ctes, ctes);
-            let bound = self.bind_join_block(
-                sq,
-                &statement,
-                &own,
-                outer,
-                id,
-                &work,
-                matches!(form, Form::Exists(_)),
-            );
+            let bound =
+                self.bind_join_block(sq, &own, outer, id, &work, matches!(form, Form::Exists(_)));
             self.ctes = around;
             bound?;
         }
-        // A join's keys are bound with its block, and its run names its columns
-        if dropped && !joined {
-            self.bind_dropped_order(sq, &statement, &own, outer, id, &work)?;
-        }
-        let statement = match (dropped, counted && !joined) {
-            (false, _) => statement,
-            (true, false) => SelectStatement {
+        let statement = match dropped {
+            // A join's run names its columns, so it binds what it reads
+            true if joined => SelectStatement {
                 order_by: Vec::new(),
                 ..statement
             },
-            (true, true) => existence(executor, statement, &own.lower, ctx)?,
+            true => {
+                self.bind_dropped_order(sq, &own, outer, id, &work)?;
+                existence(executor, statement, &own.lower, ctx)?
+            }
+            false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
         // One that binds nothing beyond itself keeps its answer across

@@ -768,7 +768,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "exists_ordered_by_a_subquery_key",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a ORDER BY (SELECT 1) LIMIT 1)",
         "SELECT id FROM t WHERE a IN (1, 2, 3)",
-        Prepared,
+        Old("planner step 5: the EXISTS's plan node binds the ORDER BY it drops, once"),
     ),
     (
         "exists_ordered_by_position_over_a_using_join",

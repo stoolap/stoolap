@@ -13,9 +13,9 @@
 // limitations under the License.
 
 //! A grouped block whose SELECT list, HAVING or GROUP BY holds a subquery,
-//! and an EXISTS whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a
-//! statement reads, run prepared as statements; an EXISTS computes no
-//! ORDER BY key.
+//! and an EXISTS whose DISTINCT ON, LIMIT or OFFSET only a statement reads,
+//! run prepared as statements; an EXISTS ordered where only a statement
+//! reads its ORDER BY stays on the general path.
 
 #![cfg(feature = "test-failpoints")]
 
@@ -226,119 +226,80 @@ fn a_grouped_block_over_a_join_binds_its_keys_over_its_groups() {
 }
 
 #[test]
-fn an_exists_computes_no_order_by_key() {
+fn an_exists_statement_block_without_an_order_by_runs_prepared() {
     let _guard = serial();
     let mut wrong = Vec::new();
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = setup(&dir, sealed);
         let mode = if sealed { "sealed" } else { "hot" };
-        // A key reading two rows fails wherever it is computed
-        let key = "(SELECT v FROM u)";
+        let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
+        let none = "SELECT 1 FROM w WHERE 1 = 0";
         for (block, twin) in [
+            (format!("{groups} LIMIT 1"), groups),
+            (format!("{groups} LIMIT 0"), none),
+            (format!("{groups} OFFSET 1"), none),
             (
-                format!("SELECT 1 FROM u WHERE u.k = t.k ORDER BY {key} LIMIT 1"),
-                "SELECT 1 FROM u WHERE u.k = t.k",
+                "SELECT DISTINCT ON ((SELECT 1)) k FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none,
+            ),
+            // Its SELECT list is never computed, so this subquery of two rows raises nothing
+            (
+                "SELECT k, (SELECT v FROM u) FROM w WHERE w.k = t.k GROUP BY k".to_string(),
+                groups,
             ),
             (
-                format!("SELECT 1 FROM u WHERE u.k = t.k ORDER BY {key}"),
-                "SELECT 1 FROM u WHERE u.k = t.k",
-            ),
-            (
-                format!("SELECT k FROM u WHERE u.k = t.k GROUP BY k ORDER BY {key} LIMIT 1"),
-                "SELECT k FROM u WHERE u.k = t.k GROUP BY k",
-            ),
-            (
-                format!("SELECT 1 FROM u WHERE u.k = t.k ORDER BY {key} LIMIT 1 OFFSET 1"),
-                "SELECT 1 FROM u WHERE u.k = t.k AND u.k <> 2",
-            ),
-            (
-                format!(
-                    "SELECT 1 FROM u JOIN t t2 ON t2.id = u.id WHERE u.k = t.k \
-                     ORDER BY {key} LIMIT 1"
-                ),
-                "SELECT 1 FROM u JOIN t t2 ON t2.id = u.id WHERE u.k = t.k",
-            ),
-            (
-                "SELECT k FROM u WHERE u.k = t.k GROUP BY k LIMIT 0".to_string(),
-                "SELECT 1 FROM u WHERE 1 = 0",
-            ),
-            (
-                "SELECT DISTINCT ON ((SELECT 1)) k FROM u WHERE u.k = t.k OFFSET 1".to_string(),
-                "SELECT 1 FROM u WHERE 1 = 0",
+                format!("{groups} HAVING COUNT(*) > (SELECT 1)"),
+                "SELECT k FROM w WHERE w.k = t.k GROUP BY k HAVING COUNT(*) > 1",
             ),
         ] {
             let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
             let literal = format!("SELECT id FROM t WHERE EXISTS ({twin}) ORDER BY id");
             holds(&db, &sql, &literal, mode, &mut wrong);
         }
-        // An aggregate key reads the groups; ABS of the smallest integer fails if computed
-        let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
-        for block in [
-            format!("{groups} ORDER BY SUM(v)"),
-            format!("{groups} ORDER BY SUM(v) LIMIT 1"),
-            "SELECT k, SUM(v) AS total FROM w WHERE w.k = t.k GROUP BY k ORDER BY total"
-                .to_string(),
-            format!("{groups} ORDER BY ABS(MIN(v)) LIMIT 1"),
-            "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY ABS(MIN(v))"
-                .to_string(),
-            format!("{groups} HAVING COUNT(*) > (SELECT 0) ORDER BY ABS(MIN(v))"),
-            "SELECT DISTINCT ON ((SELECT 1)) w.k FROM w WHERE w.k = t.k ORDER BY ABS(w.v)"
-                .to_string(),
-        ] {
-            let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
-            let literal = format!("SELECT id FROM t WHERE EXISTS ({groups}) ORDER BY id");
-            holds(&db, &sql, &literal, mode, &mut wrong);
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_exists_ordered_where_only_a_statement_reads_it_stays_on_the_general_path() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup(&dir, false);
+    let mut wrong = Vec::new();
+    let reason = "Prepared: no (an EXISTS block ordered where only a statement reads it)";
+    let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
+    let joined = "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k";
+    let rows_of = "SELECT 1 FROM w WHERE w.k = t.k";
+    for (block, twin) in [
+        (format!("{groups} ORDER BY SUM(v)"), groups.to_string()),
+        (format!("{groups} ORDER BY k LIMIT 1"), groups.to_string()),
+        (
+            "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY k".to_string(),
+            groups.to_string(),
+        ),
+        (
+            format!("{groups} HAVING COUNT(*) > (SELECT 0) ORDER BY k"),
+            format!("{groups} HAVING COUNT(*) > 0"),
+        ),
+        (
+            format!("{rows_of} ORDER BY (SELECT 1) LIMIT 1"),
+            rows_of.to_string(),
+        ),
+        (format!("{joined} ORDER BY SUM(w.v)"), joined.to_string()),
+    ] {
+        let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
+        let line = prepared_line(&db, &sql);
+        if line != reason {
+            wrong.push(format!("{sql} says {line}"));
         }
-        // Over a join the keys bind with the block, as the join reads it
-        let joined = "SELECT u.k FROM u JOIN r ON r.rid = u.id WHERE u.k = t.k GROUP BY u.k";
-        for block in [
-            format!("{joined} ORDER BY SUM(u.v)"),
-            format!("{joined} HAVING COUNT(*) > (SELECT 0) ORDER BY SUM(u.v)"),
-        ] {
-            let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
-            let literal = format!("SELECT id FROM t WHERE EXISTS ({joined}) ORDER BY id");
-            holds(&db, &sql, &literal, mode, &mut wrong);
-        }
-        // Its keys are still bound, as the same ORDER BY is anywhere else
-        for (block, error) in [
-            (
-                "SELECT 1 FROM u WHERE u.k = t.k ORDER BY nosuch LIMIT 1",
-                "nosuch",
-            ),
-            (
-                "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY nosuch",
-                "nosuch",
-            ),
-            (
-                "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY v",
-                "Column 'v' not found",
-            ),
-            (
-                "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY v",
-                "Column 'v' not found",
-            ),
-            (
-                "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY nofn(k)",
-                "Function not found: NOFN",
-            ),
-            (
-                "SELECT k FROM w WHERE w.k = t.k GROUP BY k \
-                 HAVING COUNT(*) > (SELECT 0) ORDER BY nofn(k)",
-                "Function not found: NOFN",
-            ),
-            (
-                "SELECT u.k FROM u JOIN r ON r.rid = u.id WHERE u.k = t.k GROUP BY u.k ORDER BY u.v",
-                "Column 'u.v' not found",
-            ),
-        ] {
-            let sql = format!("SELECT id FROM t WHERE EXISTS ({block})");
-            if !rows(&db, &sql).is_err_and(|e| e.contains(error)) {
-                wrong.push(format!(
-                    "{mode}: {sql} binds its key: {:?}",
-                    rows(&db, &sql)
-                ));
-            }
+        let twin = format!("SELECT id FROM t WHERE EXISTS ({twin}) ORDER BY id");
+        if rows(&db, &sql) != rows(&db, &twin) {
+            wrong.push(format!(
+                "{sql}: {:?}, want {:?}",
+                rows(&db, &sql),
+                rows(&db, &twin)
+            ));
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
@@ -372,109 +333,6 @@ fn an_exists_ordered_by_position_over_a_merged_star_checks_the_merged_width() {
         let want = format!("ORDER BY position {position} is not in the select list");
         if !rows(&db, &sql).is_err_and(|e| e.contains(&want)) {
             wrong.push(format!("{sql}: {:?}, want {want}", rows(&db, &sql)));
-        }
-    }
-    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
-}
-
-/// Each EXISTS block form, the qualifier of its rows and whether it groups
-const EXISTS_FORMS: &[(&str, &str, bool)] = &[
-    ("SELECT w.k FROM w WHERE w.k = t.k", "w", false),
-    ("SELECT w.k FROM w WHERE w.k = t.k GROUP BY w.k", "w", true),
-    (
-        "SELECT w.k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY w.k",
-        "w",
-        true,
-    ),
-    (
-        "SELECT w.k FROM w WHERE w.k = t.k GROUP BY w.k HAVING COUNT(*) > (SELECT 0)",
-        "w",
-        true,
-    ),
-    (
-        "SELECT (SELECT 1) AS g, w.k FROM w WHERE w.k = t.k GROUP BY g, w.k",
-        "w",
-        true,
-    ),
-    (
-        "SELECT (SELECT 1), w.k FROM w WHERE w.k = t.k GROUP BY 1, w.k",
-        "w",
-        true,
-    ),
-    (
-        "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k",
-        "w",
-        false,
-    ),
-    (
-        "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k",
-        "w",
-        true,
-    ),
-    (
-        "SELECT w.k, (SELECT 1) FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k",
-        "w",
-        true,
-    ),
-    (
-        "SELECT (SELECT 1) AS g, w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY g, w.k",
-        "w",
-        true,
-    ),
-    (
-        "SELECT DISTINCT ON ((SELECT 1)) w.k FROM w WHERE w.k = t.k",
-        "w",
-        false,
-    ),
-    (
-        "SELECT q.k FROM (SELECT k, v, id FROM w WHERE w.k = t.k) AS q",
-        "q",
-        false,
-    ),
-    (
-        "SELECT q.k FROM (SELECT k, v, id FROM w WHERE w.k = t.k) AS q GROUP BY q.k",
-        "q",
-        true,
-    ),
-];
-
-/// Each ORDER BY key, `Q` its rows' qualifier, and whether it binds over
-/// rows and over groups; None where the form refuses it before binding
-const EXISTS_KEYS: &[(&str, Option<bool>, Option<bool>)] = &[
-    ("SUM(Q.v)", None, Some(true)),
-    ("t.id", Some(true), Some(true)),
-    ("ABS(Q.v)", Some(true), None),
-    ("ABS(MIN(Q.v))", None, Some(true)),
-    ("(SELECT v FROM u)", Some(true), Some(true)),
-    ("nosuch", Some(false), Some(false)),
-    ("Q.v", Some(true), Some(false)),
-    ("nofn(Q.k)", Some(false), Some(false)),
-    ("nofn((SELECT 1))", Some(false), Some(false)),
-];
-
-#[test]
-fn an_exists_binds_the_order_by_it_drops_in_every_form() {
-    let _guard = serial();
-    let mut wrong = Vec::new();
-    for sealed in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let db = setup(&dir, sealed);
-        let mode = if sealed { "sealed" } else { "hot" };
-        for (block, qualifier, grouped) in EXISTS_FORMS {
-            for (key, rows_bind, groups_bind) in EXISTS_KEYS {
-                let Some(binds) = (if *grouped { groups_bind } else { rows_bind }) else {
-                    continue;
-                };
-                let key = key.replace('Q', qualifier);
-                let sql =
-                    format!("SELECT id FROM t WHERE EXISTS ({block} ORDER BY {key}) ORDER BY id");
-                if *binds {
-                    let twin = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
-                    holds(&db, &sql, &twin, mode, &mut wrong);
-                } else if rows(&db, &sql).is_ok() {
-                    wrong.push(format!("{mode}: {sql} answers a key that does not bind"));
-                }
-            }
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
