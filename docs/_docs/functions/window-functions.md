@@ -380,7 +380,7 @@ FROM employees
 WINDOW w AS (PARTITION BY dept ORDER BY salary DESC);
 ```
 
-A named window holds anything the same window written in `OVER (...)` holds, subqueries included, and a query using it answers as that query written out.
+A named window holds anything the same window written in `OVER (...)` holds, subqueries included, and a query using it answers as that query written out. A named window no window function reads is never read: `WINDOW w AS (ORDER BY nosuch)` beside no `OVER w` raises no error, and the query answers as it does without the clause.
 
 ## Notes
 

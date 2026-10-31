@@ -341,6 +341,12 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         Prepared,
     ),
     (
+        "unused_named_window",
+        "SELECT id FROM t WHERE id > (SELECT MAX(x) FROM u) WINDOW w AS (ORDER BY id) ORDER BY id",
+        "SELECT id FROM t WHERE id > 3 ORDER BY id",
+        Prepared,
+    ),
+    (
         "named_window_select",
         "SELECT id, ROW_NUMBER() OVER w, (SELECT COUNT(*) FROM u WHERE u.id = t.a) \
          FROM t WINDOW w AS (ORDER BY id)",
