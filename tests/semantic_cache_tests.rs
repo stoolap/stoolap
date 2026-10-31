@@ -800,3 +800,44 @@ fn test_float_constants_closer_than_epsilon_are_different_predicates() {
         );
     }
 }
+
+#[test]
+fn test_join_side_reads_hit_the_cache_under_the_statement_snapshot() {
+    let db = Database::open("memory://semantic_cache_join_side_snapshot").unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO u SELECT g.value, g.value % 10, g.value % 7 FROM generate_series(1, 200) g",
+        (),
+    )
+    .unwrap();
+    for sql in [
+        "SELECT y.id FROM (SELECT * FROM u WHERE a < 3) y JOIN (SELECT * FROM u WHERE b > 4) r ON y.id = r.id",
+        "WITH y AS (SELECT * FROM u WHERE a < 3), r AS (SELECT * FROM u WHERE b > 4) SELECT y.id FROM y JOIN r ON y.id = r.id",
+    ] {
+        let stmt = db.prepare(sql).unwrap();
+        let run = || -> Vec<i64> {
+            let mut out: Vec<i64> = stmt
+                .query(())
+                .unwrap()
+                .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let first = run();
+        let before = db.semantic_cache_stats().unwrap();
+        assert_eq!(run(), first, "{sql}");
+        let after = db.semantic_cache_stats().unwrap();
+        assert!(
+            after.exact_hits > before.exact_hits,
+            "the sides' reads hit the cache: {sql}"
+        );
+        db.execute("INSERT INTO u VALUES (1000, 0, 5)", ()).unwrap();
+        assert_eq!(run().last(), Some(&1000), "a new row is read: {sql}");
+        db.execute("DELETE FROM u WHERE id = 1000", ()).unwrap();
+    }
+}

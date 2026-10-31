@@ -221,6 +221,9 @@ pub struct PreparedJoin {
     side_plans: [NestedPlan; 2],
     /// How the join runs, planned on first need
     join_plan: std::sync::OnceLock<JoinPlan>,
+    /// Whether the statement's CTEs are named without reading them, which
+    /// keeps the join's plan over them; decided on first need
+    ctes_named: std::sync::OnceLock<bool>,
 }
 
 impl PreparedJoin {
@@ -239,6 +242,7 @@ impl PreparedJoin {
             grouped_blocks: Shelf::new(),
             side_plans: Default::default(),
             join_plan: std::sync::OnceLock::new(),
+            ctes_named: std::sync::OnceLock::new(),
         }
     }
 
@@ -265,6 +269,12 @@ impl PreparedJoin {
     /// Each side's columns as the blocks read them, as `name` finds once
     pub(crate) fn sides(&self, name: impl FnOnce() -> Option<JoinSides>) -> Option<&JoinSides> {
         self.sides.get_or_init(name).as_ref()
+    }
+
+    /// Whether the statement's CTEs are named without reading them, as
+    /// `decide` finds once
+    pub(crate) fn ctes_named(&self, decide: impl FnOnce() -> bool) -> bool {
+        *self.ctes_named.get_or_init(decide)
     }
 
     /// Whether the grouped statement's subqueries run as its grouped blocks,
