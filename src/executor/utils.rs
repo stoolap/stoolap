@@ -1864,12 +1864,14 @@ impl ModifierWalk<'_> {
                 self.all(&stmt.returning)
             }
             Statement::CreateView(stmt) => self.select(&stmt.query),
+            Statement::CreateTable(stmt) => {
+                stmt.as_select.as_deref().map_or(Ok(()), |s| self.select(s))
+            }
             Statement::Explain(stmt) => self.statement(&stmt.statement),
             Statement::Expression(stmt) => self.expression(&stmt.expression),
             Statement::Set(stmt) => self.expression(&stmt.value),
             Statement::Pragma(stmt) => self.optional(stmt.value.as_ref()),
             Statement::Truncate(_)
-            | Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::AlterTable(_)
             | Statement::CreateIndex(_)

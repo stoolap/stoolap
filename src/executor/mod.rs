@@ -1465,9 +1465,9 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         check_param_count(&plan.params, ctx.params().len())?;
         // The compiled fast paths run only a plan a run here has filled
-        if plan.checked.get().is_none() {
+        if plan.compiled.checked().get().is_none() {
             utils::statement_modifier_error(&plan.statement, &self.function_registry)?;
-            let _ = plan.checked.set(());
+            let _ = plan.compiled.checked().set(());
         }
         let gate = self.enter(changes_session(&plan.statement));
         // The fast paths read tables by name: CTEs the context brings are

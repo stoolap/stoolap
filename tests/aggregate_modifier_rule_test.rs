@@ -131,6 +131,8 @@ fn a_modifier_on_a_call_to_no_aggregate_is_an_error_everywhere() {
             "UPDATE t SET k = k WHERE id = 99 RETURNING ABS(DISTINCT a)",
             "DELETE FROM t WHERE id = 99 RETURNING ABS(DISTINCT a)",
             "EXPLAIN SELECT ABS(DISTINCT a) FROM t",
+            "CREATE TABLE c2 AS SELECT ROW_NUMBER(DISTINCT a) OVER () AS n FROM t",
+            "CREATE TABLE c3 AS SELECT id FROM t WHERE 1 = 1 OR ABS(DISTINCT a) > 0",
             "INSERT INTO u VALUES (50, 1, ABS(DISTINCT 3))",
             "CREATE TABLE c1 (id INTEGER PRIMARY KEY, a INTEGER CHECK (ABS(DISTINCT a) > 0))",
         ] {
