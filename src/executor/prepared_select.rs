@@ -492,18 +492,17 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        // A star over a join is named only by its run, which counts its values
+        // A star over a join that merges columns is named only by its run,
+        // which counts its values
         let branches = std::iter::once(sq).chain(sq.set_operations.iter().map(|op| &*op.right));
         for branch in branches {
-            if matches!(
-                branch.table_expr.as_deref(),
-                Some(Expression::JoinSource(_))
-            ) && branch
-                .columns
-                .iter()
-                .any(|c| matches!(c, Expression::Star(_)))
+            if branch.table_expr.as_deref().is_some_and(merges_columns)
+                && branch
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c, Expression::Star(_)))
             {
-                return Err("a subquery block selecting * over a join");
+                return Err("a subquery block selecting * over a join that merges columns");
             }
         }
         let registry = &self.executor.function_registry;
@@ -2245,19 +2244,44 @@ fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Vec<S
             Expression::Star(_) if own.tables.len() > 1 => return Ok(None),
             Expression::Star(_) => names.extend(own.columns.iter().cloned()),
             Expression::QualifiedStar(star) => {
-                let qualifier = star.qualifier.to_lowercase();
-                let (_, start) = own
-                    .tables
-                    .iter()
-                    .find(|(name, _)| **name == *qualifier)
-                    .ok_or_else(|| Error::invalid_argument(unknown_qualifier(&star.qualifier)))?;
-                let (_, range) = own.table(*start);
-                names.extend(own.columns[range].iter().cloned());
+                names.extend(
+                    own.columns[qualified_star_columns(star, own)?]
+                        .iter()
+                        .cloned(),
+                );
             }
             _ => names.push(item_name(item)),
         }
     }
     Ok(Some(names))
+}
+
+/// How many values `stmt`'s rows hold over its FROM's scope `own`, a star
+/// over a join counting every column of its sides as its run does
+fn output_width(stmt: &SelectStatement, own: &ScopeTable) -> Result<usize> {
+    let mut width = 0;
+    for item in &stmt.columns {
+        width += match item {
+            Expression::Star(_) => own.columns.len(),
+            Expression::QualifiedStar(star) => qualified_star_columns(star, own)?.len(),
+            _ => 1,
+        };
+    }
+    Ok(width)
+}
+
+/// The positions in `own` of the columns `star` stands for
+fn qualified_star_columns(
+    star: &QualifiedStarExpression,
+    own: &ScopeTable,
+) -> Result<std::ops::Range<usize>> {
+    let qualifier = star.qualifier.to_lowercase();
+    let (_, start) = own
+        .tables
+        .iter()
+        .find(|(name, _)| **name == *qualifier)
+        .ok_or_else(|| Error::invalid_argument(unknown_qualifier(&star.qualifier)))?;
+    Ok(own.table(*start).1)
 }
 
 /// The names a walked statement's rows have, or the error of a star over
@@ -5363,10 +5387,10 @@ impl Builder<'_> {
         // Its own CTEs stay in scope for the join's binding below
         let walked = walk.statement_in_scope(sq, outer, 0, Check::All);
         let ctes = std::mem::take(&mut walk.ctes);
-        let (statement, names, own) = walked?;
+        let (statement, _, own) = walked?;
         let width = form.width().unwrap_or(0);
         if form.width().is_some() {
-            block_width(named(names)?.len(), width)?;
+            block_width(output_width(sq, &own)?, width)?;
         }
         self.max_param = self.max_param.max(max_param);
         let joined = own.tables.len() > 1;
