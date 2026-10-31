@@ -376,3 +376,106 @@ fn an_exists_ordered_by_position_over_a_merged_star_checks_the_merged_width() {
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
+
+/// Each EXISTS block form, the qualifier of its rows and whether it groups
+const EXISTS_FORMS: &[(&str, &str, bool)] = &[
+    ("SELECT w.k FROM w WHERE w.k = t.k", "w", false),
+    ("SELECT w.k FROM w WHERE w.k = t.k GROUP BY w.k", "w", true),
+    (
+        "SELECT w.k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY w.k",
+        "w",
+        true,
+    ),
+    (
+        "SELECT w.k FROM w WHERE w.k = t.k GROUP BY w.k HAVING COUNT(*) > (SELECT 0)",
+        "w",
+        true,
+    ),
+    (
+        "SELECT (SELECT 1) AS g, w.k FROM w WHERE w.k = t.k GROUP BY g, w.k",
+        "w",
+        true,
+    ),
+    (
+        "SELECT (SELECT 1), w.k FROM w WHERE w.k = t.k GROUP BY 1, w.k",
+        "w",
+        true,
+    ),
+    (
+        "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k",
+        "w",
+        false,
+    ),
+    (
+        "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k",
+        "w",
+        true,
+    ),
+    (
+        "SELECT w.k, (SELECT 1) FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k",
+        "w",
+        true,
+    ),
+    (
+        "SELECT (SELECT 1) AS g, w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY g, w.k",
+        "w",
+        true,
+    ),
+    (
+        "SELECT DISTINCT ON ((SELECT 1)) w.k FROM w WHERE w.k = t.k",
+        "w",
+        false,
+    ),
+    (
+        "SELECT q.k FROM (SELECT k, v, id FROM w WHERE w.k = t.k) AS q",
+        "q",
+        false,
+    ),
+    (
+        "SELECT q.k FROM (SELECT k, v, id FROM w WHERE w.k = t.k) AS q GROUP BY q.k",
+        "q",
+        true,
+    ),
+];
+
+/// Each ORDER BY key, `Q` its rows' qualifier, and whether it binds over
+/// rows and over groups; None where the form refuses it before binding
+const EXISTS_KEYS: &[(&str, Option<bool>, Option<bool>)] = &[
+    ("SUM(Q.v)", None, Some(true)),
+    ("t.id", Some(true), Some(true)),
+    ("ABS(Q.v)", Some(true), None),
+    ("ABS(MIN(Q.v))", None, Some(true)),
+    ("(SELECT v FROM u)", Some(true), Some(true)),
+    ("nosuch", Some(false), Some(false)),
+    ("Q.v", Some(true), Some(false)),
+    ("nofn(Q.k)", Some(false), Some(false)),
+    ("nofn((SELECT 1))", Some(false), Some(false)),
+];
+
+#[test]
+fn an_exists_binds_the_order_by_it_drops_in_every_form() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup(&dir, sealed);
+        let mode = if sealed { "sealed" } else { "hot" };
+        for (block, qualifier, grouped) in EXISTS_FORMS {
+            for (key, rows_bind, groups_bind) in EXISTS_KEYS {
+                let Some(binds) = (if *grouped { groups_bind } else { rows_bind }) else {
+                    continue;
+                };
+                let key = key.replace('Q', qualifier);
+                let sql =
+                    format!("SELECT id FROM t WHERE EXISTS ({block} ORDER BY {key}) ORDER BY id");
+                if *binds {
+                    let twin = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
+                    holds(&db, &sql, &twin, mode, &mut wrong);
+                } else if rows(&db, &sql).is_ok() {
+                    wrong.push(format!("{mode}: {sql} answers a key that does not bind"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
