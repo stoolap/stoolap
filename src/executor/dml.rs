@@ -28,7 +28,7 @@ use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use crate::storage::traits::{Engine, QueryResult, ScanAccess, Table, Transaction};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -2963,7 +2963,9 @@ impl Executor {
                 }
             };
 
-            table.update(where_expr.as_deref(), &mut setter)?
+            let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            table.update(access, where_expr.as_deref(), &mut setter)?
         } else {
             // Optimized path for non-correlated subqueries
             // CRITICAL: Pre-compile update expressions ONCE before the loop
@@ -3250,24 +3252,31 @@ impl Executor {
                         table.update_by_row_ids(&row_ids, &mut setter)?
                     }
                     Candidates::Scan(expr) | Candidates::Whole(expr) => {
-                        table.update(expr.as_deref(), &mut setter)?
+                        let plan = expr.as_deref().and_then(|e| table.index_plan(e));
+                        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                        table.update(access, expr.as_deref(), &mut setter)?
                     }
                 }
-            } else if let Some(ref where_clause) = memory_where_clause {
-                if let Some(row_ids) = self.select_row_ids_for_dml(
-                    table_name,
-                    where_clause,
-                    schema,
-                    table.as_ref(),
-                    ctx,
-                )? {
-                    table.update_by_row_ids(&row_ids, &mut setter)?
-                } else {
-                    // Fall back to storage layer (non-INTEGER PK or other unsupported case)
-                    table.update(where_expr.as_deref(), &mut setter)?
-                }
             } else {
-                table.update(where_expr.as_deref(), &mut setter)?
+                let row_ids = match memory_where_clause {
+                    Some(ref where_clause) => self.select_row_ids_for_dml(
+                        table_name,
+                        where_clause,
+                        schema,
+                        table.as_ref(),
+                        ctx,
+                    )?,
+                    None => None,
+                };
+                match row_ids {
+                    Some(row_ids) => table.update_by_row_ids(&row_ids, &mut setter)?,
+                    // The storage layer reads the rows the WHERE names
+                    None => {
+                        let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+                        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                        table.update(access, where_expr.as_deref(), &mut setter)?
+                    }
+                }
             };
             rows
         };
@@ -3669,7 +3678,9 @@ impl Executor {
             let mut scanner = if where_prepared {
                 None
             } else {
-                Some(table.scan(&column_indices, where_expr.as_deref())?)
+                let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                Some(table.scan_access(access, &column_indices, None, where_expr.as_deref())?)
             };
 
             // Pre-compute column name mappings for correlated subqueries
@@ -3868,21 +3879,24 @@ impl Executor {
             // Simple WHERE expression without RETURNING - use storage layer directly
             // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch delete.
             // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
-            if let Some(ref where_clause) = memory_where_clause {
-                if let Some(row_ids) = self.select_row_ids_for_dml(
+            let row_ids = match memory_where_clause {
+                Some(ref where_clause) => self.select_row_ids_for_dml(
                     table_name,
                     where_clause,
                     schema,
                     table.as_ref(),
                     ctx,
-                )? {
-                    table.delete_by_row_ids(&row_ids)?
-                } else {
-                    // Fall back to storage layer (non-INTEGER PK or other unsupported case)
-                    table.delete(where_expr.as_deref())?
+                )?,
+                None => None,
+            };
+            match row_ids {
+                Some(row_ids) => table.delete_by_row_ids(&row_ids)?,
+                // The storage layer reads the rows the WHERE names
+                None => {
+                    let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+                    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                    table.delete(access, where_expr.as_deref())?
                 }
-            } else {
-                table.delete(where_expr.as_deref())?
             }
         };
 
@@ -4291,7 +4305,9 @@ impl Executor {
         let updated = if row_id >= 0 {
             table.update_by_row_ids(&[row_id], &mut setter)?
         } else {
-            table.update(where_expr.as_deref(), &mut setter)?
+            let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            table.update(access, where_expr.as_deref(), &mut setter)?
         };
 
         Ok((updated > 0, captured_row))
@@ -4371,7 +4387,9 @@ impl Executor {
         } else {
             vec![0]
         };
-        let mut scanner = table.scan(&column_indices, Some(&*scan_expr))?;
+        let plan = table.index_plan(&*scan_expr);
+        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+        let mut scanner = table.scan_access(access, &column_indices, None, Some(&*scan_expr))?;
 
         let result = if scanner.next() {
             let row_id = scanner.current_row_id();

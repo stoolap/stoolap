@@ -18,7 +18,7 @@
 #![cfg(feature = "test-failpoints")]
 
 use std::sync::mpsc;
-use stoolap::storage::traits::Engine;
+use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::test_failpoints;
 use stoolap::Database;
 
@@ -99,7 +99,7 @@ fn a_prepared_row_another_handle_wrote_is_not_set_again() {
         writer.update_by_row_ids(&[1], &mut set).unwrap();
     });
     let mut calls = Vec::new();
-    let updated = updater.update(None, &mut |mut row| {
+    let updated = updater.update(ScanAccess::Seq, None, &mut |mut row| {
         calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
         row.set(1, stoolap::core::Value::Integer(7)).unwrap();
         Ok((row, true))
@@ -154,7 +154,7 @@ fn a_late_conflict_on_the_second_row_leaves_no_part_of_the_statement() {
         writer.update_by_row_ids(&[2], &mut set).unwrap();
     });
     let mut calls = Vec::new();
-    let updated = updater.update(None, &mut |mut row| {
+    let updated = updater.update(ScanAccess::Seq, None, &mut |mut row| {
         calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
         row.set(1, stoolap::core::Value::Integer(7)).unwrap();
         Ok((row, true))

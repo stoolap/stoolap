@@ -54,38 +54,6 @@ pub enum ScanPlan {
         filter: Option<String>,
         workers: usize,
     },
-    /// Primary key lookup - O(1) direct access by primary key
-    PkLookup {
-        table: String,
-        pk_column: String,
-        pk_value: String,
-    },
-    /// Index scan - uses an index to find matching rows
-    IndexScan {
-        table: String,
-        index_name: String,
-        column: String,
-        condition: String,
-        /// Non-indexed predicates applied as in-memory filter after index lookup
-        filter: Option<String>,
-    },
-    /// Multi-index scan - uses multiple indexes with AND/OR operations
-    MultiIndexScan {
-        table: String,
-        indexes: Vec<(String, String, String)>, // (index_name, column, condition)
-        operation: String,                      // "AND" or "OR"
-        /// Non-indexed predicates applied as in-memory filter after index lookup
-        filter: Option<String>,
-    },
-    /// Composite index scan - uses a multi-column index
-    CompositeIndexScan {
-        table: String,
-        index_name: String,
-        columns: Vec<String>,
-        conditions: Vec<String>,
-        /// Non-indexed predicates applied as in-memory filter after index lookup
-        filter: Option<String>,
-    },
     /// HNSW approximate nearest neighbor search
     VectorSearch {
         table: String,
@@ -122,67 +90,6 @@ impl fmt::Display for ScanPlan {
                 workers,
             } => {
                 write!(f, "Parallel Seq Scan on {} (workers={})", table, workers)?;
-                if let Some(flt) = filter {
-                    write!(f, "\n  Filter: {}", flt)?;
-                }
-                Ok(())
-            }
-            ScanPlan::PkLookup {
-                table,
-                pk_column,
-                pk_value,
-            } => {
-                write!(f, "PK Lookup on {}\n  {} = {}", table, pk_column, pk_value)
-            }
-            ScanPlan::IndexScan {
-                table,
-                index_name,
-                column,
-                condition,
-                filter,
-            } => {
-                write!(
-                    f,
-                    "Index Scan using {} on {}\n  Index Cond: {} {}",
-                    index_name, table, column, condition
-                )?;
-                if let Some(flt) = filter {
-                    write!(f, "\n  Filter: {}", flt)?;
-                }
-                Ok(())
-            }
-            ScanPlan::MultiIndexScan {
-                table,
-                indexes,
-                operation,
-                filter,
-            } => {
-                write!(f, "Multi-Index Scan on {} ({})", table, operation)?;
-                for (idx_name, col, cond) in indexes {
-                    write!(f, "\n  -> {} on {}: {}", idx_name, col, cond)?;
-                }
-                if let Some(flt) = filter {
-                    write!(f, "\n  Filter: {}", flt)?;
-                }
-                Ok(())
-            }
-            ScanPlan::CompositeIndexScan {
-                table,
-                index_name,
-                columns,
-                conditions,
-                filter,
-            } => {
-                write!(
-                    f,
-                    "Composite Index Scan using {} on {}\n  Columns: ({})",
-                    index_name,
-                    table,
-                    columns.join(", ")
-                )?;
-                for (col, cond) in columns.iter().zip(conditions.iter()) {
-                    write!(f, "\n  {} {}", col, cond)?;
-                }
                 if let Some(flt) = filter {
                     write!(f, "\n  Filter: {}", flt)?;
                 }
@@ -473,6 +380,7 @@ pub trait Table: Send + Sync {
     /// Updates rows matching the given expression
     ///
     /// # Arguments
+    /// * `access` - How the rows are found, decided by the caller
     /// * `where_expr` - Expression to filter rows to update (None means all rows)
     /// * `setter` - Function that transforms a row in place, returns true if changed
     ///
@@ -480,6 +388,7 @@ pub trait Table: Send + Sync {
     /// The number of rows updated
     fn update(
         &mut self,
+        access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
@@ -505,6 +414,7 @@ pub trait Table: Send + Sync {
     /// and adds what it set to `plan` without writing it
     fn plan_update(
         &mut self,
+        _access: ScanAccess<'_>,
         _where_expr: Option<&dyn Expression>,
         _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         _skip: Option<&FxHashMap<i64, u64>>,
@@ -608,17 +518,22 @@ pub trait Table: Send + Sync {
     /// Deletes rows matching the given expression
     ///
     /// # Arguments
+    /// * `access` - How the rows are found, decided by the caller
     /// * `where_expr` - Expression to filter rows to delete (None means all rows)
     ///
     /// # Returns
     /// The number of rows deleted
-    fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32>;
+    fn delete(
+        &mut self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<i32>;
 
     /// Truncates the table, removing all rows efficiently.
     /// Unlike DELETE, this drops storage directly instead of creating delete versions.
     /// Default implementation falls back to delete(None).
     fn truncate(&mut self) -> Result<i32> {
-        self.delete(None)
+        self.delete(ScanAccess::Seq, None)
     }
 
     /// `truncate`, running `after_check` once nothing refuses it and before
@@ -640,6 +555,18 @@ pub trait Table: Send + Sync {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>>;
+
+    /// The index plan the one access rule, `index_plan::decide`, picks for
+    /// `where_expr` over this table's indexes; None for a scan of every row
+    fn index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
+        let _ = where_expr;
+        None
+    }
+
+    /// `index_plan` for a read that stops at a count of rows
+    fn limited_index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
+        self.index_plan(where_expr)
+    }
 
     /// `scan` reading the rows `access` finds, each kept only when
     /// `where_expr` holds for it, `scan_needed` when `needed` marks the
@@ -720,6 +647,18 @@ pub trait Table: Send + Sync {
         // Default implementation: collect all and apply limit/offset
         let all_rows = self.collect_all_rows(where_expr)?;
         Ok(all_rows.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// `collect_rows_with_limit` reading the rows `access` finds
+    fn collect_access_rows_with_limit(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let _ = access;
+        self.collect_rows_with_limit(where_expr, limit, offset)
     }
 
     /// Collects rows with LIMIT/OFFSET without guaranteeing deterministic order.
@@ -1329,19 +1268,27 @@ pub trait Table: Send + Sync {
         Ok(None) // Default implementation - override in concrete tables
     }
 
+    /// The index walk `index_plan::top_k_walk` picks for a top-k read of
+    /// `column_name` under `where_expr`; None when no index walks it
+    fn top_k_walk(&self, where_expr: &dyn Expression, column_name: &str) -> Option<IndexPlan> {
+        let _ = (where_expr, column_name);
+        None
+    }
+
     /// The first `limit` rows after `offset` in the order of `column_name`,
     /// with `where_expr` applied, from a table that can find them without
-    /// reading every row. None when the table cannot answer in that order
-    /// and the caller must sort a full scan.
+    /// reading every row, its hot rows by `walk`. None when the table cannot
+    /// answer in that order and the caller must sort a full scan.
     fn scan_top_k(
         &self,
+        walk: Option<&IndexPlan>,
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
-        let _ = (where_expr, column_name, ascending, limit, offset);
+        let _ = (walk, where_expr, column_name, ascending, limit, offset);
         Ok(None)
     }
 
@@ -1537,25 +1484,6 @@ pub trait Table: Send + Sync {
         Err(Error::internal("this table keeps no history"))
     }
 
-    /// Explains what access method would be used for a scan
-    ///
-    /// This method analyzes the WHERE expression and returns a ScanPlan
-    /// describing how the query would be executed (without actually executing it).
-    /// Used by EXPLAIN to show users the query execution strategy.
-    ///
-    /// # Arguments
-    /// * `where_expr` - Optional filter expression to analyze
-    ///
-    /// # Returns
-    /// A ScanPlan describing the access method that would be used
-    fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
-        // Default implementation returns SeqScan
-        ScanPlan::SeqScan {
-            table: self.name().to_string(),
-            filter: where_expr.map(|e| format!("{:?}", e)),
-        }
-    }
-
     // ---- Zone Map Operations (Statistics for Segment Pruning) ----
 
     /// Sets the zone maps for this table
@@ -1743,88 +1671,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pk_lookup_display() {
-        let plan = ScanPlan::PkLookup {
-            table: "users".to_string(),
-            pk_column: "id".to_string(),
-            pk_value: "42".to_string(),
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("PK Lookup on users"));
-        assert!(display.contains("id = 42"));
-    }
-
-    #[test]
-    fn test_index_scan_display() {
-        let plan = ScanPlan::IndexScan {
-            table: "orders".to_string(),
-            index_name: "idx_customer_id".to_string(),
-            column: "customer_id".to_string(),
-            condition: "= 123".to_string(),
-            filter: None,
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("Index Scan using idx_customer_id on orders"));
-        assert!(display.contains("Index Cond: customer_id = 123"));
-    }
-
-    #[test]
-    fn test_multi_index_scan_display_and() {
-        let plan = ScanPlan::MultiIndexScan {
-            table: "products".to_string(),
-            indexes: vec![
-                (
-                    "idx_category".to_string(),
-                    "category".to_string(),
-                    "= 'electronics'".to_string(),
-                ),
-                (
-                    "idx_price".to_string(),
-                    "price".to_string(),
-                    "> 100".to_string(),
-                ),
-            ],
-            operation: "AND".to_string(),
-            filter: None,
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("Multi-Index Scan on products (AND)"));
-        assert!(display.contains("idx_category on category: = 'electronics'"));
-        assert!(display.contains("idx_price on price: > 100"));
-    }
-
-    #[test]
-    fn test_multi_index_scan_display_or() {
-        let plan = ScanPlan::MultiIndexScan {
-            table: "items".to_string(),
-            indexes: vec![
-                ("idx_a".to_string(), "col_a".to_string(), "= 1".to_string()),
-                ("idx_b".to_string(), "col_b".to_string(), "= 2".to_string()),
-            ],
-            operation: "OR".to_string(),
-            filter: None,
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("Multi-Index Scan on items (OR)"));
-    }
-
-    #[test]
-    fn test_composite_index_scan_display() {
-        let plan = ScanPlan::CompositeIndexScan {
-            table: "orders".to_string(),
-            index_name: "idx_cust_date".to_string(),
-            columns: vec!["customer_id".to_string(), "order_date".to_string()],
-            conditions: vec!["= 100".to_string(), "> '2024-01-01'".to_string()],
-            filter: None,
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("Composite Index Scan using idx_cust_date on orders"));
-        assert!(display.contains("Columns: (customer_id, order_date)"));
-        assert!(display.contains("customer_id = 100"));
-        assert!(display.contains("order_date > '2024-01-01'"));
-    }
-
-    #[test]
     fn test_scan_plan_debug() {
         let plan = ScanPlan::SeqScan {
             table: "test".to_string(),
@@ -1833,55 +1679,6 @@ mod tests {
         let debug = format!("{:?}", plan);
         assert!(debug.contains("SeqScan"));
         assert!(debug.contains("test"));
-    }
-
-    #[test]
-    fn test_scan_plan_clone() {
-        let plan = ScanPlan::PkLookup {
-            table: "users".to_string(),
-            pk_column: "id".to_string(),
-            pk_value: "1".to_string(),
-        };
-        let cloned = plan.clone();
-        match cloned {
-            ScanPlan::PkLookup {
-                table,
-                pk_column,
-                pk_value,
-            } => {
-                assert_eq!(table, "users");
-                assert_eq!(pk_column, "id");
-                assert_eq!(pk_value, "1");
-            }
-            _ => panic!("Expected PkLookup"),
-        }
-    }
-
-    #[test]
-    fn test_multi_index_scan_empty_indexes() {
-        let plan = ScanPlan::MultiIndexScan {
-            table: "empty".to_string(),
-            indexes: vec![],
-            operation: "AND".to_string(),
-            filter: None,
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("Multi-Index Scan on empty (AND)"));
-    }
-
-    #[test]
-    fn test_composite_index_scan_single_column() {
-        let plan = ScanPlan::CompositeIndexScan {
-            table: "single".to_string(),
-            index_name: "idx_single".to_string(),
-            columns: vec!["id".to_string()],
-            conditions: vec!["= 1".to_string()],
-            filter: None,
-        };
-        let display = format!("{}", plan);
-        assert!(display.contains("Composite Index Scan using idx_single on single"));
-        assert!(display.contains("Columns: (id)"));
-        assert!(display.contains("id = 1"));
     }
 
     #[test]

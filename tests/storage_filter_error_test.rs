@@ -302,7 +302,7 @@ mod written_by_the_filter {
     use stoolap::functions::scalar::{AbsFunction, SleepFunction};
     use stoolap::functions::{FunctionInfo, ScalarFunction};
     use stoolap::storage::expression::{AndExpr, Expression, FunctionArg, FunctionExpr};
-    use stoolap::storage::traits::{Engine, Table};
+    use stoolap::storage::traits::{Engine, ScanAccess, Table};
     use stoolap::Database;
 
     thread_local! {
@@ -366,7 +366,9 @@ mod written_by_the_filter {
             WRITE.with(|slot| *slot.borrow_mut() = Some(write));
             let mut filter = filter();
             filter.prepare_for_schema(first.schema());
-            let updated = first.update(Some(filter.as_ref()), &mut |row| Ok((row, true)));
+            let plan = first.index_plan(filter.as_ref());
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            let updated = first.update(access, Some(filter.as_ref()), &mut |row| Ok((row, true)));
             let _ = done.send(updated.map_err(|e| e.to_string()));
         });
         finished

@@ -61,14 +61,14 @@ pub trait IndexTerm {
 
 impl<'e> IndexTerm for dyn Expression + 'e {
     fn term<'s>(&'s self, _schema: &'s Schema) -> Term<'s> {
+        if let Some((column, operator, _)) = self.get_comparison_info() {
+            return Term::Compare { column, operator };
+        }
         if self.get_and_operands().is_some() {
             return Term::And;
         }
         if self.get_or_operands().is_some() {
             return Term::Or;
-        }
-        if let Some((column, operator, _)) = self.get_comparison_info() {
-            return Term::Compare { column, operator };
         }
         let any = self.as_any();
         if let Some(between) = any.downcast_ref::<BetweenExpr>() {
@@ -129,6 +129,9 @@ pub enum IndexPlan {
     Intersect(Vec<IndexPlan>),
     /// The rows any read names, one read for each operand of an OR
     Union(Vec<IndexPlan>),
+    /// An OR whose operands an index reads where it has one, by position,
+    /// and a scan asks the others of the rows the reads did not name
+    Mixed(Vec<Option<IndexPlan>>),
 }
 
 impl std::fmt::Debug for IndexPlan {
@@ -146,11 +149,26 @@ impl IndexPlan {
         lines
     }
 
+    /// Whether the plan lists primary keys, which are row ids: it reads no
+    /// index, and its ids name the transaction's own rows too
+    pub fn names_keys(&self) -> bool {
+        matches!(self, Self::Key | Self::Keys)
+    }
+
     fn explain_into(&self, depth: usize, lines: &mut Vec<String>) {
         let indent = "  ".repeat(depth);
         match self {
             Self::Key => lines.push(format!("{indent}PkKey")),
             Self::Keys => lines.push(format!("{indent}PkKeys")),
+            Self::Mixed(reads) => {
+                lines.push(format!("{indent}MixedOr"));
+                for read in reads {
+                    match read {
+                        Some(read) => read.explain_into(depth + 1, lines),
+                        None => lines.push(format!("{indent}  Scan")),
+                    }
+                }
+            }
             Self::Read { index, read } => lines.push(format!(
                 "{indent}Index {} ({} {})",
                 index.name(),
@@ -229,25 +247,40 @@ struct Asked<'a> {
 
 /// The indexes that find the rows of `where_` on a table of `schema`, None
 /// when no index answers it. A PK equality names its row and a PK list its
-/// members' rows; a multi-column
-/// index reads equalities on its leading columns and a bounded range on the
-/// next; each other column is read by its own index, an equality before a
-/// list, a LIKE prefix and a range. A truth value equality is left to the
-/// scan. An OR is read when each operand is
+/// members' rows; a multi-column index reads equalities on its leading
+/// columns and a bounded range on the next; each other column, the PK's
+/// bounds among them, is read by its own index, an equality before a list,
+/// a LIKE prefix and a range. A truth value equality is left to the scan.
+/// An OR is read when each operand is; a `limited` read, one that stops at
+/// a count of rows, reads a WHERE that is one OR by its indexed operands
+/// first and scans for the others
 pub fn decide<T: IndexTerm + ?Sized>(
     store: &VersionStore,
     schema: &Schema,
     where_: &T,
+    limited: bool,
 ) -> Option<IndexPlan> {
+    // A key equality alone, a point read's WHERE, answers before the scope
+    if let Term::Compare {
+        column,
+        operator: Operator::Eq,
+    } = where_.term(schema)
+    {
+        let pk = schema.pk_column_index().map(|at| &schema.columns[at].name);
+        if pk.is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
+            return Some(IndexPlan::Key);
+        }
+    }
     let mut scope = SmallVec::new();
     conjuncts(where_, schema, &mut scope);
-    decide_scope(store, schema, &scope)
+    decide_scope(store, schema, &scope, limited)
 }
 
 fn decide_scope<T: IndexTerm + ?Sized>(
     store: &VersionStore,
     schema: &Schema,
     scope: &[&T],
+    limited: bool,
 ) -> Option<IndexPlan> {
     let pk = schema
         .pk_column_index()
@@ -304,7 +337,6 @@ fn decide_scope<T: IndexTerm + ?Sized>(
     {
         return Some(IndexPlan::Keys);
     }
-
     let mut reads: SmallVec<[IndexPlan; 2]> = SmallVec::new();
     let equal: SmallVec<[&str; 4]> = asked.iter().filter(|a| a.equal).map(|a| a.column).collect();
     // Two columns at least: two equalities, or one and another's range
@@ -354,19 +386,24 @@ fn decide_scope<T: IndexTerm + ?Sized>(
             },
         );
     }
+    let whole_or = limited && scope.len() == 1 && ors.len() == 1;
     for or in ors {
         let mut operands = SmallVec::new();
         disjuncts(or, schema, &mut operands);
-        let union: Option<Vec<IndexPlan>> = operands
+        let plans: Vec<Option<IndexPlan>> = operands
             .iter()
             .map(|&operand| {
                 let mut scope = SmallVec::new();
                 conjuncts(operand, schema, &mut scope);
-                decide_scope(store, schema, &scope)
+                decide_scope(store, schema, &scope, false)
             })
             .collect();
-        if let Some(union) = union {
-            reads.push(IndexPlan::Union(union));
+        // A limited read of a WHERE that is one OR, some of its operands
+        // indexed, reads those and scans for the others
+        if plans.iter().all(Option::is_some) {
+            reads.push(IndexPlan::Union(plans.into_iter().flatten().collect()));
+        } else if whole_or && plans.iter().any(Option::is_some) {
+            return Some(IndexPlan::Mixed(plans));
         }
     }
     match reads.len() {
@@ -374,6 +411,61 @@ fn decide_scope<T: IndexTerm + ?Sized>(
         1 => reads.pop(),
         _ => Some(IndexPlan::Intersect(reads.into_vec())),
     }
+}
+
+/// The index a top-k read of `column` walks in key order under `where_`, a
+/// conjunction of comparisons: a multi-column index its equalities lead,
+/// walked on its next column, or the column's own index under bounds on it
+/// alone. None leaves the order to a sort
+pub fn top_k_walk<T: IndexTerm + ?Sized>(
+    store: &VersionStore,
+    schema: &Schema,
+    where_: &T,
+    column: &str,
+) -> Option<IndexPlan> {
+    let mut scope = SmallVec::new();
+    conjuncts(where_, schema, &mut scope);
+    let mut compares: SmallVec<[(&str, Operator); 8]> = SmallVec::new();
+    for conjunct in scope {
+        let Term::Compare { column, operator } = conjunct.term(schema) else {
+            return None;
+        };
+        compares.push((column, operator));
+    }
+    let equal: SmallVec<[&str; 4]> = compares
+        .iter()
+        .filter(|(_, operator)| *operator == Operator::Eq)
+        .map(|(column, _)| *column)
+        .collect();
+    let prefix = (!equal.is_empty())
+        .then(|| store.get_multi_column_index(&equal))
+        .flatten()
+        .filter(|(index, matched)| index.column_names().len() > *matched);
+    if let Some((index, equal)) = prefix {
+        if !index.column_names()[equal].eq_ignore_ascii_case(column) {
+            return None;
+        }
+        let ranged = compares
+            .iter()
+            .any(|(name, operator)| name.eq_ignore_ascii_case(column) && *operator != Operator::Eq);
+        return Some(IndexPlan::Prefix {
+            index,
+            equal,
+            ranged,
+        });
+    }
+    let bounded = compares.iter().all(|(name, operator)| {
+        name.eq_ignore_ascii_case(column)
+            && matches!(
+                operator,
+                Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte
+            )
+    });
+    let index = store.get_index_by_column(column)?;
+    bounded.then_some(IndexPlan::Read {
+        index,
+        read: Read::Range,
+    })
 }
 
 /// The multi-column index `equal`'s columns lead, with how many it reads by

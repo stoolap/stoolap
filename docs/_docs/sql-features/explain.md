@@ -256,10 +256,12 @@ plan
 ----
 SELECT
   Columns: category, SUM(value)
-  -> Index Scan using idx_value on products
-       Index Cond: value > 0
+  -> IndexScan products (value > 0)
+       Index idx_value (value range)
   Group By: category
 ```
+
+The scan line is the same one a planned statement prints: the access rule that chooses its keys or indexes is one rule for every path.
 
 ### Views, CTEs and Derived Tables
 
@@ -558,6 +560,7 @@ For a planned single-table SELECT:
 | CompositeIndex | A multi-column index: equalities on its leading columns, a range on the next one |
 | PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
 | Intersect, Union | The rows every index under it names, or any of them names |
+| MixedOr | A read that stops at a LIMIT, of a WHERE that is one OR: the rows its indexed operands name, then a scan asking the others (`Scan`) |
 | IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row; for window functions, rows in their ORDER BY column's order |
 | DistinctValues | The distinct values the table keeps for one column, for a DISTINCT of that column with no WHERE |
 | PartitionsByIndex | Rows grouped by the window functions' PARTITION BY column through its index, or a partition at a time to the LIMIT |
@@ -588,9 +591,7 @@ For other statements:
 | Component | Description |
 |-----------|-------------|
 | Seq Scan | Full table scan (reads all rows) |
-| PK Lookup | Direct access by primary key |
-| Index Scan | Uses index to find rows |
-| Index Cond | Condition pushed to index |
+| IndexScan | Reads the rows its keys or indexes name, listed under it |
 | Filter | Condition applied after scan |
 
 ### Join Methods

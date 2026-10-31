@@ -26,7 +26,7 @@ use std::time::Duration;
 use stoolap::core::{Operator, Value};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
 use stoolap::storage::mvcc::registry::StatementView;
-use stoolap::storage::traits::{Engine, Table, Transaction};
+use stoolap::storage::traits::{Engine, ScanAccess, Table, Transaction};
 use stoolap::Database;
 
 const WATCHDOG: Duration = Duration::from_secs(15);
@@ -136,7 +136,11 @@ fn state(table: &dyn Table) -> Vec<(i64, i64)> {
     for id in 1..=7 {
         let mut key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(id));
         key.prepare_for_schema(table.schema());
-        let mut scanner = table.scan(&[0, 1], Some(&key)).unwrap();
+        let plan = table.index_plan(&key);
+        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+        let mut scanner = table
+            .scan_access(access, &[0, 1], None, Some(&key))
+            .unwrap();
         while scanner.next() {
             looked_up.push(pair(id, scanner.row()));
         }

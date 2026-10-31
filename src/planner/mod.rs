@@ -405,7 +405,7 @@ pub fn scan_choice(
     schema: &Schema,
     pushed: Option<&Expression>,
 ) -> ScanChoice {
-    match pushed.and_then(|pushed| index_plan::decide(store, schema, pushed)) {
+    match pushed.and_then(|pushed| index_plan::decide(store, schema, pushed, false)) {
         Some(plan) => ScanChoice::Index(plan),
         None => ScanChoice::Seq,
     }

@@ -12417,6 +12417,9 @@ struct BlockState {
     vm: RefCell<ExprVM>,
     /// Its pushed comparisons, given each call's values in place
     bound: RefCell<Option<BoundPushdown>>,
+    /// The index plan the access rule picks for `bound`, whose shape the
+    /// calls keep: decided on the first call that scans by it
+    access: std::cell::OnceCell<Option<crate::storage::mvcc::index_plan::IndexPlan>>,
     /// An uncorrelated block's value, once computed
     value: RefCell<Option<Value>>,
     /// How many times its buffer was filled in this run
@@ -12504,7 +12507,16 @@ impl<'a> PreparedRunner<'a> {
     fn scan(&self, index: usize, expr: Option<&dyn StorageExpr>) -> Result<Box<dyn Scanner>> {
         match &self.tables[index] {
             Some(BlockInput::Table(table)) => {
-                table.scan(&self.prepared.subqueries[index].column_indices, expr)
+                let access = match expr {
+                    Some(expr) => self.blocks[index]
+                        .access
+                        .get_or_init(|| table.index_plan(expr))
+                        .as_ref()
+                        .map_or(ScanAccess::Seq, ScanAccess::Index),
+                    None => ScanAccess::Seq,
+                };
+                let columns = &self.prepared.subqueries[index].column_indices;
+                table.scan_access(access, columns, None, expr)
             }
             Some(BlockInput::Rows(rows)) => Ok(Box::new(PointRows {
                 rows: CompactArc::clone(rows),
@@ -12589,6 +12601,7 @@ impl<'a> PreparedRunner<'a> {
                     buffer: RefCell::new(base.clone()),
                     vm: RefCell::new(ExprVM::new()),
                     bound: RefCell::new(None),
+                    access: std::cell::OnceCell::new(),
                     value: RefCell::new(None),
                     fills: std::cell::Cell::new(0),
                     answered: RefCell::new(None),
@@ -13043,7 +13056,17 @@ impl<'a> PreparedRunner<'a> {
             }
             return Ok(walked);
         }
-        let rows = table.scan_top_k(storage_expr.as_deref(), column, ascending, limit, offset)?;
+        let walk = storage_expr
+            .as_deref()
+            .and_then(|expr| table.top_k_walk(expr, column));
+        let rows = table.scan_top_k(
+            walk.as_ref(),
+            storage_expr.as_deref(),
+            column,
+            ascending,
+            limit,
+            offset,
+        )?;
         // A read that checks for no cancel is the statement's all the same
         ctx.check_cancelled()?;
         if rows.is_some() {
@@ -13118,21 +13141,25 @@ impl<'a> PreparedRunner<'a> {
                             break 'read (Some(rows.into_iter()), None, true, scanned_whole);
                         }
                     }
+                    // A read the plan did not choose is chosen here by the same rule
+                    let limited = target.filter(|_| scanned_whole);
+                    let decided;
                     let access = match scan {
-                        Some(ScanChoice::Index(plan)) => Some(ScanAccess::Index(plan)),
-                        Some(ScanChoice::Seq) => Some(ScanAccess::Seq),
-                        None => None,
+                        Some(ScanChoice::Index(plan)) => ScanAccess::Index(plan),
+                        Some(ScanChoice::Seq) => ScanAccess::Seq,
+                        None => {
+                            decided = filter.and_then(|filter| match limited {
+                                Some(_) => table.limited_index_plan(filter),
+                                None => table.index_plan(filter),
+                            });
+                            decided.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
+                        }
                     };
-                    match target.filter(|_| scanned_whole) {
+                    match limited {
                         Some(target) => {
-                            let answers = match access {
-                                Some(access) => table.collect_access_rows_with_limit_unordered(
-                                    access, filter, target, 0,
-                                )?,
-                                None => {
-                                    table.collect_rows_with_limit_unordered(filter, target, 0)?
-                                }
-                            };
+                            let answers = table.collect_access_rows_with_limit_unordered(
+                                access, filter, target, 0,
+                            )?;
                             // A read that checks for no cancel is the statement's all the same
                             ctx.check_cancelled()?;
                             return Ok(Passing::Answers(answers));
@@ -13147,22 +13174,13 @@ impl<'a> PreparedRunner<'a> {
                                 && extra_whole
                                 && needed.is_none()
                             {
-                                let rows = match access {
-                                    Some(access) => table.collect_access_rows(access, filter)?,
-                                    None => table.collect_all_rows(filter)?,
-                                };
+                                let rows = table.collect_access_rows(access, filter)?;
                                 // A read that checks for no cancel is the statement's all the same
                                 ctx.check_cancelled()?;
                                 return Ok(Passing::Answers(rows));
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();
-                            let scan = match (access, needed) {
-                                (Some(access), _) => {
-                                    table.scan_access(access, &all, needed, filter)?
-                                }
-                                (None, Some(needed)) => table.scan_needed(&all, needed, filter)?,
-                                (None, None) => table.scan(&all, filter)?,
-                            };
+                            let scan = table.scan_access(access, &all, needed, filter)?;
                             if stream && scanned_whole && extra_whole {
                                 return Ok(Passing::Scan(scan));
                             }

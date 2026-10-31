@@ -25,7 +25,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use stoolap::core::Error;
-use stoolap::storage::traits::Engine;
+use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::test_failpoints::{
     after_cold_round_prepared, after_delete_rows_scanned, block_file_reads,
     block_store_drops_by_fence, volume_file_drops_by_fence, volume_file_reads_by_fence,
@@ -644,7 +644,7 @@ fn every_row_with_one_its_transaction_changed_since_the_round_is_deleted_once() 
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut deleter = txn.get_table("t").unwrap();
     let done = update_through_another_handle(txn.get_table("t").unwrap(), &[1]);
-    let deleted = deleter.delete(None);
+    let deleted = deleter.delete(ScanAccess::Seq, None);
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(
@@ -669,7 +669,9 @@ fn a_row_its_transaction_changed_since_the_round_meets_the_filter_again() {
     let done = update_through_another_handle(txn.get_table("t").unwrap(), &[1]);
     let mut filter = ComparisonExpr::new("x", Operator::Eq, Value::Integer(0));
     filter.prepare_for_schema(deleter.schema());
-    let deleted = deleter.delete(Some(&filter));
+    let plan = deleter.index_plan(&filter);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let deleted = deleter.delete(access, Some(&filter));
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(
@@ -695,7 +697,9 @@ fn a_key_its_transaction_changed_since_the_round_is_deleted_once() {
     let done = update_through_another_handle(txn.get_table("t").unwrap(), &[1]);
     let mut key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(1));
     key.prepare_for_schema(deleter.schema());
-    let deleted = deleter.delete(Some(&key));
+    let plan = deleter.index_plan(&key);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let deleted = deleter.delete(access, Some(&key));
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(
@@ -728,7 +732,7 @@ fn more_rows_than_fit_inline_its_transaction_changed_since_the_round_are_deleted
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut deleter = txn.get_table("t").unwrap();
     let done = update_through_another_handle(txn.get_table("t").unwrap(), &[6, 1, 5, 2, 4, 3]);
-    let deleted = deleter.delete(None);
+    let deleted = deleter.delete(ScanAccess::Seq, None);
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(

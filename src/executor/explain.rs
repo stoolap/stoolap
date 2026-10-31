@@ -22,6 +22,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
 use crate::planner::join::{pair_method, PairMethod};
+use crate::planner::ScanChoice;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{QueryResult, ScanPlan};
 
@@ -399,8 +400,8 @@ impl Executor {
                             None
                         };
 
-                        // Get the scan plan
-                        let scan_plan = table.explain_scan(storage_expr.as_deref());
+                        // The access the rule decides, shown as the runner shows it
+                        let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
 
                         // For SeqScan, use the AST expression's Display format instead of storage expr Debug
                         // Check if parallel execution would be used based on TABLE's row count (not output rows)
@@ -410,12 +411,10 @@ impl Executor {
                         let would_use_parallel = where_clause.is_some()
                             && parallel_config.should_parallel_filter(table_row_count);
 
-                        let scan_plan = match scan_plan {
-                            ScanPlan::SeqScan {
-                                table: tbl,
-                                filter: _,
-                            } if where_clause.is_some() => {
-                                let filter_str = Some(format!("{}", where_clause.unwrap()));
+                        let tbl = table.schema().table_name.clone();
+                        let plan_str = match where_clause {
+                            Some(where_clause) if plan.is_none() => {
+                                let filter_str = Some(format!("{}", where_clause));
                                 if would_use_parallel {
                                     ScanPlan::ParallelSeqScan {
                                         table: tbl,
@@ -437,12 +436,21 @@ impl Executor {
                                         filter: filter_str,
                                     }
                                 }
+                                .to_string()
                             }
-                            other => other,
+                            _ => match plan {
+                                Some(plan) => ScanChoice::Index(plan)
+                                    .explain(&tbl, where_clause)
+                                    .join("\n"),
+                                None => ScanPlan::SeqScan {
+                                    table: tbl,
+                                    filter: None,
+                                }
+                                .to_string(),
+                            },
                         };
 
                         // Format the scan plan with actual stats
-                        let plan_str = format!("{}", scan_plan);
                         for (i, line) in plan_str.lines().enumerate() {
                             if i == 0 {
                                 lines.push(format!(
@@ -920,22 +928,22 @@ impl Executor {
                             None
                         };
 
-                        // Get the scan plan
-                        let scan_plan = table.explain_scan(storage_expr.as_deref());
-
-                        // For SeqScan, use the AST expression's Display format instead of storage expr Debug
-                        let scan_plan = match scan_plan {
-                            ScanPlan::SeqScan { table, filter: _ } if where_clause.is_some() => {
-                                ScanPlan::SeqScan {
-                                    table,
-                                    filter: Some(format!("{}", where_clause.unwrap())),
-                                }
+                        // The access the rule decides, shown as the runner shows it
+                        let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
+                        let table = table.schema().table_name.clone();
+                        let plan_str = match plan {
+                            Some(plan) => ScanChoice::Index(plan)
+                                .explain(&table, where_clause)
+                                .join("\n"),
+                            // For SeqScan, use the AST expression's Display format instead of storage expr Debug
+                            None => ScanPlan::SeqScan {
+                                table,
+                                filter: where_clause.map(|w| format!("{}", w)),
                             }
-                            other => other,
+                            .to_string(),
                         };
 
                         // Format the scan plan with indentation
-                        let plan_str = format!("{}", scan_plan);
                         for (i, line) in plan_str.lines().enumerate() {
                             if i == 0 {
                                 lines.push(format!("{}-> {}", prefix, line));

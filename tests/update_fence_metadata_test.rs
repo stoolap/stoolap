@@ -22,7 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::core::{Operator, Row, Value};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
-use stoolap::storage::traits::Engine;
+use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::test_failpoints::{
     after_cold_round_prepared, after_cold_round_settled, block_file_reads, cold_rounds,
     side_file_reads, volume_file_reads_by_fence, FailpointGuard,
@@ -210,7 +210,9 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
     // Rows 1..=5 (k 10..50), and 9001 (k 5) once sealed
     let mut filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(60));
     filter.prepare_for_schema(table.schema());
-    let result = table.update(Some(&filter), &mut set_v(&mut calls));
+    let plan = table.index_plan(&filter);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let result = table.update(access, Some(&filter), &mut set_v(&mut calls));
     let (outside, under) = delta(block_file_reads(), before);
     let other_under = delta(other_reads_under_fence(), other_before);
     let seen = rows_through(table.as_ref());
@@ -247,8 +249,12 @@ fn the_rows_read_back_through_the_transaction_show_its_own_writes() {
     let mut calls = Vec::new();
     let mut filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(30));
     filter.prepare_for_schema(table.schema());
+    let plan = table.index_plan(&filter);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
     assert_eq!(
-        table.update(Some(&filter), &mut set_v(&mut calls)).unwrap(),
+        table
+            .update(access, Some(&filter), &mut set_v(&mut calls))
+            .unwrap(),
         2
     );
     let seen = rows_through(table.as_ref());

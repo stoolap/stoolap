@@ -1714,6 +1714,7 @@ fn colorize_node(line: &str, result: &mut String) {
 
     // Indexed access patterns (green)
     let indexed = [
+        "IndexScan",
         "Index Scan",
         "PK Lookup",
         "Multi-Index Scan",

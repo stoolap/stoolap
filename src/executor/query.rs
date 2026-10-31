@@ -39,7 +39,7 @@ use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::mvcc::version_store::LayoutToken;
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::{Engine, QueryResult, ScanAccess};
 
 /// Maximum depth for nested views to prevent stack overflow
 const MAX_VIEW_DEPTH: usize = 32;
@@ -4268,8 +4268,16 @@ impl Executor {
             // Use unordered version since ORDER BY is already confirmed empty by can_pushdown_limit
             // This enables true early termination without sorting overhead
             // Now returns RowVec directly with row IDs preserved
-            let rows =
-                table.collect_rows_with_limit_unordered(storage_expr.as_deref(), limit, offset)?;
+            let plan = storage_expr
+                .as_deref()
+                .and_then(|e| table.limited_index_plan(e));
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            let rows = table.collect_access_rows_with_limit_unordered(
+                access,
+                storage_expr.as_deref(),
+                limit,
+                offset,
+            )?;
 
             // Project rows according to SELECT expressions
             // Note: collect_rows_with_limit always returns full rows (all columns),
@@ -4343,12 +4351,14 @@ impl Executor {
                     && !classification.where_has_subqueries)
                     .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
                     .flatten();
-                let scanner = match needed {
-                    Some(mask) => {
-                        table.scan_needed(&column_idx_vec, &mask, storage_expr.as_deref())?
-                    }
-                    None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
-                };
+                let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
+                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                let scanner = table.scan_access(
+                    access,
+                    &column_idx_vec,
+                    needed.as_deref(),
+                    storage_expr.as_deref(),
+                )?;
 
                 let mut result: Box<dyn QueryResult> =
                     Box::new(ScannerResult::new(scanner, all_columns.clone()));
@@ -4668,6 +4678,10 @@ impl Executor {
                     // with early termination. We fetch in batches to avoid loading
                     // all rows when only a few are needed.
                     let mut result_rows = RowVec::with_capacity(target.min(1000));
+                    let plan = storage_expr
+                        .as_deref()
+                        .and_then(|e| table.limited_index_plan(e));
+                    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
 
                     if needs_memory_filter {
                         // PARTIAL PUSHDOWN: Storage handles some filtering, memory handles rest.
@@ -4682,7 +4696,8 @@ impl Executor {
                         loop {
                             // Fetch batch from storage with storage filter + limit
                             // Now returns RowVec directly with row IDs preserved
-                            let batch = table.collect_rows_with_limit(
+                            let batch = table.collect_access_rows_with_limit(
+                                access,
                                 storage_expr.as_deref(),
                                 batch_size,
                                 offset,
@@ -4713,8 +4728,12 @@ impl Executor {
                     } else {
                         // NO MEMORY FILTER NEEDED: Full filter pushed to storage.
                         // Use storage-level limit directly. Returns RowVec directly.
-                        result_rows =
-                            table.collect_rows_with_limit(storage_expr.as_deref(), target, 0)?;
+                        result_rows = table.collect_access_rows_with_limit(
+                            access,
+                            storage_expr.as_deref(),
+                            target,
+                            0,
+                        )?;
                     }
 
                     // The rows OFFSET skips were collected too; drop them and cut to
@@ -4748,16 +4767,18 @@ impl Executor {
                 // Without a storage filter there is no index opportunity,
                 // so the table hands back the materialized RowVec directly
                 // (with real row ids) instead of a per-row scanner drain.
-                // With one, scan() keeps its PK/index fast paths.
+                // With one, the access rule picks the scan's keys or indexes.
                 let all_rows = if storage_expr.is_none() {
                     table.collect_all_rows(None)?
                 } else {
-                    let mut scanner = match needed.as_deref() {
-                        Some(mask) => {
-                            table.scan_needed(&column_idx_vec, mask, storage_expr.as_deref())?
-                        }
-                        None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
-                    };
+                    let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
+                    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                    let mut scanner = table.scan_access(
+                        access,
+                        &column_idx_vec,
+                        needed.as_deref(),
+                        storage_expr.as_deref(),
+                    )?;
                     let mut all_rows =
                         RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
                     while scanner.next() {
@@ -4828,12 +4849,14 @@ impl Executor {
                 // Create scanner for the correlated subquery path
                 // For correlated subqueries, we can't push down the WHERE clause to storage
                 // because it depends on outer row values that change per row
-                let mut scanner = match needed.as_deref() {
-                    Some(mask) => {
-                        table.scan_needed(&column_idx_vec, mask, storage_expr.as_deref())?
-                    }
-                    None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
-                };
+                let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
+                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                let mut scanner = table.scan_access(
+                    access,
+                    &column_idx_vec,
+                    needed.as_deref(),
+                    storage_expr.as_deref(),
+                )?;
 
                 // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
                 let mut rows: RowVec = RowVec::with_capacity(64);
@@ -5010,10 +5033,14 @@ impl Executor {
                 && !classification.where_has_subqueries)
                 .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
                 .flatten();
-            let mut scanner = match needed {
-                Some(mask) => table.scan_needed(&column_idx_vec, &mask, storage_expr.as_deref())?,
-                None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
-            };
+            let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            let mut scanner = table.scan_access(
+                access,
+                &column_idx_vec,
+                needed.as_deref(),
+                storage_expr.as_deref(),
+            )?;
 
             // OPTIMIZATION: Use take_row() to avoid cloning each row
             // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations

@@ -19,7 +19,7 @@ use std::path::Path;
 
 use stoolap::core::{Operator, Row, Value};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
-use stoolap::storage::traits::{Engine, Table};
+use stoolap::storage::traits::{Engine, ScanAccess, Table};
 use stoolap::Database;
 
 fn dsn(dir: &Path) -> String {
@@ -61,7 +61,9 @@ fn crash_image(from: &Path, to: &Path) {
 fn delete_row_1(table: &mut dyn Table) {
     let mut filter = ComparisonExpr::new("id", Operator::Eq, Value::Integer(1));
     filter.prepare_for_schema(table.schema());
-    assert_eq!(table.delete(Some(&filter)).unwrap(), 1);
+    let plan = table.index_plan(&filter);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    assert_eq!(table.delete(access, Some(&filter)).unwrap(), 1);
 }
 
 fn recovered(dir: &Path) -> Vec<i64> {
