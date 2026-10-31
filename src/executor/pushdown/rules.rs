@@ -20,6 +20,7 @@
 use crate::core::{Operator, Value};
 use crate::executor::volatility::statement_constant;
 use crate::functions::global_registry;
+use crate::functions::scalar::vector::read_as_vector;
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr, FunctionArg,
@@ -850,7 +851,7 @@ impl FunctionRule {
         let mut args = Vec::with_capacity(func_call.arguments.len());
         for arg in &func_call.arguments {
             // Bail out when an argument can't be converted.
-            args.push(self.convert_func_arg(arg, ctx)?);
+            args.push(self.convert_func_arg(arg, scalar_func.reads_vectors(), ctx)?);
         }
 
         // Get the comparison value
@@ -864,10 +865,12 @@ impl FunctionRule {
         Some((Box::new(func_expr), false))
     }
 
-    /// Convert AST expression to FunctionArg
+    /// Convert AST expression to FunctionArg; a literal of a function that
+    /// `reads_vectors` is read as a vector once here
     fn convert_func_arg(
         &self,
         expr: &ast::Expression,
+        reads_vectors: bool,
         ctx: &PushdownContext<'_>,
     ) -> Option<FunctionArg> {
         // Column reference: a name the table has not is left to the executor
@@ -879,7 +882,10 @@ impl FunctionRule {
 
         // Literal value
         if let Some(value) = extract_literal_with_ctx(expr, ctx) {
-            return Some(FunctionArg::Literal(value));
+            return Some(FunctionArg::Literal(match reads_vectors {
+                true => read_as_vector(value),
+                false => value,
+            }));
         }
 
         // Nested function call
@@ -888,7 +894,11 @@ impl FunctionRule {
             if let Some(scalar_func) = global_registry().get_scalar(&func_name) {
                 let mut nested_args = Vec::with_capacity(fc.arguments.len());
                 for arg in &fc.arguments {
-                    nested_args.push(self.convert_func_arg(arg, ctx)?);
+                    nested_args.push(self.convert_func_arg(
+                        arg,
+                        scalar_func.reads_vectors(),
+                        ctx,
+                    )?);
                 }
                 return Some(FunctionArg::Function {
                     function: Arc::from(scalar_func),

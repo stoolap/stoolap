@@ -1388,6 +1388,7 @@ impl ExprVM {
                 | Op::IsFalse
                 | Op::IsNotFalse
                 | Op::ReadAsColumn(_)
+                | Op::ReadAsVector
                 | Op::Dup
                 | Op::Swap
                 | Op::ExecScalarSubquery(_)
@@ -1909,6 +1910,11 @@ impl ExprVM {
             Op::ReadAsColumn(column_type) => {
                 let v = stack.pop().into_owned();
                 stack.push(crate::executor::pushdown::read_as_column(*column_type, v));
+            }
+
+            Op::ReadAsVector => {
+                let v = stack.pop().into_owned();
+                stack.push(crate::functions::scalar::vector::read_as_vector(v));
             }
 
             Op::Dup => stack.dup(),

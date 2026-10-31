@@ -45,6 +45,7 @@ use crate::executor::utils::{
     string_literal_value, string_to_datatype,
 };
 use crate::executor::volatility::expression_volatility;
+use crate::functions::scalar::vector::read_as_vector;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use smallvec::SmallVec;
@@ -1184,8 +1185,8 @@ impl<'a> ExprCompiler<'a> {
 
             // Vector distance operator (<=>)
             InfixOperator::VectorDistance => {
-                self.compile_expr(&infix.left, builder)?;
-                self.compile_expr(&infix.right, builder)?;
+                self.compile_vector_operand(&infix.left, builder)?;
+                self.compile_vector_operand(&infix.right, builder)?;
                 builder.emit(Op::VectorDistanceL2);
             }
 
@@ -1923,7 +1924,10 @@ impl<'a> ExprCompiler<'a> {
         if let Some(scalar_func) = self.ctx.functions.get_scalar(&func_name) {
             // Compile arguments
             for arg in &func.arguments {
-                self.compile_expr(arg, builder)?;
+                match scalar_func.reads_vectors() {
+                    true => self.compile_vector_operand(arg, builder)?,
+                    false => self.compile_expr(arg, builder)?,
+                }
             }
 
             // Try native function pointer for single-arg functions (no dynamic dispatch)
@@ -1945,6 +1949,24 @@ impl<'a> ExprCompiler<'a> {
             // This would be handled via LoadAggregateResult in a real implementation
             Err(CompileError::FunctionNotFound(func_name.to_string()))
         }
+    }
+
+    /// Compile an argument a vector function reads: one that reads no row
+    /// is read as a vector once, here or when its program is bound
+    fn compile_vector_operand(
+        &self,
+        arg: &Expression,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
+        let start = builder.position();
+        self.compile_expr(arg, builder)?;
+        if is_column_free(arg, self.ctx, true) {
+            match builder.take_constant_since(start) {
+                Some(value) => builder.emit(Op::LoadConst(read_as_vector(value))),
+                None => builder.emit(Op::ReadAsVector),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2033,6 +2055,9 @@ pub(crate) fn bound_consumer(
             false,
             Op::LoadConst(read_as_column(column_type, (*value).clone())),
         )),
+        (Consumer::Vector, [.., value]) => {
+            Some((1, false, Op::LoadConst(read_as_vector((*value).clone()))))
+        }
         (Consumer::EscapedLike(case_insensitive), [.., pattern, escape]) => {
             let Value::Text(escape) = escape else {
                 return None;
@@ -2063,7 +2088,7 @@ pub(crate) fn takes_values(op: &Op) -> bool {
 pub(crate) fn values_taken(op: &Op) -> Option<usize> {
     Some(match Consumer::of(op)? {
         Consumer::List(count) => count,
-        Consumer::ReadAs(_) | Consumer::Pattern(_) => 1,
+        Consumer::ReadAs(_) | Consumer::Vector | Consumer::Pattern(_) => 1,
         Consumer::EscapedLike(_) => 2,
     })
 }
@@ -2074,6 +2099,7 @@ enum Consumer {
     /// An IN list of this many items
     List(usize),
     ReadAs(DataType),
+    Vector,
     /// A LIKE whose pattern and escape are read as it runs
     EscapedLike(bool),
     Pattern(PatternKind),
@@ -2084,6 +2110,7 @@ impl Consumer {
         Some(match *op {
             Op::InList(count) => Consumer::List(count as usize),
             Op::ReadAsColumn(column_type) => Consumer::ReadAs(column_type),
+            Op::ReadAsVector => Consumer::Vector,
             Op::LikeDynamicEscapeExpr(case_insensitive) => Consumer::EscapedLike(case_insensitive),
             ref op => Consumer::Pattern(PatternKind::of_dynamic(op)?),
         })

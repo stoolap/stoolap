@@ -49,6 +49,17 @@ fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u
     }
 }
 
+/// `value` as a vector function reads it: a TEXT writing a vector is that
+/// VECTOR, any other value stays as it is
+pub(crate) fn read_as_vector(value: Value) -> Value {
+    if let Value::Text(text) = &value {
+        if let Some(floats) = crate::core::value::parse_vector_str(text.as_ref()) {
+            return Value::vector(floats);
+        }
+    }
+    value
+}
+
 /// Extract dimension count from a Value without allocation.
 #[inline]
 fn vector_dim_count(v: &Value) -> Option<usize> {
@@ -211,6 +222,10 @@ impl ScalarFunction for VecDistanceL2Function {
         Box::new(VecDistanceL2Function)
     }
 
+    fn reads_vectors(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         crate::validate_arg_count!(args, "VEC_DISTANCE_L2", 2);
         if args[0].is_null() || args[1].is_null() {
@@ -265,6 +280,10 @@ impl ScalarFunction for VecDistanceCosineFunction {
         Box::new(VecDistanceCosineFunction)
     }
 
+    fn reads_vectors(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         crate::validate_arg_count!(args, "VEC_DISTANCE_COSINE", 2);
         if args[0].is_null() || args[1].is_null() {
@@ -317,6 +336,10 @@ impl ScalarFunction for VecDistanceIpFunction {
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(VecDistanceIpFunction)
+    }
+
+    fn reads_vectors(&self) -> bool {
+        true
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
