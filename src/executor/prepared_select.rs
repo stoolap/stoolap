@@ -3977,46 +3977,62 @@ impl PreparedBlocks {
         for (at, sq) in self.subqueries.iter().enumerate() {
             let number = format!("{label}{}", first + at + 1);
             lines.push(format!("{prefix}{number}: {}", sq.explain(label, first)));
+            let (inner, label) = (format!("{prefix}  "), format!("{number}."));
+            let mut next = 0;
             for run in sq.statement_runs() {
-                if let Ok(compiled) = run.compiled.slot().read() {
-                    let inner = format!("{number}.");
-                    held_blocks(&compiled, &format!("{prefix}  "), &inner, lines);
-                }
+                next = held_blocks(&run.compiled, (&inner, &label), next, lines);
             }
         }
     }
 }
 
-/// The lines of the blocks the plan `compiled` holds, under a heading; none
-/// for a plan holding no block
-pub(crate) fn explain_held_blocks(compiled: &CompiledExecution, indent: usize) -> Vec<String> {
+/// The lines of the blocks the plan `plan` holds, under a heading; none for
+/// a plan holding no block
+pub(crate) fn explain_held_blocks(plan: &NestedPlan, indent: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    held_blocks(compiled, &"  ".repeat(indent + 1), "", &mut lines);
+    held_blocks(plan, (&"  ".repeat(indent + 1), ""), 0, &mut lines);
     if !lines.is_empty() {
         lines.insert(0, format!("{}Subqueries:", "  ".repeat(indent)));
     }
     lines
 }
 
-/// The lines of the blocks `compiled` holds, labelled `label` and a number;
-/// a join's and its groups' blocks numbered on as one list
-fn held_blocks(compiled: &CompiledExecution, prefix: &str, label: &str, lines: &mut Vec<String>) {
-    match compiled {
-        CompiledExecution::PreparedSelect(p) => p.blocks.explain(prefix, (label, 0), lines),
-        CompiledExecution::PreparedGrouped(p) => p.blocks.explain(prefix, (label, 0), lines),
-        CompiledExecution::PreparedDml(p) => p.blocks.explain(prefix, (label, 0), lines),
-        CompiledExecution::PreparedJoin(p) => {
+/// The lines of the blocks `plan` and every plan a run made in it hold (a
+/// derived FROM's, a set operation branch's, a CTE's, a join side's),
+/// numbered on from `first` as one list; the number after the last
+fn held_blocks(
+    plan: &NestedPlan,
+    (prefix, label): (&str, &str),
+    first: usize,
+    lines: &mut Vec<String>,
+) -> usize {
+    let mut next = first;
+    let mut list = |blocks: &PreparedBlocks, lines: &mut Vec<String>| {
+        blocks.explain(prefix, (label, next), lines);
+        next += blocks.subqueries.len();
+    };
+    let held = plan.slot().read().ok();
+    let mut sides: SmallVec<[&NestedPlan; 2]> = SmallVec::new();
+    match held.as_deref() {
+        Some(CompiledExecution::PreparedSelect(p)) => list(&p.blocks, lines),
+        Some(CompiledExecution::PreparedGrouped(p)) => list(&p.blocks, lines),
+        Some(CompiledExecution::PreparedDml(p)) => list(&p.blocks, lines),
+        Some(CompiledExecution::PreparedJoin(p)) => {
             let (join, grouped) = p.held_blocks();
-            let first = join.as_ref().map_or(0, |join| join.blocks.subqueries.len());
             if let Some(join) = join {
-                join.blocks.explain(prefix, (label, 0), lines);
+                list(&join.blocks, lines);
             }
             if let Some(grouped) = grouped.as_deref().and_then(Option::as_ref) {
-                grouped.blocks.explain(prefix, (label, first), lines);
+                list(&grouped.blocks, lines);
             }
+            sides.extend([p.side_plan(0), p.side_plan(1)]);
         }
         _ => {}
     }
+    for nested in sides.into_iter().chain(plan.made()) {
+        next = held_blocks(nested, (prefix, label), next, lines);
+    }
+    next
 }
 
 impl PreparedSubquery {

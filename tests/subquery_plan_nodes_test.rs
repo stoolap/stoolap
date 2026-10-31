@@ -100,6 +100,32 @@ fn explain_analyze_says_how_each_block_answers() {
             ],
         ),
         (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE 1 = 0 UNION ALL \
+             SELECT 1 FROM u WHERE u.k = t.k AND EXISTS (SELECT 1 FROM r WHERE r.rid = u.id))",
+            &[
+                "1: EXISTS over a statement, per call",
+                "  1.1: EXISTS over r, per call: a keyed set, or where the index on rid makes probing cheaper: the row its key names",
+            ],
+        ),
+        (
+            "SELECT id FROM t WHERE k = 1 UNION ALL \
+             SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)",
+            &["1: EXISTS over w, per call: a keyed set"],
+        ),
+        (
+            "SELECT q.id FROM (SELECT id FROM t WHERE EXISTS \
+             (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)) AS q",
+            &["1: EXISTS over w, per call: a keyed set"],
+        ),
+        (
+            "WITH c AS (SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)) \
+             SELECT id FROM c WHERE id IN (SELECT rid FROM r)",
+            &[
+                "1: IN over r, once per run",
+                "2: EXISTS over w, per call: a keyed set",
+            ],
+        ),
+        (
             "SELECT id, (SELECT v FROM w WHERE w.id = t.k) FROM t",
             &["1: scalar over w, per call: the row its key names"],
         ),

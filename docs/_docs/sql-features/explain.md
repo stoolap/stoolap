@@ -503,7 +503,7 @@ SELECT (actual time=1.53ms, rows=2)
 
 ### Subqueries
 
-For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with a `Subqueries:` section: one line per subquery, numbered from 1, nested ones included. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
+For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with a `Subqueries:` section: one line per subquery, numbered from 1, nested ones included, and so are the subqueries of its derived tables, set operation branches, CTEs and join sides that the run prepared. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
 
 ```sql
 EXPLAIN ANALYZE SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k);

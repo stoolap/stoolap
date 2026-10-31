@@ -342,6 +342,11 @@ impl NestedPlan {
     pub(crate) fn source(&self) -> Option<&NestedPlan> {
         self.nested(1).first()
     }
+
+    /// The plans nested in this one that a run has made; none before one
+    pub(crate) fn made(&self) -> &[NestedPlan] {
+        self.nested.get().map_or(&[], |nested| &nested[..])
+    }
 }
 
 /// What a statement's slot holds: a fast path's compiled state, a planned

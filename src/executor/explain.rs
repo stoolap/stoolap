@@ -161,8 +161,8 @@ impl Executor {
             let ran = plan
                 .and_then(NestedPlan::source)
                 .or(statement_plan.as_deref());
-            if let Some(compiled) = ran.and_then(|ran| ran.slot().read().ok()) {
-                plan_lines.extend(explain_held_blocks(&compiled, 1));
+            if let Some(ran) = ran {
+                plan_lines.extend(explain_held_blocks(ran, 1));
             }
 
             // Return the plan as a result
