@@ -568,7 +568,7 @@ impl Executor {
         let mut lines = vec![head, format!("  PkGet {table} {} = {key}", plan.pk_column)];
         // A key that names no row id leaves the WHERE to the table's write,
         // whose index rule reads a key equality by the key
-        let scan = ScanChoice::Index(IndexPlan::Key);
+        let scan = ScanChoice::Index(IndexPlan::Key, std::sync::Weak::new());
         for (at, line) in scan
             .explain(table, Some(where_clause))
             .into_iter()
