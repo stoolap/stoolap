@@ -2012,26 +2012,11 @@ fn test_explain_vector_hnsw_search() {
         "EXPLAIN SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs ORDER BY dist LIMIT 5",
     );
     assert!(
-        plan.contains("HNSW Index Scan"),
-        "Expected HNSW Index Scan, got:\n{}",
+        plan.contains("NearestHnsw docs emb L2"),
+        "Expected NearestHnsw, got:\n{}",
         plan
     );
-    assert!(
-        plan.contains("idx_emb"),
-        "Expected index name idx_emb, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("Metric: L2"),
-        "Expected Metric: L2, got:\n{}",
-        plan
-    );
-    assert!(plan.contains("K: 5"), "Expected K: 5, got:\n{}", plan);
-    assert!(
-        plan.contains("EF Search:"),
-        "Expected EF Search, got:\n{}",
-        plan
-    );
+    assert!(plan.contains("Limit 5"), "Expected Limit 5, got:\n{}", plan);
 }
 
 #[test]
@@ -2050,19 +2035,13 @@ fn test_explain_vector_brute_force() {
         "EXPLAIN SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs ORDER BY dist LIMIT 5",
     );
     assert!(
-        plan.contains("Vector Scan"),
-        "Expected Vector Scan (no HNSW index), got:\n{}",
+        plan.contains("NearestScan docs emb L2"),
+        "Expected NearestScan (no HNSW index), got:\n{}",
         plan
     );
+    assert!(plan.contains("Limit 5"), "Expected Limit 5, got:\n{}", plan);
     assert!(
-        plan.contains("Metric: L2"),
-        "Expected Metric: L2, got:\n{}",
-        plan
-    );
-    assert!(plan.contains("K: 5"), "Expected K: 5, got:\n{}", plan);
-    // Should NOT contain HNSW
-    assert!(
-        !plan.contains("HNSW"),
+        !plan.contains("Hnsw"),
         "Should not show HNSW without index, got:\n{}",
         plan
     );
@@ -2088,8 +2067,8 @@ fn test_explain_analyze_vector_hnsw() {
         "EXPLAIN ANALYZE SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs ORDER BY dist LIMIT 2",
     );
     assert!(
-        plan.contains("HNSW Index Scan"),
-        "Expected HNSW Index Scan, got:\n{}",
+        plan.contains("rows=2"),
+        "Expected the two nearest rows, got:\n{}",
         plan
     );
     assert!(
@@ -2123,11 +2102,11 @@ fn test_explain_vector_with_alias() {
         "EXPLAIN SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs ORDER BY dist LIMIT 3",
     );
     assert!(
-        plan.contains("HNSW Index Scan"),
+        plan.contains("NearestHnsw docs emb L2"),
         "Expected HNSW with alias ORDER BY, got:\n{}",
         plan
     );
-    assert!(plan.contains("K: 3"), "Expected K: 3, got:\n{}", plan);
+    assert!(plan.contains("Limit 3"), "Expected Limit 3, got:\n{}", plan);
 }
 
 #[test]
@@ -2151,13 +2130,8 @@ fn test_explain_vector_cosine() {
         "EXPLAIN SELECT id, VEC_DISTANCE_COSINE(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs ORDER BY dist LIMIT 5",
     );
     assert!(
-        plan.contains("HNSW Index Scan"),
+        plan.contains("NearestHnsw docs emb Cosine"),
         "Expected HNSW for cosine, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("Metric: Cosine"),
-        "Expected Metric: Cosine, got:\n{}",
         plan
     );
 }
@@ -2180,13 +2154,81 @@ fn test_explain_vector_with_where() {
         "EXPLAIN SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs WHERE category = 'a' ORDER BY dist LIMIT 5",
     );
     assert!(
-        plan.contains("HNSW Index Scan"),
+        plan.contains("NearestHnsw docs emb L2 (category = 'a')"),
         "Expected HNSW with WHERE, got:\n{}",
         plan
     );
-    assert!(
-        plan.contains("Filter:"),
-        "Expected filter in plan, got:\n{}",
-        plan
-    );
+}
+
+fn nearest_ids(rows: stoolap::Rows) -> Vec<i64> {
+    rows.map(|row| row.expect("row").get::<i64>(0).expect("id"))
+        .collect()
+}
+
+#[test]
+fn test_nearest_query_vector_from_a_parameter() {
+    for indexed in [false, true] {
+        let db = Database::open(&format!("memory://nearest_param_{indexed}")).expect("db");
+        db.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, emb VECTOR(2))",
+            (),
+        )
+        .expect("create");
+        if indexed {
+            db.execute("CREATE INDEX idx_emb ON docs(emb) USING HNSW", ())
+                .expect("index");
+        }
+        db.execute(
+            "INSERT INTO docs VALUES (1, '[0.0, 0.0]'), (2, '[5.0, 0.0]'), (3, '[9.0, 0.0]')",
+            (),
+        )
+        .expect("insert");
+        let sql = "SELECT id FROM docs ORDER BY emb <=> $1 LIMIT 2";
+        let stmt = db.prepare(sql).expect("prepare");
+        assert_eq!(
+            nearest_ids(stmt.query(("[8.0, 0.0]",)).expect("query")),
+            vec![3, 2],
+            "indexed {indexed}"
+        );
+        assert_eq!(
+            nearest_ids(stmt.query(("[1.0, 0.0]",)).expect("query")),
+            vec![1, 2],
+            "the second run reads its own vector, indexed {indexed}"
+        );
+        assert_eq!(
+            nearest_ids(db.query(sql, ("[4.0, 0.0]",)).expect("query")),
+            vec![2, 1],
+            "indexed {indexed}"
+        );
+    }
+}
+
+#[test]
+fn test_nearest_dimension_mismatch_is_the_functions_error() {
+    for indexed in [false, true] {
+        let db = Database::open(&format!("memory://nearest_mismatch_{indexed}")).expect("db");
+        db.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, emb VECTOR(3))",
+            (),
+        )
+        .expect("create");
+        if indexed {
+            db.execute("CREATE INDEX idx_emb ON docs(emb) USING HNSW", ())
+                .expect("index");
+        }
+        db.execute("INSERT INTO docs VALUES (1, '[1.0, 0.0, 0.0]')", ())
+            .expect("insert");
+        let err = db
+            .query(
+                "SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0]') AS d FROM docs ORDER BY d LIMIT 1",
+                (),
+            )
+            .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+            .err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.to_string().contains("dimension mismatch")),
+            "indexed {indexed}: {err:?}"
+        );
+    }
 }

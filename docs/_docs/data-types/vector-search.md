@@ -100,7 +100,7 @@ ORDER BY dist
 LIMIT 5;
 ```
 
-The query optimizer detects this `ORDER BY distance LIMIT k` pattern and automatically uses an HNSW index (if available) or a parallel brute-force scan with a min-heap for efficient top-k selection.
+The query optimizer detects this `ORDER BY distance LIMIT k` pattern and automatically uses an HNSW index (if available) or a parallel brute-force scan with a min-heap for efficient top-k selection. `EXPLAIN` shows the choice as `NearestHnsw` (the index) or `NearestScan` (the scan), followed by the sort the statement uses when the index cannot answer it.
 
 ## HNSW Indexes
 

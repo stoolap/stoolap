@@ -230,6 +230,32 @@ const CASES: &[Case] = &[
     ),
     case(
         "memory",
+        "vector_search",
+        "SELECT id, v <=> '[10.31, 2.77, 0.13]' AS d FROM near WHERE id % 3 <> 0 \
+         ORDER BY d LIMIT 4 OFFSET 2",
+        "SELECT DISTINCT id, v <=> '[10.31, 2.77, 0.13]' AS d FROM near WHERE id % 3 <> 0 \
+         ORDER BY d",
+        Some((4, 2)),
+    ),
+    case(
+        "sealed",
+        "vector_search",
+        "SELECT id, VEC_DISTANCE_L2(v, '[20.31, 4.77, 0.13]') AS d FROM near ORDER BY d LIMIT 5",
+        "SELECT DISTINCT id, VEC_DISTANCE_L2(v, '[20.31, 4.77, 0.13]') AS d FROM near \
+         ORDER BY d",
+        Some((5, 0)),
+    ),
+    case(
+        "sealed",
+        "vector_search",
+        "SELECT id, VEC_DISTANCE_COSINE(v, '[1.0, 2.0, 0.5]') AS d FROM near WHERE id > 7 \
+         ORDER BY d LIMIT 3",
+        "SELECT DISTINCT id, VEC_DISTANCE_COSINE(v, '[1.0, 2.0, 0.5]') AS d FROM near \
+         WHERE id > 7 ORDER BY d",
+        Some((3, 0)),
+    ),
+    case(
+        "memory",
         "keyset_pagination",
         "SELECT * FROM (SELECT * FROM t WHERE id > 5 ORDER BY id LIMIT 3) s",
         "SELECT * FROM (SELECT DISTINCT * FROM t WHERE id > 5 ORDER BY id) s",
@@ -321,6 +347,8 @@ fn setup(db: &Database) {
         "INSERT INTO u SELECT value, value % 17, (value * 13) % 97 FROM generate_series(1, 100)",
         "CREATE INDEX u_k ON u (k)",
         "CREATE TABLE docs (id INTEGER PRIMARY KEY, v VECTOR(3))",
+        "CREATE TABLE near (id INTEGER PRIMARY KEY, v VECTOR(3))",
+        "CREATE INDEX near_v ON near (v) USING HNSW",
         "CREATE VIEW tv AS SELECT id, a, b, c FROM t",
     ] {
         db.execute(sql, ()).unwrap();
@@ -331,6 +359,15 @@ fn setup(db: &Database) {
             (),
         )
         .unwrap();
+    }
+    for id in 1..=60 {
+        let v = if id % 9 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'[{id}.0, {}.0, {}.5]'", id * 7 % 11, id % 4)
+        };
+        db.execute(&format!("INSERT INTO near VALUES ({id}, {v})"), ())
+            .unwrap();
     }
 }
 
