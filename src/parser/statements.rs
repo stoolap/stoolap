@@ -1409,9 +1409,10 @@ impl Parser<'_> {
         self.next_token(); // advance to first arg or ')'
 
         let mut arguments = Vec::new();
+        let no_arguments = self.cur_token_is_punctuator(")");
 
         // Parse arguments (comma-separated expressions)
-        if !self.cur_token_is_punctuator(")") {
+        if !no_arguments {
             if let Some(arg) = self.parse_expression(Precedence::Lowest) {
                 arguments.push(arg);
             }
@@ -1430,9 +1431,9 @@ impl Parser<'_> {
             }
         }
 
-        // Expect closing ')' - if cur_token is already ')' (zero-arg case), we're done;
-        // otherwise it should be the peek token
-        if !self.cur_token_is_punctuator(")")
+        // Expect closing ')' - with no arguments cur_token is already it; otherwise
+        // it is the peek token, as the last argument may itself end in ')'
+        if !no_arguments
             && (!self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")")
         {
             self.add_error(format!(
