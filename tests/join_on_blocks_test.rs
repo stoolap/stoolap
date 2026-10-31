@@ -678,7 +678,6 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         .unwrap();
     let join = "SELECT l.id, r.k FROM l JOIN r ON l.id = r.id \
                 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
-    let outside = "Prepared: no (a join in a SELECT that holds no plan)";
     let lines = |sql: &str| -> Vec<String> {
         db.query(&format!("EXPLAIN {sql}"), ())
             .unwrap()
@@ -692,11 +691,8 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         (format!("{join} UNION ALL SELECT 0, 0"), vec![yes]),
         (format!("SELECT d.id, d.k FROM ({join}) d"), vec![yes]),
         (
-            format!("SELECT COUNT(*), (SELECT SUM((SELECT 1)) FROM s) FROM ({join}) d"),
-            vec![
-                "Prepared: no (a subquery outside WHERE and the subquery blocks)",
-                outside,
-            ],
+            format!("SELECT d.id, (SELECT MAX(id) FROM s) FROM ({join}) d WINDOW w AS ()"),
+            vec!["Prepared: no (a clause outside the family)", yes],
         ),
         (
             format!("SELECT d.id, d.k FROM ({join}) d WHERE d.id > (SELECT MIN(id) FROM s)"),

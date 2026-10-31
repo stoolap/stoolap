@@ -745,6 +745,38 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT a, MAX(b) AS z FROM t GROUP BY a ORDER BY z DESC",
         Prepared,
     ),
+    (
+        "scalar_block_aggregating_a_subquery",
+        "SELECT id, (SELECT MAX(x + (SELECT MIN(x) FROM u)) FROM u WHERE u.x = t.a) FROM t",
+        "SELECT id, CASE WHEN a BETWEEN 1 AND 3 THEN a + 1 END FROM t",
+        Prepared,
+    ),
+    (
+        "exists_block_with_a_having_subquery",
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT x FROM u WHERE u.x = t.a GROUP BY x HAVING COUNT(*) > (SELECT 0))",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
+    (
+        "exists_grouped_block_with_a_limit",
+        "SELECT id FROM t WHERE EXISTS (SELECT x FROM u WHERE u.x = t.a GROUP BY x LIMIT 1)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
+    (
+        "exists_ordered_by_a_subquery_key",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a ORDER BY (SELECT 1) LIMIT 1)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Old("planner step 5: the EXISTS's plan node binds the ORDER BY it drops, once"),
+    ),
+    (
+        "exists_ordered_by_position_over_a_using_join",
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT * FROM u JOIN u u2 USING (x) WHERE u.x = t.a ORDER BY 1 LIMIT 1)",
+        "SELECT id FROM t WHERE a IN (1, 2, 3)",
+        Prepared,
+    ),
 ];
 
 /// The query shapes whose statement orders its rows, compared in that order

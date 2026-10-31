@@ -515,7 +515,7 @@ impl<'a> Family<'a> {
             }
         }
         let registry = &self.executor.function_registry;
-        if statement_form_block(sq, counts_rows, false, registry) {
+        if statement_form_block(sq, counts_rows, registry) {
             return self.derived(sq);
         }
         let columns = || {
@@ -641,22 +641,24 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        // An EXISTS runs the clauses only a statement reads as main does
-        if !clause_block(sq, false) && statement_order(sq, &self.executor.function_registry) {
-            return Err("an EXISTS block whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads");
+        let registry = &self.executor.function_registry;
+        // An EXISTS computes no ORDER BY key nor SELECT item, which a statement
+        // run with its ORDER BY or its DISTINCT ON would
+        let keyed = !sq.order_by.is_empty() || !sq.distinct_on.is_empty();
+        if keyed && (statement_order(sq, registry) || grouped_with_subquery(sq)) {
+            return Err("an EXISTS block ordered or distinct where only a statement reads it");
         }
-        if clause_block(sq, false) {
+        if statement_form_block(sq, false, registry) {
             return self.derived(sq);
         }
         self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
         let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
-        // Only its run knows how wide a star over a join merging columns is
-        if sq.table_expr.as_deref().is_some_and(merges_columns)
-            && sq.columns.iter().any(star)
-            && crate::parser::scope::order_position_outside(sq, Some(0)).is_some()
-        {
-            return Err("an EXISTS ordered by position in a star over a NATURAL or USING join");
+        // Its run reads the ORDER BY for the positions, so every key is one
+        let position =
+            |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
+        if orders_by_merged_star_position(sq) && !sq.order_by.iter().all(position) {
+            return Err("an EXISTS ordered by position in a star over a NATURAL or USING join, and by a key");
         }
         let mut found = false;
         for column in &sq.columns {
@@ -672,6 +674,17 @@ impl<'a> Family<'a> {
             None => Ok(()),
         }
     }
+}
+
+/// Whether `sq` orders by position over a star a NATURAL or USING join
+/// merges, whose width only its run knows
+fn orders_by_merged_star_position(sq: &SelectStatement) -> bool {
+    sq.table_expr.as_deref().is_some_and(merges_columns)
+        && sq
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+        && crate::parser::scope::order_position_outside(sq, Some(0)).is_some()
 }
 
 /// Whether `from` holds a NATURAL or USING join, whose run merges columns
@@ -737,24 +750,27 @@ fn windowed_block(sq: &SelectStatement) -> bool {
         .any(QueryClassification::expression_has_window_function)
 }
 
-/// A block that runs as one statement: one `clause_block` names, or, but
-/// for an EXISTS (`exists`), whose ORDER BY chooses no row, one whose
-/// ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads
+/// A block that runs as one statement: one `clause_block` names, or one
+/// whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a statement reads
 fn statement_form_block(
     sq: &SelectStatement,
     counts_rows: bool,
-    exists: bool,
     registry: &FunctionRegistry,
 ) -> bool {
-    clause_block(sq, counts_rows) || (!exists && statement_order(sq, registry))
+    clause_block(sq, counts_rows) || statement_order(sq, registry)
 }
 
-/// A block a statement runs for its clauses: a windowed one, or one holding
-/// its own WITH, a set operation, ROLLUP, CUBE, grouping sets, a WINDOW
-/// clause or a DISTINCT that changes its answer, which it does only where
-/// something counts its rows: a value block (`counts_rows`), a LIMIT or an
-/// OFFSET
+/// A block a statement runs for its clauses: one `clause_form` names, or
+/// one `grouped_with_subquery` names
 fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
+    clause_form(sq, counts_rows) || grouped_with_subquery(sq)
+}
+
+/// A block whose rows its clauses choose: a windowed one, or one holding its
+/// own WITH, a set operation, ROLLUP, CUBE, grouping sets, a WINDOW clause
+/// or a DISTINCT that changes its answer, which it does only where something
+/// counts its rows: a value block (`counts_rows`), a LIMIT or an OFFSET
+fn clause_form(sq: &SelectStatement, counts_rows: bool) -> bool {
     let counted = counts_rows || sq.limit.is_some() || sq.offset.is_some();
     windowed_block(sq)
         || sq.with.is_some()
@@ -762,6 +778,18 @@ fn clause_block(sq: &SelectStatement, counts_rows: bool) -> bool {
         || (sq.distinct && sq.distinct_on.is_empty() && counted)
         || !matches!(sq.group_by.modifier, GroupByModifier::None)
         || !sq.window_defs.is_empty()
+}
+
+/// A grouped block whose SELECT list, HAVING or GROUP BY holds a subquery,
+/// which a block's aggregation does not run
+fn grouped_with_subquery(sq: &SelectStatement) -> bool {
+    grouped_block(sq)
+        && sq
+            .columns
+            .iter()
+            .chain(sq.having.as_deref())
+            .chain(&sq.group_by.columns)
+            .any(mentions_subquery)
 }
 
 /// A block's DISTINCT ON, ORDER BY, LIMIT or OFFSET only a statement reads:
@@ -5000,9 +5028,9 @@ impl Builder<'_> {
 
     /// Bind the block `sq` over a join as a block over one table is bound
     /// when prepared, computing nothing: its clauses over its FROM's scope
-    /// `own` read by position, its grouping checked as `grouping` checks it.
-    /// A window function, or a bare name two of its tables have, binds when
-    /// the block runs, which binds that name as the prepared side cannot know
+    /// `own` read by position, its grouping and keys checked as `grouping`
+    /// checks them. A window function, a bare name two of its tables have, or
+    /// a grouped block's subquery binds when the block runs
     fn bind_join_block(
         &mut self,
         sq: &SelectStatement,
@@ -5044,9 +5072,18 @@ impl Builder<'_> {
         let named = |expr: &Expression| with_aliases(expr, &sq.columns, &scope.lower).into_owned();
         let mut bound: Vec<Expression> =
             sq.where_clause.as_deref().map(named).into_iter().collect();
-        if !windowed {
-            bound.extend(sq.order_by.iter().map(|ob| named(&ob.expression)));
-            bound.extend(sq.distinct_on.iter().map(named));
+        // A grouped block's keys read its groups, bound with its items
+        let keys: Vec<Expression> = match windowed {
+            true => Vec::new(),
+            false => sq
+                .order_by
+                .iter()
+                .map(|ob| named(&ob.expression))
+                .chain(sq.distinct_on.iter().map(named))
+                .collect(),
+        };
+        if !grouped {
+            bound.extend(keys.iter().cloned());
         }
         if !grouped && !windowed {
             bound.extend(items.iter().map(|item| (*item).clone()));
@@ -5055,14 +5092,18 @@ impl Builder<'_> {
             let expr = self.trial_rewrite(&chain, id, expr, &work.outer)?;
             compile_with(&compile, &expr)?;
         }
-        if grouped {
-            let values = match exists {
-                true => Vec::new(),
-                false => items
-                    .iter()
-                    .map(|item| self.trial_rewrite(&chain, id, item, &work.outer))
-                    .collect::<Result<Vec<_>>>()?,
+        // Its grouping compiles no subquery: a key holding one binds when it runs
+        if grouped && !grouped_with_subquery(sq) {
+            let listed = match exists {
+                true => &[][..],
+                false => &items[..],
             };
+            let values = listed
+                .iter()
+                .copied()
+                .chain(keys.iter().filter(|key| !mentions_subquery(key)))
+                .map(|value| self.trial_rewrite(&chain, id, value, &work.outer))
+                .collect::<Result<Vec<_>>>()?;
             let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
             let mut trial = Rewritten {
                 outer: work.outer.clone(),
@@ -5097,12 +5138,14 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
-        // An EXISTS runs without its ORDER BY, which is still bound; one whose
-        // rows its items choose, by a window, a DISTINCT ON or the clauses of
-        // a statement block, runs as written
+        // An EXISTS runs without its ORDER BY, which is still bound, and its
+        // SELECT list; one whose rows its items choose, by a window, a
+        // DISTINCT ON or the clauses `clause_form` names, runs as written, and
+        // so does one ordered by a position its run counts, reading a column
         let dropped = matches!(form, Form::Exists(_))
-            && !clause_block(sq, false)
-            && sq.distinct_on.is_empty();
+            && !clause_form(sq, false)
+            && sq.distinct_on.is_empty()
+            && !orders_by_merged_star_position(sq);
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
@@ -5633,9 +5676,8 @@ impl Builder<'_> {
                     ..
                 }
         );
-        let exists = matches!(form, Form::Exists(_));
         let registry = &self.executor.function_registry;
-        if statement_form_block(sq, counts_rows, exists, registry) {
+        if statement_form_block(sq, counts_rows, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities

@@ -781,23 +781,13 @@ fn a_grouped_statement_outside_the_blocks_says_why() {
     let _guard = serial();
     let db = Database::open("memory://grouped_output_blocks_outside").unwrap();
     fill(&db);
-    for (sql, reason) in [
-        (
-            "SELECT a, RANK() OVER (ORDER BY a), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
-             ORDER BY (SELECT MIN(u.x) FROM u) + a",
-            "an ORDER BY holding a subquery",
-        ),
-        (
-            "SELECT a, (SELECT SUM((SELECT 1)) FROM u) FROM t GROUP BY a",
-            "a subquery outside WHERE and the subquery blocks",
-        ),
-    ] {
-        assert_eq!(
-            prepared_line(&db, sql),
-            format!("Prepared: no ({reason})"),
-            "{sql}"
-        );
-    }
+    let sql = "SELECT a, RANK() OVER (ORDER BY a), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+               ORDER BY (SELECT MIN(u.x) FROM u) + a";
+    assert_eq!(
+        prepared_line(&db, sql),
+        "Prepared: no (an ORDER BY holding a subquery)",
+        "{sql}"
+    );
 }
 
 #[test]
