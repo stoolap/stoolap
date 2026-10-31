@@ -1090,6 +1090,7 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        utils::statement_modifier_error(statement, &self.function_registry)?;
         let holds = statement_holds_as_of(statement);
         let ctx = self.with_statement_cut(statement, std::borrow::Cow::Borrowed(ctx), holds)?;
         self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None)
@@ -1463,6 +1464,11 @@ impl Executor {
         ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
         check_param_count(&plan.params, ctx.params().len())?;
+        // The compiled fast paths run only a plan a run here has filled
+        if plan.checked.get().is_none() {
+            utils::statement_modifier_error(&plan.statement, &self.function_registry)?;
+            let _ = plan.checked.set(());
+        }
         let gate = self.enter(changes_session(&plan.statement));
         // The fast paths read tables by name: CTEs the context brings are
         // read by the plans, which hold the CTE names they bound

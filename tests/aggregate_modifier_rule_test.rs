@@ -42,6 +42,7 @@ fn setup(name: &str, dir: &tempfile::TempDir, sealed: bool) -> Database {
         "CREATE TABLE h (id INTEGER PRIMARY KEY, v VECTOR(2))",
         "INSERT INTO h VALUES (1, '[1,0]'), (2, '[0,1]')",
         "CREATE INDEX h_v ON h (v) USING HNSW",
+        "CREATE TABLE he (id INTEGER PRIMARY KEY, v VECTOR(2))",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -119,6 +120,17 @@ fn a_modifier_on_a_call_to_no_aggregate_is_an_error_everywhere() {
             "SELECT id FROM h ORDER BY VEC_DISTANCE_L2(DISTINCT v, '[0,0]') LIMIT 1",
             "SELECT id FROM h ORDER BY VEC_DISTANCE_L2(v, '[0,0]') FILTER (WHERE id > 0) LIMIT 1",
             "SELECT id, VEC_DISTANCE_L2(v, '[0,0]' ORDER BY id) AS d FROM h ORDER BY d LIMIT 1",
+            "SELECT VEC_DISTANCE_L2(DISTINCT v, '[0,0]') AS d FROM h ORDER BY VEC_DISTANCE_L2(v, '[0,0]') LIMIT 1",
+            "SELECT VEC_DISTANCE_L2(v, '[0,0]') FILTER (WHERE id > 0) FROM h ORDER BY VEC_DISTANCE_L2(v, '[0,0]') LIMIT 1",
+            "SELECT ABS(DISTINCT id) FROM he ORDER BY VEC_DISTANCE_L2(v, '[0,0]') LIMIT 1",
+            "SELECT u.id FROM u WHERE EXISTS (SELECT ABS(DISTINCT a) FROM t WHERE t.k = u.k) AND u.id = (SELECT 1 ORDER BY 1)",
+            "SELECT u.id FROM u WHERE NOT EXISTS (SELECT ABS(DISTINCT a) FROM t WHERE t.k = u.k) AND u.id = (SELECT 1 ORDER BY 1)",
+            "SELECT id FROM t WHERE EXISTS (SELECT (SELECT ABS(DISTINCT a)) FROM u)",
+            "SELECT id FROM t WHERE 1 = 1 OR ABS(DISTINCT a) > 0",
+            "SELECT id FROM t UNION ALL SELECT ABS(DISTINCT a) FROM t LIMIT 0",
+            "UPDATE t SET k = k WHERE id = 99 RETURNING ABS(DISTINCT a)",
+            "DELETE FROM t WHERE id = 99 RETURNING ABS(DISTINCT a)",
+            "EXPLAIN SELECT ABS(DISTINCT a) FROM t",
             "INSERT INTO u VALUES (50, 1, ABS(DISTINCT 3))",
             "CREATE TABLE c1 (id INTEGER PRIMARY KEY, a INTEGER CHECK (ABS(DISTINCT a) > 0))",
         ] {
@@ -146,6 +158,29 @@ fn a_parameter_a_prepared_statement_and_a_default_refuse_it_too() {
             .map_err(|e| e.to_string()),
         "parameter",
     );
+    for run in ["first run", "cached plan"] {
+        refused(
+            db.query("SELECT id FROM t WHERE 1 = 1 OR ABS(DISTINCT a) > 0", ())
+                .map(|rows| rows.count())
+                .map_err(|e| e.to_string()),
+            run,
+        );
+        refused(
+            db.execute(
+                "DELETE FROM t WHERE id = $1 RETURNING ABS(DISTINCT a)",
+                (99,),
+            )
+            .map(|n| n as usize)
+            .map_err(|e| e.to_string()),
+            run,
+        );
+        refused(
+            db.query("SELECT ABS(DISTINCT a) FROM t WHERE id = $1", (99,))
+                .map(|rows| rows.count())
+                .map_err(|e| e.to_string()),
+            run,
+        );
+    }
     let prepared = db
         .prepare("SELECT id FROM t WHERE ABS(DISTINCT a) > $1")
         .map_err(|e| e.to_string());

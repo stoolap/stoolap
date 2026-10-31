@@ -2123,11 +2123,7 @@ impl Executor {
         let is_vec_distance = ["VEC_DISTANCE_L2", "VEC_DISTANCE_COSINE", "VEC_DISTANCE_IP"]
             .iter()
             .any(|name| func_call.function.eq_ignore_ascii_case(name));
-        // A modifier on the call is the error its compile gives
-        (is_vec_distance
-            && func_call.arguments.len() == 2
-            && func_call.aggregate_modifier().is_none())
-        .then_some(func_call)
+        (is_vec_distance && func_call.arguments.len() == 2).then_some(func_call)
     }
 
     /// Vector search optimization using HNSW index or parallel brute-force

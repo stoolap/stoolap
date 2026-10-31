@@ -410,6 +410,9 @@ pub struct CachedPlanRef {
     pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
+    /// Set once the statement passed `statement_modifier_error`; a failure
+    /// is checked again, as the registry may gain an aggregate
+    pub checked: Arc<std::sync::OnceLock<()>>,
     /// Whether the statement reads a table AS OF anywhere
     pub holds_as_of: bool,
 }
@@ -423,6 +426,7 @@ impl CachedPlanRef {
             params,
             compiled: Arc::new(NestedPlan::default()),
             classification: Arc::new(std::sync::OnceLock::new()),
+            checked: Arc::new(std::sync::OnceLock::new()),
             holds_as_of,
         }
     }
@@ -452,6 +456,8 @@ pub struct CachedQueryPlan {
     pub compiled: Arc<NestedPlan>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
+    /// Set once the statement passed `statement_modifier_error`
+    pub checked: Arc<std::sync::OnceLock<()>>,
     /// Whether the statement reads a table AS OF anywhere
     pub holds_as_of: bool,
 }
@@ -587,6 +593,7 @@ impl QueryCache {
             params: plan.params.clone(),
             compiled: plan.compiled.clone(), // Share compiled state
             classification: plan.classification.clone(),
+            checked: plan.checked.clone(),
             holds_as_of: plan.holds_as_of,
         }))
     }
@@ -617,6 +624,7 @@ impl QueryCache {
                     params: plan.params.clone(),
                     compiled: plan.compiled.clone(), // Arc clone - cheap
                     classification: plan.classification.clone(),
+                    checked: plan.checked.clone(),
                     holds_as_of: plan.holds_as_of,
                 }),
             );

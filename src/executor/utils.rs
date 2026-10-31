@@ -1823,6 +1823,224 @@ pub(crate) fn modifier_outside_aggregate(
     })
 }
 
+/// The error of the first call in `statement` that [`modifier_outside_aggregate`]
+/// refuses, at any depth: checked before any path runs, since a path may
+/// answer without compiling a call. A table's CHECK and DEFAULT take the
+/// rule where they compile
+pub(crate) fn statement_modifier_error(
+    statement: &crate::parser::ast::Statement,
+    registry: &crate::functions::FunctionRegistry,
+) -> crate::core::Result<()> {
+    ModifierWalk { registry }
+        .statement(statement)
+        .map_err(crate::core::Error::invalid_argument)
+}
+
+struct ModifierWalk<'a> {
+    registry: &'a crate::functions::FunctionRegistry,
+}
+
+impl ModifierWalk<'_> {
+    fn statement(&self, statement: &crate::parser::ast::Statement) -> Result<(), String> {
+        use crate::parser::ast::Statement;
+        match statement {
+            Statement::Select(stmt) => self.select(stmt),
+            Statement::Insert(stmt) => {
+                stmt.values.iter().try_for_each(|row| self.all(row))?;
+                stmt.select.as_deref().map_or(Ok(()), |s| self.select(s))?;
+                self.all(&stmt.update_expressions)?;
+                self.optional(stmt.update_where.as_deref())?;
+                self.all(&stmt.returning)
+            }
+            Statement::Update(stmt) => {
+                self.with(stmt.with.as_ref())?;
+                stmt.updates.values().try_for_each(|e| self.expression(e))?;
+                self.optional(stmt.where_clause.as_deref())?;
+                self.all(&stmt.returning)
+            }
+            Statement::Delete(stmt) => {
+                self.with(stmt.with.as_ref())?;
+                self.optional(stmt.where_clause.as_deref())?;
+                self.all(&stmt.returning)
+            }
+            Statement::CreateView(stmt) => self.select(&stmt.query),
+            Statement::Explain(stmt) => self.statement(&stmt.statement),
+            Statement::Expression(stmt) => self.expression(&stmt.expression),
+            Statement::Set(stmt) => self.expression(&stmt.value),
+            Statement::Pragma(stmt) => self.optional(stmt.value.as_ref()),
+            Statement::Truncate(_)
+            | Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::AlterTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::DropView(_)
+            | Statement::Begin(_)
+            | Statement::Commit(_)
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::ReleaseSavepoint(_)
+            | Statement::ShowTables(_)
+            | Statement::ShowViews(_)
+            | Statement::ShowCreateTable(_)
+            | Statement::ShowCreateView(_)
+            | Statement::ShowIndexes(_)
+            | Statement::Describe(_)
+            | Statement::Analyze(_)
+            | Statement::Vacuum(_)
+            | Statement::Copy(_) => Ok(()),
+        }
+    }
+
+    fn select(&self, stmt: &SelectStatement) -> Result<(), String> {
+        let SelectStatement {
+            token: _,
+            param_count: _,
+            distinct: _,
+            distinct_on,
+            columns,
+            with,
+            table_expr,
+            where_clause,
+            group_by,
+            having,
+            window_defs,
+            order_by,
+            limit,
+            offset,
+            set_operations,
+            prepared: _,
+        } = stmt;
+        self.all(distinct_on)?;
+        self.all(columns)?;
+        self.with(with.as_ref())?;
+        self.optional(table_expr.as_deref())?;
+        self.optional(where_clause.as_deref())?;
+        self.all(&group_by.columns)?;
+        if let GroupByModifier::GroupingSets(sets) = &group_by.modifier {
+            sets.iter().try_for_each(|set| self.all(set))?;
+        }
+        self.optional(having.as_deref())?;
+        for window in window_defs {
+            window.expressions().try_for_each(|e| self.expression(e))?;
+        }
+        self.ordered(order_by)?;
+        self.optional(limit.as_deref())?;
+        self.optional(offset.as_deref())?;
+        set_operations
+            .iter()
+            .try_for_each(|op| self.select(&op.right))
+    }
+
+    fn with(&self, with: Option<&crate::parser::ast::WithClause>) -> Result<(), String> {
+        with.map_or(Ok(()), |with| {
+            with.ctes.iter().try_for_each(|cte| self.select(&cte.query))
+        })
+    }
+
+    fn expression(&self, expr: &Expression) -> Result<(), String> {
+        match expr {
+            Expression::Identifier(_)
+            | Expression::QualifiedIdentifier(_)
+            | Expression::Column(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::CteReference(_) => Ok(()),
+            Expression::Prefix(prefix) => self.expression(&prefix.right),
+            Expression::Infix(infix) => {
+                self.expression(&infix.left)?;
+                self.expression(&infix.right)
+            }
+            Expression::List(list) => self.all(&list.elements),
+            Expression::ExpressionList(list) => self.all(&list.expressions),
+            Expression::Distinct(distinct) => self.expression(&distinct.expr),
+            Expression::Exists(exists) => self.select(&exists.subquery),
+            Expression::AllAny(all_any) => {
+                self.expression(&all_any.left)?;
+                self.select(&all_any.subquery)
+            }
+            Expression::In(in_expr) => {
+                self.expression(&in_expr.left)?;
+                self.expression(&in_expr.right)
+            }
+            Expression::InHashSet(in_set) => self.expression(&in_set.column),
+            Expression::QuantifiedSet(set) => self.expression(&set.left),
+            Expression::Between(between) => {
+                self.expression(&between.expr)?;
+                self.expression(&between.lower)?;
+                self.expression(&between.upper)
+            }
+            Expression::Like(like) => {
+                self.expression(&like.left)?;
+                self.expression(&like.pattern)?;
+                self.optional(like.escape.as_deref())
+            }
+            Expression::ScalarSubquery(subquery) => self.select(&subquery.subquery),
+            Expression::Case(case) => {
+                self.optional(case.value.as_deref())?;
+                for when in &case.when_clauses {
+                    self.expression(&when.condition)?;
+                    self.expression(&when.then_result)?;
+                }
+                self.optional(case.else_value.as_deref())
+            }
+            Expression::Cast(cast) => self.expression(&cast.expr),
+            Expression::FunctionCall(call) => self.call(call),
+            Expression::Aliased(aliased) => self.expression(&aliased.expression),
+            Expression::Window(window) => {
+                self.call(&window.function)?;
+                self.all(&window.partition_by)?;
+                self.ordered(&window.order_by)?;
+                window.frame_offsets().try_for_each(|e| self.expression(e))
+            }
+            Expression::TableSource(table) => {
+                self.optional(table.as_of.as_ref().map(|as_of| &*as_of.value))
+            }
+            Expression::JoinSource(join) => {
+                self.expression(&join.left)?;
+                self.expression(&join.right)?;
+                self.optional(join.condition.as_deref())
+            }
+            Expression::SubquerySource(source) => self.select(&source.subquery),
+            Expression::ValuesSource(values) => {
+                values.rows.iter().try_for_each(|row| self.all(row))
+            }
+            Expression::FunctionTableSource(source) => self.all(&source.arguments),
+        }
+    }
+
+    fn call(&self, call: &FunctionCall) -> Result<(), String> {
+        if let Some(error) = modifier_outside_aggregate(call, self.registry) {
+            return Err(error);
+        }
+        self.all(&call.arguments)?;
+        self.ordered(&call.order_by)?;
+        self.optional(call.filter.as_deref())
+    }
+
+    fn all(&self, exprs: &[Expression]) -> Result<(), String> {
+        exprs.iter().try_for_each(|e| self.expression(e))
+    }
+
+    fn optional(&self, expr: Option<&Expression>) -> Result<(), String> {
+        expr.map_or(Ok(()), |e| self.expression(e))
+    }
+
+    fn ordered(&self, order: &[crate::parser::ast::OrderByExpression]) -> Result<(), String> {
+        order
+            .iter()
+            .try_for_each(|o| self.expression(&o.expression))
+    }
+}
+
 /// Check if an expression contains an aggregate function.
 /// Used for detecting nested aggregates and determining query structure.
 pub fn expression_contains_aggregate(expr: &Expression) -> bool {
