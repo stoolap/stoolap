@@ -1912,10 +1912,8 @@ impl ExprVM {
                 stack.push(crate::executor::pushdown::read_as_column(*column_type, v));
             }
 
-            Op::ReadAsVector => {
-                let v = stack.pop().into_owned();
-                stack.push(crate::functions::scalar::vector::read_as_vector(v));
-            }
+            // Read when the program is bound; unbound, the function reads it
+            Op::ReadAsVector => {}
 
             Op::Dup => stack.dup(),
 

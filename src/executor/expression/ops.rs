@@ -434,8 +434,9 @@ pub enum Op {
     /// Stack: [value] -> [value as the column's type]
     ReadAsColumn(DataType),
 
-    /// Read a value a vector function takes as that function reads it
-    /// Stack: [value] -> [a TEXT writing a vector as that VECTOR]
+    /// A parameter a vector function takes, which binding reads as a vector
+    /// once; run unbound, it leaves the value to the function
+    /// Stack: [value] -> [value]
     ReadAsVector,
 
     /// Truncate timestamp to date (midnight)

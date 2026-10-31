@@ -1951,8 +1951,8 @@ impl<'a> ExprCompiler<'a> {
         }
     }
 
-    /// Compile an argument a vector function reads: one that reads no row
-    /// is read as a vector once, here or when its program is bound
+    /// Compile an argument a vector function reads: a constant is read as a
+    /// vector here, a parameter when its program is bound
     fn compile_vector_operand(
         &self,
         arg: &Expression,
@@ -1960,11 +1960,10 @@ impl<'a> ExprCompiler<'a> {
     ) -> Result<(), CompileError> {
         let start = builder.position();
         self.compile_expr(arg, builder)?;
-        if is_column_free(arg, self.ctx, true) {
-            match builder.take_constant_since(start) {
-                Some(value) => builder.emit(Op::LoadConst(read_as_vector(value))),
-                None => builder.emit(Op::ReadAsVector),
-            }
+        match builder.take_constant_since(start) {
+            Some(value) => builder.emit(Op::LoadConst(read_as_vector(value))),
+            None if matches!(arg, Expression::Parameter(_)) => builder.emit(Op::ReadAsVector),
+            None => {}
         }
         Ok(())
     }

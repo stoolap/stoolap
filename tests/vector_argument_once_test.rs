@@ -58,6 +58,17 @@ const SHAPES: &[&str] = &[
     "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_IP('[0.5, 0.5, 0.5]', e)) < 0",
 ];
 
+/// Arguments that read no row yet are evaluated per row: the function
+/// reads them itself, at its own cost
+const PER_ROW: &[&str] = &[
+    "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_L2(e, \
+     CASE WHEN $1 IS NOT NULL THEN '[0, 0, 0]' ELSE '[1, 1, 1]' END)) > 0",
+    "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_L2(e, \
+     CASE WHEN RANDOM() >= 0 THEN '[0.5, 0.5, 0.5]' ELSE '[1, 1, 1]' END)) > 0",
+    "SELECT COUNT(*) FROM t WHERE e <=> \
+     CASE WHEN $1 IS NOT NULL THEN '[0, 0, 0]' ELSE '[1, 1, 1]' END < 1e9",
+];
+
 /// The allocations one execution of `sql` takes over a table of `rows`
 fn allocations(rows: i64, sql: &str) -> usize {
     let db = Database::open(&format!("memory://vector_argument_once_{rows}")).unwrap();
@@ -88,6 +99,22 @@ fn a_known_text_vector_is_read_once_per_execution() {
         let short = allocations(200, sql);
         let long = allocations(2_000, sql);
         if long >= short + 200 {
+            wrong.push(format!(
+                "{sql}: {long} allocations over 2000 rows, {short} over 200"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_argument_read_per_row_costs_only_the_functions_own_read() {
+    let mut wrong = Vec::new();
+    for sql in PER_ROW {
+        let short = allocations(200, sql);
+        let long = allocations(2_000, sql);
+        // Parsing the text takes a buffer of floats and one of bytes
+        if long >= short + 2 * 1_800 + 200 {
             wrong.push(format!(
                 "{sql}: {long} allocations over 2000 rows, {short} over 200"
             ));
