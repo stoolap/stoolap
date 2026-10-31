@@ -44,6 +44,23 @@ pub(crate) fn commit_log_capacity() -> Option<usize> {
 }
 
 thread_local! {
+    static AS_OF_HOT_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next read AS OF of a table with
+/// volumes has read the hot rows and not yet the volumes
+pub fn after_as_of_hot_read(hook: impl FnOnce() + 'static) {
+    AS_OF_HOT_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn as_of_hot_read() {
+    let hook = AS_OF_HOT_READ_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMMIT_LOG_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

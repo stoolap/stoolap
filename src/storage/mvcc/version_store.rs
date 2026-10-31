@@ -501,6 +501,20 @@ pub fn aggregate_row(
     }
 }
 
+/// The stamp of a version published before its transaction took a commit
+/// sequence: a reader asks the registry for that commit
+pub const UNSTAMPED: i64 = i64::MAX;
+
+/// What became of a transaction, for a version carrying [`UNSTAMPED`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitOf {
+    Committed(i64),
+    /// Active, committing, or rolled back: its versions are not committed
+    NotCommitted,
+    /// No longer recorded
+    Unknown,
+}
+
 /// Visibility checker trait - will be implemented by TransactionRegistry
 ///
 /// This allows VersionStore to check visibility without circular dependencies
@@ -564,6 +578,12 @@ pub trait VisibilityChecker: Send + Sync {
     /// published versions carry; 0 when it is not committing
     fn committing_sequence(&self, _txn_id: i64) -> i64 {
         0
+    }
+
+    /// The commit of `txn_id`, for a version published before it took a
+    /// sequence and so carrying [`UNSTAMPED`]
+    fn commit_of(&self, _txn_id: i64) -> CommitOf {
+        CommitOf::Unknown
     }
 
     /// The point a retention pass takes for `time` (nanoseconds): a version
@@ -2107,6 +2127,14 @@ impl VersionStore {
     /// Raises the mark a historical point must pass: called before the
     /// discard it guards becomes visible
     pub fn raise_history_mark(&self, seq: i64) {
+        // An unstamped version's commit is not known here: every point so far
+        let seq = match seq {
+            UNSTAMPED => self
+                .visibility_checker
+                .as_ref()
+                .map_or(0, |checker| checker.get_current_sequence()),
+            seq => seq,
+        };
         self.history_mark.fetch_max(seq, Ordering::AcqRel);
     }
 
@@ -2131,7 +2159,7 @@ impl VersionStore {
         for (&row_id, head) in versions.iter() {
             let mut current = Some(head);
             while let Some(entry) = current {
-                if point.sees(entry.version.create_time) {
+                if self.point_sees(point, &entry.version)? {
                     if let Some(authority) = authority.as_deref_mut() {
                         authority.insert(row_id);
                     }
@@ -2147,8 +2175,32 @@ impl VersionStore {
         Ok(rows)
     }
 
+    /// Whether `version` had committed by `point`. An unstamped one asks the
+    /// registry for its commit; one the registry no longer records cannot
+    /// be placed, and the read fails rather than guess
+    fn point_sees(&self, point: &ReadPoint, version: &RowVersion) -> Result<bool, Error> {
+        if version.create_time != UNSTAMPED {
+            return Ok(point.sees(version.create_time));
+        }
+        let commit = self
+            .visibility_checker
+            .as_ref()
+            .map_or(CommitOf::Unknown, |checker| {
+                checker.commit_of(version.txn_id)
+            });
+        match commit {
+            CommitOf::Committed(seq) => Ok(point.sees(seq)),
+            CommitOf::NotCommitted => Ok(false),
+            CommitOf::Unknown => Err(Error::invalid_argument(format!(
+                "AS OF point is older than table '{}' still holds: a version \
+                 of transaction {} can no longer be placed",
+                self.table_name, version.txn_id
+            ))),
+        }
+    }
+
     /// Whether this table still holds everything `point` needs
-    fn check_history(&self, point: &ReadPoint) -> Result<(), Error> {
+    pub fn check_history(&self, point: &ReadPoint) -> Result<(), Error> {
         let mark = self.history_mark();
         if point.completed_through() >= mark {
             return Ok(());
@@ -8085,7 +8137,11 @@ impl TransactionVersionStore {
 
         // Commit local versions to parent store, each stamped with the
         // commit's sequence in place of its write time
-        let stamp = self.parent_store.committing_sequence(self.txn_id);
+        let stamp = match self.parent_store.committing_sequence(self.txn_id) {
+            // Published before the commit took a sequence: 0 is recovered state
+            0 => UNSTAMPED,
+            seq => seq,
+        };
         let stamped = |mut version: RowVersion| {
             version.create_time = stamp;
             version

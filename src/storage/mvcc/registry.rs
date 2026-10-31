@@ -34,6 +34,7 @@ use super::commit_log::{
 };
 use crate::common::I64Map;
 use crate::core::{Error, IsolationLevel};
+use crate::storage::mvcc::version_store::CommitOf;
 use crate::storage::VisibilityChecker;
 
 /// Invalid transaction ID returned when registry is not accepting new transactions.
@@ -577,10 +578,9 @@ impl HistoryEvent {
 impl Drop for HistoryEvent {
     fn drop(&mut self) {
         let registry = &self.registry;
-        let clock = wall_clock();
         let mut txns = registry.transactions.lock();
         txns.uncommitting(self.seq);
-        registry.log_completion(&txns, 0, self.seq, clock);
+        registry.log_completion(&txns, 0, self.seq);
     }
 }
 
@@ -890,19 +890,12 @@ impl TransactionRegistry {
     /// Completes the commit process (two-phase commit).
     #[inline]
     pub fn complete_commit(&self, txn_id: i64) {
-        // A commit that writes reads the clock before the lock; one that
-        // only read has no entry and reads none
-        let clock = match self.status.get(txn_id) {
-            Some(slot) if slot_committing(slot) || slot == slot_published(txn_id) => wall_clock(),
-            _ => 0,
-        };
         {
             let mut txns = self.transactions.lock();
             let seq = txns.get(txn_id).map(|e| e.commit_seq()).unwrap_or(0);
             if seq > 0 {
                 txns.uncommitting(seq);
-                let clock = if clock == 0 { wall_clock() } else { clock };
-                self.log_completion(&txns, txn_id, seq, clock);
+                self.log_completion(&txns, txn_id, seq);
             }
 
             // Store commit_seq for snapshot isolation while holding transactions lock
@@ -929,11 +922,10 @@ impl TransactionRegistry {
     /// lock section that makes it visible, as `start_commit` does
     pub fn commit_transaction(&self, txn_id: i64) -> i64 {
         let commit_seq;
-        let clock = wall_clock();
         {
             let mut txns = self.transactions.lock();
             commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
-            self.log_completion(&txns, txn_id, commit_seq, clock);
+            self.log_completion(&txns, txn_id, commit_seq);
 
             // Store commit_seq for snapshot isolation while holding transactions lock
             if self.global_isolation_level.load(Ordering::Relaxed) == 1
@@ -1282,7 +1274,10 @@ impl TransactionRegistry {
 
     /// Records a completion in the commit log, in the lock section that
     /// makes it visible; `commit_seq` has left the in-flight list
-    fn log_completion(&self, txns: &TxnTable, txn_id: i64, commit_seq: i64, clock: i64) {
+    /// The time is read here, in that section: read before it, a reader
+    /// could see the commit absent at a later time
+    fn log_completion(&self, txns: &TxnTable, txn_id: i64, commit_seq: i64) {
+        let clock = wall_clock();
         let assigned_through = self.next_sequence.load(Ordering::Acquire);
         let completion = Completion {
             txn_id,
@@ -1318,8 +1313,11 @@ impl TransactionRegistry {
         txn_id: i64,
         cut: HistoricalCut,
     ) -> crate::core::Result<ReadPoint> {
-        if let Some(point) = self.commit_log.point_of_transaction(txn_id, cut)? {
-            return Ok(point);
+        // History events log as transaction 0; no transaction has an id below 1
+        if txn_id > 0 {
+            if let Some(point) = self.commit_log.point_of_transaction(txn_id, cut)? {
+                return Ok(point);
+            }
         }
         let why = match self.transactions.lock().get(txn_id).map(|e| e.status()) {
             Some(TxnStatus::Aborted) => "was rolled back",
@@ -1827,6 +1825,22 @@ impl VisibilityChecker for TransactionRegistry {
 
     fn oldest_time_through(&self, seq: i64) -> Option<i64> {
         self.commit_log.oldest_time_through(seq)
+    }
+
+    fn commit_of(&self, txn_id: i64) -> CommitOf {
+        match self.status.get(txn_id) {
+            Some(slot) if slot > 0 => return CommitOf::Committed(slot),
+            Some(_) => return CommitOf::NotCommitted,
+            None => {}
+        }
+        let txns = self.transactions.lock();
+        if txns.get(txn_id).is_some() {
+            return CommitOf::NotCommitted;
+        }
+        match txns.slotless.get(txn_id) {
+            Some(&seq) => CommitOf::Committed(seq),
+            None => CommitOf::Unknown,
+        }
     }
 
     /// When the log does not reach `time`, the point that sees what no

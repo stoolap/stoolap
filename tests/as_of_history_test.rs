@@ -94,6 +94,7 @@ fn refused(answer: Rows, why: &str) {
 
 #[test]
 fn a_row_written_before_a_time_and_committed_after_it_is_absent_at_it() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_written_before");
     let mut tx = db.begin().unwrap();
     tx.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
@@ -105,6 +106,7 @@ fn a_row_written_before_a_time_and_committed_after_it_is_absent_at_it() {
 
 #[test]
 fn a_point_beyond_the_kept_history_fails_instead_of_losing_a_row() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_beyond");
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
         .unwrap();
@@ -119,6 +121,7 @@ fn a_point_beyond_the_kept_history_fails_instead_of_losing_a_row() {
 
 #[test]
 fn a_delete_counts_from_its_commit() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_delete");
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
         .unwrap();
@@ -131,6 +134,7 @@ fn a_delete_counts_from_its_commit() {
 
 #[test]
 fn a_rolled_back_write_is_never_visible() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_rolled_back");
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
     let mut tx = db.begin().unwrap();
@@ -143,6 +147,7 @@ fn a_rolled_back_write_is_never_visible() {
 
 #[test]
 fn as_of_transaction_reads_right_after_it_completed() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_transaction");
     let mut first = db.begin().unwrap();
     let first_id = first.id();
@@ -219,6 +224,7 @@ fn a_point_that_needs_an_evicted_entry_is_refused() {
 
 #[test]
 fn a_seal_refuses_a_point_that_has_not_seen_its_cutoff() {
+    let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = file(&dir);
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
@@ -235,6 +241,7 @@ fn a_seal_refuses_a_point_that_has_not_seen_its_cutoff() {
 
 #[test]
 fn a_point_after_the_newest_seal_reads_the_volumes() {
+    let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = file(&dir);
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", ())
@@ -256,6 +263,7 @@ fn a_point_after_the_newest_seal_reads_the_volumes() {
 
 #[test]
 fn a_truncate_refuses_the_points_before_it() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_truncate");
     let other = db.clone();
     db.execute("BEGIN", ()).unwrap();
@@ -274,6 +282,7 @@ fn a_truncate_refuses_the_points_before_it() {
 
 #[test]
 fn a_failed_truncate_still_completes_its_event() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_failed_truncate");
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
     let writer = db.clone();
@@ -288,6 +297,7 @@ fn a_failed_truncate_still_completes_its_event() {
 
 #[test]
 fn an_alter_refuses_the_points_before_it() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_alter");
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
     let before = now(&db);
@@ -346,6 +356,7 @@ fn a_ring_overwritten_while_read_voids_the_read() {
 
 #[test]
 fn vacuum_keeps_the_points_after_the_versions_it_drops() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_vacuum");
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
     let first = now(&db);
@@ -358,6 +369,7 @@ fn vacuum_keeps_the_points_after_the_versions_it_drops() {
 
 #[test]
 fn a_reopened_database_starts_its_history_at_the_open() {
+    let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let before = {
         let db = file(&dir);
@@ -380,7 +392,71 @@ fn a_reopened_database_starts_its_history_at_the_open() {
 
 #[test]
 fn a_time_not_passed_yet_reads_the_newest_state() {
+    let _guard = FailpointGuard::new();
     let db = memory("as_of_history_future");
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
     assert_eq!(at(&db, "2200-01-01"), Ok(vec![(1, 10)]));
+}
+
+#[test]
+fn a_compaction_during_a_read_refuses_the_point_it_overtook() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file(&dir);
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (4, 40), (5, 50), (6, 60)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let point = now(&db);
+    db.execute("DELETE FROM t WHERE id = 2", ()).unwrap();
+    let other = db.clone();
+    fp::after_as_of_hot_read(move || other.engine().compact_for_test().unwrap());
+    let answer = at(&db, &point);
+    assert!(
+        answer.is_err() || answer.as_ref().is_ok_and(|rows| rows.len() == 6),
+        "row 2 stood at the point: {answer:?}"
+    );
+}
+
+#[test]
+fn a_row_published_before_its_transaction_committed_is_never_history() {
+    use std::sync::Arc;
+    use stoolap::core::{Row, Value};
+    use stoolap::storage::mvcc::version_store::TransactionVersionStore;
+    use stoolap::storage::mvcc::MVCCTable;
+    use stoolap::storage::traits::{Engine, Table};
+
+    let _guard = FailpointGuard::new();
+    let db = memory("as_of_history_early_publication");
+    db.execute("INSERT INTO t VALUES (2, 20)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let store = db.engine().get_version_store("t").unwrap();
+    let local = TransactionVersionStore::new(Arc::clone(&store), txn.id());
+    let mut handle = MVCCTable::new(txn.id(), store, local);
+    handle
+        .insert(Row::from(vec![Value::Integer(1), Value::Integer(10)]))
+        .unwrap();
+    handle
+        .txn_versions()
+        .unwrap()
+        .write_store()
+        .commit()
+        .unwrap();
+    drop(handle);
+    assert_eq!(at(&db, "2200-01-01"), Ok(vec![(2, 20)]), "still active");
+    txn.rollback().unwrap();
+    assert_eq!(at(&db, "2200-01-01"), Ok(vec![(2, 20)]), "rolled back");
+}
+
+#[test]
+fn transaction_zero_is_no_history_event() {
+    let _guard = FailpointGuard::new();
+    let db = memory("as_of_history_transaction_zero");
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN w INTEGER", ())
+        .unwrap();
+    refused(after(&db, 0), "no transaction has id 0");
+    refused(after(&db, -1), "nor a negative one");
 }

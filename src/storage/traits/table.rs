@@ -1531,6 +1531,12 @@ pub trait Table: Send + Sync {
         Err(Error::internal("this table keeps no history"))
     }
 
+    /// Whether the table still holds everything `point` needs: asked again
+    /// once a read at the point has read everything
+    fn check_history(&self, _point: &ReadPoint) -> Result<()> {
+        Err(Error::internal("this table keeps no history"))
+    }
+
     /// Explains what access method would be used for a scan
     ///
     /// This method analyzes the WHERE expression and returns a ScanPlan

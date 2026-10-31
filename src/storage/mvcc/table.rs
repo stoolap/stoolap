@@ -5203,11 +5203,16 @@ impl Table for MVCCTable {
     fn rows_at(&self, point: &ReadPoint, authority: Option<&mut FxHashSet<i64>>) -> Result<RowVec> {
         let mut rows = self.version_store.rows_at(point, authority)?;
         self.check_read()?;
-        let schema = self.version_store.schema();
+        // The handle's schema: a column change since raised the mark the read
+        // checked, so every row read predates it
         for (_, row) in rows.iter_mut() {
-            *row = normalize_row_to_schema(std::mem::take(row), &schema);
+            *row = normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
         }
         Ok(rows)
+    }
+
+    fn check_history(&self, point: &ReadPoint) -> Result<()> {
+        self.version_store.check_history(point)
     }
 
     fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {

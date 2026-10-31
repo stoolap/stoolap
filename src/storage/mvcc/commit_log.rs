@@ -60,6 +60,9 @@ pub struct HistoricalCut {
     /// What had completed at the cut: the newest point sees as much, since
     /// no commit completed between it and the cut
     completed_through: i64,
+    /// The ordinal a completion last went unrecorded at: the newest point
+    /// is then not extended to the cut
+    skipped_at: u64,
 }
 
 /// A point K: what had completed when the K-th commit did
@@ -103,6 +106,8 @@ pub(crate) struct CommitLog {
     time_floor: AtomicI64,
     open_seq: AtomicI64,
     open_time: AtomicI64,
+    /// The ordinal a completion last found no prepared slot at, 0 if none
+    skipped_at: AtomicU64,
 }
 
 /// Nanoseconds since the epoch, as AS OF TIMESTAMP reads them
@@ -133,6 +138,7 @@ impl CommitLog {
             time_floor: AtomicI64::new(now),
             open_seq: AtomicI64::new(0),
             open_time: AtomicI64::new(now),
+            skipped_at: AtomicU64::new(0),
         }
     }
 
@@ -188,9 +194,11 @@ impl CommitLog {
         let k = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
         let Some(slot) = self.slot(k) else {
-            // Not prepared ahead: no point that needs this entry is kept
+            // Not prepared ahead: no point that needs this entry is kept, and
+            // the entry before it no longer reaches to the next cut
             self.bound
                 .fetch_max(completion.commit_seq, Ordering::Release);
+            self.skipped_at.store(k, Ordering::Release);
             return;
         };
         if k - tail >= self.capacity as u64 {
@@ -220,6 +228,7 @@ impl CommitLog {
             open_seq: self.open_seq.load(Ordering::Acquire),
             open_time: self.open_time.load(Ordering::Acquire),
             completed_through,
+            skipped_at: self.skipped_at.load(Ordering::Acquire),
         }
     }
 
@@ -307,7 +316,7 @@ impl CommitLog {
     /// The point at ordinal `k`; `touched` is the smallest ordinal the
     /// search already read
     fn point(&self, k: u64, touched: u64, cut: &HistoricalCut) -> Result<ReadPoint> {
-        let newest = k + 1 == cut.head;
+        let newest = k + 1 == cut.head && cut.skipped_at != cut.head;
         if k == 0 {
             let completed_through = match newest {
                 true => cut.open_seq.max(cut.completed_through),
@@ -449,5 +458,20 @@ mod tests {
         assert_eq!(allocated(&log), 1);
         assert_eq!(log.bound(), CHUNK_SLOTS as i64 + 1);
         assert_eq!(log.head.load(Ordering::Acquire), CHUNK_SLOTS as u64);
+    }
+
+    #[test]
+    fn an_unrecorded_completion_keeps_the_entry_before_it_from_reaching_the_cut() {
+        let log = CommitLog::new(COMMIT_LOG_CAPACITY);
+        log.prepare();
+        let last = CHUNK_SLOTS as i64 + 1;
+        for seq in 1..=last {
+            complete(&log, seq);
+        }
+        let cut = log.cut(wall_clock(), last);
+        assert!(
+            log.point_at_time(i64::MAX, cut).is_err(),
+            "the newest kept entry predates the unrecorded commits"
+        );
     }
 }

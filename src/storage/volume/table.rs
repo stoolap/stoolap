@@ -7443,11 +7443,16 @@ impl Table for SegmentedTable {
             if let Some(authority) = authority.as_deref_mut() {
                 authority.extend(decided.iter().copied());
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::as_of_hot_read();
             let Some(cold_rows) = self.collect_cold_rows(None, decided, generation, Some(point))?
             else {
                 return Ok(None);
             };
             self.check_cold()?;
+            // A compaction that ran during the read moves no seal generation;
+            // it raised the mark before its rewrite was visible
+            self.hot.check_history(point)?;
             // Newest volume first: a row id answers once
             let mut seen = FxHashSet::default();
             let mut rows = RowVec::with_capacity(hot_rows.len() + cold_rows.len());
