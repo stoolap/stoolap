@@ -77,6 +77,23 @@ pub(crate) fn commit_log_slots_read() {
     }
 }
 
+thread_local! {
+    static GC_ROWS_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next deleted-row cleanup has chosen
+/// its rows and not yet taken the versions lock
+pub fn after_gc_rows_chosen(hook: impl FnOnce() + 'static) {
+    GC_ROWS_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn gc_rows_chosen() {
+    let hook = GC_ROWS_CHOSEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Write the WAL buffer but its last 5 bytes, then fail the write
 pub static WAL_WRITE_PARTIAL: AtomicBool = AtomicBool::new(false);
 
@@ -3493,6 +3510,7 @@ pub fn reset_all() {
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     AS_OF_HOT_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_LOG_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    GC_ROWS_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
     TABLE_WAL_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);

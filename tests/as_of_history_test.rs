@@ -525,6 +525,36 @@ fn retention_keeps_a_delete_whose_commit_took_no_sequence() {
 }
 
 #[test]
+fn retention_rechecks_a_chosen_row_rewritten_before_its_lock() {
+    let _guard = FailpointGuard::new();
+    let db = memory("as_of_history_retention_rewritten");
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    db.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
+    now(&db);
+    let between = Rc::new(RefCell::new(String::new()));
+    let (other, seen) = (db.clone(), Rc::clone(&between));
+    fp::after_gc_rows_chosen(move || {
+        for write in [true, false] {
+            let mut txn = other.engine().begin_transaction().unwrap();
+            let mut writer = early_writer(&other, txn.id());
+            if write {
+                writer.insert(row(1, 11)).unwrap();
+            } else {
+                writer.delete_by_row_ids(&[1]).unwrap();
+            }
+            publish(&mut writer);
+            txn.commit().unwrap();
+            if write {
+                *seen.borrow_mut() = now(&other);
+            }
+        }
+    });
+    let store = db.engine().get_version_store("t").unwrap();
+    store.cleanup_deleted_rows(Duration::ZERO);
+    refused(at(&db, &between.borrow()), "the rewrites cannot be placed");
+}
+
+#[test]
 fn transaction_zero_is_no_history_event() {
     let _guard = FailpointGuard::new();
     let db = memory("as_of_history_transaction_zero");

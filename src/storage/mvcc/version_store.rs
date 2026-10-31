@@ -6570,6 +6570,8 @@ impl VersionStore {
         if rows_to_delete.is_empty() {
             return 0;
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::gc_rows_chosen();
 
         // Second pass: acquire write lock and re-validate before removing.
         // Between the snapshot (first pass) and now, a concurrent transaction may have
@@ -6585,7 +6587,9 @@ impl VersionStore {
             for &row_id in &rows_to_delete {
                 // Re-check: the row must still exist AND still be deleted below the bound
                 if let Some(entry) = versions.get(row_id) {
-                    if removable(&entry.version) {
+                    if removable(&entry.version)
+                        && self.past_retention(point.as_ref(), &entry.version)
+                    {
                         if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                             actual_arena_indices.push(idx);
                         }
