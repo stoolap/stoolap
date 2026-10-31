@@ -507,6 +507,24 @@ fn retention_places_an_early_published_delete_by_its_commit() {
 }
 
 #[test]
+fn retention_keeps_a_delete_whose_commit_took_no_sequence() {
+    let _guard = FailpointGuard::new();
+    let db = memory("as_of_history_unplaced_retention");
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    let before = now(&db);
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut writer = early_writer(&db, txn.id());
+    writer.delete_by_row_ids(&[1]).unwrap();
+    publish(&mut writer);
+    txn.commit().unwrap();
+    refused(at(&db, &before), "the delete cannot be placed");
+    now(&db);
+    let store = db.engine().get_version_store("t").unwrap();
+    store.cleanup_deleted_rows(Duration::ZERO);
+    refused(at(&db, &before), "still, after retention");
+}
+
+#[test]
 fn transaction_zero_is_no_history_event() {
     let _guard = FailpointGuard::new();
     let db = memory("as_of_history_transaction_zero");

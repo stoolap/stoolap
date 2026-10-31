@@ -2253,12 +2253,11 @@ impl VersionStore {
     }
 
     /// Whether a retention pass at `point` finds `version` past retention.
-    /// One the registry no longer places is: its discard raises the mark
+    /// One the registry no longer places stays: no mark could bound its discard
     fn past_retention(&self, point: Option<&ReadPoint>, version: &RowVersion) -> bool {
         point.is_none_or(|point| match self.commit_of(version) {
             CommitOf::Committed(seq) => point.sees(seq),
-            CommitOf::NotCommitted => false,
-            CommitOf::Unknown => true,
+            CommitOf::NotCommitted | CommitOf::Unknown => false,
         })
     }
 
