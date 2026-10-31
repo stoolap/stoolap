@@ -246,7 +246,17 @@ fn a_filter_judges_the_rows_a_transaction_wrote_by_its_own_versions() {
 fn a_filter_error_is_the_statements_as_of_a_transaction() {
     let db = Database::open("memory://storage_filter_error_as_of").unwrap();
     filled(&db);
-    for as_of in ["TIMESTAMP '2200-01-01 00:00:00'", "TRANSACTION 100"] {
+    db.execute("CREATE TABLE z (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let mut writer = db.begin().unwrap();
+    let after_fill = writer.id();
+    writer.execute("INSERT INTO z VALUES (1)", ()).unwrap();
+    writer.commit().unwrap();
+    let points = [
+        "TIMESTAMP '2200-01-01 00:00:00'".to_string(),
+        format!("TRANSACTION {after_fill}"),
+    ];
+    for as_of in &points {
         let all = answer(&db, &format!("SELECT id FROM t AS OF {as_of}"));
         let some = answer(
             &db,

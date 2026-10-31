@@ -121,7 +121,20 @@ fn test_a_subquery_reading_a_cte_of_its_statement_runs_in_each_statement() {
 #[test]
 fn test_a_non_deterministic_as_of_runs_in_each_statement() {
     let db = setup("volatile_subquery_as_of");
-    let sql = "SELECT (SELECT MAX(bid) FROM b AS OF TIMESTAMP CASE WHEN RANDOM() < 0.5 \
-               THEN '1970-01-01 00:00:00' ELSE '2099-01-01 00:00:00' END)";
-    assert!(answers(&db, sql).len() > 1, "{sql} gave one answer");
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let before: String = db
+        .query("SELECT CAST(NOW() AS TEXT)", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    db.execute("INSERT INTO b VALUES (1000, 1)", ()).unwrap();
+    let sql = format!(
+        "SELECT (SELECT MAX(bid) FROM b AS OF TIMESTAMP CASE WHEN RANDOM() < 0.5 \
+         THEN '{before}' ELSE '2099-01-01 00:00:00' END)"
+    );
+    assert!(answers(&db, &sql).len() > 1, "{sql} gave one answer");
 }

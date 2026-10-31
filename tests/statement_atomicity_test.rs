@@ -15,9 +15,7 @@
 use std::sync::Arc;
 
 use stoolap::core::{DataType, Row, SchemaBuilder, Value};
-use stoolap::storage::mvcc::{
-    get_fast_timestamp, MVCCTable, TransactionVersionStore, VersionStore,
-};
+use stoolap::storage::mvcc::{last_write_order, MVCCTable, TransactionVersionStore, VersionStore};
 use stoolap::storage::traits::Table;
 use stoolap::storage::volume::manifest::SegmentManager;
 use stoolap::storage::volume::table::SegmentedTable;
@@ -132,7 +130,7 @@ fn repeated_pending_tombstone_keeps_its_original_boundary() {
         None,
     );
     manager.add_pending_tombstone(1, 1);
-    let boundary = get_fast_timestamp();
+    let boundary = last_write_order();
     manager.add_pending_tombstone(1, 1);
     manager.add_pending_tombstone(1, 2);
     manager.rollback_pending_tombstones_after(1, boundary);
@@ -151,7 +149,7 @@ fn table_rollback_keeps_the_claim_for_an_earlier_cold_delete() {
     store.try_claim_row(1, 1).unwrap();
     local.track_external_claim(1);
     manager.add_pending_tombstone(1, 1);
-    let boundary = get_fast_timestamp();
+    let boundary = last_write_order();
     local
         .put(1, Row::from_values(vec![Value::Integer(1)]), false)
         .unwrap();

@@ -21,10 +21,11 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
+use crate::core::{Error, IsolationLevel, Result, RowVec, Schema, SchemaColumn};
+use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
-use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
+use crate::storage::mvcc::TransactionRegistry;
 use crate::storage::traits::transaction::{StatementAccess, TableUse};
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
@@ -471,7 +472,7 @@ impl MvccTransaction {
         // or drops whole statements
         let gate = self.hold_writes();
         let _hold = gate.as_ref().map(|gate| gate.hold());
-        let timestamp = get_fast_timestamp();
+        let timestamp = crate::storage::mvcc::last_write_order();
         let ddl_state = SavepointDdlState {
             created_tables_len: self.created_tables.len(),
             dropped_tables_len: self.dropped_tables.len(),
@@ -605,6 +606,8 @@ impl Transaction for MvccTransaction {
 
         // Two-phase commit protocol
         if !is_read_only {
+            // Before any fence or lock: the first commit allocates the log here
+            self.registry.prepare_commit_log();
             if let Some(ops) = &self.engine_operations {
                 ops.wait_for_hot_admission(self.id);
             }
@@ -1047,20 +1050,20 @@ impl Transaction for MvccTransaction {
         table.select_with_aliases(&col_refs, expr, aliases)
     }
 
-    fn select_as_of(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
+    fn read_point(&self, temporal_type: &str, temporal_value: i64) -> Result<ReadPoint> {
+        let cut = self.registry.historical_cut();
+        match temporal_type.to_uppercase().as_str() {
+            "TIMESTAMP" => self.registry.point_at_time(temporal_value, cut),
+            "TRANSACTION" => self.registry.point_of_transaction(temporal_value, cut),
+            other => Err(Error::invalid_argument(format!(
+                "Unsupported AS OF type: {other}"
+            ))),
+        }
+    }
 
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select_as_of(&col_refs, expr, temporal_type, temporal_value)
+    fn rows_at(&self, table_name: &str, point: &ReadPoint) -> Result<RowVec> {
+        self.check_active()?;
+        self.get_table(table_name)?.rows_at(point, None)
     }
 }
 

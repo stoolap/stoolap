@@ -13320,48 +13320,15 @@ impl Executor {
             .and_then(get_table_alias_from_expr);
         let source_alias = source_alias.as_deref().unwrap_or(table_name);
 
-        // Parse temporal value
-        let temporal_value = self.parse_temporal_value(as_of, ctx)?;
-
-        // Build storage expression if WHERE clause exists
-        // Try to push down to storage, fall back to memory filter for complex expressions
-        let (storage_expr, needs_memory_filter) = stmt
-            .where_clause
-            .as_ref()
-            .map(|where_expr| pushdown::try_pushdown(where_expr, &schema, Some(ctx)))
-            .unwrap_or((None, false));
-
-        // Every column, in the table's order: the filter, the projection, the
+        // The point the AS OF value names, and every row as it stood there,
+        // every column in the table's order: the filter, the projection, the
         // grouping and the sort below read the rows as the table lays them out
-        let result = tx.select_as_of(
-            table_name,
-            &all_columns,
-            storage_expr.as_deref(),
-            &as_of.as_of_type,
-            temporal_value,
-            Some(&all_columns),
-        )?;
-
-        // Get output columns from result
-        let _output_columns = result.columns().to_vec();
-
-        // Collect rows for further processing (projection, aggregation, etc.)
-        // Use synthetic row IDs since temporal queries don't preserve original IDs
-        let mut rows = RowVec::with_capacity(64);
-        let mut result_iter = result;
-        let mut row_id = 0i64;
-        while result_iter.next() {
-            rows.push((row_id, result_iter.take_row()));
-            row_id += 1;
-        }
-
-        // Apply in-memory WHERE filter if storage expression couldn't handle it fully
-        if needs_memory_filter {
-            if let Some(where_expr) = &stmt.where_clause {
-                let where_filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
-
-                where_filter.retain_checked(&mut rows)?;
-            }
+        let temporal_value = self.parse_temporal_value(as_of, ctx)?;
+        let point = tx.read_point(&as_of.as_of_type, temporal_value)?;
+        let mut rows = tx.rows_at(table_name, &point)?;
+        if let Some(where_expr) = &stmt.where_clause {
+            let where_filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
+            where_filter.retain_checked(&mut rows)?;
         }
 
         // The shape of what this read answers, for its ORDER BY

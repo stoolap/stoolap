@@ -33,8 +33,9 @@ See [Date and Time Handling]({{ '/docs/data-types/date-and-time/' | relative_url
 ## Temporal Queries (AS OF)
 
 - **No subqueries with AS OF**: AS OF clauses cannot be combined with subqueries.
+- **Explicit transactions**: Inside an explicit transaction, a table read AS OF in a statement without subqueries is read at its current state.
 - **System clock dependency**: Timestamp resolution depends on the system clock precision.
-- **VACUUM removes history**: Running VACUUM permanently removes all historical row versions not needed by currently active transactions. After a VACUUM, AS OF queries referencing timestamps before the VACUUM will return no results.
+- **A bounded history window**: History starts at the last open and ends where a table's version limit, the 24-hour background cleanup, a checkpoint, a compaction, a TRUNCATE, a column change, a VACUUM or the 262,144-commit log cut it. A point outside it is an error naming the oldest point still readable, never a partial answer.
 
 See [Temporal Queries]({{ '/docs/sql-features/temporal-queries/' | relative_url }}) for AS OF usage.
 
@@ -73,7 +74,7 @@ See [WebAssembly]({{ '/docs/drivers/wasm/' | relative_url }}) for WASM usage.
 
 ## Cold Segments (Frozen Volumes)
 
-- **AS OF on cold rows**: Historical point-in-time queries (AS OF TRANSACTION) are not supported on tables with cold segments because cold rows lack version chains. AS OF CURRENT queries work correctly.
+- **AS OF on cold rows**: Cold rows keep no version history, so an AS OF query reads a table with cold segments only at points after its newest checkpoint moved rows into them.
 - **Compaction memory**: Compaction materializes the full cold dataset in memory before rewriting. For tables with millions of cold rows, this causes a temporary memory spike. Similarly, parallel GROUP BY on 4+ volumes materializes one group map per volume simultaneously before merging.
 - **Skip-set cloning**: Each scan builds per-volume skip sets by cloning cumulative row_id sets. For tables with many volumes, this is O(N*V). Compaction keeps volume counts low (default threshold: 4).
 - **WAL growth under continuous writes**: WAL truncation requires all hot buffers to be empty. Under continuous writes, new rows may arrive between the seal pass and the truncation check. The checkpoint cycle force-seals small tables below the normal threshold, but truly continuous writes can delay truncation until a quiet period or clean close.

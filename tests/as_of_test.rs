@@ -18,6 +18,17 @@
 
 use stoolap::{Database, Value};
 
+/// Whether the statement was refused for naming a point past the history
+/// the database keeps, not for its text
+fn refused_by_history(result: stoolap::Result<stoolap::Rows>) -> bool {
+    match result {
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .is_err_and(|e| e.to_string().contains("AS OF")),
+        Err(e) => e.to_string().contains("AS OF"),
+    }
+}
+
 // ============================================================================
 // Parser Tests
 // ============================================================================
@@ -30,10 +41,10 @@ fn test_as_of_parser_transaction_integer() {
     db.execute("INSERT INTO users VALUES (1, 'Alice')", ())
         .expect("Insert failed");
 
-    // AS OF TRANSACTION with integer should parse successfully
+    // AS OF TRANSACTION with an integer parses; no such commit is kept
     let result = db.query("SELECT * FROM users AS OF TRANSACTION 12345", ());
     assert!(
-        result.is_ok(),
+        refused_by_history(result),
         "AS OF TRANSACTION with integer should parse"
     );
 }
@@ -46,12 +57,15 @@ fn test_as_of_parser_timestamp_string() {
     db.execute("INSERT INTO users VALUES (1, 'Alice')", ())
         .expect("Insert failed");
 
-    // AS OF TIMESTAMP with string should parse successfully
+    // AS OF TIMESTAMP with a string parses; that time is before the open
     let result = db.query(
         "SELECT * FROM users AS OF TIMESTAMP '2024-01-01 10:00:00'",
         (),
     );
-    assert!(result.is_ok(), "AS OF TIMESTAMP with string should parse");
+    assert!(
+        refused_by_history(result),
+        "AS OF TIMESTAMP with string should parse"
+    );
 }
 
 #[test]
@@ -63,7 +77,7 @@ fn test_as_of_parser_with_table_alias() {
         .expect("Insert failed");
 
     // AS OF with table alias should parse successfully
-    let result = db.query("SELECT * FROM users AS OF TRANSACTION 100 AS u", ());
+    let result = db.query("SELECT * FROM users AS OF TIMESTAMP '2200-01-01' AS u", ());
     assert!(result.is_ok(), "AS OF with table alias should parse");
 }
 
@@ -163,12 +177,15 @@ fn test_as_of_timestamp() {
     db.execute("UPDATE events SET status = 'completed' WHERE id = 1", ())
         .expect("Update failed");
 
-    // Query with AS OF TIMESTAMP (past timestamp)
+    // A time before the database was opened is past the history it keeps
     let result = db.query(
         "SELECT * FROM events AS OF TIMESTAMP '2020-01-01 00:00:00'",
         (),
     );
-    assert!(result.is_ok(), "AS OF TIMESTAMP should execute");
+    assert!(
+        refused_by_history(result),
+        "AS OF TIMESTAMP 2020 is refused"
+    );
 
     // Query with AS OF TIMESTAMP (future timestamp should see current data)
     let result = db.query(
@@ -340,16 +357,17 @@ fn test_as_of_timestamp_boundary_conditions() {
     )
     .expect("Insert failed");
 
-    // Test various timestamp boundaries
+    // A time before the database was opened is refused; one not passed yet
+    // reads the newest state
     let test_cases = [
-        ("2024-06-15 12:00:01", true),  // 1 second after
-        ("2024-06-15 11:00:00", false), // 1 hour before
-        ("2024-06-16 12:00:00", true),  // 1 day after
-        ("2050-01-01 00:00:00", true),  // Far future
-        ("2020-01-01 00:00:00", false), // Far past
+        ("2024-06-15 12:00:01", false),
+        ("2024-06-15 11:00:00", false),
+        ("2024-06-16 12:00:00", false),
+        ("2200-01-01 00:00:00", true),
+        ("2020-01-01 00:00:00", false),
     ];
 
-    for (timestamp, _should_have_row) in test_cases {
+    for (timestamp, answers) in test_cases {
         let result = db.query(
             &format!(
                 "SELECT id FROM timestamp_edge AS OF TIMESTAMP '{}'",
@@ -357,11 +375,13 @@ fn test_as_of_timestamp_boundary_conditions() {
             ),
             (),
         );
-        assert!(
-            result.is_ok(),
-            "AS OF TIMESTAMP '{}' should execute",
-            timestamp
-        );
+        match answers {
+            true => assert!(result.is_ok(), "AS OF TIMESTAMP '{timestamp}' answers"),
+            false => assert!(
+                refused_by_history(result),
+                "AS OF TIMESTAMP '{timestamp}' is refused"
+            ),
+        }
     }
 }
 
@@ -383,12 +403,18 @@ fn test_as_of_error_conditions() {
     let result = db.query("SELECT * FROM error_test AS OF TRANSACTION 'abc'", ());
     assert!(result.is_err(), "Non-integer transaction ID should error");
 
-    // AS OF TIMESTAMP with integer is accepted (interpreted as nanoseconds)
+    // AS OF TIMESTAMP with integer is read as nanoseconds: 123 is long
+    // before the database was opened
     let result = db.query("SELECT * FROM error_test AS OF TIMESTAMP 123", ());
     assert!(
-        result.is_ok(),
-        "AS OF TIMESTAMP with integer is valid (nanoseconds)"
+        refused_by_history(result),
+        "AS OF TIMESTAMP 123 reads nanoseconds and is refused"
     );
+    let result = db.query(
+        "SELECT * FROM error_test AS OF TIMESTAMP 7000000000000000000",
+        (),
+    );
+    assert!(result.is_ok(), "AS OF TIMESTAMP with integer nanoseconds");
 
     // Malformed timestamp string
     let result = db.query("SELECT * FROM error_test AS OF TIMESTAMP 'not-a-date'", ());
@@ -446,7 +472,10 @@ fn test_as_of_empty_table() {
     .expect("Create failed");
 
     // Query empty table with AS OF
-    let result = db.query("SELECT * FROM coverage_test AS OF TRANSACTION 1", ());
+    let result = db.query(
+        "SELECT * FROM coverage_test AS OF TIMESTAMP '2200-01-01'",
+        (),
+    );
     assert!(result.is_ok(), "AS OF on empty table should execute");
 }
 
@@ -462,9 +491,9 @@ fn test_as_of_very_old_transaction() {
     db.execute("INSERT INTO coverage_test VALUES (1, 100)", ())
         .expect("Insert failed");
 
-    // Query with transaction ID 0 (before any data)
+    // Transaction 0 completed no commit
     let result = db.query("SELECT * FROM coverage_test AS OF TRANSACTION 0", ());
-    assert!(result.is_ok(), "AS OF TRANSACTION 0 should execute");
+    assert!(refused_by_history(result), "AS OF TRANSACTION 0 is refused");
 }
 
 #[test]
@@ -479,12 +508,15 @@ fn test_as_of_very_old_timestamp() {
     db.execute("INSERT INTO coverage_test VALUES (1, 100)", ())
         .expect("Insert failed");
 
-    // Query with timestamp from 1970
+    // A time before the database was opened is past the history it keeps
     let result = db.query(
         "SELECT * FROM coverage_test AS OF TIMESTAMP '1970-01-01 00:00:00'",
         (),
     );
-    assert!(result.is_ok(), "AS OF TIMESTAMP 1970 should execute");
+    assert!(
+        refused_by_history(result),
+        "AS OF TIMESTAMP 1970 is refused"
+    );
 }
 
 #[test]
@@ -525,7 +557,7 @@ fn test_as_of_with_complex_expressions() {
 
     // Complex WHERE with AS OF
     let result = db.query(
-        "SELECT id, value FROM coverage_test AS OF TRANSACTION 4 \
+        "SELECT id, value FROM coverage_test AS OF TIMESTAMP '2200-01-01' \
          WHERE (value > 150 AND value < 400) OR text_value IS NULL \
          ORDER BY id",
         (),
@@ -660,11 +692,14 @@ fn test_as_of_select_specific_columns() {
         .expect("Insert failed");
 
     // Select specific columns with AS OF
-    let result = db.query("SELECT a, c FROM multi_col AS OF TRANSACTION 2", ());
+    let result = db.query(
+        "SELECT a, c FROM multi_col AS OF TIMESTAMP '2200-01-01'",
+        (),
+    );
     assert!(result.is_ok(), "AS OF with specific columns should execute");
 
     let result = db.query(
-        "SELECT b, d FROM multi_col AS OF TRANSACTION 2 WHERE a = 1",
+        "SELECT b, d FROM multi_col AS OF TIMESTAMP '2200-01-01' WHERE a = 1",
         (),
     );
     assert!(
@@ -712,7 +747,11 @@ fn test_as_of_selects_the_columns_it_names() {
         let before: String = db.query_one("SELECT CAST(NOW() AS TEXT)", ()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         db.execute("UPDATE u SET x = 30 WHERE id = 2", ()).unwrap();
-        db.execute("INSERT INTO u VALUES (3, 9, 'c')", ()).unwrap();
+        let mut last = db.begin().unwrap();
+        let last_id = last.id();
+        last.execute("INSERT INTO u VALUES (3, 9, 'c')", ())
+            .unwrap();
+        last.commit().unwrap();
         let answer = |sql: &str| -> (Vec<String>, Vec<Vec<Value>>) {
             let rows = db
                 .query(sql, ())
@@ -754,7 +793,7 @@ fn test_as_of_selects_the_columns_it_names() {
                 vec![vec![int(1)], vec![int(9)], vec![int(30)]],
             ),
             (
-                "SELECT u.s FROM u AS OF TRANSACTION 1000000 ORDER BY s".to_string(),
+                format!("SELECT u.s FROM u AS OF TRANSACTION {last_id} ORDER BY s"),
                 vec!["s"],
                 vec![vec![text("a")], vec![text("b")], vec![text("c")]],
             ),

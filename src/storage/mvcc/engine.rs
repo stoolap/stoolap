@@ -1139,6 +1139,11 @@ impl MVCCEngine {
                 // Replay WAL entries after the checkpoint/snapshot LSN
                 self.replay_wal(replay_from_lsn)?;
 
+                // History opens at the recovered state, above every sequence
+                // a volume or a tombstone kept from earlier runs
+                self.registry
+                    .open_history_at(self.persisted_sequence_floor());
+
                 // Populate pre-computed default_value from default_expr for schema evolution.
                 // Neither snapshots nor WAL persist the cached default_value, so old rows
                 // read via normalize_row_to_schema would get NULL instead of the column default.
@@ -4088,6 +4093,24 @@ impl MVCCEngine {
     /// the max row_id in segments (which may be higher than hot buffer).
     /// Normal secondary indexes are NOT populated from cold data.
     /// HNSW is the one cold index that needs explicit graph rebuild.
+    /// The largest sequence the volumes and tombstones loaded from disk carry
+    fn persisted_sequence_floor(&self) -> i64 {
+        let mgrs = self
+            .segment_managers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut floor = 0u64;
+        for mgr in mgrs.values() {
+            for seg in &mgr.manifest().segments {
+                floor = floor.max(seg.seal_seq);
+            }
+            for &seq in mgr.tombstone_set_arc().values() {
+                floor = floor.max(seq);
+            }
+        }
+        floor as i64
+    }
+
     fn sync_auto_increment_from_segments(&self) -> Result<()> {
         let mut segment_data: Vec<_> = {
             let mgrs = self.segment_managers.read().unwrap();
@@ -7039,6 +7062,11 @@ impl MVCCEngine {
                 .map_err(|_| Error::internal("version stores lock poisoned"))?
                 .get(table_name)
                 .cloned();
+            // Before the rewrite is visible: a point that has not seen every
+            // tombstone it applies would need the rows they hid
+            if let Some(store) = &store {
+                store.raise_history_mark(tombstone_limit as i64 - 1);
+            }
             let unique_columns = store
                 .as_ref()
                 .map(|store| store.get_unique_non_pk_index_columns())
@@ -8011,6 +8039,9 @@ impl MVCCEngine {
                     for entry in entries.iter_mut() {
                         entry.2.seal_seq = current_seal_seq;
                     }
+                    // Before the volume is visible: a point that has not seen
+                    // every commit up to the cutoff would need the moved chains
+                    store.raise_history_mark(current_seal_seq as i64);
                     // The mapping is computed against the schema current now,
                     // under the schema cache's read lock held until the
                     // segments are visible, as a single registration does

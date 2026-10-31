@@ -130,15 +130,29 @@ This feature enables powerful use cases:
 
 ## How It Works
 
-1. **Transaction-based Queries**: When using `AS OF TRANSACTION`, Stoolap finds all row versions that were visible to that specific transaction ID.
+A point is a moment in the order commits complete, the order in which they become visible.
 
-2. **Timestamp-based Queries**: When using `AS OF TIMESTAMP`, Stoolap finds the newest version of each row that was created before or at the specified timestamp.
+1. **Timestamp-based Queries**: `AS OF TIMESTAMP t` reads, for each row, the newest version whose transaction had completed its commit at or before `t`. A transaction that wrote before `t` and committed after it is not part of the answer. A time that has not passed yet when the statement starts reads the newest committed state at its start.
 
-3. **Version Chain Traversal**: Stoolap traverses the version chain for each row from newest to oldest, finding the appropriate version based on the temporal criteria.
+2. **Transaction-based Queries**: `AS OF TRANSACTION n` reads the state right after transaction `n` completed its commit, including every commit that completed before it, whatever the transaction ids. A transaction that is still active, was rolled back, wrote nothing, or is no longer in the history the database keeps is an error.
 
-4. **Deletion Handling**: Deleted rows are properly handled - if a row was deleted before the AS OF point, it won't appear in the results.
+3. **Deletion Handling**: A row deleted by a commit that completed at or before the point does not appear; one deleted later does.
 
-5. **Columns**: Each version is read whole, so a query answers the columns it names, in any order and with or without a `WHERE`, as the row held them at that point. A column added after a version was written reads in it as the column's default, or NULL when it has none.
+4. **Columns**: Each version is read whole, so a query answers the columns it names, in any order and with or without a `WHERE`, as the row held them at that point. A column added after a version was written reads in it as the column's default, or NULL when it has none.
+
+5. **Stable answers**: The answer for a given transaction, and for a time that has passed, never changes: a commit that completes later is never part of an earlier point.
+
+## History Window
+
+Stoolap answers a point exactly or not at all. When it no longer holds what a point needs, the statement fails with an error that names the oldest point it can still read. A point is out of reach when it is:
+
+- before the database was last opened: history does not survive a restart;
+- older than the version history a table keeps: a row keeps up to 10 earlier versions, and versions older than 24 hours are let go in the background, so a table updated often keeps a shorter window;
+- before a `TRUNCATE`, an `ALTER TABLE` that adds, drops or changes a column, or the creation of the table;
+- before the table's newest checkpoint moved rows into its volumes, or before a compaction of them;
+- older than the database's commit log, which keeps the last 262,144 commits.
+
+The window is a property of each table: 24 hours is the longest it keeps, not a guarantee.
 
 ## Important Notes
 
@@ -153,17 +167,17 @@ This feature enables powerful use cases:
 
 ### Performance Considerations
 
-- AS OF queries may need to load historical data from disk if it's not in memory
-- Transaction-based queries are generally faster than timestamp-based queries
-- Using indexes with AS OF queries provides the same benefits as regular queries
+- An AS OF query reads every row version of the table and the volumes it holds; it uses no index
+- A transaction-based point is found by scanning the commit log, a timestamp-based one by a binary search in it
 
 ### VACUUM Warning
 
-Running `VACUUM` (or `PRAGMA vacuum`) permanently removes all historical row versions not needed by currently active transactions. After a VACUUM, AS OF TIMESTAMP queries referencing timestamps before the VACUUM will no longer return results. If you rely on time-travel queries, use the background cleanup (which preserves a configurable retention window) instead of VACUUM.
+Running `VACUUM` (or `PRAGMA vacuum`) permanently removes all historical row versions not needed by currently active transactions. After a VACUUM, an AS OF query naming a point before it fails with the history error. If you rely on time-travel queries, leave history to the background cleanup instead of running VACUUM.
 
 ### Limitations
 
 - Subqueries with AS OF are not yet supported
+- Inside an explicit transaction, a table read AS OF in a statement without subqueries is read at its current state
 - The timestamp resolution depends on the system clock precision
 
 ## Use Cases

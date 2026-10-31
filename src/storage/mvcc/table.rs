@@ -29,6 +29,7 @@ use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::{passes, ConstBoolExpr, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
+use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::{self, IndexPlan, Read};
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
@@ -5199,76 +5200,19 @@ impl Table for MVCCTable {
         Ok(result.with_aliases(aliases.clone()))
     }
 
-    fn select_as_of(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Convert column names to indices
-        let column_indices: Vec<usize> = columns
-            .iter()
-            .filter_map(|name| self.cached_schema.find_column(name).map(|(idx, _)| idx))
-            .collect();
-        // Every column in the table's order: a version as wide is its own row, shared
-        let whole = column_indices.len() == self.cached_schema.columns.len()
-            && column_indices
-                .iter()
-                .enumerate()
-                .all(|(at, &idx)| at == idx);
-
-        // Get all row IDs
-        let row_ids = self.version_store.get_all_row_ids();
-
-        // Collect temporal rows
-        let mut rows = Vec::new();
-        let fallible = expr.is_some_and(|e| e.can_fail());
-        for row_id in row_ids {
-            let version = match temporal_type.to_uppercase().as_str() {
-                "TRANSACTION" => self
-                    .version_store
-                    .get_visible_version_as_of_transaction(row_id, temporal_value),
-                "TIMESTAMP" => self
-                    .version_store
-                    .get_visible_version_as_of_timestamp(row_id, temporal_value),
-                _ => {
-                    return Err(Error::internal(format!(
-                        "unsupported temporal type: {}",
-                        temporal_type
-                    )))
-                }
-            };
-
-            if let Some(v) = version {
-                if !v.is_deleted() {
-                    // Apply filter
-                    if let Some(e) = expr {
-                        if !passes(e, fallible, &v.data)? {
-                            continue;
-                        }
-                    }
-
-                    if whole && v.data.len() == column_indices.len() {
-                        rows.push(v.data.clone());
-                        continue;
-                    }
-                    // Project columns
-                    let projected: Vec<Value> = column_indices
-                        .iter()
-                        .map(|&idx| v.data.get(idx).cloned().unwrap_or(Value::null_unknown()))
-                        .collect();
-                    rows.push(Row::from_values(projected));
-                }
-            }
-        }
+    fn rows_at(&self, point: &ReadPoint, authority: Option<&mut FxHashSet<i64>>) -> Result<RowVec> {
+        let mut rows = self.version_store.rows_at(point, authority)?;
         self.check_read()?;
+        // The handle's schema: a column change since raised the mark the read
+        // checked, so every row read predates it
+        for (_, row) in rows.iter_mut() {
+            *row = normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
+        }
+        Ok(rows)
+    }
 
-        // Create result
-        let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
-        let result = MemoryResult::with_rows(result_columns, rows);
-
-        Ok(Box::new(result))
+    fn check_history(&self, point: &ReadPoint) -> Result<()> {
+        self.version_store.check_history(point)
     }
 
     fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {

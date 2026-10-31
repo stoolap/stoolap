@@ -29,8 +29,12 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
+use super::commit_log::{
+    wall_clock, CommitLog, Completion, HistoricalCut, ReadPoint, COMMIT_LOG_CAPACITY,
+};
 use crate::common::I64Map;
-use crate::core::IsolationLevel;
+use crate::core::{Error, IsolationLevel};
+use crate::storage::mvcc::version_store::CommitOf;
 use crate::storage::VisibilityChecker;
 
 /// Invalid transaction ID returned when registry is not accepting new transactions.
@@ -543,6 +547,41 @@ pub struct TransactionRegistry {
     /// Truncates and drops taking rows away now; written under the
     /// transactions lock, read there by a capture and outside it by a wait
     destructions_active: AtomicU32,
+
+    /// The order commits complete in: the points AS OF reads at
+    commit_log: CommitLog,
+}
+
+/// The commit log's slots: a test may ask for fewer
+fn log_capacity() -> usize {
+    #[cfg(feature = "test-failpoints")]
+    if let Some(slots) = crate::test_failpoints::commit_log_capacity() {
+        return slots;
+    }
+    COMMIT_LOG_CAPACITY
+}
+
+/// A change that destroys history, from `begin_history_event` until this
+/// drops on any exit: no point taken before it reads what it changed
+pub struct HistoryEvent {
+    registry: Arc<TransactionRegistry>,
+    seq: i64,
+}
+
+impl HistoryEvent {
+    /// The sequence a point must have completed through to read past it
+    pub fn seq(&self) -> i64 {
+        self.seq
+    }
+}
+
+impl Drop for HistoryEvent {
+    fn drop(&mut self) {
+        let registry = &self.registry;
+        let mut txns = registry.transactions.lock();
+        txns.uncommitting(self.seq);
+        registry.log_completion(&txns, 0, self.seq);
+    }
 }
 
 /// A truncate or drop taking rows away, from `begin_destruction` until this
@@ -587,6 +626,7 @@ impl TransactionRegistry {
             live_views: AtomicUsize::new(0),
             destruction_epoch: AtomicU64::new(0),
             destructions_active: AtomicU32::new(0),
+            commit_log: CommitLog::new(log_capacity()),
         }
     }
 
@@ -855,6 +895,7 @@ impl TransactionRegistry {
             let seq = txns.get(txn_id).map(|e| e.commit_seq()).unwrap_or(0);
             if seq > 0 {
                 txns.uncommitting(seq);
+                self.log_completion(&txns, txn_id, seq);
             }
 
             // Store commit_seq for snapshot isolation while holding transactions lock
@@ -884,6 +925,7 @@ impl TransactionRegistry {
         {
             let mut txns = self.transactions.lock();
             commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+            self.log_completion(&txns, txn_id, commit_seq);
 
             // Store commit_seq for snapshot isolation while holding transactions lock
             if self.global_isolation_level.load(Ordering::Relaxed) == 1
@@ -1228,6 +1270,95 @@ impl TransactionRegistry {
     /// under it
     fn completed_through(txns: &TxnTable, current: i64) -> i64 {
         txns.committing.iter().min().map_or(current, |&seq| seq - 1)
+    }
+
+    /// Records a completion in the commit log, in the lock section that
+    /// makes it visible; `commit_seq` has left the in-flight list
+    /// The time is read here, in that section: read before it, a reader
+    /// could see the commit absent at a later time
+    fn log_completion(&self, txns: &TxnTable, txn_id: i64, commit_seq: i64) {
+        let clock = wall_clock();
+        let assigned_through = self.next_sequence.load(Ordering::Acquire);
+        let completion = Completion {
+            txn_id,
+            commit_seq,
+            completed_through: Self::completed_through(txns, assigned_through),
+            assigned_through,
+        };
+        self.commit_log.append(completion, clock);
+    }
+
+    /// Readies the commit log outside every lock, before a commit that
+    /// writes takes its sequence
+    pub fn prepare_commit_log(&self) {
+        self.commit_log.prepare();
+    }
+
+    /// A statement's bounds for the points it reads AS OF, taken once at
+    /// its start
+    pub fn historical_cut(&self) -> HistoricalCut {
+        let txns = self.transactions.lock();
+        let completed = Self::completed_through(&txns, self.next_sequence.load(Ordering::Acquire));
+        self.commit_log.cut(wall_clock(), completed)
+    }
+
+    /// The point AS OF TIMESTAMP `time` (nanoseconds) reads under `cut`
+    pub fn point_at_time(&self, time: i64, cut: HistoricalCut) -> crate::core::Result<ReadPoint> {
+        self.commit_log.point_at_time(time, cut)
+    }
+
+    /// The point right after transaction `txn_id` completed its commit
+    pub fn point_of_transaction(
+        &self,
+        txn_id: i64,
+        cut: HistoricalCut,
+    ) -> crate::core::Result<ReadPoint> {
+        // History events log as transaction 0; no transaction has an id below 1
+        if txn_id > 0 {
+            if let Some(point) = self.commit_log.point_of_transaction(txn_id, cut)? {
+                return Ok(point);
+            }
+        }
+        let why = match self.transactions.lock().get(txn_id).map(|e| e.status()) {
+            Some(TxnStatus::Aborted) => "was rolled back",
+            Some(_) => "has not committed",
+            None => "has no committed write in the history the database keeps",
+        };
+        Err(Error::invalid_argument(format!(
+            "AS OF TRANSACTION {txn_id}: the transaction {why}"
+        )))
+    }
+
+    /// Opens history at a recovered state: every sequence at or below
+    /// `seq` is part of it. Called before the first commit
+    pub fn open_history_at(&self, seq: i64) {
+        loop {
+            let current = self.next_sequence.load(Ordering::Acquire);
+            if current >= seq
+                || self
+                    .next_sequence
+                    .compare_exchange(current, seq, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                break;
+            }
+        }
+        let open = self.next_sequence.load(Ordering::Acquire);
+        self.commit_log.open_at(open, wall_clock());
+    }
+
+    /// Takes a sequence for a change that destroys history, in flight
+    /// until the returned guard drops on any exit, which completes it. It
+    /// never allocates the log: before the first commit its completion
+    /// moves the open point
+    pub fn begin_history_event(self: &Arc<Self>) -> HistoryEvent {
+        let mut txns = self.transactions.lock();
+        let seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        txns.committing.push(seq);
+        HistoryEvent {
+            registry: Arc::clone(self),
+            seq,
+        }
     }
 
     /// Takes a statement view: the commits complete now, plus the reader's
@@ -1683,6 +1814,41 @@ impl VisibilityChecker for TransactionRegistry {
             return None;
         }
         Some(TransactionRegistry::maintenance_limit(self))
+    }
+
+    fn committing_sequence(&self, txn_id: i64) -> i64 {
+        match self.status.get(txn_id) {
+            Some(slot) if slot_committing(slot) => -slot,
+            _ => self.get_committing_sequence(txn_id),
+        }
+    }
+
+    fn oldest_time_through(&self, seq: i64) -> Option<i64> {
+        self.commit_log.oldest_time_through(seq)
+    }
+
+    fn commit_of(&self, txn_id: i64) -> CommitOf {
+        match self.status.get(txn_id) {
+            Some(slot) if slot > 0 => return CommitOf::Committed(slot),
+            Some(SLOT_UNKNOWN) | None => {}
+            Some(_) => return CommitOf::NotCommitted,
+        }
+        let txns = self.transactions.lock();
+        if txns.get(txn_id).is_some() {
+            return CommitOf::NotCommitted;
+        }
+        match txns.slotless.get(txn_id) {
+            Some(&seq) => CommitOf::Committed(seq),
+            None => CommitOf::Unknown,
+        }
+    }
+
+    /// When the log does not reach `time`, the point that sees what no
+    /// AS OF can still read
+    fn retention_point(&self, time: i64) -> Option<ReadPoint> {
+        let cut = self.historical_cut();
+        let point = self.commit_log.point_at_time(time, cut);
+        Some(point.unwrap_or_else(|_| self.commit_log.unreadable_point()))
     }
 }
 

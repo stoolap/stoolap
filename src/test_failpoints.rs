@@ -17,11 +17,82 @@
 //! Normal builds without that feature compile out the failpoints and their calls.
 
 use std::cell::RefCell;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Mutex, MutexGuard};
 
 /// Fail WAL `write_to_file()` with an I/O error
 pub static WAL_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// Nanoseconds added to the wall clock the commit log reads: a negative
+/// shift steps the clock back
+pub static COMMIT_CLOCK_SHIFT: AtomicI64 = AtomicI64::new(0);
+
+pub(crate) fn commit_clock_shift() -> i64 {
+    COMMIT_CLOCK_SHIFT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Slots of the commit log a registry created from now on keeps; 0 keeps
+/// the default
+pub static COMMIT_LOG_CAPACITY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn commit_log_capacity() -> Option<usize> {
+    match COMMIT_LOG_CAPACITY.load(std::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        slots => Some(slots),
+    }
+}
+
+thread_local! {
+    static AS_OF_HOT_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next read AS OF of a table with
+/// volumes has read the hot rows and not yet the volumes
+pub fn after_as_of_hot_read(hook: impl FnOnce() + 'static) {
+    AS_OF_HOT_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn as_of_hot_read() {
+    let hook = AS_OF_HOT_READ_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static COMMIT_LOG_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next search of the commit log has
+/// taken the ring's bounds and not yet read a slot
+pub fn before_commit_log_slots_read(hook: impl FnOnce() + 'static) {
+    COMMIT_LOG_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_log_slots_read() {
+    let hook = COMMIT_LOG_READ_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static GC_ROWS_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next deleted-row cleanup has chosen
+/// its rows and not yet taken the versions lock
+pub fn after_gc_rows_chosen(hook: impl FnOnce() + 'static) {
+    GC_ROWS_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn gc_rows_chosen() {
+    let hook = GC_ROWS_CHOSEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// Write the WAL buffer but its last 5 bytes, then fail the write
 pub static WAL_WRITE_PARTIAL: AtomicBool = AtomicBool::new(false);
@@ -3391,6 +3462,8 @@ pub(crate) fn volume_file_read() {
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
+    COMMIT_CLOCK_SHIFT.store(0, Release);
+    COMMIT_LOG_CAPACITY.store(0, Release);
     WAL_WRITE_FAIL.store(false, Release);
     WAL_WRITE_PARTIAL.store(false, Release);
     WAL_CUT_FAIL.store(false, Release);
@@ -3448,6 +3521,9 @@ pub fn reset_all() {
     RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    AS_OF_HOT_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_LOG_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    GC_ROWS_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
     TABLE_WAL_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);

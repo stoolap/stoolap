@@ -200,6 +200,16 @@ fn a_negated_subquery_shaped_by_distinct_on_or_as_of_is_read_as_written() {
     .unwrap();
     db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
         .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let empty: String = db
+        .query("SELECT CAST(NOW() AS TEXT)", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
     db.execute("INSERT INTO c VALUES (1, 1, 1), (2, NULL, 1)", ())
         .unwrap();
     // DISTINCT ON keeps the first row of the group, whose p_id is 1
@@ -214,7 +224,7 @@ fn a_negated_subquery_shaped_by_distinct_on_or_as_of_is_read_as_written() {
     assert_eq!(
         ids(
             &db,
-            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c AS OF TIMESTAMP '1970-01-01 00:00:00') OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+            &format!("SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c AS OF TIMESTAMP '{empty}') OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id")
         ),
         vec![1, 2, 3]
     );

@@ -14,8 +14,9 @@
 
 use stoolap::Database;
 
-/// Every parent has a child now; before the children were written, none did
-fn setup(name: &str) -> Database {
+/// Every parent has a child now; before the children were written, none
+/// did: the AS OF clause for that time
+fn setup(name: &str) -> (Database, String) {
     let db = Database::open(&format!("memory://{name}")).unwrap();
     db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
         .unwrap();
@@ -23,9 +24,19 @@ fn setup(name: &str) -> Database {
         .unwrap();
     db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
         .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let before: String = db
+        .query("SELECT CAST(NOW() AS TEXT)", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
     db.execute("INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)", ())
         .unwrap();
-    db
+    (db, format!("AS OF TIMESTAMP '{before}'"))
 }
 
 /// The ids the statement gives, sorted here so no ORDER BY shapes its plan
@@ -39,11 +50,9 @@ fn ids(db: &Database, sql: &str) -> Vec<i64> {
     found
 }
 
-const BEFORE: &str = "AS OF TIMESTAMP '1970-01-01 00:00:00'";
-
 #[test]
 fn test_exists_reads_the_inner_table_as_of() {
-    let db = setup("semi_join_as_of_exists");
+    let (db, before) = setup("semi_join_as_of_exists");
     assert_eq!(
         ids(
             &db,
@@ -56,7 +65,7 @@ fn test_exists_reads_the_inner_table_as_of() {
         ids(
             &db,
             &format!(
-                "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM c {BEFORE} WHERE c.p_id = p.id) ORDER BY id"
+                "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM c {before} WHERE c.p_id = p.id) ORDER BY id"
             )
         ),
         Vec::<i64>::new(),
@@ -66,12 +75,12 @@ fn test_exists_reads_the_inner_table_as_of() {
 
 #[test]
 fn test_not_exists_reads_the_inner_table_as_of() {
-    let db = setup("semi_join_as_of_not_exists");
+    let (db, before) = setup("semi_join_as_of_not_exists");
     assert_eq!(
         ids(
             &db,
             &format!(
-                "SELECT id FROM p WHERE NOT EXISTS (SELECT 1 FROM c {BEFORE} WHERE c.p_id = p.id)"
+                "SELECT id FROM p WHERE NOT EXISTS (SELECT 1 FROM c {before} WHERE c.p_id = p.id)"
             )
         ),
         vec![1, 2, 3],
@@ -81,7 +90,7 @@ fn test_not_exists_reads_the_inner_table_as_of() {
         ids(
             &db,
             &format!(
-                "SELECT id FROM p WHERE id > 0 AND NOT EXISTS (SELECT 1 FROM c {BEFORE} WHERE c.p_id = p.id) ORDER BY id"
+                "SELECT id FROM p WHERE id > 0 AND NOT EXISTS (SELECT 1 FROM c {before} WHERE c.p_id = p.id) ORDER BY id"
             )
         ),
         vec![1, 2, 3],
