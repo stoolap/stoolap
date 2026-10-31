@@ -313,7 +313,7 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
         "the blocks ask a correlated WHERE of the index join's rows: {}",
         plan(correlated)
     );
-    let per_row = "SELECT COUNT(*), (SELECT SUM((SELECT 1)) FROM flags) FROM (SELECT u.id, o.id \
+    let per_row = "SELECT COUNT(*), (SELECT MAX(uid) FROM flags), COALESCE(DISTINCT 1, 0) FROM (SELECT u.id, o.id \
         FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE EXISTS (SELECT 1 FROM flags f \
         WHERE f.uid = u.id) LIMIT 1) AS general";
     assert!(
