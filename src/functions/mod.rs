@@ -300,6 +300,12 @@ pub trait ScalarFunction: Send + Sync {
     fn native_fn1(&self) -> Option<NativeFn1> {
         None
     }
+
+    /// Whether every argument is read as a VECTOR, a TEXT writing one
+    /// included, so a TEXT known before the rows is read once
+    fn reads_vectors(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for window functions

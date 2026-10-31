@@ -434,6 +434,11 @@ pub enum Op {
     /// Stack: [value] -> [value as the column's type]
     ReadAsColumn(DataType),
 
+    /// A parameter a vector function takes, which binding reads as a vector
+    /// once; run unbound, it leaves the value to the function
+    /// Stack: [value] -> [value]
+    ReadAsVector,
+
     /// Truncate timestamp to date (midnight)
     /// Used for CAST(timestamp AS DATE) - truncates time component to 00:00:00
     /// Stack: [value] -> [timestamp_at_midnight]
@@ -1031,6 +1036,7 @@ impl std::fmt::Debug for Op {
             Op::Least(n) => write!(f, "Least({})", n),
             Op::Cast(dt) => write!(f, "Cast({:?})", dt),
             Op::ReadAsColumn(dt) => write!(f, "ReadAsColumn({:?})", dt),
+            Op::ReadAsVector => write!(f, "ReadAsVector"),
             Op::TruncateToDate => write!(f, "TruncateToDate"),
             Op::CaseStart => write!(f, "CaseStart"),
             Op::CaseWhen(target) => write!(f, "CaseWhen(jump={})", target),
