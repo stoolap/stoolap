@@ -388,11 +388,20 @@ fn test_cte_block_reading_the_grandparent_row() {
 }
 
 #[test]
+fn test_join_side_values_row() {
+    site(
+        "site_join_side_values_row",
+        Fails("7b Phase 3: a join reads a VALUES side on the general executor"),
+        "SELECT t.id FROM t JOIN (VALUES ((SELECT 3))) v(n) ON v.n = t.id",
+        "SELECT t.id FROM t JOIN (VALUES (3)) v(n) ON v.n = t.id",
+    );
+}
+
+#[test]
 fn test_table_function_argument() {
-    // The grammar does not take a subquery argument yet
     site(
         "site_tvf_argument",
-        Fails("step 6, grammar first"),
+        Right,
         "SELECT * FROM generate_series(1, (SELECT 3))",
         "SELECT * FROM generate_series(1, 3)",
     );

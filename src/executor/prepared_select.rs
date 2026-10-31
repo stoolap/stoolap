@@ -130,53 +130,49 @@ impl<'a> Family<'a> {
     }
 
     /// The statement's FROM: one table, view or CTE, a derived table, a
-    /// VALUES list or a table function; the statement of a view, a CTE or a
-    /// derived table runs as any statement does; or none, which reads one
-    /// row without columns
+    /// VALUES list or a table function, whose subqueries are blocks of the
+    /// statement; the statement of a view, a CTE or a derived table runs as
+    /// any statement does; or none, which reads one row without columns
     fn statement_from(
         &self,
         table_expr: Option<&'a Expression>,
+        found: &mut bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        match table_expr {
-            None | Some(Expression::SubquerySource(_)) => Ok(()),
-            Some(Expression::ValuesSource(values)) => {
-                match values.rows.iter().flatten().any(Executor::has_subqueries) {
-                    true => Err("a VALUES row holding a subquery"),
-                    false => Ok(()),
-                }
-            }
-            Some(Expression::FunctionTableSource(function)) => {
-                match function.arguments.iter().any(Executor::has_subqueries) {
-                    true => Err("a table function argument holding a subquery"),
-                    false => Ok(()),
-                }
-            }
-            other => Self::one_table(other).map(drop),
+        match source_values(table_expr) {
+            Some(values) => values
+                .iter()
+                .flatten()
+                .try_for_each(|value| self.expression(value, 1, Site::Subqueries, found)),
+            None => match table_expr {
+                None
+                | Some(
+                    Expression::SubquerySource(_)
+                    | Expression::ValuesSource(_)
+                    | Expression::FunctionTableSource(_),
+                ) => Ok(()),
+                other => Self::one_table(other).map(drop),
+            },
         }
     }
 
     /// A block's FROM: one table, view or CTE, a VALUES list or a table
-    /// function whose values hold no subquery, read once per run, or for
-    /// each call when they read an enclosing scope; or none, which reads one
-    /// row without columns
+    /// function, read once per run, or for each call when its values read an
+    /// enclosing scope or hold a subquery, which the block's statement runs
+    /// as its own; or none, which reads one row without columns
     fn block_from(
         &self,
         table_expr: Option<&'a Expression>,
     ) -> std::result::Result<(), OutOfFamily> {
+        if let Some(values) = source_values(table_expr) {
+            let mut nested = Vec::new();
+            values
+                .iter()
+                .flatten()
+                .for_each(|value| nested_statements(value, &mut nested));
+            return nested.into_iter().try_for_each(|s| self.derived(s));
+        }
         match table_expr {
-            None => Ok(()),
-            Some(Expression::ValuesSource(values)) => {
-                match values.rows.iter().flatten().any(Executor::has_subqueries) {
-                    true => Err("a subquery's VALUES row holding a subquery"),
-                    false => Ok(()),
-                }
-            }
-            Some(Expression::FunctionTableSource(function)) => {
-                match function.arguments.iter().any(Executor::has_subqueries) {
-                    true => Err("a subquery's table function argument holding a subquery"),
-                    false => Ok(()),
-                }
-            }
+            None | Some(Expression::ValuesSource(_) | Expression::FunctionTableSource(_)) => Ok(()),
             Some(Expression::SubquerySource(derived)) => self.derived(&derived.subquery),
             Some(Expression::JoinSource(join)) => self.join_from(join),
             some => {
@@ -1171,10 +1167,10 @@ impl Executor {
                 family.expression(key, 1, Site::Subqueries, &mut found)?;
             }
         }
+        family.statement_from(stmt.table_expr.as_deref(), &mut found)?;
         if needs_subquery && !found {
             return Err("no WHERE, SELECT list, ORDER BY or DISTINCT ON subquery");
         }
-        family.statement_from(stmt.table_expr.as_deref())?;
         family.catalog()
     }
 
@@ -1192,8 +1188,13 @@ impl Executor {
                 .iter()
                 .any(|ob| Self::has_subqueries(&ob.expression));
         let distinct_on = stmt.distinct_on.iter().any(Self::has_subqueries);
+        let source = source_values(stmt.table_expr.as_deref()).is_some();
         (classification.has_aggregation || classification.has_window_functions)
-            && (classification.grouped_has_subqueries || rows_where || grouped_keys || distinct_on)
+            && (classification.grouped_has_subqueries
+                || rows_where
+                || grouped_keys
+                || distinct_on
+                || source)
     }
 
     /// Whether `stmt` groups its rows or has window functions, and holds
@@ -1290,6 +1291,7 @@ impl Executor {
         if !joined {
             found |= stmt.where_clause.as_deref().is_some_and(mentions_subquery);
         }
+        found |= source_values(stmt.table_expr.as_deref()).is_some();
         if !found {
             return Err("no clause the blocks run holds a subquery");
         }
@@ -1311,7 +1313,7 @@ impl Executor {
                 if let Some(where_clause) = stmt.where_clause.as_deref() {
                     family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
                 }
-                family.statement_from(table_expr)?;
+                family.statement_from(table_expr, &mut found)?;
             }
         }
         family.catalog()
@@ -3664,7 +3666,14 @@ pub struct PreparedSelect {
     /// The window step's plan, made once when no run changes it; None makes
     /// it on each run
     window: Option<super::window::WindowPlan<'static>>,
+    /// Its VALUES rows or table function arguments compiled over the blocks
+    /// when a value holds a subquery; None evaluates them as written
+    source_values: Option<SourcePrograms>,
 }
+
+/// A VALUES list's rows, or a table function's arguments as one row, each
+/// value a program over no row that reads the statement's blocks
+type SourcePrograms = Box<[Box<[SharedProgram]>]>;
 
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table` or
@@ -5584,6 +5593,34 @@ impl Builder<'_> {
         Ok((Some(self.slotted(&rewritten, run_slots)?), reads))
     }
 
+    /// `stmt`'s VALUES rows or table function arguments when a value holds a
+    /// subquery, each rewritten by `rewrite` over no row, as a FROM sees none
+    /// of its statement's, and each uncorrelated value it reads a run slot
+    fn prepare_source_values(
+        &mut self,
+        stmt: &SelectStatement,
+        run_slots: &mut Vec<(usize, Expression)>,
+        rewrite: fn(&mut Self, &Chain<'_>, &Expression) -> Result<Expression>,
+    ) -> Result<Option<Vec<Vec<Expression>>>> {
+        let Some(rows) = source_values(stmt.table_expr.as_deref()) else {
+            return Ok(None);
+        };
+        let no_row = ScopeTable::unnamed();
+        let scopes = [&no_row];
+        let chain = Chain { scopes: &scopes };
+        let mut prepared = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut values = Vec::with_capacity(row.len());
+            for value in row {
+                self.note_params(value);
+                let rewritten = rewrite(self, &chain, value)?;
+                values.push(self.slotted(&rewritten, run_slots)?);
+            }
+            prepared.push(values);
+        }
+        Ok(Some(prepared))
+    }
+
     /// `expr`, rewritten for the statement's row, with each uncorrelated
     /// block it reads for a value or an existence test a run slot
     fn slotted(
@@ -6925,6 +6962,31 @@ pub(crate) fn redefines_cte(stmt: &SelectStatement, names: &dyn Fn(&str) -> bool
 }
 
 /// Each statement `expr` holds as a subquery, not those inside them
+/// `rows` compiled by `compile`, value by value
+fn source_programs(
+    rows: &[Vec<Expression>],
+    compile: impl Fn(&Expression) -> Result<SharedProgram>,
+) -> Result<SourcePrograms> {
+    rows.iter()
+        .map(|row| row.iter().map(&compile).collect())
+        .collect()
+}
+
+/// The rows of a VALUES list, or the arguments of a table function as one
+/// row, when a value in them holds a subquery
+fn source_values(table_expr: Option<&Expression>) -> Option<&[Vec<Expression>]> {
+    let values = match table_expr? {
+        Expression::ValuesSource(values) => values.rows.as_slice(),
+        Expression::FunctionTableSource(function) => std::slice::from_ref(&function.arguments),
+        _ => return None,
+    };
+    values
+        .iter()
+        .flatten()
+        .any(Executor::has_subqueries)
+        .then_some(values)
+}
+
 fn nested_statements<'e>(expr: &'e Expression, out: &mut Vec<&'e SelectStatement>) {
     each_nested_statement(expr, &mut |nested| out.push(nested));
 }
@@ -7832,12 +7894,18 @@ impl PreparedSelect {
         let (order_by, order_reads) = keys(&mut stmt.order_by.iter().map(|ob| &ob.expression))?;
         let (distinct_on, distinct_reads) = keys(&mut stmt.distinct_on.iter())?;
         let output_blocks = first_output_block..builder.subqueries.len();
+        let source = builder.prepare_source_values(stmt, &mut run_slots, |b, chain, value| {
+            b.rewrite(chain, None, value, &mut Rewritten::default())
+        })?;
         let mut read_as = FxHashMap::default();
         parts.read_as(schema, &mut read_as);
         let own = CompileContext::bound(registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Expression| compile_with(&own, expr);
+        let source_values = source
+            .map(|rows| source_programs(&rows, compile))
+            .transpose()?;
         let where_programs = parts.programs(compile)?;
         let run_slots = run_slots
             .iter()
@@ -8062,6 +8130,7 @@ impl PreparedSelect {
             }),
             windowed,
             window,
+            source_values,
         })
     }
 
@@ -8132,6 +8201,9 @@ pub struct PreparedGrouped {
     ahead: Vec<u16>,
     /// A WHERE holding subqueries, which the table's rows pass before they group
     where_: Option<PreparedWhere>,
+    /// Its VALUES rows or table function arguments compiled over the blocks
+    /// when a value holds a subquery; None evaluates them as written
+    source_values: Option<SourcePrograms>,
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
 }
@@ -8179,7 +8251,30 @@ impl GroupedRun<'_> {
             ));
         };
         let columns = CompactArc::new(columns.to_vec());
-        let where_ = self.held.as_deref().and_then(|held| held.where_.as_ref());
+        let held = self.held.as_deref();
+        // Values holding subqueries are computed through the run's blocks
+        let programs = held.and_then(|held| Some(held).zip(held.source_values.as_deref()));
+        let source = match (source, run.zip(programs)) {
+            (StatementSource::Values(names, _), Some((run, (_, programs)))) => {
+                let rows = (0i64..)
+                    .zip(programs)
+                    .map(|(id, row)| run.source_row(row).map(|row| (id, row)))
+                    .collect::<Result<_>>()?;
+                StatementSource::Rows(names, rows)
+            }
+            (StatementSource::Function(names, function), Some((run, (held, [arguments])))) => {
+                let where_clause = held.stmt.where_clause.as_deref();
+                let rows = run.function_rows(function, arguments, where_clause, None, ctx)?;
+                StatementSource::Rows(names, rows)
+            }
+            (StatementSource::Function(..), _) => {
+                return Err(Error::internal(
+                    "a table function read before its blocks answered its arguments",
+                ))
+            }
+            (source, _) => source,
+        };
+        let where_ = held.and_then(|held| held.where_.as_ref());
         let Some((run, where_)) = run.zip(where_) else {
             let rows = match source {
                 StatementSource::Rows(_, rows) => rows,
@@ -8191,7 +8286,7 @@ impl GroupedRun<'_> {
                     .map(|(id, exprs)| Executor::values_row(exprs, ctx).map(|row| (id, row)))
                     .collect::<Result<_>>()?,
                 StatementSource::Cte((_, rows)) => rows.iter().cloned().collect(),
-                StatementSource::Table(_) => {
+                StatementSource::Table(_) | StatementSource::Function(..) => {
                     return Err(Error::internal(
                         "a grouped statement read its table as rows",
                     ))
@@ -8227,7 +8322,7 @@ impl GroupedRun<'_> {
                 None,
                 keep,
             ),
-            StatementSource::Table(_) => {
+            StatementSource::Table(_) | StatementSource::Function(..) => {
                 return Err(Error::internal(
                     "a grouped statement read its table as rows",
                 ))
@@ -8558,7 +8653,12 @@ impl PreparedGrouped {
             }
         }
         let blocks_read = builder.subqueries.len();
+        let source_rows =
+            builder.prepare_source_values(stmt, &mut run_slots, Builder::rewrite_blocks)?;
         let values = CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
+        let source_values = source_rows
+            .map(|rows| source_programs(&rows, |expr| compile_with(&values, expr)))
+            .transpose()?;
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
@@ -8718,6 +8818,7 @@ impl PreparedGrouped {
             holes: HoleSet { holes },
             ahead,
             where_,
+            source_values,
             classification: super::query_classification::get_classification(&stmt),
             stmt,
         }))
@@ -11124,7 +11225,8 @@ impl Executor {
                     let offset = offset.as_deref().map(|o| row_count(o, ctx, "OFFSET"));
                     Some(limit.saturating_add(offset.transpose().ok()?.unwrap_or(0)))
                 });
-                let (rows, columns) = self.tvf_rows(function, range.as_deref(), first, ctx)?;
+                let (rows, columns) =
+                    self.tvf_rows(function, None, range.as_deref(), first, ctx)?;
                 (columns, rows)
             }
         };
@@ -11483,12 +11585,19 @@ impl Executor {
                 named(&values.alias),
             ),
             Some(Expression::FunctionTableSource(function)) => {
-                let (rows, columns) =
-                    self.tvf_rows(function, stmt.where_clause.as_deref(), first, ctx)?;
                 let scope = function
                     .alias
                     .as_ref()
                     .map_or(&function.function.value_lower, |alias| &alias.value_lower);
+                if source_values(stmt.table_expr.as_deref()).is_some() {
+                    let columns = Self::tvf_columns(function)?;
+                    return Ok((
+                        Some(StatementSource::Function(columns, function)),
+                        Some(scope),
+                    ));
+                }
+                let (rows, columns) =
+                    self.tvf_rows(function, None, stmt.where_clause.as_deref(), first, ctx)?;
                 (Some(StatementSource::Rows(columns, rows)), Some(scope))
             }
             None => {
@@ -11604,7 +11713,8 @@ impl Executor {
             }
             StatementSource::Rows(columns, _)
             | StatementSource::Stream(columns, _)
-            | StatementSource::Values(columns, _) => columns,
+            | StatementSource::Values(columns, _)
+            | StatementSource::Function(columns, _) => columns,
             StatementSource::Cte((columns, _)) => columns,
         };
         let schema = || match &source {
@@ -11612,6 +11722,7 @@ impl Executor {
             StatementSource::Rows(..)
             | StatementSource::Stream(..)
             | StatementSource::Values(..)
+            | StatementSource::Function(..)
             | StatementSource::Cte(_) => {
                 std::borrow::Cow::Owned(untyped_schema(scope_name, columns))
             }
@@ -11656,6 +11767,7 @@ impl Executor {
             StatementSource::Stream(_, result) => result.estimated_count().unwrap_or(0),
             StatementSource::Values(_, values) => values.rows.len(),
             StatementSource::Cte((_, rows)) => rows.len(),
+            StatementSource::Function(..) => 0,
         };
         let mut runner = PreparedRunner::new(
             self,
@@ -11671,6 +11783,15 @@ impl Executor {
             runner.fill_run_slots()?;
         }
         runner.read_ahead(&prepared.ahead, &prepared.holes)?;
+        // A table function reads its rows once the blocks answer its arguments
+        let source = match (source, prepared.source_values.as_deref()) {
+            (StatementSource::Function(columns, function), Some([arguments])) => {
+                let where_clause = stmt.where_clause.as_deref();
+                let rows = runner.function_rows(function, arguments, where_clause, first, ctx)?;
+                StatementSource::Rows(columns, rows)
+            }
+            (source, _) => source,
+        };
         // The window step computes the SELECT list over every row the read
         // passes; the finishing steps follow it
         if prepared.windowed {
@@ -12027,15 +12148,26 @@ impl Executor {
                     ),
                 }
             }
-            (None, StatementSource::Values(_, values)) => runner.rows_passing(
-                &prepared.where_,
-                (0i64..)
-                    .zip(&values.rows)
-                    .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
-                ctx,
-                target,
-                &mut keep,
-            ),
+            (None, StatementSource::Values(_, values)) => match prepared.source_values.as_deref() {
+                Some(programs) => runner.rows_passing(
+                    &prepared.where_,
+                    (0i64..)
+                        .zip(programs)
+                        .map(|(id, row)| runner.source_row(row).map(|row| (id, row))),
+                    ctx,
+                    target,
+                    &mut keep,
+                ),
+                None => runner.rows_passing(
+                    &prepared.where_,
+                    (0i64..)
+                        .zip(&values.rows)
+                        .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
+                    ctx,
+                    target,
+                    &mut keep,
+                ),
+            },
             (None, StatementSource::Cte((_, rows))) => runner.rows_passing(
                 &prepared.where_,
                 rows.iter().map(|(id, row)| Ok((*id, row))),
@@ -12043,6 +12175,9 @@ impl Executor {
                 target,
                 &mut keep,
             ),
+            (None, StatementSource::Function(..)) => Err(Error::internal(
+                "a table function read before its blocks answered its arguments",
+            )),
         };
         let mut scanned = None;
         let mut rows = match read? {
@@ -12205,6 +12340,9 @@ enum StatementSource<'s> {
     Values(Vec<String>, &'s ValuesTableSource),
     /// A CTE's columns and rows, materialized by the statement's WITH
     Cte(&'s super::cte::CteData),
+    /// A table function's columns, whose arguments hold subqueries: its rows
+    /// are read once the run's blocks can answer them
+    Function(Vec<String>, &'s FunctionTableSource),
 }
 
 impl StatementSource<'_> {
@@ -12214,7 +12352,8 @@ impl StatementSource<'_> {
             StatementSource::Table(_) => None,
             StatementSource::Rows(columns, _)
             | StatementSource::Stream(columns, _)
-            | StatementSource::Values(columns, _) => Some(columns),
+            | StatementSource::Values(columns, _)
+            | StatementSource::Function(columns, _) => Some(columns),
             StatementSource::Cte((columns, _)) => Some(columns),
         }
     }
@@ -12798,6 +12937,38 @@ impl<'a> PreparedRunner<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A VALUES row or a table function's arguments, `programs` computed over
+    /// no row once the run slots are filled, reading the blocks
+    fn source_row(&self, programs: &[SharedProgram]) -> Result<Row> {
+        let empty = Row::new();
+        let mut vm = ExprVM::new();
+        let exec = self
+            .exec_over(&empty, &self.base)
+            .with_subquery_executor(self);
+        let values = programs
+            .iter()
+            .map(|program| vm.execute(program, &exec))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
+    }
+
+    /// The rows of `function`, whose arguments are `programs`, as the
+    /// statement's WHERE and `first` let its read cut them
+    fn function_rows(
+        &self,
+        function: &FunctionTableSource,
+        programs: &[SharedProgram],
+        where_clause: Option<&Expression>,
+        first: Option<usize>,
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
+        let arguments = self.source_row(programs)?.into_values();
+        let (rows, _) =
+            self.executor
+                .tvf_rows(function, Some(arguments), where_clause, first, ctx)?;
+        Ok(rows)
     }
 
     /// The WHERE's run slots whose value failed in this run

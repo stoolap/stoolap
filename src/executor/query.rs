@@ -2838,7 +2838,7 @@ impl Executor {
         });
 
         let (mut result_rows, column_names) =
-            Self::evaluate_tvf_with_range(tvf_source, ctx, tvf_limit, range_hint)?;
+            Self::evaluate_tvf_with_range(tvf_source, None, ctx, tvf_limit, range_hint)?;
 
         let table_alias = tvf_source
             .alias
@@ -2899,8 +2899,13 @@ impl Executor {
             None
         };
 
-        let (result_rows, columns) =
-            self.tvf_rows(tvf_source, stmt.where_clause.as_deref(), limit_hint, ctx)?;
+        let (result_rows, columns) = self.tvf_rows(
+            tvf_source,
+            None,
+            stmt.where_clause.as_deref(),
+            limit_hint,
+            ctx,
+        )?;
 
         // Delegate to execute_query_on_memory_result which handles
         // WHERE, ORDER BY, LIMIT, GROUP BY, aggregation, window functions
@@ -2913,6 +2918,7 @@ impl Executor {
     pub(super) fn tvf_rows(
         &self,
         tvf_source: &FunctionTableSource,
+        arguments: Option<Vec<Value>>,
         where_clause: Option<&Expression>,
         limit: Option<usize>,
         ctx: &ExecutionContext,
@@ -2937,7 +2943,7 @@ impl Executor {
             Self::tvf_range_hint(where_clause, &col_name, ctx)
         });
 
-        Self::evaluate_tvf_with_range(tvf_source, ctx, limit, range_hint)
+        Self::evaluate_tvf_with_range(tvf_source, arguments, ctx, limit, range_hint)
     }
 
     /// The integers the conjuncts of `filter` on the TVF's column allow it to
@@ -3033,19 +3039,25 @@ impl Executor {
         }
     }
 
+    /// The rows of `tvf_source` over its `arguments` computed already, or
+    /// over its arguments as written
     fn evaluate_tvf_with_range(
         tvf_source: &FunctionTableSource,
+        arguments: Option<Vec<Value>>,
         ctx: &ExecutionContext,
         limit: Option<usize>,
         range_hint: Option<Resolved>,
     ) -> Result<(RowVec, Vec<String>)> {
         let tvf = Self::tvf_of(tvf_source)?;
 
-        // Evaluate arguments to Values
-        let mut arg_values = Vec::with_capacity(tvf_source.arguments.len());
-        for arg in &tvf_source.arguments {
-            arg_values.push(super::expression::evaluate_once(arg, Some(ctx))?);
-        }
+        let mut arg_values = match arguments {
+            Some(arguments) => arguments,
+            None => tvf_source
+                .arguments
+                .iter()
+                .map(|arg| super::expression::evaluate_once(arg, Some(ctx)))
+                .collect::<Result<Vec<_>>>()?,
+        };
 
         if let Some(range) = range_hint {
             // An empty range narrows past both ends
