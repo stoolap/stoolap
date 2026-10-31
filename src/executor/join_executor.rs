@@ -263,10 +263,10 @@ pub(crate) struct StatementRun<'a> {
 
 impl<'a> StatementRun<'a> {
     /// The run as a site over the joined row, or over the pair when `pair`;
-    /// none when the statement holds no subquery for a site to run
+    /// none when the statement asks nothing of a site
     pub(crate) fn site(self, pair: bool) -> Option<SiteRunner<'a>> {
         self.blocks
-            .holds_subqueries()
+            .asks_sites()
             .then(|| SiteRunner::new(self.run, self.blocks.holes(pair)))
     }
 }

@@ -5566,27 +5566,33 @@ impl Executor {
         let holds_subquery = classification.where_has_subqueries
             || classification.output_has_subqueries
             || Self::ons_hold_subqueries(join_source);
-        let clauses: smallvec::SmallVec<[&Expression; 2]> = join_source
-            .condition
-            .as_deref()
-            .into_iter()
-            .chain(stmt.where_clause.as_deref())
+        // Each WHERE part as its site reads it, the SELECT aliases it names
+        // opened over the joined columns the sides lay out
+        let columns: Vec<String> = sides
+            .iter()
+            .flat_map(|side| side.columns())
+            .map(|(table, name)| qualified(table, name))
             .collect();
-        if !holds_subquery && join_names_ambiguous(join_source, sides, &clauses) {
-            return Err("a join without a subquery naming a column both sources have");
+        if !holds_subquery {
+            let opened_where = stmt
+                .where_clause
+                .as_deref()
+                .map(|w| Self::with_select_aliases(stmt, w, &columns).unwrap_or_else(|| w.clone()));
+            let clauses: smallvec::SmallVec<[&Expression; 2]> = join_source
+                .condition
+                .as_deref()
+                .into_iter()
+                .chain(opened_where.as_ref())
+                .collect();
+            if join_names_ambiguous(join_source, sides, &clauses) {
+                return Err("a join without a subquery naming a column both sources have");
+            }
         }
         let Some(where_clause) = stmt.where_clause.as_deref() else {
             return Ok(());
         };
         let (left, right, cross) =
             split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
-        // Each part as its site reads it, the SELECT aliases it names opened
-        // over the joined columns the sides lay out
-        let columns: Vec<String> = sides
-            .iter()
-            .flat_map(|side| side.columns())
-            .map(|(table, name)| qualified(table, name))
-            .collect();
         let opened = |part: Option<Expression>| {
             part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
         };

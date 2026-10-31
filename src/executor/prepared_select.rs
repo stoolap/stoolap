@@ -8904,9 +8904,10 @@ impl JoinBlocks {
         })
     }
 
-    /// Whether the statement holds a subquery its blocks run
-    pub(crate) fn holds_subqueries(&self) -> bool {
-        !self.blocks.subqueries.is_empty()
+    /// Whether the statement's rows are asked through a site: a block runs
+    /// there, or a value the run computes once, a run slot, is read there
+    pub(crate) fn asks_sites(&self) -> bool {
+        !self.blocks.subqueries.is_empty() || !self.blocks.run_slots.is_empty()
     }
 
     /// Whether the statement holds a condition on side `side` alone
