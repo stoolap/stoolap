@@ -8009,7 +8009,7 @@ impl PreparedSelect {
                 executor
                     .prepared_window_plan(computed, &schema.column_names_arc(), ctx)
                     .ok()
-                    .filter(|plan| plan.fixed())
+                    .flatten()
             })
             .flatten();
         Ok(Self {

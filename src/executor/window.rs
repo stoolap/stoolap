@@ -669,18 +669,6 @@ pub(crate) struct WindowPlan<'s> {
     added_wf_names: Vec<String>,
 }
 
-impl WindowPlan<'_> {
-    /// Whether no run changes the plan: each window's arguments after the
-    /// first are literals, read without the run's parameters, and none
-    /// holds a subquery, which the plan would answer once
-    pub(crate) fn fixed(&self) -> bool {
-        self.window_functions.iter().all(|wf| {
-            super::aggregation::extra_args_literal(&wf.arguments)
-                && !wf.arguments.iter().any(Executor::has_subqueries)
-        })
-    }
-}
-
 impl std::fmt::Debug for WindowPlan<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WindowPlan")
@@ -1171,21 +1159,36 @@ impl Executor {
     }
 
     /// The window plan of a windowed statement a prepared plan runs, over
-    /// rows of `columns`, made once with the statement
+    /// rows of `columns`, made once with the statement; None, read nothing,
+    /// when a run would change it
     pub(crate) fn prepared_window_plan(
         &self,
         stmt: &SelectStatement,
         columns: &[String],
         ctx: &ExecutionContext,
-    ) -> Result<WindowPlan<'static>> {
-        let extended =
-            std::borrow::Cow::Owned(Self::with_hidden_order_by_windows(stmt).into_owned());
+    ) -> Result<Option<WindowPlan<'static>>> {
+        let extended = Self::with_hidden_order_by_windows(stmt).into_owned();
+        // An argument after the first that is no literal is read with the
+        // run's parameters, a subquery answered, as the plan is made
+        let mut windows = Vec::new();
+        for item in &extended.columns {
+            Self::collect_all_windows_in_expression(item, &mut windows);
+        }
+        let fixed = windows.iter().all(|window| {
+            let arguments = &window.function.arguments;
+            super::aggregation::extra_args_literal(arguments)
+                && !arguments.iter().any(Executor::has_subqueries)
+        });
+        if !fixed {
+            return Ok(None);
+        }
         self.window_plan(
-            extended,
+            std::borrow::Cow::Owned(extended),
             (columns, columns.len(), stmt.columns.len()),
             &FxHashMap::default(),
             ctx,
         )
+        .map(Some)
     }
 
     /// The window plan of `stmt` over rows of `base_columns`, of which the
