@@ -841,3 +841,27 @@ fn test_join_side_reads_hit_the_cache_under_the_statement_snapshot() {
         db.execute("DELETE FROM u WHERE id = 1000", ()).unwrap();
     }
 }
+
+#[test]
+fn test_a_cte_named_as_a_table_is_not_cached_as_the_table() {
+    let db = Database::open("memory://semantic_cache_cte_shadows_table").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    let cte = "WITH t(id) AS (SELECT 2) SELECT * FROM t WHERE id > 0";
+    let table = "SELECT * FROM t WHERE id > 0";
+    let read = |sql: &str, prepared: bool| -> Vec<i64> {
+        let rows = match prepared {
+            true => db.prepare(sql).unwrap().query(()).unwrap(),
+            false => db.query(sql, ()).unwrap(),
+        };
+        rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    for prepared in [true, false] {
+        db.clear_semantic_cache().unwrap();
+        assert_eq!(read(cte, prepared), vec![2], "prepared {prepared}");
+        assert_eq!(read(table, false), vec![1], "prepared {prepared}");
+        assert_eq!(read(cte, prepared), vec![2], "prepared {prepared}");
+    }
+}

@@ -3480,7 +3480,8 @@ impl Executor {
     /// `where_expr` under `stamp`, with their output columns; None on a miss
     /// Whether the semantic cache keeps the answer of `stmt`, a SELECT * read
     /// from `source` outside an explicit transaction, by reads no older than
-    /// a stamp taken before them, as a cached subquery's are
+    /// a stamp taken before them, as a cached subquery's are; a CTE of the
+    /// same name is not the table the stamp names
     pub(crate) fn semantic_writable(
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
@@ -3488,6 +3489,7 @@ impl Executor {
         source: &SimpleTableSource,
     ) -> bool {
         Self::reads_cacheable_rows(ctx)
+            && !ctx.has_cte_by_lower(&source.name.value_lower)
             && ctx.outer_row().is_none()
             && source.as_of.is_none()
             && stmt.where_clause.is_some()
