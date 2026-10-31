@@ -6502,8 +6502,8 @@ pub(crate) fn holds_as_of(stmt: &SelectStatement) -> bool {
     holds
 }
 
-/// A CTE `stmt` reads AS OF, by the names its WITH and those of the
-/// statements around it, `enclosing`, define
+/// A CTE `stmt` reads AS OF, by the names the statements around it,
+/// `enclosing`, and its own WITH define where each is read
 pub(crate) fn cte_read_as_of(stmt: &SelectStatement, enclosing: &[&str]) -> Option<SmartString> {
     fn from(source: &Expression, names: &[&str]) -> Option<SmartString> {
         match source {
@@ -6518,17 +6518,50 @@ pub(crate) fn cte_read_as_of(stmt: &SelectStatement, enclosing: &[&str]) -> Opti
             _ => None,
         }
     }
-    let mut names = enclosing.to_vec();
-    names.extend(
-        stmt.with
-            .iter()
-            .flat_map(|with| &with.ctes)
-            .map(|cte| cte.name.value_lower.as_str()),
-    );
-    let mut found = stmt.table_expr.as_deref().and_then(|s| from(s, &names));
+    let (mut found, names) = ctes_read_as_of(stmt.with.as_ref(), enclosing);
+    if found.is_none() {
+        found = stmt.table_expr.as_deref().and_then(|s| from(s, &names));
+    }
+    let ctes = stmt.with.iter().flat_map(|with| &with.ctes);
     each_statement_inside(stmt, &mut |inside| {
-        if found.is_none() {
+        let body = ctes.clone().any(|cte| std::ptr::eq(&*cte.query, inside));
+        if found.is_none() && !body {
             found = cte_read_as_of(inside, &names);
+        }
+    });
+    found
+}
+
+/// A CTE the bodies of `with` read AS OF, each body seeing the CTEs before
+/// it, and itself when recursive; and the names the statement then sees
+pub(crate) fn ctes_read_as_of<'w>(
+    with: Option<&'w WithClause>,
+    enclosing: &[&'w str],
+) -> (Option<SmartString>, Vec<&'w str>) {
+    let mut names = enclosing.to_vec();
+    let mut found = None;
+    for cte in with.iter().flat_map(|with| &with.ctes) {
+        let recursive = cte.is_recursive || with.is_some_and(|with| with.is_recursive);
+        let own = cte.name.value_lower.as_str();
+        if recursive {
+            names.push(own);
+        }
+        if found.is_none() {
+            found = cte_read_as_of(&cte.query, &names);
+        }
+        if !recursive {
+            names.push(own);
+        }
+    }
+    (found, names)
+}
+
+/// A CTE named in `names` that a subquery of `expr` reads AS OF
+pub(crate) fn expr_cte_read_as_of(expr: &Expression, names: &[&str]) -> Option<SmartString> {
+    let mut found = None;
+    each_nested_statement(expr, &mut |inside| {
+        if found.is_none() {
+            found = cte_read_as_of(inside, names);
         }
     });
     found

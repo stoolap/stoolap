@@ -73,9 +73,12 @@ impl Executor {
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
             let start = crate::common::time_compat::Instant::now();
+            let holds = super::statement_holds_as_of(&stmt.statement);
+            let ctx =
+                self.with_statement_cut(&stmt.statement, std::borrow::Cow::Borrowed(ctx), holds)?;
             let mut result = self.execute_statement_inner(
                 &stmt.statement,
-                std::borrow::Cow::Borrowed(ctx),
+                ctx,
                 self.active_txn_id(),
                 None,
                 plan.and_then(NestedPlan::source),

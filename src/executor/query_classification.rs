@@ -138,8 +138,6 @@ pub struct QueryClassification {
     // === Table source analysis ===
     /// Whether query has derived tables (subqueries in FROM)
     pub has_derived_tables: bool,
-    /// Whether a table is read AS OF anywhere in the statement
-    pub holds_as_of: bool,
 
     // === Compound classifications ===
     /// Simple scan: no joins, no subqueries, no aggregation, no window functions
@@ -296,7 +294,6 @@ impl QueryClassification {
             output_has_subqueries,
             order_by_has_correlated_subqueries,
             has_derived_tables,
-            holds_as_of: super::prepared_select::holds_as_of(stmt),
             is_simple_scan,
         }
     }

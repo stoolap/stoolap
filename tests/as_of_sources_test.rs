@@ -247,6 +247,14 @@ fn as_of_names_a_table_and_no_view_reads_one() {
     ));
     for sql in [
         format!(
+            "WITH c AS (SELECT * FROM u), d AS (SELECT * FROM c AS OF TIMESTAMP '{before}') \
+             DELETE FROM t WHERE k IN (SELECT k FROM d)"
+        ),
+        format!(
+            "WITH c AS (SELECT * FROM u), d AS (SELECT * FROM c AS OF TIMESTAMP '{before}') \
+             UPDATE t SET k = 0 WHERE k IN (SELECT k FROM d)"
+        ),
+        format!(
             "WITH c AS (SELECT * FROM u) DELETE FROM t WHERE k IN (SELECT k FROM c AS OF TIMESTAMP '{before}')"
         ),
         format!(
@@ -267,6 +275,23 @@ fn as_of_names_a_table_and_no_view_reads_one() {
     }
 }
 
+#[test]
+fn a_cte_body_reads_the_table_its_name_shadows_only_after_it() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://as_of_sources_cte_scope").unwrap();
+    let before = setup(&db, false);
+    let want = rows(&db, "SELECT id, v FROM u0 ORDER BY id");
+    for sql in [
+        format!("WITH u AS (SELECT * FROM u AS OF TIMESTAMP '{before}') SELECT id, v FROM u ORDER BY id"),
+        format!(
+            "WITH a AS (SELECT * FROM u AS OF TIMESTAMP '{before}'), u AS (SELECT 1 AS id) \
+             SELECT id, v FROM a ORDER BY id"
+        ),
+    ] {
+        assert_eq!(rows(&db, &sql), want, "{sql}");
+    }
+}
+
 /// `sql` while another handle commits `u.v = 20` just before the
 /// statement's first AS OF resolves
 fn with_commit_before_resolution(sql: &str, name: &str) -> Rows {
@@ -274,6 +299,7 @@ fn with_commit_before_resolution(sql: &str, name: &str) -> Rows {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
         "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER)",
         "INSERT INTO t VALUES (1, 10)",
         "INSERT INTO u VALUES (1, 10)",
     ] {
@@ -285,7 +311,21 @@ fn with_commit_before_resolution(sql: &str, name: &str) -> Rows {
             .execute("UPDATE u SET v = 20 WHERE id = 1", ())
             .unwrap();
     });
+    if sql.starts_with("INSERT") {
+        db.execute(sql, ()).map_err(|e| e.to_string())?;
+        return rows(&db, "SELECT * FROM w");
+    }
     rows(&db, sql)
+}
+
+#[test]
+fn an_insert_reads_its_query_at_its_start() {
+    let _guard = FailpointGuard::new();
+    let got = with_commit_before_resolution(
+        "INSERT INTO w SELECT * FROM u AS OF TIMESTAMP '2099-01-01'",
+        "as_of_sources_insert_cut",
+    );
+    assert_eq!(got, Ok(vec![vec!["1".into(), "10".into()]]));
 }
 
 #[test]

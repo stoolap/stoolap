@@ -390,18 +390,22 @@ pub struct CachedPlanRef {
     /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
     /// without one
     pub counts: Option<Arc<CountsSlot>>,
+    /// Whether the statement reads a table AS OF anywhere
+    pub holds_as_of: bool,
 }
 
 impl CachedPlanRef {
     /// A plan of `statement`, nothing compiled or classified yet
     pub(crate) fn new(statement: Arc<Statement>, params: ParamSlots) -> Self {
         let counts = counts_slot(&statement);
+        let holds_as_of = super::statement_holds_as_of(&statement);
         Self {
             statement,
             params,
             compiled: Arc::new(NestedPlan::default()),
             classification: Arc::new(std::sync::OnceLock::new()),
             counts,
+            holds_as_of,
         }
     }
 }
@@ -451,6 +455,8 @@ pub struct CachedQueryPlan {
     /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
     /// without one
     pub counts: Option<Arc<CountsSlot>>,
+    /// Whether the statement reads a table AS OF anywhere
+    pub holds_as_of: bool,
 }
 
 /// Query cache for parsed SQL statements
@@ -585,6 +591,7 @@ impl QueryCache {
             compiled: plan.compiled.clone(), // Share compiled state
             classification: plan.classification.clone(),
             counts: plan.counts.clone(),
+            holds_as_of: plan.holds_as_of,
         }))
     }
 
@@ -615,6 +622,7 @@ impl QueryCache {
                     compiled: plan.compiled.clone(), // Arc clone - cheap
                     classification: plan.classification.clone(),
                     counts: plan.counts.clone(),
+                    holds_as_of: plan.holds_as_of,
                 }),
             );
         }

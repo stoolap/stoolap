@@ -276,6 +276,14 @@ fn reads_through_a_view(statement: &Statement) -> bool {
     }
 }
 
+/// Whether `statement` reads a table AS OF anywhere
+pub(crate) fn statement_holds_as_of(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(stmt) => prepared_select::holds_as_of(stmt),
+        other => dml_holds_as_of(other),
+    }
+}
+
 /// Whether DML `statement` reads a table AS OF in its query, a subquery or a CTE
 fn dml_holds_as_of(statement: &Statement) -> bool {
     use prepared_select::{expr_holds_as_of, holds_as_of};
@@ -306,6 +314,58 @@ fn dml_holds_as_of(statement: &Statement) -> bool {
             with(&stmt.with) || maybe(&stmt.where_clause) || any(&stmt.returning)
         }
         _ => false,
+    }
+}
+
+/// A CTE `statement` reads AS OF, where each of its WITH names is read
+fn cte_read_as_of(statement: &Statement) -> Option<crate::common::SmartString> {
+    use prepared_select::{ctes_read_as_of, expr_cte_read_as_of};
+    fn first<'e>(
+        mut exprs: impl Iterator<Item = &'e crate::parser::ast::Expression>,
+        names: &[&str],
+    ) -> Option<crate::common::SmartString> {
+        exprs.find_map(|expr| expr_cte_read_as_of(expr, names))
+    }
+    match statement {
+        Statement::Select(stmt) => prepared_select::cte_read_as_of(stmt, &[]),
+        Statement::Insert(stmt) => stmt
+            .select
+            .as_deref()
+            .and_then(|select| prepared_select::cte_read_as_of(select, &[]))
+            .or_else(|| {
+                let mut exprs = stmt
+                    .values
+                    .iter()
+                    .flatten()
+                    .chain(&stmt.update_expressions)
+                    .chain(stmt.update_where.as_deref())
+                    .chain(&stmt.returning);
+                first(&mut exprs, &[])
+            }),
+        Statement::Update(stmt) => {
+            let (found, names) = ctes_read_as_of(stmt.with.as_ref(), &[]);
+            found.or_else(|| {
+                let mut exprs = stmt
+                    .where_clause
+                    .as_deref()
+                    .into_iter()
+                    .chain(stmt.updates.values())
+                    .chain(&stmt.returning);
+                first(&mut exprs, &names)
+            })
+        }
+        Statement::Delete(stmt) => {
+            let (found, names) = ctes_read_as_of(stmt.with.as_ref(), &[]);
+            found.or_else(|| {
+                let mut exprs = stmt
+                    .where_clause
+                    .as_deref()
+                    .into_iter()
+                    .chain(&stmt.returning);
+                first(&mut exprs, &names)
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1022,14 +1082,30 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_statement_inner(
-            statement,
-            std::borrow::Cow::Borrowed(ctx),
-            self.active_txn_id(),
-            None,
-            None,
-            None,
-        )
+        let holds = statement_holds_as_of(statement);
+        let ctx = self.with_statement_cut(statement, std::borrow::Cow::Borrowed(ctx), holds)?;
+        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None, None)
+    }
+
+    /// `ctx` with the bounds every AS OF of `statement`, which `holds` one,
+    /// resolves against, taken as it starts, before any path reads a row. A
+    /// CTE read AS OF is refused here, before a path inlines it
+    pub(crate) fn with_statement_cut<'c>(
+        &self,
+        statement: &Statement,
+        ctx: std::borrow::Cow<'c, ExecutionContext>,
+        holds: bool,
+    ) -> Result<std::borrow::Cow<'c, ExecutionContext>> {
+        if !holds || ctx.historical_cut().is_some() {
+            return Ok(ctx);
+        }
+        if let Some(name) = cte_read_as_of(statement) {
+            return Err(Self::as_of_not_a_table(&name));
+        }
+        let cut = self.engine.registry().historical_cut();
+        Ok(std::borrow::Cow::Owned(
+            ctx.into_owned().into_historical_cut(cut),
+        ))
     }
 
     /// Execute a single statement with pre-captured transaction state.
@@ -1075,18 +1151,7 @@ impl Executor {
                 query::EarlySemantic::NotTried => {}
             }
         }
-        let reads = reads_through_a_view(statement);
-        let holds_as_of = match statement {
-            Statement::Select(stmt) => match plan_classification {
-                Some(slot) => {
-                    slot.get_or_init(|| query_classification::get_classification(stmt))
-                        .holds_as_of
-                }
-                None => query_classification::get_classification(stmt).holds_as_of,
-            },
-            other => reads && dml_holds_as_of(other),
-        };
-        let view = self.statement_view(reads, &ctx, active_txn_id);
+        let view = self.statement_view(reads_through_a_view(statement), &ctx, active_txn_id);
         let took_view = view.is_some();
         let ctx = match (active_txn_id, view) {
             (None, None) => ctx,
@@ -1108,26 +1173,6 @@ impl Executor {
                 }
                 std::borrow::Cow::Owned(owned)
             }
-        };
-        // A CTE the statement inlines would read its rows at no point
-        let query = match statement {
-            Statement::Select(stmt) => Some(stmt),
-            Statement::Insert(stmt) => stmt.select.as_deref(),
-            _ => None,
-        };
-        if let Some(name) = query
-            .filter(|_| holds_as_of)
-            .and_then(|stmt| prepared_select::cte_read_as_of(stmt, &[]))
-        {
-            return Err(Self::as_of_not_a_table(&name));
-        }
-        // Every AS OF of the statement resolves against bounds taken before it reads a row
-        let ctx = match holds_as_of {
-            true => std::borrow::Cow::Owned(
-                ctx.into_owned()
-                    .into_historical_cut(self.engine.registry().historical_cut()),
-            ),
-            false => ctx,
         };
         if select {
             let started = started.filter(|_| took_view);
@@ -1419,6 +1464,7 @@ impl Executor {
         // The fast paths read tables by name: CTEs the context brings are
         // read by the plans, which hold the CTE names they bound
         let held = !ctx.brings_ctes();
+        let ctx = self.with_statement_cut(&plan.statement, ctx, plan.holds_as_of)?;
         if let (Statement::Insert(stmt), true) = (plan.statement.as_ref(), held) {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
