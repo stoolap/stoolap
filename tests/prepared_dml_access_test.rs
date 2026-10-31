@@ -97,3 +97,63 @@ fn a_prepared_delete_removes_the_rows_its_where_names_across_index_changes() {
     assert_eq!(by_a.execute((3,)).unwrap(), 21);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 200 - 20 - 20 - 20);
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_prepared_write_reads_by_the_indexes_of_the_table_it_opened() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let db = Database::open("memory://prepared_dml_access_renamed").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 7, 0)", ()).unwrap();
+    let other = db.clone();
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    stoolap::test_failpoints::after_dml_table_opened(move || {
+        for sql in [
+            "ALTER TABLE t RENAME TO old_t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+            "CREATE INDEX t_k2 ON t(k)",
+            "INSERT INTO t VALUES (2, 7, 0)",
+        ] {
+            other.execute(sql, ()).unwrap();
+        }
+        hook_fired.set(true);
+    });
+    let updated = db.execute("UPDATE t SET v = v + 1 WHERE k = 7", ());
+    assert!(fired.get(), "the rename ran between the open and the plan");
+    // The write is the opened table's, or refused; never a quiet miss
+    if let Ok(updated) = updated {
+        assert_eq!(updated, 1, "the opened table's row was not written");
+        assert_eq!(count(&db, "SELECT v FROM old_t WHERE id = 1"), 1);
+    }
+    assert_eq!(count(&db, "SELECT v FROM t WHERE id = 2"), 0);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_prepared_write_reads_the_comparison_a_set_test_makes_by_its_index() {
+    let db = Database::open("memory://prepared_dml_access_set").unwrap();
+    fill(&db);
+    db.execute("CREATE TABLE rhs (id INTEGER PRIMARY KEY, b INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO rhs VALUES (1, 5), (2, 7)", ())
+        .unwrap();
+    for sql in [
+        "UPDATE t SET v = v + 1 WHERE a > ALL (SELECT b FROM rhs)",
+        "DELETE FROM t WHERE a > ALL (SELECT b FROM rhs)",
+    ] {
+        let statement = db.prepare(sql).unwrap();
+        let before = stoolap::test_failpoints::hot_index_ids_read();
+        assert_eq!(statement.execute(()).unwrap(), 40, "{sql}");
+        assert!(
+            stoolap::test_failpoints::hot_index_ids_read() > before,
+            "{sql}: the comparison the set test made read no index"
+        );
+    }
+}

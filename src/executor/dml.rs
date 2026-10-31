@@ -3254,7 +3254,7 @@ impl Executor {
                     Candidates::Scan(expr) | Candidates::Whole(expr) => {
                         // The access the plan decided, else the rule's answer now
                         let plan;
-                        let access = match dml_run.as_ref().and_then(|run| run.access()) {
+                        let access = match dml_run.as_ref().and_then(|run| run.access(&*table)) {
                             Some(access) => access,
                             None => {
                                 plan = expr.as_deref().and_then(|e| table.index_plan(e));
@@ -3904,7 +3904,7 @@ impl Executor {
                     let decided = dml_run
                         .as_ref()
                         .filter(|_| where_prepared)
-                        .and_then(|run| run.access());
+                        .and_then(|run| run.access(&*table));
                     let plan;
                     let access = match decided {
                         Some(access) => access,

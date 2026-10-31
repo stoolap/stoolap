@@ -8953,8 +8953,9 @@ pub struct PreparedDml {
     blocks: PreparedBlocks,
     holes: HoleSet,
     where_: Option<PreparedWhere>,
-    /// The access the WHERE's scan reads by, decided at preparation
-    scan: Option<ScanChoice>,
+    /// The access the WHERE's scan reads by, decided at preparation over the
+    /// store it holds, for a WHERE whose scan no run adds conjuncts to
+    scan: Option<(std::sync::Weak<VersionStore>, ScanChoice)>,
     /// Each SET value with the column it writes
     sets: Vec<(usize, SharedProgram)>,
     /// Each VALUES row's programs, None for a value without a subquery
@@ -9295,11 +9296,19 @@ impl PreparedDml {
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, schema));
-        // The access the WHERE's scan reads by, decided once by the rule
-        let scan = where_.as_ref().and_then(|where_| {
-            let store = executor.engine.get_version_store(&schema.table_name).ok()?;
-            Some(scan_choice(&store, schema, where_.pushdown.as_ref()))
-        });
+        // The access the WHERE's scan reads by, decided once by the rule, as
+        // a prepared SELECT's is: a run that adds a set's or a narrowing's
+        // conjuncts decides over them
+        let scan = where_
+            .as_ref()
+            .filter(|where_| {
+                where_.sets.is_empty() && where_.narrowing.is_none() && blocks.subqueries.is_empty()
+            })
+            .and_then(|where_| {
+                let store = executor.engine.get_version_store(&schema.table_name).ok()?;
+                let choice = scan_choice(&store, schema, where_.pushdown.as_ref());
+                Some((Arc::downgrade(&store), choice))
+            });
         Ok(Self {
             validity,
             cte_scope: ctx.cte_scope(),
@@ -10259,10 +10268,12 @@ impl<'a> DmlRunner<'a> {
         })
     }
 
-    /// The access the WHERE's scan reads by, decided at preparation; None
-    /// for a statement without WHERE, or a target the plan found no store for
-    pub(crate) fn access(&self) -> Option<ScanAccess<'a>> {
-        self.prepared.scan.as_ref().map(|scan| match scan {
+    /// The access the WHERE's scan reads `target` by, decided at preparation;
+    /// None when it was decided over another store than the one `target`
+    /// reads, or not decided, which leaves it to the run
+    pub(crate) fn access(&self, target: &dyn Table) -> Option<ScanAccess<'a>> {
+        let (store, scan) = self.prepared.scan.as_ref()?;
+        target.reads_store(store).then_some(match scan {
             ScanChoice::Index(plan) => ScanAccess::Index(plan),
             ScanChoice::Seq => ScanAccess::Seq,
         })
@@ -10305,8 +10316,12 @@ impl<'a> DmlRunner<'a> {
             keep(id, row);
             true
         };
+        let chosen = self.prepared.scan.as_ref();
+        let chosen = chosen
+            .filter(|(store, _)| table.reads_store(store))
+            .map(|(_, scan)| scan);
         match self.runner.passing_rows(
-            (where_, self.prepared.scan.as_ref()),
+            (where_, chosen),
             None,
             table,
             ctx,

@@ -26,6 +26,7 @@ use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::IndexPlan;
 use crate::storage::mvcc::version_store::{AggregateOp, LayoutToken};
+use crate::storage::mvcc::VersionStore;
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
 
 /// How a scan finds its rows, as the statement's plan chose it
@@ -566,6 +567,13 @@ pub trait Table: Send + Sync {
     /// `index_plan` for a read that stops at a count of rows
     fn limited_index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
         self.index_plan(where_expr)
+    }
+
+    /// Whether this table reads the rows and indexes `store` holds, the
+    /// store an access decided earlier was decided over
+    fn reads_store(&self, store: &std::sync::Weak<VersionStore>) -> bool {
+        let _ = store;
+        false
     }
 
     /// `scan` reading the rows `access` finds, each kept only when
