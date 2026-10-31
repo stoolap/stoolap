@@ -801,7 +801,7 @@ pub trait Table: Send + Sync {
     /// This is used by ROLLBACK TO SAVEPOINT to partially undo transaction changes.
     ///
     /// # Arguments
-    /// * `timestamp` - The timestamp to roll back to (in nanoseconds since epoch)
+    /// * `timestamp` - The write order to roll back to, from `last_write_order`
     fn rollback_to_timestamp(&self, timestamp: i64) {
         self.rollback_to_timestamp_with_pending(timestamp, &[]);
     }

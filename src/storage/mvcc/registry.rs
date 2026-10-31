@@ -1830,8 +1830,8 @@ impl VisibilityChecker for TransactionRegistry {
     fn commit_of(&self, txn_id: i64) -> CommitOf {
         match self.status.get(txn_id) {
             Some(slot) if slot > 0 => return CommitOf::Committed(slot),
+            Some(SLOT_UNKNOWN) | None => {}
             Some(_) => return CommitOf::NotCommitted,
-            None => {}
         }
         let txns = self.transactions.lock();
         if txns.get(txn_id).is_some() {

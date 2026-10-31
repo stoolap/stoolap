@@ -1548,7 +1548,8 @@ impl VersionStore {
     /// being the new head's
     fn history_kept(&self, existing: &VersionChainEntry, head_stamp: i64) -> KeptHistory {
         let limit = self.max_version_history;
-        if limit == 0 || !chain_reaches(existing, limit) {
+        // An unstamped head has not committed: every point until it does reads below it
+        if limit == 0 || head_stamp == UNSTAMPED || !chain_reaches(existing, limit) {
             return KeptHistory::Whole;
         }
         let Some(checker) = self.visibility_checker.as_ref() else {
@@ -2127,7 +2128,7 @@ impl VersionStore {
     /// Raises the mark a historical point must pass: called before the
     /// discard it guards becomes visible
     pub fn raise_history_mark(&self, seq: i64) {
-        // An unstamped version's commit is not known here: every point so far
+        // Callers pass a committed version's stamp: unstamped, every point so far
         let seq = match seq {
             UNSTAMPED => self
                 .visibility_checker
@@ -2175,20 +2176,24 @@ impl VersionStore {
         Ok(rows)
     }
 
+    /// The commit of `version`: its stamp, or for an unstamped one the registry's answer
+    #[inline]
+    fn commit_of(&self, version: &RowVersion) -> CommitOf {
+        if version.create_time != UNSTAMPED {
+            return CommitOf::Committed(version.create_time);
+        }
+        self.visibility_checker
+            .as_ref()
+            .map_or(CommitOf::Unknown, |checker| {
+                checker.commit_of(version.txn_id)
+            })
+    }
+
     /// Whether `version` had committed by `point`. An unstamped one asks the
     /// registry for its commit; one the registry no longer records cannot
     /// be placed, and the read fails rather than guess
     fn point_sees(&self, point: &ReadPoint, version: &RowVersion) -> Result<bool, Error> {
-        if version.create_time != UNSTAMPED {
-            return Ok(point.sees(version.create_time));
-        }
-        let commit = self
-            .visibility_checker
-            .as_ref()
-            .map_or(CommitOf::Unknown, |checker| {
-                checker.commit_of(version.txn_id)
-            });
-        match commit {
+        match self.commit_of(version) {
             CommitOf::Committed(seq) => Ok(point.sees(seq)),
             CommitOf::NotCommitted => Ok(false),
             CommitOf::Unknown => Err(Error::invalid_argument(format!(
@@ -2245,6 +2250,16 @@ impl VersionStore {
         self.visibility_checker
             .as_ref()
             .and_then(|checker| checker.retention_point(time))
+    }
+
+    /// Whether a retention pass at `point` finds `version` past retention.
+    /// One the registry no longer places is: its discard raises the mark
+    fn past_retention(&self, point: Option<&ReadPoint>, version: &RowVersion) -> bool {
+        point.is_none_or(|point| match self.commit_of(version) {
+            CommitOf::Committed(seq) => point.sees(seq),
+            CommitOf::NotCommitted => false,
+            CommitOf::Unknown => true,
+        })
     }
 
     /// The stamp versions of `txn_id` carry as it publishes them
@@ -6531,7 +6546,6 @@ impl VersionStore {
         };
 
         let point = self.retention_point(retention_period);
-        let old = |stamp: i64| point.as_ref().is_none_or(|point| point.sees(stamp));
 
         let mut rows_to_delete = Vec::new();
         // A delete committed below the bound is complete and seen by every reader
@@ -6549,7 +6563,7 @@ impl VersionStore {
 
         // First pass: identify deleted rows older than retention period
         for (&row_id, chain) in versions.iter() {
-            if old(chain.version.create_time) && removable(&chain.version) {
+            if self.past_retention(point.as_ref(), &chain.version) && removable(&chain.version) {
                 rows_to_delete.push(row_id);
             }
         }
@@ -6758,7 +6772,6 @@ impl VersionStore {
         };
 
         let point = self.retention_point(retention_period);
-        let old = |stamp: i64| point.as_ref().is_none_or(|point| point.sees(stamp));
 
         // A version committed below the bound is seen by every reader
         let cutoff = checker.maintenance_limit() - 1;
@@ -6817,7 +6830,7 @@ impl VersionStore {
             };
             // Versions within the retention period stay, with all newer ones
             for (i, prev_entry) in prev_versions.iter().enumerate() {
-                if !old(prev_entry.version.create_time) {
+                if !self.past_retention(point.as_ref(), &prev_entry.version) {
                     keep_count = keep_count.max(i + 1);
                 }
             }

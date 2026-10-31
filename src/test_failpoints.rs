@@ -3491,6 +3491,8 @@ pub fn reset_all() {
     RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    AS_OF_HOT_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_LOG_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
     TABLE_WAL_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);

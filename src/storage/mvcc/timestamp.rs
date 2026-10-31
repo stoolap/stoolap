@@ -34,8 +34,9 @@ pub(crate) fn next_write_order() -> i64 {
     WRITE_ORDER.fetch_add(1, Ordering::AcqRel) + 1
 }
 
-/// The order of the latest transaction-local write, for a statement boundary
-pub(crate) fn last_write_order() -> i64 {
+/// The order of the latest transaction-local write: the boundary a savepoint
+/// or statement rollback takes
+pub fn last_write_order() -> i64 {
     WRITE_ORDER.load(Ordering::Acquire)
 }
 

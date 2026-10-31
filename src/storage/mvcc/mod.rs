@@ -70,8 +70,8 @@ pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSAC
 pub use scanner::{EmptyScanner, MVCCScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
 pub use table::MVCCTable;
-pub use timestamp::get_fast_timestamp;
-pub(crate) use timestamp::{last_write_order, next_write_order};
+pub(crate) use timestamp::next_write_order;
+pub use timestamp::{get_fast_timestamp, last_write_order};
 pub use transaction::{
     MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
 };

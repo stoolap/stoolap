@@ -22,6 +22,9 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use stoolap::core::{Row, Value};
+use stoolap::storage::mvcc::MVCCTable;
+use stoolap::storage::traits::{Engine, Table};
 use stoolap::test_failpoints::{self as fp, FailpointGuard};
 use stoolap::Database;
 
@@ -422,32 +425,85 @@ fn a_compaction_during_a_read_refuses_the_point_it_overtook() {
 
 #[test]
 fn a_row_published_before_its_transaction_committed_is_never_history() {
-    use std::sync::Arc;
-    use stoolap::core::{Row, Value};
-    use stoolap::storage::mvcc::version_store::TransactionVersionStore;
-    use stoolap::storage::mvcc::MVCCTable;
-    use stoolap::storage::traits::{Engine, Table};
-
     let _guard = FailpointGuard::new();
     let db = memory("as_of_history_early_publication");
     db.execute("INSERT INTO t VALUES (2, 20)", ()).unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
+    let mut writer = early_writer(&db, txn.id());
+    writer.insert(row(1, 10)).unwrap();
+    publish(&mut writer);
+    assert_eq!(at(&db, "2200-01-01"), Ok(vec![(2, 20)]), "still active");
+    txn.rollback().unwrap();
+    assert_eq!(at(&db, "2200-01-01"), Ok(vec![(2, 20)]), "rolled back");
+
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut writer = early_writer(&db, txn.id());
+    writer.insert(row(3, 30)).unwrap();
+    publish(&mut writer);
+    // Nothing local is left, so the commit takes no sequence
+    txn.commit().unwrap();
+    assert_eq!(rows(&db, "SELECT id, v FROM t"), Ok(vec![(2, 20), (3, 30)]));
+    refused(at(&db, "2200-01-01"), "a commit without a sequence");
+}
+
+/// A handle on table t for transaction `txn_id`, outside the transaction's own tables
+fn early_writer(db: &Database, txn_id: i64) -> MVCCTable {
+    use std::sync::Arc;
+    use stoolap::storage::mvcc::version_store::TransactionVersionStore;
+
     let store = db.engine().get_version_store("t").unwrap();
-    let local = TransactionVersionStore::new(Arc::clone(&store), txn.id());
-    let mut handle = MVCCTable::new(txn.id(), store, local);
-    handle
-        .insert(Row::from(vec![Value::Integer(1), Value::Integer(10)]))
-        .unwrap();
+    let local = TransactionVersionStore::new(Arc::clone(&store), txn_id);
+    MVCCTable::new(txn_id, store, local)
+}
+
+/// Publishes what `handle` wrote to the shared store before its transaction commits
+fn publish(handle: &mut MVCCTable) {
     handle
         .txn_versions()
         .unwrap()
         .write_store()
         .commit()
         .unwrap();
-    drop(handle);
-    assert_eq!(at(&db, "2200-01-01"), Ok(vec![(2, 20)]), "still active");
+}
+
+fn row(id: i64, v: i64) -> Row {
+    Row::from(vec![Value::Integer(id), Value::Integer(v)])
+}
+
+#[test]
+fn a_chain_cut_by_early_published_writes_keeps_the_committed_version() {
+    let _guard = FailpointGuard::new();
+    let db = memory("as_of_history_unstamped_cut");
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut writer = early_writer(&db, txn.id());
+    for v in 11..=22 {
+        writer
+            .txn_versions()
+            .unwrap()
+            .write_store()
+            .put(1, row(1, v), false)
+            .unwrap();
+        publish(&mut writer);
+    }
+    assert_eq!(at(&db, &now(&db)), Ok(vec![(1, 10)]));
     txn.rollback().unwrap();
-    assert_eq!(at(&db, "2200-01-01"), Ok(vec![(2, 20)]), "rolled back");
+}
+
+#[test]
+fn retention_places_an_early_published_delete_by_its_commit() {
+    let _guard = FailpointGuard::new();
+    let db = memory("as_of_history_unstamped_retention");
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut writer = early_writer(&db, txn.id());
+    writer.delete_by_row_ids(&[1]).unwrap();
+    publish(&mut writer);
+    txn.get_table("t").unwrap().insert(row(2, 20)).unwrap();
+    txn.commit().unwrap();
+    now(&db);
+    let store = db.engine().get_version_store("t").unwrap();
+    assert_eq!(store.cleanup_deleted_rows(Duration::ZERO), 1);
 }
 
 #[test]
