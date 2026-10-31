@@ -533,6 +533,9 @@ pub struct SqlAggregateFunction {
     /// The error an extra argument gave when evaluated, the result of
     /// every group that reads this call
     pub(crate) extra_error: Option<crate::core::Error>,
+    /// The extra arguments as written when one is not a literal, which a
+    /// subquery block evaluates for each call; None otherwise
+    pub(crate) extra_exprs: Option<Box<[Expression]>>,
     /// The expression to evaluate for each row (for SUM(val * 2), AVG(a + b), etc.)
     /// If None, use column directly; if Some, evaluate expression first
     pub expression: Option<Expression>,
@@ -721,6 +724,15 @@ impl Modifiers {
 /// An aggregate call's extra argument values and the error one of them gave
 pub(crate) type ExtraArgs = (Vec<Value>, Option<crate::core::Error>);
 
+/// What a parse of aggregate calls does with their extra arguments
+#[derive(Clone, Copy)]
+enum ExtraArgsRead<'a> {
+    /// Reads them, a parameter bound by the context
+    With(Option<&'a ExecutionContext>),
+    /// Leaves them unread, the calls wanted for their identities alone
+    Unread,
+}
+
 /// The error an extra argument of one of `aggregations` gave, which a path
 /// that reads groups itself reports at its first group
 pub(crate) fn extra_args_failure(
@@ -740,31 +752,51 @@ pub(crate) fn aggregate_extra_args(
     let mut values = Vec::with_capacity(args.len().saturating_sub(1));
     let mut failed = None;
     for arg in args.iter().skip(1) {
-        let value = match arg {
-            Expression::Identifier(id) if id.quoted => Value::text(id.value.as_str()),
-            arg => match super::utils::extract_literal_value(arg) {
-                Some(value) => value,
-                None => {
-                    if !super::volatility::statement_constant(
-                        arg,
-                        crate::functions::registry::global_registry(),
-                    ) {
-                        return Err(crate::core::Error::invalid_argument(format!(
-                            "an aggregate argument after the first must not read the row: {}",
-                            arg
-                        )));
-                    }
-                    let program = super::expression::compile_once(arg)?;
-                    super::expression::execute_once(&program, ctx).unwrap_or_else(|error| {
-                        failed.get_or_insert(error);
-                        Value::null_unknown()
-                    })
-                }
-            },
+        let value = match literal_extra_arg(arg) {
+            Some(value) => value,
+            None => {
+                extra_arg_constant(arg)?;
+                let program = super::expression::compile_once(arg)?;
+                super::expression::execute_once(&program, ctx).unwrap_or_else(|error| {
+                    failed.get_or_insert(error);
+                    Value::null_unknown()
+                })
+            }
         };
         values.push(value);
     }
     Ok((values, failed))
+}
+
+/// An aggregate's extra argument written as its value: a literal, or a
+/// quoted name, which reads as text
+fn literal_extra_arg(arg: &Expression) -> Option<Value> {
+    match arg {
+        Expression::Identifier(id) if id.quoted => Some(Value::text(id.value.as_str())),
+        arg => super::utils::extract_literal_value(arg),
+    }
+}
+
+/// The extra arguments of a call to `args` as written, when one of them is
+/// not a literal
+fn written_extra_args(args: &[Expression]) -> Option<Box<[Expression]>> {
+    let extra = args.get(1..)?;
+    extra
+        .iter()
+        .any(|arg| literal_extra_arg(arg).is_none())
+        .then(|| extra.into())
+}
+
+/// An error unless `arg`, an aggregate argument after the first, is one
+/// value for the call: it reads no row the aggregate reads
+pub(crate) fn extra_arg_constant(arg: &Expression) -> Result<()> {
+    if super::volatility::statement_constant(arg, crate::functions::registry::global_registry()) {
+        return Ok(());
+    }
+    Err(crate::core::Error::invalid_argument(format!(
+        "an aggregate argument after the first must not read the row: {}",
+        arg
+    )))
 }
 
 /// What one aggregate call reads from each input row, compiled once: the
@@ -2276,6 +2308,23 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: Option<&ExecutionContext>,
     ) -> Result<(Vec<SqlAggregateFunction>, Vec<String>)> {
+        self.parse_calls(stmt, ExtraArgsRead::With(ctx))
+    }
+
+    /// The aggregate calls of `stmt` for their identities alone, their extra
+    /// arguments unread: a block's name an enclosing row before it binds
+    pub(crate) fn parse_aggregation_calls(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Vec<SqlAggregateFunction>> {
+        Ok(self.parse_calls(stmt, ExtraArgsRead::Unread)?.0)
+    }
+
+    fn parse_calls(
+        &self,
+        stmt: &SelectStatement,
+        ctx: ExtraArgsRead<'_>,
+    ) -> Result<(Vec<SqlAggregateFunction>, Vec<String>)> {
         let mut aggregations = Vec::new();
         let mut non_agg_columns = Vec::new();
 
@@ -2363,7 +2412,7 @@ impl Executor {
         expr: &Expression,
         aggregations: &mut Vec<SqlAggregateFunction>,
         non_agg_columns: &mut Vec<String>,
-        ctx: Option<&ExecutionContext>,
+        ctx: ExtraArgsRead<'_>,
     ) -> Result<()> {
         match expr {
             Expression::FunctionCall(func) => {
@@ -2390,6 +2439,7 @@ impl Executor {
                         distinct: distinct || func.is_distinct,
                         extra_args,
                         extra_error,
+                        extra_exprs: written_extra_args(&func.arguments),
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2499,7 +2549,7 @@ impl Executor {
         aliased: &crate::parser::ast::AliasedExpression,
         aggregations: &mut Vec<SqlAggregateFunction>,
         non_agg_columns: &mut Vec<String>,
-        ctx: Option<&ExecutionContext>,
+        ctx: ExtraArgsRead<'_>,
     ) -> Result<()> {
         match aliased.expression.as_ref() {
             Expression::FunctionCall(func) => {
@@ -2526,6 +2576,7 @@ impl Executor {
                         distinct: distinct || func.is_distinct,
                         extra_args,
                         extra_error,
+                        extra_exprs: written_extra_args(&func.arguments),
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2592,7 +2643,7 @@ impl Executor {
     fn extract_agg_column(
         &self,
         args: &[Expression],
-        ctx: Option<&ExecutionContext>,
+        ctx: ExtraArgsRead<'_>,
     ) -> Result<(String, bool, ExtraArgs, Option<Expression>)> {
         if args.is_empty() {
             return Ok(("*".to_string(), false, (Vec::new(), None), None));
@@ -2614,12 +2665,11 @@ impl Executor {
             }
         };
 
-        Ok((
-            column,
-            distinct,
-            aggregate_extra_args(args, ctx)?,
-            expression,
-        ))
+        let extra = match ctx {
+            ExtraArgsRead::With(ctx) => aggregate_extra_args(args, ctx)?,
+            ExtraArgsRead::Unread => (Vec::new(), None),
+        };
+        Ok((column, distinct, extra, expression))
     }
 
     /// Parse GROUP BY clause

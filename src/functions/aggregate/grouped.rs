@@ -123,6 +123,30 @@ impl CallTemplate {
             },
         }
     }
+
+    /// This call with `extra_args` for its extra arguments, and `failed`
+    /// the error one of them gave; a compiled call takes none
+    pub(crate) fn with_extra_args(
+        &self,
+        extra_args: Vec<Value>,
+        failed: Option<crate::core::Error>,
+    ) -> CallTemplate {
+        match self {
+            CallTemplate::Compiled(make) => CallTemplate::Compiled(*make),
+            CallTemplate::Dynamic {
+                function,
+                distinct,
+                order_by,
+                ..
+            } => CallTemplate::Dynamic {
+                function: function.clone_box(),
+                distinct: *distinct,
+                extra_args,
+                order_by: order_by.clone(),
+                failed,
+            },
+        }
+    }
 }
 
 /// A row's group key, read where the row holds it

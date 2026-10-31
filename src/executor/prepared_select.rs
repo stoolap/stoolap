@@ -46,8 +46,8 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
-    grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
-    Modifiers, SqlAggregateFunction, COUNT_STAR,
+    extra_arg_constant, grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs,
+    GroupByItem, Modifiers, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -616,17 +616,9 @@ impl<'a> Family<'a> {
             None | Some(Expression::Star(_)) => {}
             Some(first) => values(first)?,
         }
-        // The statement's own call reads one value for an argument after the
-        // first, which a subquery there gives once; a block's call a literal
-        let literal = |arg: &Expression| {
-            extract_literal_value(arg).is_some()
-                || matches!(arg, Expression::Identifier(id) if id.quoted)
-        };
-        if inputs == Site::Subqueries {
-            arguments.try_for_each(&mut values)?;
-        } else if !arguments.all(literal) {
-            return Err("an aggregate argument after the first that is not a literal");
-        }
+        // An argument after the first is one value: the statement's own call
+        // reads a subquery there once, a block's call its slots per call
+        arguments.try_for_each(&mut values)?;
         if let Some(filter) = call.filter.as_deref() {
             values(filter)?;
         }
@@ -3200,7 +3192,7 @@ fn grouped_having(
     stmt: &SelectStatement,
     having: &Expression,
 ) -> Result<Expression> {
-    let (aggregations, _) = executor.parse_aggregations(stmt, None)?;
+    let aggregations = executor.parse_aggregation_calls(stmt)?;
     let items = executor.parse_group_by(stmt, &[])?;
     let slots = aggregate_slot_keys(&items, &aggregations, &stmt.columns);
     let aliased = |name: &str| {
@@ -4315,6 +4307,9 @@ struct Grouping {
     items: Vec<Hole>,
     /// Over a slot row
     having: Option<SharedProgram>,
+    /// Each call whose extra arguments are not all literals, by index, with
+    /// each one's program over the block's slots, read once per call
+    extra: Vec<(usize, Vec<SharedProgram>)>,
     /// The groups of every key read in one pass, for a block that reads
     /// its parent only through key equalities
     keyed: Option<KeyedPlan>,
@@ -4355,9 +4350,32 @@ impl std::fmt::Debug for Grouping {
 
 impl Grouping {
     /// No groups yet, for keys of `prefix` key columns before the items;
-    /// without either, the one group there with no rows
-    fn groups(&self, prefix: usize) -> GroupedAggregates {
-        let calls = self.calls.iter().map(CallTemplate::duplicate).collect();
+    /// without either, the one group there with no rows. The extra arguments
+    /// that are not literals are read for the call `call` runs over, an
+    /// error read as NULL and kept for the first group, as a statement's are
+    fn groups(
+        &self,
+        prefix: usize,
+        mut call: Option<(&mut ExprVM, &ExecuteContext)>,
+    ) -> GroupedAggregates {
+        let calls = self.calls.iter().enumerate().map(|(i, template)| {
+            let extra = self.extra.iter().find(|(at, _)| *at == i);
+            let (Some((vm, exec)), Some((_, programs))) = (call.as_mut(), extra) else {
+                return template.duplicate();
+            };
+            let mut failed = None;
+            let values = programs
+                .iter()
+                .map(|program| {
+                    vm.execute(program, exec).unwrap_or_else(|error| {
+                        failed.get_or_insert(error);
+                        Value::null_unknown()
+                    })
+                })
+                .collect();
+            template.with_extra_args(values, failed)
+        });
+        let calls = calls.collect();
         match prefix + self.items.len() {
             0 => GroupedAggregates::global(calls),
             width => GroupedAggregates::new(calls, width),
@@ -6264,7 +6282,8 @@ impl Builder<'_> {
                 if counts_rows && one_equality && table.is_some() && source.is_none() {
                     grouping.read = CallRead::CountByIndex;
                 }
-                if self.keyed(&chain, &keys, &work, sq, &others) {
+                // A key's groups are read once per run, an extra argument per call
+                if grouping.extra.is_empty() && self.keyed(&chain, &keys, &work, sq, &others) {
                     grouping.keyed = Some(keyed_plan(&chain, &keys, filter.as_ref(), &schema));
                 }
                 Some(Box::new(grouping))
@@ -6462,6 +6481,21 @@ impl Builder<'_> {
             .collect::<Result<Vec<_>>>()?;
         let own = CompileContext::bound(registry);
         let inputs = CallInputs::compile_with(&aggregations, |expr| compile_with(&own, expr))?;
+        let extra = aggregations
+            .iter()
+            .enumerate()
+            .filter_map(|(at, agg)| Some((at, agg.extra_exprs.as_deref()?)))
+            .map(|(at, args)| {
+                let programs = args
+                    .iter()
+                    .map(|arg| {
+                        extra_arg_constant(arg)?;
+                        compile_with(&own, arg)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((at, programs))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let slot = |i: usize| {
             u16::try_from(i).map_err(|_| Error::internal("too many grouped values in a block"))
@@ -6514,6 +6548,7 @@ impl Builder<'_> {
                 columns,
                 items,
                 having: having_program,
+                extra,
                 keyed: None,
                 statement: None,
                 read: CallRead::Rows,
@@ -15616,7 +15651,9 @@ impl PreparedRunner<'_> {
             self.scan(index, None)?
         };
         let decided = pushed && sq.pushed_whole;
-        let mut groups = grouping.groups(0);
+        let no_row = Row::new();
+        let call = (!grouping.extra.is_empty()).then(|| self.exec_over(&no_row, &params));
+        let mut groups = grouping.groups(0, call.as_ref().map(|exec| (&mut *vm, exec)));
         let mut key = KeyReader::new(grouping, Vec::new());
         let mut scanned = 0u64;
         'rows: while scanner.next() {
@@ -15675,7 +15712,7 @@ impl PreparedRunner<'_> {
         let count = CompiledAggregate::CountStar {
             count: i64::try_from(count).map_err(|_| Error::internal("a count past i64"))?,
         };
-        let mut groups = grouping.groups(0);
+        let mut groups = grouping.groups(0, None);
         for run in groups.aggregates(0) {
             run.merge(&count);
         }
@@ -15756,7 +15793,7 @@ impl PreparedRunner<'_> {
         let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
         let decided = sq.filter.is_none() || (bound.is_some() && plan.pushed_whole);
         let prefix: Vec<usize> = plan.keys.iter().map(|(own, _, _)| *own).collect();
-        let mut groups = grouping.groups(prefix.len());
+        let mut groups = grouping.groups(prefix.len(), None);
         let mut key = KeyReader::new(grouping, prefix.clone());
         let mut failed: FxHashMap<SmallVec<[Value; 1]>, Error> = FxHashMap::default();
         let mut scanned = 0u64;
@@ -15822,7 +15859,7 @@ impl PreparedRunner<'_> {
             by_key.insert(at, Err(e));
         }
         let missing = if grouping.items.is_empty() {
-            let none = grouping.groups(0).into_rows()?;
+            let none = grouping.groups(0, None).into_rows()?;
             none.into_iter().map(|(_, row)| row).collect()
         } else {
             Vec::new()
