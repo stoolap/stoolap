@@ -223,6 +223,67 @@ fn an_error_in_the_subquery_is_the_statements_error() {
     }
 }
 
+#[test]
+fn a_table_function_a_false_where_keeps_no_row_of_computes_no_argument() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup("values_tvf_subquery_false_where", &dir, false);
+    for (sql, want) in [
+        (
+            "SELECT value FROM generate_series(ABS(-9223372036854775808), (SELECT 3)) WHERE 1 = 0",
+            vec![],
+        ),
+        (
+            "SELECT value FROM generate_series(1, (SELECT v FROM u)) WHERE 1 = 0",
+            vec![],
+        ),
+        (
+            "SELECT COUNT(*) FROM generate_series(1, (SELECT v FROM u)) WHERE 1 = 0",
+            vec![vec![Value::Integer(0)]],
+        ),
+    ] {
+        assert_eq!(rows(&db, sql), Ok(want), "{sql}");
+    }
+}
+
+#[test]
+fn a_statement_run_without_a_plan_of_its_own_reads_it_too() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup("values_tvf_subquery_no_plan", &dir, false);
+    let values = "SELECT * FROM (VALUES ((SELECT 2))) x(a)";
+    let series = "SELECT value FROM generate_series(1, (SELECT 2))";
+    for (sql, want) in [(values, vec![2]), (series, vec![1, 2])] {
+        let want: Vec<Vec<Value>> = want.into_iter().map(|v| vec![Value::Integer(v)]).collect();
+        assert_eq!(
+            rows(&db, &format!("SELECT 0; {sql}")),
+            Ok(want.clone()),
+            "the second statement of a program: {sql}"
+        );
+        let stmt = stoolap::parser::parse_sql(sql).unwrap().remove(0);
+        let mut tx = db.begin().unwrap();
+        let got: Vec<Vec<Value>> = tx
+            .query_prepared(&stmt, ())
+            .unwrap()
+            .map(|row| row.map(|row| vec![row.get(0).unwrap()]))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        tx.rollback().unwrap();
+        assert_eq!(got, want, "a parsed statement in a transaction: {sql}");
+    }
+    db.execute(&format!("CREATE VIEW vv AS {values}"), ())
+        .unwrap();
+    db.execute(&format!("CREATE VIEW vs AS {series}"), ())
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT * FROM vv", vec![2]),
+        ("SELECT * FROM vs", vec![1, 2]),
+    ] {
+        let want: Vec<Vec<Value>> = want.into_iter().map(|v| vec![Value::Integer(v)]).collect();
+        assert_eq!(rows(&db, sql), Ok(want), "a view's query: {sql}");
+    }
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_subquery_in_a_values_row_or_a_table_function_argument_runs_no_general_path_mechanism() {

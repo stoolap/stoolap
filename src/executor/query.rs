@@ -2918,7 +2918,7 @@ impl Executor {
     pub(super) fn tvf_rows(
         &self,
         tvf_source: &FunctionTableSource,
-        arguments: Option<Vec<Value>>,
+        arguments: Option<&dyn Fn() -> Result<Vec<Value>>>,
         where_clause: Option<&Expression>,
         limit: Option<usize>,
         ctx: &ExecutionContext,
@@ -3039,11 +3039,11 @@ impl Executor {
         }
     }
 
-    /// The rows of `tvf_source` over its `arguments` computed already, or
+    /// The rows of `tvf_source` over the values `arguments` computes, or
     /// over its arguments as written
     fn evaluate_tvf_with_range(
         tvf_source: &FunctionTableSource,
-        arguments: Option<Vec<Value>>,
+        arguments: Option<&dyn Fn() -> Result<Vec<Value>>>,
         ctx: &ExecutionContext,
         limit: Option<usize>,
         range_hint: Option<Resolved>,
@@ -3051,12 +3051,15 @@ impl Executor {
         let tvf = Self::tvf_of(tvf_source)?;
 
         let mut arg_values = match arguments {
-            Some(arguments) => arguments,
-            None => tvf_source
-                .arguments
-                .iter()
-                .map(|arg| super::expression::evaluate_once(arg, Some(ctx)))
-                .collect::<Result<Vec<_>>>()?,
+            Some(compute) => compute()?,
+            None => {
+                // Evaluate arguments to Values
+                let mut values = Vec::with_capacity(tvf_source.arguments.len());
+                for arg in &tvf_source.arguments {
+                    values.push(super::expression::evaluate_once(arg, Some(ctx))?);
+                }
+                values
+            }
         };
 
         if let Some(range) = range_hint {

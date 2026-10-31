@@ -4956,8 +4956,8 @@ struct Builder<'e> {
     /// The statement's own blocks keep their holes as written, for a row
     /// laid out apart from its table's
     keeps_holes: bool,
-    /// The run slots of values a WHERE tests a column against, whose error
-    /// a run raises only where a row reads the slot
+    /// The run slots of values a WHERE tests a column against, or of a
+    /// source's values, whose error a run raises only where a row reads it
     where_slots: Vec<usize>,
     /// The width of the statement's row, past which a column its keys read
     /// is the projected row's, which a key reads as its second row
@@ -5608,6 +5608,7 @@ impl Builder<'_> {
         let no_row = ScopeTable::unnamed();
         let scopes = [&no_row];
         let chain = Chain { scopes: &scopes };
+        let first = run_slots.len();
         let mut prepared = Vec::with_capacity(rows.len());
         for row in rows {
             let mut values = Vec::with_capacity(row.len());
@@ -5618,6 +5619,9 @@ impl Builder<'_> {
             }
             prepared.push(values);
         }
+        // A run that reads no source row raises no error of its values
+        self.where_slots
+            .extend(run_slots[first..].iter().map(|(slot, _)| *slot));
         Ok(Some(prepared))
     }
 
@@ -12964,10 +12968,11 @@ impl<'a> PreparedRunner<'a> {
         first: Option<usize>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
-        let arguments = self.source_row(programs)?.into_values();
+        // Computed only where the WHERE lets the function give a row
+        let arguments = || self.source_row(programs).map(Row::into_values);
         let (rows, _) =
             self.executor
-                .tvf_rows(function, Some(arguments), where_clause, first, ctx)?;
+                .tvf_rows(function, Some(&arguments), where_clause, first, ctx)?;
         Ok(rows)
     }
 
