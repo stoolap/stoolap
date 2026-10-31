@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::optimizer::workload::{EdgeAwarePlanner, EdgeJoinRecommendation};
 use crate::storage::traits::Index;
 
 /// What the planner decided for one join. A run reads it and chooses only
@@ -31,9 +32,9 @@ pub(crate) struct JoinPlan {
     /// The probe each side offers as the inner side of an index join, the
     /// right side's first
     pub probes: [Option<IndexProbe>; 2],
-    /// A small LIMIT streams the join through a hash table: whether it
-    /// builds on the left side
-    pub limit_hash: Option<bool>,
+    /// Whether a small LIMIT streams the join through a hash table, built
+    /// on the side a run's statistics estimate smaller
+    pub limit_hash: bool,
 }
 
 /// The inner side of an index join: its table, how a key finds its rows,
@@ -80,7 +81,8 @@ pub(crate) enum PairMethod {
 }
 
 /// The method for sides of `left_rows` and `right_rows` rows: a nested loop
-/// without an equality key, with a side empty, or where comparing every
+/// without an equality key, where the workload's memory limit or its
+/// learned preference says so, with a side empty, or where comparing every
 /// pair costs less than a hash table; else a hash table on the side the
 /// join type keeps whole, or on the smaller side of an inner join
 pub(crate) fn pair_method(
@@ -91,10 +93,30 @@ pub(crate) fn pair_method(
 ) -> PairMethod {
     const NESTED_LOOP_MAX: usize = 200;
     const HASH_JOIN_MIN_BENEFIT: usize = 50;
+    const ESTIMATED_BYTES_PER_ROW: u64 = 100;
     if !has_keys {
         return PairMethod::NestedLoop;
     }
-    let small = left_rows <= NESTED_LOOP_MAX && right_rows <= NESTED_LOOP_MAX;
+    let (build, probe) = (left_rows.min(right_rows), left_rows.max(right_rows));
+    let workload = EdgeAwarePlanner::from_global().recommend_join_for_edge(
+        build as u64,
+        probe as u64,
+        ESTIMATED_BYTES_PER_ROW,
+    );
+    let small = match workload {
+        EdgeJoinRecommendation::ForceNestedLoop { .. } => return PairMethod::NestedLoop,
+        EdgeJoinRecommendation::PreferNestedLoop { .. }
+            if left_rows <= NESTED_LOOP_MAX * 2 && right_rows <= NESTED_LOOP_MAX * 2 =>
+        {
+            return PairMethod::NestedLoop;
+        }
+        EdgeJoinRecommendation::PreferHashJoin { .. }
+            if left_rows + right_rows > NESTED_LOOP_MAX =>
+        {
+            true
+        }
+        _ => left_rows <= NESTED_LOOP_MAX && right_rows <= NESTED_LOOP_MAX,
+    };
     if !small {
         let product = left_rows.saturating_mul(right_rows);
         if left_rows == 0
@@ -142,6 +164,29 @@ mod tests {
         assert_eq!(
             pair_method(2, 5000, true, "INNER"),
             PairMethod::Hash { build_left: true }
+        );
+    }
+
+    #[test]
+    fn a_workload_memory_limit_keeps_a_large_build_side_out_of_a_hash_table() {
+        use crate::optimizer::workload::{global_workload_learner, WorkloadConfig};
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let learner = global_workload_learner();
+        let before = learner.config();
+        learner.set_config(WorkloadConfig {
+            memory_limit_mb: 1,
+            ..before.clone()
+        });
+        let limited = pair_method(20_000, 20_000, true, "INNER");
+        learner.set_config(before);
+        assert_eq!(limited, PairMethod::NestedLoop, "under a 1 MiB limit");
+        assert_eq!(
+            pair_method(20_000, 20_000, true, "INNER"),
+            PairMethod::Hash { build_left: true },
+            "without a limit"
         );
     }
 }

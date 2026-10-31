@@ -91,7 +91,7 @@ impl Executor {
             reduction,
             grouped_index,
             probes,
-            limit_hash: self.limit_hash(shape),
+            limit_hash: Self::limit_hash(shape),
         })
     }
 
@@ -340,13 +340,12 @@ impl Executor {
         ))
     }
 
-    /// Whether a small LIMIT streams the join through a hash table, and
-    /// then whether it builds on the left side, the one estimated smaller:
-    /// an INNER join with an equality, nothing that orders, groups,
-    /// aggregates or merges the joined rows, and no condition across sides
-    fn limit_hash(&self, shape: &JoinShape<'_>) -> Option<bool> {
+    /// Whether a small LIMIT streams the join through a hash table: an
+    /// INNER join with an equality, nothing that orders, groups, aggregates
+    /// or merges the joined rows, and no condition across sides
+    fn limit_hash(shape: &JoinShape<'_>) -> bool {
         let (stmt, class, join_type) = (shape.stmt, shape.classification, shape.join_type);
-        let streams = !join_type.contains("FULL")
+        !join_type.contains("FULL")
             && !join_type.contains("LEFT")
             && !join_type.contains("RIGHT")
             && !class.has_order_by
@@ -356,12 +355,18 @@ impl Executor {
             && !stmt.distinct
             && stmt.distinct_on.is_empty()
             && shape.cross_filter.is_none()
-            && shape.join.condition.as_deref().is_some_and(has_equality);
-        streams.then(|| {
-            let estimate = |side: &Expression, filter| self.estimate_side_rows(side, filter);
-            estimate(&shape.join.left, shape.filters[0])
-                < estimate(&shape.join.right, shape.filters[1])
-        })
+            && shape.join.condition.as_deref().is_some_and(has_equality)
+    }
+
+    /// Whether a LIMIT hash join builds on its left side: the side the
+    /// statistics estimate smaller under its conditions, read per run since
+    /// ANALYZE moves the estimates without changing the plan
+    pub(crate) fn limit_hash_builds_left(
+        &self,
+        [left, right]: [&Expression; 2],
+        [left_filter, right_filter]: [Option<&Expression>; 2],
+    ) -> bool {
+        self.estimate_side_rows(left, left_filter) < self.estimate_side_rows(right, right_filter)
     }
 
     /// The rows a base table side is estimated to give under `filter`;

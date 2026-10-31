@@ -7201,11 +7201,19 @@ impl Executor {
 
             // OFFSET rows are skipped after collection, so the early-termination
             // budget is LIMIT + OFFSET, for a LIMIT of at most 100
-            let streaming = join_plan.limit_hash.and_then(|build_left| {
-                let counts = row_counts(stmt, ctx).ok()?;
-                let limit = counts.limit.filter(|limit| *limit <= 100)?;
-                Some((limit.saturating_add(counts.offset) as u64, build_left))
-            });
+            let streaming = match join_plan.limit_hash {
+                true => row_counts(stmt, ctx).ok().and_then(|counts| {
+                    let limit = counts.limit.filter(|limit| *limit <= 100)?;
+                    let build_left = self.limit_hash_builds_left(
+                        [&join_source.left, &join_source.right],
+                        [left_filter.as_ref(), right_filter.as_ref()],
+                    );
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::limit_hash_built(build_left);
+                    Some((limit.saturating_add(counts.offset) as u64, build_left))
+                }),
+                false => None,
+            };
 
             // Use streaming path if eligible; sides it ran but could not join
             // by hash go on to the standard path

@@ -3296,6 +3296,19 @@ thread_local! {
     static IN_SUBQUERY_SETS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STREAMING_JOINS_STREAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIMIT_HASH_LEFT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Streaming LIMIT joins this thread ran that built their hash table on
+/// the left side, so far
+pub fn limit_hash_left_builds() -> usize {
+    LIMIT_HASH_LEFT_BUILDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn limit_hash_built(left: bool) {
+    if left {
+        LIMIT_HASH_LEFT_BUILDS.with(|n| n.set(n.get() + 1));
+    }
 }
 
 /// Outer rows this thread's streaming index joins read, so far

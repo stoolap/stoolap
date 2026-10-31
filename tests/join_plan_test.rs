@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A join plans how it runs once; a run that cannot take the planned index
-//! reads each side once all the same
+//! A join plans how it runs once; what moves without changing the plan,
+//! statistics and the workload's memory limit, is read per run, and a run
+//! that cannot take the planned index reads each side once all the same
 
 #![cfg(feature = "test-failpoints")]
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{after_join_index_chosen, join_side_runs, reset_all};
+use stoolap::optimizer::{global_workload_learner, WorkloadConfig};
+use stoolap::test_failpoints::{
+    after_join_index_chosen, join_side_runs, limit_hash_left_builds, reset_all,
+};
 use stoolap::Database;
 
 // The failpoint hooks are per thread, the counters process-wide in effect
@@ -107,4 +111,68 @@ fn a_grouped_join_whose_index_was_replaced_reads_each_side_once() {
         sides, 2,
         "the left side read for the grouped join is read again"
     );
+}
+
+#[test]
+fn a_limit_hash_join_builds_on_the_side_statistics_found_smaller_after_analyze() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_limit_hash_analyze").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO s VALUES (1, 3)",
+        "INSERT INTO t SELECT g.value, g.value % 10 FROM generate_series(1, 3000) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let stmt = db
+        .prepare("SELECT s.id, t.id FROM s JOIN t ON t.k = s.k LIMIT $1")
+        .unwrap();
+    let builds = || {
+        let before = limit_hash_left_builds();
+        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        limit_hash_left_builds() - before
+    };
+    assert_eq!(
+        builds(),
+        0,
+        "without statistics neither side is known smaller"
+    );
+    db.execute("ANALYZE s", ()).unwrap();
+    db.execute("ANALYZE t", ()).unwrap();
+    assert_eq!(builds(), 1, "after ANALYZE the one-row side builds");
+}
+
+#[test]
+fn a_workload_memory_limit_keeps_a_join_off_a_hash_table() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_memory_limit").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO p SELECT g.value, g.value % 100 FROM generate_series(1, 12000) g",
+        "INSERT INTO q SELECT g.value, g.value % 100 FROM generate_series(1, 12000) g",
+        "ANALYZE p",
+        "ANALYZE q",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let plan = |db: &Database| -> String {
+        db.query("EXPLAIN SELECT p.id, q.id FROM p JOIN q ON q.k = p.k", ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let learner = global_workload_learner();
+    let before = learner.config();
+    let free = plan(&db);
+    learner.set_config(WorkloadConfig {
+        memory_limit_mb: 1,
+        ..before.clone()
+    });
+    let limited = plan(&db);
+    learner.set_config(before);
+    assert!(free.contains("Hash Join"), "{free}");
+    assert!(limited.contains("Nested Loop"), "{limited}");
 }
