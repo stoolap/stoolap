@@ -20,6 +20,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Mutex;
 
 use stoolap::Database;
 
@@ -69,9 +70,13 @@ const PER_ROW: &[&str] = &[
      CASE WHEN $1 IS NOT NULL THEN '[0, 0, 0]' ELSE '[1, 1, 1]' END < 1e9",
 ];
 
-/// The allocations one execution of `sql` takes over a table of `rows`
-fn allocations(rows: i64, sql: &str) -> usize {
-    let db = Database::open(&format!("memory://vector_argument_once_{rows}")).unwrap();
+/// Closing a database clears process-wide caches a counted run reads
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// The allocations one execution of `sql` takes over a table of `rows`,
+/// in a database of the `test`'s own
+fn allocations(test: &str, rows: i64, sql: &str) -> usize {
+    let db = Database::open(&format!("memory://vector_argument_once_{test}_{rows}")).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, e VECTOR(3))", ())
         .unwrap();
     let values: Vec<String> = (1..=rows)
@@ -94,10 +99,11 @@ fn allocations(rows: i64, sql: &str) -> usize {
 
 #[test]
 fn a_known_text_vector_is_read_once_per_execution() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
     for sql in SHAPES {
-        let short = allocations(200, sql);
-        let long = allocations(2_000, sql);
+        let short = allocations("once", 200, sql);
+        let long = allocations("once", 2_000, sql);
         if long >= short + 200 {
             wrong.push(format!(
                 "{sql}: {long} allocations over 2000 rows, {short} over 200"
@@ -109,10 +115,11 @@ fn a_known_text_vector_is_read_once_per_execution() {
 
 #[test]
 fn an_argument_read_per_row_costs_only_the_functions_own_read() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
     for sql in PER_ROW {
-        let short = allocations(200, sql);
-        let long = allocations(2_000, sql);
+        let short = allocations("per_row", 200, sql);
+        let long = allocations("per_row", 2_000, sql);
         // Parsing the text takes a buffer of floats and one of bytes
         if long >= short + 2 * 1_800 + 200 {
             wrong.push(format!(
