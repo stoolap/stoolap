@@ -20,8 +20,17 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::{Mutex, MutexGuard};
 
 use stoolap::Database;
+
+// Dropping a database clears the process-wide classification cache a
+// measured run reads, so the tests here run one at a time
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct ThreadCounting;
 
@@ -77,6 +86,7 @@ fn first_run(db: &Database, sql: &str) -> usize {
 
 #[test]
 fn a_qualified_name_prepares_as_a_bare_one_does() {
+    let _guard = serial();
     let db = open("block_prepare_qualified", 0);
     let terms = |term: &str| vec![term; 8].join(" AND ");
     let qualified = first_run(
@@ -98,6 +108,7 @@ fn a_qualified_name_prepares_as_a_bare_one_does() {
 
 #[test]
 fn a_block_names_each_column_of_its_statement_once() {
+    let _guard = serial();
     let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.v < t.a)";
     let narrow = first_run(&open("block_prepare_narrow", 0), sql);
     let wide = first_run(&open("block_prepare_wide", 64), sql);
