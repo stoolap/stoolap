@@ -8953,6 +8953,8 @@ pub struct PreparedDml {
     blocks: PreparedBlocks,
     holes: HoleSet,
     where_: Option<PreparedWhere>,
+    /// The access the WHERE's scan reads by, decided at preparation
+    scan: Option<ScanChoice>,
     /// Each SET value with the column it writes
     sets: Vec<(usize, SharedProgram)>,
     /// Each VALUES row's programs, None for a value without a subquery
@@ -9293,6 +9295,11 @@ impl PreparedDml {
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks, schema));
+        // The access the WHERE's scan reads by, decided once by the rule
+        let scan = where_.as_ref().and_then(|where_| {
+            let store = executor.engine.get_version_store(&schema.table_name).ok()?;
+            Some(scan_choice(&store, schema, where_.pushdown.as_ref()))
+        });
         Ok(Self {
             validity,
             cte_scope: ctx.cte_scope(),
@@ -9300,6 +9307,7 @@ impl PreparedDml {
             blocks,
             holes,
             where_,
+            scan,
             sets,
             values,
             conflict: prepared_conflict,
@@ -10251,6 +10259,15 @@ impl<'a> DmlRunner<'a> {
         })
     }
 
+    /// The access the WHERE's scan reads by, decided at preparation; None
+    /// for a statement without WHERE, or a target the plan found no store for
+    pub(crate) fn access(&self) -> Option<ScanAccess<'a>> {
+        self.prepared.scan.as_ref().map(|scan| match scan {
+            ScanChoice::Index(plan) => ScanAccess::Index(plan),
+            ScanChoice::Seq => ScanAccess::Seq,
+        })
+    }
+
     /// The scan of `table` that takes the whole WHERE, found without reading
     /// a row: None when a narrowing reads the rows or the scan takes part
     pub(crate) fn whole_scan(
@@ -10289,7 +10306,7 @@ impl<'a> DmlRunner<'a> {
             true
         };
         match self.runner.passing_rows(
-            (where_, None),
+            (where_, self.prepared.scan.as_ref()),
             None,
             table,
             ctx,

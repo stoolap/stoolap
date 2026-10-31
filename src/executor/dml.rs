@@ -3252,8 +3252,15 @@ impl Executor {
                         table.update_by_row_ids(&row_ids, &mut setter)?
                     }
                     Candidates::Scan(expr) | Candidates::Whole(expr) => {
-                        let plan = expr.as_deref().and_then(|e| table.index_plan(e));
-                        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                        // The access the plan decided, else the rule's answer now
+                        let plan;
+                        let access = match dml_run.as_ref().and_then(|run| run.access()) {
+                            Some(access) => access,
+                            None => {
+                                plan = expr.as_deref().and_then(|e| table.index_plan(e));
+                                plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
+                            }
+                        };
                         table.update(access, expr.as_deref(), &mut setter)?
                     }
                 }
@@ -3893,8 +3900,19 @@ impl Executor {
                 Some(row_ids) => table.delete_by_row_ids(&row_ids)?,
                 // The storage layer reads the rows the WHERE names
                 None => {
-                    let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
-                    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                    // The access the plan decided, else the rule's answer now
+                    let decided = dml_run
+                        .as_ref()
+                        .filter(|_| where_prepared)
+                        .and_then(|run| run.access());
+                    let plan;
+                    let access = match decided {
+                        Some(access) => access,
+                        None => {
+                            plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+                            plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
+                        }
+                    };
                     table.delete(access, where_expr.as_deref())?
                 }
             }
