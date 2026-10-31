@@ -32,7 +32,7 @@ fn setup(name: &str) -> Database {
     db
 }
 
-/// The lines under EXPLAIN ANALYZE's `Subqueries:` heading
+/// The lines under EXPLAIN ANALYZE's `Subqueries:` heading, past its indent
 fn block_lines(db: &Database, sql: &str) -> Vec<String> {
     let lines: Vec<String> = db
         .query(&format!("EXPLAIN ANALYZE {sql}"), ())
@@ -43,7 +43,7 @@ fn block_lines(db: &Database, sql: &str) -> Vec<String> {
         .iter()
         .skip_while(|line| line.as_str() != "  Subqueries:")
         .skip(1)
-        .map(|line| line.trim().to_string())
+        .map(|line| line.strip_prefix("    ").unwrap_or(line).to_string())
         .collect()
 }
 
@@ -82,6 +82,22 @@ fn explain_analyze_says_how_each_block_answers() {
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k)",
             &["1: EXISTS over a statement, per call"],
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w JOIN r ON r.rid = w.id \
+             WHERE w.k = t.k AND EXISTS (SELECT 1 FROM u WHERE u.k = w.k))",
+            &[
+                "1: EXISTS over a statement, per call",
+                "  1.1: EXISTS over u, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions",
+            ],
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k \
+             AND EXISTS (SELECT 1 FROM u JOIN r ON r.rid = u.id WHERE u.k = t.k))",
+            &[
+                "1: EXISTS over w, per call: its pushed conditions",
+                "2: EXISTS over a statement, per call",
+            ],
         ),
         (
             "SELECT id, (SELECT v FROM w WHERE w.id = t.k) FROM t",

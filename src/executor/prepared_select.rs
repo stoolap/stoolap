@@ -3970,16 +3970,19 @@ impl PartialEq for HeldRow<'_> {
 impl Eq for HeldRow<'_> {}
 
 impl PreparedBlocks {
-    /// One line for each block, numbered on from the lines before it, as its
-    /// nodes say it answers
-    fn explain(&self, prefix: &str, lines: &mut Vec<String>) {
-        let before = lines.len();
+    /// One line for each block, labelled `label` and its number counted on
+    /// from `first`; a block run as a statement lists that statement's blocks
+    /// under it, labelled by its own number
+    fn explain(&self, prefix: &str, (label, first): (&str, usize), lines: &mut Vec<String>) {
         for (at, sq) in self.subqueries.iter().enumerate() {
-            lines.push(format!(
-                "{prefix}{}: {}",
-                before + at + 1,
-                sq.explain(before)
-            ));
+            let number = format!("{label}{}", first + at + 1);
+            lines.push(format!("{prefix}{number}: {}", sq.explain(label, first)));
+            for run in sq.statement_runs() {
+                if let Ok(compiled) = run.compiled.slot().read() {
+                    let inner = format!("{number}.");
+                    held_blocks(&compiled, &format!("{prefix}  "), &inner, lines);
+                }
+            }
         }
     }
 }
@@ -3988,27 +3991,32 @@ impl PreparedBlocks {
 /// for a plan holding no block
 pub(crate) fn explain_held_blocks(compiled: &CompiledExecution, indent: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    let prefix = "  ".repeat(indent + 1);
-    let mut explain = |blocks: &PreparedBlocks| blocks.explain(&prefix, &mut lines);
-    match compiled {
-        CompiledExecution::PreparedSelect(p) => explain(&p.blocks),
-        CompiledExecution::PreparedGrouped(p) => explain(&p.blocks),
-        CompiledExecution::PreparedDml(p) => explain(&p.blocks),
-        CompiledExecution::PreparedJoin(p) => {
-            let (join, grouped) = p.held_blocks();
-            if let Some(join) = join {
-                explain(&join.blocks);
-            }
-            if let Some(grouped) = grouped.as_deref().and_then(Option::as_ref) {
-                explain(&grouped.blocks);
-            }
-        }
-        _ => {}
-    }
+    held_blocks(compiled, &"  ".repeat(indent + 1), "", &mut lines);
     if !lines.is_empty() {
         lines.insert(0, format!("{}Subqueries:", "  ".repeat(indent)));
     }
     lines
+}
+
+/// The lines of the blocks `compiled` holds, labelled `label` and a number;
+/// a join's and its groups' blocks numbered on as one list
+fn held_blocks(compiled: &CompiledExecution, prefix: &str, label: &str, lines: &mut Vec<String>) {
+    match compiled {
+        CompiledExecution::PreparedSelect(p) => p.blocks.explain(prefix, (label, 0), lines),
+        CompiledExecution::PreparedGrouped(p) => p.blocks.explain(prefix, (label, 0), lines),
+        CompiledExecution::PreparedDml(p) => p.blocks.explain(prefix, (label, 0), lines),
+        CompiledExecution::PreparedJoin(p) => {
+            let (join, grouped) = p.held_blocks();
+            let first = join.as_ref().map_or(0, |join| join.blocks.subqueries.len());
+            if let Some(join) = join {
+                join.blocks.explain(prefix, (label, 0), lines);
+            }
+            if let Some(grouped) = grouped.as_deref().and_then(Option::as_ref) {
+                grouped.blocks.explain(prefix, (label, first), lines);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl PreparedSubquery {
@@ -4017,9 +4025,24 @@ impl PreparedSubquery {
         self.runs == BlockRuns::Once
     }
 
+    /// The statements the block runs whose plans hold blocks of their own:
+    /// its own, an uncorrelated grouped one's, a derived table's
+    fn statement_runs(&self) -> impl Iterator<Item = &StatementRun> {
+        let own = match &self.answer {
+            Answer::Statement(_, block) => Some(&block.run),
+            _ => None,
+        };
+        let grouped = self.grouping.as_ref().and_then(|g| g.statement.as_deref());
+        let derived = match &self.source {
+            Some(BlockSource::Derived(run, _)) => Some(&**run),
+            _ => None,
+        };
+        [own, grouped, derived].into_iter().flatten()
+    }
+
     /// What the block tests, what it reads and how its nodes answer a call;
-    /// its statement's blocks are numbered from `before` + 1
-    fn explain(&self, before: usize) -> String {
+    /// its statement's blocks are labelled `label` and numbered from `first` + 1
+    fn explain(&self, label: &str, first: usize) -> String {
         let member = |test: &MemberTest| match test {
             MemberTest::In => "IN",
             MemberTest::Quantified(_, true) => "ALL",
@@ -4049,8 +4072,8 @@ impl PreparedSubquery {
         let runs = match (self.runs, self.parent) {
             (BlockRuns::Once, _) => return format!("{test} over {over}, once per run"),
             (BlockRuns::PerParentRow, Some(parent)) => {
-                let parent = before + usize::from(parent) + 1;
-                return format!("{test} over {over}, once per row of {parent}");
+                let parent = first + usize::from(parent) + 1;
+                return format!("{test} over {over}, once per row of {label}{parent}");
             }
             _ => "per call",
         };
@@ -5386,7 +5409,11 @@ impl Builder<'_> {
             grouping: None,
             order: None,
             parent,
-            runs: block_runs(uncorrelated, parent, &holes),
+            // Its run keeps no answer for its parent's row
+            runs: match uncorrelated {
+                true => BlockRuns::Once,
+                false => BlockRuns::PerCall,
+            },
             holes,
             hole_exprs,
             hole_written,
@@ -6311,7 +6338,12 @@ impl Builder<'_> {
             grouping,
             order,
             parent,
-            runs: block_runs(!correlated, parent, &holes),
+            // One reading none of its parent's row answers once per parent row
+            runs: match (correlated, parent) {
+                (false, _) => BlockRuns::Once,
+                (true, Some(_)) if holes.is_empty() => BlockRuns::PerParentRow,
+                (true, _) => BlockRuns::PerCall,
+            },
             holes,
             hole_exprs,
             hole_written,
@@ -6544,16 +6576,6 @@ fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<usize> {
             });
             found
         }
-    }
-}
-
-/// How often a block with the parent `parent` and the holes `holes` computes
-/// its answer: one reading none of its parent's row answers per parent row
-fn block_runs(uncorrelated: bool, parent: Option<u16>, holes: &[(usize, Hole)]) -> BlockRuns {
-    match (uncorrelated, parent) {
-        (true, _) => BlockRuns::Once,
-        (false, Some(_)) if holes.is_empty() => BlockRuns::PerParentRow,
-        (false, _) => BlockRuns::PerCall,
     }
 }
 
