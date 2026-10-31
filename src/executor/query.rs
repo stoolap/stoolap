@@ -463,6 +463,7 @@ use super::operators::index_nested_loop::{
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::planned_aggregate::{bounds, AggregateRead};
+use super::planned_join::{pick_index_join_side, JoinShape};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
@@ -497,6 +498,7 @@ use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
+use crate::planner::join::IndexProbe;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
 /// The layout an ORDER BY or DISTINCT ON projection produces
@@ -577,7 +579,7 @@ pub(crate) enum CteNames<'a> {
 }
 
 impl CteNames<'_> {
-    fn hides(self, name_lower: &str) -> bool {
+    pub(super) fn hides(self, name_lower: &str) -> bool {
         match self {
             CteNames::Context(ctx) => ctx.get_cte_by_lower(name_lower).is_some(),
             CteNames::Listed(names) => names.iter().any(|name| name == name_lower),
@@ -1179,53 +1181,6 @@ pub(crate) fn true_for_no_row(
     })
 }
 
-/// The side an index join probes, given what the right table offers
-/// (`unswapped`): an INNER join probes its left table instead from a right
-/// side that is not a base table (a subquery, a CTE, a view), or for a
-/// primary key when only the right side is filtered. Some((probe, true))
-/// when the sides swap
-pub(crate) fn pick_index_join_side<T>(
-    join_type: &str,
-    right_is_table: bool,
-    right_filtered: bool,
-    left_filtered: bool,
-    unswapped: Option<T>,
-    probe_left: impl FnOnce() -> Option<T>,
-    is_primary_key: impl Fn(&T) -> bool,
-) -> Option<(T, bool)> {
-    // Only an INNER join reads the same with its sides exchanged; a LEFT
-    // join would go on preserving the side it was given
-    if join_type != "INNER" {
-        return unswapped.map(|probe| (probe, false));
-    }
-    if unswapped.is_none() && !right_is_table {
-        return probe_left().map(|probe| (probe, true));
-    }
-    if right_filtered && !left_filtered {
-        if let Some(probe) = probe_left().filter(&is_primary_key) {
-            return Some((probe, true));
-        }
-    }
-    unswapped.map(|probe| (probe, false))
-}
-
-/// The table an index join can probe on a side that names one: never a table
-/// read AS OF, whose past rows no index holds
-pub(crate) fn index_join_table_name(side: &Expression) -> Option<String> {
-    let table = match side {
-        Expression::TableSource(ts) => ts,
-        Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-            Expression::TableSource(ts) => ts,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    table
-        .as_of
-        .is_none()
-        .then(|| table.name.value_lower.to_string())
-}
-
 /// Partition WHERE clause predicates for JOIN filter pushdown.
 /// Returns (left_filter, right_filter, cross_table_filter).
 /// - left_filter: predicates referencing only left table
@@ -1331,12 +1286,12 @@ struct ReductionPass {
 
 /// The most rows an outer side may hold for a join without a LIMIT to
 /// narrow its inner side by the inner table's candidates
-const SMALL_OUTER_ROWS: usize = 1024;
+pub(super) const SMALL_OUTER_ROWS: usize = 1024;
 
 /// Inner rows a table without sealed rows must hold per row of the largest
 /// small outer before a small outer narrows it: a key read costs about what
 /// its scan pays for 17 rows, 45 under a pushed filter
-const HOT_INNER_ROWS_PER_KEY: usize = 64;
+pub(super) const HOT_INNER_ROWS_PER_KEY: usize = 64;
 
 /// A small outer side the join ran and handed on to the standard join
 struct PreparedSide {
@@ -6154,28 +6109,36 @@ impl Executor {
             .filter(|_| !classification.where_has_subqueries)
             .is_some_and(|w| true_for_no_row(w, ctx, &self.function_registry));
 
-        // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
-        // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
-        // Optimization: limit left side first, filter right side with IN clause (uses index)
-        // This reduces materialization from O(L + R) to O(N + N*avg_matches)
-        let left_table = match join_source.left.as_ref() {
-            Expression::TableSource(ts) => Some(ts.name.value.as_str()),
-            _ => None,
-        };
         // Outside the blocks a correlated WHERE runs per row on the general path
         let per_row_where = correlated_where && statement_run.is_none();
-        let semijoin_limit = if per_row_where {
-            None
-        } else {
-            self.get_semijoin_reduction_limit(
-                &join_type,
-                (stmt, Some(ctx)),
-                left_alias.as_deref(),
-                left_table,
-                &join_source.condition,
-                classification,
-            )
+        let shape = JoinShape {
+            stmt,
+            classification,
+            join: join_source,
+            condition: on_condition,
+            join_type: &join_type,
+            aliases: [left_alias.as_deref(), right_alias.as_deref()],
+            filters: [left_filter.as_ref(), right_filter.as_ref()],
+            cross_filter: cross_filter.as_ref(),
+            rows_sides,
+            per_row_where,
+            blocks: statement_run.is_some(),
+            ctes: CteNames::Context(ctx),
         };
+        let planned;
+        let join_plan = match prepared {
+            Some(prepared) => prepared.join_plan(|| self.plan_join(&shape))?,
+            None => {
+                planned = self.plan_join(&shape)?;
+                &planned
+            }
+        };
+        // A GROUP BY + LIMIT reads the left side in a chunk, then the right
+        // side narrowed by its keys
+        let semijoin_limit = join_plan
+            .reduction
+            .as_ref()
+            .and_then(|keys| Self::semijoin_reduction(stmt, &join_type, keys, Some(ctx)));
 
         let (left_rows, left_columns, right_rows, right_columns) = if never {
             // Not every side honours the filter or the limit, so its rows are
@@ -6207,20 +6170,24 @@ impl Executor {
                 right_cols,
             )
         } else if let Some(plan) = semijoin_limit {
-            if let Some(result) = self.try_grouped_index_join(
-                stmt,
-                ctx,
-                join_source,
-                &join_type,
-                left_alias.as_deref(),
-                right_alias.as_deref(),
-                left_read,
-                right_filter.as_ref(),
-                cross_filter.as_ref(),
-                prepared,
-                &plan,
-            )? {
-                return Ok(result);
+            let grouped_probe = join_plan.probes[0]
+                .as_ref()
+                .filter(|_| join_plan.grouped_index);
+            if let Some(probe) = grouped_probe {
+                if let Some(result) = self.try_grouped_index_join(
+                    stmt,
+                    ctx,
+                    join_source,
+                    &join_type,
+                    right_alias.as_deref(),
+                    left_read,
+                    right_filter.as_ref(),
+                    cross_filter.as_ref(),
+                    prepared,
+                    (&plan, probe),
+                )? {
+                    return Ok(result);
+                }
             }
             // Semi-join reduction for INNER/LEFT JOIN + GROUP BY: fetch the left
             // side with the limit, then the right side through an IN filter on
@@ -6278,49 +6245,23 @@ impl Executor {
             // An INNER join without a limit narrows its inner side by a table's
             // candidates only for an outer side found small once it runs
             let small_outer = pushed_limit.is_none() && join_type == "INNER";
-            let picked = if per_row_where {
-                None
-            } else {
-                let ctes = CteNames::Context(ctx);
+            let picked = {
                 let left_is_table = left_schema.is_some();
                 let right_is_table = right_schema.is_some();
-                // A side the blocks read as rows is read as rows, never by index
-                let rows_side =
-                    |side: usize| statement_run.is_some_and(|run| run.blocks.rows_sides[side]);
-                let unswapped = match rows_side(1) {
-                    true => None,
-                    false => self.check_index_nested_loop_opportunity(
-                        ctes,
-                        &join_source.right,
-                        on_condition,
-                        &join_type,
-                        left_alias.as_deref(),
-                        right_alias.as_deref(),
-                        pushed_limit.is_some(),
-                        small_outer,
-                        !left_is_table,
-                    ),
+                // The probe a side offers, when this run takes it
+                let probe = |side: usize, outer_materialized: bool| {
+                    join_plan.probes[side].as_ref().and_then(|probe| {
+                        let bounded = pushed_limit.is_some();
+                        self.probe_strategy(probe, bounded, small_outer, outer_materialized)
+                    })
                 };
                 pick_index_join_side(
                     &join_type,
                     right_is_table,
                     right_filter.is_some(),
                     left_filter.is_some(),
-                    unswapped,
-                    || match rows_side(0) {
-                        true => None,
-                        false => self.check_index_nested_loop_opportunity(
-                            ctes,
-                            &join_source.left,
-                            on_condition,
-                            &join_type,
-                            right_alias.as_deref(),
-                            left_alias.as_deref(),
-                            pushed_limit.is_some(),
-                            small_outer,
-                            !right_is_table,
-                        ),
-                    },
+                    probe(0, !left_is_table),
+                    || probe(1, !right_is_table),
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };
@@ -6524,6 +6465,24 @@ impl Executor {
                     prepared_ctx = Some(ctx_join);
                     break 'index_nl;
                 }
+                // The inner table opens before the outer side is read, so one
+                // whose index is no longer the planned one joins by hash with
+                // nothing read twice
+                #[cfg(feature = "test-failpoints")]
+                if statement_run.is_some() {
+                    crate::test_failpoints::join_side_opening();
+                }
+                let Some(inner_table) = self.index_join_inner(
+                    &snapshot,
+                    ctx,
+                    &table_name,
+                    &lookup_strategy,
+                    &inner_col,
+                    None,
+                )?
+                else {
+                    break 'index_nl;
+                };
                 // An explicit transaction reads through its own transaction, whose
                 // isolation may let a commit move rows between two fetches, so
                 // the outer side is fetched whole there
@@ -6569,22 +6528,6 @@ impl Executor {
                     });
 
                 if let Some(outer_idx) = outer_key_idx {
-                    // Get inner table for schema and row fetching
-                    #[cfg(feature = "test-failpoints")]
-                    if statement_run.is_some() {
-                        crate::test_failpoints::join_side_opening();
-                    }
-                    let Some(inner_table) = self.index_join_inner(
-                        &snapshot,
-                        ctx,
-                        &table_name,
-                        &lookup_strategy,
-                        &inner_col,
-                        None,
-                    )?
-                    else {
-                        break 'index_nl;
-                    };
                     let inner_token = inner_table.layout_token();
                     let inner_schema = inner_table.schema();
                     if let Some(run) = statement_run {
@@ -7256,280 +7199,239 @@ impl Executor {
             // - No DISTINCT, which reads every joined row before the LIMIT
             // - No cross-table predicates (applied after join)
 
-            let streaming_limit = if !join_type.contains("FULL")
-                && !join_type.contains("LEFT")
-                && !join_type.contains("RIGHT")
-                && !classification.has_order_by
-                && !classification.has_group_by
-                && !classification.has_aggregation
-                && !classification.has_window_functions
-                && !stmt.distinct
-                && stmt.distinct_on.is_empty()
-                && cross_filter.is_none()
-            {
-                // OFFSET rows are skipped after collection, so the
-                // early-termination budget is LIMIT + OFFSET, for a LIMIT of
-                // at most 100
-                row_counts(stmt, ctx).ok().and_then(|counts| {
-                    let limit = counts.limit.filter(|limit| *limit <= 100)?;
-                    Some(limit.saturating_add(counts.offset) as u64)
-                })
-            } else {
-                None
-            };
-
-            // Check if we have equality keys for hash join using AST analysis
-            let has_equality_keys_for_streaming = join_source
-                .condition
-                .as_ref()
-                .map(|cond| Self::has_equality_condition(cond))
-                .unwrap_or(false);
+            // OFFSET rows are skipped after collection, so the early-termination
+            // budget is LIMIT + OFFSET, for a LIMIT of at most 100
+            let streaming = join_plan.limit_hash.and_then(|build_left| {
+                let counts = row_counts(stmt, ctx).ok()?;
+                let limit = counts.limit.filter(|limit| *limit <= 100)?;
+                Some((limit.saturating_add(counts.offset) as u64, build_left))
+            });
 
             // Use streaming path if eligible; sides it ran but could not join
             // by hash go on to the standard path
             let streamed = 'streaming: {
-                let Some(limit) = streaming_limit else {
+                let Some((limit, build_left)) = streaming else {
                     break 'streaming None;
                 };
-                if has_equality_keys_for_streaming {
-                    // Estimate cardinalities to choose optimal build side (smaller = build)
-                    let left_card = self
-                        .estimate_table_expr_cardinality(&join_source.left, left_filter.as_ref());
-                    let right_card = self
-                        .estimate_table_expr_cardinality(&join_source.right, right_filter.as_ref());
-                    let build_left = left_card < right_card;
+                // Execute both sides
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::join_side_ran();
+                let (left_result, left_cols, _, _) =
+                    self.read_join_side(&join_source.left, ctx, left_read, None, None, 0)?;
 
-                    // Execute both sides
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::join_side_ran();
-                    let (left_result, left_cols, _, _) =
-                        self.read_join_side(&join_source.left, ctx, left_read, None, None, 0)?;
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::join_side_ran();
+                let (right_result, right_cols, _, _) =
+                    self.read_join_side(&join_source.right, ctx, right_read, None, None, 0)?;
 
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::join_side_ran();
-                    let (right_result, right_cols, _, _) =
-                        self.read_join_side(&join_source.right, ctx, right_read, None, None, 0)?;
+                // Extract join keys BEFORE moving columns (uses original left/right positions)
+                let (left_key_indices, right_key_indices, _) = if let Some(cond) = on_condition {
+                    extract_join_keys_and_residual(cond, &left_cols, &right_cols)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
 
-                    // Extract join keys BEFORE moving columns (uses original left/right positions)
-                    let (left_key_indices, right_key_indices, _) = if let Some(cond) = on_condition
-                    {
-                        extract_join_keys_and_residual(cond, &left_cols, &right_cols)
+                // Build combined columns (always left-first for consistent output schema)
+                let mut all_cols = left_cols.clone();
+                all_cols.extend(right_cols.iter().cloned());
+
+                // Materialize the smaller side as build, stream the larger as probe
+                let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
+                    if build_left {
+                        let build = Self::materialize_result_arc(left_result)?;
+                        (build, left_cols, right_result, right_cols, true)
                     } else {
-                        (Vec::new(), Vec::new(), Vec::new())
+                        let build = Self::materialize_result_arc(right_result)?;
+                        (build, right_cols, left_result, left_cols, false)
                     };
 
-                    // Build combined columns (always left-first for consistent output schema)
-                    let mut all_cols = left_cols.clone();
-                    all_cols.extend(right_cols.iter().cloned());
+                // Map key indices based on which side is build
+                let (build_key_indices, probe_key_indices) = if build_is_left {
+                    (left_key_indices, right_key_indices)
+                } else {
+                    (right_key_indices, left_key_indices)
+                };
 
-                    // Materialize the smaller side as build, stream the larger as probe
-                    let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
-                        if build_left {
-                            let build = Self::materialize_result_arc(left_result)?;
-                            (build, left_cols, right_result, right_cols, true)
-                        } else {
-                            let build = Self::materialize_result_arc(right_result)?;
-                            (build, right_cols, left_result, left_cols, false)
-                        };
+                // A key pair where a number may meet a TEXT is no hash key.
+                // A base table side's schema says what it holds, else the
+                // build rows do. One key over a build column of one family
+                // has a probe key of the other answered as it streams; any
+                // other such pair has the probe read whole and joined by
+                // the standard path
+                let (build_expr, probe_expr) = if build_is_left {
+                    (&join_source.left, &join_source.right)
+                } else {
+                    (&join_source.right, &join_source.left)
+                };
+                let build_schema = self.base_table_side_schema(build_expr, CteNames::Context(ctx));
+                let probe_schema = self.base_table_side_schema(probe_expr, CteNames::Context(ctx));
 
-                    // Map key indices based on which side is build
-                    let (build_key_indices, probe_key_indices) = if build_is_left {
-                        (left_key_indices, right_key_indices)
-                    } else {
-                        (right_key_indices, left_key_indices)
-                    };
-
-                    // A key pair where a number may meet a TEXT is no hash key.
-                    // A base table side's schema says what it holds, else the
-                    // build rows do. One key over a build column of one family
-                    // has a probe key of the other answered as it streams; any
-                    // other such pair has the probe read whole and joined by
-                    // the standard path
-                    let (build_expr, probe_expr) = if build_is_left {
-                        (&join_source.left, &join_source.right)
-                    } else {
-                        (&join_source.right, &join_source.left)
-                    };
-                    let build_schema =
-                        self.base_table_side_schema(build_expr, CteNames::Context(ctx));
-                    let probe_schema =
-                        self.base_table_side_schema(probe_expr, CteNames::Context(ctx));
-
-                    // Skip bloom filter for small LIMIT queries - the overhead of building
-                    // a bloom filter for thousands of rows isn't worth it when we only
-                    // need a few results. With streaming + early termination, we don't
-                    // probe many rows anyway.
-                    let skip_bloom_for_small_limit = limit <= 500;
-                    let wants_bloom = build_rows.len() >= 100
-                        && !build_key_indices.is_empty()
-                        && !skip_bloom_for_small_limit;
-                    let new_bloom = || {
-                        BloomFilterBuilder::new(
-                            "join_key".to_string(),
-                            "build".to_string(),
-                            build_rows.len(),
-                        )
-                    };
-                    // One key no schema types: the pass that builds its hash table
-                    // tells what the build column holds
-                    let typed = |idx: usize| {
-                        let name = bare_name(&build_cols[idx]);
-                        build_schema
-                            .as_ref()
-                            .and_then(|s| s.get_column_type(name))
-                            .is_some()
-                    };
-                    let one_key_built = match build_key_indices.as_slice() {
-                        &[build_idx] if !typed(build_idx) => {
-                            let mut builder = wants_bloom.then(new_bloom);
-                            let (table, kinds) = JoinHashTable::build_one_key(
-                                &build_rows,
-                                build_idx,
-                                builder.as_mut(),
-                            );
-                            Some((table, builder, kinds))
-                        }
-                        _ => None,
-                    };
-                    let mut cross_key = None;
-                    let mut unverified = false;
-                    for (&build_idx, &probe_idx) in build_key_indices.iter().zip(&probe_key_indices)
-                    {
-                        let build = match &one_key_built {
-                            Some((_, _, kinds)) => *kinds,
-                            None => column_kinds(
-                                &build_rows,
-                                &build_cols,
-                                build_schema.as_deref(),
-                                build_idx,
-                            ),
-                        };
-                        if build & (kind::TEXT | kind::READ_FROM_TEXT) == 0 {
-                            continue;
-                        }
-                        let probe_column = &probe_cols[probe_idx];
-                        let name = bare_name(probe_column);
-                        let crosses = probe_schema
-                            .as_ref()
-                            .and_then(|s| s.get_column_type(name))
-                            .is_none_or(|probe| kind::crosses(build, kind::of_type(probe)));
-                        match KeySide::of_kinds(build) {
-                            Some(side) if crosses && build_key_indices.len() == 1 => {
-                                cross_key = Some(side);
-                            }
-                            _ if crosses => unverified = true,
-                            _ => {}
-                        }
+                // Skip bloom filter for small LIMIT queries - the overhead of building
+                // a bloom filter for thousands of rows isn't worth it when we only
+                // need a few results. With streaming + early termination, we don't
+                // probe many rows anyway.
+                let skip_bloom_for_small_limit = limit <= 500;
+                let wants_bloom = build_rows.len() >= 100
+                    && !build_key_indices.is_empty()
+                    && !skip_bloom_for_small_limit;
+                let new_bloom = || {
+                    BloomFilterBuilder::new(
+                        "join_key".to_string(),
+                        "build".to_string(),
+                        build_rows.len(),
+                    )
+                };
+                // One key no schema types: the pass that builds its hash table
+                // tells what the build column holds
+                let typed = |idx: usize| {
+                    let name = bare_name(&build_cols[idx]);
+                    build_schema
+                        .as_ref()
+                        .and_then(|s| s.get_column_type(name))
+                        .is_some()
+                };
+                let one_key_built = match build_key_indices.as_slice() {
+                    &[build_idx] if !typed(build_idx) => {
+                        let mut builder = wants_bloom.then(new_bloom);
+                        let (table, kinds) =
+                            JoinHashTable::build_one_key(&build_rows, build_idx, builder.as_mut());
+                        Some((table, builder, kinds))
                     }
-                    if unverified {
-                        let probe_rows = Self::materialize_result_arc(probe_result)?;
-                        break 'streaming Some(if build_is_left {
-                            (build_rows, build_cols, probe_rows, probe_cols)
-                        } else {
-                            (probe_rows, probe_cols, build_rows, build_cols)
-                        });
-                    }
-
-                    // Convert probe side to streaming operator
-                    let probe_source: Box<dyn Operator> =
-                        Box::new(QueryResultOperator::new(probe_result, probe_cols.len()));
-
-                    // Build hash table and bloom filter together in a single pass
-                    // This avoids iterating build_rows twice (once for bloom, once for hash table)
-                    // A probe key the comparison reads as another type would miss
-                    // a bloom filter of the build keys as they are
-                    let (bloom_filter, pre_built_hash_table) =
-                        if let Some((table, builder, _)) = one_key_built {
-                            let bloom = builder
-                                .filter(|_| cross_key.is_none())
-                                .map(BloomFilterBuilder::build)
-                                .filter(|bf| bf.is_effective());
-                            (bloom, Some(table))
-                        } else if wants_bloom && cross_key.is_none() {
-                            let mut builder = new_bloom();
-                            // Single-pass: build hash table and populate bloom filter
-                            let hash_table = JoinHashTable::build_with_bloom(
-                                &build_rows,
-                                &build_key_indices,
-                                &mut builder,
-                            );
-                            let bf = builder.build();
-                            let bloom = if bf.is_effective() { Some(bf) } else { None };
-                            (bloom, Some(hash_table))
-                        } else if !build_key_indices.is_empty() {
-                            // No bloom filter, but still pre-build hash table
-                            let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
-                            (None, Some(hash_table))
-                        } else {
-                            (None, None)
-                        };
-
-                    // Wrap probe with bloom filter if available
-                    let probe_source: Box<dyn Operator> = match bloom_filter {
-                        Some(bf) if !probe_key_indices.is_empty() => Box::new(
-                            BloomFilterOperator::new(probe_source, bf, probe_key_indices),
+                    _ => None,
+                };
+                let mut cross_key = None;
+                let mut unverified = false;
+                for (&build_idx, &probe_idx) in build_key_indices.iter().zip(&probe_key_indices) {
+                    let build = match &one_key_built {
+                        Some((_, _, kinds)) => *kinds,
+                        None => column_kinds(
+                            &build_rows,
+                            &build_cols,
+                            build_schema.as_deref(),
+                            build_idx,
                         ),
-                        _ => probe_source,
                     };
-
-                    // Execute streaming hash join
-                    let join_executor = JoinExecutor::new();
-                    let streaming_request = StreamingJoinRequest {
-                        build_rows,
-                        build_columns: &build_cols,
-                        probe_source,
-                        probe_columns: probe_cols.clone(),
-                        condition: on_condition,
-                        join_type: &join_type,
-                        build_is_left,
-                        limit: Some(limit),
-                        ctx,
-                        pre_built_hash_table,
-                        cross_key,
-                        prepared,
-                        blocks: statement_run,
-                    };
-
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::streaming_join_streamed();
-                    let join_result = join_executor.execute_streaming(streaming_request)?;
-                    let merging = blocks.as_deref().filter(|_| side_merged && !apart);
-                    let (all_cols, joined_rows) =
-                        merged_side_rows(stmt, merging, all_cols, join_result.rows);
-                    let held = self.held_join_output(
-                        prepared,
-                        stmt,
-                        &all_cols,
-                        false,
-                        blocks.as_deref(),
-                        ctx,
-                    )?;
-                    if let Some(output) = held.as_deref().and_then(Option::as_ref) {
-                        return output_result(output, joined_rows, false);
+                    if build & (kind::TEXT | kind::READ_FROM_TEXT) == 0 {
+                        continue;
                     }
-
-                    // Project and return results
-                    let projected_rows = self.project_rows_with_alias(
-                        &stmt.columns,
-                        joined_rows,
-                        &all_cols,
-                        None,
-                        ctx,
-                        None,
-                    )?;
-                    let output_columns = CompactArc::new(self.get_output_column_names(
-                        &stmt.columns,
-                        &all_cols,
-                        None,
-                    ));
-
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&output_columns),
-                        projected_rows,
-                    );
-                    return Ok((Box::new(result), output_columns, false, None));
+                    let probe_column = &probe_cols[probe_idx];
+                    let name = bare_name(probe_column);
+                    let crosses = probe_schema
+                        .as_ref()
+                        .and_then(|s| s.get_column_type(name))
+                        .is_none_or(|probe| kind::crosses(build, kind::of_type(probe)));
+                    match KeySide::of_kinds(build) {
+                        Some(side) if crosses && build_key_indices.len() == 1 => {
+                            cross_key = Some(side);
+                        }
+                        _ if crosses => unverified = true,
+                        _ => {}
+                    }
                 }
-                None
+                if unverified {
+                    let probe_rows = Self::materialize_result_arc(probe_result)?;
+                    break 'streaming Some(if build_is_left {
+                        (build_rows, build_cols, probe_rows, probe_cols)
+                    } else {
+                        (probe_rows, probe_cols, build_rows, build_cols)
+                    });
+                }
+
+                // Convert probe side to streaming operator
+                let probe_source: Box<dyn Operator> =
+                    Box::new(QueryResultOperator::new(probe_result, probe_cols.len()));
+
+                // Build hash table and bloom filter together in a single pass
+                // This avoids iterating build_rows twice (once for bloom, once for hash table)
+                // A probe key the comparison reads as another type would miss
+                // a bloom filter of the build keys as they are
+                let (bloom_filter, pre_built_hash_table) =
+                    if let Some((table, builder, _)) = one_key_built {
+                        let bloom = builder
+                            .filter(|_| cross_key.is_none())
+                            .map(BloomFilterBuilder::build)
+                            .filter(|bf| bf.is_effective());
+                        (bloom, Some(table))
+                    } else if wants_bloom && cross_key.is_none() {
+                        let mut builder = new_bloom();
+                        // Single-pass: build hash table and populate bloom filter
+                        let hash_table = JoinHashTable::build_with_bloom(
+                            &build_rows,
+                            &build_key_indices,
+                            &mut builder,
+                        );
+                        let bf = builder.build();
+                        let bloom = if bf.is_effective() { Some(bf) } else { None };
+                        (bloom, Some(hash_table))
+                    } else if !build_key_indices.is_empty() {
+                        // No bloom filter, but still pre-build hash table
+                        let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
+                        (None, Some(hash_table))
+                    } else {
+                        (None, None)
+                    };
+
+                // Wrap probe with bloom filter if available
+                let probe_source: Box<dyn Operator> = match bloom_filter {
+                    Some(bf) if !probe_key_indices.is_empty() => Box::new(
+                        BloomFilterOperator::new(probe_source, bf, probe_key_indices),
+                    ),
+                    _ => probe_source,
+                };
+
+                // Execute streaming hash join
+                let join_executor = JoinExecutor::new();
+                let streaming_request = StreamingJoinRequest {
+                    build_rows,
+                    build_columns: &build_cols,
+                    probe_source,
+                    probe_columns: probe_cols.clone(),
+                    condition: on_condition,
+                    join_type: &join_type,
+                    build_is_left,
+                    limit: Some(limit),
+                    ctx,
+                    pre_built_hash_table,
+                    cross_key,
+                    prepared,
+                    blocks: statement_run,
+                };
+
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::streaming_join_streamed();
+                let join_result = join_executor.execute_streaming(streaming_request)?;
+                let merging = blocks.as_deref().filter(|_| side_merged && !apart);
+                let (all_cols, joined_rows) =
+                    merged_side_rows(stmt, merging, all_cols, join_result.rows);
+                let held = self.held_join_output(
+                    prepared,
+                    stmt,
+                    &all_cols,
+                    false,
+                    blocks.as_deref(),
+                    ctx,
+                )?;
+                if let Some(output) = held.as_deref().and_then(Option::as_ref) {
+                    return output_result(output, joined_rows, false);
+                }
+
+                // Project and return results
+                let projected_rows = self.project_rows_with_alias(
+                    &stmt.columns,
+                    joined_rows,
+                    &all_cols,
+                    None,
+                    ctx,
+                    None,
+                )?;
+                let output_columns =
+                    CompactArc::new(self.get_output_column_names(&stmt.columns, &all_cols, None));
+
+                let result = ExecutorResult::with_arc_columns(
+                    CompactArc::clone(&output_columns),
+                    projected_rows,
+                );
+                return Ok((Box::new(result), output_columns, false, None));
             };
 
             // =================================================================
@@ -9804,7 +9706,7 @@ impl Executor {
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
     /// stream compiles its filters raw, where a subquery has no executor
-    fn filter_has_subquery(expr: &Expression) -> bool {
+    pub(super) fn filter_has_subquery(expr: &Expression) -> bool {
         use crate::parser::ast::Expression as E;
         let any = |exprs: &[Expression]| exprs.iter().any(Self::filter_has_subquery);
         match expr {
@@ -9893,20 +9795,15 @@ impl Executor {
         ctx: &ExecutionContext,
         join_source: &JoinTableSource,
         join_type: &str,
-        left_alias: Option<&str>,
         right_alias: Option<&str>,
         left: SideRead<'_>,
         right_filter: Option<&Expression>,
         cross_filter: Option<&Expression>,
         prepared: Option<&PreparedJoin>,
-        plan: &SemijoinReduction,
+        (plan, probe): (&SemijoinReduction, &IndexProbe),
     ) -> Result<Option<SelectOutput>> {
         // The statement's blocks run the filters' subqueries, on each site
         let run = left.run.map(|(run, _)| run);
-        // A right side the blocks read as rows is never probed by index
-        if run.is_some_and(|run| run.blocks.rows_sides[1]) {
-            return Ok(None);
-        }
         let filters_have_subquery = run.is_none()
             && [left.filter, right_filter, cross_filter]
                 .into_iter()
@@ -9923,18 +9820,8 @@ impl Executor {
         else {
             return Ok(None);
         };
-        let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
-            .check_index_nested_loop_opportunity(
-                CteNames::Context(ctx),
-                &join_source.right,
-                join_source.condition.as_deref(),
-                join_type,
-                left_alias,
-                right_alias,
-                true,
-                false,
-                false,
-            )
+        let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) =
+            self.probe_strategy(probe, true, false, false)
         else {
             return Ok(None);
         };
@@ -9946,19 +9833,39 @@ impl Executor {
             None => self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?,
         };
         let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
-        let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
-        let mut outer_limit = if in_explicit_transaction {
-            None
-        } else {
-            Some(plan.cap)
+        // Opened before the outer side is read, so an index no longer the
+        // planned one leaves the reduction nothing read twice
+        let Some(inner_table) = self.index_join_inner(
+            &snapshot,
+            ctx,
+            &table_name,
+            &lookup_strategy,
+            &inner_key_col,
+            None,
+        )?
+        else {
+            return Ok(None);
         };
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::join_side_ran();
-        let (outer_result, outer_cols, outer_bounded, outer_token) =
-            self.read_join_side(&join_source.left, &ctx_join, left, None, outer_limit, 0)?;
-        if !outer_bounded {
-            outer_limit = None;
-        }
+        // The outer side is the left table, read whole row: its columns are
+        // named from its schema, so every column below is found before it is
+        // read, and a read under another schema is a schema change
+        let (Expression::TableSource(left_ts), Some(left_schema)) = (
+            join_source.left.as_ref(),
+            self.base_table_side_schema(&join_source.left, CteNames::Context(ctx)),
+        ) else {
+            return Ok(None);
+        };
+        let left_alias = left_ts
+            .alias
+            .as_ref()
+            .unwrap_or(&left_ts.name)
+            .value
+            .as_str();
+        let outer_cols: Vec<String> = left_schema
+            .columns
+            .iter()
+            .map(|col| qualified(left_alias, &col.name))
+            .collect();
         let unqualified = |name: &str| bare_name(name).to_string();
         let outer_key_lower = outer_key_col.to_lowercase();
         let outer_key_unqualified = unqualified(&outer_key_lower);
@@ -9970,17 +9877,6 @@ impl Executor {
                     .iter()
                     .position(|c| unqualified(&c.to_lowercase()) == outer_key_unqualified)
             })
-        else {
-            return Ok(None);
-        };
-        let Some(inner_table) = self.index_join_inner(
-            &snapshot,
-            ctx,
-            &table_name,
-            &lookup_strategy,
-            &inner_key_col,
-            None,
-        )?
         else {
             return Ok(None);
         };
@@ -10000,11 +9896,9 @@ impl Executor {
         let inner_key_idx = inner_cols
             .iter()
             .position(|c| bare_name(c).eq_ignore_ascii_case(&inner_key_col));
-        let all_columns: Vec<String> = outer_cols
-            .iter()
-            .chain(inner_cols.iter())
-            .cloned()
-            .collect();
+        let outer_len = outer_cols.len();
+        let mut all_columns = outer_cols;
+        all_columns.extend(inner_cols.iter().cloned());
 
         // Where each group column and aggregate argument lives in the joined row
         let mut group_idx = Vec::with_capacity(group_names.len());
@@ -10024,6 +9918,24 @@ impl Executor {
                     None => return Ok(None),
                 }
             }
+        }
+        let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
+        let mut outer_limit = if in_explicit_transaction {
+            None
+        } else {
+            Some(plan.cap)
+        };
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::join_side_ran();
+        let (outer_result, outer_cols, outer_bounded, outer_token) =
+            self.read_join_side(&join_source.left, &ctx_join, left, None, outer_limit, 0)?;
+        if outer_cols[..] != all_columns[..outer_len] {
+            return Err(Error::SchemaChanged {
+                table: left_ts.name.value.to_string(),
+            });
+        }
+        if !outer_bounded {
+            outer_limit = None;
         }
         // Without a cross filter the operator builds only the columns the
         // groups and aggregates read
@@ -13764,173 +13676,28 @@ impl Executor {
         Some((cap.min(i64::MAX as usize), want, offset, limit))
     }
 
-    /// Check if semi-join reduction optimization can be applied and return its plan
-    ///
-    /// Conditions for semi-join reduction:
-    /// 1. INNER JOIN or LEFT JOIN (not RIGHT or FULL)
-    /// 2. GROUP BY references only left table columns
-    /// 3. LIMIT is present with no ORDER BY (for correctness)
-    /// 4. Single equality join condition (a.col = b.col)
-    ///
-    /// The first left chunk is the limit, doubled for an INNER JOIN since some
-    /// left rows may not have matches and doubled again under HAVING; the join
+    /// The reduction a run of a plan with reduction `keys` takes: the first
+    /// left chunk is the limit, doubled for an INNER JOIN since some left
+    /// rows may not have matches and doubled again under HAVING; the join
     /// reruns with twice the chunk when the result stops short. `ctx` gives
-    /// the statement's parameters when it runs; EXPLAIN gives none.
-    fn get_semijoin_reduction_limit(
-        &self,
+    /// the statement's parameters when it runs; EXPLAIN gives none
+    fn semijoin_reduction(
+        stmt: &SelectStatement,
         join_type: &str,
-        (stmt, ctx): (&SelectStatement, Option<&ExecutionContext>),
-        left_alias: Option<&str>,
-        left_table: Option<&str>,
-        join_condition: &Option<Box<Expression>>,
-        classification: &QueryClassification,
+        (left_key_col, right_key_col): &(String, String),
+        ctx: Option<&ExecutionContext>,
     ) -> Option<SemijoinReduction> {
-        // Applies to INNER JOIN and LEFT JOIN (not RIGHT or FULL)
-        let is_inner = join_type == "INNER";
-        let is_left = join_type.contains("LEFT") && !join_type.contains("FULL");
-        if !is_inner && !is_left {
-            return None;
-        }
-
-        // Must have a plain GROUP BY: ROLLUP, CUBE and GROUPING SETS add
-        // groups of many left rows, which a cut left side would count short
-        if stmt.group_by.columns.is_empty()
-            || stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None
-        {
-            return None;
-        }
-
-        // Must have LIMIT with no ORDER BY (for correctness)
-        // Order of grouped results without ORDER BY is undefined, so early termination is safe
-        if stmt.limit.is_none() || !stmt.order_by.is_empty() {
-            return None;
-        }
-
-        // A window function or DISTINCT runs on the grouped rows afterwards and
-        // needs every group, not a chunk that already meets the limit
-        if classification.has_window_functions || stmt.distinct || !stmt.distinct_on.is_empty() {
-            return None;
-        }
-        let (cap, want, offset, limit) = Self::semijoin_caps(stmt, is_inner, ctx)?;
-        // Each group must come from one left row, or a partial chunk would
-        // give partial aggregates: GROUP BY has to cover the left primary key
-        let left_alias = left_alias?;
-        let left_schema = self.engine.get_table_schema(left_table?).ok()?;
-        let pk_columns = left_schema.primary_key_columns();
-        let pk_covered = !pk_columns.is_empty()
-            && pk_columns.iter().all(|pk| {
-                stmt.group_by.columns.iter().any(|col| match col {
-                    Expression::QualifiedIdentifier(qid) => {
-                        qid.qualifier.value.eq_ignore_ascii_case(left_alias)
-                            && qid.name.value.eq_ignore_ascii_case(&pk.name)
-                    }
-                    Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&pk.name),
-                    _ => false,
-                })
-            });
-        if !pk_covered {
-            return None;
-        }
-        // Check that GROUP BY references only left table columns
-        for col in &stmt.group_by.columns {
-            if !self.column_references_table(col, left_alias) {
-                return None;
-            }
-        }
-
-        // Extract join key columns from simple equality condition: left.col = right.col
-        let condition = join_condition.as_ref()?;
-        let (left_key_col, right_key_col) = self.extract_simple_join_key(condition)?;
-
-        // Verify left key references the left table
-        let left_key_lower = left_key_col.to_lowercase();
-        let left_alias_lower = left_alias.to_lowercase();
-        let qualified_by_left =
-            |key: &str| split_qualified(key).is_some_and(|(q, _)| q == left_alias_lower);
-        let left_matches = qualified_by_left(&left_key_lower);
-        if !left_matches {
-            // Maybe it's right.col = left.col (swapped)
-            let right_key_lower = right_key_col.to_lowercase();
-            let right_matches = qualified_by_left(&right_key_lower);
-            if !right_matches {
-                return None;
-            }
-            // Swap the keys
-            return Some(SemijoinReduction {
-                cap,
-                want,
-                offset,
-                limit,
-                left_key_col: right_key_col,
-                right_key_col: left_key_col,
-            });
-        }
-
+        let (cap, want, offset, limit) = Self::semijoin_caps(stmt, join_type == "INNER", ctx)?;
         Some(SemijoinReduction {
             cap,
             want,
             offset,
             limit,
-            left_key_col,
-            right_key_col,
+            left_key_col: left_key_col.clone(),
+            right_key_col: right_key_col.clone(),
         })
     }
 
-    /// Check if a column expression references a specific table
-    fn column_references_table(&self, expr: &Expression, table_alias: &str) -> bool {
-        match expr {
-            Expression::QualifiedIdentifier(qid) => {
-                qid.qualifier.value.eq_ignore_ascii_case(table_alias)
-            }
-            Expression::Identifier(_) => {
-                // Unqualified column - could be from any table, assume it's from the expected table
-                // This is a conservative assumption
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Extract join key column names from a simple equality condition
-    /// Returns Some((left_col_qualified, right_col_qualified)) for patterns like a.id = b.user_id
-    fn extract_simple_join_key(&self, condition: &Expression) -> Option<(String, String)> {
-        match condition {
-            Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
-                let left_col = self.extract_qualified_column_name(&infix.left)?;
-                let right_col = self.extract_qualified_column_name(&infix.right)?;
-                Some((left_col, right_col))
-            }
-            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
-                // For AND conditions, try to extract the first simple equality
-                if let Some(result) = self.extract_simple_join_key(&infix.left) {
-                    return Some(result);
-                }
-                self.extract_simple_join_key(&infix.right)
-            }
-            _ => None,
-        }
-    }
-
-    /// Extract qualified column name from an identifier expression
-    fn extract_qualified_column_name(&self, expr: &Expression) -> Option<String> {
-        match expr {
-            Expression::QualifiedIdentifier(qid) => {
-                Some(qualified(&qid.qualifier.value, &qid.name.value))
-            }
-            Expression::Identifier(id) => Some(id.value.to_string()),
-            _ => None,
-        }
-    }
-
-    /// Check if Index Nested Loop Join can be used.
-    ///
-    /// Returns Some((table_name, index, inner_key_column, outer_key_column, outer_key_idx)) if:
-    /// - Right side is a simple TableSource OR a simple passthrough SubquerySource
-    /// - There's an equality join condition on a column that has an index on the right table
-    /// - Join type is INNER or LEFT (not RIGHT or FULL)
-    ///
-    /// The outer_key_idx will be determined after materializing the outer side.
-    #[allow(clippy::type_complexity)]
     /// The limit the executor pushes into a join of `stmt`: the statement's
     /// LIMIT plus OFFSET when nothing orders, groups or aggregates the joined
     /// rows and both evaluate; None when the join runs unbounded. Without a
@@ -13972,7 +13739,7 @@ impl Executor {
     /// ones; a plain GROUP BY over columns; no subquery in the filters.
     /// The executor and EXPLAIN ask the same question; the executor passes
     /// `ctx`, whose parameters the calls it runs read
-    fn grouped_index_join_applies(
+    pub(super) fn grouped_index_join_applies(
         &self,
         stmt: &SelectStatement,
         join_type: &str,
@@ -14047,64 +13814,51 @@ impl Executor {
         if classification.where_has_correlated_subqueries && !blocks {
             return JoinIndexUse::None;
         }
-        let left_table = match join.left.as_ref() {
-            Expression::TableSource(ts) => Some(ts.name.value.as_str()),
-            _ => None,
-        };
         let ctes = super::explain::cte_names(stmt);
-        let rows = [&join.left, &join.right].map(|side| {
-            blocks
-                && self
-                    .base_table_side_schema(side, CteNames::Listed(&ctes))
-                    .is_none()
-        });
-        if self
-            .get_semijoin_reduction_limit(
+        let schemas = [&join.left, &join.right]
+            .map(|side| self.base_table_side_schema(side, CteNames::Listed(&ctes)));
+        let rows = [0, 1].map(|side| blocks && schemas[side].is_none());
+        let aliases = [&join.left, &join.right].map(|side| get_table_alias_from_expr(side));
+        let (left, right, cross) = match stmt.where_clause.as_deref() {
+            Some(where_clause) => split_join_where(
+                where_clause,
+                aliases[0].as_deref(),
+                aliases[1].as_deref(),
+                (schemas[0].as_deref(), schemas[1].as_deref()),
                 &join_type,
-                (stmt, None),
-                get_table_alias_from_expr(&join.left).as_deref(),
-                left_table,
-                &join.condition,
-                &classification,
-            )
-            .is_none()
-        {
+            ),
+            None => (None, None, None),
+        };
+        let shape = JoinShape {
+            stmt,
+            classification: &classification,
+            join,
+            condition: join.condition.as_deref(),
+            join_type: &join_type,
+            aliases: [aliases[0].as_deref(), aliases[1].as_deref()],
+            filters: [left.as_ref(), right.as_ref()],
+            cross_filter: cross.as_ref(),
+            rows_sides: rows,
+            per_row_where: false,
+            blocks,
+            ctes: CteNames::Listed(&ctes),
+        };
+        let Ok(plan) = self.plan_join(&shape) else {
+            return JoinIndexUse::None;
+        };
+        let reduced = plan
+            .reduction
+            .as_ref()
+            .is_some_and(|keys| Self::semijoin_reduction(stmt, &join_type, keys, None).is_some());
+        if !reduced {
             let bounded = self
                 .pushed_join_limit(stmt, None, &classification, &join_type)
                 .is_some();
             return JoinIndexUse::Streaming { bounded, rows };
         }
-        if rows[1] {
-            return JoinIndexUse::None;
-        }
-        let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
-            Some(where_clause) => {
-                let schema = |side| self.base_table_side_schema(side, CteNames::Listed(&ctes));
-                let (left_schema, right_schema) = (schema(&join.left), schema(&join.right));
-                let (_, right, _) = split_join_where(
-                    where_clause,
-                    get_table_alias_from_expr(&join.left).as_deref(),
-                    get_table_alias_from_expr(&join.right).as_deref(),
-                    (left_schema.as_deref(), right_schema.as_deref()),
-                    &join_type,
-                );
-                (
-                    right.is_some(),
-                    !blocks && Self::filter_has_subquery(where_clause),
-                )
-            }
-            None => (false, false),
-        };
-        match self.grouped_index_join_applies(
-            stmt,
-            &join_type,
-            join.condition.as_deref(),
-            right_filter_present,
-            filters_have_subquery,
-            None,
-        ) {
-            Ok(Some(_)) => JoinIndexUse::Grouped,
-            _ => JoinIndexUse::None,
+        match plan.grouped_index {
+            true => JoinIndexUse::Grouped,
+            false => JoinIndexUse::None,
         }
     }
 
@@ -14127,285 +13881,6 @@ impl Executor {
             return None;
         }
         self.engine.get_table_schema(&ts.name.value_lower).ok()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn check_index_nested_loop_opportunity(
-        &self,
-        ctes: CteNames<'_>,
-        right_expr: &Expression,
-        join_condition: Option<&Expression>,
-        join_type: &str,
-        left_alias: Option<&str>,
-        right_alias: Option<&str>,
-        bounded: bool,
-        small_outer: bool,
-        outer_materialized: bool,
-    ) -> Option<(
-        String,              // table_name
-        IndexLookupStrategy, // lookup strategy (index or PK)
-        String,              // inner_key_column (unqualified)
-        String,              // outer_key_column (qualified)
-    )> {
-        // Only for INNER or LEFT joins (not RIGHT or FULL)
-        // RIGHT joins would need to track all unmatched inner rows
-        if join_type.contains("RIGHT") || join_type.contains("FULL") {
-            return None;
-        }
-
-        // Extract table name and effective alias from right side
-        // Supports: TableSource, Aliased TableSource, and simple SubquerySource
-        let (table_name, effective_alias) = match right_expr {
-            Expression::TableSource(_) => (index_join_table_name(right_expr)?, None),
-            Expression::Aliased(aliased) => {
-                match aliased.expression.as_ref() {
-                    Expression::TableSource(_) => (index_join_table_name(right_expr)?, None),
-                    Expression::SubquerySource(sq) => {
-                        // Check if subquery is a simple passthrough
-                        let underlying = self.extract_simple_subquery_table(&sq.subquery)?;
-                        // Use the subquery's alias as the effective alias for join condition matching
-                        let alias = sq.alias.as_ref().map(|a| a.value.to_string());
-                        (underlying, alias)
-                    }
-                    _ => return None,
-                }
-            }
-            Expression::SubquerySource(sq) => {
-                // Check if subquery is a simple passthrough
-                let underlying = self.extract_simple_subquery_table(&sq.subquery)?;
-                let alias = sq.alias.as_ref().map(|a| a.value.to_string());
-                (underlying, alias)
-            }
-            _ => return None,
-        };
-
-        let table_name_ref = &table_name;
-
-        // A CTE of the same name hides the table and has no index
-        if ctes.hides(table_name_ref) {
-            return None;
-        }
-
-        // Need a join condition
-        let condition = join_condition?;
-
-        // Extract equality keys from the join condition
-        let (left_col, right_col) = self.extract_simple_join_key(condition)?;
-
-        // Determine which column belongs to which table
-        let left_col_lower = left_col.to_lowercase();
-        let right_col_lower = right_col.to_lowercase();
-
-        // Get the right table alias - prefer effective_alias (from subquery), then right_alias, then table name
-        let right_table_alias = effective_alias
-            .as_deref()
-            .or(right_alias)
-            .unwrap_or(table_name_ref);
-
-        // Check if left_col is from right table and right_col is from left table (swapped)
-        // Pre-compute lowercase alias to avoid repeated format! allocations
-        let right_alias_lower = right_table_alias.to_lowercase();
-        // Whether a column is the one `alias` qualifies
-        let starts_with_alias = |col: &str, alias: &str| -> bool {
-            split_qualified(col).is_some_and(|(qualifier, _)| qualifier == alias)
-        };
-        let (inner_col, outer_col) = if starts_with_alias(&left_col_lower, &right_alias_lower) {
-            // left_col is actually from right (inner) table
-            (left_col.clone(), right_col.clone())
-        } else if starts_with_alias(&right_col_lower, &right_alias_lower) {
-            // right_col is from right (inner) table - normal case
-            (right_col.clone(), left_col.clone())
-        } else {
-            // Can't determine which column is from which table
-            return None;
-        };
-        // An equality between two columns of the inner table joins nothing
-        if starts_with_alias(&outer_col.to_lowercase(), &right_alias_lower) {
-            return None;
-        }
-
-        // Verify outer column is from left table (if we have left alias)
-        if let Some(left_a) = left_alias {
-            let outer_col_lower = outer_col.to_lowercase();
-            let left_alias_lower = left_a.to_lowercase();
-            if !starts_with_alias(&outer_col_lower, &left_alias_lower) {
-                // Outer column doesn't reference left table
-                return None;
-            }
-        }
-
-        // Extract unqualified column name for the inner (right) table
-        let inner_col_unqualified = bare_name(&inner_col).to_string();
-
-        // Try to get the table and check for index or PK
-        let txn = self.begin_transaction().ok()?;
-        let table = txn
-            .get_read_table_at(table_name_ref, None, TableUse::Read)
-            .ok()?;
-        let schema = table.schema();
-
-        // First check if inner column is the PRIMARY KEY (direct row_id lookup)
-        let inner_col_lower = inner_col_unqualified.to_lowercase();
-        if let Some(pk_idx) = schema.pk_column_index() {
-            if schema.columns[pk_idx].name_lower == inner_col_lower {
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::join_index_chosen();
-                // It's a primary key lookup - most efficient!
-                return Some((
-                    table_name,
-                    IndexLookupStrategy::PrimaryKey,
-                    inner_col_unqualified,
-                    outer_col,
-                ));
-            }
-        }
-
-        // Check if there's a secondary index on the inner column
-        if let Some(index) = table.lookup_index_on_column(&inner_col_unqualified) {
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::join_index_chosen();
-            return Some((
-                table_name,
-                IndexLookupStrategy::SecondaryIndex(index),
-                inner_col_unqualified,
-                outer_col,
-            ));
-        }
-
-        // A table that keeps rows outside its index still answers a bounded
-        // probe from it while it can, deciding per probe; only a join the
-        // executor bounds with a limit asks it, at execution and in EXPLAIN,
-        // or one whose outer side may be small: on a table with sealed rows,
-        // or a hot one large enough for the largest small outer
-        // A narrowing key must be the outer side's; an inner column's name is unsure
-        let outer_is_sure = left_alias.is_some()
-            || split_qualified(&outer_col).is_some()
-            || !schema
-                .columns
-                .iter()
-                .any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
-        let large =
-            table.row_count_hint() >= SMALL_OUTER_ROWS.saturating_mul(HOT_INNER_ROWS_PER_KEY);
-        let probes = crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified);
-        // A bounded join probes the column. A small outer never probes: its
-        // keys narrow a large table, a sealed table through its side file,
-        // or the scan of a column no probe reads, from a side whose size only
-        // running it tells
-        let narrows =
-            large || (probes && table.has_sealed_rows()) || (outer_materialized && !probes);
-        if (bounded && probes) || (small_outer && outer_is_sure && narrows) {
-            return Some((
-                table_name,
-                IndexLookupStrategy::TableEquality {
-                    column: inner_col_unqualified.clone(),
-                },
-                inner_col_unqualified,
-                outer_col,
-            ));
-        }
-
-        // No index or PK available
-        None
-    }
-
-    /// Extract the underlying table name from a simple passthrough subquery.
-    ///
-    /// A "simple passthrough" subquery is one that:
-    /// - Selects from a single table (no joins)
-    /// - Has no WHERE, GROUP BY, ORDER BY, LIMIT, HAVING, DISTINCT
-    /// - Has no CTEs, set operations, or window definitions
-    ///
-    /// Note: WHERE clauses are rejected because Index Nested Loop would
-    /// bypass the subquery and query the raw table directly.
-    ///
-    /// Returns Some(table_name) if the subquery is simple, None otherwise.
-    fn extract_simple_subquery_table(&self, stmt: &SelectStatement) -> Option<String> {
-        // Must not have CTEs
-        if stmt.with.is_some() {
-            return None;
-        }
-
-        // Must not have set operations (UNION, INTERSECT, EXCEPT)
-        if !stmt.set_operations.is_empty() {
-            return None;
-        }
-
-        // Must not have GROUP BY
-        if !stmt.group_by.columns.is_empty() {
-            return None;
-        }
-
-        // Must not have HAVING
-        if stmt.having.is_some() {
-            return None;
-        }
-
-        // Must not have ORDER BY (would affect result order)
-        if !stmt.order_by.is_empty() {
-            return None;
-        }
-
-        // Must not have LIMIT or OFFSET (would affect which rows are returned)
-        if stmt.limit.is_some() || stmt.offset.is_some() {
-            return None;
-        }
-
-        // Must not have WHERE clause (Index NL would bypass it and query raw table)
-        if stmt.where_clause.is_some() {
-            return None;
-        }
-
-        // Must not be DISTINCT
-        if stmt.distinct {
-            return None;
-        }
-
-        // Must not have window definitions
-        if !stmt.window_defs.is_empty() {
-            return None;
-        }
-
-        // Must have a table expression that is a simple TableSource
-        let table = index_join_table_name(stmt.table_expr.as_ref()?)?;
-
-        // The probe returns the table's columns in the table's order, so the
-        // subquery must select exactly those, each under its own name
-        if !matches!(
-            stmt.columns.as_slice(),
-            [Expression::Star(_)] | [Expression::QualifiedStar(_)]
-        ) {
-            let schema = self.engine.get_table_schema(&table).ok()?;
-            // The output name as written, since the probe names the column
-            // as the schema spells it
-            let own_name = |column: &Expression| match column {
-                Expression::Identifier(id) => Some(id.value.to_string()),
-                Expression::QualifiedIdentifier(q) => Some(q.name.value.to_string()),
-                Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                    Expression::Identifier(id) if id.value_lower == aliased.alias.value_lower => {
-                        Some(aliased.alias.value.to_string())
-                    }
-                    Expression::QualifiedIdentifier(q)
-                        if q.name.value_lower == aliased.alias.value_lower =>
-                    {
-                        Some(aliased.alias.value.to_string())
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            let same = stmt.columns.len() == schema.columns.len()
-                && stmt
-                    .columns
-                    .iter()
-                    .zip(&schema.columns)
-                    .all(|(column, table_column)| {
-                        own_name(column).is_some_and(|name| name == table_column.name)
-                    });
-            if !same {
-                return None;
-            }
-        }
-        Some(table)
     }
 
     /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)

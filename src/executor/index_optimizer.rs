@@ -541,62 +541,6 @@ impl Executor {
         }
     }
 
-    /// Check if an expression contains an equality condition (for hash join eligibility).
-    ///
-    /// Returns true if the expression contains at least one `=` comparison
-    /// that is NOT `!=`, `<>`, `>=`, or `<=`. This is used to determine if
-    /// streaming hash join can be used.
-    pub(crate) fn has_equality_condition(expr: &Expression) -> bool {
-        match expr {
-            // Direct equality comparison: col1 = col2
-            Expression::Infix(infix) => {
-                let op = infix.operator.as_str();
-                if op == "=" {
-                    // This is a pure equality, not >=, <=, !=, <>
-                    return true;
-                }
-                // Recurse into AND/OR branches
-                if op.eq_ignore_ascii_case("AND") || op.eq_ignore_ascii_case("OR") {
-                    return Self::has_equality_condition(&infix.left)
-                        || Self::has_equality_condition(&infix.right);
-                }
-                false
-            }
-            // Note: The parser inlines parenthesized expressions, so no Grouped variant needed
-            _ => false,
-        }
-    }
-
-    /// Estimate cardinality of a table expression for join build side selection.
-    ///
-    /// Uses table statistics and filter selectivity to estimate output rows.
-    /// Returns u64::MAX for complex expressions (subqueries, CTEs) that can't be estimated.
-    ///
-    /// This is used to choose the smaller side as build in streaming hash joins.
-    pub(crate) fn estimate_table_expr_cardinality(
-        &self,
-        expr: &Expression,
-        filter: Option<&Expression>,
-    ) -> u64 {
-        // Extract table name from expression (use pre-computed lowercase)
-        let table_name: &str = match expr {
-            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
-            Expression::Aliased(aliased) => {
-                if let Expression::TableSource(ts) = aliased.expression.as_ref() {
-                    ts.name.value_lower.as_str()
-                } else {
-                    return u64::MAX; // Can't estimate subqueries/complex sources
-                }
-            }
-            _ => return u64::MAX, // Can't estimate joins, subqueries, CTEs
-        };
-
-        // Use the planner's estimate_scan_rows for accurate estimation
-        self.get_query_planner()
-            .estimate_scan_rows(table_name, filter)
-            .unwrap_or(u64::MAX)
-    }
-
     /// Find window ORDER BY info in an expression
     fn find_window_order_in_expr(expr: &Expression) -> Option<(String, bool)> {
         match expr {

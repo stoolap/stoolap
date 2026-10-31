@@ -22,6 +22,7 @@ use smallvec::SmallVec;
 
 use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Schema};
+use crate::planner::join::JoinPlan;
 
 use super::context::CteScope;
 use super::expression::SharedProgram;
@@ -218,6 +219,8 @@ pub struct PreparedJoin {
     /// The plan of each side that runs as a statement of its own: a join or
     /// a derived table
     side_plans: [NestedPlan; 2],
+    /// How the join runs, planned on first need
+    join_plan: std::sync::OnceLock<JoinPlan>,
 }
 
 impl PreparedJoin {
@@ -235,7 +238,17 @@ impl PreparedJoin {
             grouped: std::sync::OnceLock::new(),
             grouped_blocks: Shelf::new(),
             side_plans: Default::default(),
+            join_plan: std::sync::OnceLock::new(),
         }
+    }
+
+    /// How the join runs, as `plan` decides once
+    pub(crate) fn join_plan(&self, plan: impl FnOnce() -> Result<JoinPlan>) -> Result<&JoinPlan> {
+        if let Some(held) = self.join_plan.get() {
+            return Ok(held);
+        }
+        let planned = plan()?;
+        Ok(self.join_plan.get_or_init(|| planned))
     }
 
     /// The plan of side `side` when it runs as a statement of its own
