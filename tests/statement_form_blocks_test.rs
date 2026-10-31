@@ -31,7 +31,8 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// t: (id, k), u: (id, k, v), sealed into volumes when `sealed`
+/// t: (id, k), u: (id, k, v), and w: (id, k, v) with an index on k and the
+/// smallest integer, which ABS cannot negate; sealed into volumes when `sealed`
 fn setup(dir: &tempfile::TempDir, sealed: bool) -> Database {
     let dsn = match sealed {
         true => format!("file://{}/db", dir.path().display()),
@@ -41,8 +42,11 @@ fn setup(dir: &tempfile::TempDir, sealed: bool) -> Database {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
         "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX w_k ON w (k)",
         "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4)",
         "INSERT INTO u VALUES (1, 1, 5), (2, 1, NULL), (3, 2, 7), (4, 3, 1), (5, 3, 2)",
+        "INSERT INTO w VALUES (1, 1, -9223372036854775808), (2, 1, 3), (3, 2, 5)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -220,13 +224,46 @@ fn an_exists_computes_no_order_by_key() {
             let literal = format!("SELECT id FROM t WHERE EXISTS ({twin}) ORDER BY id");
             holds(&db, &sql, &literal, mode, &mut wrong);
         }
-        let unknown =
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k ORDER BY nosuch LIMIT 1)";
-        if !rows(&db, unknown).is_err_and(|e| e.contains("nosuch")) {
-            wrong.push(format!(
-                "{mode}: {unknown} binds its key: {:?}",
-                rows(&db, unknown)
-            ));
+        // An aggregate key reads the groups; ABS of the smallest integer fails if computed
+        let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
+        for block in [
+            format!("{groups} ORDER BY SUM(v)"),
+            format!("{groups} ORDER BY SUM(v) LIMIT 1"),
+            "SELECT k, SUM(v) AS total FROM w WHERE w.k = t.k GROUP BY k ORDER BY total"
+                .to_string(),
+            format!("{groups} ORDER BY ABS(MIN(v)) LIMIT 1"),
+            "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY ABS(MIN(v))"
+                .to_string(),
+            format!("{groups} HAVING COUNT(*) > (SELECT 0) ORDER BY ABS(MIN(v))"),
+            "SELECT DISTINCT ON ((SELECT 1)) w.k FROM w WHERE w.k = t.k ORDER BY ABS(w.v)"
+                .to_string(),
+        ] {
+            let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
+            let literal = format!("SELECT id FROM t WHERE EXISTS ({groups}) ORDER BY id");
+            holds(&db, &sql, &literal, mode, &mut wrong);
+        }
+        // Its keys are still bound, as the same ORDER BY is anywhere else
+        for (block, error) in [
+            (
+                "SELECT 1 FROM u WHERE u.k = t.k ORDER BY nosuch LIMIT 1",
+                "nosuch",
+            ),
+            (
+                "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY nosuch",
+                "nosuch",
+            ),
+            (
+                "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY v",
+                "Column 'v' not found",
+            ),
+        ] {
+            let sql = format!("SELECT id FROM t WHERE EXISTS ({block})");
+            if !rows(&db, &sql).is_err_and(|e| e.contains(error)) {
+                wrong.push(format!(
+                    "{mode}: {sql} binds its key: {:?}",
+                    rows(&db, &sql)
+                ));
+            }
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));

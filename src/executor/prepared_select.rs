@@ -5113,14 +5113,12 @@ impl Builder<'_> {
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
-        // An EXISTS runs without its ORDER BY, which is still bound; one whose
-        // rows its items choose, by a window, a DISTINCT ON or the clauses of
-        // a statement block, runs as written, and so does one ordered by a
-        // position its run counts, which reads no key beyond a column
-        let dropped = matches!(form, Form::Exists(_))
-            && !clause_block(sq, false)
-            && sq.distinct_on.is_empty()
-            && !orders_by_merged_star_position(sq);
+        // An EXISTS counts its rows, which no ORDER BY changes: it runs
+        // without one, whose names are still bound, but for a position its
+        // run counts. Unless its items choose its rows, by a window, a
+        // DISTINCT ON or the clauses of a statement block, it reads no item
+        let dropped = matches!(form, Form::Exists(_)) && !orders_by_merged_star_position(sq);
+        let counted = dropped && !clause_block(sq, false) && sq.distinct_on.is_empty();
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
@@ -5160,7 +5158,7 @@ impl Builder<'_> {
         self.max_param = self.max_param.max(max_param);
         let joined = own.tables.len() > 1;
         if joined {
-            if dropped {
+            if counted {
                 check_block_positions(sq, own.columns.len())?;
             }
             let around = std::mem::replace(&mut self.ctes, ctes);
@@ -5169,17 +5167,20 @@ impl Builder<'_> {
             self.ctes = around;
             bound?;
         }
-        let statement = match dropped {
-            // A join's run names its columns, so it binds what it reads
-            true if joined => SelectStatement {
+        // A join's run names its columns, so it binds what it reads
+        let statement = match (dropped, counted && !joined) {
+            (false, _) => statement,
+            (true, false) => SelectStatement {
                 order_by: Vec::new(),
                 ..statement
             },
-            true => {
-                self.bind_dropped_order(sq, &own, outer, id, &work)?;
+            // A grouped block's keys read its groups, bound by its walk
+            (true, true) => {
+                if !grouped_block(sq) {
+                    self.bind_dropped_order(sq, &own, outer, id, &work)?;
+                }
                 existence(executor, statement, &own.lower, ctx)?
             }
-            false => statement,
         };
         let (identity, signature, _) = block_identity(sq, form);
         // One that binds nothing beyond itself keeps its answer across
