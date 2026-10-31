@@ -2415,28 +2415,16 @@ impl Executor {
         if stmt.window_defs.is_empty() {
             return Vec::new();
         }
-        let mut windows = Vec::new();
-        let read = stmt
-            .columns
-            .iter()
-            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-            .chain(&stmt.distinct_on);
-        for expr in read {
-            Self::collect_all_windows_in_expression(expr, &mut windows);
-        }
         // Whether each definition is named, and its ORDER BY and frame read
         let mut used = vec![(false, false, false); stmt.window_defs.len()];
-        for window in windows {
-            let (Some((at, def)), Some((_, order_by, frame))) = (
-                window.named(&stmt.window_defs),
-                window.resolved(&stmt.window_defs),
-            ) else {
+        for window in Self::windows_read(stmt) {
+            let Some((at, order_by, frame)) = definition_read(window, &stmt.window_defs) else {
                 continue;
             };
             let read = &mut used[at];
             read.0 = true;
-            read.1 |= std::ptr::eq(order_by, def.order_by.as_slice());
-            read.2 |= frame.is_some_and(|f| def.frame.as_ref().is_some_and(|d| std::ptr::eq(f, d)));
+            read.1 |= order_by;
+            read.2 |= frame;
         }
         stmt.window_defs
             .iter()
@@ -2455,15 +2443,38 @@ impl Executor {
             .collect()
     }
 
+    /// Whether a window `stmt` reads names one of its definitions, which
+    /// `used_window_defs` then keeps; nothing is copied
+    pub(crate) fn reads_window_defs(stmt: &SelectStatement) -> bool {
+        !stmt.window_defs.is_empty()
+            && Self::windows_read(stmt)
+                .into_iter()
+                .any(|window| definition_read(window, &stmt.window_defs).is_some())
+    }
+
+    /// Every window `stmt` reads: in its SELECT list, ORDER BY and DISTINCT ON
+    fn windows_read(stmt: &SelectStatement) -> SmallVec<[&WindowExpression; 4]> {
+        let mut windows = SmallVec::new();
+        let read = stmt
+            .columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on);
+        for expr in read {
+            Self::collect_all_windows_in_expression(expr, &mut windows);
+        }
+        windows
+    }
+
     /// Recursively find a window expression inside an expression
     /// Returns the first Window expression found, if any
     /// Collect all window expressions found anywhere in an expression tree (depth-first order).
     pub(crate) fn collect_all_windows_in_expression<'a>(
         expr: &'a Expression,
-        out: &mut Vec<&'a WindowExpression>,
+        out: &mut impl Extend<&'a WindowExpression>,
     ) {
         match expr {
-            Expression::Window(w) => out.push(w),
+            Expression::Window(w) => out.extend([&**w]),
             Expression::Infix(infix) => {
                 Self::collect_all_windows_in_expression(&infix.left, out);
                 Self::collect_all_windows_in_expression(&infix.right, out);
@@ -4534,6 +4545,24 @@ impl Executor {
             .map(|opt| opt.unwrap_or(NULL_VALUE))
             .collect())
     }
+}
+
+/// The definition among `defs` that `window` names and resolves to, by its
+/// position, and whether the window reads that definition's ORDER BY and frame
+fn definition_read(
+    window: &WindowExpression,
+    defs: &[WindowDefinition],
+) -> Option<(usize, bool, bool)> {
+    let (Some((at, def)), Some((_, order_by, frame))) = (window.named(defs), window.resolved(defs))
+    else {
+        return None;
+    };
+    let frame_read = frame.is_some_and(|f| def.frame.as_ref().is_some_and(|d| std::ptr::eq(f, d)));
+    Some((
+        at,
+        std::ptr::eq(order_by, def.order_by.as_slice()),
+        frame_read,
+    ))
 }
 
 #[cfg(test)]

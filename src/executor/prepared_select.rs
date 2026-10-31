@@ -1092,7 +1092,7 @@ pub(crate) fn set_operation_key_item(item: &Expression, registry: &FunctionRegis
 /// definition a window function reads: one nothing reads is never read
 fn plain_statement(stmt: &SelectStatement) -> bool {
     matches!(stmt.group_by.modifier, GroupByModifier::None)
-        && Executor::used_window_defs(stmt).is_empty()
+        && !Executor::reads_window_defs(stmt)
         && stmt.group_by.columns.is_empty()
         && stmt.having.is_none()
 }
