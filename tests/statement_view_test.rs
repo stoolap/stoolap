@@ -242,6 +242,29 @@ fn snapshot_context(
     (db, executor, ctx)
 }
 
+/// The prepared families refused while it lives, as `families_off` says;
+/// one switch at a time
+struct FamiliesOff {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+impl FamiliesOff {
+    fn set(families_off: bool) -> Self {
+        static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let held = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        stoolap::test_failpoints::PREPARED_FAMILIES_OFF
+            .store(families_off, std::sync::atomic::Ordering::Relaxed);
+        FamiliesOff { _held: held }
+    }
+}
+
+impl Drop for FamiliesOff {
+    fn drop(&mut self) {
+        stoolap::test_failpoints::PREPARED_FAMILIES_OFF
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn first_column(
     executor: &stoolap::Executor,
     sql: &str,
@@ -308,14 +331,13 @@ fn a_dml_under_a_snapshot_view_selects_its_target_from_the_newest_state() {
 
 #[test]
 fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statements() {
-    // A DISTINCT in a call keeps the general path's probe; without one the
+    // The prepared families off keep the general path's probe; with them the
     // prepared family probes
     let cases: [(&str, &str, &str, &'static str); 5] = [
         (
             "probe",
             "INSERT INTO w VALUES (1, 1)",
-            "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) \
-             AND COALESCE(DISTINCT 1, 1) = 1 ORDER BY id LIMIT 10",
+            "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 10",
             "DELETE FROM w WHERE id = 1",
         ),
         (
@@ -365,7 +387,10 @@ fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statement
         } else {
             stoolap::test_failpoints::after_select_table_opened(commit);
         }
-        let seen = first_column(&executor, sql, &ctx);
+        let seen = {
+            let _families = FamiliesOff::set(name == "probe");
+            first_column(&executor, sql, &ctx)
+        };
         assert!(committed.get(), "{name}: the commit did not land inside");
         if seen.as_deref() != Ok(&[1]) {
             wrong.push(format!("{name}: {seen:?}"));

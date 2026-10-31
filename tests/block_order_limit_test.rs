@@ -283,23 +283,16 @@ fn a_cut_block_outside_the_family_says_why() {
     // A grouped block with ORDER BY and LIMIT runs as a statement block
     let grouped = scalar("SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1");
     assert_eq!(prepared_line(&db, &grouped), "Prepared: yes", "{grouped}");
-    for (block, reason) in [
-        (
-            "SELECT x FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1",
-            "an ORDER BY position in a subquery block",
-        ),
-        (
-            "SELECT x FROM u WHERE u.k = t.id ORDER BY x LIMIT t.a",
-            "a derived table's LIMIT or OFFSET naming a column",
-        ),
-    ] {
-        let sql = scalar(block);
-        assert_eq!(
-            prepared_line(&db, &sql),
-            format!("Prepared: no ({reason})"),
-            "{sql}"
-        );
-    }
+    let sql = scalar("SELECT x FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1");
+    assert_eq!(
+        prepared_line(&db, &sql),
+        "Prepared: no (an ORDER BY position in a subquery block)",
+        "{sql}"
+    );
+    // A count reads no column: the block's own run says so
+    let sql = scalar("SELECT x FROM u WHERE u.k = t.id ORDER BY x LIMIT t.a");
+    assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
+    assert!(error(&db, &sql).contains("Column 't.a' not found"), "{sql}");
 }
 
 #[test]

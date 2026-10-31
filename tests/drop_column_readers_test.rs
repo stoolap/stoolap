@@ -443,44 +443,63 @@ fn a_correlated_exists_probes_across_a_drop() {
     let _guard = fp::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let mut report = Vec::new();
-    // A DISTINCT in a call keeps the EXISTS out of the prepared family, on
-    // the general path's probe; the family's blocks are the others
+    // The prepared families off keep the EXISTS on the general path's probe;
+    // the family's blocks are the others
     type Install = fn(Box<dyn FnOnce() + Send>);
     let general: Install = |hook| fp::before_correlated_fetch(hook);
     let prepared: Install = |hook| fp::before_prepared_exists(hook);
     let prepared_scalar: Install = |hook| fp::before_prepared_scalar(hook);
-    for (sql, install) in [
-        (
-            "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) \
-             AND COALESCE(DISTINCT 1, 1) = 1 ORDER BY p.id LIMIT 10",
-            general,
-        ),
+    let exists = "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) \
+                  ORDER BY p.id LIMIT 10";
+    for (sql, install, families_off) in [
+        (exists, general, true),
         (
             "SELECT p.id, (SELECT COUNT(*) FROM c WHERE c.pid = p.v) FROM p ORDER BY p.id LIMIT 10",
             prepared_scalar,
+            false,
         ),
-        (
-            "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) ORDER BY p.id LIMIT 10",
-            prepared,
-        ),
+        (exists, prepared, false),
     ] {
-    let expected = expected_probe(sql);
-    for (engine, dsn) in engines(&dir, "exists") {
-        let db = Database::open(&dsn).unwrap();
-        probe_setup(&db, &dsn);
-        let other = db.clone();
-        let reader = db.clone();
-        let (got, fired, paths) = on_thread(
-            install,
-            move || {
-                other.execute("ALTER TABLE c DROP COLUMN x", ()).unwrap();
-            },
-            move || rows(&reader, sql),
-        );
-        report.push(outcome(&format!("{engine}: {sql}"), got, &expected, fired, &paths));
-    }
+        let expected = expected_probe(sql);
+        let path = if families_off {
+            "general path"
+        } else {
+            "prepared"
+        };
+        for (engine, dsn) in engines(&dir, "exists") {
+            let db = Database::open(&dsn).unwrap();
+            probe_setup(&db, &dsn);
+            let other = db.clone();
+            let reader = db.clone();
+            let _families = FamiliesOff::set(families_off);
+            let (got, fired, paths) = on_thread(
+                install,
+                move || {
+                    other.execute("ALTER TABLE c DROP COLUMN x", ()).unwrap();
+                },
+                move || rows(&reader, sql),
+            );
+            let label = format!("{engine} {path}: {sql}");
+            report.push(outcome(&label, got, &expected, fired, &paths));
+        }
     }
     finish(report);
+}
+
+/// The prepared families refused while it lives, as `families_off` says
+struct FamiliesOff;
+
+impl FamiliesOff {
+    fn set(families_off: bool) -> Self {
+        fp::PREPARED_FAMILIES_OFF.store(families_off, Ordering::Relaxed);
+        FamiliesOff
+    }
+}
+
+impl Drop for FamiliesOff {
+    fn drop(&mut self) {
+        fp::PREPARED_FAMILIES_OFF.store(false, Ordering::Relaxed);
+    }
 }
 
 /// A join that opened its inner table probes it after a drop on it
