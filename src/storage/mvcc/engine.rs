@@ -11802,7 +11802,9 @@ mod tests {
         {
             let mut tx = engine.begin_transaction().unwrap();
             let mut table = tx.get_table("cleanup_test").unwrap();
-            table.delete(None).unwrap();
+            table
+                .delete(crate::storage::traits::ScanAccess::Seq, None)
+                .unwrap();
             tx.commit().unwrap();
         }
 

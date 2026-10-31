@@ -27,7 +27,7 @@ use crate::common::{CompactArc, I64Set};
 use crate::core::predicate::{kind, PredicateSet};
 use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
-use crate::storage::traits::{QueryResult, Table};
+use crate::storage::traits::{QueryResult, ScanAccess, Table};
 
 use super::context::{cache_in_subquery, get_cached_in_subquery_set, ExecutionContext};
 use super::expression::{ExpressionEval, RowFilter};
@@ -203,7 +203,15 @@ impl Executor {
             return Ok(None);
         };
 
-        let Some(rows) = table.scan_top_k(storage_expr, column_name, ascending, limit, offset)?
+        let walk = storage_expr.and_then(|expr| table.top_k_walk(expr, column_name));
+        let Some(rows) = table.scan_top_k(
+            walk.as_ref(),
+            storage_expr,
+            column_name,
+            ascending,
+            limit,
+            offset,
+        )?
         else {
             return Ok(None);
         };
@@ -820,7 +828,9 @@ impl Executor {
         let columns: Vec<usize> = (0..table.schema().columns.len()).collect();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::in_members_read(true);
-        let mut scanner = table.scan(&columns, Some(&membership))?;
+        let plan = table.index_plan(&membership);
+        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+        let mut scanner = table.scan_access(access, &columns, None, Some(&membership))?;
         let mut rows = RowVec::new();
         while scanner.next() {
             let row_id = scanner.current_row_id();

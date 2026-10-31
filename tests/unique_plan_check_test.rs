@@ -17,7 +17,7 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::storage::traits::Engine;
+use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::test_failpoints;
 use stoolap::Database;
 
@@ -48,7 +48,7 @@ fn a_run_of_hot_rows_only_is_not_compared_pair_by_pair() {
     let mut table = txn.get_table("t").unwrap();
     // The sealed row takes a key of its own; the hot rows share another,
     // which the commit refuses, not the statement
-    let updated = table.update(None, &mut |mut row| {
+    let updated = table.update(ScanAccess::Seq, None, &mut |mut row| {
         let sealed = row.get(0).and_then(|v| v.as_int64()) == Some(1);
         let key = if sealed { 7 } else { 5 };
         row.set(1, stoolap::core::Value::Integer(key)).unwrap();

@@ -17,7 +17,7 @@
 
 use stoolap::core::{RowVec, Value};
 use stoolap::storage::expression::{
-    AndExpr, BetweenExpr, ComparisonExpr, Expression, InListExpr, LikeExpr,
+    AndExpr, BetweenExpr, ComparisonExpr, Expression, InListExpr, LikeExpr, OrExpr,
 };
 use stoolap::storage::mvcc::index_plan::decide;
 use stoolap::storage::traits::{Engine, ScanAccess, Scanner};
@@ -62,6 +62,23 @@ fn cases() -> Vec<(Box<dyn Expression>, Box<dyn Expression>)> {
         Box::new(BetweenExpr::new("a", Value::Integer(6), Value::Integer(8))) as Box<dyn Expression>
     };
     let prefix = || Box::new(LikeExpr::new("b", "k1%")) as Box<dyn Expression>;
+    let key = || Box::new(ComparisonExpr::eq("id", Value::Integer(50))) as Box<dyn Expression>;
+    let keys = || {
+        let members = [50, 1001, 2001, 5000].map(Value::Integer);
+        Box::new(InListExpr::new("id", members.to_vec())) as Box<dyn Expression>
+    };
+    let key_range = || {
+        Box::new(AndExpr::new(vec![
+            Box::new(ComparisonExpr::gte("id", Value::Integer(280))),
+            Box::new(ComparisonExpr::lte("id", Value::Integer(2005))),
+        ])) as Box<dyn Expression>
+    };
+    let mixed = || {
+        Box::new(OrExpr::new(vec![
+            Box::new(ComparisonExpr::eq("a", Value::Integer(3))),
+            Box::new(ComparisonExpr::eq("c", Value::Integer(99))),
+        ])) as Box<dyn Expression>
+    };
     let with_c = |condition: Box<dyn Expression>| {
         Box::new(AndExpr::new(vec![
             condition,
@@ -76,6 +93,11 @@ fn cases() -> Vec<(Box<dyn Expression>, Box<dyn Expression>)> {
         (list(), with_c(list())),
         (between(), with_c(between())),
         (prefix(), with_c(prefix())),
+        (key(), with_c(key())),
+        (keys(), with_c(keys())),
+        (key_range(), key_range()),
+        (key_range(), with_c(key_range())),
+        (mixed(), mixed()),
     ]
 }
 
@@ -113,8 +135,13 @@ fn change(db: &Database) {
 }
 
 fn assert_alike(db: &Database, what: &str) {
+    assert_alike_in(db, what, true);
+    assert_alike_in(db, &format!("{what} without local rows"), false);
+}
+
+fn assert_alike_in(db: &Database, what: &str, local: bool) {
     let mut tx = db.engine().begin_transaction().unwrap();
-    {
+    if local {
         let mut table = tx.get_table("t").unwrap();
         // The transaction's own rows: a new one, a changed one, a deleted one
         table
@@ -132,7 +159,7 @@ fn assert_alike(db: &Database, what: &str) {
     for (mut condition, mut filter) in cases() {
         condition.prepare_for_schema(table.schema());
         filter.prepare_for_schema(table.schema());
-        let plan = decide(&store, table.schema(), condition.as_ref())
+        let plan = decide(&store, table.schema(), condition.as_ref(), true)
             .unwrap_or_else(|| panic!("{what}: no index reads {condition:?}"));
         let expected = scanned(table.scan(&columns, Some(filter.as_ref())).unwrap());
         assert!(!expected.is_empty(), "{what}: {filter:?} keeps no row");
@@ -181,6 +208,19 @@ fn assert_alike(db: &Database, what: &str) {
                     rows.iter().all(|row| expected.contains(row)),
                     "{what}: limit {limit} read a row {filter:?} does not keep"
                 );
+                let ordered = table
+                    .collect_access_rows_with_limit(access, Some(filter.as_ref()), limit, 0)
+                    .unwrap();
+                let ordered = collected(ordered);
+                assert_eq!(
+                    ordered.len(),
+                    limit.min(expected.len()),
+                    "{what}: ordered limit {limit} for {filter:?}"
+                );
+                assert!(
+                    ordered.iter().all(|row| expected.contains(row)),
+                    "{what}: ordered limit {limit} read a row {filter:?} does not keep"
+                );
             }
         }
     }
@@ -188,7 +228,7 @@ fn assert_alike(db: &Database, what: &str) {
     {
         let mut condition = ComparisonExpr::eq("a", Value::Integer(3));
         condition.prepare_for_schema(table.schema());
-        let plan = decide(&store, table.schema(), &condition as &dyn Expression).unwrap();
+        let plan = decide(&store, table.schema(), &condition as &dyn Expression, false).unwrap();
         let read = stoolap::test_failpoints::hot_index_ids_read;
         let before = read();
         drop(
@@ -215,6 +255,63 @@ fn assert_alike(db: &Database, what: &str) {
         assert!(read() > before, "{what}: the index access read no index");
     }
     tx.rollback().unwrap();
+}
+
+#[test]
+fn the_rule_reads_key_bounds_by_the_key_index_and_a_mixed_or_only_under_a_limit() {
+    let db = Database::open("memory://scan_access_rule_kinds").unwrap();
+    fill(&db);
+    let tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+    let store = db.engine().get_version_store("t").unwrap();
+    let kind = |mut condition: Box<dyn Expression>, limited: bool| {
+        condition.prepare_for_schema(table.schema());
+        decide(&store, table.schema(), condition.as_ref(), limited)
+            .map(|plan| plan.explain()[0].clone())
+    };
+    let between = |low: i64, high: i64| {
+        Box::new(AndExpr::new(vec![
+            Box::new(ComparisonExpr::gte("id", Value::Integer(low))),
+            Box::new(ComparisonExpr::lt("id", Value::Integer(high))),
+        ])) as Box<dyn Expression>
+    };
+    let mixed = || {
+        Box::new(OrExpr::new(vec![
+            Box::new(ComparisonExpr::eq("a", Value::Integer(3))),
+            Box::new(ComparisonExpr::eq("c", Value::Integer(99))),
+        ])) as Box<dyn Expression>
+    };
+    let key = Box::new(AndExpr::new(vec![
+        Box::new(ComparisonExpr::eq("id", Value::Integer(5))),
+        Box::new(ComparisonExpr::gt("c", Value::Integer(1))),
+    ]));
+    assert_eq!(kind(key, false).as_deref(), Some("PkKey"));
+    assert_eq!(
+        kind(between(10, 20), false).as_deref(),
+        Some("Index __pk_t_id (id range)")
+    );
+    assert_eq!(kind(mixed(), false), None, "a mixed OR read to the end");
+    assert_eq!(kind(mixed(), true).as_deref(), Some("MixedOr"));
+    #[cfg(feature = "test-failpoints")]
+    {
+        let mut condition = mixed();
+        condition.prepare_for_schema(table.schema());
+        let plan = decide(&store, table.schema(), condition.as_ref(), true).unwrap();
+        let before = stoolap::test_failpoints::hot_index_ids_read();
+        let rows = table
+            .collect_access_rows_with_limit_unordered(
+                ScanAccess::Index(&plan),
+                Some(condition.as_ref()),
+                5,
+                0,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(
+            stoolap::test_failpoints::hot_index_ids_read() > before,
+            "a limited read of a mixed OR read no index"
+        );
+    }
 }
 
 #[test]

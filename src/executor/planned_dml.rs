@@ -25,7 +25,7 @@ use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression
 use crate::storage::mvcc::index_plan::IndexPlan;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use crate::storage::traits::{Engine, QueryResult, ScanAccess, Table, Transaction};
 
 use super::context::ExecutionContext;
 use super::dml::StatementRollback;
@@ -478,8 +478,9 @@ impl Executor {
             Value::Integer(key),
         );
         pk_expr.prepare_for_schema(&plan.schema);
+        let access = ScanAccess::Index(&IndexPlan::Key);
         let written = match plan.write {
-            DmlWrite::Delete => table.delete(Some(&pk_expr)),
+            DmlWrite::Delete => table.delete(access, Some(&pk_expr)),
             DmlWrite::Update(_) => {
                 let mut vm = super::expression::ExprVM::new();
                 let mut setter = |mut row: Row| -> Result<(Row, bool)> {
@@ -515,7 +516,7 @@ impl Executor {
                     }
                     Ok((row, true))
                 };
-                table.update(Some(&pk_expr), &mut setter)
+                table.update(access, Some(&pk_expr), &mut setter)
             }
         };
         let rows_affected = rollback.finish(written)?;

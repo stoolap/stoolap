@@ -617,7 +617,7 @@ impl Executor {
                     let scan_where = rewritten.as_deref().unwrap_or(where_clause);
                     let scan = super::pushdown::try_pushdown(scan_where, &schema, Some(ctx))
                         .0
-                        .and_then(|pushed| index_plan::decide(&store, &schema, &*pushed))
+                        .and_then(|pushed| index_plan::decide(&store, &schema, &*pushed, false))
                         .map_or(ScanChoice::Seq, ScanChoice::Index);
                     let lines = scan.explain(table, Some(scan_where));
                     for (at, line) in lines.into_iter().enumerate() {

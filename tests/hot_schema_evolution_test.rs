@@ -411,14 +411,16 @@ fn an_update_written_before_a_column_change_cannot_commit() {
     {
         use stoolap::core::{Operator, Row, Value};
         use stoolap::storage::expression::{ComparisonExpr, Expression};
-        use stoolap::storage::traits::Engine;
+        use stoolap::storage::traits::{Engine, ScanAccess};
         let mut tx = db.engine().begin_transaction().unwrap();
         let mut older = tx.get_table("t").unwrap();
         let mut by_key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(1));
         by_key.prepare_for_schema(older.schema());
         db.execute("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'c'", ())
             .unwrap();
-        let updated = older.update(Some(&by_key), &mut |row| {
+        let plan = older.index_plan(&by_key);
+        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+        let updated = older.update(access, Some(&by_key), &mut |row| {
             let mut values: Vec<Value> = row.iter().cloned().collect();
             values[2] = Value::text("new-b");
             Ok((Row::from_values(values), true))
@@ -575,7 +577,7 @@ fn a_handle_that_changed_the_columns_itself_writes_under_them() {
 fn every_write_through_an_older_handle_carries_its_layout() {
     use stoolap::core::{Operator, Row, Value};
     use stoolap::storage::expression::{ComparisonExpr, Expression};
-    use stoolap::storage::traits::Engine;
+    use stoolap::storage::traits::{Engine, ScanAccess};
     for write in ["update", "delete"] {
         let db = Database::open(&format!("memory://hot_schema_older_{write}")).unwrap();
         db.execute(
@@ -616,7 +618,9 @@ fn every_write_through_an_older_handle_carries_its_layout() {
             // it matches the row now and must not delete it
             let mut predicate = ComparisonExpr::new("a", Operator::Eq, Value::text("old-b"));
             predicate.prepare_for_schema(older.schema());
-            older.delete(Some(&predicate)).map(|_| ())
+            let plan = older.index_plan(&predicate);
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            older.delete(access, Some(&predicate)).map(|_| ())
         };
         drop(older);
         let refused = |result: &stoolap::Result<()>| {

@@ -39,12 +39,13 @@ use crate::functions::aggregate::{CompiledAggregate, GroupedAggregates};
 use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::commit_log::ReadPoint;
+use crate::storage::mvcc::index_plan::IndexPlan;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
     aggregate_row, grouped_aggregates, AggregateOp, LayoutToken,
 };
-use crate::storage::traits::table::{ScanAccess, ScanPlan};
+use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
     CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
 };
@@ -453,21 +454,18 @@ pub struct SegmentedTable {
 
 impl SegmentedTable {
     /// Up to `limit` visible rows past `offset` that `where_expr` keeps, the
-    /// hot ones first, read by `access` when the statement's plan chose one
+    /// hot ones first, read by `access`
     fn limited_cold_and_hot_unordered(
         &self,
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-        access: Option<ScanAccess<'_>>,
+        access: ScanAccess<'_>,
     ) -> Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.collect_rows_with_limit_unordered");
-        let hot_rows = |hot: &dyn Table, target: usize, offset: usize| match access {
-            Some(access) => {
-                hot.collect_access_rows_with_limit_unordered(access, where_expr, target, offset)
-            }
-            None => hot.collect_rows_with_limit_unordered(where_expr, target, offset),
+        let hot_rows = |hot: &dyn Table, target: usize, offset: usize| {
+            hot.collect_access_rows_with_limit_unordered(access, where_expr, target, offset)
         };
         if let Some(result) = self.unsealed(|hot| hot_rows(hot, limit, offset)) {
             return result;
@@ -640,30 +638,23 @@ impl SegmentedTable {
         })
     }
 
-    /// The hot rows `where_expr` keeps, read by `access` when the
-    /// statement's plan chose one
+    /// The hot rows `where_expr` keeps, read by `access`
     fn hot_rows(
         &self,
         where_expr: Option<&dyn Expression>,
-        access: Option<ScanAccess<'_>>,
+        access: ScanAccess<'_>,
     ) -> Result<RowVec> {
-        match access {
-            Some(access) => self.hot.collect_access_rows(access, where_expr),
-            None => self.hot.collect_all_rows(where_expr),
-        }
+        self.hot.collect_access_rows(access, where_expr)
     }
 
     /// Every visible row `where_expr` keeps, the cold ones and the hot ones,
-    /// the hot ones read by `access` when the statement's plan chose one
+    /// the hot ones read by `access`
     fn collect_cold_and_hot(
         &self,
         where_expr: Option<&dyn Expression>,
-        access: Option<ScanAccess<'_>>,
+        access: ScanAccess<'_>,
     ) -> Result<RowVec> {
-        if let Some(result) = self.unsealed(|hot| match access {
-            Some(access) => hot.collect_access_rows(access, where_expr),
-            None => hot.collect_all_rows(where_expr),
-        }) {
+        if let Some(result) = self.unsealed(|hot| hot.collect_access_rows(access, where_expr)) {
             return result;
         }
 
@@ -695,7 +686,7 @@ impl SegmentedTable {
         })
     }
 
-    /// How many rows `collect_cold_and_hot(None, None)` returns: the hot
+    /// How many rows `collect_cold_and_hot(None, Seq)` returns: the hot
     /// rows, and the sealed rows counted by their ids, no row built for them
     fn count_cold_and_hot(&self) -> Result<usize> {
         if let Some(result) = self.unsealed(|hot| hot.collect_all_rows(None).map(|r| r.len())) {
@@ -705,7 +696,7 @@ impl SegmentedTable {
         self.across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
-            let hot_rows = self.hot_rows(None, None)?;
+            let hot_rows = self.hot_rows(None, ScanAccess::Seq)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -3006,14 +2997,12 @@ impl SegmentedTable {
         column_indices: &[usize],
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
-        access: Option<ScanAccess<'_>>,
+        access: ScanAccess<'_>,
     ) -> Result<Box<dyn Scanner>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_cold_and_hot");
-        let unsealed = self.unsealed(|hot| match access {
-            Some(access) => hot.scan_access(access, column_indices, None, where_expr),
-            None => hot.scan(column_indices, where_expr),
-        });
+        let unsealed =
+            self.unsealed(|hot| hot.scan_access(access, column_indices, None, where_expr));
         if let Some(result) = unsealed {
             return result;
         }
@@ -4242,15 +4231,18 @@ impl Table for SegmentedTable {
 
     fn update(
         &mut self,
+        access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::statement_admitted();
+        let keyed = matches!(access, ScanAccess::Index(IndexPlan::Key));
         // A bare `pk = k` names one row: resolve it by id instead of walking
         // every cold row and collecting every hot id
         if let Some(pk) = where_expr
+            .filter(|_| keyed)
             .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
         {
             return self.update_admitted_by_row_ids(&[pk], setter);
@@ -4258,6 +4250,7 @@ impl Table for SegmentedTable {
         let txn_id = self.txn_id();
         // A key ANDed with other conditions names the one cold row they judge
         let named = where_expr
+            .filter(|_| keyed)
             .and_then(|e| crate::storage::mvcc::table::pk_conjunct_id(e, self.hot.schema()));
         // The cold rows the statement changes are read, filtered, set and
         // checked outside the fence; under it they are claimed, then the hot
@@ -4286,7 +4279,9 @@ impl Table for SegmentedTable {
             &seen,
         )?;
         let skip = (!prepared.visited.is_empty()).then_some(&prepared.visited);
-        let planned = self.hot.plan_update(where_expr, setter, skip, &mut plan);
+        let planned = self
+            .hot
+            .plan_update(access, where_expr, setter, skip, &mut plan);
         Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
     }
 
@@ -4395,18 +4390,23 @@ impl Table for SegmentedTable {
         })
     }
 
-    fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+    fn delete(
+        &mut self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // A bare `pk = k` names one row: the hot half keeps the predicate and
         // the cold half resolves the id instead of walking every cold row
         if let Some(pk) = where_expr
+            .filter(|_| matches!(access, ScanAccess::Index(IndexPlan::Key)))
             .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
         {
             let mgr = Arc::clone(&self.segment_mgr);
             let prepared =
                 self.prepare_cold_deletes(&mgr, Some(std::slice::from_ref(&pk)), None, false)?;
             return self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-                hot.delete(where_expr)
+                hot.delete(access, where_expr)
             });
         }
         // The sealed rows the filter selects are read and evaluated outside
@@ -4415,7 +4415,7 @@ impl Table for SegmentedTable {
         let prepared = self.prepare_cold_deletes(&mgr, None, where_expr, false)?;
         // A row changed since the round meets the filter again in the hot half
         self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-            hot.delete(where_expr)
+            hot.delete(access, where_expr)
         })
     }
 
@@ -4449,7 +4449,15 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, None, where_expr, None)
+        self.scan_cold_and_hot(column_indices, None, where_expr, ScanAccess::Seq)
+    }
+
+    fn index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
+        self.hot.index_plan(where_expr)
+    }
+
+    fn limited_index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
+        self.hot.limited_index_plan(where_expr)
     }
 
     fn scan_access(
@@ -4459,7 +4467,7 @@ impl Table for SegmentedTable {
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, needed, where_expr, Some(access))
+        self.scan_cold_and_hot(column_indices, needed, where_expr, access)
     }
 
     fn narrows_scans(&self) -> bool {
@@ -4472,11 +4480,11 @@ impl Table for SegmentedTable {
         needed: &[bool],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, Some(needed), where_expr, None)
+        self.scan_cold_and_hot(column_indices, Some(needed), where_expr, ScanAccess::Seq)
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
-        self.collect_cold_and_hot(where_expr, None)
+        self.collect_cold_and_hot(where_expr, ScanAccess::Seq)
     }
 
     fn collect_access_rows(
@@ -4484,7 +4492,7 @@ impl Table for SegmentedTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
     ) -> Result<RowVec> {
-        self.collect_cold_and_hot(where_expr, Some(access))
+        self.collect_cold_and_hot(where_expr, access)
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
@@ -4640,10 +4648,20 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        self.collect_access_rows_with_limit(ScanAccess::Seq, where_expr, limit, offset)
+    }
+
+    fn collect_access_rows_with_limit(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.collect_rows_with_limit");
-        if let Some(result) =
-            self.unsealed(|hot| hot.collect_rows_with_limit(where_expr, limit, offset))
+        if let Some(result) = self
+            .unsealed(|hot| hot.collect_access_rows_with_limit(access, where_expr, limit, offset))
         {
             return result;
         }
@@ -4664,7 +4682,9 @@ impl Table for SegmentedTable {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::cold_volumes_taken();
             if view.seg_ids.is_empty() {
-                return self.hot.collect_rows_with_limit(where_expr, limit, offset);
+                return self
+                    .hot
+                    .collect_access_rows_with_limit(access, where_expr, limit, offset);
             }
 
             // Phase 1: Build authority map (row_id → volume index).
@@ -4831,7 +4851,9 @@ impl Table for SegmentedTable {
             // for the remainder only.
             if cold_rows.len() < target {
                 let remaining = target - cold_rows.len();
-                let hot_rows = self.hot.collect_rows_with_limit(where_expr, remaining, 0)?;
+                let hot_rows = self
+                    .hot
+                    .collect_access_rows_with_limit(access, where_expr, remaining, 0)?;
                 cold_rows.extend(hot_rows);
             }
 
@@ -4845,7 +4867,7 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        self.limited_cold_and_hot_unordered(where_expr, limit, offset, None)
+        self.limited_cold_and_hot_unordered(where_expr, limit, offset, ScanAccess::Seq)
     }
 
     fn collect_access_rows_with_limit_unordered(
@@ -4855,7 +4877,7 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        self.limited_cold_and_hot_unordered(where_expr, limit, offset, Some(access))
+        self.limited_cold_and_hot_unordered(where_expr, limit, offset, access)
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
@@ -6651,8 +6673,13 @@ impl Table for SegmentedTable {
     /// that column, stopping as soon as a bound can no longer beat the k rows
     /// held. Volumes past the bound are never opened, so the old ones stay
     /// warm.
+    fn top_k_walk(&self, where_expr: &dyn Expression, column_name: &str) -> Option<IndexPlan> {
+        self.hot.top_k_walk(where_expr, column_name)
+    }
+
     fn scan_top_k(
         &self,
+        walk: Option<&IndexPlan>,
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
@@ -6675,7 +6702,7 @@ impl Table for SegmentedTable {
             if !self.segment_mgr.is_destruction_in_progress() {
                 let answer =
                     self.hot
-                        .scan_top_k(where_expr, column_name, ascending, limit, offset)?;
+                        .scan_top_k(walk, where_expr, column_name, ascending, limit, offset)?;
                 if self.segment_mgr.seal_generation() == generation
                     && !self.destruction_since(begun)
                     && !self.segment_mgr.has_segments()
@@ -6710,9 +6737,9 @@ impl Table for SegmentedTable {
             // The hot store answers from an index when it can; then only its
             // best rows are read, and a sealed copy of a hot row is recognised
             // per candidate instead of through a set of every matching hot row
-            let hot_top = self
-                .hot
-                .scan_top_k(where_expr, column_name, ascending, needed, 0)?;
+            let hot_top =
+                self.hot
+                    .scan_top_k(walk, where_expr, column_name, ascending, needed, 0)?;
             let sealed_copies_checked = hot_top.is_some();
             let hot_rows = match hot_top {
                 Some(rows) => rows,
@@ -7466,10 +7493,6 @@ impl Table for SegmentedTable {
             }
             Ok(Some(rows))
         })
-    }
-
-    fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
-        self.hot.explain_scan(where_expr)
     }
 
     // =========================================================================
@@ -8517,6 +8540,7 @@ mod tests {
         }
         fn update(
             &mut self,
+            _: ScanAccess<'_>,
             _: Option<&dyn Expression>,
             _: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         ) -> Result<i32> {
@@ -8543,7 +8567,7 @@ mod tests {
         fn has_visible_row(&self, row_id: i64) -> Result<bool> {
             Ok(self.rows.iter().any(|(id, _)| *id == row_id))
         }
-        fn delete(&mut self, _: Option<&dyn Expression>) -> Result<i32> {
+        fn delete(&mut self, _: ScanAccess<'_>, _: Option<&dyn Expression>) -> Result<i32> {
             Ok(0)
         }
         fn scan(&self, _: &[usize], _: Option<&dyn Expression>) -> Result<Box<dyn Scanner>> {

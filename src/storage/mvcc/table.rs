@@ -26,7 +26,7 @@ use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
 use crate::storage::expression::logical::OrExpr;
-use crate::storage::expression::{passes, ConstBoolExpr, Expression};
+use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::commit_log::ReadPoint;
@@ -39,9 +39,7 @@ use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
-use crate::storage::traits::{
-    Index, PlannedUpdate, QueryResult, ScanAccess, ScanPlan, Scanner, Table,
-};
+use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table};
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 use crate::storage::MemoryResult;
 
@@ -273,54 +271,51 @@ pub(crate) fn pk_conjunct_id(expr: &dyn Expression, schema: &Schema) -> Option<i
 }
 
 /// How an UPDATE or DELETE reaches the hot rows its WHERE names
-pub(crate) enum WriteAccess {
-    /// The row the primary key equality, the whole WHERE, names
+enum WriteAccess<'a> {
+    /// The row a primary key equality names, judged by the WHERE again
     Key(i64),
-    /// Every key of a bounded primary key range, the whole WHERE
+    /// Every key of a primary key index range that is the whole WHERE
     KeyRange(i64, i64),
     /// The rows an index plan gives, each judged by the WHERE again
-    Index(IndexPlan),
+    Index(&'a IndexPlan),
     /// Every row
     Scan,
 }
 
-/// The access to the hot rows of a table of `schema`, whose indexes `store`
-/// holds, that `where_expr` names: the one rule every write follows
-#[inline(always)]
-pub(crate) fn write_access(
-    store: &VersionStore,
+/// `access`, decided for `where_expr` over a table of `schema`, with the
+/// keys a key plan or a primary key range names taken from the WHERE; a
+/// plan whose keys it does not hold, or a mixed one, reads every row
+fn write_access<'a>(
     schema: &Schema,
+    access: ScanAccess<'a>,
     where_expr: Option<&dyn Expression>,
-) -> WriteAccess {
-    let Some(expr) = where_expr else {
+) -> WriteAccess<'a> {
+    let (ScanAccess::Index(plan), Some(expr)) = (access, where_expr) else {
         return WriteAccess::Scan;
     };
-    if let Some(key) = pk_equality_id(expr, schema) {
-        return WriteAccess::Key(key);
-    }
-    if let Some((low, high)) = key_range(expr, schema) {
-        return WriteAccess::KeyRange(low, high);
-    }
-    match index_plan::decide(store, schema, expr) {
-        Some(plan) => WriteAccess::Index(plan),
-        None => WriteAccess::Scan,
+    match plan {
+        IndexPlan::Key => pk_conjunct_id(expr, schema).map_or(WriteAccess::Scan, WriteAccess::Key),
+        IndexPlan::Read {
+            index,
+            read: Read::Range,
+        } if index.index_type() == IndexType::PrimaryKey => key_range(expr, schema)
+            .map_or(WriteAccess::Index(plan), |(low, high)| {
+                WriteAccess::KeyRange(low, high)
+            }),
+        IndexPlan::Mixed(_) => WriteAccess::Scan,
+        plan => WriteAccess::Index(plan),
     }
 }
 
-/// The bounds of an AND of comparisons on the primary key alone (WHERE
-/// id >= X AND id < Y), whose keys are row ids; None when a comparison is
-/// on another column, or the range is too wide to list
+/// The keys of a WHERE of comparisons on the primary key alone, row ids all;
+/// None when another conjunct joins them, or the range is too wide to list
 fn key_range(expr: &dyn Expression, schema: &Schema) -> Option<(i64, i64)> {
-    let &[pk] = schema.primary_key_indices() else {
-        return None;
-    };
-    let pk_col_name = &schema.columns[pk].name;
-    expr.get_and_operands()?;
+    let pk = &schema.columns[schema.pk_column_index()?].name;
     let mut leaves = Vec::new();
     if !collect_conjuncts(expr, &mut leaves)
         || !leaves
             .iter()
-            .all(|(column, _, _)| column.eq_ignore_ascii_case(pk_col_name))
+            .all(|(column, _, _)| column.eq_ignore_ascii_case(pk))
     {
         return None;
     }
@@ -334,7 +329,7 @@ fn key_range(expr: &dyn Expression, schema: &Schema) -> Option<(i64, i64)> {
         Resolved::Empty => (1, 0),
         Resolved::Fallback => return None,
     };
-    // A wider range is left to the indexes, so its keys are never all listed
+    // A wider range is read by the index, so its keys are never all listed
     const MAX_PK_RANGE_SIZE: i64 = 100_000;
     let range_size = end.saturating_sub(start).saturating_add(1);
     (range_size <= MAX_PK_RANGE_SIZE).then_some((start, end))
@@ -657,13 +652,6 @@ impl MVCCTable {
         Ok(delete_count)
     }
 
-    /// Try to extract a primary key lookup from the expression
-    ///
-    /// Returns Some(row_id) if the expression is a simple equality on the PK column
-    fn try_pk_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<i64> {
-        pk_equality_id(expr, schema)
-    }
-
     /// Try to use an index to filter row IDs
     ///
     /// Returns Some(row_ids) if an index can be used, None otherwise
@@ -686,112 +674,64 @@ impl MVCCTable {
             .collect()
     }
 
-    /// A conjunction of equalities on the leading columns of a multi-column
-    /// index, with the bounds the same conjunction puts on the next column
-    fn prefix_plan(&self, expr: &dyn Expression) -> Option<PrefixPlan> {
+    /// The keys a `top_k_walk` plan, `walk`, walks for `expr`: the prefix
+    /// its equalities give and the bounds on the walked column; a walk of a
+    /// column's own index starts past the NULL keys. None when a key is NULL
+    fn walk_keys(&self, walk: &IndexPlan, expr: &dyn Expression) -> Option<PrefixPlan> {
+        use crate::core::Operator;
         let mut leaves = Vec::new();
         if !collect_conjuncts(expr, &mut leaves) {
             return None;
         }
-        let eq_columns: Vec<&str> = leaves
-            .iter()
-            .filter(|(_, op, value)| matches!(op, crate::core::Operator::Eq) && !value.is_null())
-            .map(|(column, _, _)| *column)
-            .collect();
-        if eq_columns.is_empty() {
-            return None;
-        }
-        let (index, matched) = self.version_store.get_multi_column_index(&eq_columns)?;
+        let (index, equal) = match walk {
+            IndexPlan::Prefix { index, equal, .. } => (index, *equal),
+            IndexPlan::Read { index, .. } => (index, 0),
+            _ => return None,
+        };
         let columns = index.column_names();
-        let mut prefix = Vec::with_capacity(matched);
-        for column in columns.iter().take(matched) {
+        let mut prefix = Vec::with_capacity(equal);
+        for column in &columns[..equal] {
             let (_, _, value) = leaves.iter().find(|(name, op, value)| {
-                matches!(op, crate::core::Operator::Eq)
-                    && !value.is_null()
-                    && name.eq_ignore_ascii_case(column)
+                *op == Operator::Eq && !value.is_null() && name.eq_ignore_ascii_case(column)
             })?;
             prefix.push((*value).clone());
         }
-        let walked = columns.get(matched)?;
+        let walked = columns.get(equal)?;
         let mut lower = None;
         let mut upper = None;
         for (name, op, value) in &leaves {
-            if !name.eq_ignore_ascii_case(walked) || value.is_null() {
+            if !name.eq_ignore_ascii_case(walked) {
                 continue;
             }
+            if value.is_null() {
+                return None;
+            }
             match op {
-                crate::core::Operator::Gt => lower = Some(((*value).clone(), false)),
-                crate::core::Operator::Gte => lower = Some(((*value).clone(), true)),
-                crate::core::Operator::Lt => upper = Some(((*value).clone(), false)),
-                crate::core::Operator::Lte => upper = Some(((*value).clone(), true)),
+                Operator::Gt => lower = Some(((*value).clone(), false)),
+                Operator::Gte => lower = Some(((*value).clone(), true)),
+                Operator::Lt => upper = Some(((*value).clone(), false)),
+                Operator::Lte => upper = Some(((*value).clone(), true)),
                 _ => {}
             }
         }
+        if equal == 0 {
+            lower = lower.or(Some((Value::Null(DataType::Null), false)));
+        }
         Some(PrefixPlan {
-            index,
+            index: Arc::clone(index),
             prefix,
             lower,
             upper,
         })
     }
 
-    /// A walk of the order column's own index for a WHERE of bounds on that
-    /// column only, so each visible row it visits is in the answer; it starts
-    /// past the NULL keys
-    fn range_plan(&self, expr: &dyn Expression, column_name: &str) -> Option<PrefixPlan> {
-        let mut leaves = Vec::new();
-        if !collect_conjuncts(expr, &mut leaves) {
-            return None;
-        }
-        let mut lower = None;
-        let mut upper = None;
-        for (name, op, value) in &leaves {
-            if !name.eq_ignore_ascii_case(column_name) || value.is_null() {
-                return None;
-            }
-            let side = match op {
-                crate::core::Operator::Gt | crate::core::Operator::Gte => &mut lower,
-                crate::core::Operator::Lt | crate::core::Operator::Lte => &mut upper,
-                _ => return None,
-            };
-            let inclusive = matches!(op, crate::core::Operator::Gte | crate::core::Operator::Lte);
-            *side = Some(((*value).clone(), inclusive));
-        }
-        let index = self.version_store.get_index_by_column(column_name)?;
-        Some(PrefixPlan {
-            index,
-            prefix: Vec::new(),
-            lower: lower.or(Some((Value::Null(DataType::Null), false))),
-            upper,
-        })
-    }
-
-    /// The ids the indexes give for `expr`; under a statement view only while
-    /// no change the removal history does not cover ran, with every entry a
-    /// commit the view does not see took out added back from the history.
-    /// Every caller reads the rows through the view and applies `expr` again
-    fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
-        let plan = index_plan::decide(&self.version_store, &self.cached_schema, expr)?;
-        self.read_indexes(&plan, expr)
-    }
-
-    /// The ids `access` reads, its values taken from `filter`; None for a
-    /// scan of every row
-    fn access_ids(
-        &self,
-        access: ScanAccess<'_>,
-        filter: Option<&dyn Expression>,
-    ) -> Option<RowIdVec> {
-        match (access, filter) {
-            (ScanAccess::Index(plan), Some(filter)) => self.read_indexes(plan, filter),
-            _ => None,
-        }
-    }
-
-    /// The ids `plan` reads for `expr`, under the guard `try_index_lookup`
-    /// describes
+    /// The ids `plan` reads for `expr`; an index read under a statement view
+    /// only while no change the removal history does not cover ran, with
+    /// every entry a commit the view does not see took out added back from
+    /// the history. Every caller reads the rows through the view and applies
+    /// `expr` again
     fn read_indexes(&self, plan: &IndexPlan, expr: &dyn Expression) -> Option<RowIdVec> {
-        let Some(view) = self.view.as_ref() else {
+        let Some(view) = self.view.as_ref().filter(|_| !plan.names_keys()) else {
             return self.read_plan(plan, expr, None);
         };
         let epoch = self.committed_candidate_epoch()?;
@@ -803,21 +743,6 @@ impl MVCCTable {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::view_index_lookup_answered();
         Some(row_ids)
-    }
-
-    /// The index and the `[start, end)` text range a `LIKE 'prefix%'` reads:
-    /// only a TEXT column's index orders its keys as LIKE reads them
-    fn like_prefix_range(&self, expr: &dyn Expression) -> Option<(Arc<dyn Index>, Value, Value)> {
-        let (col_name, prefix, negated) = expr.get_like_prefix_info()?;
-        if negated {
-            return None;
-        }
-        let index = self.version_store.get_index_by_column(col_name)?;
-        if index.data_types() != [DataType::Text] {
-            return None;
-        }
-        let end = crate::core::pattern::Pattern::prefix_range_end(&prefix)?;
-        Some((index, Value::text(&prefix), Value::text(&end)))
     }
 
     /// The ids `plan` reads for `expr`, each read taking its values from
@@ -882,6 +807,8 @@ impl MVCCTable {
                 row_ids.dedup();
                 Some(row_ids)
             }
+            // An unindexed operand leaves the rows to a scan
+            IndexPlan::Mixed(_) => None,
             IndexPlan::Read { index, read } => {
                 let row_ids = self.read_column(&**index, *read, scope, history);
                 #[cfg(feature = "test-failpoints")]
@@ -1381,38 +1308,36 @@ impl MVCCTable {
         }
     }
 
-    /// Hybrid optimization for mixed OR predicates (some indexed, some not).
-    ///
-    /// For `(indexed_col = X OR non_indexed_col = Y)`:
-    /// 1. Fetch rows matching indexed branches via index lookup
-    /// 2. Scan all rows evaluating only the non-indexed branches (skip already-found rows)
-    /// 3. Union deduplicated results
-    ///
-    /// Returns `Some(rows)` when we can handle this, `None` to fall through.
-    fn try_mixed_or_fetch(
+    /// Up to `limit` rows past `offset` that the OR `expr` keeps, read as an
+    /// `IndexPlan::Mixed` of `reads` says: the rows its indexed operands
+    /// name, then a scan asking the other operands of the rows left
+    fn mixed_rows_with_limit(
         &self,
+        reads: &[Option<IndexPlan>],
         expr: &dyn Expression,
-        schema: &Schema,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
         if limit == 0 {
             return Ok(Some(RowVec::new()));
         }
-
-        let Some(or_operands) = expr.get_or_operands() else {
+        let schema = &*self.cached_schema;
+        let mut operands = SmallVec::new();
+        index_plan::disjuncts(expr, schema, &mut operands);
+        if operands.len() != reads.len() {
             return Ok(None);
-        };
+        }
 
-        // Partition operands into indexed and non-indexed
+        // An operand whose read declines joins the scanned ones
         let mut indexed_row_ids: Vec<RowIdVec> = Vec::new();
         let mut unindexed_operands: Vec<Box<dyn Expression>> = Vec::new();
-
-        for operand in or_operands {
-            if let Some(row_ids) = self.try_index_lookup(operand.as_ref()) {
-                indexed_row_ids.push(row_ids);
-            } else {
-                unindexed_operands.push(operand.clone_box());
+        for (read, &operand) in reads.iter().zip(&operands) {
+            match read
+                .as_ref()
+                .and_then(|plan| self.read_indexes(plan, operand))
+            {
+                Some(row_ids) => indexed_row_ids.push(row_ids),
+                None => unindexed_operands.push(operand.clone_box()),
             }
         }
 
@@ -2107,14 +2032,13 @@ impl MVCCTable {
     /// This is the LIMIT pushdown optimization
     fn collect_visible_rows_with_limit(
         &self,
+        access: ScanAccess<'_>,
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        if let Some(expr) = filter {
-            if let Some(rows) = self.keyed_rows_with_limit(expr, limit, offset)? {
-                return Ok(rows);
-            }
+        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset)? {
+            return Ok(rows);
         }
         self.visible_rows_with_limit(filter, limit, offset)
     }
@@ -2234,89 +2158,51 @@ impl MVCCTable {
     /// skip sorting and return rows in arbitrary order, enabling true early termination.
     fn collect_visible_rows_with_limit_unordered(
         &self,
+        access: ScanAccess<'_>,
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        if let Some(expr) = filter {
-            if let Some(rows) = self.keyed_rows_with_limit(expr, limit, offset)? {
-                return Ok(rows);
-            }
+        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset)? {
+            return Ok(rows);
         }
         self.limited_rows_unordered(filter, limit, offset)
     }
 
-    /// Up to `limit` rows past `offset` of those `expr` names by the
-    /// primary key or the indexes, that it keeps; None when neither names them
-    fn keyed_rows_with_limit(
+    /// Up to `limit` rows past `offset` that `access` reads and `filter`
+    /// keeps; None when it reads every row, or declines to
+    fn access_rows_with_limit(
         &self,
-        expr: &dyn Expression,
+        access: ScanAccess<'_>,
+        filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
-        let schema = &self.cached_schema;
-
-        // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
-        // This is O(1) and skips all scanning
-        if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
-            // Direct O(1) lookup by primary key
-            let txn_versions = self.local();
-            // Check local versions first via get_local_version (preserves
-            // delete signal). txn_versions.get() swallows deletes as None,
-            // which would cause a fallback to the committed store and miss
-            // uncommitted deletes in the current transaction.
-            let row = if let Some(local) = txn_versions.get_local_version(pk_id) {
-                if local.is_deleted() {
-                    None // Locally deleted in this transaction
-                } else {
-                    Some((pk_id, local.data.clone()))
-                }
-            } else if let Some(version) =
-                self.version_store.get_visible_version(pk_id, self.reader())
-            {
-                if !version.is_deleted() {
-                    Some((pk_id, version.data.clone()))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            return Ok(Some(match row {
-                Some((row_id, r)) if offset == 0 && limit >= 1 => {
-                    let mut rv = RowVec::with_capacity(1);
-                    rv.push((row_id, self.normalize_row_to_schema(r, schema)));
-                    rv
-                }
-                _ => RowVec::new(),
-            }));
-        }
-
-        // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
-        // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
-        let row_ids = self.try_index_lookup(expr);
-        if let Some(result) = self.index_rows_with_limit(row_ids, expr, limit, offset)? {
-            return Ok(Some(result));
-        }
-
-        // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
-        self.try_mixed_or_fetch(expr, schema, limit, offset)
-    }
-
-    /// Up to `limit` rows past `offset` of those the indexes gave, `row_ids`,
-    /// that `filter` keeps; None when the indexes did not answer or the
-    /// transaction has changes of its own
-    fn index_rows_with_limit(
-        &self,
-        row_ids: Option<RowIdVec>,
-        filter: &dyn Expression,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Option<RowVec>> {
-        let Some(row_ids) = row_ids else {
+        let (ScanAccess::Index(plan), Some(filter)) = (access, filter) else {
             return Ok(None);
         };
+        match plan {
+            IndexPlan::Mixed(reads) => {
+                return self.mixed_rows_with_limit(reads, filter, limit, offset)
+            }
+            // The one row a key names is past an offset or under no limit
+            IndexPlan::Key => {
+                let mut rows = self.key_rows(filter)?;
+                if offset > 0 || limit == 0 {
+                    rows.iter_mut().for_each(|rows| rows.clear());
+                }
+                return Ok(rows);
+            }
+            _ => {}
+        }
+        let Some(row_ids) = self.read_indexes(plan, filter) else {
+            return Ok(None);
+        };
+        // A key list names the transaction's own rows, read by their ids
+        if plan.names_keys() && self.local().has_local_changes() {
+            let rows = self.fetch_rows_by_ids(&row_ids, filter)?;
+            return Ok(Some(rows.into_iter().skip(offset).take(limit).collect()));
+        }
         self.try_fetch_from_index(row_ids, filter, &self.cached_schema, limit, offset)
     }
 
@@ -2328,6 +2214,9 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        #[cfg(test)]
+        self.full_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let schema = &self.cached_schema;
         let txn_versions = self.local();
 
@@ -2404,6 +2293,7 @@ impl MVCCTable {
     /// write through another handle
     fn plan_rows(
         &self,
+        access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         skip: Option<&FxHashMap<i64, u64>>,
@@ -2415,7 +2305,7 @@ impl MVCCTable {
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         if let Some(expr) = where_expr {
-            let access = write_access(&self.version_store, schema, Some(expr));
+            let access = write_access(schema, access, Some(expr));
             // The row the key names
             if let WriteAccess::Key(pk_id) = access {
                 if skipped(pk_id) {
@@ -2437,8 +2327,10 @@ impl MVCCTable {
                 self.check_read()?;
                 if let Some((row, read)) = read {
                     let row = self.normalize_row_to_schema(row, schema);
-                    plan.hot.push((pk_id, row, read));
-                    self.set_planned(plan, start, setter)?;
+                    if passes(expr, fallible, &row)? {
+                        plan.hot.push((pk_id, row, read));
+                        self.set_planned(plan, start, setter)?;
+                    }
                 }
                 return Ok(());
             }
@@ -2896,21 +2788,60 @@ impl MVCCTable {
 }
 
 impl MVCCTable {
-    /// The rows the indexes gave, `row_ids`, this transaction's own rows
-    /// among them, that `filter` keeps; None when the indexes did not answer
-    fn index_rows(
+    /// The rows `access` reads, this transaction's own rows among them, that
+    /// `filter` keeps; None for a scan of every row
+    fn access_rows(
         &self,
-        row_ids: Option<RowIdVec>,
+        access: ScanAccess<'_>,
         filter: Option<&dyn Expression>,
     ) -> Result<Option<RowVec>> {
-        let Some(mut row_ids) = row_ids else {
+        let (ScanAccess::Index(plan), Some(filter)) = (access, filter) else {
             return Ok(None);
         };
-        row_ids.extend(self.local_ids_missing_from(&row_ids));
-        let rows = match filter {
-            Some(filter) => self.fetch_rows_by_ids(&row_ids, filter)?,
-            None => self.fetch_rows_by_ids(&row_ids, &ConstBoolExpr::true_expr())?,
+        if let IndexPlan::Key = plan {
+            let rows = self.key_rows(filter)?;
+            self.check_read()?;
+            return Ok(rows);
+        }
+        let Some(mut row_ids) = self.read_indexes(plan, filter) else {
+            return Ok(None);
         };
+        if !plan.names_keys() {
+            row_ids.extend(self.local_ids_missing_from(&row_ids));
+        }
+        self.fetch_rows_by_ids(&row_ids, filter).map(Some)
+    }
+
+    /// The row an `IndexPlan::Key` names in `filter`, the transaction's own
+    /// version before the committed one, when `filter` keeps it; None when
+    /// the key is not an integer, which leaves the rows to the scan
+    fn key_rows(&self, filter: &dyn Expression) -> Result<Option<RowVec>> {
+        let schema = &self.cached_schema;
+        // A filter that is the key equality alone keeps the row it names
+        let whole = pk_equality_id(filter, schema);
+        let Some(id) = whole.or_else(|| pk_conjunct_id(filter, schema)) else {
+            return Ok(None);
+        };
+        // get_local_version keeps a local delete, which txn_versions.get()
+        // would hide behind the committed row
+        let row = {
+            let txn_versions = self.local();
+            match txn_versions.get_local_version(id) {
+                Some(local) => (!local.is_deleted()).then(|| local.data.clone()),
+                None => self
+                    .version_store
+                    .get_visible_version(id, self.reader())
+                    .filter(|version| !version.is_deleted())
+                    .map(|version| version.data.clone()),
+            }
+        };
+        let mut rows = RowVec::new();
+        if let Some(row) = row {
+            let row = self.normalize_row_to_schema(row, schema);
+            if whole.is_some() || passes(filter, filter.can_fail(), &row)? {
+                rows.push((id, row));
+            }
+        }
         Ok(Some(rows))
     }
 
@@ -3121,12 +3052,13 @@ impl Table for MVCCTable {
 
     fn update(
         &mut self,
+        access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut plan = PlannedUpdate::default();
-        self.plan_rows(where_expr, setter, None, &mut plan)?;
+        self.plan_rows(access, where_expr, setter, None, &mut plan)?;
         self.publish(&mut plan)
     }
 
@@ -3143,13 +3075,14 @@ impl Table for MVCCTable {
 
     fn plan_update(
         &mut self,
+        access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         skip: Option<&FxHashMap<i64, u64>>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
-        self.plan_rows(where_expr, setter, skip, plan)
+        self.plan_rows(access, where_expr, setter, skip, plan)
     }
 
     fn plan_update_by_row_ids(
@@ -3290,14 +3223,18 @@ impl Table for MVCCTable {
         }
     }
 
-    fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+    fn delete(
+        &mut self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per delete
         let schema = &self.cached_schema;
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         if let Some(expr) = where_expr {
-            let access = write_access(&self.version_store, schema, Some(expr));
+            let access = write_access(schema, access, Some(expr));
             if let WriteAccess::Key(pk_id) = access {
                 // Direct O(1) lookup by primary key
                 // Use get_local_version to preserve delete signal. txn_versions.get()
@@ -3328,6 +3265,9 @@ impl Table for MVCCTable {
                 self.check_read()?;
 
                 if let Some((row, original_version)) = row_with_original {
+                    if !passes(expr, fallible, &row)? {
+                        return Ok(0);
+                    }
                     if let Some(orig) = original_version {
                         // Use optimized put that skips redundant get_visible_version
                         self.writes()?.put_with_original(pk_id, row, orig, true)?;
@@ -3550,58 +3490,15 @@ impl Table for MVCCTable {
     ) -> Result<Box<dyn Scanner>> {
         // CompactArc clone - O(1) reference count increment instead of full Schema clone
         let schema = self.cached_schema.clone();
-
-        // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
-        if let Some(expr) = where_expr {
-            if let Some(pk_lookup) = self.try_pk_lookup(expr, &schema) {
-                // Direct O(1) lookup by primary key
-                // Use get_local_version to preserve delete signal. txn_versions.get()
-                // swallows deletes as None, causing fallback to committed store and
-                // missing uncommitted deletes in the current transaction.
-                let row = {
-                    let txn_versions = self.local();
-                    if let Some(local) = txn_versions.get_local_version(pk_lookup) {
-                        if local.is_deleted() {
-                            None // Locally deleted in this transaction
-                        } else {
-                            Some(local.data.clone())
-                        }
-                    } else if let Some(version) = self
-                        .version_store
-                        .get_visible_version(pk_lookup, self.reader())
-                    {
-                        if !version.is_deleted() {
-                            Some(version.data.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                self.check_read()?;
-
-                if let Some(row) = row {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    let row = self.normalize_row_to_schema(row, &schema);
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((pk_lookup, row));
-                    let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
-                    return Ok(Box::new(scanner));
-                } else {
-                    // Row not found - return empty scanner
-                    let scanner = MVCCScanner::empty(column_indices.to_vec());
-                    return Ok(Box::new(scanner));
-                }
-            }
-
-            // Try index lookup for non-PK columns
-            if let Some(rows) = self.index_rows(self.try_index_lookup(expr), Some(expr))? {
-                let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
-                return Ok(Box::new(scanner));
-            }
-        }
         self.scan_every(schema, column_indices, where_expr)
+    }
+
+    fn index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
+        index_plan::decide(&self.version_store, &self.cached_schema, where_expr, false)
+    }
+
+    fn limited_index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
+        index_plan::decide(&self.version_store, &self.cached_schema, where_expr, true)
     }
 
     fn scan_access(
@@ -3612,8 +3509,7 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
         let schema = self.cached_schema.clone();
-        let row_ids = self.access_ids(access, where_expr);
-        if let Some(rows) = self.index_rows(row_ids, where_expr)? {
+        if let Some(rows) = self.access_rows(access, where_expr)? {
             let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
             return Ok(Box::new(scanner));
         }
@@ -3625,8 +3521,7 @@ impl Table for MVCCTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
     ) -> Result<RowVec> {
-        let row_ids = self.access_ids(access, where_expr);
-        if let Some(rows) = self.index_rows(row_ids, where_expr)? {
+        if let Some(rows) = self.access_rows(access, where_expr)? {
             return Ok(rows);
         }
         self.collect_all_rows(where_expr)
@@ -3635,8 +3530,18 @@ impl Table for MVCCTable {
     /// Answered by walking a multi-column index whose leading columns the
     /// WHERE pins with equalities and whose next column is the order column:
     /// the rows come out in key order and the walk stops at the limit
+    fn top_k_walk(&self, where_expr: &dyn Expression, column_name: &str) -> Option<IndexPlan> {
+        index_plan::top_k_walk(
+            &self.version_store,
+            &self.cached_schema,
+            where_expr,
+            column_name,
+        )
+    }
+
     fn scan_top_k(
         &self,
+        walk: Option<&IndexPlan>,
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
@@ -3651,13 +3556,10 @@ impl Table for MVCCTable {
         if self.local().has_local_changes() {
             return Ok(None);
         }
-        let Some(expr) = where_expr else {
+        let (Some(walk), Some(expr)) = (walk, where_expr) else {
             return Ok(None);
         };
-        let Some(plan) = self
-            .prefix_plan(expr)
-            .or_else(|| self.range_plan(expr, column_name))
-        else {
+        let Some(plan) = self.walk_keys(walk, expr) else {
             return Ok(None);
         };
         if !plan.index.column_names()[plan.prefix.len()].eq_ignore_ascii_case(column_name) {
@@ -3779,8 +3681,17 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        // Use the optimized version with limit/offset
-        let rows = self.collect_visible_rows_with_limit(where_expr, limit, offset)?;
+        self.collect_access_rows_with_limit(ScanAccess::Seq, where_expr, limit, offset)
+    }
+
+    fn collect_access_rows_with_limit(
+        &self,
+        access: ScanAccess<'_>,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let rows = self.collect_visible_rows_with_limit(access, where_expr, limit, offset)?;
         self.check_read()?;
         Ok(rows)
     }
@@ -3791,10 +3702,7 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        // Use the optimized unordered version with true early termination
-        let rows = self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset)?;
-        self.check_read()?;
-        Ok(rows)
+        self.collect_access_rows_with_limit_unordered(ScanAccess::Seq, where_expr, limit, offset)
     }
 
     fn collect_access_rows_with_limit_unordered(
@@ -3804,17 +3712,8 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        let indexed = match where_expr {
-            Some(filter) => {
-                let row_ids = self.access_ids(access, where_expr);
-                self.index_rows_with_limit(row_ids, filter, limit, offset)?
-            }
-            None => None,
-        };
-        let rows = match indexed {
-            Some(rows) => rows,
-            None => self.limited_rows_unordered(where_expr, limit, offset)?,
-        };
+        let rows =
+            self.collect_visible_rows_with_limit_unordered(access, where_expr, limit, offset)?;
         self.check_read()?;
         Ok(rows)
     }
@@ -5172,7 +5071,9 @@ impl Table for MVCCTable {
             .collect();
 
         // Scan and collect results
-        let mut scanner = self.scan(&column_indices, expr)?;
+        let plan = expr.and_then(|expr| self.index_plan(expr));
+        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+        let mut scanner = self.scan_access(access, &column_indices, None, expr)?;
         let mut rows = Vec::new();
 
         while scanner.next() {
@@ -5214,345 +5115,6 @@ impl Table for MVCCTable {
 
     fn check_history(&self, point: &ReadPoint) -> Result<()> {
         self.version_store.check_history(point)
-    }
-
-    fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
-        use crate::core::Operator;
-
-        let table_name = self.cached_schema.table_name.clone();
-        let schema = &self.cached_schema;
-
-        // No WHERE clause - always Seq Scan
-        let Some(expr) = where_expr else {
-            return ScanPlan::SeqScan {
-                table: table_name,
-                filter: None,
-            };
-        };
-
-        // Check for PK lookup
-        let pk_indices = schema.primary_key_indices();
-        if pk_indices.len() == 1 {
-            let pk_col_idx = pk_indices[0];
-            let pk_col = &schema.columns[pk_col_idx];
-
-            if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-                if col_name.eq_ignore_ascii_case(&pk_col.name) && operator == Operator::Eq {
-                    return ScanPlan::PkLookup {
-                        table: table_name,
-                        pk_column: pk_col.name.clone(),
-                        pk_value: format!("{}", value),
-                    };
-                }
-            }
-
-            // An AND with a key equality reads that one row, as an index plan's Key does
-            if let (Some(id), Some(index)) = (
-                pk_conjunct_id(expr, schema),
-                self.version_store.get_index_by_column(&pk_col.name),
-            ) {
-                let key = Value::Integer(id);
-                let residual: Vec<String> = expr
-                    .collect_comparisons()
-                    .iter()
-                    .filter(|(col, op, val)| {
-                        !(col.eq_ignore_ascii_case(&pk_col.name)
-                            && *op == Operator::Eq
-                            && **val == key)
-                    })
-                    .map(|(col, op, val)| format!("{} {} {}", col, operator_to_string(*op), val))
-                    .collect();
-                return ScanPlan::IndexScan {
-                    table: table_name,
-                    index_name: index.name().to_string(),
-                    column: pk_col.name.clone(),
-                    condition: format!("= {}", id),
-                    filter: (!residual.is_empty()).then(|| residual.join(" AND ")),
-                };
-            }
-        }
-
-        // Check for single column index lookup
-        if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-            // Skip boolean index (low cardinality)
-            if !matches!(value, Value::Boolean(_))
-                || !matches!(operator, Operator::Eq | Operator::Ne)
-            {
-                if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                    let condition = format!("{} {}", operator_to_string(operator), value);
-                    return ScanPlan::IndexScan {
-                        table: table_name,
-                        index_name: index.name().to_string(),
-                        column: col_name.to_string(),
-                        condition,
-                        filter: None,
-                    };
-                }
-            }
-        }
-
-        // Check for LIKE prefix pattern, as an index plan reads it
-        if let (Some((col_name, prefix, _)), Some((index, _, _))) =
-            (expr.get_like_prefix_info(), self.like_prefix_range(expr))
-        {
-            return ScanPlan::IndexScan {
-                table: table_name,
-                index_name: index.name().to_string(),
-                column: col_name.to_string(),
-                condition: format!("LIKE '{}%'", prefix),
-                filter: None,
-            };
-        }
-
-        // Check for OR expressions (union of indexes)
-        if let Some(or_operands) = expr.get_or_operands() {
-            let mut indexed_info: Vec<(String, String, String)> = Vec::new();
-            let mut all_indexed = true;
-
-            for operand in or_operands {
-                if let Some((col_name, operator, value)) = operand.get_comparison_info() {
-                    if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                        let condition = format!("{} {}", operator_to_string(operator), value);
-                        indexed_info.push((
-                            index.name().to_string(),
-                            col_name.to_string(),
-                            condition,
-                        ));
-                    } else {
-                        all_indexed = false;
-                    }
-                } else {
-                    all_indexed = false;
-                }
-            }
-
-            if !indexed_info.is_empty() {
-                if all_indexed {
-                    if indexed_info.len() == 1 {
-                        let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
-                        return ScanPlan::IndexScan {
-                            table: table_name,
-                            index_name: idx_name,
-                            column: col,
-                            condition: cond,
-                            filter: None,
-                        };
-                    }
-                    return ScanPlan::MultiIndexScan {
-                        table: table_name,
-                        indexes: indexed_info,
-                        operation: "OR".to_string(),
-                        filter: None,
-                    };
-                }
-                // Mixed OR: some operands indexed, some not — hybrid scan
-                // Show as Multi-Index Scan with a Filter for the non-indexed operands
-                let non_indexed_parts: Vec<String> = or_operands
-                    .iter()
-                    .filter(|op| {
-                        if let Some((col_name, _, _)) = op.get_comparison_info() {
-                            self.version_store.get_index_by_column(col_name).is_none()
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|op| {
-                        if let Some((col, operator, val)) = op.get_comparison_info() {
-                            format!("{} {} {}", col, operator_to_string(operator), val)
-                        } else {
-                            format!("{:?}", op)
-                        }
-                    })
-                    .collect();
-                let filter_str = if non_indexed_parts.len() == 1 {
-                    non_indexed_parts.into_iter().next().unwrap()
-                } else {
-                    non_indexed_parts.join(" OR ")
-                };
-                return ScanPlan::MultiIndexScan {
-                    table: table_name,
-                    indexes: indexed_info,
-                    operation: "OR".to_string(),
-                    filter: Some(filter_str),
-                };
-            }
-        }
-
-        // Check for multi-column (composite) index before single-column index intersection
-        let comparisons = expr.collect_comparisons();
-        if !comparisons.is_empty() {
-            // Group by column - needed for both multi-column and single-column index checks
-            let mut column_conditions: FxHashMap<&str, Vec<(Operator, &Value)>> =
-                FxHashMap::default();
-            for (col_name, op, val) in &comparisons {
-                column_conditions
-                    .entry(*col_name)
-                    .or_default()
-                    .push((*op, *val));
-            }
-
-            // Collect columns with equality predicates (best for multi-column index)
-            let eq_columns: Vec<&str> = column_conditions
-                .iter()
-                .filter_map(|(col, ops)| {
-                    if ops.iter().any(|(op, _)| *op == Operator::Eq) {
-                        Some(*col)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Try multi-column index if we have equality predicates matching a prefix
-            if !eq_columns.is_empty() {
-                if let Some((multi_idx, matched_count)) =
-                    self.version_store.get_multi_column_index(&eq_columns)
-                {
-                    let index_columns = multi_idx.column_names();
-                    let mut columns = Vec::new();
-                    let mut conditions = Vec::new();
-
-                    // Build columns and conditions in index column order
-                    for col in index_columns.iter().take(matched_count) {
-                        if let Some(ops) = column_conditions.get(col.as_str()) {
-                            columns.push(col.clone());
-                            // Find the equality condition
-                            for (op, val) in ops {
-                                if *op == Operator::Eq {
-                                    conditions.push(format!("= {}", val));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Check if the next index column (after the equality prefix) has
-                    // range predicates — the composite index BTree can serve these too
-                    if matched_count < index_columns.len() {
-                        let next_col = &index_columns[matched_count];
-                        if let Some(ops) = column_conditions.get(next_col.as_str()) {
-                            let range_ops: Vec<String> = ops
-                                .iter()
-                                .filter(|(op, _)| !matches!(op, Operator::Eq))
-                                .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
-                                .collect();
-                            if !range_ops.is_empty() {
-                                columns.push(next_col.clone());
-                                conditions.push(range_ops.join(" AND "));
-                            }
-                        }
-                    }
-
-                    if !columns.is_empty() {
-                        // Collect residual predicates: columns not covered by the index
-                        let covered: rustc_hash::FxHashSet<&str> =
-                            columns.iter().map(|c| c.as_str()).collect();
-                        let residual: Vec<String> = column_conditions
-                            .iter()
-                            .filter(|(col, _)| !covered.contains(*col))
-                            .map(|(col, ops)| {
-                                ops.iter()
-                                    .map(|(op, val)| {
-                                        format!("{} {} {}", col, operator_to_string(*op), val)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" AND ")
-                            })
-                            .collect();
-                        let filter = if residual.is_empty() {
-                            None
-                        } else {
-                            Some(residual.join(" AND "))
-                        };
-
-                        return ScanPlan::CompositeIndexScan {
-                            table: table_name,
-                            index_name: multi_idx.name().to_string(),
-                            columns,
-                            conditions,
-                            filter,
-                        };
-                    }
-                }
-            }
-        }
-
-        // Check for AND expressions (intersection of indexes)
-        if !comparisons.is_empty() {
-            let mut indexed_info: Vec<(String, String, String)> = Vec::new();
-
-            // Re-group by column for single-column index checks
-            let mut column_conditions: FxHashMap<&str, Vec<(Operator, &Value)>> =
-                FxHashMap::default();
-            for (col_name, op, val) in &comparisons {
-                column_conditions
-                    .entry(*col_name)
-                    .or_default()
-                    .push((*op, *val));
-            }
-
-            let mut indexed_columns: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
-            for (col_name, ops) in &column_conditions {
-                if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                    // Simplify to a single condition string
-                    let condition = if ops.len() == 1 {
-                        let (op, val) = ops[0];
-                        format!("{} {}", operator_to_string(op), val)
-                    } else {
-                        // Multiple conditions on same column (e.g., col >= 5 AND col <= 10)
-                        let parts: Vec<String> = ops
-                            .iter()
-                            .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
-                            .collect();
-                        parts.join(" AND ")
-                    };
-                    indexed_info.push((index.name().to_string(), col_name.to_string(), condition));
-                    indexed_columns.insert(col_name);
-                }
-            }
-
-            if !indexed_info.is_empty() {
-                // Collect residual predicates for non-indexed columns
-                let residual: Vec<String> = column_conditions
-                    .iter()
-                    .filter(|(col, _)| !indexed_columns.contains(*col))
-                    .map(|(col, ops)| {
-                        ops.iter()
-                            .map(|(op, val)| format!("{} {} {}", col, operator_to_string(*op), val))
-                            .collect::<Vec<_>>()
-                            .join(" AND ")
-                    })
-                    .collect();
-                let filter = if residual.is_empty() {
-                    None
-                } else {
-                    Some(residual.join(" AND "))
-                };
-
-                if indexed_info.len() == 1 {
-                    let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
-                    return ScanPlan::IndexScan {
-                        table: table_name,
-                        index_name: idx_name,
-                        column: col,
-                        condition: cond,
-                        filter,
-                    };
-                }
-                return ScanPlan::MultiIndexScan {
-                    table: table_name,
-                    indexes: indexed_info,
-                    operation: "AND".to_string(),
-                    filter,
-                };
-            }
-        }
-
-        // Default: Seq Scan with filter
-        ScanPlan::SeqScan {
-            table: table_name,
-            filter: Some(format!("{:?}", expr)),
-        }
     }
 
     fn set_zone_maps(&self, zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
@@ -5632,24 +5194,6 @@ impl Table for MVCCTable {
         )?;
         self.check_read()?;
         Ok(groups)
-    }
-}
-
-/// Helper function to convert Operator to string for display
-fn operator_to_string(op: crate::core::Operator) -> &'static str {
-    use crate::core::Operator;
-    match op {
-        Operator::Eq => "=",
-        Operator::Ne => "!=",
-        Operator::Lt => "<",
-        Operator::Lte => "<=",
-        Operator::Gt => ">",
-        Operator::Gte => ">=",
-        Operator::Like => "LIKE",
-        Operator::In => "IN",
-        Operator::NotIn => "NOT IN",
-        Operator::IsNull => "IS NULL",
-        Operator::IsNotNull => "IS NOT NULL",
     }
 }
 
@@ -5736,6 +5280,23 @@ mod tests {
     /// A table of `rows` committed rows with an index on `k`, read by a
     /// later transaction of the same registry
     fn indexed_table(rows: i64) -> (Arc<VersionStore>, MVCCTable) {
+        let (registry, version_store) = indexed_store(rows);
+        let (reader_txn, _) = registry.begin_transaction();
+        let reader = MVCCTable::new(
+            reader_txn,
+            Arc::clone(&version_store),
+            TransactionVersionStore::new(Arc::clone(&version_store), reader_txn),
+        );
+        (version_store, reader)
+    }
+
+    /// `rows` committed rows `(i, i * 10)` of a table indexed on `k`
+    fn indexed_store(
+        rows: i64,
+    ) -> (
+        Arc<crate::storage::mvcc::registry::TransactionRegistry>,
+        Arc<VersionStore>,
+    ) {
         let schema = SchemaBuilder::new("t")
             .column("id", DataType::Integer, false, true)
             .column("k", DataType::Integer, true, false)
@@ -5764,13 +5325,7 @@ mod tests {
         }
         writer.commit_published().unwrap();
         registry.commit_transaction(writer_txn);
-        let (reader_txn, _) = registry.begin_transaction();
-        let reader = MVCCTable::new(
-            reader_txn,
-            Arc::clone(&version_store),
-            TransactionVersionStore::new(Arc::clone(&version_store), reader_txn),
-        );
-        (version_store, reader)
+        (registry, version_store)
     }
 
     fn equals(table: &MVCCTable, k: i64) -> crate::storage::expression::ComparisonExpr {
@@ -5783,17 +5338,26 @@ mod tests {
         expr
     }
 
+    /// `table`'s scan of `expr` by the access the rule decides for it
+    fn decided_scan(table: &MVCCTable, expr: &dyn Expression) -> Box<dyn Scanner> {
+        let plan = table.index_plan(expr);
+        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+        table
+            .scan_access(access, &[0, 1], None, Some(expr))
+            .unwrap()
+    }
+
     #[test]
     fn an_absent_key_is_answered_by_the_index_without_a_scan() {
         let (_store, table) = indexed_table(100);
-        let mut scanner = table.scan(&[0, 1], Some(&equals(&table, 555))).unwrap();
+        let mut scanner = decided_scan(&table, &equals(&table, 555));
         assert!(!scanner.next());
         assert_eq!(
             table.full_scans(),
             0,
             "an empty probe must not fall through to a scan"
         );
-        let mut scanner = table.scan(&[0, 1], Some(&equals(&table, 70))).unwrap();
+        let mut scanner = decided_scan(&table, &equals(&table, 70));
         assert!(scanner.next());
         assert_eq!(scanner.row().get(0), Some(&Value::Integer(7)));
         assert!(!scanner.next());
@@ -5811,11 +5375,81 @@ mod tests {
                 Value::Integer(555),
             ]))
             .unwrap();
-        let mut scanner = table.scan(&[0, 1], Some(&equals(&table, 555))).unwrap();
+        let mut scanner = decided_scan(&table, &equals(&table, 555));
         assert!(scanner.next());
         assert_eq!(scanner.row().get(0), Some(&Value::Integer(1000)));
         assert!(!scanner.next());
         assert_eq!(table.full_scans(), 1);
+    }
+
+    #[test]
+    fn a_key_read_through_a_view_reads_its_keys_where_an_index_read_declines() {
+        use crate::core::{IsolationLevel, Operator};
+        use crate::storage::expression::{ComparisonExpr, InListExpr};
+        let (registry, store) = indexed_store(100);
+        let (txn, _) = registry.begin_transaction_at(IsolationLevel::SnapshotIsolation);
+        let table = MVCCTable::new(
+            txn,
+            Arc::clone(&store),
+            TransactionVersionStore::new(Arc::clone(&store), txn),
+        )
+        .with_view(Some(registry.capture_view()));
+        let ids = |scanner: &mut Box<dyn Scanner>| {
+            let mut ids = Vec::new();
+            while scanner.next() {
+                ids.push(scanner.current_row_id());
+            }
+            ids
+        };
+        assert_eq!(ids(&mut decided_scan(&table, &equals(&table, 70))), vec![7]);
+        assert_eq!(
+            table.full_scans(),
+            1,
+            "an index read under the snapshot scans"
+        );
+        let mut key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(7));
+        key.prepare_for_schema(table.schema());
+        assert_eq!(ids(&mut decided_scan(&table, &key)), vec![7]);
+        let mut keys = InListExpr::new("id", vec![Value::Integer(3), Value::Integer(7)]);
+        keys.prepare_for_schema(table.schema());
+        let mut read = ids(&mut decided_scan(&table, &keys));
+        read.sort_unstable();
+        assert_eq!(read, vec![3, 7]);
+        assert_eq!(table.full_scans(), 1, "a key read scanned");
+    }
+
+    #[test]
+    fn a_limited_key_read_in_a_transaction_with_local_writes_reads_its_keys() {
+        use crate::core::Operator;
+        use crate::storage::expression::{ComparisonExpr, InListExpr};
+        let (_store, mut table) = indexed_table(100);
+        table
+            .insert(Row::from_values(vec![
+                Value::Integer(1000),
+                Value::Integer(555),
+            ]))
+            .unwrap();
+        let limited = |table: &MVCCTable, expr: &dyn Expression| {
+            let plan = table.index_plan(expr).unwrap();
+            let rows = table
+                .collect_access_rows_with_limit_unordered(
+                    ScanAccess::Index(&plan),
+                    Some(expr),
+                    5,
+                    0,
+                )
+                .unwrap();
+            let mut ids: Vec<i64> = rows.into_iter().map(|(id, _)| id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let mut key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(7));
+        key.prepare_for_schema(table.schema());
+        assert_eq!(limited(&table, &key), vec![7]);
+        let mut keys = InListExpr::new("id", vec![Value::Integer(7), Value::Integer(1000)]);
+        keys.prepare_for_schema(table.schema());
+        assert_eq!(limited(&table, &keys), vec![7, 1000]);
+        assert_eq!(table.full_scans(), 0, "a limited key read scanned");
     }
 
     #[test]
@@ -5863,7 +5497,7 @@ mod tests {
             .unwrap();
 
         // Delete all rows (no filter)
-        let deleted = table.delete(None).unwrap();
+        let deleted = table.delete(ScanAccess::Seq, None).unwrap();
         assert_eq!(deleted, 3);
 
         // Verify no rows remain
@@ -5896,7 +5530,7 @@ mod tests {
 
         // Update the row
         let updated = table
-            .update(None, &mut |row| {
+            .update(ScanAccess::Seq, None, &mut |row| {
                 let mut new_row = row.clone();
                 let _ = new_row.set(1, Value::Integer(20));
                 Ok((new_row, true))

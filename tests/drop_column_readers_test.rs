@@ -1180,7 +1180,7 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
     let _guard = fp::FailpointGuard::new();
     use stoolap::core::{Operator, Row};
     use stoolap::storage::expression::{AndExpr, ComparisonExpr, ConstBoolExpr, Expression};
-    use stoolap::storage::traits::{Engine, Table};
+    use stoolap::storage::traits::{Engine, ScanAccess, Table};
     type Op = fn(&mut dyn Table, &AtomicBool) -> Result<(), Error>;
     let ops: [(&str, Op); 5] = [
         ("fetch_rows_by_ids", |table, _| {
@@ -1205,8 +1205,10 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
             let mut high = ComparisonExpr::new("id", Operator::Lt, Value::Integer(6));
             high.prepare_for_schema(table.schema());
             let range = AndExpr::new(vec![Box::new(low), Box::new(high)]);
+            let plan = table.index_plan(&range);
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table
-                .update(Some(&range), &mut |row| {
+                .update(access, Some(&range), &mut |row| {
                     called.store(true, Ordering::SeqCst);
                     Ok((row, true))
                 })
@@ -1215,8 +1217,10 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
         ("update by key", |table, called| {
             let mut key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(5));
             key.prepare_for_schema(table.schema());
+            let plan = table.index_plan(&key);
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table
-                .update(Some(&key), &mut |row| {
+                .update(access, Some(&key), &mut |row| {
                     called.store(true, Ordering::SeqCst);
                     Ok((row, true))
                 })

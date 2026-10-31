@@ -274,7 +274,7 @@ fn top_k_inside_a_seal_keeps_a_cold_row_updated_before_it() {
     let table = tx.get_table("t").unwrap();
     let rows = inside_seal(&db, Hold::IndexesCleaned, None, || {
         let rows = table
-            .scan_top_k(None, "v", true, 100, 0)
+            .scan_top_k(None, None, "v", true, 100, 0)
             .unwrap()
             .expect("the top-k path answers");
         row_pairs(&rows)

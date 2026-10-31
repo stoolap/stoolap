@@ -234,8 +234,8 @@ fn test_explain_analyze_index_scan() {
         plan
     );
     assert!(
-        plan.contains("Index Scan"),
-        "Expected Index Scan, got:\n{}",
+        plan.contains("IndexScan orders (user_id = 2)") && plan.contains("Index idx_user_id"),
+        "Expected an index scan, got:\n{}",
         plan
     );
 }
@@ -255,8 +255,8 @@ fn test_explain_analyze_pk_lookup() {
     );
     assert!(plan.contains("rows=1"), "Expected rows=1, got:\n{}", plan);
     assert!(
-        plan.contains("PK Lookup"),
-        "Expected PK Lookup, got:\n{}",
+        plan.contains("IndexScan orders (id = 5)") && plan.contains("PkKey"),
+        "Expected a key read, got:\n{}",
         plan
     );
 }

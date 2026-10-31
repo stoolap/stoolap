@@ -17,7 +17,7 @@
 
 use stoolap::core::Value;
 use stoolap::storage::expression::{Expression, InListExpr};
-use stoolap::storage::traits::Engine;
+use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::Database;
 
 /// The second column of every row the scan of `t` keeps under `s IN list`
@@ -26,7 +26,11 @@ fn scan(db: &Database, list: &[Value]) -> Vec<String> {
     let table = tx.get_table("t").unwrap();
     let mut expr = InListExpr::new("s", list.to_vec());
     expr.prepare_for_schema(table.schema());
-    let mut scanner = table.scan(&[0, 1], Some(&expr)).unwrap();
+    let plan = table.index_plan(&expr);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let mut scanner = table
+        .scan_access(access, &[0, 1], None, Some(&expr))
+        .unwrap();
     let mut out = Vec::new();
     while scanner.next() {
         out.push(format!("{:?}", scanner.take_row().get(1).unwrap()));

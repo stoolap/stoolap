@@ -35,7 +35,7 @@ use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema,
 use crate::storage::expression::Expression as StorageExpression;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::Engine;
+use crate::storage::traits::{Engine, ScanAccess};
 
 /// Check that all FK values in a row reference existing parent rows.
 /// Called on INSERT and UPDATE (when FK columns change).
@@ -149,7 +149,9 @@ fn parent_row_exists(
     // (O(log N)) when available
     let expr = key_filter(&parent_schema, ref_idx, value);
 
-    let rows = parent.collect_rows_with_limit_unordered(Some(&expr), 1, 0)?;
+    let plan = parent.index_plan(&expr);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let rows = parent.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
 }
 
@@ -515,7 +517,9 @@ fn child_rows_exist(
         parent_pk_value,
     );
 
-    let rows = child.collect_rows_with_limit_unordered(Some(&expr), 1, 0)?;
+    let plan = child.index_plan(&expr);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let rows = child.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
 }
 
@@ -666,7 +670,9 @@ fn cascade_delete_recursive(
         parent_pk_value,
     );
 
-    let count = child.delete(Some(&expr))?;
+    let plan = child.index_plan(&expr);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let count = child.delete(access, Some(&expr))?;
     // Do NOT commit here — changes stay in TransactionVersionStore and are committed
     // atomically when the parent transaction's commit_all_tables() runs.
 
@@ -811,7 +817,9 @@ fn cascade_update_recursive(
         });
     let mut vm = super::expression::ExprVM::new();
 
-    let count = child.update(Some(&expr), &mut |mut row| {
+    let plan = child.index_plan(&expr);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let count = child.update(access, Some(&expr), &mut |mut row| {
         let _ = row.set(col_idx, new_val.clone());
         for check in &checks {
             super::dml::run_check(&mut vm, check, &row)?;
@@ -901,7 +909,9 @@ fn set_null_on_delete(
         });
     let mut vm = super::expression::ExprVM::new();
 
-    let count = child.update(Some(&expr), &mut |mut row| {
+    let plan = child.index_plan(&expr);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let count = child.update(access, Some(&expr), &mut |mut row| {
         let _ = row.set(col_idx, null_val.clone());
         for check in &checks {
             super::dml::run_check(&mut vm, check, &row)?;

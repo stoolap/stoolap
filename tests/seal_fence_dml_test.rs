@@ -224,7 +224,10 @@ fn a_row_another_transaction_changed_while_prepared_is_a_write_conflict() {
         }
         Ok((row, true))
     };
-    let err = table.update(None, &mut setter).unwrap_err().to_string();
+    let err = table
+        .update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("write conflict"), "{err}");
     assert_eq!(calls, 1);
     drop(table);
@@ -291,8 +294,13 @@ fn a_prepared_row_sealed_again_outside_the_filter_is_a_write_conflict() {
         }
         Ok((row, true))
     };
+    let plan = table.index_plan(&filter);
+    let access = plan.as_ref().map_or(
+        stoolap::storage::traits::ScanAccess::Seq,
+        stoolap::storage::traits::ScanAccess::Index,
+    );
     let err = table
-        .update(Some(&filter), &mut setter)
+        .update(access, Some(&filter), &mut setter)
         .unwrap_err()
         .to_string();
     assert!(err.contains("write conflict"), "{err}");
@@ -361,7 +369,10 @@ fn a_prepared_row_another_transaction_holds_fails_before_any_hot_write() {
         bump(&mut row);
         Ok((row, true))
     };
-    let err = table.update(None, &mut setter).unwrap_err().to_string();
+    let err = table
+        .update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("uncommitted changes"), "{err}");
     // The cold row was prepared; the hot row was never set
     assert_eq!(calls, 1);
@@ -430,7 +441,7 @@ fn a_row_the_setter_left_unchanged_is_not_set_again_hot() {
         }
         Ok((row, false))
     };
-    let updated = table.update(None, &mut setter);
+    let updated = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter);
     drop(table);
     txn.rollback().unwrap();
     assert_eq!(calls, 1, "the setter ran again: {updated:?}");
@@ -469,7 +480,7 @@ fn a_changed_row_lands_while_an_unchanged_one_went_hot() {
             _ => Ok((row, false)),
         }
     };
-    let updated = table.update(None, &mut setter);
+    let updated = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter);
     drop(table);
     txn.commit().unwrap();
     seen.sort_unstable();
@@ -592,7 +603,7 @@ fn a_keyless_row_left_unchanged_that_went_hot_is_not_set_again() {
         seen.push(a);
         Ok((row, false))
     };
-    let updated = table.update(None, &mut setter);
+    let updated = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter);
     drop(table);
     txn.rollback().unwrap();
     seen.sort_unstable();
@@ -623,7 +634,7 @@ fn a_refused_statement_keeps_an_earlier_hot_claim_and_takes_no_new_one() {
         Ok((row, true))
     };
     assert_eq!(table.update_by_row_ids(&[2], &mut set).unwrap(), 1);
-    let refused = table.update(None, &mut set);
+    let refused = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut set);
     let rows = rows_of(table.as_ref());
     let earlier = db.execute("UPDATE t SET v = 5 WHERE id = 2", ());
     let new = db.execute("UPDATE t SET v = 5 WHERE id = 3", ());
@@ -675,19 +686,23 @@ fn a_cold_row_another_handle_wrote_from_the_setter_leaves_no_part_of_the_stateme
     let mut calls = Vec::new();
     // Hot row 3's setter call changes cold row 2, already prepared, through
     // the other handle
-    let updated = updater.update(None, &mut |mut row| {
-        let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
-        calls.push(id);
-        if id == 3 {
-            let mut set = |mut row: stoolap::core::Row| {
-                row.set(1, stoolap::core::Value::Integer(5)).unwrap();
-                Ok((row, true))
-            };
-            writer.update_by_row_ids(&[2], &mut set).unwrap();
-        }
-        row.set(1, stoolap::core::Value::Integer(7)).unwrap();
-        Ok((row, true))
-    });
+    let updated = updater.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
+            calls.push(id);
+            if id == 3 {
+                let mut set = |mut row: stoolap::core::Row| {
+                    row.set(1, stoolap::core::Value::Integer(5)).unwrap();
+                    Ok((row, true))
+                };
+                writer.update_by_row_ids(&[2], &mut set).unwrap();
+            }
+            row.set(1, stoolap::core::Value::Integer(7)).unwrap();
+            Ok((row, true))
+        },
+    );
     let rows = rows_of(reader.as_ref());
     drop(updater);
     drop(reader);
@@ -717,15 +732,23 @@ fn a_keyless_cold_update_refuses_a_null_or_a_wrong_type_when_it_runs() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("k").unwrap();
-    let null = table.update(None, &mut |mut row| {
-        row.set(0, stoolap::core::Value::null_unknown()).unwrap();
-        Ok((row, true))
-    });
-    let text = table.update(None, &mut |mut row| {
-        row.set(1, stoolap::core::Value::text("not a number"))
-            .unwrap();
-        Ok((row, true))
-    });
+    let null = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            row.set(0, stoolap::core::Value::null_unknown()).unwrap();
+            Ok((row, true))
+        },
+    );
+    let text = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            row.set(1, stoolap::core::Value::text("not a number"))
+                .unwrap();
+            Ok((row, true))
+        },
+    );
     let rows = rows_of(table.as_ref());
     drop(table);
     txn.rollback().unwrap();
@@ -749,14 +772,18 @@ fn a_keyless_cold_update_meets_a_hot_unique_key_when_it_runs() {
     db.execute("INSERT INTO k VALUES (2, 0)", ()).unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("k").unwrap();
-    let updated = table.update(None, &mut |mut row| {
-        let a = row.get(0).and_then(|v| v.as_int64()).unwrap();
-        if a == 1 {
-            row.set(0, stoolap::core::Value::Integer(2)).unwrap();
-            return Ok((row, true));
-        }
-        Ok((row, false))
-    });
+    let updated = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            let a = row.get(0).and_then(|v| v.as_int64()).unwrap();
+            if a == 1 {
+                row.set(0, stoolap::core::Value::Integer(2)).unwrap();
+                return Ok((row, true));
+            }
+            Ok((row, false))
+        },
+    );
     let rows = rows_of(table.as_ref());
     drop(table);
     txn.rollback().unwrap();
@@ -799,10 +826,14 @@ fn a_hot_row_another_transaction_holds_leaves_no_part_of_the_statement() {
         .unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
-    let updated = table.update(None, &mut |mut row| {
-        bump(&mut row);
-        Ok((row, true))
-    });
+    let updated = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            bump(&mut row);
+            Ok((row, true))
+        },
+    );
     let rows = rows_of(table.as_ref());
     let free_cold = db.execute("UPDATE t SET v = 4 WHERE id = 1", ());
     let free_hot = db.execute("UPDATE t SET v = 4 WHERE id = 2", ());
@@ -827,13 +858,17 @@ fn a_hot_setter_error_lets_go_of_the_cold_claims() {
     db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
-    let updated = table.update(None, &mut |mut row| {
-        if row.get(0).and_then(|v| v.as_int64()) == Some(2) {
-            return Err(stoolap::core::Error::internal("refused by the setter"));
-        }
-        bump(&mut row);
-        Ok((row, true))
-    });
+    let updated = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            if row.get(0).and_then(|v| v.as_int64()) == Some(2) {
+                return Err(stoolap::core::Error::internal("refused by the setter"));
+            }
+            bump(&mut row);
+            Ok((row, true))
+        },
+    );
     let rows = rows_of(table.as_ref());
     let free = db.execute("UPDATE t SET v = 4 WHERE id = 1", ());
     drop(table);
@@ -861,17 +896,21 @@ fn a_hot_row_another_handle_wrote_from_the_setter_leaves_no_part_of_the_statemen
     let mut writer = txn.get_table("t").unwrap();
     let reader = txn.get_table("t").unwrap();
     // Row 2's setter call writes row 1, already set, through the other handle
-    let updated = updater.update(None, &mut |mut row| {
-        if row.get(0).and_then(|v| v.as_int64()) == Some(2) {
-            let mut set = |mut row: stoolap::core::Row| {
-                row.set(1, stoolap::core::Value::Integer(5)).unwrap();
-                Ok((row, true))
-            };
-            writer.update_by_row_ids(&[1], &mut set).unwrap();
-        }
-        row.set(1, stoolap::core::Value::Integer(7)).unwrap();
-        Ok((row, true))
-    });
+    let updated = updater.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut |mut row| {
+            if row.get(0).and_then(|v| v.as_int64()) == Some(2) {
+                let mut set = |mut row: stoolap::core::Row| {
+                    row.set(1, stoolap::core::Value::Integer(5)).unwrap();
+                    Ok((row, true))
+                };
+                writer.update_by_row_ids(&[1], &mut set).unwrap();
+            }
+            row.set(1, stoolap::core::Value::Integer(7)).unwrap();
+            Ok((row, true))
+        },
+    );
     let rows = rows_of(reader.as_ref());
     drop(updater);
     drop(reader);

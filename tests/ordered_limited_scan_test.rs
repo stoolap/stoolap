@@ -592,6 +592,7 @@ fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
     .unwrap();
     let table = SegmentedTable::new(hot, mgr);
     let filter = ComparisonExpr::new("t", Operator::Lt, Value::Integer(15));
-    let result = table.scan_top_k(Some(&filter), "t", false, 1, 0);
+    let walk = table.top_k_walk(&filter, "t");
+    let result = table.scan_top_k(walk.as_ref(), Some(&filter), "t", false, 1, 0);
     assert!(result.is_err(), "corrupt column accepted: {result:?}");
 }
