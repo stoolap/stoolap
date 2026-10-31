@@ -5958,14 +5958,17 @@ impl Executor {
                 Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
             });
             // A side's conditions come without their qualifier; it is put
-            // back, as the index join puts it back on its inner side's
+            // back, as the index join puts it back on its inner side's. A
+            // joined side's keep their tables'
+            let qualified = |filter: Option<&Expression>, alias: Option<&str>| {
+                filter.map(|f| match alias {
+                    Some(alias) => add_table_qualifier(f, alias),
+                    None => f.clone(),
+                })
+            };
             let [left_filter, right_filter] = side_filters;
-            let left_filter = left_filter
-                .zip(left_alias)
-                .map(|(f, alias)| add_table_qualifier(f, alias));
-            let right_filter = right_filter
-                .zip(right_alias)
-                .map(|(f, alias)| add_table_qualifier(f, alias));
+            let left_filter = qualified(left_filter, left_alias);
+            let right_filter = qualified(right_filter, right_alias);
             // The SELECT items and sort keys whose subqueries the blocks run
             let output = !Self::grouped_join_output(stmt);
             let select: Vec<Option<&Expression>> = stmt
@@ -6157,8 +6160,9 @@ impl Executor {
         // join path sees a plain predicate, and a correlated one left after
         // the join is evaluated per joined row
         let correlated_where = classification.where_has_correlated_subqueries;
+        let where_folds = classification.where_has_subqueries && !blocks_where;
         let where_for_join: Option<Expression> = match &stmt.where_clause {
-            Some(where_clause) if classification.where_has_subqueries && !blocks_where => {
+            Some(where_clause) if where_folds => {
                 // Each conjunct folds on its own, so an uncorrelated one folds
                 // next to a correlated one
                 let mut folded = Vec::new();
@@ -6218,10 +6222,16 @@ impl Executor {
         // blocks ask those of its others that bind as it is read, and the
         // rest of the joined row with the WHERE's conditions on both sides
         let rows_sides = blocks.as_deref().map_or([false; 2], |held| held.rows_sides);
-        // A joined side runs all of its conditions as a join of its own
-        let reads_plain = [&join_source.left, &join_source.right]
-            .map(|side| !matches!(**side, Expression::JoinSource(_)));
-        let reads_plain = [0, 1].map(|i| reads_plain[i] && rows_sides[i]);
+        // A joined side runs all of its conditions as a join of its own, not
+        // under the plan it holds when the values this run read are in them
+        let joined = [&join_source.left, &join_source.right]
+            .map(|side| matches!(**side, Expression::JoinSource(_)));
+        let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i]);
+        let side_plan = |side: usize| {
+            plan.as_deref()
+                .map(|plan| plan.side_plan(side))
+                .filter(|_| !(joined[side] && where_folds))
+        };
         let plain = |filter: &Option<Expression>, rows: bool| match rows {
             true => filter.as_ref().and_then(|filter| {
                 combine_predicates_with_and(
@@ -6275,7 +6285,7 @@ impl Executor {
                 false => left_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 0)),
-            plan: plan.as_deref().map(|plan| plan.side_plan(0)),
+            plan: side_plan(0),
             apart,
         };
         let right_read = SideRead {
@@ -6284,7 +6294,7 @@ impl Executor {
                 false => right_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 1)),
-            plan: plan.as_deref().map(|plan| plan.side_plan(1)),
+            plan: side_plan(1),
             apart,
         };
         let where_blocks = statement_run.and_then(|run| run.site(false));

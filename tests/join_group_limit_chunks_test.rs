@@ -65,6 +65,40 @@ fn ids(db: &Database, sql: &str) -> Vec<i64> {
 }
 
 #[test]
+fn a_group_named_by_a_select_item_is_whole_however_the_left_side_is_read() {
+    let _guard = serial();
+    let db = Database::open("memory://join_group_limit_chunks_items").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO t SELECT g.value, g.value % 3 FROM generate_series(1, 60) g",
+        "INSERT INTO s VALUES (1, 0), (2, 1), (3, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT t.k AS id, COUNT(*) FROM t JOIN s ON s.k = t.k GROUP BY id LIMIT 2",
+        "SELECT t.k, COUNT(*) FROM t JOIN s ON s.k = t.k GROUP BY 1 LIMIT 2",
+        "SELECT t.k AS id, COUNT(*) FROM t LEFT JOIN s ON s.k = t.k GROUP BY id LIMIT 3",
+    ] {
+        let mut got: Vec<(i64, i64)> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+            })
+            .collect();
+        got.sort_unstable();
+        let keys: Vec<i64> = got.iter().map(|(k, _)| *k).collect();
+        let mut distinct = keys.clone();
+        distinct.dedup();
+        assert_eq!(distinct, keys, "{sql}: a group came in parts: {got:?}");
+        assert!(got.iter().all(|(_, n)| *n == 20), "{sql}: {got:?}");
+    }
+}
+
+#[test]
 fn an_offset_skips_groups_and_the_limit_still_finds_its_own() {
     let _guard = serial();
     let db = setup("offset", 200);

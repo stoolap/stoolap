@@ -82,6 +82,11 @@ const WHERES: &[&str] = &[
     "t.b + r.id > 25",
     "r.id > 1 AND t.a IS NOT NULL",
     "id > 1",
+    "t.id = 1 AND r.id = (SELECT t.b)",
+    "t.id = 1 AND r.id = (SELECT b)",
+    "t.b < 50 AND r.id IN (SELECT w.x FROM w WHERE w.y = a)",
+    "t.b > 20 AND r.id IN (SELECT w.x FROM w WHERE w.y = t.id)",
+    "u.x > 7 AND r.id > (SELECT MIN(w.x) FROM w WHERE w.y < t.b)",
 ];
 
 const KINDS: &[&str] = &["", "LEFT", "RIGHT", "FULL"];
@@ -155,6 +160,47 @@ fn a_joined_side_answers_its_conditions_as_recorded() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+#[test]
+fn a_joined_side_reads_the_values_each_run_gives_its_conditions() {
+    let _guard = serial();
+    let db = hot("runs");
+    let mut wrong = Vec::new();
+    for from in [
+        "t {j1} JOIN u ON u.id = t.a {j2} JOIN r ON r.id = t.id",
+        "t {j1} JOIN u ON u.id = t.a {j2} JOIN r USING (id)",
+    ] {
+        for j1 in KINDS {
+            for j2 in KINDS {
+                let from = from.replace("{j1}", j1).replace("{j2}", j2);
+                for select in ["t.id, u.id, r.id", "t.id, u.id, r.id, (SELECT 1)"] {
+                    let sql = format!("SELECT {select} FROM {from} WHERE t.b > (SELECT $1)");
+                    let stmt = db.prepare(&sql).unwrap();
+                    for b in [20, 40, 0, 20] {
+                        let mut got: Vec<String> = stmt
+                            .query((b,))
+                            .unwrap()
+                            .map(|row| row.unwrap().get::<Option<String>>(0).unwrap())
+                            .map(|id| id.unwrap_or_else(|| "NULL".into()))
+                            .collect();
+                        got.sort();
+                        let literal = sql.replace("(SELECT $1)", &b.to_string());
+                        let mut want: Vec<String> = answer(&db, &literal, Vec::new())
+                            .unwrap()
+                            .into_iter()
+                            .map(|row| row.split('|').next().unwrap_or_default().to_string())
+                            .collect();
+                        want.sort();
+                        if got != want {
+                            wrong.push(format!("{sql} [$1 = {b}]: {got:?}, want {want:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[cfg(feature = "test-failpoints")]
