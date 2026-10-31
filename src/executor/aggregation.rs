@@ -815,6 +815,13 @@ fn literal_extra_arg(arg: &Expression) -> Option<Value> {
     }
 }
 
+/// Whether every argument of a call to `args` after the first is a literal,
+/// which `aggregate_extra_args` reads without a run's parameters
+pub(crate) fn extra_args_literal(args: &[Expression]) -> bool {
+    args.get(1..)
+        .is_none_or(|extra| extra.iter().all(is_literal_extra_arg))
+}
+
 /// The extra arguments of a call to `args` as written, when one of them is
 /// not a literal
 fn written_extra_args(args: &[Expression]) -> Option<Box<[Expression]>> {

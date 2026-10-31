@@ -241,3 +241,27 @@ fn explain_shows_the_window_step_and_the_index_read_it_takes() {
         }
     }
 }
+
+#[test]
+fn a_prepared_window_reads_the_parameters_of_each_run() {
+    let _serial = serial();
+    let db = hot("parameter_runs");
+    let stmt = db
+        .prepare("SELECT id, STRING_AGG(CAST(a AS TEXT), $1) OVER () FROM t WHERE id <= 3")
+        .unwrap();
+    for separator in [",", "-", "+"] {
+        let rows: Vec<String> = stmt
+            .query((separator,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(1).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for joined in rows {
+            assert_eq!(
+                joined.matches(separator).count(),
+                2,
+                "{separator}: {joined}"
+            );
+        }
+    }
+}

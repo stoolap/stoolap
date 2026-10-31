@@ -638,10 +638,45 @@ pub struct WindowFunctionInfo {
     pub extra_args: Vec<Value>,
     /// The error one of them gave, reported once there is a row to aggregate
     pub extra_error: Option<Error>,
+    /// The structural identity of its ORDER BY, and of its whole OVER
+    /// clause, which caches of sorted values and partitions are keyed by
+    pub(crate) order_key: OrderByKey,
+    pub(crate) over_key: OverClauseKey,
 }
 
 /// A window result, with the layout its ORDER BY reads when it has one
 pub(crate) type WindowOutput = (Box<dyn QueryResult>, Option<OutputLayout>);
+
+/// What a windowed statement computes over rows of known columns, which no
+/// row and no run changes: its window functions and how each output
+/// column is made of them
+pub(crate) struct WindowPlan<'s> {
+    /// The statement, a window only its ORDER BY reads added to its items
+    stmt: std::borrow::Cow<'s, SelectStatement>,
+    /// The items the statement wrote, before the ORDER BY's own windows
+    written_items: usize,
+    window_functions: Vec<WindowFunctionInfo>,
+    /// Every OVER clause shares its partitions, one partition map serving all
+    streams: bool,
+    col_index_map: StringMap<usize>,
+    select_items: Vec<SelectItem>,
+    /// The item each output column computes, for the ORDER BY's layout
+    item_of: Vec<usize>,
+    /// Each item with windows inside it, the windows read as columns
+    transformed: Vec<Option<Expression>>,
+    /// The input columns, then the windows an expression item reads
+    extended_columns: Vec<String>,
+    added_wf_names: Vec<String>,
+}
+
+impl std::fmt::Debug for WindowPlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowPlan")
+            .field("windows", &self.window_functions.len())
+            .field("items", &self.select_items.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// What a window index read gives: the rows, sorted or grouped as it read
 /// them, or a partition-at-a-time read's whole answer
@@ -874,7 +909,7 @@ impl Executor {
     pub(crate) fn read_window_rows(
         &self,
         read: &crate::planner::WindowRead,
-        stmt: &SelectStatement,
+        (stmt, plan): (&SelectStatement, Option<&WindowPlan<'_>>),
         ctx: &ExecutionContext,
         table: &dyn Table,
         columns: &[String],
@@ -883,8 +918,21 @@ impl Executor {
         match read {
             WindowRead::Partitions { column, lazy } => {
                 if let Some(limit) = lazy.then(|| Self::fetch_limit(stmt, ctx)).flatten() {
+                    let made;
+                    let plan = match plan {
+                        Some(plan) => plan,
+                        None => {
+                            made = self.window_plan(
+                                std::borrow::Cow::Borrowed(stmt),
+                                (columns, columns.len(), stmt.columns.len()),
+                                &FxHashMap::default(),
+                                ctx,
+                            )?;
+                            &made
+                        }
+                    };
                     let answer = self.execute_select_with_window_functions_lazy_partition(
-                        stmt, ctx, table, columns, column, limit,
+                        plan, ctx, table, columns, column, limit,
                     )?;
                     if let Some(answer) = answer {
                         return Ok(Some(WindowRows::Answer(answer)));
@@ -957,6 +1005,24 @@ impl Executor {
         )
     }
 
+    /// `window_over` by a plan prepared with the statement
+    pub(crate) fn window_by_plan(
+        &self,
+        plan: &WindowPlan<'_>,
+        ctx: &ExecutionContext,
+        (rows, columns): (&[(i64, Row)], &[String]),
+        order: (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
+    ) -> Result<WindowOutput> {
+        self.run_window(
+            plan,
+            ctx,
+            (rows, columns),
+            &FxHashMap::default(),
+            order,
+            None,
+        )
+    }
+
     /// Window functions over the rows, the statement's subqueries answered
     /// by its `blocks`
     pub(crate) fn execute_select_with_window_functions(
@@ -1026,29 +1092,17 @@ impl Executor {
         // sort reads and the projection then drops. It goes in before the
         // subqueries are lifted, so one inside it is lifted with the rest
         let written_items = stmt.columns.len();
-        let extended_stmt;
-        let stmt = {
-            let hidden = Self::hidden_order_by_windows(stmt);
-            if hidden.is_empty() {
-                stmt
-            } else {
-                let mut extended = stmt.clone();
-                extended.columns.extend(hidden);
-                extended_stmt = extended;
-                &extended_stmt
-            }
-        };
+        let stmt = Self::with_hidden_order_by_windows(stmt);
 
         // A subquery inside a window function or its OVER clause is resolved
         // per input row first, unless the blocks answer it; the columns it
         // adds stay out of SELECT *
         let visible_columns = base_columns.len();
-        let lifted_stmt;
         let lifted_rows;
         let lifted_columns;
         let (stmt, base_rows, base_columns) = match (blocks.is_none()
-            && Self::windows_hold_subquery(stmt))
-        .then(|| Self::lift_subqueries_in_windows(stmt, base_columns))
+            && Self::windows_hold_subquery(&stmt))
+        .then(|| Self::lift_subqueries_in_windows(&stmt, base_columns))
         .flatten()
         {
             Some((rewritten, lifted, names)) => {
@@ -1064,11 +1118,10 @@ impl Executor {
                     base_columns,
                     qualifier.as_deref(),
                 )?;
-                lifted_stmt = rewritten;
                 lifted_rows = rows;
                 lifted_columns = all_columns;
                 (
-                    &lifted_stmt,
+                    std::borrow::Cow::Owned(rewritten),
                     lifted_rows.as_slice(),
                     lifted_columns.as_slice(),
                 )
@@ -1076,10 +1129,168 @@ impl Executor {
             None => (stmt, base_rows, base_columns),
         };
 
+        let plan = self.window_plan(
+            stmt,
+            (base_columns, visible_columns, written_items),
+            group_slots,
+            ctx,
+        )?;
+        self.run_window(
+            &plan,
+            ctx,
+            (base_rows, base_columns),
+            group_slots,
+            (pre_sorted, pre_grouped),
+            blocks,
+        )
+    }
+
+    /// `stmt` with each window only its ORDER BY reads added to its items
+    fn with_hidden_order_by_windows(
+        stmt: &SelectStatement,
+    ) -> std::borrow::Cow<'_, SelectStatement> {
+        let hidden = Self::hidden_order_by_windows(stmt);
+        if hidden.is_empty() {
+            return std::borrow::Cow::Borrowed(stmt);
+        }
+        let mut extended = stmt.clone();
+        extended.columns.extend(hidden);
+        std::borrow::Cow::Owned(extended)
+    }
+
+    /// The window plan of a windowed statement a prepared plan runs, over
+    /// rows of `columns`, made once with the statement; None, read nothing,
+    /// when a run would change it
+    pub(crate) fn prepared_window_plan(
+        &self,
+        stmt: &SelectStatement,
+        columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<WindowPlan<'static>>> {
+        let extended = Self::with_hidden_order_by_windows(stmt).into_owned();
+        // An argument after the first that is no literal is read with the
+        // run's parameters, a subquery answered, as the plan is made
+        let mut windows = Vec::new();
+        for item in &extended.columns {
+            Self::collect_all_windows_in_expression(item, &mut windows);
+        }
+        let fixed = windows.iter().all(|window| {
+            let arguments = &window.function.arguments;
+            super::aggregation::extra_args_literal(arguments)
+                && !arguments.iter().any(Executor::has_subqueries)
+        });
+        if !fixed {
+            return Ok(None);
+        }
+        self.window_plan(
+            std::borrow::Cow::Owned(extended),
+            (columns, columns.len(), stmt.columns.len()),
+            &FxHashMap::default(),
+            ctx,
+        )
+        .map(Some)
+    }
+
+    /// The window plan of `stmt` over rows of `base_columns`, of which the
+    /// first `visible_columns` are the read's own, its first `written_items`
+    /// items the ones it wrote
+    fn window_plan<'s>(
+        &self,
+        stmt: std::borrow::Cow<'s, SelectStatement>,
+        (base_columns, visible_columns, written_items): (&[String], usize, usize),
+        group_slots: &FxHashMap<ExprKey, usize>,
+        ctx: &ExecutionContext,
+    ) -> Result<WindowPlan<'s>> {
         // Parse window functions from the SELECT list
-        let mut window_functions = self.parse_window_functions(stmt, base_columns, ctx)?;
+        let mut window_functions = self.parse_window_functions(&stmt, base_columns, ctx)?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
 
+        // LIMIT pushdown for PARTITION BY queries is safe only when there is
+        // no top-level ORDER BY, when every window function shares the same
+        // PARTITION BY, and when no OVER clause is volatile. The streamed
+        // rows meet the LIMIT before DISTINCT runs, so DISTINCT keeps it off
+        let streams = window_functions
+            .iter()
+            .all(|wf| self.over_clause_is_shareable(wf))
+            && stmt.order_by.is_empty()
+            && stmt.offset.is_none()
+            && !stmt.distinct
+            && stmt.distinct_on.is_empty()
+            && window_functions
+                .iter()
+                .any(|wf| !wf.partition_by_exprs.is_empty())
+            && Self::all_partitions_match(&window_functions);
+
+        let col_index_map = build_column_index_map(base_columns);
+
+        // Parse the SELECT list to determine output column order
+        let laid_out = !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty();
+        let mut item_of = Vec::new();
+        let select_items = self.parse_select_list_for_window(
+            &stmt,
+            base_columns,
+            visible_columns,
+            &window_functions,
+            group_slots,
+            laid_out.then_some(&mut item_of),
+        );
+
+        // Each window inside an expression item is read as a column of its own
+        let transformed: Vec<Option<Expression>> = select_items
+            .iter()
+            .map(|item| match &item.source {
+                SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
+                    let mut counter = 0;
+                    Some(Self::replace_windows_with_identifiers(
+                        expr,
+                        wf_names,
+                        &mut counter,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut extended_columns = base_columns.to_vec();
+        let mut added_wf_names: Vec<String> = Vec::new();
+        for item in &select_items {
+            if let SelectItemSource::ExpressionWithWindow(_, wf_names) = &item.source {
+                for wf_name in wf_names {
+                    if !added_wf_names.contains(wf_name) {
+                        extended_columns.push(wf_name.clone());
+                        added_wf_names.push(wf_name.clone());
+                    }
+                }
+            }
+        }
+        Ok(WindowPlan {
+            stmt,
+            written_items,
+            window_functions,
+            streams,
+            col_index_map,
+            select_items,
+            item_of,
+            transformed,
+            extended_columns,
+            added_wf_names,
+        })
+    }
+
+    /// The window functions of `plan` over `base_rows`, read in the order or
+    /// the partitions `pre_sorted` or `pre_grouped` says, the statement's
+    /// subqueries answered by its `blocks`
+    fn run_window(
+        &self,
+        plan: &WindowPlan<'_>,
+        ctx: &ExecutionContext,
+        (base_rows, base_columns): (&[(i64, Row)], &[String]),
+        group_slots: &FxHashMap<ExprKey, usize>,
+        (pre_sorted, pre_grouped): (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<WindowOutput> {
+        let stmt = &*plan.stmt;
+        let written_items = plan.written_items;
+        let window_functions = &plan.window_functions;
         if window_functions.is_empty() {
             // No window functions found, return base result
             let mut rows = RowVec::with_capacity(base_rows.len());
@@ -1094,48 +1305,26 @@ impl Executor {
             ));
         }
 
-        // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
-        // Only safe when there is no top-level ORDER BY (otherwise the sort must see all
-        // rows before LIMIT can be applied), when all window functions share the same
-        // PARTITION BY so one partition map can serve them all, and when no OVER clause
-        // is volatile (RANDOM and friends must draw per window function).
-        let all_over_clauses_shareable = window_functions
-            .iter()
-            .all(|wf| self.over_clause_is_shareable(wf));
-        // The streamed rows meet the LIMIT before DISTINCT runs, so DISTINCT keeps it off
-        if all_over_clauses_shareable
-            && stmt.order_by.is_empty()
-            && stmt.offset.is_none()
-            && !stmt.distinct
-            && stmt.distinct_on.is_empty()
-        {
-            let has_partition_by = window_functions
-                .iter()
-                .any(|wf| !wf.partition_by_exprs.is_empty());
-
-            if has_partition_by && Self::all_partitions_match(&window_functions) {
-                if let Some(limit_val) = super::row_count::rows_needed(stmt, ctx) {
-                    if limit_val > 0 {
-                        // Streaming runs without an ORDER BY, which reads no layout
-                        let result = self.execute_select_with_window_functions_streaming(
-                            stmt,
-                            ctx,
-                            base_rows,
-                            base_columns,
-                            group_slots,
-                            visible_columns,
-                            &window_functions,
-                            limit_val,
-                            blocks,
-                        )?;
-                        return Ok((result, None));
-                    }
+        // LIMIT pushdown for PARTITION BY queries, as the plan admits it
+        if plan.streams {
+            if let Some(limit_val) = super::row_count::rows_needed(stmt, ctx) {
+                if limit_val > 0 {
+                    // Streaming runs without an ORDER BY, which reads no layout
+                    let result = self.execute_select_with_window_functions_streaming(
+                        plan,
+                        ctx,
+                        base_rows,
+                        base_columns,
+                        group_slots,
+                        limit_val,
+                        blocks,
+                    )?;
+                    return Ok((result, None));
                 }
             }
         }
 
-        // Build column index map for base columns
-        let col_index_map = build_column_index_map(base_columns);
+        let col_index_map = &plan.col_index_map;
 
         // Step 1: Compute all window function values upfront
         // OPTIMIZATION: Use FxHashMap for fastest lookups with trusted keys
@@ -1147,23 +1336,23 @@ impl Executor {
         // compares token positions, making structurally identical expressions from different window
         // functions appear different.
         let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
-        for wf in &window_functions {
+        for wf in window_functions {
             if !wf.order_by.is_empty() {
                 // Create a semantic key from the ORDER BY expressions (ignores token positions)
-                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                let cache_key = &wf.order_key;
                 // Check if this ORDER BY clause is already in the cache
-                let already_cached = order_by_cache.iter().any(|(key, _)| key == &cache_key);
+                let already_cached = order_by_cache.iter().any(|(key, _)| key == cache_key);
                 if !already_cached {
                     let precomputed = self.precompute_order_by_values(
                         &wf.order_by,
                         base_rows,
                         base_columns,
-                        &col_index_map,
+                        col_index_map,
                         group_slots,
                         ctx,
                         blocks,
                     )?;
-                    order_by_cache.push((cache_key, precomputed));
+                    order_by_cache.push((cache_key.clone(), precomputed));
                 }
             }
         }
@@ -1172,12 +1361,12 @@ impl Executor {
         // Sorted partitions shared across window functions with the same
         // OVER clause (K functions pay one map build and one sort)
         let mut partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
-        for wf in &window_functions {
+        for wf in window_functions {
             let window_values = self.compute_window_function(
                 wf,
                 base_rows,
                 base_columns,
-                &col_index_map,
+                col_index_map,
                 group_slots,
                 ctx,
                 pre_sorted.as_ref(),
@@ -1191,64 +1380,27 @@ impl Executor {
 
         // Step 2: Build output columns and rows based on the SELECT list
         // The result should respect the SELECT list order, not just append window functions
-        let mut result_columns = Vec::new();
-
-        // Parse the SELECT list to determine output column order
         let laid_out = !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty();
-        let mut item_of = Vec::new();
-        let select_items = self.parse_select_list_for_window(
-            stmt,
-            base_columns,
-            visible_columns,
-            &window_functions,
-            group_slots,
-            laid_out.then_some(&mut item_of),
-        );
-
-        for item in &select_items {
-            result_columns.push(item.output_name.clone());
-        }
+        let select_items = &plan.select_items;
+        let item_of = &plan.item_of;
+        let result_columns: Vec<String> = select_items
+            .iter()
+            .map(|item| item.output_name.clone())
+            .collect();
 
         // Step 3: Build result using COLUMNAR storage
         // OPTIMIZATION: Instead of allocating one Row per result row, we store data column-major
         // and use ColumnarResult which materializes rows lazily with a single reused buffer.
         // This reduces allocations from O(num_rows) to O(num_columns).
         let num_rows = base_rows.len();
-
-        // Pre-transform expressions with window functions by replacing Window expr with Identifier
-        // This is done once, not per row
-        let transformed_items: Vec<_> = select_items
-            .iter()
-            .map(|item| match &item.source {
-                SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
-                    let mut counter = 0;
-                    let transformed =
-                        Self::replace_windows_with_identifiers(expr, wf_names, &mut counter);
-                    (item, Some(transformed), Some(wf_names.clone()))
-                }
-                _ => (item, None, None),
-            })
-            .collect();
-
-        // Build extended columns (base_columns + synthetic window columns)
-        let mut extended_columns = base_columns.to_vec();
-        let mut added_wf_names: Vec<String> = Vec::new();
-        for (_, _, wf_names_opt) in &transformed_items {
-            if let Some(wf_names) = wf_names_opt {
-                for wf_name in wf_names {
-                    if !added_wf_names.contains(wf_name) {
-                        extended_columns.push(wf_name.clone());
-                        added_wf_names.push(wf_name.clone());
-                    }
-                }
-            }
-        }
+        let extended_columns = &plan.extended_columns;
+        let added_wf_names = &plan.added_wf_names;
 
         // Collect Expression items (with base_columns) and their indices
-        let base_expr_items: Vec<(usize, &Expression)> = transformed_items
+        let base_expr_items: Vec<(usize, &Expression)> = select_items
             .iter()
             .enumerate()
-            .filter_map(|(i, (item, _, _))| {
+            .filter_map(|(i, item)| {
                 if let SelectItemSource::Expression(expr) = &item.source {
                     Some((i, expr))
                 } else {
@@ -1258,10 +1410,11 @@ impl Executor {
             .collect();
 
         // Collect ExpressionWithWindow transformed expressions and their indices
-        let ext_expr_items: Vec<(usize, &Expression)> = transformed_items
+        let ext_expr_items: Vec<(usize, &Expression)> = plan
+            .transformed
             .iter()
             .enumerate()
-            .filter_map(|(i, (_, transformed_opt, _))| transformed_opt.as_ref().map(|t| (i, t)))
+            .filter_map(|(i, transformed)| transformed.as_ref().map(|t| (i, t)))
             .collect();
 
         // Pre-compile base expressions (Expression items with base_columns)
@@ -1286,7 +1439,7 @@ impl Executor {
         let mut ext_eval = if !ext_exprs.is_empty() {
             Some(RowPrograms::compile(
                 &ext_exprs,
-                &extended_columns,
+                extended_columns,
                 Some(group_slots),
                 ctx,
                 blocks,
@@ -1325,7 +1478,7 @@ impl Executor {
 
         // Phase 1: Build columns for WindowFunction and BaseColumn items
         // Expression columns get placeholder Vecs (filled in Phase 2)
-        for (item, _, _) in &transformed_items {
+        for item in select_items {
             match &item.source {
                 SelectItemSource::WindowFunction(wf_name_lower) => {
                     // OPTIMIZATION: Move or clone the entire Vec at once
@@ -1379,7 +1532,7 @@ impl Executor {
                     if let Some(ref mut eval) = ext_eval {
                         ext_row.clear();
                         ext_row.extend_from_slice(base_row.as_slice());
-                        for wf_name in &added_wf_names {
+                        for wf_name in added_wf_names {
                             let wf_value = window_value_map
                                 .get(wf_name)
                                 .and_then(|vals| vals.get(row_idx).cloned())
@@ -1404,7 +1557,7 @@ impl Executor {
         let (mut result_columns, mut column_data) = (result_columns, column_data);
         let mut sources: super::query::LayoutSources = select_items
             .iter()
-            .zip(&item_of)
+            .zip(item_of)
             .map(|(select_item, &item)| ColumnSource {
                 item: (item < written_items).then_some(item),
                 input: match select_item.source {
@@ -1446,45 +1599,36 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     fn execute_select_with_window_functions_streaming(
         &self,
-        stmt: &SelectStatement,
+        plan: &WindowPlan<'_>,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         group_slots: &FxHashMap<ExprKey, usize>,
-        visible_columns: usize,
-        window_functions: &[WindowFunctionInfo],
         limit: usize,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
+        let window_functions = &plan.window_functions[..];
         // Use the first window function with PARTITION BY for partitioning
         let primary_wf = window_functions
             .iter()
             .find(|wf| !wf.partition_by_exprs.is_empty())
             .unwrap(); // Safe: we checked has_partition_by before calling this
 
-        // Build column index map
-        let col_index_map = build_column_index_map(base_columns);
+        let col_index_map = &plan.col_index_map;
 
         // Build partition map from the primary window function
         let partitions = Self::build_partition_map(
             primary_wf,
             base_rows,
             base_columns,
-            &col_index_map,
+            col_index_map,
             group_slots,
             ctx,
             blocks,
         )?;
 
-        // Build result columns from SELECT list
-        let select_items = self.parse_select_list_for_window(
-            stmt,
-            base_columns,
-            visible_columns,
-            window_functions,
-            group_slots,
-            None,
-        );
+        // The plan's items: a streamed statement has no ORDER BY to lay out
+        let select_items = &plan.select_items;
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
@@ -1492,19 +1636,19 @@ impl Executor {
         let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
         for wf in window_functions {
             if !wf.order_by.is_empty() {
-                let cache_key = Self::order_by_cache_key(&wf.order_by);
-                let already_cached = order_by_cache.iter().any(|(key, _)| key == &cache_key);
+                let cache_key = &wf.order_key;
+                let already_cached = order_by_cache.iter().any(|(key, _)| key == cache_key);
                 if !already_cached {
                     let precomputed = self.precompute_order_by_values(
                         &wf.order_by,
                         base_rows,
                         base_columns,
-                        &col_index_map,
+                        col_index_map,
                         group_slots,
                         ctx,
                         blocks,
                     )?;
-                    order_by_cache.push((cache_key, precomputed));
+                    order_by_cache.push((cache_key.clone(), precomputed));
                 }
             }
         }
@@ -1524,7 +1668,7 @@ impl Executor {
                     wf,
                     base_rows,
                     base_columns,
-                    &col_index_map,
+                    col_index_map,
                     group_slots,
                     ctx,
                     blocks,
@@ -1539,16 +1683,16 @@ impl Executor {
             Vec::new();
         for (wf, _, is_agg, args) in &resolved_wfs {
             if *is_agg {
-                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                let cache_key = &wf.order_key;
                 let precomputed_order_by = order_by_cache
                     .iter()
-                    .find(|(key, _)| key == &cache_key)
+                    .find(|(key, _)| key == cache_key)
                     .map(|(_, v)| v);
                 let agg_results = self.compute_aggregate_window_function(
                     wf,
                     base_rows,
                     base_columns,
-                    &col_index_map,
+                    col_index_map,
                     group_slots,
                     ctx,
                     None,
@@ -1589,10 +1733,10 @@ impl Executor {
                         window_value_map.insert(key, partition_vals);
                     }
                 } else if let Some(win_func) = win_func_opt {
-                    let cache_key = Self::order_by_cache_key(&wf.order_by);
+                    let cache_key = &wf.order_key;
                     let precomputed_order_by = order_by_cache
                         .iter()
-                        .find(|(key, _)| key == &cache_key)
+                        .find(|(key, _)| key == cache_key)
                         .map(|(_, v)| v);
                     let (sorted_values, sorted_indices) = self.compute_window_for_partition(
                         win_func.as_ref(),
@@ -1601,7 +1745,7 @@ impl Executor {
                         row_indices.clone(),
                         precomputed_order_by,
                         base_columns,
-                        &col_index_map,
+                        col_index_map,
                         group_slots,
                         ctx,
                         args,
@@ -1633,7 +1777,7 @@ impl Executor {
             }
             let num_items = select_items.len();
             let mut compiled_items: Vec<CompiledItem<'_, '_>> = Vec::with_capacity(num_items);
-            for item in &select_items {
+            for item in select_items {
                 compiled_items.push(match &item.source {
                     SelectItemSource::BaseColumn(idx) => CompiledItem::BaseColumn(*idx),
                     SelectItemSource::WindowFunction(name) => {
@@ -1707,24 +1851,21 @@ impl Executor {
     /// Lazy partition fetching for window functions with LIMIT pushdown
     /// Fetches partitions one at a time from the index and stops when LIMIT is reached
     /// This is the key optimization for PARTITION BY + LIMIT queries
-    pub fn execute_select_with_window_functions_lazy_partition(
+    pub(crate) fn execute_select_with_window_functions_lazy_partition(
         &self,
-        stmt: &SelectStatement,
+        plan: &WindowPlan<'_>,
         ctx: &ExecutionContext,
         table: &dyn Table,
         base_columns: &[String],
         partition_col: &str,
         limit: usize,
     ) -> Result<Option<Box<dyn QueryResult>>> {
-        // Parse window functions from SELECT list
-        let mut window_functions = self.parse_window_functions(stmt, base_columns, ctx)?;
-        self.fold_window_control_arguments(&mut window_functions, ctx)?;
+        let window_functions = &plan.window_functions;
         if window_functions.is_empty() {
             return Ok(None);
         }
 
-        // Build column index map
-        let col_index_map = build_column_index_map(base_columns);
+        let col_index_map = &plan.col_index_map;
         // Rows read straight from the table: nothing aggregated precedes the window
         let group_slots = FxHashMap::default();
 
@@ -1742,15 +1883,8 @@ impl Executor {
             })
             .collect();
 
-        // Build result columns from SELECT list
-        let select_items = self.parse_select_list_for_window(
-            stmt,
-            base_columns,
-            base_columns.len(),
-            &window_functions,
-            &group_slots,
-            None,
-        );
+        // The plan's items: a partition-at-a-time read has no ORDER BY to lay out
+        let select_items = &plan.select_items;
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
@@ -1786,21 +1920,21 @@ impl Executor {
 
             // Precompute ORDER BY values for each unique ORDER BY clause
             let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
-            for wf in &window_functions {
+            for wf in window_functions {
                 if !wf.order_by.is_empty() {
-                    let cache_key = Self::order_by_cache_key(&wf.order_by);
-                    let already_cached = order_by_cache.iter().any(|(key, _)| key == &cache_key);
+                    let cache_key = &wf.order_key;
+                    let already_cached = order_by_cache.iter().any(|(key, _)| key == cache_key);
                     if !already_cached {
                         let precomputed = self.precompute_order_by_values(
                             &wf.order_by,
                             &partition_rows,
                             base_columns,
-                            &col_index_map,
+                            col_index_map,
                             &group_slots,
                             ctx,
                             None,
                         )?;
-                        order_by_cache.push((cache_key, precomputed));
+                        order_by_cache.push((cache_key.clone(), precomputed));
                     }
                 }
             }
@@ -1814,16 +1948,16 @@ impl Executor {
             let mut lazy_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
 
             for (wf, win_func_opt, is_agg, args) in &mut resolved_wfs {
-                let cache_key = Self::order_by_cache_key(&wf.order_by);
+                let cache_key = &wf.order_key;
                 let precomputed_order_by = order_by_cache
                     .iter()
-                    .find(|(key, _)| key == &cache_key)
+                    .find(|(key, _)| key == cache_key)
                     .map(|(_, v)| v);
                 args.input = self.window_input(
                     wf,
                     &partition_rows,
                     base_columns,
-                    &col_index_map,
+                    col_index_map,
                     &group_slots,
                     ctx,
                     None,
@@ -1834,7 +1968,7 @@ impl Executor {
                         wf,
                         &partition_rows,
                         base_columns,
-                        &col_index_map,
+                        col_index_map,
                         &group_slots,
                         ctx,
                         None,
@@ -1853,7 +1987,7 @@ impl Executor {
                         row_indices.clone(),
                         precomputed_order_by,
                         base_columns,
-                        &col_index_map,
+                        col_index_map,
                         &group_slots,
                         ctx,
                         args,
@@ -1877,7 +2011,7 @@ impl Executor {
             }
             let num_items = select_items.len();
             let mut compiled_items: Vec<CompiledItemLazy<'_, '_>> = Vec::with_capacity(num_items);
-            for item in &select_items {
+            for item in select_items {
                 compiled_items.push(match &item.source {
                     SelectItemSource::BaseColumn(idx) => CompiledItemLazy::BaseColumn(*idx),
                     SelectItemSource::WindowFunction(name) => {
@@ -2609,6 +2743,8 @@ impl Executor {
         };
 
         // OPTIMIZATION: func.function is already uppercase from parsing
+        let order_key = Self::order_by_cache_key(&order_by);
+        let over_key = Self::over_clause_cache_key(&partition_by_exprs, order_key.clone());
         Ok(WindowFunctionInfo {
             name: func.function.to_string(),
             arguments: func.arguments.clone(),
@@ -2622,6 +2758,8 @@ impl Executor {
             call_order_by: func.order_by.clone().into_boxed_slice(),
             extra_args,
             extra_error,
+            order_key,
+            over_key,
         })
     }
 
@@ -2643,9 +2781,9 @@ impl Executor {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<SharedSortedPartitions> {
         let shareable = self.over_clause_is_shareable(wf_info);
-        let key = Self::over_clause_cache_key(wf_info);
+        let key = &wf_info.over_key;
         if shareable {
-            if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == &key) {
+            if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == key) {
                 return Ok(std::sync::Arc::clone(cached));
             }
         }
@@ -2680,20 +2818,19 @@ impl Executor {
 
         let shared: SharedSortedPartitions = std::sync::Arc::new(partition_vec);
         if shareable {
-            partition_cache.push((key, std::sync::Arc::clone(&shared)));
+            partition_cache.push((key.clone(), std::sync::Arc::clone(&shared)));
         }
         Ok(shared)
     }
 
     /// Structural cache key for a (PARTITION BY, ORDER BY) pair; window
     /// functions sharing both reuse one partition map and one sort
-    fn over_clause_cache_key(wf: &WindowFunctionInfo) -> OverClauseKey {
-        let partition = wf
-            .partition_by_exprs
+    fn over_clause_cache_key(partition_by: &[Expression], order_key: OrderByKey) -> OverClauseKey {
+        let partition = partition_by
             .iter()
             .map(|e| (compute_expression_hash(e), e.to_string()))
             .collect();
-        (partition, Self::order_by_cache_key(&wf.order_by))
+        (partition, order_key)
     }
 
     /// Window functions whose OVER clause contains a volatile expression
@@ -2837,10 +2974,10 @@ impl Executor {
         if is_aggregate {
             // Handle aggregate functions as window functions (SUM, COUNT, AVG, etc.)
             // Look up precomputed ORDER BY values from cache using semantic key
-            let cache_key = Self::order_by_cache_key(&wf_info.order_by);
+            let cache_key = &wf_info.order_key;
             let cached_order_by = order_by_cache
                 .iter()
-                .find(|(key, _)| key == &cache_key)
+                .find(|(key, _)| key == cache_key)
                 .map(|(_, v)| v);
             return self.compute_aggregate_window_function(
                 wf_info,
@@ -2867,10 +3004,10 @@ impl Executor {
 
         // Look up precomputed ORDER BY values from cache using semantic key
         let precomputed_order_by: Option<&ColumnarOrderByValues> = if !wf_info.order_by.is_empty() {
-            let cache_key = Self::order_by_cache_key(&wf_info.order_by);
+            let cache_key = &wf_info.order_key;
             order_by_cache
                 .iter()
-                .find(|(key, _)| key == &cache_key)
+                .find(|(key, _)| key == cache_key)
                 .map(|(_, v)| v)
         } else {
             None
@@ -4524,6 +4661,8 @@ mod tests {
             call_order_by: Box::new([]),
             extra_args: Vec::new(),
             extra_error: None,
+            order_key: SmallVec::new(),
+            over_key: (SmallVec::new(), SmallVec::new()),
         };
 
         assert_eq!(info.name, "ROW_NUMBER");
