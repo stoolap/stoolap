@@ -1238,6 +1238,10 @@ impl Executor {
             .map(|ob| &ob.expression)
             .filter(|key| whole && mentions_subquery(key))
             .collect();
+        // Over rows that are not grouped a key reads no SELECT alias
+        if !keys.is_empty() && !grouped {
+            return Err("an ORDER BY holding a subquery");
+        }
         let windows = Executor::used_window_defs(stmt);
         let family = Family {
             executor: self,

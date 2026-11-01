@@ -777,6 +777,18 @@ fn a_grouped_statement_s_subqueries_read_parameters_and_the_transaction_s_writes
 }
 
 #[test]
+fn a_windowed_statement_that_does_not_group_sorts_by_an_alias_in_a_subquery_key() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_windowed_rows").unwrap();
+    fill(&db);
+    let sql = "SELECT id AS z, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > (SELECT 190) \
+               ORDER BY (SELECT 0) - z";
+    let twin = "SELECT id AS z, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > 190 \
+                ORDER BY 0 - z";
+    assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
+}
+
+#[test]
 fn a_windowed_grouped_statement_sorts_by_a_key_holding_a_subquery() {
     let _guard = serial();
     let mut wrong = Vec::new();
