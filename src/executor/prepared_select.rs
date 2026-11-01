@@ -5347,8 +5347,9 @@ impl Builder<'_> {
             false => sq
                 .order_by
                 .iter()
-                .map(|ob| named(&ob.expression))
-                .chain(sq.distinct_on.iter().map(named))
+                .map(|ob| &ob.expression)
+                .chain(&sq.distinct_on)
+                .map(|key| bound_key(key, sq, &scope.lower).into_owned())
                 .collect(),
         };
         if !grouped {

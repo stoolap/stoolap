@@ -204,6 +204,16 @@ fn a_grouped_block_over_a_join_binds_its_keys_over_its_groups() {
                 "SELECT id FROM t WHERE k IN (2) ORDER BY id".to_string(),
             ),
             (
+                format!(
+                    "SELECT id, (SELECT MAX(u.v) AS k {from} WHERE u.k = t.k GROUP BY u.id \
+                     ORDER BY k DESC LIMIT 1) FROM t ORDER BY id"
+                ),
+                format!(
+                    "SELECT id, (SELECT MAX(u.v) {from} WHERE u.k = t.k GROUP BY u.id \
+                     ORDER BY MAX(u.v) DESC LIMIT 1) FROM t ORDER BY id"
+                ),
+            ),
+            (
                 format!("SELECT id, (SELECT COUNT(*) + (SELECT 1) {from} WHERE u.k = t.k) FROM t ORDER BY id"),
                 format!("SELECT id, (SELECT COUNT(*) + 1 {from} WHERE u.k = t.k) FROM t ORDER BY id"),
             ),
@@ -347,6 +357,12 @@ fn an_exists_ordered_or_distinct_where_only_a_statement_reads_it_computes_neithe
                 "SELECT MAX(v) AS m FROM w WHERE w.k = t.k GROUP BY id ORDER BY 1 LIMIT 1"
                     .to_string(),
                 rows_of.to_string(),
+            ),
+            (
+                "SELECT MAX(w.v) AS k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k \
+                 GROUP BY w.id ORDER BY k LIMIT 1"
+                    .to_string(),
+                "SELECT 1 FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k".to_string(),
             ),
         ] {
             for site in [
