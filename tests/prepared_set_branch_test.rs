@@ -18,9 +18,12 @@
 
 use stoolap::Database;
 
+mod oracle;
+
+/// Each statement's answer, recorded when the general path gave the same
+const RECORDED: oracle::Answers = answers!("prepared_set_branch");
+
 const PREPARED: &str = "(SELECT v FROM u WHERE u.id = 1)";
-// An ORDER BY position in the block keeps the statement out of the family
-const GENERAL: &str = "(SELECT v FROM u WHERE u.id = 1 ORDER BY 1)";
 
 fn setup(db: &Database) {
     db.execute(
@@ -102,22 +105,26 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT a + 1 AS a1 FROM t WHERE c > {sq} UNION SELECT a FROM t WHERE id < 10",
     ] {
         let prepared = shape.replace("{sq}", PREPARED);
-        let general = shape.replace("{sq}", GENERAL);
-        let (got, want) = (answer(db, &prepared), answer(db, &general));
-        // A LIMIT without ORDER BY may keep any rows of the answer
-        let unordered_limit = general
+        // A LIMIT without ORDER BY may keep any rows of the whole answer,
+        // which is the one recorded
+        let unordered_limit = prepared
             .rsplit_once(" LIMIT ")
             .filter(|_| !shape.contains("ORDER BY"));
-        if let Some((all, limit)) = unordered_limit {
+        let whole = unordered_limit.map_or(prepared.as_str(), |(all, _)| all);
+        let all = answer(db, whole);
+        let key = format!("{phase}: {whole}");
+        let general = || oracle::general_answer(whole, |twin| answer(db, twin));
+        if let Some(why) = oracle::check_confirmed(&RECORDED, &key, &all, general) {
+            wrong.push(why);
+        }
+        if let Some((_, limit)) = unordered_limit {
             let limit: usize = limit.parse().unwrap();
-            match (&got, &answer(db, all)) {
+            match (&answer(db, &prepared), &all) {
                 (Ok(got), Ok(all))
                     if got.len() == limit.min(all.len()) && got.iter().all(|r| all.contains(r)) => {
                 }
-                _ => wrong.push(format!("{phase}: {shape}\n  got  {got:?}")),
+                (got, _) => wrong.push(format!("{phase}: {shape}\n  got  {got:?}")),
             }
-        } else if got != want {
-            wrong.push(format!("{phase}: {shape}\n  got  {got:?}\n  want {want:?}"));
         }
     }
 }

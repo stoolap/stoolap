@@ -691,9 +691,12 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         (format!("{join} UNION ALL SELECT 0, 0"), vec![yes]),
         (format!("SELECT d.id, d.k FROM ({join}) d"), vec![yes]),
         (
-            format!("SELECT d.id, (SELECT id FROM s ORDER BY 1 DESC LIMIT 1) FROM ({join}) d"),
+            format!(
+                "SELECT d.id, (SELECT * FROM (SELECT id FROM s) a JOIN (SELECT id FROM s) b \
+                 USING (id) LIMIT 1) FROM ({join}) d"
+            ),
             vec![
-                "Prepared: no (an ORDER BY position in a subquery block)",
+                "Prepared: no (a subquery block selecting * over a join that merges columns)",
                 yes,
             ],
         ),

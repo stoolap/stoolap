@@ -17,9 +17,12 @@
 
 use stoolap::Database;
 
+mod oracle;
+
+/// Each statement's answer, recorded when the general path gave the same
+const RECORDED: oracle::Answers = answers!("prepared_order_limit");
+
 const PREPARED: &str = "(SELECT v FROM u WHERE u.id = 1)";
-// An ORDER BY position in the block keeps the statement out of the family
-const GENERAL: &str = "(SELECT v FROM u WHERE u.id = 1 ORDER BY 1)";
 
 fn setup(db: &Database) {
     db.execute(
@@ -88,16 +91,14 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT id FROM t WHERE c > {sq} ORDER BY c * 2, id LIMIT $1",
     ] {
         let prepared = shape.replace("{sq}", PREPARED);
-        let general = shape.replace("{sq}", GENERAL);
         if prepared_line(db, &prepared) != "Prepared: yes" {
             wrong.push(format!("{phase}: not prepared: {prepared}"));
         }
-        if !prepared_line(db, &general).starts_with("Prepared: no") {
-            wrong.push(format!("{phase}: prepared: {general}"));
-        }
-        let (got, want) = (answer(db, &prepared), answer(db, &general));
-        if got != want {
-            wrong.push(format!("{phase}: {shape}\n  got  {got:?}\n  want {want:?}"));
+        let key = format!("{phase}: {prepared}");
+        let general = || oracle::general_answer(&prepared, |twin| answer(db, twin));
+        if let Some(why) = oracle::check_confirmed(&RECORDED, &key, &answer(db, &prepared), general)
+        {
+            wrong.push(why);
         }
     }
 }

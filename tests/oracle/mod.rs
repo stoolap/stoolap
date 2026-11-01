@@ -152,20 +152,9 @@ fn top_level(sql: &str, keyword: &str) -> Option<usize> {
 /// path than the one that gave it
 #[cfg(feature = "test-failpoints")]
 pub fn on_general_path<T>(sql: &str, run: impl FnOnce() -> T) -> T {
-    use std::sync::atomic::Ordering::Relaxed;
-    use stoolap::test_failpoints::{general_path_total, PREPARED_FAMILIES_OFF};
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, Relaxed);
-        }
-    }
+    use stoolap::test_failpoints::general_path_total;
     let before = general_path_total();
-    PREPARED_FAMILIES_OFF.store(true, Relaxed);
-    let given = {
-        let _restore = Restore;
-        run()
-    };
+    let given = families_off(run);
     assert!(
         general_path_total() > before,
         "{sql}: the reference ran no general path mechanism"
@@ -173,14 +162,52 @@ pub fn on_general_path<T>(sql: &str, run: impl FnOnce() -> T) -> T {
     given
 }
 
-/// `sql` with an unused named window, which no prepared plan the statement
-/// already holds answers; `on_general_path` keeps the families off it
+/// What `run` gives with the prepared families and their plans refused
+#[cfg(feature = "test-failpoints")]
+fn families_off<T>(run: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering::Relaxed;
+    use stoolap::test_failpoints::PREPARED_FAMILIES_OFF;
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREPARED_FAMILIES_OFF.store(false, Relaxed);
+        }
+    }
+    PREPARED_FAMILIES_OFF.store(true, Relaxed);
+    let _restore = Restore;
+    run()
+}
+
+/// What `run` gives for the `general_twin` of `sql` with the prepared
+/// families refused, another path than the one a recording confirms; a
+/// statement the general path answers through no counted mechanism counts
+/// too. A file built without test-failpoints records nothing
+#[cfg(feature = "test-failpoints")]
+pub fn general_answer<T>(sql: &str, run: impl FnOnce(&str) -> T) -> T {
+    families_off(|| run(&general_twin(sql)))
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+pub fn general_answer<T>(sql: &str, _: impl FnOnce(&str) -> T) -> T {
+    panic!("{sql}: a recording is confirmed on the general path, built with test-failpoints")
+}
+
+/// `sql` with an unused named window in its first branch, which no prepared
+/// plan the statement already holds answers; `on_general_path` keeps the
+/// families off it
 pub fn general_twin(sql: &str) -> String {
-    let at = [" ORDER BY ", " LIMIT ", " OFFSET "]
-        .iter()
-        .filter_map(|keyword| top_level(sql, keyword))
-        .min()
-        .unwrap_or(sql.len());
+    let at = [
+        " ORDER BY ",
+        " LIMIT ",
+        " OFFSET ",
+        " UNION ",
+        " INTERSECT ",
+        " EXCEPT ",
+    ]
+    .iter()
+    .filter_map(|keyword| top_level(sql, keyword))
+    .min()
+    .unwrap_or(sql.len());
     format!("{} WINDOW oracle_unused AS (){}", &sql[..at], &sql[at..])
 }
 

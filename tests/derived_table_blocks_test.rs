@@ -653,11 +653,10 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
 fn a_slot_spelled_as_a_name_shares_no_cached_subquery_with_that_name() {
     let _turn = turn();
     // The inner `a` is t's, a slot holding 'z'; the quoted "a" no table has
-    // is the text 'a'. An inner ORDER BY position keeps both statements on
-    // the general path
+    // is the text 'a'. Neither block keeps the other's answer
     let slot = "SELECT (SELECT MAX(d.c) FROM (SELECT \
-                (SELECT COUNT(*) FROM w WHERE w.k = a ORDER BY 1) AS c FROM u) AS d) FROM t";
-    let text = "SELECT (SELECT COUNT(*) FROM w WHERE w.k = \"a\" ORDER BY 1), $1 FROM u";
+                (SELECT COUNT(*) FROM w WHERE w.k = a) AS c FROM u) AS d) FROM t";
+    let text = "SELECT (SELECT COUNT(*) FROM w WHERE w.k = \"a\"), $1 FROM u";
     for slot_first in [true, false] {
         let db = Database::open(&format!(
             "memory://derived_table_blocks_spelled_slot_cache_{slot_first}"
