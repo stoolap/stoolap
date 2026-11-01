@@ -15,9 +15,18 @@
 //! A prepared statement with ORDER BY and LIMIT answers as the general path
 //! does, whether it chooses its rows before or after projecting them
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::Database;
 
 mod oracle;
+
+// Recording turns the prepared families off process-wide
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Each statement's answer, recorded when the general path gave the same
 const RECORDED: oracle::Answers = answers!("prepared_order_limit");
@@ -105,6 +114,7 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
 
 #[test]
 fn a_prepared_order_by_with_a_limit_answers_as_the_general_path() {
+    let _guard = serial();
     let mut wrong = Vec::new();
     let db = Database::open("memory://prepared_order_limit_hot").unwrap();
     setup(&db);
@@ -123,6 +133,7 @@ fn a_prepared_order_by_with_a_limit_answers_as_the_general_path() {
 
 #[test]
 fn a_computed_item_of_a_row_the_limit_drops_raises_no_error() {
+    let _guard = serial();
     let db = Database::open("memory://prepared_order_limit_errors").unwrap();
     setup(&db);
     // The product overflows for a > 1 only
