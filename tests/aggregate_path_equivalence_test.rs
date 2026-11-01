@@ -95,6 +95,51 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT COUNT(a) * 2, COUNT(DISTINCT a), COUNT(a) * 2 AS z FROM t",
         "SELECT COUNT(a) * 2, COUNT(DISTINCT a), COUNT(a) * 2 AS z FROM t WHERE id + 0 = id",
     ),
+    // A WHERE hot rows hold: the runner feeds the rows its read passes
+    (
+        "memory",
+        "global_scan",
+        "SELECT SUM(a) AS x, COUNT(*), SUM(a) AS y, MIN(a), MAX(a) FROM t WHERE a > 0",
+        "SELECT SUM(a) AS x, COUNT(*), SUM(a) AS y, MIN(a), MAX(a) FROM t WHERE a > 0 \
+         AND id + 0 = id",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT SUM(a) FROM t WHERE g = 2 ORDER BY COUNT(*)",
+        "SELECT SUM(a) FROM t WHERE g = 2 AND id + 0 = id ORDER BY COUNT(*)",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT COUNT(DISTINCT a), SUM(a + 1), COUNT(*) FILTER (WHERE a > 1) FROM t WHERE g > 0",
+        "SELECT COUNT(DISTINCT a), SUM(a + 1), COUNT(*) FILTER (WHERE a > 1) FROM t \
+         WHERE g > 0 AND id + 0 = id",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT SUM(a), COUNT(a), MAX(s) FROM t WHERE a > 100",
+        "SELECT SUM(a), COUNT(a), MAX(s) FROM t WHERE a > 100 AND id + 0 = id",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT SUM(a), COUNT(*), MAX(s) FROM t WHERE id = 4",
+        "SELECT SUM(a), COUNT(*), MAX(s) FROM t WHERE id = 4 AND id + 0 = id",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE 1 = 0",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE 1 = 0 AND id + 0 = id",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT 1 + COUNT(*), MIN(s) FROM t WHERE g = 1",
+        "SELECT 1 + COUNT(*), MIN(s) FROM t WHERE g = 1 AND id + 0 = id",
+    ),
     (
         "memory",
         "storage_grouped",

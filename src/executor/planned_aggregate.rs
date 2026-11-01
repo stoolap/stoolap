@@ -39,7 +39,7 @@ use super::Executor;
 /// Where a statement that aggregates one table without grouping reads its
 /// one row from
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GlobalSource {
+pub enum GlobalSource {
     /// Every call from what the table keeps of its rows: the row count, an
     /// index's distinct count, a column's sum and bounds
     Stats,
@@ -425,32 +425,48 @@ impl Executor {
             return Ok(None);
         };
         let aggregations = &plan.aggregations;
+        // A WHERE the table declined is the scan's to read, and so are calls
+        // the feed does not stream
+        let scan = || match stmt.where_clause.is_none()
+            && Self::streams_calls(classification, aggregations, plan.plain)
+        {
+            true => self
+                .global_scan_rows(table, aggregations, ctx, blocks)
+                .map(Some),
+            false => Ok(None),
+        };
+        let source = (*source, pushed.as_deref());
+        self.global_answer(table, stmt, (aggregations, source), ctx, blocks, scan)
+    }
+
+    /// `stmt`'s one row of `aggregations` over `table`, from `source` with
+    /// the WHERE the table runs, or else from the group `scan` feeds the
+    /// rows it reads; None when `scan` reads none
+    pub(super) fn global_answer(
+        &self,
+        table: &dyn Table,
+        stmt: &SelectStatement,
+        (aggregations, (source, pushed)): (
+            &[SqlAggregateFunction],
+            (GlobalSource, Option<&dyn StorageExpr>),
+        ),
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+        scan: impl FnOnce() -> Result<Option<RowVec>>,
+    ) -> Result<Option<Box<dyn QueryResult>>> {
         let source_columns = table.schema().column_names_arc();
         let columns = Self::call_columns(aggregations, &source_columns);
-        let row = Self::global_values(
-            *source,
-            table,
-            aggregations,
-            &columns,
-            false,
-            pushed.as_deref(),
-        )?;
+        let row = Self::global_values(source, table, aggregations, &columns, false, pushed)?;
         let (path, rows) = match row {
             Some((answered, values)) => {
                 let mut rows = RowVec::with_capacity(1);
                 rows.push((0, Row::from_compact_vec(values)));
                 (answered.path(), rows)
             }
-            // A WHERE the table declined is the scan's to read, and so are
-            // calls the feed does not stream
-            None if stmt.where_clause.is_some() => return Ok(None),
-            None if !Self::streams_calls(classification, aggregations, plan.plain) => {
-                return Ok(None)
-            }
-            None => (
-                AggregatePath::GlobalScan,
-                self.global_scan_rows(table, aggregations, ctx, blocks)?,
-            ),
+            None => match scan()? {
+                Some(rows) => (AggregatePath::GlobalScan, rows),
+                None => return Ok(None),
+            },
         };
         self.finish_global(
             path,
@@ -691,20 +707,7 @@ impl Executor {
         ctx: &ExecutionContext,
         validity: PlanValidity,
     ) -> Option<Arc<PlannedAggregate>> {
-        let (table, schema, aggregations, source) = self.global_inputs(stmt, ctx)?;
-        // One count or an index's bound vouches for itself read through no
-        // view. Several calls each vouch only for their own read, and a sum
-        // or a column's bound may cross a seal: the regular path reads those
-        // through the statement's snapshot
-        let [agg] = aggregations.as_slice() else {
-            return None;
-        };
-        let count = agg.counts_rows() || agg.name == "COUNT" && agg.distinct;
-        match source {
-            GlobalSource::Stats if count => {}
-            GlobalSource::IndexBound => {}
-            _ => return None,
-        }
+        let (table, schema, aggregations, source) = self.held_aggregate(stmt, ctx)?;
         let source_columns = schema.column_names_arc();
         Some(Arc::new(PlannedAggregate {
             alone: Self::calls_alone(stmt, &aggregations).map(CompactArc::new),
@@ -714,6 +717,33 @@ impl Executor {
             source_columns,
             validity,
         }))
+    }
+
+    /// What [`Self::global_inputs`] gives for a statement the aggregate plan
+    /// takes: one count or an index's bound, which vouches for itself read
+    /// through no view. Several calls each vouch only for their own read,
+    /// and a sum or a column's bound may cross a seal: the statement's
+    /// snapshot reads those
+    pub(crate) fn held_aggregate(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<(
+        SmartString,
+        CompactArc<Schema>,
+        Vec<SqlAggregateFunction>,
+        GlobalSource,
+    )> {
+        let inputs = self.global_inputs(stmt, ctx)?;
+        let [agg] = inputs.2.as_slice() else {
+            return None;
+        };
+        let count = agg.counts_rows() || agg.name == "COUNT" && agg.distinct;
+        match inputs.3 {
+            GlobalSource::Stats if count => Some(inputs),
+            GlobalSource::IndexBound => Some(inputs),
+            _ => None,
+        }
     }
 
     /// The table, its schema, the calls and the source of a statement of a

@@ -46,8 +46,8 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
-    grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, GroupByItem,
-    Modifiers, SqlAggregateFunction, COUNT_STAR,
+    grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, FeedInput,
+    GroupByItem, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -60,6 +60,7 @@ use super::expression::{
     RowMembers, RowTest, SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
+use super::planned_aggregate::{AggregatePlan, AggregateRead, GlobalSource};
 use super::prepared_join::{JoinSide, JoinSides};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
@@ -3515,6 +3516,76 @@ enum Passing {
     Read,
 }
 
+/// The rows of a scan a statement's WHERE passes, as an aggregation reads
+/// them one at a time: each judged by the bound WHERE when the scan did not
+/// take it whole, the cancel checked every hundred rows read
+struct PassedRows<'r, 'a> {
+    scan: Box<dyn Scanner>,
+    bound: Option<SharedProgram>,
+    runner: &'r PreparedRunner<'a>,
+    ctx: &'r ExecutionContext,
+    vm: ExprVM,
+    read: u64,
+}
+
+impl<'r, 'a> PassedRows<'r, 'a> {
+    fn new(
+        scan: Box<dyn Scanner>,
+        bound: Option<SharedProgram>,
+        runner: &'r PreparedRunner<'a>,
+        ctx: &'r ExecutionContext,
+    ) -> Self {
+        Self {
+            scan,
+            bound,
+            runner,
+            ctx,
+            vm: ExprVM::new(),
+            read: 0,
+        }
+    }
+
+    /// Every row of a scan that took the whole WHERE, held at once; their
+    /// ids are not read
+    fn held(mut self) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(self.scan.estimated_count().unwrap_or(64));
+        while self.scan.next() {
+            self.read += 1;
+            if self.read.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            rows.push((0, self.scan.take_row()));
+        }
+        match self.scan.err() {
+            Some(err) => Err(err.clone()),
+            None => Ok(rows),
+        }
+    }
+}
+
+impl RowSource for PassedRows<'_, '_> {
+    fn next_row(&mut self) -> Result<Option<&Row>> {
+        loop {
+            if !self.scan.next() {
+                return match self.scan.err() {
+                    Some(err) => Err(err.clone()),
+                    None => Ok(None),
+                };
+            }
+            self.read += 1;
+            if self.read.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            if let Some(bound) = &self.bound {
+                if !self.runner.matches(&mut self.vm, bound, self.scan.row())? {
+                    continue;
+                }
+            }
+            return Ok(Some(self.scan.row()));
+        }
+    }
+}
+
 /// A statement's WHERE rewritten for its blocks, before it compiles
 struct WhereParts {
     clause: Expression,
@@ -3717,6 +3788,12 @@ pub struct PreparedSelect {
     /// The statement has window functions: its rows are read whole and the
     /// window step computes its SELECT list over them
     windowed: bool,
+    /// The statement aggregates its rows into one: they are read whole and
+    /// fed to its calls, unless the table answers them
+    aggregated: bool,
+    /// Those calls, parsed once when its SELECT list reads no parameter;
+    /// None parses them on each run
+    calls: Option<Vec<SqlAggregateFunction>>,
     /// The window step's plan, made once when no run changes it; None makes
     /// it on each run
     window: Option<super::window::WindowPlan<'static>>,
@@ -3799,6 +3876,10 @@ impl PreparedSelect {
                 distinct_on,
                 having: None,
                 windows,
+                aggregate: self.aggregated.then(|| {
+                    let items: Vec<String> = stmt.columns.iter().map(item_name).collect();
+                    items.join(", ")
+                }),
                 names: &self.output_columns[..self.visible],
                 pushed,
                 ordered: Executor::ordered_read_column(stmt)
@@ -7913,9 +7994,12 @@ impl PreparedSelect {
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .chain(&stmt.distinct_on)
             .any(QueryClassification::expression_has_window_function);
+        // A statement that aggregates its rows into one reads them as the
+        // windowed one does, its calls computed over them
+        let aggregated = !windowed && Self::global_aggregate(stmt);
         let rows_stmt;
         let written = stmt;
-        let stmt = match windowed {
+        let stmt = match windowed || aggregated {
             true => {
                 rows_stmt = Self::rows_of(stmt);
                 &rows_stmt
@@ -8132,9 +8216,11 @@ impl PreparedSelect {
                 let mut scan = None;
                 if blocks.subqueries.is_empty() {
                     scan = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
+                    // An aggregate's calls read only the columns it names
+                    let reads = if aggregated { written } else { stmt };
                     where_.needed = needed_columns(
-                        stmt,
-                        stmt.where_clause.as_deref(),
+                        reads,
+                        reads.where_clause.as_deref(),
                         &schema.column_names_lower_arc(),
                     );
                 }
@@ -8216,9 +8302,48 @@ impl PreparedSelect {
                 if windowed {
                     steps = Self::window_steps(written, where_.conjuncts > where_.pushed);
                 }
+                // The aggregate's row from where the one rule says, else from
+                // the rows the read passes
+                let read = match aggregated {
+                    true => {
+                        steps = Self::aggregate_steps(written, where_.conjuncts > where_.pushed);
+                        let indexed = |column: &str| {
+                            super::planned_aggregate::bounds(store.get_index_by_column(column))
+                        };
+                        let classification = get_classification(written);
+                        let rule = executor.aggregate_read_plan(
+                            written,
+                            &classification,
+                            ctx,
+                            schema,
+                            indexed,
+                        )?;
+                        match rule {
+                            Some(AggregatePlan {
+                                aggregations,
+                                read: AggregateRead::Global { source, .. },
+                                ..
+                            }) => Read::Aggregated {
+                                source,
+                                column: aggregations
+                                    .first()
+                                    .map(|agg| SmartString::from(bare_name(&agg.column_lower))),
+                                otherwise: Box::new(read),
+                            },
+                            _ => read,
+                        }
+                    }
+                    false => read,
+                };
                 plan = Some(Plan { steps, read });
             }
         }
+        // A SELECT list reading a parameter, or a value drawn anew each run,
+        // has its calls parsed on each run
+        let varies = |item: &Expression| {
+            super::utils::expression_has_parameters(item)
+                || Executor::expression_varies_by_statement(item, ctx)
+        };
         let window = windowed
             .then(|| {
                 let keyed = Executor::with_distinct_on_items(written, &get_classification(written));
@@ -8247,9 +8372,38 @@ impl PreparedSelect {
                 !Executor::has_subqueries(w) && has_constant_term(w, &executor.function_registry)
             }),
             windowed,
+            aggregated,
+            calls: match aggregated && !written.columns.iter().any(varies) {
+                true => Some(executor.parse_aggregations(written, Some(ctx))?.0),
+                false => None,
+            },
             window,
             source_values,
         })
+    }
+
+    /// Whether `stmt` aggregates its rows into one: a call, and no grouping
+    /// or HAVING
+    fn global_aggregate(stmt: &SelectStatement) -> bool {
+        stmt.group_by.columns.is_empty()
+            && matches!(stmt.group_by.modifier, GroupByModifier::None)
+            && stmt.having.is_none()
+            && get_classification(stmt).has_aggregation
+    }
+
+    /// The steps of `stmt`, which aggregates its rows into one, over its
+    /// read, outermost first: the finishing steps over the aggregate, over
+    /// the conjuncts the read did not take when `filter`
+    fn aggregate_steps(stmt: &SelectStatement, filter: bool) -> SmallVec<[Step; 4]> {
+        let mut inner = SmallVec::<[Step; 2]>::new();
+        if stmt.distinct {
+            inner.push(Step::Distinct);
+        }
+        inner.push(Step::Aggregate);
+        if filter {
+            inner.push(Step::Filter);
+        }
+        Executor::finishing_steps(stmt, &inner)
     }
 
     /// The statement a windowed `stmt` reads its rows by: every column of
@@ -11820,6 +11974,88 @@ impl Executor {
         Ok(kept)
     }
 
+    /// The one row of `stmt`, which aggregates the rows of `table` into one:
+    /// from where the plan's rule says, else every row the WHERE passes fed
+    /// to the calls, held at once when the table shares them or is large,
+    /// else as the read decodes them
+    fn prepared_global(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        table: &dyn Table,
+    ) -> Result<Box<dyn QueryResult>> {
+        let parsed;
+        let aggregations = match &prepared.calls {
+            Some(calls) => calls,
+            None => {
+                parsed = self.parse_aggregations(stmt, Some(ctx))?.0;
+                &parsed
+            }
+        };
+        let plan = prepared.plan.as_ref();
+        let source = plan.and_then(|plan| plan.read.aggregated());
+        let source = source.unwrap_or(GlobalSource::Scan);
+        let pushed = match (source, stmt.where_clause.as_deref()) {
+            (GlobalSource::StorageFiltered, Some(where_clause)) => {
+                match pushdown::try_pushdown(where_clause, table.schema(), Some(ctx)) {
+                    (Some(pushed), false) => Some(pushed),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let scan = || {
+            let columns = table.schema().column_names_arc();
+            let mut kept = RowVec::new();
+            let passing = match prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
+                true => Passing::Pruned,
+                false => {
+                    let chosen = plan.and_then(|plan| plan.read.scan());
+                    let keep = |id: i64, _: u64, row: Row| {
+                        kept.push((id, row));
+                        true
+                    };
+                    let read = (&prepared.where_, chosen);
+                    runner.passing_rows(read, None, table, ctx, None, Take::Stream, keep)?
+                }
+            };
+            // Rows the table shares cost nothing to hold, and a large table's
+            // feed on the thread pool; rows decoded from volumes stream
+            #[cfg(feature = "parallel")]
+            let large = table.row_count_hint() >= super::aggregation::PARALLEL_ROWS;
+            #[cfg(not(feature = "parallel"))]
+            let large = false;
+            let hold = large || !table.narrows_scans();
+            let held: RowVec;
+            let input = match passing {
+                Passing::Pruned => FeedInput::Rows(&[]),
+                Passing::Read => FeedInput::Rows(&kept),
+                Passing::Answers(rows) => {
+                    held = rows;
+                    FeedInput::Rows(&held)
+                }
+                Passing::Scan(scan) if hold => {
+                    held = PassedRows::new(scan, None, runner, ctx).held()?;
+                    FeedInput::Rows(&held)
+                }
+                Passing::Filtered(scan, bound) if hold => {
+                    held = runner.drain(scan, Some(bound))?;
+                    FeedInput::Rows(&held)
+                }
+                Passing::Scan(scan) => FeedInput::Each(PassedRows::new(scan, None, runner, ctx)),
+                Passing::Filtered(scan, bound) => {
+                    FeedInput::Each(PassedRows::new(scan, Some(bound), runner, ctx))
+                }
+            };
+            self.global_row(aggregations, &columns, ctx, None, input)
+                .map(Some)
+        };
+        let source = (source, pushed.as_deref());
+        self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)?
+            .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))
+    }
+
     /// Run an in-family statement: scan its table narrowed by the
     /// conjuncts without a subquery, keep the rows the WHERE program
     /// passes, and project them. With no ORDER BY the scan stops once
@@ -12004,6 +12240,21 @@ impl Executor {
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
             let layout = layout.map(CompactArc::new);
+            return Ok((result, output_columns, false, visible, layout, false));
+        }
+        // The calls over every row the read passes, unless the table answers
+        // them; the finishing steps follow
+        if prepared.aggregated {
+            let StatementSource::Table(table) = &source else {
+                return Err(Error::internal("an aggregate statement over a source"));
+            };
+            let result = self.prepared_global(stmt, ctx, (&runner, &prepared), &**table)?;
+            let output_columns = CompactArc::new(result.columns().to_vec());
+            let visible = self.count_select_columns(stmt);
+            let names = table.schema().column_names_arc();
+            let layout =
+                Self::shared_result_layout(stmt, &names, Some(scope_name), &output_columns)
+                    .map(CompactArc::new);
             return Ok((result, output_columns, false, visible, layout, false));
         }
         let output_columns = CompactArc::clone(&prepared.output_columns);

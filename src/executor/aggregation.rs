@@ -944,7 +944,7 @@ pub(crate) static COUNT_STAR: Value = Value::Integer(1);
 
 /// Rows at which an aggregation whose calls all merge splits its input
 #[cfg(feature = "parallel")]
-const PARALLEL_ROWS: usize = 100_000;
+pub(super) const PARALLEL_ROWS: usize = 100_000;
 
 /// One GROUP BY item as each row is read for it
 enum KeyItem {
@@ -967,6 +967,35 @@ impl GroupKey for Picked<'_> {
     #[inline(always)]
     fn at(&self, i: usize) -> &Value {
         &self.key[self.picks[i]]
+    }
+}
+
+/// What hands an aggregation its rows one at a time, each borrowed until
+/// the next is asked for
+pub(super) trait RowSource {
+    /// The next row; None once every row was handed over
+    fn next_row(&mut self) -> Result<Option<&Row>>;
+}
+
+/// The rows an aggregation reads: held at once, which a large input feeds
+/// on the thread pool, or handed over one at a time
+pub(super) enum FeedInput<'r, S> {
+    Rows(&'r [(i64, Row)]),
+    Each(S),
+}
+
+/// A table's scanner as a source of rows, its error raised at the end
+pub(super) struct ScannedRows<'s>(pub(super) &'s mut dyn crate::storage::traits::Scanner);
+
+impl RowSource for ScannedRows<'_> {
+    fn next_row(&mut self) -> Result<Option<&Row>> {
+        if self.0.next() {
+            return Ok(Some(self.0.row()));
+        }
+        match self.0.err() {
+            Some(err) => Err(err.clone()),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1277,6 +1306,39 @@ impl<'a> RowFeed<'a> {
         let mut state = FeedState::default();
         let reads = RowReads::of(ctx, blocks);
         for (_, row) in rows {
+            self.run_one(groups, row, &reads, &mut state)?;
+        }
+        Ok(())
+    }
+
+    /// Runs into its group every row `source` hands over, as `run_rows`
+    /// does a slice's, one at a time
+    fn run_each(
+        &self,
+        groups: &mut GroupedAggregates,
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+        mut source: impl RowSource,
+    ) -> Result<()> {
+        if let (false, Some(columns)) = (self.programs, &self.key_columns) {
+            if columns.is_empty() {
+                let Some(group) = groups.group(&[] as &[Value]) else {
+                    return Ok(());
+                };
+                let runs = groups.aggregates(group);
+                while let Some(row) = source.next_row()? {
+                    self.feed_columns(runs, row);
+                }
+                return Ok(());
+            }
+            while let Some(row) = source.next_row()? {
+                self.run_columns(groups, row, columns);
+            }
+            return Ok(());
+        }
+        let mut state = FeedState::default();
+        let reads = RowReads::of(ctx, blocks);
+        while let Some(row) = source.next_row()? {
             self.run_one(groups, row, &reads, &mut state)?;
         }
         Ok(())
@@ -3254,32 +3316,40 @@ impl Executor {
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<RowVec> {
-        let schema_lower = table.schema().column_names_lower_arc();
-        let col_index_map: StringMap<usize> = schema_lower
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.clone(), i))
-            .collect();
+        let columns = table.schema().column_names_lower_arc();
+        let mut scanner = table.scan(&[], None)?;
+        let source = ScannedRows(&mut *scanner);
+        let rows = self.global_row(aggregations, &columns, ctx, blocks, FeedInput::Each(source))?;
+        scanner.close()?;
+        Ok(rows)
+    }
+
+    /// The one group of `aggregations` over the rows of `input`, whose
+    /// columns are `columns`; the statement's `blocks` answer what the calls
+    /// ask of each row
+    pub(super) fn global_row(
+        &self,
+        aggregations: &[SqlAggregateFunction],
+        columns: &[String],
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+        input: FeedInput<'_, impl RowSource>,
+    ) -> Result<RowVec> {
+        let col_index_map = build_column_index_map(columns);
         let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
         let feed = RowFeed::new(
             aggregations,
             &[],
             None,
-            &schema_lower,
+            columns,
             &col_index_map,
             ctx,
             blocks,
         )?;
-        let mut state = FeedState::default();
-        let reads = RowReads::of(ctx, blocks);
-        let mut scanner = table.scan(&[], None)?;
-        while scanner.next() {
-            feed.run_one(&mut groups, scanner.row(), &reads, &mut state)?;
+        match input {
+            FeedInput::Rows(rows) => feed.run_rows(&mut groups, rows, ctx, blocks)?,
+            FeedInput::Each(source) => feed.run_each(&mut groups, ctx, blocks, source)?,
         }
-        if let Some(e) = scanner.err() {
-            return Err(e.clone());
-        }
-        scanner.close()?;
         groups.into_rows()
     }
 
