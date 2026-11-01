@@ -9020,14 +9020,18 @@ impl PreparedGrouped {
                     if column >= width && unrepeatable(column - width))
                 })
         };
-        let mut late_blocks = vec![false; blocks.subqueries.len()];
+        let mut late_blocks = Vec::new();
         let mut late: Vec<(usize, Expression)> = Vec::new();
-        for &(index, at) in &keyed_columns {
+        let any_late =
+            !keyed_columns.is_empty() && (0..blocks.subqueries.len()).any(&reads_unrepeatable);
+        for &(index, at) in keyed_columns.iter().filter(|_| any_late) {
             let Some(Expression::Aliased(column)) = run_stmt.columns.get_mut(index) else {
                 continue;
             };
-            let mut asked = vec![false; late_blocks.len()];
-            for id in blocks_asked(&column.expression) {
+            let (mut found, mut values) = (SmallVec::new(), Vec::new());
+            outside_blocks(&column.expression, &mut found, &mut values);
+            let mut asked = vec![false; blocks.subqueries.len()];
+            for id in found {
                 asked[usize::from(id)] = true;
             }
             for id in 0..asked.len() {
@@ -9037,6 +9041,7 @@ impl PreparedGrouped {
             if !(0..asked.len()).any(|id| asked[id] && reads_unrepeatable(id)) {
                 continue;
             }
+            late_blocks.resize(asked.len(), false);
             for (late, asked) in late_blocks.iter_mut().zip(asked) {
                 *late |= asked;
             }
@@ -9069,10 +9074,12 @@ impl PreparedGrouped {
                 group_reads.insert(key, at);
                 Ok(())
             };
-            for (id, sq) in blocks.subqueries.iter().enumerate() {
-                if !late_blocks[id] {
-                    continue;
-                }
+            for (sq, _) in blocks
+                .subqueries
+                .iter()
+                .zip(&late_blocks)
+                .filter(|(_, &late)| late)
+            {
                 for (_, written) in &sq.hole_written {
                     if !matches!(key_chain.resolve(written), Ok(Some((0, column))) if column >= width)
                     {
@@ -9081,7 +9088,9 @@ impl PreparedGrouped {
                 }
             }
             for (_, key) in &late {
-                for expr in &group_values(key) {
+                let (mut asked, mut values) = (SmallVec::new(), Vec::new());
+                outside_blocks(key, &mut asked, &mut values);
+                for expr in &values {
                     read(expr)?;
                 }
             }
@@ -9129,16 +9138,15 @@ impl PreparedGrouped {
         };
         let slots_ctx = CompileContext::bound(&executor.function_registry);
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
-        let mut late_holes = Vec::with_capacity(late_blocks.len());
+        let mut late_holes = Vec::new();
         for (id, sq) in blocks.subqueries.iter().enumerate() {
             if input.get(id) == Some(&true) {
                 holes.push(std::mem::take(&mut row_holes.holes[id]));
-                late_holes.push(Vec::new());
                 continue;
             }
             // A late key's block reads the run's row: an item, or a value of the
             // group held in a column of its own
-            if late_blocks[id] {
+            if late_blocks.get(id) == Some(&true) {
                 let read = |written: &Expression| match key_chain.resolve(written) {
                     Ok(Some((0, column))) if column >= width => Some(column - width),
                     _ => group_reads
@@ -9155,10 +9163,10 @@ impl PreparedGrouped {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 holes.push(Vec::new());
+                late_holes.resize_with(id, Vec::new);
                 late_holes.push(late_read);
                 continue;
             }
-            late_holes.push(Vec::new());
             let mut grouped = Vec::with_capacity(sq.hole_written.len());
             for (slot, written) in &sq.hole_written {
                 // Each alias's item over the group's row, its group items and
@@ -9216,6 +9224,7 @@ impl PreparedGrouped {
                     .iter()
                     .map(|(at, key)| compile_with(&over_row, key).map(|program| (*at, program)))
                     .collect::<Result<Vec<_>>>()?;
+                late_holes.resize_with(blocks.subqueries.len(), Vec::new);
                 let holes = HoleSet { holes: late_holes };
                 Some(Box::new(LateKeys { keys, holes }))
             }
@@ -12920,45 +12929,36 @@ impl StatementSource<'_> {
     }
 }
 
-/// The block `expr` asks itself, a subquery a block rewrote
-fn asked_block(expr: &Expression) -> Option<u16> {
-    match expr {
-        Expression::ScalarSubquery(sq) => sq.subquery.prepared,
-        Expression::Exists(exists) => exists.subquery.prepared,
-        Expression::AllAny(all_any) => all_any.subquery.prepared,
-        _ => None,
-    }
-}
-
-/// The blocks `expr` asks, outside one another
-fn blocks_asked(expr: &Expression) -> SmallVec<[u16; 2]> {
-    let found = std::cell::RefCell::new(SmallVec::new());
-    let asked = |e: &Expression| match asked_block(e) {
-        Some(id) => {
-            found.borrow_mut().push(id);
-            true
-        }
-        None => false,
+/// The blocks a grouped `key` asks, outside one another, into `blocks`, and
+/// each value of the group it reads outside them, a column or an aggregate
+/// call, whole, into `values`; the left of an ANY or ALL is outside its block
+fn outside_blocks(key: &Expression, blocks: &mut SmallVec<[u16; 2]>, values: &mut Vec<Expression>) {
+    let found = std::cell::RefCell::new((SmallVec::<[u16; 2]>::new(), Vec::new(), Vec::new()));
+    let skip = |e: &Expression| {
+        let (asked, calls, lefts) = &mut *found.borrow_mut();
+        let block = match e {
+            Expression::ScalarSubquery(sq) => sq.subquery.prepared,
+            Expression::Exists(exists) => exists.subquery.prepared,
+            Expression::AllAny(all_any) => {
+                lefts.push((*all_any.left).clone());
+                all_any.subquery.prepared
+            }
+            Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
+                calls.push(e.clone());
+                return true;
+            }
+            _ => return false,
+        };
+        asked.extend(block);
+        true
     };
-    visit_column_refs_outside(expr, &asked, &mut |_| {});
-    found.into_inner()
-}
-
-/// Each value of a group `key` reads outside its blocks, a column or an
-/// aggregate call, whole
-fn group_values(key: &Expression) -> Vec<Expression> {
-    let calls = std::cell::RefCell::new(Vec::new());
-    let skip = |e: &Expression| match e {
-        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
-            calls.borrow_mut().push(e.clone());
-            true
-        }
-        e => asked_block(e).is_some(),
-    };
-    let mut values = Vec::new();
     visit_column_refs_outside(key, &skip, &mut |column| values.push(column.clone()));
-    values.extend(calls.into_inner());
-    values
+    let (asked, calls, lefts) = found.into_inner();
+    blocks.extend(asked);
+    values.extend(calls);
+    for left in &lefts {
+        outside_blocks(left, blocks, values);
+    }
 }
 
 /// A grouped ORDER BY `key` with each SELECT alias outside its subqueries,

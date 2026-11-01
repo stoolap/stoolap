@@ -9613,9 +9613,10 @@ impl Executor {
                 let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
                     Error::internal("a table's columns changed while the statement prepared")
                 })?;
-                return self.group_held_rows(held, &run, ctx, rows, columns, |out| {
+                let output = self.group_held_rows(held, &run, ctx, rows, columns, |out| {
                     Self::result_layout(&held.stmt, columns, None, out)
-                });
+                })?;
+                return Self::with_late_keys(held, &run, output, ctx);
             }
         }
         self.grouped_select(stmt, ctx, classification, rows, columns, None)
@@ -9720,13 +9721,23 @@ impl Executor {
             Error::internal("a table's columns changed while the statement prepared")
         })?;
         let output = self.grouped_output(held, &run, grouped, ctx)?;
+        Self::with_late_keys(held, &run, output, ctx)
+    }
+
+    /// `output`, the rows the run `run` of `held` returned, with each late key
+    /// written into its column of every row, which a sort reads whole anyway
+    fn with_late_keys(
+        held: &super::prepared_select::PreparedGrouped,
+        run: &super::prepared_select::PreparedRunner<'_>,
+        output: SelectOutput,
+        ctx: &ExecutionContext,
+    ) -> SelectResult {
         let Some(late) = held.late_keys() else {
             return Ok(output);
         };
-        // Its late keys read each row the run returned, which a sort reads whole
         let (result, columns, applied, shape) = output;
         let mut rows = Self::materialize_result(result)?;
-        late.fill(&run, &mut rows, ctx)?;
+        late.fill(run, &mut rows, ctx)?;
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
         Ok((Box::new(result), columns, applied, shape))
     }

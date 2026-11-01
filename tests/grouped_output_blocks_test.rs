@@ -1001,6 +1001,26 @@ fn a_grouped_key_reading_an_alias_of_an_item_holding_a_subquery_reads_its_value(
                      ORDER BY {m} / 2, a"
                 ),
             ),
+            // A join's groups, whose run returns its rows on its own path
+            (
+                "SELECT DISTINCT ON ((SELECT 0) + z) t.a, (SELECT t.a) AS z, COUNT(*) \
+                 FROM t JOIN u ON u.id = t.id GROUP BY t.a ORDER BY t.a"
+                    .to_string(),
+                "SELECT DISTINCT ON (t.a) t.a, t.a AS z, COUNT(*) \
+                 FROM t JOIN u ON u.id = t.id GROUP BY t.a ORDER BY t.a"
+                    .to_string(),
+            ),
+            // A group column on the left of an ANY, outside its block
+            (
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY CASE WHEN a = ANY (SELECT k FROM u WHERE k < 5) THEN m ELSE -m END, a"
+                ),
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY CASE WHEN a IN (0, 1, 2, 3, 4) THEN m ELSE -m END, a"
+                ),
+            ),
             // A window item, computed after the groups
             (
                 "SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM t GROUP BY a \
