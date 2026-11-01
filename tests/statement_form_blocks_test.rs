@@ -330,6 +330,24 @@ fn an_exists_ordered_or_distinct_where_only_a_statement_reads_it_computes_neithe
                 "SELECT DISTINCT ON (2) * FROM w WHERE w.k = t.k OFFSET 1".to_string(),
                 none.to_string(),
             ),
+            (
+                "SELECT DISTINCT ON (1) 42 FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (x) 42 AS x FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT MAX(v) AS k FROM w WHERE w.k = t.k GROUP BY id ORDER BY k LIMIT 1"
+                    .to_string(),
+                rows_of.to_string(),
+            ),
+            (
+                "SELECT MAX(v) AS m FROM w WHERE w.k = t.k GROUP BY id ORDER BY 1 LIMIT 1"
+                    .to_string(),
+                rows_of.to_string(),
+            ),
         ] {
             for site in [
                 "SELECT id FROM t WHERE EXISTS (?) ORDER BY id",
@@ -396,6 +414,14 @@ fn an_exists_ordered_or_distinct_binds_what_it_does_not_compute() {
         (
             "SELECT DISTINCT ON (3) k FROM w WHERE w.k = t.k OFFSET 1",
             "DISTINCT ON key 3 names no column",
+        ),
+        (
+            "SELECT DISTINCT ON (0) k FROM w WHERE w.k = t.k OFFSET 1",
+            "DISTINCT ON key 0 names no column",
+        ),
+        (
+            "SELECT DISTINCT ON (-9223372036854775808) 1 FROM w WHERE w.k = t.k OFFSET 1",
+            "DISTINCT ON key -9223372036854775808 names no column",
         ),
     ] {
         let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");

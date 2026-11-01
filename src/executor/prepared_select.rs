@@ -3045,28 +3045,22 @@ fn existence(
     let distinct_on = stmt
         .distinct_on
         .iter()
-        .map(|key| match key {
-            Expression::IntegerLiteral(position) => usize::try_from(position.value - 1)
-                .ok()
-                .and_then(|at| stmt.columns.get(at))
-                .map(|item| unaliased(item).clone())
-                .ok_or_else(|| {
-                    Error::invalid_argument(format!("DISTINCT ON key {key} names no column"))
-                }),
-            // A bare alias names its item, as an ORDER BY key's does
-            Expression::Identifier(name) if order_by_names_an_alias(key, &stmt) => Ok(stmt
-                .columns
-                .iter()
-                .find_map(|item| match item {
-                    Expression::Aliased(aliased)
-                        if aliased.alias.value_lower == name.value_lower =>
-                    {
-                        Some((*aliased.expression).clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| key.clone())),
-            key => Ok(with_aliases(key, &stmt.columns, from_names).into_owned()),
+        .map(|key| {
+            let bound = bound_key(key, &stmt, from_names);
+            match &*bound {
+                Expression::IntegerLiteral(_) if std::ptr::eq(&*bound, key) => Err(
+                    Error::invalid_argument(format!("DISTINCT ON key {key} names no column")),
+                ),
+                // An integer item puts every row in one group, which written
+                // as an integer would read as a position
+                Expression::IntegerLiteral(literal) => {
+                    Ok(Expression::BooleanLiteral(BooleanLiteral {
+                        token: literal.token.clone(),
+                        value: true,
+                    }))
+                }
+                _ => Ok(bound.into_owned()),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     let token = |kind, text: &str| Token::new(kind, text, Position::default());
@@ -3205,6 +3199,32 @@ fn check_block_positions(sq: &SelectStatement, columns: usize) -> Result<()> {
         )),
         None => Ok(()),
     }
+}
+
+/// `key`, an ORDER BY or DISTINCT ON key of `stmt`, as the statement binds
+/// it: a position or a bare SELECT alias reads its item, any other key binds
+/// as a WHERE does over `columns`; a position past the items or beside a
+/// star stays as written
+fn bound_key<'e>(
+    key: &'e Expression,
+    stmt: &'e SelectStatement,
+    columns: &[String],
+) -> std::borrow::Cow<'e, Expression> {
+    let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
+    let item = match key {
+        Expression::IntegerLiteral(position) if !stmt.columns.iter().any(star) => position
+            .value
+            .checked_sub(1)
+            .and_then(|at| usize::try_from(at).ok())
+            .and_then(|at| stmt.columns.get(at)),
+        Expression::Identifier(name) if order_by_names_an_alias(key, stmt) => {
+            stmt.columns.iter().find(|item| {
+                matches!(item, Expression::Aliased(a) if a.alias.value_lower == name.value_lower)
+            })
+        }
+        _ => return with_aliases(key, &stmt.columns, columns),
+    };
+    std::borrow::Cow::Borrowed(item.map_or(key, unaliased))
 }
 
 /// A block's WHERE with its SELECT aliases read as their expressions, as
@@ -5255,19 +5275,21 @@ impl Builder<'_> {
         scopes.push(own);
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
-        let keys: Vec<Expression> = sq
-            .order_by
-            .iter()
-            .map(|ob| with_aliases(&ob.expression, &sq.columns, &own.columns).into_owned())
-            .collect();
         // A grouped block's keys read its groups
-        if grouped_block(sq) && !keys.is_empty() {
-            return self.bind_grouping(&chain, id, sq, keys.iter(), true, work);
+        if grouped_block(sq) && !sq.order_by.is_empty() {
+            let keys: SmallVec<[std::borrow::Cow<'_, Expression>; 2]> = sq
+                .order_by
+                .iter()
+                .map(|ob| bound_key(&ob.expression, sq, &own.columns))
+                .collect();
+            let keys = keys.iter().map(|key| &**key);
+            return self.bind_grouping(&chain, id, sq, keys, true, work);
         }
         let registry = &self.executor.function_registry;
         let compile = CompileContext::bound(registry).with_prepared_subqueries();
-        for key in &keys {
-            let key = self.trial_rewrite(&chain, id, key, &work.outer)?;
+        for ob in &sq.order_by {
+            let key = with_aliases(&ob.expression, &sq.columns, &own.columns);
+            let key = self.trial_rewrite(&chain, id, &key, &work.outer)?;
             compile_with(&compile, &key)?;
         }
         Ok(())
