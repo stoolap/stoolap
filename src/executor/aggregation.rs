@@ -3289,7 +3289,8 @@ impl Executor {
     /// stream directly to aggregation HashMap without materializing all rows first.
     /// This reduces memory allocations from O(N) to O(groups).
     ///
-    /// Returns None if the optimization cannot be applied.
+    /// Hands `result` back unread when the optimization cannot be applied,
+    /// so the derived table's statement runs once either way.
     ///
     /// Supported patterns:
     /// - Single-column GROUP BY (column reference)
@@ -3302,34 +3303,34 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<Option<Box<dyn QueryResult>>> {
+    ) -> Result<std::result::Result<Box<dyn QueryResult>, Box<dyn QueryResult>>> {
         if Self::aggregates_hold_subquery(stmt) {
-            return Ok(None);
+            return Ok(Err(result));
         }
 
         // Quick eligibility checks
         if !classification.has_group_by {
-            return Ok(None);
+            return Ok(Err(result));
         }
         if classification.has_having {
-            return Ok(None);
+            return Ok(Err(result));
         }
         if classification.has_window_functions {
-            return Ok(None);
+            return Ok(Err(result));
         }
         // Skip ROLLUP/CUBE/GROUPING SETS
         if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
-            return Ok(None);
+            return Ok(Err(result));
         }
 
         // Only single-column GROUP BY for this optimization
         if stmt.group_by.columns.len() != 1 {
-            return Ok(None);
+            return Ok(Err(result));
         }
 
         // The derived table's columns carry no qualifier
         let Some((group_col_name, _)) = self.single_group_column(stmt)? else {
-            return Ok(None);
+            return Ok(Err(result));
         };
 
         // Build column index map from result columns
@@ -3343,7 +3344,7 @@ impl Executor {
         // Find GROUP BY column index
         let group_col_idx = match col_index_map.get(&group_col_name) {
             Some(&idx) => idx,
-            None => return Ok(None),
+            None => return Ok(Err(result)),
         };
 
         // Parse aggregations
@@ -3373,7 +3374,7 @@ impl Executor {
                 .iter()
                 .all(|column| column.eq_ignore_ascii_case(&group_col_name))
         {
-            return Ok(None);
+            return Ok(Err(result));
         }
 
         // Plain COUNT, SUM, AVG, MIN and MAX over the derived table's columns
@@ -3387,7 +3388,7 @@ impl Executor {
                 }
         });
         if !plain {
-            return Ok(None);
+            return Ok(Err(result));
         }
 
         let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
@@ -3430,7 +3431,7 @@ impl Executor {
             slot_columns,
             groups.into_rows()?,
         )
-        .map(Some)
+        .map(Ok)
     }
 }
 

@@ -7856,25 +7856,28 @@ impl Executor {
             && classification.has_aggregation
             && !classification.has_window_functions
         {
-            if let Some(agg_result) =
-                self.try_streaming_derived_table_aggregation(result, stmt, ctx, classification)?
-            {
-                let out_columns = CompactArc::new(agg_result.columns().to_vec());
-                let alias = subquery_source
-                    .alias
-                    .as_ref()
-                    .map(|a| a.value_lower.as_str());
-                let layout = Self::result_layout(stmt, &columns, alias, &out_columns);
-                return Ok((
-                    agg_result,
-                    out_columns,
-                    false,
-                    SelectShape::laid_out(layout),
-                ));
-            }
-            // Streaming not applicable - need to re-execute the subquery
-            // (the streaming function consumed the result iterator)
-            let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan)?;
+            let result = match self.try_streaming_derived_table_aggregation(
+                result,
+                stmt,
+                ctx,
+                classification,
+            )? {
+                Ok(agg_result) => {
+                    let out_columns = CompactArc::new(agg_result.columns().to_vec());
+                    let alias = subquery_source
+                        .alias
+                        .as_ref()
+                        .map(|a| a.value_lower.as_str());
+                    let layout = Self::result_layout(stmt, &columns, alias, &out_columns);
+                    return Ok((
+                        agg_result,
+                        out_columns,
+                        false,
+                        SelectShape::laid_out(layout),
+                    ));
+                }
+                Err(unread) => unread,
+            };
 
             // Fall through to materialization path
             let mut rows = RowVec::new();
