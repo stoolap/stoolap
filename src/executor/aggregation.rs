@@ -943,8 +943,7 @@ impl CallInputs {
 pub(crate) static COUNT_STAR: Value = Value::Integer(1);
 
 /// Rows at which an aggregation whose calls all merge splits its input
-#[cfg(feature = "parallel")]
-pub(super) const PARALLEL_ROWS: usize = 100_000;
+const PARALLEL_ROWS: usize = 100_000;
 
 /// One GROUP BY item as each row is read for it
 enum KeyItem {
@@ -975,13 +974,17 @@ impl GroupKey for Picked<'_> {
 pub(super) trait RowSource {
     /// The next row; None once every row was handed over
     fn next_row(&mut self) -> Result<Option<&Row>>;
+
+    /// Every row left, taken at once; their ids are not read
+    fn held(self) -> Result<RowVec>;
 }
 
 /// The rows an aggregation reads: held at once, which a large input feeds
-/// on the thread pool, or handed over one at a time
+/// on the thread pool, or handed over one at a time, with about how many
+/// there are; the feed takes those at once when it splits them
 pub(super) enum FeedInput<'r, S> {
     Rows(&'r [(i64, Row)]),
-    Each(S),
+    Each(S, usize),
 }
 
 /// A table's scanner as a source of rows, its error raised at the end
@@ -995,6 +998,17 @@ impl RowSource for ScannedRows<'_> {
         match self.0.err() {
             Some(err) => Err(err.clone()),
             None => Ok(None),
+        }
+    }
+
+    fn held(self) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(self.0.estimated_count().unwrap_or(64));
+        while self.0.next() {
+            rows.push((0, self.0.take_row()));
+        }
+        match self.0.err() {
+            Some(err) => Err(err.clone()),
+            None => Ok(rows),
         }
     }
 }
@@ -1254,6 +1268,12 @@ impl<'a> RowFeed<'a> {
         }
     }
 
+    /// Whether `run_rows` splits an input of `rows` rows over the thread
+    /// pool: a large one whose calls all merge and run no program
+    fn splits(&self, groups: &GroupedAggregates, rows: usize) -> bool {
+        cfg!(feature = "parallel") && rows >= PARALLEL_ROWS && !self.programs && groups.can_merge()
+    }
+
     /// Runs every row into its group, its subqueries answered by `blocks`;
     /// a large input whose calls all merge is split, and its parts merge in
     /// input order
@@ -1265,7 +1285,7 @@ impl<'a> RowFeed<'a> {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<()> {
         #[cfg(feature = "parallel")]
-        if rows.len() >= PARALLEL_ROWS && !self.programs && groups.can_merge() {
+        if self.splits(groups, rows.len()) {
             let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
             let params = ctx.params();
             let parts: Vec<GroupedAggregates> = rows
@@ -3318,8 +3338,8 @@ impl Executor {
     ) -> Result<RowVec> {
         let columns = table.schema().column_names_lower_arc();
         let mut scanner = table.scan(&[], None)?;
-        let source = ScannedRows(&mut *scanner);
-        let rows = self.global_row(aggregations, &columns, ctx, blocks, FeedInput::Each(source))?;
+        let input = FeedInput::Each(ScannedRows(&mut *scanner), table.row_count_hint());
+        let rows = self.global_row(aggregations, &columns, ctx, blocks, input)?;
         scanner.close()?;
         Ok(rows)
     }
@@ -3348,7 +3368,10 @@ impl Executor {
         )?;
         match input {
             FeedInput::Rows(rows) => feed.run_rows(&mut groups, rows, ctx, blocks)?,
-            FeedInput::Each(source) => feed.run_each(&mut groups, ctx, blocks, source)?,
+            FeedInput::Each(source, rows) if feed.splits(&groups, rows) => {
+                feed.run_rows(&mut groups, &source.held()?, ctx, blocks)?
+            }
+            FeedInput::Each(source, _) => feed.run_each(&mut groups, ctx, blocks, source)?,
         }
         groups.into_rows()
     }

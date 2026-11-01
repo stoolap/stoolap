@@ -3544,10 +3544,15 @@ impl<'r, 'a> PassedRows<'r, 'a> {
             read: 0,
         }
     }
+}
 
-    /// Every row of a scan that took the whole WHERE, held at once; their
-    /// ids are not read
+impl RowSource for PassedRows<'_, '_> {
+    /// Rows the bound WHERE judges are judged as the drain judges them, on
+    /// the thread pool when many
     fn held(mut self) -> Result<RowVec> {
+        if let Some(bound) = self.bound {
+            return self.runner.drain(self.scan, Some(bound));
+        }
         let mut rows = RowVec::with_capacity(self.scan.estimated_count().unwrap_or(64));
         while self.scan.next() {
             self.read += 1;
@@ -3561,9 +3566,7 @@ impl<'r, 'a> PassedRows<'r, 'a> {
             None => Ok(rows),
         }
     }
-}
 
-impl RowSource for PassedRows<'_, '_> {
     fn next_row(&mut self) -> Result<Option<&Row>> {
         loop {
             if !self.scan.next() {
@@ -3791,8 +3794,8 @@ pub struct PreparedSelect {
     /// The statement aggregates its rows into one: they are read whole and
     /// fed to its calls, unless the table answers them
     aggregated: bool,
-    /// Those calls, parsed once when its SELECT list reads no parameter;
-    /// None parses them on each run
+    /// Those calls, parsed once when each later argument is written as its
+    /// value; None parses them on each run
     calls: Option<Vec<SqlAggregateFunction>>,
     /// The window step's plan, made once when no run changes it; None makes
     /// it on each run
@@ -8338,11 +8341,12 @@ impl PreparedSelect {
                 plan = Some(Plan { steps, read });
             }
         }
-        // A SELECT list reading a parameter, or a value drawn anew each run,
-        // has its calls parsed on each run
-        let varies = |item: &Expression| {
-            super::utils::expression_has_parameters(item)
-                || Executor::expression_varies_by_statement(item, ctx)
+        // A run reads only a call's later arguments not written as values:
+        // calls without one are held, the others parsed on each run
+        let calls = match aggregated {
+            true => Some(executor.parse_block_aggregations(written)?)
+                .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())),
+            false => None,
         };
         let window = windowed
             .then(|| {
@@ -8373,10 +8377,7 @@ impl PreparedSelect {
             }),
             windowed,
             aggregated,
-            calls: match aggregated && !written.columns.iter().any(varies) {
-                true => Some(executor.parse_aggregations(written, Some(ctx))?.0),
-                false => None,
-            },
+            calls,
             window,
             source_values,
         })
@@ -12020,13 +12021,9 @@ impl Executor {
                     runner.passing_rows(read, None, table, ctx, None, Take::Stream, keep)?
                 }
             };
-            // Rows the table shares cost nothing to hold, and a large table's
-            // feed on the thread pool; rows decoded from volumes stream
-            #[cfg(feature = "parallel")]
-            let large = table.row_count_hint() >= super::aggregation::PARALLEL_ROWS;
-            #[cfg(not(feature = "parallel"))]
-            let large = false;
-            let hold = large || !table.narrows_scans();
+            // Rows the table shares cost nothing to hold; rows decoded from
+            // volumes stream, unless the feed splits them over the thread pool
+            let hold = !table.narrows_scans();
             let held: RowVec;
             let input = match passing {
                 Passing::Pruned => FeedInput::Rows(&[]),
@@ -12043,10 +12040,14 @@ impl Executor {
                     held = runner.drain(scan, Some(bound))?;
                     FeedInput::Rows(&held)
                 }
-                Passing::Scan(scan) => FeedInput::Each(PassedRows::new(scan, None, runner, ctx)),
-                Passing::Filtered(scan, bound) => {
-                    FeedInput::Each(PassedRows::new(scan, Some(bound), runner, ctx))
-                }
+                Passing::Scan(scan) => FeedInput::Each(
+                    PassedRows::new(scan, None, runner, ctx),
+                    table.row_count_hint(),
+                ),
+                Passing::Filtered(scan, bound) => FeedInput::Each(
+                    PassedRows::new(scan, Some(bound), runner, ctx),
+                    table.row_count_hint(),
+                ),
             };
             self.global_row(aggregations, &columns, ctx, None, input)
                 .map(Some)

@@ -100,6 +100,46 @@ fn a_call_s_argument_read_from_a_parameter_is_read_on_each_run() {
 }
 
 #[test]
+fn a_parameter_a_like_s_escape_reads_in_a_call_s_argument_is_read_on_each_run() {
+    let db = Database::open("memory://runner_global_aggregate_escape").unwrap();
+    fill(&db, 20);
+    let stmt = db
+        .prepare(
+            "SELECT STRING_AGG('x', CASE WHEN 'a_' LIKE 'a!_' ESCAPE $1 THEN '-' ELSE '+' END) \
+             FROM t WHERE id <= 2",
+        )
+        .unwrap();
+    for (escape, want) in [("!", "x-x"), ("#", "x+x")] {
+        let joined: String = stmt
+            .query((escape,))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(joined, want, "ESCAPE {escape}");
+    }
+}
+
+#[test]
+fn a_parameter_in_a_call_the_order_by_alone_names_is_read_on_each_run() {
+    let db = Database::open("memory://runner_global_aggregate_order_call").unwrap();
+    fill(&db, 20);
+    let stmt = db
+        .prepare(
+            "SELECT COUNT(*) FROM t WHERE id <= 2 \
+             ORDER BY STRING_AGG(CAST(id AS TEXT), CAST(9223372036854775807 + $1 AS TEXT))",
+        )
+        .unwrap();
+    assert!(stmt.query((0,)).unwrap().next().unwrap().is_ok());
+    let overflow = stmt
+        .query((1,))
+        .and_then(|mut rows| rows.next().unwrap().map(|_| ()));
+    assert!(overflow.is_err(), "the second run's argument overflows");
+}
+
+#[test]
 fn an_aggregate_in_a_transaction_reads_its_own_writes() {
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
