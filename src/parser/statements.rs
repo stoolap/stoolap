@@ -19,7 +19,7 @@ use crate::core::ForeignKeyAction;
 use rustc_hash::FxHashMap;
 
 use super::ast::*;
-use super::parser::Parser;
+use super::parser::{Parser, MAX_STATEMENT_DEPTH};
 use super::precedence::Precedence;
 use super::token::{Keyword, Token, TokenType};
 
@@ -150,8 +150,24 @@ impl Parser<'_> {
     }
 
     /// A SELECT statement as written: a recursive CTE's body keeps its set
-    /// operation at the top, where the recursive run reads its members
+    /// operation at the top, where the recursive run reads its members. One
+    /// nested past [`MAX_STATEMENT_DEPTH`] is refused before any later stage
+    /// recurses that deep
     fn parse_select_parts(&mut self) -> Option<SelectStatement> {
+        if self.limited && self.statement_depth >= MAX_STATEMENT_DEPTH {
+            self.add_error(format!(
+                "statement nested too deeply: more than {MAX_STATEMENT_DEPTH} SELECTs inside one another"
+            ));
+            return None;
+        }
+        self.statement_depth += 1;
+        let stmt = self.parse_select_written();
+        self.statement_depth -= 1;
+        stmt
+    }
+
+    /// [`Self::parse_select_parts`] within the depth it allows
+    fn parse_select_written(&mut self) -> Option<SelectStatement> {
         let token = self.cur_token.clone();
 
         let mut stmt = SelectStatement {
@@ -940,10 +956,14 @@ impl Parser<'_> {
             return None;
         }
 
+        // A CTE body sits inside the statement that carries the WITH
+        self.statement_depth += 1;
         let query = match is_recursive {
-            true => self.parse_select_parts()?,
-            false => self.parse_select_statement()?,
+            true => self.parse_select_parts(),
+            false => self.parse_select_statement(),
         };
+        self.statement_depth -= 1;
+        let query = query?;
 
         // Expect )
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {

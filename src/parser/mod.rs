@@ -125,7 +125,7 @@ pub use ast::{
 
 pub use error::{ParseError, ParseErrors};
 pub use lexer::Lexer;
-pub use parser::Parser;
+pub use parser::{Parser, MAX_EXPRESSION_DEPTH, MAX_STATEMENT_DEPTH};
 pub use precedence::Precedence;
 pub use token::{
     is_operator, is_punctuator, lookup_keyword, Keyword, Position, Token, TokenType, OPERATORS,
@@ -154,6 +154,16 @@ pub use token::{
 /// assert_eq!(statements.len(), 1);
 /// ```
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParseErrors> {
+    parse_statements(sql, true)
+}
+
+/// [`parse_sql`] of text the engine wrote from a statement it took, such as
+/// a view's query, past the nesting limits its parentheses can reach
+pub(crate) fn parse_written_sql(sql: &str) -> Result<Vec<Statement>, ParseErrors> {
+    parse_statements(sql, false)
+}
+
+fn parse_statements(sql: &str, limited: bool) -> Result<Vec<Statement>, ParseErrors> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(ParseErrors::from_errors(vec![ParseError::new(
@@ -162,7 +172,10 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParseErrors> {
         )]));
     }
 
-    let mut parser = Parser::new(sql);
+    let mut parser = match limited {
+        true => Parser::new(sql),
+        false => Parser::new(sql).unlimited(),
+    };
     let program = parser.parse_program()?;
 
     if program.statements.is_empty() {
@@ -191,6 +204,7 @@ pub(crate) fn parse_stored_expression(
     let sql = format!("SELECT {}", text);
     let program = Parser::new(&sql)
         .unscoped()
+        .unlimited()
         .parse_program()
         .map_err(|e| Error::parse(format!("the {kind} of {column} does not parse: {e}")))?;
     match program.statements.into_iter().next() {

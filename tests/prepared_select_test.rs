@@ -953,7 +953,7 @@ fn test_uncorrelated_blocks_run_once_when_needed() {
 #[test]
 fn test_scope_chain_depth() {
     let _guard = serial();
-    // The general path recurses per scope and needs more than a test thread's stack
+    // A chain of scopes recurses per scope, so it runs on a larger stack
     std::thread::Builder::new()
         .stack_size(16 << 20)
         .spawn(scope_chain_depth)
@@ -982,26 +982,32 @@ fn scope_chain_depth() {
         }
         format!("SELECT id FROM d AS s0 WHERE s0.v = {sql} ORDER BY id")
     };
-    let in_family = chain(32);
+    // The deepest chain the parser's limits take, of SELECTs or of the
+    // expressions each scope nests
+    let deepest = (2..=stoolap::parser::MAX_STATEMENT_DEPTH)
+        .rev()
+        .find(|&scopes| stoolap::parser::parse_sql(&chain(scopes)).is_ok())
+        .unwrap();
+    let in_family = chain(deepest);
     assert_eq!(prepared_line(&db, &in_family), "Prepared: yes");
     let built = prepared_selects_built();
     let (found, runs) = ids(&db, &in_family, ());
     assert_eq!(found, vec![1, 2, 3]);
-    assert_eq!(runs, 31 * 3, "31 blocks for each of three rows");
+    assert_eq!(
+        runs,
+        (deepest - 1) * 3,
+        "a block per nested scope for each of three rows"
+    );
     assert_eq!(prepared_selects_built() - built, 1);
 
-    let too_deep = chain(33);
-    assert_eq!(
-        prepared_line(&db, &too_deep),
-        "Prepared: no (more than 32 scopes in a chain)"
+    let too_deep = chain(deepest + 1);
+    let refused = db.query(&too_deep, ()).err().map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("statement nested too deeply")),
+        "{refused:?}"
     );
-    let built = prepared_selects_built();
-    assert_eq!(
-        ids(&db, &too_deep, ()),
-        (vec![1, 2, 3], 0),
-        "the old path answers"
-    );
-    assert_eq!(prepared_selects_built() - built, 0);
 }
 
 #[test]

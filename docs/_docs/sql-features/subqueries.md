@@ -705,6 +705,17 @@ with `EXISTS`, `IN (subquery)` or `ANY or ALL` in place of `scalar subquery` for
 
 A column `DEFAULT` and a `CHECK` constraint never hold a subquery: `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` refuse one when the constraint is declared.
 
+### Nesting limits
+
+A statement may nest at most 32 `SELECT`s inside one another, the outermost counted: subqueries, derived tables, and CTE bodies, which sit inside the statement that carries them. Its expressions may nest at most 64 deep, counted across those `SELECT`s: parentheses, function calls, `CASE`, unary operators such as `NOT`, and the subqueries themselves. A debug build of Stoolap, whose unoptimized code takes more stack for each level, allows 16 `SELECT`s and 32 expressions; `stoolap::parser::MAX_STATEMENT_DEPTH` and `MAX_EXPRESSION_DEPTH` hold the values of the build. The branches of a set operation sit side by side, so a long `UNION` nests nothing. A statement past either limit fails where it is parsed, before it runs:
+
+```
+statement nested too deeply: more than 32 SELECTs inside one another
+statement nested too deeply: more than 64 expressions inside one another
+```
+
+A long chain of operators such as `a = 1 OR a = 2 OR ...` is not nesting and is not limited here. The text Stoolap stores for a view, a column `DEFAULT` or a `CHECK` writes each operator of such a chain in parentheses, and it reads back whatever its depth.
+
 ## Best Practices
 
 1. **Use Subqueries for Dynamic Filtering**: Subqueries are ideal when you need to filter based on conditions that require querying other tables.

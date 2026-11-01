@@ -8053,9 +8053,16 @@ impl Executor {
             return Ok(cached);
         }
 
-        // Parse the view's query
-        let statements = crate::parser::parse_sql(view_query)
-            .map_err(|e| Error::InvalidArgument(format!("Failed to parse view query: {}", e)))?;
+        // Text past a user's nesting limits parses without them, kept out of the cache users read
+        let (statements, cached) = match crate::parser::parse_sql(view_query) {
+            Ok(statements) => (statements, true),
+            Err(_) => (
+                crate::parser::parse_written_sql(view_query).map_err(|e| {
+                    Error::InvalidArgument(format!("Failed to parse view query: {}", e))
+                })?,
+                false,
+            ),
+        };
 
         // The view query should be a single SELECT statement
         if statements.len() != 1 {
@@ -8080,9 +8087,12 @@ impl Executor {
         let stmt_arc = Arc::new(statements.into_iter().next().unwrap());
 
         // Cache the parsed statement for future use
-        Ok(self
-            .query_cache
-            .put(view_query, stmt_arc, ParamSlots::default()))
+        Ok(match cached {
+            true => self
+                .query_cache
+                .put(view_query, stmt_arc, ParamSlots::default()),
+            false => CachedPlanRef::new(stmt_arc, ParamSlots::default()),
+        })
     }
 
     /// Refuse a view read one view too deep, before its nesting overflows the stack
