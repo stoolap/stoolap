@@ -1238,9 +1238,6 @@ impl Executor {
             .map(|ob| &ob.expression)
             .filter(|key| whole && mentions_subquery(key))
             .collect();
-        if !keys.is_empty() && windowed {
-            return Err("an ORDER BY holding a subquery");
-        }
         let windows = Executor::used_window_defs(stmt);
         let family = Family {
             executor: self,

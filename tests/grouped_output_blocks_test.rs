@@ -777,17 +777,72 @@ fn a_grouped_statement_s_subqueries_read_parameters_and_the_transaction_s_writes
 }
 
 #[test]
-fn a_grouped_statement_outside_the_blocks_says_why() {
+fn a_windowed_grouped_statement_sorts_by_a_key_holding_a_subquery() {
     let _guard = serial();
-    let db = Database::open("memory://grouped_output_blocks_outside").unwrap();
-    fill(&db);
-    let sql = "SELECT a, RANK() OVER (ORDER BY a), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
-               ORDER BY (SELECT MIN(u.x) FROM u) + a";
-    assert_eq!(
-        prepared_line(&db, sql),
-        "Prepared: no (an ORDER BY holding a subquery)",
-        "{sql}"
-    );
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://grouped_output_blocks_windowed_key").unwrap();
+            fill(&db);
+            db
+        };
+        let counted = "(SELECT a, COUNT(*) AS c, RANK() OVER (ORDER BY a DESC) AS r FROM t \
+                       GROUP BY a) g LEFT JOIN (SELECT k, COUNT(*) AS n FROM u GROUP BY k) m \
+                       ON m.k = g.a";
+        for (sql, twin) in [
+            (
+                "SELECT a, RANK() OVER (ORDER BY a), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+                 ORDER BY (SELECT MIN(u.x) FROM u) - a"
+                    .to_string(),
+                "SELECT a, RANK() OVER (ORDER BY a), 6 FROM t GROUP BY a ORDER BY 0 - a"
+                    .to_string(),
+            ),
+            (
+                "SELECT a, SUM(b), ROW_NUMBER() OVER (ORDER BY SUM(b) DESC, a) FROM t GROUP BY a \
+                 ORDER BY (SELECT MAX(u.x) FROM u) - a LIMIT 4 OFFSET 1"
+                    .to_string(),
+                "SELECT a, SUM(b), ROW_NUMBER() OVER (ORDER BY SUM(b) DESC, a) FROM t GROUP BY a \
+                 ORDER BY 6 - a LIMIT 4 OFFSET 1"
+                    .to_string(),
+            ),
+            (
+                "SELECT a, COUNT(*), RANK() OVER (ORDER BY a DESC) FROM t GROUP BY a \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), a"
+                    .to_string(),
+                format!("SELECT g.a, g.c, g.r FROM {counted} ORDER BY COALESCE(m.n, 0), g.a"),
+            ),
+            (
+                "SELECT a, RANK() OVER (ORDER BY a) FROM t GROUP BY a \
+                 ORDER BY (SELECT MAX(u.x) FROM u) - a, RANK() OVER (ORDER BY a DESC)"
+                    .to_string(),
+                "SELECT a, RANK() OVER (ORDER BY a) FROM t GROUP BY a ORDER BY 6 - a".to_string(),
+            ),
+        ] {
+            let mode = if sealed { "sealed" } else { "hot" };
+            let before = general_path_total();
+            let got = rows(&db, &sql);
+            if general_path_total() != before {
+                wrong.push(format!("{mode}: {sql} ran a general path mechanism"));
+            }
+            if got != rows(&db, &twin) {
+                wrong.push(format!(
+                    "{mode}: {sql}: {got:?}, want {:?}",
+                    rows(&db, &twin)
+                ));
+            }
+            let line = prepared_line(&db, &sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("{mode}: {sql} says {line}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
 #[test]
