@@ -13,9 +13,8 @@
 // limitations under the License.
 
 //! A grouped block whose SELECT list, HAVING or GROUP BY holds a subquery,
-//! and an EXISTS whose LIMIT or OFFSET only a statement reads, run prepared
-//! as statements; an EXISTS whose ORDER BY or DISTINCT ON only a statement
-//! reads stays on the general path.
+//! and an EXISTS whose ORDER BY, DISTINCT ON, LIMIT or OFFSET only a
+//! statement reads, run prepared as statements.
 
 #![cfg(feature = "test-failpoints")]
 
@@ -205,6 +204,16 @@ fn a_grouped_block_over_a_join_binds_its_keys_over_its_groups() {
                 "SELECT id FROM t WHERE k IN (2) ORDER BY id".to_string(),
             ),
             (
+                format!(
+                    "SELECT id, (SELECT MAX(u.v) AS k {from} WHERE u.k = t.k GROUP BY u.id \
+                     ORDER BY k DESC LIMIT 1) FROM t ORDER BY id"
+                ),
+                format!(
+                    "SELECT id, (SELECT MAX(u.v) {from} WHERE u.k = t.k GROUP BY u.id \
+                     ORDER BY MAX(u.v) DESC LIMIT 1) FROM t ORDER BY id"
+                ),
+            ),
+            (
                 format!("SELECT id, (SELECT COUNT(*) + (SELECT 1) {from} WHERE u.k = t.k) FROM t ORDER BY id"),
                 format!("SELECT id, (SELECT COUNT(*) + 1 {from} WHERE u.k = t.k) FROM t ORDER BY id"),
             ),
@@ -258,54 +267,183 @@ fn an_exists_statement_block_without_an_order_by_runs_prepared() {
 }
 
 #[test]
-fn an_exists_ordered_or_distinct_where_only_a_statement_reads_it_stays_on_the_general_path() {
+fn an_exists_ordered_or_distinct_where_only_a_statement_reads_it_computes_neither_keys_nor_list() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup(&dir, sealed);
+        let mode = if sealed { "sealed" } else { "hot" };
+        let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
+        let joined = "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k";
+        let rows_of = "SELECT 1 FROM w WHERE w.k = t.k";
+        let none = "SELECT 1 FROM w WHERE 1 = 0";
+        let big = "9223372036854775807";
+        for (block, twin) in [
+            (format!("{groups} ORDER BY SUM(v)"), groups.to_string()),
+            (format!("{groups} ORDER BY k LIMIT 1"), groups.to_string()),
+            (
+                "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY k".to_string(),
+                groups.to_string(),
+            ),
+            (
+                format!("{groups} HAVING COUNT(*) > (SELECT 0) ORDER BY k"),
+                format!("{groups} HAVING COUNT(*) > 0"),
+            ),
+            (
+                format!("{rows_of} ORDER BY (SELECT 1) LIMIT 1"),
+                rows_of.to_string(),
+            ),
+            (format!("{joined} ORDER BY SUM(w.v)"), joined.to_string()),
+            (
+                format!("{groups} ORDER BY SUM(v) * {big} LIMIT 1"),
+                groups.to_string(),
+            ),
+            (
+                format!("{groups} ORDER BY (SELECT MAX(v) FROM u) - MAX(v) LIMIT 1"),
+                groups.to_string(),
+            ),
+            (
+                "SELECT k AS kk FROM w WHERE w.k = t.k GROUP BY k ORDER BY kk, COUNT(*) LIMIT 1"
+                    .to_string(),
+                groups.to_string(),
+            ),
+            (
+                "SELECT ABS(MIN(v)) FROM w WHERE w.k = t.k GROUP BY k ORDER BY k LIMIT 1".to_string(),
+                groups.to_string(),
+            ),
+            (
+                format!("SELECT ABS(v) FROM w WHERE w.k = t.k ORDER BY v * {big} LIMIT (SELECT 1)"),
+                rows_of.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON ((SELECT 1)) ABS(v) FROM w WHERE w.k = t.k".to_string(),
+                rows_of.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON ((SELECT 1)) k FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                format!("SELECT DISTINCT ON (1) k, ABS(v) FROM w WHERE w.k = t.k ORDER BY v * {big} OFFSET 1"),
+                none.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (kk) k AS kk FROM w WHERE w.k = t.k OFFSET (SELECT 1)".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (MAX(v)) k FROM w WHERE w.k = t.k GROUP BY k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (2) * FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (1) 42 FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (x) 42 AS x FROM w WHERE w.k = t.k OFFSET 1".to_string(),
+                none.to_string(),
+            ),
+            (
+                "SELECT MAX(v) AS k FROM w WHERE w.k = t.k GROUP BY id ORDER BY k LIMIT 1"
+                    .to_string(),
+                rows_of.to_string(),
+            ),
+            (
+                "SELECT MAX(v) AS m FROM w WHERE w.k = t.k GROUP BY id ORDER BY 1 LIMIT 1"
+                    .to_string(),
+                rows_of.to_string(),
+            ),
+            (
+                "SELECT MAX(w.v) AS k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k \
+                 GROUP BY w.id ORDER BY k LIMIT 1"
+                    .to_string(),
+                "SELECT 1 FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k".to_string(),
+            ),
+        ] {
+            for site in [
+                "SELECT id FROM t WHERE EXISTS (?) ORDER BY id",
+                "SELECT id FROM t WHERE NOT EXISTS (?) ORDER BY id",
+                "SELECT id, EXISTS (?) FROM t ORDER BY id",
+                "SELECT id, CASE WHEN EXISTS (?) THEN 'y' ELSE 'n' END FROM t ORDER BY id",
+            ] {
+                let (sql, twin) = (site.replace('?', &block), site.replace('?', &twin));
+                holds(&db, &sql, &twin, mode, &mut wrong);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_exists_ordered_where_only_a_statement_reads_it_reads_a_parameter_prepared() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup(&dir, false);
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT k FROM w WHERE w.k = t.k AND w.v > $1 \
+               GROUP BY k ORDER BY SUM(v) * 9223372036854775807 LIMIT $2) ORDER BY id";
+    let statement = db.prepare(sql).unwrap();
+    let mut got = Vec::new();
+    for (floor, limit) in [(0, 1), (4, 1), (0, 0)] {
+        let ids: Vec<i64> = statement
+            .query((floor, limit))
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        got.push(ids);
+    }
+    assert_eq!(got, vec![vec![1, 2], vec![2], vec![]]);
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes");
+}
+
+#[test]
+fn an_exists_ordered_or_distinct_binds_what_it_does_not_compute() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = setup(&dir, false);
     let mut wrong = Vec::new();
-    let reason =
-        "Prepared: no (an EXISTS block ordered or distinct where only a statement reads it)";
-    let groups = "SELECT k FROM w WHERE w.k = t.k GROUP BY k";
-    let joined = "SELECT w.k FROM w JOIN r ON r.rid = w.id WHERE w.k = t.k GROUP BY w.k";
-    let rows_of = "SELECT 1 FROM w WHERE w.k = t.k";
-    for (block, twin) in [
-        (format!("{groups} ORDER BY SUM(v)"), groups.to_string()),
-        (format!("{groups} ORDER BY k LIMIT 1"), groups.to_string()),
+    for (block, error) in [
         (
-            "SELECT k, (SELECT 1) FROM w WHERE w.k = t.k GROUP BY k ORDER BY k".to_string(),
-            groups.to_string(),
+            "SELECT k FROM w WHERE w.k = t.k AND 1 = 0 GROUP BY k ORDER BY nocol LIMIT 1",
+            "nocol",
         ),
         (
-            format!("{groups} HAVING COUNT(*) > (SELECT 0) ORDER BY k"),
-            format!("{groups} HAVING COUNT(*) > 0"),
+            "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY v LIMIT 1",
+            "Column 'v' not found",
         ),
         (
-            format!("{rows_of} ORDER BY (SELECT 1) LIMIT 1"),
-            rows_of.to_string(),
-        ),
-        (format!("{joined} ORDER BY SUM(w.v)"), joined.to_string()),
-        // ABS of the smallest integer fails where the SELECT list is computed
-        (
-            "SELECT DISTINCT ON ((SELECT 1)) ABS(v) FROM w WHERE w.k = t.k".to_string(),
-            rows_of.to_string(),
+            "SELECT k FROM w WHERE w.k = t.k GROUP BY k ORDER BY NOFUNC(k) LIMIT 1",
+            "NOFUNC",
         ),
         (
-            "SELECT DISTINCT ON ((SELECT 1)) k FROM w WHERE w.k = t.k OFFSET 1".to_string(),
-            "SELECT 1 FROM w WHERE 1 = 0".to_string(),
+            "SELECT COUNT(*) FROM w WHERE w.k = t.k ORDER BY v LIMIT 1",
+            "Column 'v' not found",
+        ),
+        (
+            "SELECT v FROM w WHERE w.k = t.k ORDER BY (SELECT MAX(nocol) FROM u)",
+            "nocol",
+        ),
+        (
+            "SELECT DISTINCT ON (3) k FROM w WHERE w.k = t.k OFFSET 1",
+            "DISTINCT ON key 3 names no column",
+        ),
+        (
+            "SELECT DISTINCT ON (0) k FROM w WHERE w.k = t.k OFFSET 1",
+            "DISTINCT ON key 0 names no column",
+        ),
+        (
+            "SELECT DISTINCT ON (-9223372036854775808) 1 FROM w WHERE w.k = t.k OFFSET 1",
+            "DISTINCT ON key -9223372036854775808 names no column",
         ),
     ] {
         let sql = format!("SELECT id FROM t WHERE EXISTS ({block}) ORDER BY id");
-        let line = prepared_line(&db, &sql);
-        if line != reason {
-            wrong.push(format!("{sql} says {line}"));
-        }
-        let twin = format!("SELECT id FROM t WHERE EXISTS ({twin}) ORDER BY id");
-        if rows(&db, &sql) != rows(&db, &twin) {
-            wrong.push(format!(
-                "{sql}: {:?}, want {:?}",
-                rows(&db, &sql),
-                rows(&db, &twin)
-            ));
+        match rows(&db, &sql) {
+            Err(e) if e.contains(error) => {}
+            other => wrong.push(format!("{sql}: {other:?}, want an error naming {error}")),
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));

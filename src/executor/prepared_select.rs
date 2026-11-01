@@ -616,12 +616,6 @@ impl<'a> Family<'a> {
             return Err("more than 32 scopes in a chain");
         }
         let registry = &self.executor.function_registry;
-        // An EXISTS computes no ORDER BY key nor SELECT item, which a statement
-        // run with its ORDER BY or its DISTINCT ON would
-        let keyed = !sq.order_by.is_empty() || !sq.distinct_on.is_empty();
-        if keyed && (statement_order(sq, registry) || grouped_with_subquery(sq)) {
-            return Err("an EXISTS block ordered or distinct where only a statement reads it");
-        }
         if statement_form_block(sq, false, registry) {
             return self.derived(sq);
         }
@@ -3048,6 +3042,27 @@ fn existence(
         .as_deref()
         .map(|h| grouped_having(executor, &stmt, h).map(Box::new))
         .transpose()?;
+    let distinct_on = stmt
+        .distinct_on
+        .iter()
+        .map(|key| {
+            let bound = bound_key(key, &stmt, from_names);
+            match &*bound {
+                Expression::IntegerLiteral(_) if std::ptr::eq(&*bound, key) => Err(
+                    Error::invalid_argument(format!("DISTINCT ON key {key} names no column")),
+                ),
+                // An integer item puts every row in one group, which written
+                // as an integer would read as a position
+                Expression::IntegerLiteral(literal) => {
+                    Ok(Expression::BooleanLiteral(BooleanLiteral {
+                        token: literal.token.clone(),
+                        value: true,
+                    }))
+                }
+                _ => Ok(bound.into_owned()),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     let token = |kind, text: &str| Token::new(kind, text, Position::default());
     let row = match grouped {
         true => Expression::FunctionCall(Box::new(FunctionCall {
@@ -3070,6 +3085,7 @@ fn existence(
         where_clause,
         group_by,
         having,
+        distinct_on,
         order_by: Vec::new(),
         ..stmt
     })
@@ -3183,6 +3199,32 @@ fn check_block_positions(sq: &SelectStatement, columns: usize) -> Result<()> {
         )),
         None => Ok(()),
     }
+}
+
+/// `key`, an ORDER BY or DISTINCT ON key of `stmt`, as the statement binds
+/// it: a position or a bare SELECT alias reads its item, any other key binds
+/// as a WHERE does over `columns`; a position past the items or beside a
+/// star stays as written
+fn bound_key<'e>(
+    key: &'e Expression,
+    stmt: &'e SelectStatement,
+    columns: &[String],
+) -> std::borrow::Cow<'e, Expression> {
+    let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
+    let item = match key {
+        Expression::IntegerLiteral(position) if !stmt.columns.iter().any(star) => position
+            .value
+            .checked_sub(1)
+            .and_then(|at| usize::try_from(at).ok())
+            .and_then(|at| stmt.columns.get(at)),
+        Expression::Identifier(name) if order_by_names_an_alias(key, stmt) => {
+            stmt.columns.iter().find(|item| {
+                matches!(item, Expression::Aliased(a) if a.alias.value_lower == name.value_lower)
+            })
+        }
+        _ => return with_aliases(key, &stmt.columns, columns),
+    };
+    std::borrow::Cow::Borrowed(item.map_or(key, unaliased))
 }
 
 /// A block's WHERE with its SELECT aliases read as their expressions, as
@@ -5233,6 +5275,16 @@ impl Builder<'_> {
         scopes.push(own);
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
+        // A grouped block's keys read its groups
+        if grouped_block(sq) && !sq.order_by.is_empty() {
+            let keys: SmallVec<[std::borrow::Cow<'_, Expression>; 2]> = sq
+                .order_by
+                .iter()
+                .map(|ob| bound_key(&ob.expression, sq, &own.columns))
+                .collect();
+            let keys = keys.iter().map(|key| &**key);
+            return self.bind_grouping(&chain, id, sq, keys, true, work);
+        }
         let registry = &self.executor.function_registry;
         let compile = CompileContext::bound(registry).with_prepared_subqueries();
         for ob in &sq.order_by {
@@ -5295,8 +5347,9 @@ impl Builder<'_> {
             false => sq
                 .order_by
                 .iter()
-                .map(|ob| named(&ob.expression))
-                .chain(sq.distinct_on.iter().map(named))
+                .map(|ob| &ob.expression)
+                .chain(&sq.distinct_on)
+                .map(|key| bound_key(key, sq, &scope.lower).into_owned())
                 .collect(),
         };
         if !grouped {
@@ -5315,23 +5368,42 @@ impl Builder<'_> {
                 true => &[][..],
                 false => &items[..],
             };
-            let values = listed
-                .iter()
-                .copied()
-                .chain(keys.iter().filter(|key| !mentions_subquery(key)))
-                .map(|value| self.trial_rewrite(&chain, id, value, &work.outer))
-                .collect::<Result<Vec<_>>>()?;
-            let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
-            let mut trial = Rewritten {
-                outer: work.outer.clone(),
-                ..Rewritten::default()
-            };
-            let grouping = self.grouping(&chain, id, sq, &values, exists, &mut trial);
-            self.next_slot = next_slot;
-            self.subqueries.truncate(blocks);
-            grouping?;
+            let keys = keys.iter().filter(|key| !mentions_subquery(key));
+            self.bind_grouping(
+                &chain,
+                id,
+                sq,
+                listed.iter().copied().chain(keys),
+                exists,
+                work,
+            )?;
         }
         Ok(())
+    }
+
+    /// Bind the grouped block `sq`'s `values`, its items or keys, over its
+    /// groups as `grouping` reads them, computing nothing
+    fn bind_grouping<'e>(
+        &mut self,
+        chain: &Chain<'_>,
+        id: u16,
+        sq: &SelectStatement,
+        values: impl Iterator<Item = &'e Expression>,
+        exists: bool,
+        work: &Rewritten,
+    ) -> Result<()> {
+        let values = values
+            .map(|value| self.trial_rewrite(chain, id, value, &work.outer))
+            .collect::<Result<Vec<_>>>()?;
+        let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
+        let mut trial = Rewritten {
+            outer: work.outer.clone(),
+            ..Rewritten::default()
+        };
+        let grouping = self.grouping(chain, id, sq, &values, exists, &mut trial);
+        self.next_slot = next_slot;
+        self.subqueries.truncate(blocks);
+        grouping.map(|_| ())
     }
 
     /// The block `sq`, whose FROM is a join or a derived table reading an
@@ -5356,13 +5428,27 @@ impl Builder<'_> {
         let mut work = Rewritten::default();
         let (executor, ctx) = (self.executor, self.ctx);
         // An EXISTS runs without its ORDER BY, which is still bound, and its
-        // SELECT list; one whose rows its items choose, by a window, a
-        // DISTINCT ON or the clauses `clause_form` names, runs as written, and
-        // so does one ordered by a position its run counts, reading a column
+        // SELECT list; one whose rows its items choose, by a window or the
+        // clauses `clause_form` names, runs as written, and so does one keyed
+        // by a position its run counts, reading a column, or one grouped and
+        // ordered whose subqueries only its run binds
+        let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
+        let star_position = sq.columns.iter().any(star)
+            && sq
+                .distinct_on
+                .iter()
+                .any(|key| matches!(key, Expression::IntegerLiteral(_)));
+        let subquery_key = sq
+            .order_by
+            .iter()
+            .any(|ob| mentions_subquery(&ob.expression));
         let dropped = matches!(form, Form::Exists(_))
             && !clause_form(sq, false)
-            && sq.distinct_on.is_empty()
-            && !orders_by_merged_star_position(sq);
+            && !star_position
+            && !orders_by_merged_star_position(sq)
+            && !(grouped_block(sq)
+                && !sq.order_by.is_empty()
+                && (grouped_with_subquery(sq) || subquery_key));
         let mut max_param = 0;
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
