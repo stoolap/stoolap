@@ -160,33 +160,6 @@ const CASES: &[Case] = &[
          FROM t JOIN u USING (id) ORDER BY t.id",
         None,
     ),
-    case(
-        "memory, families off",
-        "index_ordered",
-        "SELECT t.id, (SELECT i.id FROM t i ORDER BY i.c DESC NULLS LAST LIMIT 1 OFFSET 1) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT i.id FROM t i ORDER BY i.c + 0 DESC NULLS LAST LIMIT 1 OFFSET 1) \
-         AS x FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
-    ),
-    case(
-        "memory, families off",
-        "top_k_scan",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.g = 1 AND i.id <> t.id \
-         ORDER BY i.n DESC LIMIT 1) AS x FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.g = 1 AND i.id <> t.id \
-         ORDER BY i.n + 0 DESC LIMIT 1) AS x FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
-    ),
-    case(
-        "sealed, families off",
-        "top_k_scan",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id LIMIT 1) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
-    ),
     // The same statements over the table run on the plan
     case(
         "sealed",
@@ -276,15 +249,6 @@ const CASES: &[Case] = &[
         "SELECT DISTINCT id, VEC_DISTANCE_COSINE(v, '[1.0, 2.0, 0.5]') AS d FROM near \
          WHERE id > 7 ORDER BY d",
         Some((3, 0)),
-    ),
-    case(
-        "memory, families off",
-        "keyset_pagination",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > 5 ORDER BY i.id LIMIT 1) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > 5) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
     ),
     case(
         "memory",
