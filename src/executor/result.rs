@@ -1070,14 +1070,8 @@ pub(crate) enum OrderLimitPath {
     DeferredProjection,
     /// A projection offering each row it builds to a `TopN`
     ProjectedTop,
-    /// Rows read in the order of an index or the primary key
-    IndexOrdered,
-    /// The table's top-k scan over one column
-    TopKScan,
     /// Nearest vectors by distance, through HNSW or by brute force
     VectorSearch,
-    /// Primary-key rows past a bound, read in key order
-    KeysetPagination,
     /// An index nested loop join sorting its joined rows itself
     JoinIndexSort,
     /// A CTE grouped for a join, cut to the rows the main ORDER BY keeps
@@ -1106,15 +1100,12 @@ impl OrderLimitPath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl OrderLimitPath {
-    pub(crate) const ALL: [OrderLimitPath; 16] = [
+    pub(crate) const ALL: [OrderLimitPath; 13] = [
         OrderLimitPath::TopN,
         OrderLimitPath::ComputedKeys,
         OrderLimitPath::DeferredProjection,
         OrderLimitPath::ProjectedTop,
-        OrderLimitPath::IndexOrdered,
-        OrderLimitPath::TopKScan,
         OrderLimitPath::VectorSearch,
-        OrderLimitPath::KeysetPagination,
         OrderLimitPath::JoinIndexSort,
         OrderLimitPath::CteOrderLimitPushdown,
         OrderLimitPath::PreparedIndexOrdered,
@@ -1131,10 +1122,7 @@ impl OrderLimitPath {
             OrderLimitPath::ComputedKeys => "computed_keys",
             OrderLimitPath::DeferredProjection => "deferred_projection",
             OrderLimitPath::ProjectedTop => "projected_top",
-            OrderLimitPath::IndexOrdered => "index_ordered",
-            OrderLimitPath::TopKScan => "top_k_scan",
             OrderLimitPath::VectorSearch => "vector_search",
-            OrderLimitPath::KeysetPagination => "keyset_pagination",
             OrderLimitPath::JoinIndexSort => "join_index_sort",
             OrderLimitPath::CteOrderLimitPushdown => "cte_order_limit_pushdown",
             OrderLimitPath::PreparedIndexOrdered => "prepared_index_ordered",
