@@ -9613,9 +9613,10 @@ impl Executor {
                 let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
                     Error::internal("a table's columns changed while the statement prepared")
                 })?;
-                return self.group_held_rows(held, &run, ctx, rows, columns, |out| {
+                let output = self.group_held_rows(held, &run, ctx, rows, columns, |out| {
                     Self::result_layout(&held.stmt, columns, None, out)
-                });
+                })?;
+                return Self::with_late_keys(held, &run, output, ctx);
             }
         }
         self.grouped_select(stmt, ctx, classification, rows, columns, None)
@@ -9719,9 +9720,39 @@ impl Executor {
         let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
             Error::internal("a table's columns changed while the statement prepared")
         })?;
+        let output = self.grouped_output(held, &run, grouped, ctx)?;
+        Self::with_late_keys(held, &run, output, ctx)
+    }
+
+    /// `output`, the rows the run `run` of `held` returned, with each late key
+    /// written into its column of every row, which a sort reads whole anyway
+    fn with_late_keys(
+        held: &super::prepared_select::PreparedGrouped,
+        run: &super::prepared_select::PreparedRunner<'_>,
+        output: SelectOutput,
+        ctx: &ExecutionContext,
+    ) -> SelectResult {
+        let Some(late) = held.late_keys() else {
+            return Ok(output);
+        };
+        let (result, columns, applied, shape) = output;
+        let mut rows = Self::materialize_result(result)?;
+        late.fill(run, &mut rows, ctx)?;
+        let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
+        Ok((Box::new(result), columns, applied, shape))
+    }
+
+    /// The rows the grouped run `run` of `held` returns
+    fn grouped_output(
+        &self,
+        held: &super::prepared_select::PreparedGrouped,
+        run: &super::prepared_select::PreparedRunner<'_>,
+        grouped: super::prepared_select::GroupedRun<'_>,
+        ctx: &ExecutionContext,
+    ) -> SelectResult {
         let alias = grouped.scope_name().map(SmartString::from);
-        if let Some((columns, rows)) = grouped.source_rows(Some(&run), ctx)? {
-            return self.group_held_rows(held, &run, ctx, rows, &columns, |out| {
+        if let Some((columns, rows)) = grouped.source_rows(Some(run), ctx)? {
+            return self.group_held_rows(held, run, ctx, rows, &columns, |out| {
                 Self::shared_result_layout(&held.stmt, &columns, alias.as_deref(), out)
             });
         }
@@ -9742,7 +9773,7 @@ impl Executor {
         crate::test_failpoints::grouped_table_opening();
         if held.reads_through_where() {
             let name = &table_source.name.value_lower;
-            let (columns, rows) = held.passing_rows(self, &run, name, ctx)?;
+            let (columns, rows) = held.passing_rows(self, run, name, ctx)?;
             let alias = table_source.alias.as_ref().map_or(name, |a| &a.value_lower);
             let (result, layout) = self.group_and_window_rows(
                 &held.stmt,
@@ -9750,7 +9781,7 @@ impl Executor {
                 &held.classification,
                 rows,
                 &columns,
-                Some(&run),
+                Some(run),
                 |out| Self::shared_result_layout(&held.stmt, &columns, Some(alias), out),
             )?;
             let columns = CompactArc::new(result.columns().to_vec());
@@ -9763,7 +9794,7 @@ impl Executor {
             ctx,
             &held.classification,
             Some(&mut read),
-            Some(&run),
+            Some(run),
         );
         if let Some((_, schema)) = &read {
             held.table_fits(schema)?;

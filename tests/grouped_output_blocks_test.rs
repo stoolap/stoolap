@@ -27,7 +27,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
     aggregate_paths_taken, before_grouped_table_opened, general_path_hits, general_path_total,
-    reset_aggregate_paths, GeneralPath,
+    random_draws, reset_aggregate_paths, GeneralPath, PREPARED_FAMILIES_OFF,
 };
 use stoolap::Database;
 
@@ -857,8 +857,21 @@ fn a_windowed_grouped_statement_sorts_by_a_key_holding_a_subquery() {
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
+/// `run` with the prepared families refused, as the general path answers
+fn on_general_path<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREPARED_FAMILIES_OFF.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    PREPARED_FAMILIES_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _restore = Restore;
+    run()
+}
+
 #[test]
-fn a_grouped_key_reading_an_alias_of_a_volatile_item_runs_on_the_general_path() {
+fn a_grouped_key_reading_an_alias_of_a_volatile_item_runs_prepared() {
     let _guard = serial();
     let db = Database::open("memory://grouped_output_blocks_volatile_alias").unwrap();
     fill(&db);
@@ -873,8 +886,37 @@ fn a_grouped_key_reading_an_alias_of_a_volatile_item_runs_on_the_general_path() 
          FROM u ORDER BY u.x LIMIT 1 OFFSET 1), 1",
     ] {
         let before = general_path_total();
-        let _ = rows(&db, sql);
-        assert!(general_path_total() > before, "{sql} ran prepared");
+        let got = rows(&db, sql);
+        assert_eq!(
+            general_path_total(),
+            before,
+            "{sql} ran on the general path"
+        );
+        assert!(got.is_ok(), "{sql}: {got:?}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+    // The key reads the value its item returns: the rows sort by that column
+    let sql = "SELECT a, RANDOM() AS g FROM t GROUP BY a ORDER BY (SELECT 0) + g";
+    let drawn: Vec<f64> = rows(&db, sql)
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let value = row.rsplit_once('|').unwrap().1;
+            value
+                .trim_start_matches("Float(")
+                .trim_end_matches(')')
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(drawn.windows(2).all(|pair| pair[0] <= pair[1]), "{drawn:?}");
+    // An item read by its alias draws once for each group; a key that is
+    // RANDOM() itself draws again
+    for (key, draws) in [("(SELECT 0) + g", 9), ("(SELECT 0) + RANDOM()", 18)] {
+        let sql = format!("SELECT a, RANDOM() AS g FROM t GROUP BY a ORDER BY {key}");
+        let before = random_draws();
+        rows(&db, &sql).unwrap();
+        assert_eq!(random_draws() - before, draws, "{sql}");
     }
     // A column of the subquery's own table of the alias's name is no alias
     let sql = "SELECT a, SUM(b) AS z, RANDOM() AS x FROM t GROUP BY a \
@@ -895,6 +937,127 @@ fn a_grouped_key_reading_an_alias_of_a_volatile_item_runs_on_the_general_path() 
             .collect()
     };
     assert_eq!(shown(got), shown(rows(&db, twin).unwrap()), "{sql}");
+}
+
+#[test]
+fn a_grouped_key_reading_an_alias_of_an_item_holding_a_subquery_reads_its_value() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://grouped_output_blocks_subquery_alias").unwrap();
+            fill(&db);
+            db
+        };
+        let mode = if sealed { "sealed" } else { "hot" };
+        let m = "(SELECT COUNT(*) FROM u WHERE u.k = t.a)";
+        for (sql, twin) in [
+            (
+                format!("SELECT a, {m} AS m FROM t GROUP BY a ORDER BY (SELECT 0) + m DESC, a"),
+                format!("SELECT a, {m} AS m FROM t GROUP BY a ORDER BY m DESC, a"),
+            ),
+            (
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a ORDER BY (SELECT 0) + m DESC, a \
+                     LIMIT 3 OFFSET 2"
+                ),
+                format!("SELECT a, {m} AS m FROM t GROUP BY a ORDER BY m DESC, a LIMIT 3 OFFSET 2"),
+            ),
+            // A value of the group that is no item: an aggregate, a column
+            (
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a \
+                     ORDER BY (SELECT 0) + m * 1000 + SUM(b), aa"
+                ),
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a ORDER BY m * 1000 + SUM(b), aa"
+                ),
+            ),
+            (
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a \
+                     ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a + 1 AND u.x < m) DESC, aa"
+                ),
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a ORDER BY \
+                     (SELECT COUNT(*) FROM u AS v WHERE v.k = t.a + 1 AND v.x < {m}) DESC, aa"
+                ),
+            ),
+            // The general path reads no alias inside a key's subquery, so the
+            // twin writes the item out
+            (
+                format!(
+                    "SELECT DISTINCT ON ((SELECT m / 2)) a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY (SELECT m / 2), a"
+                ),
+                format!(
+                    "SELECT DISTINCT ON ({m} / 2) a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY {m} / 2, a"
+                ),
+            ),
+            // A join's groups, whose run returns its rows on its own path
+            (
+                "SELECT DISTINCT ON ((SELECT 0) + z) t.a, (SELECT t.a) AS z, COUNT(*) \
+                 FROM t JOIN u ON u.id = t.id GROUP BY t.a ORDER BY t.a"
+                    .to_string(),
+                "SELECT DISTINCT ON (t.a) t.a, t.a AS z, COUNT(*) \
+                 FROM t JOIN u ON u.id = t.id GROUP BY t.a ORDER BY t.a"
+                    .to_string(),
+            ),
+            // A group column on the left of an ANY, outside its block
+            (
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY CASE WHEN a = ANY (SELECT k FROM u WHERE k < 5) THEN m ELSE -m END, a"
+                ),
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY CASE WHEN a IN (0, 1, 2, 3, 4) THEN m ELSE -m END, a"
+                ),
+            ),
+            // A window item, computed after the groups
+            (
+                "SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM t GROUP BY a \
+                 ORDER BY (SELECT 0) - rn"
+                    .to_string(),
+                "SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM t GROUP BY a \
+                 ORDER BY rn DESC"
+                    .to_string(),
+            ),
+        ] {
+            let before = general_path_total();
+            let got = rows(&db, &sql);
+            if general_path_total() != before {
+                wrong.push(format!("{mode}: {sql} ran on the general path"));
+            }
+            let want = on_general_path(|| rows(&db, &twin));
+            if got != want {
+                wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+            }
+            let line = prepared_line(&db, &sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("{mode}: {sql} says {line}"));
+            }
+        }
+        // A key's subquery that fails for a group fails as on the general path,
+        // though the LIMIT keeps one group
+        let sql = format!(
+            "SELECT a, {m} AS m FROM t GROUP BY a \
+             ORDER BY (SELECT u.x FROM u WHERE u.k = t.a) + m LIMIT 1"
+        );
+        let got = rows(&db, &sql);
+        let want = on_general_path(|| rows(&db, &sql));
+        if got.is_ok() || got != want {
+            wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
 #[test]
