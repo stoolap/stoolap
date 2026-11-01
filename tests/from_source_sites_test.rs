@@ -384,12 +384,9 @@ const BODIES: &[(&str, &str, &str, &str)] = &[
 
 /// The states today; every cell not listed is Right
 fn state(source: &str, cell: &str) -> State {
-    const STEP_6: State = Fails("step 6");
     const GRAMMAR: State = Fails("step 6, grammar first");
     match (source, cell) {
-        ("series", "body_argument") => GRAMMAR,
         ("cte" | "cte_columns", "insert_values" | "on_conflict_set") => GRAMMAR,
-        ("values", "body_row") => STEP_6,
         _ => Right,
     }
 }

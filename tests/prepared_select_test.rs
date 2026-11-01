@@ -2273,16 +2273,17 @@ fn test_a_values_list_evaluates_every_value_under_a_limit() {
 }
 
 #[test]
-fn test_a_values_row_holding_a_subquery_is_not_prepared() {
+fn test_a_values_row_holding_a_subquery_is_prepared() {
     let _guard = serial();
     let db = setup("prepared_values_row_subquery");
-    assert_eq!(
-        prepared_line(
-            &db,
-            "SELECT n FROM (VALUES ((SELECT MAX(v) FROM u)), (1)) AS s(n) WHERE n > (SELECT 0)"
-        ),
-        "Prepared: no (a VALUES row holding a subquery)"
-    );
+    let sql = "SELECT n FROM (VALUES ((SELECT MAX(v) FROM u)), (1)) AS s(n) WHERE n > (SELECT 0)";
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes");
+    let got: Vec<i64> = db
+        .query(&format!("{sql} ORDER BY n"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(got, vec![1, 60]);
 }
 
 #[test]
