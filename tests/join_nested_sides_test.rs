@@ -292,7 +292,7 @@ fn a_join_of_four_sources_and_a_cross_join_run_their_blocks() {
 }
 
 #[test]
-fn a_subquery_in_the_output_over_a_joined_side_that_merges_stays_on_the_general_path() {
+fn a_subquery_in_the_output_over_a_joined_side_that_merges_runs_its_blocks() {
     let _guard = serial();
     let db = hot("refused");
     let mut wrong = Vec::new();
@@ -300,12 +300,12 @@ fn a_subquery_in_the_output_over_a_joined_side_that_merges_stays_on_the_general_
         (
             "SELECT t.id, u.id, (SELECT MIN(y) * 10 FROM w) FROM t JOIN u USING (id) \
              JOIN r ON r.id = t.a",
-            "Prepared: no (a NATURAL or USING join whose output holds a subquery)",
+            "Prepared: yes",
         ),
         (
             "SELECT t.id, r.id, (SELECT MAX(y) FROM w) FROM t NATURAL JOIN r \
              JOIN u ON u.id = t.a",
-            "Prepared: no (a NATURAL or USING join whose output holds a subquery)",
+            "Prepared: yes",
         ),
     ] {
         check(

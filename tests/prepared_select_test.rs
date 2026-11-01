@@ -1050,6 +1050,7 @@ fn test_classifier_rules() {
         "SELECT id FROM t WHERE a > (SELECT MAX(q.v) FROM (SELECT u.v FROM u JOIN uv \
          ON uv.id = u.id) AS q WHERE q.v = t.id)"
             .to_string(),
+        format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
@@ -1115,18 +1116,12 @@ fn test_classifier_rules() {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
         assert!(error(&db, sql, ()).0.contains(want), "{sql}");
     }
-    let no = [
-        (
-            format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),
-            "a NATURAL or USING join whose output holds a subquery",
-        ),
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
+    let no = [(
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
              AS q WHERE q.v = t.a)"
-                .to_string(),
-            "a derived table selecting * over a join",
-        ),
-    ];
+            .to_string(),
+        "a derived table selecting * over a join",
+    )];
     for (sql, reason) in &no {
         assert_eq!(
             prepared_line(&db, sql),

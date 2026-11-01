@@ -340,7 +340,7 @@ fn a_join_output_s_subqueries_answer_in_every_context() {
         (
             "SELECT l.id, r.id, (SELECT s.a FROM s WHERE s.id = l.id) FROM l JOIN r USING (k) \
              ORDER BY 1, 2",
-            false,
+            true,
         ),
         (
             "SELECT l.k, COUNT(*), (SELECT MAX(s.a) FROM s WHERE s.b = l.k) FROM l JOIN r ON l.k = r.k \

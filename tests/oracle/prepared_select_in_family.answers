@@ -30,3 +30,4 @@
 2	e9f561c810a20390	SELECT id, a + 1 AS s, CASE WHEN b = 1 THEN 'x' END FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
 2	7164b455f4b0c10c	SELECT t.* FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)
 2	d9f3a5e1b0bbb11a	SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > (SELECT v FROM u WHERE u.id = t.id)
+5	f6f6d499135f2001	SELECT t.id, (SELECT v FROM u WHERE u.id = t.id) FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id

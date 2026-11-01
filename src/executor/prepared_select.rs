@@ -7071,11 +7071,21 @@ fn projected_aliases(
     names
 }
 
+/// The columns of a joined row of `width` columns a `*` shows: all but
+/// each merged pair's right column, as the merge shows the pair once
+fn star_columns(width: usize, merged: &[(usize, usize)]) -> Vec<usize> {
+    (0..width)
+        .filter(|at| !merged.iter().any(|&(_, right)| right == *at))
+        .collect()
+}
+
 /// The SELECT alias each column of a join statement's projected row has,
-/// over its joined columns `columns`, as `projected_aliases` gives them
+/// over its joined columns `columns`, a `*` showing `star` of them, as
+/// `projected_aliases` gives them
 pub(crate) fn joined_aliases(
     stmt: &SelectStatement,
     columns: &[String],
+    star: usize,
 ) -> Vec<Option<SmartString>> {
     projected_aliases(stmt, columns, |item| match item {
         Expression::QualifiedStar(q) => {
@@ -7083,7 +7093,7 @@ pub(crate) fn joined_aliases(
             for_each_qualified_star_column(columns, &q.qualifier, None, |_, _| width += 1);
             width
         }
-        _ => columns.len(),
+        _ => star,
     })
 }
 
@@ -7180,13 +7190,15 @@ impl PreparedProjection {
         Self::build(executor, stmt, chain, items, sort, columns, keys)
     }
 
-    /// The SELECT list over a join's rows of `all_columns` and, unless the
-    /// join sorted them already, what ORDER BY and DISTINCT ON append; an
-    /// item or key holding subqueries compiles as `blocks` rewrote it
+    /// The SELECT list over a join's rows of `all_columns`, as clauses name
+    /// them and as read, a star showing the columns at `shown`, and, unless
+    /// the join sorted them already, what ORDER BY and DISTINCT ON append;
+    /// an item or key holding subqueries compiles as `blocks` rewrote it
     pub(crate) fn prepare_joined(
         executor: &Executor,
         stmt: &SelectStatement,
-        all_columns: &[String],
+        (all_columns, read): (&[String], &[String]),
+        shown: &[usize],
         sorted: bool,
         blocks: &JoinBlocks,
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
@@ -7208,9 +7220,9 @@ impl PreparedProjection {
         };
         for (item, rewritten) in stmt.columns.iter().zip(&blocks.select) {
             match item {
-                Expression::Star(_) => (0..all_columns.len()).for_each(|i| star(&mut items, i)),
+                Expression::Star(_) => shown.iter().for_each(|&i| star(&mut items, i)),
                 Expression::QualifiedStar(q) => {
-                    for_each_qualified_star_column(all_columns, &q.qualifier, None, |i, _| {
+                    for_each_qualified_star_column(read, &q.qualifier, None, |i, _| {
                         star(&mut items, i)
                     })
                 }
@@ -9550,6 +9562,26 @@ impl JoinBlocks {
             .filter(move |&(left, right)| (left < left_width) == (right < left_width))
     }
 
+    /// Whether a SELECT item, ORDER BY key or DISTINCT ON key runs a block
+    pub(crate) fn runs_output(&self) -> bool {
+        self.select
+            .iter()
+            .chain(&self.order_by)
+            .chain(&self.distinct_on)
+            .any(Option::is_some)
+    }
+
+    /// Every pair the joined row merges, the join's own and its sides',
+    /// each its left and right column in the joined row
+    pub(crate) fn merges(&self) -> &[(usize, usize)] {
+        &self.scope.merged
+    }
+
+    /// The columns of the joined row a `*` the blocks project shows
+    pub(crate) fn star_columns(&self) -> Vec<usize> {
+        star_columns(self.all.len(), &self.scope.merged)
+    }
+
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
     fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
@@ -9573,7 +9605,8 @@ impl JoinBlocks {
     /// conditions on one side, `side_filters`, and the SELECT items, ORDER BY
     /// keys and DISTINCT ON keys holding a subquery, `output`, over the
     /// joined row of `sides`, each a name, its columns' schema and whether it
-    /// is read as rows; None when the join's `width` columns do not line up
+    /// is read as rows; None when the join's `width` columns do not line up.
+    /// `items` gives the projected row's aliases, a `*` showing so many columns
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
@@ -9582,7 +9615,7 @@ impl JoinBlocks {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
-        items: Vec<Option<SmartString>>,
+        items: impl FnOnce(usize) -> Vec<Option<SmartString>>,
         sides: &JoinSides,
         width: usize,
         param_count: usize,
@@ -9599,6 +9632,7 @@ impl JoinBlocks {
         if scope.columns.len() != width {
             return Ok(None);
         }
+        let items = items(star_columns(width, &scope.merged).len());
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -9991,7 +10025,7 @@ impl Executor {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
-        items: Vec<Option<SmartString>>,
+        items: impl FnOnce(usize) -> Vec<Option<SmartString>>,
         sides: &JoinSides,
         width: usize,
         ctx: &ExecutionContext,
