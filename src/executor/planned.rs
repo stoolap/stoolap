@@ -174,6 +174,20 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
+        self.explain_planned(stmt, ctx, true)
+            .or_else(|| self.explain_over_source(stmt, ctx))
+            .or_else(|| self.explain_aggregate(stmt, ctx))
+    }
+
+    /// The plan the planner makes of `stmt` over its table in `ctx`, as
+    /// EXPLAIN shows it, its key read when the run is `keyed`; None for a
+    /// statement it does not plan so
+    pub(crate) fn explain_planned(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        keyed: bool,
+    ) -> Option<Vec<String>> {
         let slot = RwLock::new(CompiledExecution::Unknown);
         self.with_planned(stmt, &slot, None, Some(ctx), |_| ());
         if let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? {
@@ -185,11 +199,11 @@ impl Executor {
                 &first_branch_of(stmt),
                 (table, &self.function_registry),
                 Vec::new(),
+                keyed,
             )?;
             return Some(self.explain_set_operations(stmt, first, ctx));
         }
-        self.explain_over_source(stmt, ctx)
-            .or_else(|| self.explain_aggregate(stmt, ctx))
+        None
     }
 
     /// `stmt`'s plan over `first`, its first branch's: each set operation
@@ -258,6 +272,7 @@ impl Executor {
             ordered: None,
             empty_unless: None,
             body: Vec::new(),
+            keyed: true,
         }
     }
 

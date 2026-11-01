@@ -261,6 +261,9 @@ pub struct PlanText<'a> {
     pub empty_unless: Option<String>,
     /// The plan of the statement a source's rows come from
     pub body: Vec<String>,
+    /// Whether the run reads a key read's row itself; a nested statement's
+    /// run reads what the key read falls back to
+    pub keyed: bool,
 }
 
 impl Plan {
@@ -306,17 +309,21 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
     };
     match (read, text.ordered) {
         (Read::PkGet(key), _) => {
-            alternative(
-                lines,
-                format!("PkGet {} {}", text.table, key.key.describe()),
-            );
+            if text.keyed {
+                alternative(
+                    lines,
+                    format!("PkGet {} {}", text.table, key.key.describe()),
+                );
+            }
             read_lines(&key.otherwise, text, lines);
         }
         (Read::UniqueGet(key), _) => {
-            alternative(
-                lines,
-                format!("UniqueGet {} {}", text.table, key.key.describe()),
-            );
+            if text.keyed {
+                alternative(
+                    lines,
+                    format!("UniqueGet {} {}", text.table, key.key.describe()),
+                );
+            }
             read_lines(&key.otherwise, text, lines);
         }
         (Read::DistinctValues { column, otherwise }, _) => {

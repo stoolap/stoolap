@@ -3669,13 +3669,14 @@ pub struct PreparedSelect {
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table` or
     /// over a source whose statement's plan is `body`, as EXPLAIN shows it,
-    /// its constant terms by the functions of `registry`; None when the
-    /// table chooses how it reads
+    /// its constant terms by the functions of `registry`, its key read shown
+    /// when the run is `keyed`; None when the table chooses how it reads
     pub(crate) fn explain(
         &self,
         stmt: &SelectStatement,
         (table, registry): (&str, &FunctionRegistry),
         body: Vec<String>,
+        keyed: bool,
     ) -> Option<Vec<String>> {
         let plan = self.plan.as_ref().filter(|plan| {
             plan.read.scan().is_some()
@@ -3741,6 +3742,7 @@ impl PreparedSelect {
                     .map(|(column, ascending, _)| (column, ascending)),
                 empty_unless,
                 body,
+                keyed,
             }),
         )
     }
@@ -10989,7 +10991,7 @@ impl Executor {
         let params = ctx.params().len();
         let prepared =
             PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch).ok()?;
-        prepared.explain(stmt, (&scope, &self.function_registry), body)
+        prepared.explain(stmt, (&scope, &self.function_registry), body, false)
     }
 
     /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
@@ -11000,10 +11002,13 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Vec<String> {
-        self.reads_source(stmt, ctx)
-            .then(|| self.explain_over_source(stmt, ctx))
-            .flatten()
-            .unwrap_or_else(|| self.general_explain(stmt))
+        // A body over a table runs as the planner plans it into its slot,
+        // reading no key itself
+        let planned = match self.reads_source(stmt, ctx) {
+            true => self.explain_over_source(stmt, ctx),
+            false => self.explain_planned(stmt, ctx, false),
+        };
+        planned.unwrap_or_else(|| self.general_explain(stmt))
     }
 
     /// The general path's EXPLAIN of `stmt`
