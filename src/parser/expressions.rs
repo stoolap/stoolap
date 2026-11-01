@@ -32,7 +32,7 @@ impl Parser<'_> {
     /// Parse an expression with the given precedence, refusing one nested
     /// past [`MAX_EXPRESSION_DEPTH`] before any later stage recurses that deep
     pub fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
-        if self.limited && self.expression_depth == MAX_EXPRESSION_DEPTH {
+        if self.limited && self.expression_depth >= MAX_EXPRESSION_DEPTH {
             self.add_error(format!(
                 "statement nested too deeply: more than {MAX_EXPRESSION_DEPTH} expressions inside one another"
             ));

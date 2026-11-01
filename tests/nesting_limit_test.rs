@@ -196,4 +196,36 @@ fn text_the_engine_wrote_reads_back_past_the_limits() {
         Ok(1),
         "the stored view reads back"
     );
+    // The view's text as the engine wrote it, read back, is still held to
+    // the limits when a user sends it
+    let written = stoolap::parser::parse_sql(&format!("SELECT id FROM w WHERE {checks}"))
+        .unwrap()
+        .remove(0)
+        .to_string();
+    let refused = answer(&db, &written);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains(&expressions_error())),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_with_that_starts_at_the_limit_is_counted() {
+    let db = setup("nesting_limit_with_at_limit");
+    let wrappers = MAX_STATEMENT_DEPTH - 1;
+    let body = nested("derived", 10_000);
+    let sql = format!(
+        "SELECT * FROM {}(WITH c AS ({body}) SELECT * FROM c) w{}",
+        "(SELECT * FROM ".repeat(wrappers),
+        ") d".repeat(wrappers)
+    );
+    let refused = answer(&db, &sql);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains(&selects_error())),
+        "{refused:?}"
+    );
 }
