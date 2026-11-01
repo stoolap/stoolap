@@ -208,3 +208,23 @@ fn the_first_branch_keeps_its_repeated_rows_and_its_layout() {
         assert_eq!(rows(&db, sql), Ok(want), "{sql}");
     }
 }
+
+#[test]
+fn explain_shows_the_distinct_on_between_the_limit_and_the_sort() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup(&dir, false);
+    let sql = "EXPLAIN SELECT DISTINCT ON (k) k, id FROM t \
+               UNION ALL SELECT k, id FROM u ORDER BY k, id LIMIT 1";
+    let lines: Vec<String> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap().trim().to_string())
+        .collect();
+    let steps: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split(' ').next().unwrap_or(""))
+        .take_while(|step| ["Limit", "DistinctOn", "Sort", "TopN"].contains(step))
+        .collect();
+    assert_eq!(steps, ["Limit", "DistinctOn", "Sort"], "{sql}: {lines:?}");
+}

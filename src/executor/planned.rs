@@ -242,14 +242,23 @@ impl Executor {
     }
 
     /// The steps the statement's own clauses take over its executor's rows,
-    /// outermost first: its LIMIT, its ORDER BY, cut by the LIMIT or whole,
-    /// then `inner`
+    /// outermost first: its LIMIT, its DISTINCT ON, its ORDER BY, cut by the
+    /// LIMIT or whole, then `inner`
     pub(super) fn finishing_steps(stmt: &SelectStatement, inner: &[Step]) -> SmallVec<[Step; 4]> {
         let mut steps = SmallVec::new();
         if stmt.limit.is_some() || stmt.offset.is_some() {
             steps.push(Step::Limit);
         }
-        match (stmt.order_by.is_empty(), stmt.limit.is_some()) {
+        // A DISTINCT ON keeps a row per key of every sorted row, and only
+        // then the LIMIT's
+        let distinct_on = !stmt.distinct_on.is_empty();
+        if distinct_on {
+            steps.push(Step::DistinctOn);
+        }
+        match (
+            stmt.order_by.is_empty(),
+            stmt.limit.is_some() && !distinct_on,
+        ) {
             (true, _) => {}
             (false, true) => steps.push(Step::TopN),
             (false, false) => steps.push(Step::Sort),
@@ -270,7 +279,10 @@ impl Executor {
                 .filter(|o| !matches!(o, Expression::IntegerLiteral(lit) if lit.value == 0))
                 .map(Expression::to_string),
             keys: Some(keys.join(", ")),
-            distinct_on: None,
+            distinct_on: (!stmt.distinct_on.is_empty()).then(|| {
+                let keys: Vec<String> = stmt.distinct_on.iter().map(|k| k.to_string()).collect();
+                keys.join(", ")
+            }),
             having: stmt.having.as_deref().map(Expression::to_string),
             windows: None,
             names: &[],
