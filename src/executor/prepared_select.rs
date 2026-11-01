@@ -978,11 +978,14 @@ pub(crate) fn prepared_branch(
 ) -> (std::borrow::Cow<'_, SelectStatement>, bool) {
     let keyed = !stmt.set_operations.is_empty() && !stmt.distinct_on.is_empty();
     let branch = match first_branch_of(stmt) {
-        std::borrow::Cow::Owned(branch) => std::borrow::Cow::Owned(SelectStatement {
+        // The DISTINCT that marks a DISTINCT ON goes with it, or the branch
+        // would drop its repeated rows before the set operation reads them
+        std::borrow::Cow::Owned(branch) if keyed => std::borrow::Cow::Owned(SelectStatement {
+            distinct: false,
             distinct_on: Vec::new(),
             ..branch
         }),
-        borrowed => borrowed,
+        branch => branch,
     };
     (branch, keyed)
 }
@@ -12331,7 +12334,7 @@ impl Executor {
                     output_columns,
                     true,
                     prepared.visible,
-                    None,
+                    prepared.layout.clone(),
                     false,
                 ));
             }

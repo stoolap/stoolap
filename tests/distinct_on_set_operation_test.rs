@@ -169,3 +169,42 @@ fn a_set_operation_s_distinct_on_reads_its_rows_over_a_prepared_first_select() {
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
+
+#[test]
+fn the_first_branch_keeps_its_repeated_rows_and_its_layout() {
+    let _guard = serial();
+    let db = Database::open("memory://distinct_on_set_operation_branch").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)",
+        "CREATE INDEX t_k ON t (k)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO t VALUES (1, 30, 1), (2, 10, 1), (3, 20, 2)",
+        "INSERT INTO u VALUES (1, 1), (2, 3)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for (sql, want) in [
+        (
+            "SELECT DISTINCT ON (k) k FROM t EXCEPT ALL SELECT k FROM u ORDER BY 1",
+            vec!["Integer(1)", "Integer(2)"],
+        ),
+        (
+            "SELECT DISTINCT ON (k) k FROM t WHERE a > (SELECT 0) EXCEPT ALL SELECT k FROM u \
+             ORDER BY 1",
+            vec!["Integer(1)", "Integer(2)"],
+        ),
+        (
+            "SELECT DISTINCT ON (k + 0) k + 0 FROM t WHERE 1 = 0 UNION ALL SELECT k FROM u \
+             ORDER BY 1",
+            vec!["Integer(1)", "Integer(3)"],
+        ),
+        (
+            "SELECT DISTINCT ON (k + 0) k + 0 FROM t WHERE 1 = 0 AND a > (SELECT 0) \
+             UNION ALL SELECT k FROM u ORDER BY 1",
+            vec!["Integer(1)", "Integer(3)"],
+        ),
+    ] {
+        let want: Vec<String> = want.into_iter().map(str::to_string).collect();
+        assert_eq!(rows(&db, sql), Ok(want), "{sql}");
+    }
+}
