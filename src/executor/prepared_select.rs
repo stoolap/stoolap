@@ -1292,18 +1292,7 @@ impl Executor {
         }
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
-            Some(Expression::JoinSource(join)) => {
-                let side_merges = |side: &Expression| {
-                    matches!(side, Expression::JoinSource(_)) && merges_columns(side)
-                };
-                if join.join_type.to_uppercase().contains("NATURAL")
-                    || !join.using_columns.is_empty()
-                    || side_merges(&join.left)
-                    || side_merges(&join.right)
-                {
-                    return Err("a NATURAL or USING join whose output holds a subquery");
-                }
-            }
+            Some(Expression::JoinSource(_)) => {}
             table_expr => {
                 if let Some(where_clause) = stmt.where_clause.as_deref() {
                     family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
@@ -7179,13 +7168,15 @@ impl PreparedProjection {
         Self::build(executor, stmt, chain, items, sort, columns, keys)
     }
 
-    /// The SELECT list over a join's rows of `all_columns` and, unless the
-    /// join sorted them already, what ORDER BY and DISTINCT ON append; an
-    /// item or key holding subqueries compiles as `blocks` rewrote it
+    /// The SELECT list over a join's rows of `all_columns`, as clauses name
+    /// them and as read, a star showing the columns at `shown`, and, unless
+    /// the join sorted them already, what ORDER BY and DISTINCT ON append;
+    /// an item or key holding subqueries compiles as `blocks` rewrote it
     pub(crate) fn prepare_joined(
         executor: &Executor,
         stmt: &SelectStatement,
-        all_columns: &[String],
+        (all_columns, read): (&[String], &[String]),
+        shown: &[usize],
         sorted: bool,
         blocks: &JoinBlocks,
     ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
@@ -7207,9 +7198,9 @@ impl PreparedProjection {
         };
         for (item, rewritten) in stmt.columns.iter().zip(&blocks.select) {
             match item {
-                Expression::Star(_) => (0..all_columns.len()).for_each(|i| star(&mut items, i)),
+                Expression::Star(_) => shown.iter().for_each(|&i| star(&mut items, i)),
                 Expression::QualifiedStar(q) => {
-                    for_each_qualified_star_column(all_columns, &q.qualifier, None, |i, _| {
+                    for_each_qualified_star_column(read, &q.qualifier, None, |i, _| {
                         star(&mut items, i)
                     })
                 }
@@ -9547,6 +9538,21 @@ impl JoinBlocks {
             .iter()
             .copied()
             .filter(move |&(left, right)| (left < left_width) == (right < left_width))
+    }
+
+    /// Whether a SELECT item, ORDER BY key or DISTINCT ON key runs a block
+    pub(crate) fn runs_output(&self) -> bool {
+        self.select
+            .iter()
+            .chain(&self.order_by)
+            .chain(&self.distinct_on)
+            .any(Option::is_some)
+    }
+
+    /// Every pair the joined row merges, the join's own and its sides',
+    /// each its left and right column in the joined row
+    pub(crate) fn merges(&self) -> &[(usize, usize)] {
+        &self.scope.merged
     }
 
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read

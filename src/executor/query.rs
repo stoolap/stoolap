@@ -666,6 +666,17 @@ fn merged_columns(
     }
 }
 
+/// `all_columns`, the names of joined rows holding each of the pairs
+/// `merges` apart, with each pair's left column named bare, as the
+/// merged column a bare name reads
+fn merged_names(all_columns: &[String], merges: &[(usize, usize)]) -> Vec<String> {
+    let mut named = all_columns.to_vec();
+    for &(left, _) in merges {
+        named[left] = bare_name(&all_columns[left]).to_string();
+    }
+    named
+}
+
 /// Into `excluded` and `renames`, as [`merged_columns`] takes them, the pairs
 /// `held`'s joined sides merge, which the blocks read apart, over `columns`,
 /// for `stmt`'s star or a qualified star; the left columns a clause names
@@ -5544,23 +5555,6 @@ impl Executor {
         }
     }
 
-    /// Whether `join` is a NATURAL or USING join, whose rows merge columns
-    fn merges_columns(join: &JoinTableSource) -> bool {
-        join.join_type.to_uppercase().contains("NATURAL") || !join.using_columns.is_empty()
-    }
-
-    /// Whether the join side `side` is or holds a NATURAL or USING join
-    fn merges_within(side: &Expression) -> bool {
-        match side {
-            Expression::JoinSource(join) => {
-                Self::merges_columns(join)
-                    || Self::merges_within(&join.left)
-                    || Self::merges_within(&join.right)
-            }
-            _ => false,
-        }
-    }
-
     /// Whether the ON of `join`, or of a join it holds as a side, holds a
     /// subquery
     pub(crate) fn ons_hold_subqueries(join: &JoinTableSource) -> bool {
@@ -5616,7 +5610,7 @@ impl Executor {
                 self.joined_side_family(join)?;
             }
         }
-        self.join_output_family(stmt, join_source, join_type)?;
+        self.join_output_family(stmt)?;
         // A join without a subquery reads a name both sources have from its
         // left source, which its blocks refuse as ambiguous
         let classification = get_classification(stmt);
@@ -5689,12 +5683,7 @@ impl Executor {
     /// Why the subqueries of the SELECT list, the ORDER BY or the DISTINCT ON
     /// of a join are not all of the forms the prepared blocks run over the
     /// joined rows
-    fn join_output_family(
-        &self,
-        stmt: &SelectStatement,
-        join_source: &JoinTableSource,
-        join_type: &str,
-    ) -> std::result::Result<(), OutOfFamily> {
+    fn join_output_family(&self, stmt: &SelectStatement) -> std::result::Result<(), OutOfFamily> {
         if Self::grouped_join_output(stmt) {
             return Ok(());
         }
@@ -5718,13 +5707,6 @@ impl Executor {
         }
         if !found {
             return Ok(());
-        }
-        if join_type.contains("NATURAL")
-            || !join_source.using_columns.is_empty()
-            || Self::merges_within(&join_source.left)
-            || Self::merges_within(&join_source.right)
-        {
-            return Err("a NATURAL or USING join whose output holds a subquery");
         }
         if classification.has_aggregation
             || classification.has_window_functions
@@ -6138,6 +6120,11 @@ impl Executor {
         let side_merged = blocks
             .as_deref()
             .is_some_and(|held| held.side_merges().next().is_some());
+        // An output the blocks run reads every pair apart and shows it merged
+        let output_apart = !classification.has_aggregation
+            && !classification.has_window_functions
+            && blocks.as_deref().is_some_and(JoinBlocks::runs_output);
+        let side_merged = side_merged && !output_apart;
         let left_read = SideRead {
             filter: match reads_plain[0] {
                 true => left_plain.as_ref(),
@@ -7611,7 +7598,7 @@ impl Executor {
         let (natural_join_cond, mut excluded_column_indices, mut join_col_renames) =
             natural_join_condition;
         // Run apart, it keeps both columns of each pair it merges
-        if apart {
+        if apart || output_apart {
             excluded_column_indices.clear();
             join_col_renames.clear();
         }
@@ -11683,15 +11670,7 @@ impl Executor {
         blocks: Option<&JoinBlocks>,
         ctx: &ExecutionContext,
     ) -> Result<Option<JoinOutput>> {
-        let runs_output = |blocks: &&JoinBlocks| {
-            blocks
-                .select
-                .iter()
-                .chain(&blocks.order_by)
-                .chain(&blocks.distinct_on)
-                .any(Option::is_some)
-        };
-        if let Some(blocks) = blocks.filter(runs_output) {
+        if let Some(blocks) = blocks.filter(|blocks| blocks.runs_output()) {
             debug_assert_eq!(
                 blocks.all.len(),
                 all_columns.len(),
@@ -11741,20 +11720,50 @@ impl Executor {
         sorted: bool,
         blocks: &JoinBlocks,
     ) -> Result<JoinOutput> {
-        let (projection, extra_names, extra_sources) =
-            PreparedProjection::prepare_joined(self, stmt, all_columns, sorted, blocks)?;
-        let mut columns = self.get_output_column_names(&stmt.columns, all_columns, None);
+        // The rows hold each merged pair apart: a bare name reads its left
+        // column, and a star shows that one alone, as the general path does
+        let merges = blocks.merges();
+        let named = merged_names(all_columns, merges);
+        let star = !merges.is_empty()
+            && stmt
+                .columns
+                .iter()
+                .any(|c| matches!(c, Expression::Star(_)));
+        let shown: Vec<usize> = (0..all_columns.len())
+            .filter(|at| !star || !merges.iter().any(|&(_, right)| right == *at))
+            .collect();
+        let names: Vec<String> = match star {
+            true => shown.iter().map(|&at| named[at].clone()).collect(),
+            false => all_columns.to_vec(),
+        };
+        let (projection, extra_names, extra_sources) = PreparedProjection::prepare_joined(
+            self,
+            stmt,
+            (&named, all_columns),
+            &shown,
+            sorted,
+            blocks,
+        )?;
+        let mut columns = self.get_output_column_names(&stmt.columns, &names, None);
+        let layout_over = |mut layout: OutputLayout| {
+            for source in &mut layout.sources {
+                source.input = source.input.map(|at| shown[at]);
+            }
+            layout.input_columns = CompactArc::new(named.clone());
+            layout
+        };
         if extra_names.is_empty() {
             return Ok(JoinOutput {
                 projection: JoinProjection::Prepared(projection),
                 columns: CompactArc::new(columns),
-                layout: Self::output_layout(stmt, all_columns, None).map(CompactArc::new),
+                layout: Self::output_layout(stmt, &names, None)
+                    .map(layout_over)
+                    .map(CompactArc::new),
                 visible: None,
             });
         }
         let visible = columns.len();
-        let mut layout =
-            Self::shared_select_layout(&stmt.columns, CompactArc::new(all_columns.to_vec()), None);
+        let mut layout = layout_over(Self::select_layout(&stmt.columns, &names, None));
         layout.sources.extend(extra_sources);
         columns.extend(extra_names);
         Ok(JoinOutput {

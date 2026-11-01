@@ -18,8 +18,10 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::sync::atomic::Ordering::Relaxed;
+
 use stoolap::test_failpoints::{
-    order_limit_paths, order_limit_paths_taken, reset_order_limit_paths,
+    order_limit_paths, order_limit_paths_taken, reset_order_limit_paths, PREPARED_FAMILIES_OFF,
 };
 use stoolap::Database;
 
@@ -71,9 +73,9 @@ const CASES: &[Case] = &[
          ORDER BY a DESC NULLS FIRST, id",
         Some((5, 0)),
     ),
-    // A subquery in the SELECT list of a USING join runs on the general path
+    // With the prepared families off, a statement runs on the general path
     case(
-        "memory",
+        "memory, families off",
         "projected_top",
         "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id + 0 LIMIT 1) AS x \
          FROM t JOIN u USING (id) ORDER BY t.id",
@@ -82,7 +84,7 @@ const CASES: &[Case] = &[
         None,
     ),
     case(
-        "sealed",
+        "sealed, families off",
         "projected_top",
         "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id + 0 LIMIT 1) AS x \
          FROM t JOIN u USING (id) ORDER BY t.id",
@@ -150,7 +152,7 @@ const CASES: &[Case] = &[
         Some((4, 0)),
     ),
     case(
-        "memory",
+        "memory, families off",
         "deferred_projection",
         "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id LIMIT 1) AS x \
          FROM t JOIN u USING (id) ORDER BY t.id",
@@ -159,7 +161,7 @@ const CASES: &[Case] = &[
         None,
     ),
     case(
-        "memory",
+        "memory, families off",
         "index_ordered",
         "SELECT t.id, (SELECT i.id FROM t i ORDER BY i.c DESC NULLS LAST LIMIT 1 OFFSET 1) AS x \
          FROM t JOIN u USING (id) ORDER BY t.id",
@@ -168,7 +170,7 @@ const CASES: &[Case] = &[
         None,
     ),
     case(
-        "memory",
+        "memory, families off",
         "top_k_scan",
         "SELECT t.id, (SELECT i.id FROM t i WHERE i.g = 1 AND i.id <> t.id \
          ORDER BY i.n DESC LIMIT 1) AS x FROM t JOIN u USING (id) ORDER BY t.id",
@@ -177,7 +179,7 @@ const CASES: &[Case] = &[
         None,
     ),
     case(
-        "sealed",
+        "sealed, families off",
         "top_k_scan",
         "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id LIMIT 1) AS x \
          FROM t JOIN u USING (id) ORDER BY t.id",
@@ -276,7 +278,7 @@ const CASES: &[Case] = &[
         Some((3, 0)),
     ),
     case(
-        "memory",
+        "memory, families off",
         "keyset_pagination",
         "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > 5 ORDER BY i.id LIMIT 1) AS x \
          FROM t JOIN u USING (id) ORDER BY t.id",
@@ -432,12 +434,15 @@ fn every_order_limit_path_answers_as_the_whole_sort() {
     let mut wrong = Vec::new();
     let mut covered: Vec<&str> = Vec::new();
     for case in CASES {
-        let db = match case.ctx {
-            "sealed" => &sealed,
-            _ => &memory,
+        let db = match case.ctx.starts_with("sealed") {
+            true => &sealed,
+            false => &memory,
         };
+        let off = case.ctx.ends_with("families off");
+        PREPARED_FAMILIES_OFF.store(off, Relaxed);
         let (got, taken) = run(db, case.sql);
         let (whole, reference_taken) = run(db, case.reference);
+        PREPARED_FAMILIES_OFF.store(false, Relaxed);
         let want: Vec<String> = match case.cut {
             Some((limit, offset)) => {
                 let mut whole = whole.into_iter();
