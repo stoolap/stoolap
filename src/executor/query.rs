@@ -5832,7 +5832,7 @@ impl Executor {
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
                 [&select, &keys, &distinct],
-                joined_aliases(stmt, &columns),
+                |star| joined_aliases(stmt, &columns, star),
                 sides,
                 columns.len(),
                 ctx,
@@ -11722,20 +11722,9 @@ impl Executor {
     ) -> Result<JoinOutput> {
         // The rows hold each merged pair apart: a bare name reads its left
         // column, and a star shows that one alone, as the general path does
-        let merges = blocks.merges();
-        let named = merged_names(all_columns, merges);
-        let star = !merges.is_empty()
-            && stmt
-                .columns
-                .iter()
-                .any(|c| matches!(c, Expression::Star(_)));
-        let shown: Vec<usize> = (0..all_columns.len())
-            .filter(|at| !star || !merges.iter().any(|&(_, right)| right == *at))
-            .collect();
-        let names: Vec<String> = match star {
-            true => shown.iter().map(|&at| named[at].clone()).collect(),
-            false => all_columns.to_vec(),
-        };
+        let named = merged_names(all_columns, blocks.merges());
+        let shown = blocks.star_columns();
+        let star = Some((&shown[..], &named[..]));
         let (projection, extra_names, extra_sources) = PreparedProjection::prepare_joined(
             self,
             stmt,
@@ -11744,26 +11733,26 @@ impl Executor {
             sorted,
             blocks,
         )?;
-        let mut columns = self.get_output_column_names(&stmt.columns, &names, None);
-        let layout_over = |mut layout: OutputLayout| {
-            for source in &mut layout.sources {
-                source.input = source.input.map(|at| shown[at]);
+        let mut columns = Self::output_columns(&stmt.columns, all_columns, None, star, None);
+        let layout = || {
+            let mut sources = LayoutSources::new();
+            Self::output_columns(&stmt.columns, all_columns, None, star, Some(&mut sources));
+            OutputLayout {
+                input_columns: CompactArc::new(named.clone()),
+                sources,
             }
-            layout.input_columns = CompactArc::new(named.clone());
-            layout
         };
         if extra_names.is_empty() {
+            let keyed = !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty();
             return Ok(JoinOutput {
                 projection: JoinProjection::Prepared(projection),
                 columns: CompactArc::new(columns),
-                layout: Self::output_layout(stmt, &names, None)
-                    .map(layout_over)
-                    .map(CompactArc::new),
+                layout: keyed.then(|| CompactArc::new(layout())),
                 visible: None,
             });
         }
         let visible = columns.len();
-        let mut layout = layout_over(Self::select_layout(&stmt.columns, &names, None));
+        let mut layout = layout();
         layout.sources.extend(extra_sources);
         columns.extend(extra_names);
         Ok(JoinOutput {
@@ -12157,7 +12146,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
     ) -> Vec<String> {
-        Self::output_columns(select_exprs, all_columns, table_alias, None)
+        Self::output_columns(select_exprs, all_columns, table_alias, None, None)
     }
 
     /// The layout of the output columns `select_exprs` give over the input
@@ -12194,7 +12183,13 @@ impl Executor {
         table_alias: Option<&str>,
     ) -> LayoutSources {
         let mut sources = LayoutSources::new();
-        Self::output_columns(select_exprs, all_columns, table_alias, Some(&mut sources));
+        Self::output_columns(
+            select_exprs,
+            all_columns,
+            table_alias,
+            None,
+            Some(&mut sources),
+        );
         sources
     }
 
@@ -12271,11 +12266,13 @@ impl Executor {
     }
 
     /// The names of the output columns `select_exprs` give over the input
-    /// `all_columns`, a star expanded, and into `sources` the source of each
+    /// `all_columns`, a star expanded, and into `sources` the source of each.
+    /// With `star`, a `*` shows the columns at its positions, by its names
     fn output_columns(
         select_exprs: &[Expression],
         all_columns: &[String],
         table_alias: Option<&str>,
+        star: Option<(&[usize], &[String])>,
         mut sources: Option<&mut LayoutSources>,
     ) -> Vec<String> {
         // A layout reads the sources alone: no name is built for it
@@ -12294,10 +12291,20 @@ impl Executor {
             match expr {
                 Expression::Star(_) => {
                     // SELECT * - add all column names
-                    if !laid_out {
-                        names.extend(all_columns.iter().cloned());
+                    match star {
+                        Some((shown, named)) => {
+                            if !laid_out {
+                                names.extend(shown.iter().map(|&at| named[at].clone()));
+                            }
+                            shown.iter().for_each(|&at| source(i, Some(at)));
+                        }
+                        None => {
+                            if !laid_out {
+                                names.extend(all_columns.iter().cloned());
+                            }
+                            (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
+                        }
                     }
-                    (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
                     continue;
                 }
                 Expression::QualifiedStar(qs) => {

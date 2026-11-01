@@ -275,3 +275,53 @@ fn an_ordered_subquery_in_a_merging_join_s_output_takes_a_prepared_path() {
         }
     }
 }
+
+#[test]
+fn a_star_lines_up_with_the_items_and_qualified_stars_beside_it() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    for (context, db) in databases(&dir) {
+        // An alias after the star is read where the projection put it
+        let sql = "SELECT *, l.id AS x, (SELECT MAX(s.a) FROM s WHERE s.id = r.id) AS c \
+                   FROM l JOIN r USING (k) ORDER BY x + 0 DESC, r.id";
+        let general = oracle::general_answer(sql, |twin| rows(&db, twin));
+        assert_eq!(rows(&db, sql), general, "{context}: {sql}");
+        // Each name stands over its own value
+        let sql = "SELECT *, r.*, (SELECT 7) AS x FROM l JOIN r USING (k)";
+        let result = db.query(sql, ()).unwrap();
+        let columns = result.columns().to_vec();
+        assert_eq!(
+            columns,
+            ["l.id", "k", "l.g", "r.id", "r.w", "id", "k", "w", "x"],
+            "{context}: {sql}"
+        );
+        for row in result {
+            let row = row.unwrap();
+            assert_eq!(row.len(), columns.len(), "{context}: {sql}");
+            assert_eq!(row.get_by_name::<i64>("x").unwrap(), 7, "{context}: {sql}");
+        }
+    }
+}
+
+#[test]
+fn a_merging_join_that_groups_or_has_windows_stays_out_of_the_family() {
+    let _guard = serial();
+    let db = Database::open("memory://merged_join_output_grouped").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT ROW_NUMBER() OVER () AS rn, (SELECT 1) AS x FROM l JOIN r USING (id)",
+        "SELECT k, COUNT(*), (SELECT MAX(s.a) FROM s) AS m FROM l JOIN r USING (k) \
+         GROUP BY k ORDER BY k",
+    ] {
+        assert_eq!(
+            prepared_line(&db, sql),
+            "Prepared: no (a NATURAL or USING join whose output holds a subquery)",
+            "{sql}"
+        );
+        let answer = rows(&db, sql);
+        assert!(
+            answer.as_ref().is_ok_and(|r| r.len() > 1),
+            "{sql}: {answer:?}"
+        );
+    }
+}

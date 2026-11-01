@@ -1292,7 +1292,18 @@ impl Executor {
         }
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
-            Some(Expression::JoinSource(_)) => {}
+            Some(Expression::JoinSource(join)) => {
+                let side_merges = |side: &Expression| {
+                    matches!(side, Expression::JoinSource(_)) && merges_columns(side)
+                };
+                if join.join_type.to_uppercase().contains("NATURAL")
+                    || !join.using_columns.is_empty()
+                    || side_merges(&join.left)
+                    || side_merges(&join.right)
+                {
+                    return Err("a NATURAL or USING join whose output holds a subquery");
+                }
+            }
             table_expr => {
                 if let Some(where_clause) = stmt.where_clause.as_deref() {
                     family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
@@ -7059,11 +7070,21 @@ fn projected_aliases(
     names
 }
 
+/// The columns of a joined row of `width` columns a `*` shows: all but
+/// each merged pair's right column, as the merge shows the pair once
+fn star_columns(width: usize, merged: &[(usize, usize)]) -> Vec<usize> {
+    (0..width)
+        .filter(|at| !merged.iter().any(|&(_, right)| right == *at))
+        .collect()
+}
+
 /// The SELECT alias each column of a join statement's projected row has,
-/// over its joined columns `columns`, as `projected_aliases` gives them
+/// over its joined columns `columns`, a `*` showing `star` of them, as
+/// `projected_aliases` gives them
 pub(crate) fn joined_aliases(
     stmt: &SelectStatement,
     columns: &[String],
+    star: usize,
 ) -> Vec<Option<SmartString>> {
     projected_aliases(stmt, columns, |item| match item {
         Expression::QualifiedStar(q) => {
@@ -7071,7 +7092,7 @@ pub(crate) fn joined_aliases(
             for_each_qualified_star_column(columns, &q.qualifier, None, |_, _| width += 1);
             width
         }
-        _ => columns.len(),
+        _ => star,
     })
 }
 
@@ -9555,6 +9576,11 @@ impl JoinBlocks {
         &self.scope.merged
     }
 
+    /// The columns of the joined row a `*` the blocks project shows
+    pub(crate) fn star_columns(&self) -> Vec<usize> {
+        star_columns(self.all.len(), &self.scope.merged)
+    }
+
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
     fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
@@ -9578,7 +9604,8 @@ impl JoinBlocks {
     /// conditions on one side, `side_filters`, and the SELECT items, ORDER BY
     /// keys and DISTINCT ON keys holding a subquery, `output`, over the
     /// joined row of `sides`, each a name, its columns' schema and whether it
-    /// is read as rows; None when the join's `width` columns do not line up
+    /// is read as rows; None when the join's `width` columns do not line up.
+    /// `items` gives the projected row's aliases, a `*` showing so many columns
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
@@ -9587,7 +9614,7 @@ impl JoinBlocks {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
-        items: Vec<Option<SmartString>>,
+        items: impl FnOnce(usize) -> Vec<Option<SmartString>>,
         sides: &JoinSides,
         width: usize,
         param_count: usize,
@@ -9604,6 +9631,7 @@ impl JoinBlocks {
         if scope.columns.len() != width {
             return Ok(None);
         }
+        let items = items(star_columns(width, &scope.merged).len());
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -9996,7 +10024,7 @@ impl Executor {
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         output: [&[Option<&Expression>]; 3],
-        items: Vec<Option<SmartString>>,
+        items: impl FnOnce(usize) -> Vec<Option<SmartString>>,
         sides: &JoinSides,
         width: usize,
         ctx: &ExecutionContext,
