@@ -96,7 +96,23 @@ impl Executor {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
         };
-        if shape.has_aggregation
+        // A statement that aggregates its rows into one, unless the
+        // aggregate plan holds it whole
+        let global = shape.has_aggregation
+            && !shape.has_group_by
+            && !shape.has_having
+            && !shape.has_window_functions
+            && !shape.has_set_operations;
+        if global {
+            #[cfg(feature = "test-failpoints")]
+            if crate::test_failpoints::prepared_families_off() {
+                return None;
+            }
+            if self.held_aggregate(stmt, ctx).is_some() {
+                return None;
+            }
+        }
+        if shape.has_aggregation && !global
             || shape.has_window_functions
                 && (shape.has_set_operations || shape.grouped_has_subqueries)
             || shape.has_group_by
@@ -145,9 +161,13 @@ impl Executor {
         .map(|mut prepared| {
             // A LIMIT or OFFSET read per run leaves the statement to a
             // scan, and so do a DISTINCT, which the key read does not
-            // take, and a set operation, whose rows are its branches' too
+            // take, a set operation, whose rows are its branches' too, and
+            // an aggregate, whose row its calls compute
             let counts = static_row_counts(stmt).filter(|_| {
-                stmt.set_operations.is_empty() && !stmt.distinct && !shape.has_window_functions
+                stmt.set_operations.is_empty()
+                    && !stmt.distinct
+                    && !shape.has_window_functions
+                    && !global
             });
             if let Some(counts) = counts {
                 prepared.read_by_key(
@@ -285,6 +305,7 @@ impl Executor {
             }),
             having: stmt.having.as_deref().map(Expression::to_string),
             windows: None,
+            aggregate: None,
             names: &[],
             pushed: None,
             ordered: None,

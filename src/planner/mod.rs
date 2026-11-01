@@ -21,6 +21,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::pattern::Pattern;
 use crate::core::{Operator, Schema};
 use crate::executor::expression::SharedProgram;
+use crate::executor::planned_aggregate::GlobalSource;
 use crate::executor::prepared_select::PreparedComparison;
 use crate::executor::projection::Projection;
 use crate::executor::query_classification::QueryClassification;
@@ -58,6 +59,8 @@ pub enum Step {
     Distinct,
     /// The groups the HAVING keeps
     Having,
+    /// The aggregate calls over the rows the read passes
+    Aggregate,
     /// The window functions over the rows the read passes, and the SELECT
     /// list over them
     Window,
@@ -97,6 +100,14 @@ pub enum Read {
     /// table cannot read them so in this run
     Window {
         read: WindowRead,
+        otherwise: Box<Read>,
+    },
+    /// The aggregate's one row from `source`, a bound read from the index
+    /// of `column`; the rows of `otherwise` fed to the calls when the table
+    /// cannot answer so in this run
+    Aggregated {
+        source: GlobalSource,
+        column: Option<SmartString>,
         otherwise: Box<Read>,
     },
     /// The rows nearest the query vector of an ORDER BY of a vector
@@ -145,9 +156,9 @@ impl Read {
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
             Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.scan(),
-            Self::DistinctValues { otherwise, .. } | Self::Window { otherwise, .. } => {
-                otherwise.scan()
-            }
+            Self::DistinctValues { otherwise, .. }
+            | Self::Window { otherwise, .. }
+            | Self::Aggregated { otherwise, .. } => otherwise.scan(),
             Self::Source(_) => None,
             Self::Scan(scan)
             | Self::Ordered {
@@ -189,6 +200,14 @@ impl Read {
     pub fn window(&self) -> Option<&WindowRead> {
         match self {
             Self::Window { read, .. } => Some(read),
+            _ => None,
+        }
+    }
+
+    /// Where an aggregate's one row comes from, for a plan that aggregates
+    pub fn aggregated(&self) -> Option<GlobalSource> {
+        match self {
+            Self::Aggregated { source, .. } => Some(*source),
             _ => None,
         }
     }
@@ -252,6 +271,8 @@ pub struct PlanText<'a> {
     pub having: Option<String>,
     /// The window functions
     pub windows: Option<String>,
+    /// The SELECT items an aggregate step computes
+    pub aggregate: Option<String>,
     pub names: &'a [String],
     /// The conjuncts the read takes
     pub pushed: Option<&'a Expression>,
@@ -334,6 +355,28 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             alternative(lines, read.explain(text.table));
             read_lines(otherwise, text, lines);
         }
+        (
+            Read::Aggregated {
+                source,
+                column,
+                otherwise,
+            },
+            _,
+        ) => {
+            let table = text.table;
+            match (source, column, text.pushed) {
+                (GlobalSource::IndexBound, Some(column), _) => {
+                    alternative(lines, format!("IndexBound {table} ({column})"));
+                    alternative(lines, format!("Stats {table}"));
+                }
+                (GlobalSource::Stats, ..) => alternative(lines, format!("Stats {table}")),
+                (GlobalSource::StorageFiltered, _, Some(pushed)) => {
+                    alternative(lines, format!("StorageFiltered {table} {pushed}"))
+                }
+                _ => {}
+            }
+            read_lines(otherwise, text, lines);
+        }
         (Read::Nearest { read, otherwise }, _) => {
             alternative(lines, read.explain(text.table, text.pushed));
             for (at, line) in scan(otherwise.as_ref()).into_iter().enumerate() {
@@ -398,6 +441,7 @@ fn step_line(step: Step, text: &PlanText<'_>) -> Option<String> {
         Step::DistinctOn => format!("DistinctOn {}", text.distinct_on.as_deref()?),
         Step::Distinct => "Distinct".to_string(),
         Step::Having => format!("Having {}", text.having.as_deref()?),
+        Step::Aggregate => format!("Aggregate {}", text.aggregate.as_deref()?),
         Step::Window => format!("Window {}", text.windows.as_deref()?),
         Step::Project => format!("Project {}", text.names.join(", ")),
         Step::Filter => "Filter".to_string(),

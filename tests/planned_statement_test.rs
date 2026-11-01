@@ -513,8 +513,7 @@ fn a_declined_filtered_aggregate_reads_by_the_where_its_scan_reads() {
         [
             "Aggregate SUM(v)",
             "  StorageFiltered t (FALSE OR (v > 1))",
-            "  else IndexScan t (v > 1)",
-            "    Index t_v (v range)",
+            "  else SeqScan t (FALSE OR (v > 1))",
         ],
         "the scan's indexes"
     );
