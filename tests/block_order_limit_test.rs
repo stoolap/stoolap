@@ -284,11 +284,7 @@ fn a_cut_block_outside_the_family_says_why() {
     let grouped = scalar("SELECT MAX(x) FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1");
     assert_eq!(prepared_line(&db, &grouped), "Prepared: yes", "{grouped}");
     let sql = scalar("SELECT x FROM u WHERE u.k = t.id ORDER BY 1 LIMIT 1");
-    assert_eq!(
-        prepared_line(&db, &sql),
-        "Prepared: no (an ORDER BY position in a subquery block)",
-        "{sql}"
-    );
+    assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
     // A count reads no column: the block's own run says so
     let sql = scalar("SELECT x FROM u WHERE u.k = t.id ORDER BY x LIMIT t.a");
     assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");

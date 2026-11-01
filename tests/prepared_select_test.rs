@@ -16,12 +16,13 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
     after_prepared_plan_taken, after_select_table_opened, before_prepared_scalar,
     general_path_hits, prepared_ordered_reads, prepared_projection_runs, prepared_scalar_runs,
-    prepared_selects_built, random_draws, tvf_rows, GeneralPath,
+    prepared_selects_built, random_draws, tvf_rows, GeneralPath, PREPARED_FAMILIES_OFF,
 };
 use stoolap::{Database, Params};
 
@@ -41,9 +42,6 @@ const S1: &str =
     "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id) ORDER BY id";
 const S2: &str =
     "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id + 1) ORDER BY id";
-// The same questions with an inner ORDER BY position, which keeps them out of the family
-const S1_OLD: &str = "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1) ORDER BY id";
-const S2_OLD: &str = "SELECT id FROM t WHERE b = $1 AND a > (SELECT v FROM u WHERE u.id = t.id + 1 ORDER BY 1) ORDER BY id";
 
 fn setup(name: &str) -> Database {
     let db = Database::open(&format!("memory://{name}")).unwrap();
@@ -116,6 +114,19 @@ fn general_hits() -> Vec<usize> {
     ALL_GENERAL.iter().map(|p| general_path_hits(*p)).collect()
 }
 
+/// What `run` gives with the prepared families refused: the old path's answer
+fn on_old_path<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREPARED_FAMILIES_OFF.store(false, Ordering::SeqCst);
+        }
+    }
+    PREPARED_FAMILIES_OFF.store(true, Ordering::SeqCst);
+    let _restore = Restore;
+    run()
+}
+
 #[test]
 fn test_one_plan_answers_each_parameter_and_outer_row() {
     let _guard = serial();
@@ -132,8 +143,9 @@ fn test_one_plan_answers_each_parameter_and_outer_row() {
         let (found, runs) = ids(&db, S2, (param,));
         assert_eq!(found, s2, "S2 with b = {param}");
         assert_eq!(runs, 3, "S2 with b = {param} runs once per outer row");
-        assert_eq!(ids(&db, S1_OLD, (param,)), (s1, 0), "S1 on the old path");
-        assert_eq!(ids(&db, S2_OLD, (param,)), (s2, 0), "S2 on the old path");
+        let old = |sql| on_old_path(|| ids(&db, sql, (param,)));
+        assert_eq!(old(S1), (s1, 0), "S1 on the old path");
+        assert_eq!(old(S2), (s2, 0), "S2 on the old path");
     }
     assert_eq!(
         prepared_selects_built() - built,
@@ -269,9 +281,8 @@ fn test_scalar_subquery_results() {
     let (err, runs) = error(&db, multi, ());
     assert!(err.contains("more than one row"), "{err}");
     assert!(runs >= 1, "the error came from the prepared path");
-    let multi_old =
-        "SELECT id FROM t WHERE a > (SELECT v FROM m WHERE m.k = t.id ORDER BY 1) ORDER BY id";
-    assert!(error(&db, multi_old, ()).0.contains("more than one row"));
+    let (old_err, _) = on_old_path(|| error(&db, multi, ()));
+    assert!(old_err.contains("more than one row"), "{old_err}");
 }
 
 #[test]
@@ -310,8 +321,8 @@ fn prepared_with_commit_inside(db: &Database) -> (Vec<i64>, usize) {
     found
 }
 
-/// The rows of S1_OLD when another handle commits `COMMIT` as the
-/// subquery of the first outer row opens its table
+/// The rows of S1 on the old path when another handle commits `COMMIT` as
+/// the subquery of the first outer row opens its table
 fn old_with_commit_inside(db: &Database) -> Vec<i64> {
     let writer = db.clone();
     let done = Rc::new(Cell::new(false));
@@ -323,7 +334,7 @@ fn old_with_commit_inside(db: &Database) -> Vec<i64> {
             flag.set(true);
         });
     });
-    let found = ids(db, S1_OLD, (1,)).0;
+    let found = on_old_path(|| ids(db, S1, (1,))).0;
     assert!(done.get(), "the commit ran inside the statement");
     found
 }
@@ -354,7 +365,7 @@ fn test_old_path_reads_one_view() {
     let db = setup("prepared_one_view_old");
     db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
     assert_eq!(old_with_commit_inside(&db), vec![1], "old path");
-    assert_eq!(ids(&db, S1_OLD, (1,)).0, vec![1, 2, 5]);
+    assert_eq!(on_old_path(|| ids(&db, S1, (1,))).0, vec![1, 2, 5]);
 }
 
 #[test]
@@ -394,7 +405,6 @@ fn test_projection_and_order_by_run_prepared() {
     let _guard = serial();
     let db = setup("prepared_projection");
     let present = "(SELECT v FROM u WHERE u.id = t.id) IS NOT NULL";
-    let present_old = "(SELECT v FROM u WHERE u.id = t.id ORDER BY 1) IS NOT NULL";
     let names = vec!["id".to_string(), "d".to_string()];
     for (order, expected) in [
         ("a DESC", vec![(6, 120), (5, 100), (2, 40), (1, 20)]),
@@ -408,9 +418,8 @@ fn test_projection_and_order_by_run_prepared() {
             (names.clone(), expected.clone(), 1),
             "ORDER BY {order} on the prepared projection"
         );
-        let old = format!("SELECT id, a * 2 AS d FROM t WHERE {present_old} ORDER BY {order}");
         assert_eq!(
-            pairs(&db, &old),
+            on_old_path(|| pairs(&db, &sql)),
             (names.clone(), expected, 0),
             "ORDER BY {order} on the old path"
         );
@@ -625,8 +634,7 @@ fn test_a_reused_comparison_takes_each_value() {
     db.execute("INSERT INTO q VALUES (1, 1, 0), (2, 2, 20)", ())
         .unwrap();
     let sql = "SELECT id FROM o WHERE a > (SELECT v FROM q WHERE q.k = o.s) ORDER BY id";
-    let old = "SELECT id FROM o WHERE a > (SELECT v FROM q WHERE q.k = o.s ORDER BY 1) ORDER BY id";
-    let expected = ids(&db, old, ()).0;
+    let expected = on_old_path(|| ids(&db, sql, ())).0;
     assert_eq!(expected, vec![1, 4], "the old path's answer");
     assert_eq!(
         ids(&db, sql, ()),
@@ -638,10 +646,6 @@ fn test_a_reused_comparison_takes_each_value() {
 const NESTED: &str = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
                       AND u.v < (SELECT w.x FROM w WHERE w.k = u.id AND w.z = t.b AND w.x > $1)) \
                       ORDER BY id";
-// The same question with an inner ORDER BY position in the middle scope, out of the family
-const NESTED_OLD: &str = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
-                          AND u.v < (SELECT w.x FROM w WHERE w.k = u.id AND w.z = t.b AND w.x > $1) \
-                          ORDER BY 1) ORDER BY id";
 
 fn nested_setup(name: &str) -> Database {
     let db = setup(name);
@@ -672,7 +676,7 @@ fn test_nested_scopes_read_each_depth() {
             "six middle runs, one per outer row, and five innermost, one per u row found"
         );
         assert_eq!(
-            ids(&db, NESTED_OLD, (param,)),
+            on_old_path(|| ids(&db, NESTED, (param,))),
             (expected, 0),
             "old path, w.x > {param}"
         );
@@ -723,7 +727,8 @@ fn test_nested_null_and_errors_cross_scopes() {
     let (err, runs) = error(&db, NESTED, (0,));
     assert!(err.contains("more than one row"), "{err}");
     assert!(runs >= 1, "raised on the prepared path");
-    assert!(error(&db, NESTED_OLD, (0,)).0.contains("more than one row"));
+    let (old_err, _) = on_old_path(|| error(&db, NESTED, (0,)));
+    assert!(old_err.contains("more than one row"), "{old_err}");
 }
 
 #[test]
@@ -744,14 +749,16 @@ fn test_one_value_reading_two_enclosing_scopes() {
     .unwrap();
     let sql = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
                AND u.v < (SELECT s.x FROM s WHERE s.k = u.id + t.b)) ORDER BY id";
-    let old = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id \
-               AND u.v < (SELECT s.x FROM s WHERE s.k = u.id + t.b) ORDER BY 1) ORDER BY id";
     assert_eq!(
         ids(&db, sql, ()),
         (vec![1, 6], 11),
         "u.id + t.b on the prepared path"
     );
-    assert_eq!(ids(&db, old, ()), (vec![1, 6], 0), "old path");
+    assert_eq!(
+        on_old_path(|| ids(&db, sql, ())),
+        (vec![1, 6], 0),
+        "old path"
+    );
 }
 
 #[test]
@@ -1069,16 +1076,10 @@ fn test_classifier_rules() {
         let found = Ok(rows(sql));
         assert!(prepared_scalar_runs() > runs, "{sql} ran prepared");
         let old_path = || {
-            // An inner ORDER BY position keeps the same question out of the family
-            let old = sql
-                .replace(" = t.id)", " = t.id ORDER BY 1)")
-                .replace("u.id = 2)", "u.id = 2 ORDER BY 1)");
-            let old = old.replace(" = o.id)", " = o.id ORDER BY 1)");
-            assert!(
-                prepared_line(&db, &old).starts_with("Prepared: no"),
-                "{old}"
-            );
-            Ok(rows(&old))
+            on_old_path(|| {
+                assert!(prepared_line(&db, sql).starts_with("Prepared: no"), "{sql}");
+                Ok(rows(sql))
+            })
         };
         let wrong = oracle::check_confirmed(&RECORDED_IN_FAMILY, sql, &found, old_path);
         assert_eq!(wrong, None);
@@ -1118,11 +1119,6 @@ fn test_classifier_rules() {
         (
             format!("SELECT t.id, {sq} FROM t JOIN u USING (id) JOIN u AS w ON w.id = t.id"),
             "a NATURAL or USING join whose output holds a subquery",
-        ),
-        (
-            "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id ORDER BY 1 LIMIT 1)"
-                .to_string(),
-            "an ORDER BY position in a subquery block",
         ),
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
@@ -1188,7 +1184,7 @@ fn test_in_family_statements_reach_no_general_path_mechanism() {
     assert!(prepared_scalar_runs() > runs, "the corpus ran prepared");
 
     let before = general_hits();
-    ids(&db, S1_OLD, (1,));
+    on_old_path(|| ids(&db, S1, (1,)));
     assert_ne!(general_hits(), before, "the old path moves the counters");
 }
 
@@ -1400,10 +1396,7 @@ fn test_a_whole_pushed_inner_where_is_not_checked_again() {
         .unwrap();
     for (inner, param) in [("u.b = $1", "true"), ("u.ts = $1", "2024-01-02 03:04:05")] {
         let sql = format!("SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner})");
-        let old = format!(
-            "SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner} ORDER BY 1)"
-        );
-        let expected = ids(&db, &old, (param,)).0;
+        let expected = on_old_path(|| ids(&db, &sql, (param,))).0;
         assert_eq!(
             expected,
             vec![1],
@@ -1695,9 +1688,11 @@ fn test_a_subquery_value_against_a_boolean_column_reads_as_the_column() {
     db.execute("INSERT INTO w VALUES (1, 'true')", ()).unwrap();
     let sql = "SELECT t.id FROM t WHERE t.id = \
                (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1))";
-    let old = "SELECT t.id FROM t WHERE t.id = \
-               (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1) ORDER BY 1)";
-    assert_eq!(ids(&db, old, ()).0, vec![1], "the general path");
+    assert_eq!(
+        on_old_path(|| ids(&db, sql, ())).0,
+        vec![1],
+        "the general path"
+    );
     let (found, runs) = ids(&db, sql, ());
     assert!(runs >= 1, "ran prepared");
     assert_eq!(found, vec![1], "the subquery's TEXT read as BOOLEAN");

@@ -23,11 +23,35 @@ use stoolap::functions::{
     global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, NativeFn1,
     ScalarFunction,
 };
-use stoolap::test_failpoints::{aggregate_paths, aggregate_paths_taken, reset_aggregate_paths};
+use stoolap::test_failpoints::{
+    aggregate_paths, aggregate_paths_taken, reset_aggregate_paths, PREPARED_FAMILIES_OFF,
+};
 use stoolap::Database;
 
+// The families' switch is process-wide
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `run` gives with the prepared families refused, so a subquery block
+/// aggregates on the general path
+fn families_off<T>(run: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering::SeqCst;
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREPARED_FAMILIES_OFF.store(false, SeqCst);
+        }
+    }
+    PREPARED_FAMILIES_OFF.store(true, SeqCst);
+    let _restore = Restore;
+    run()
+}
+
 /// (context, path the query takes there, query, the same query forced
-/// onto the general path)
+/// onto the general path, run with the prepared families refused)
 const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
@@ -233,27 +257,27 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "memory",
         "prepared_block",
         "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
-        "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id ORDER BY 1)",
+        "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
     ),
     (
         "sealed",
         "prepared_block",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
-        "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id ORDER BY 1)",
+        "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
     ),
     (
         "memory",
         "index_count",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u WHERE u.g = t.g) LIMIT 10",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u \
-         WHERE u.g = t.g AND u.id + 0 = u.id ORDER BY 1) LIMIT 10",
+         WHERE u.g = t.g AND u.id + 0 = u.id) LIMIT 10",
     ),
     (
         "memory",
         "index_count",
         "SELECT id, (SELECT COUNT(*) FROM t AS u WHERE u.g = t.a) AS n FROM t LIMIT 10",
         "SELECT id, (SELECT COUNT(*) FROM t AS u \
-         WHERE u.g = t.a AND u.id + 0 = u.id ORDER BY 1) AS n FROM t LIMIT 10",
+         WHERE u.g = t.a AND u.id + 0 = u.id) AS n FROM t LIMIT 10",
     ),
     (
         "memory",
@@ -261,7 +285,7 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u WHERE u.g = t.g \
          HAVING COUNT(*) > 1) LIMIT 10",
         "SELECT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u \
-         WHERE u.g = t.g AND u.id + 0 = u.id HAVING COUNT(*) > 1 ORDER BY 1) LIMIT 10",
+         WHERE u.g = t.g AND u.id + 0 = u.id HAVING COUNT(*) > 1) LIMIT 10",
     ),
     (
         "empty",
@@ -330,6 +354,7 @@ fn run(db: &Database, sql: &str) -> (Answer, Vec<&'static str>) {
 
 #[test]
 fn every_aggregate_path_answers_as_the_general_path() {
+    let _guard = serial();
     let memory = open(
         Database::open("memory://aggregate_path_equivalence").unwrap(),
         false,
@@ -359,7 +384,7 @@ fn every_aggregate_path_answers_as_the_general_path() {
             _ => &memory,
         };
         let (got, taken) = run(db, sql);
-        let (want, reference_taken) = run(db, reference);
+        let (want, reference_taken) = families_off(|| run(db, reference));
         if taken != [path] {
             wrong.push(format!("{ctx}: {sql}: took {taken:?}, expected [{path}]"));
         }
@@ -387,6 +412,7 @@ fn every_aggregate_path_answers_as_the_general_path() {
 
 #[test]
 fn a_filtered_aggregate_keeps_every_conjunct_with_literals_and_parameters() {
+    let _guard = serial();
     let int = Value::Integer;
     // Each WHERE with its parameters; the literal form writes them in
     let cases: &[(&str, Vec<Value>, &str)] = &[
@@ -476,6 +502,7 @@ fn a_filtered_aggregate_keeps_every_conjunct_with_literals_and_parameters() {
 
 #[test]
 fn a_having_that_calls_a_scalar_function_is_not_judged_inside_the_index_walk() {
+    let _guard = serial();
     let db = open(
         Database::open("memory://aggregate_path_having_scalar_call").unwrap(),
         false,
@@ -520,6 +547,7 @@ impl ScalarFunction for NativeHaving {
 
 #[test]
 fn a_having_that_calls_a_native_function_is_not_judged_inside_the_index_walk() {
+    let _guard = serial();
     global_registry().register_scalar::<NativeHaving>();
     let db = open(
         Database::open("memory://aggregate_path_having_native_call").unwrap(),

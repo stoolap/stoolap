@@ -527,20 +527,15 @@ impl<'a> Family<'a> {
     }
 
     /// A block's DISTINCT ON and ORDER BY keys, values over its row and the
-    /// enclosing ones: no ORDER BY position (an EXISTS checks its own where
-    /// it is bound) and no subquery in a key that chooses no row; one only a
-    /// statement reads (`statement_order`) runs as a statement block instead
+    /// enclosing ones, an ORDER BY position naming an item: no subquery in a
+    /// key that chooses no row; one only a statement reads (`statement_order`)
+    /// runs as a statement block instead
     fn order(
         &self,
         sq: &'a SelectStatement,
         scopes: usize,
         exists: bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        let position =
-            |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
-        if !exists && sq.order_by.iter().any(position) {
-            return Err("an ORDER BY position in a subquery block");
-        }
         // Keys that choose no row are bound but never computed
         let chooses =
             !exists && (sq.limit.is_some() || sq.offset.is_some() || !sq.distinct_on.is_empty());
@@ -6143,12 +6138,10 @@ impl Builder<'_> {
         // the member reads
         let mut row_keys = vec![None; if values.len() > 1 { values.len() } else { 0 }];
         let mut repeats = Vec::new();
-        if matches!(form, Form::Exists(_)) {
-            check_block_positions(sq, scope.columns.len())?;
-        }
+        check_block_positions(sq, scope.columns.len())?;
         for ob in &sq.order_by {
-            // A key naming one of a row's values, by its alias or as written,
-            // sorts by that value as a single item's does
+            // A key naming one of a row's values, by its alias, its position or
+            // as written, sorts by that value as a single item's does
             if !row_keys.is_empty() && chooses {
                 let named = match &ob.expression {
                     Expression::Identifier(name) if order_by_names_an_alias(&ob.expression, sq) => {
@@ -6157,6 +6150,9 @@ impl Builder<'_> {
                                 if a.alias.value_lower == name.value_lower)
                         })
                     }
+                    Expression::IntegerLiteral(position) => usize::try_from(position.value - 1)
+                        .ok()
+                        .filter(|&at| at < values.len()),
                     key if !mentions_subquery(key) => self
                         .trial_rewrite(&chain, id, key, &work.outer)
                         .ok()
@@ -6183,8 +6179,10 @@ impl Builder<'_> {
                     continue;
                 }
             }
-            // A bare alias sorts by the item's value
-            let alias = item.is_some() && order_by_names_an_alias(&ob.expression, sq);
+            // A bare alias, or the position of the one item, sorts by its value
+            let alias = item.is_some()
+                && (order_by_names_an_alias(&ob.expression, sq)
+                    || matches!(ob.expression, Expression::IntegerLiteral(_)));
             let key = match alias {
                 true => None,
                 false => Some(with_aliases(&ob.expression, &sq.columns, &scope.columns)),

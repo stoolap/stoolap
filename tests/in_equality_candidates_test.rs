@@ -222,6 +222,7 @@ mod probed {
     use std::sync::Arc;
     use stoolap::test_failpoints::{
         after_equality_key_probed, in_member_probes, in_member_reads, in_subquery_runs,
+        PREPARED_FAMILIES_OFF,
     };
 
     /// The rows of `sql`, with the member reads it made by candidates and
@@ -535,12 +536,20 @@ mod probed {
             .unwrap();
         db.execute("BEGIN", ()).unwrap();
         let (before, asked) = (in_subquery_runs(), in_member_probes());
-        // An inner ORDER BY position keeps it on the general path, which asks
-        // the list's candidates
+        // The general path asks the list's candidates
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PREPARED_FAMILIES_OFF.store(false, Ordering::SeqCst);
+            }
+        }
+        PREPARED_FAMILIES_OFF.store(true, Ordering::SeqCst);
+        let restore = Restore;
         let (found, reads) = read(
             &db,
-            "SELECT id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s ORDER BY 1)",
+            "SELECT id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s)",
         );
+        drop(restore);
         let (runs, asked) = (in_subquery_runs() - before, in_member_probes() - asked);
         db.execute("COMMIT", ()).unwrap();
         assert_eq!(asked, 1, "the list did not ask the candidates");
