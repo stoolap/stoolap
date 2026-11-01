@@ -154,7 +154,7 @@ impl Parser<'_> {
     /// nested past [`MAX_STATEMENT_DEPTH`] is refused before any later stage
     /// recurses that deep
     fn parse_select_parts(&mut self) -> Option<SelectStatement> {
-        if self.statement_depth == MAX_STATEMENT_DEPTH {
+        if self.limited && self.statement_depth == MAX_STATEMENT_DEPTH {
             self.add_error(format!(
                 "statement nested too deeply: more than {MAX_STATEMENT_DEPTH} SELECTs inside one another"
             ));
@@ -956,10 +956,14 @@ impl Parser<'_> {
             return None;
         }
 
+        // A CTE body sits inside the statement that carries the WITH
+        self.statement_depth += 1;
         let query = match is_recursive {
-            true => self.parse_select_parts()?,
-            false => self.parse_select_statement()?,
+            true => self.parse_select_parts(),
+            false => self.parse_select_statement(),
         };
+        self.statement_depth -= 1;
+        let query = query?;
 
         // Expect )
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {

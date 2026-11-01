@@ -8054,7 +8054,7 @@ impl Executor {
         }
 
         // Parse the view's query
-        let statements = crate::parser::parse_sql(view_query)
+        let statements = crate::parser::parse_written_sql(view_query)
             .map_err(|e| Error::InvalidArgument(format!("Failed to parse view query: {}", e)))?;
 
         // The view query should be a single SELECT statement
