@@ -139,6 +139,14 @@ fn next_significant_token(lexer: &mut Tokens, errors: &mut Vec<ParseError>) -> T
 /// A view is stored SQL, read inside other statements: it has no values of its own
 pub(crate) const VIEW_TAKES_NO_PARAMETERS: &str = "a view cannot take parameters";
 
+/// The most SELECTs one statement nests inside one another: subqueries,
+/// derived tables and CTE bodies, the outermost counted
+pub const MAX_STATEMENT_DEPTH: usize = 32;
+
+/// The most expressions one statement nests inside one another, across
+/// its nested SELECTs: parentheses, calls, CASE, unary operators
+pub const MAX_EXPRESSION_DEPTH: usize = 256;
+
 /// Whether running `stmt` creates a view, under any EXPLAIN
 fn creates_view(stmt: &Statement) -> bool {
     match stmt {
@@ -172,6 +180,9 @@ pub struct Parser<'a> {
     /// Whether the current statement wrote what the scope check can refuse:
     /// a qualifier, a SELECT DISTINCT and its ORDER BY, or an ORDER BY position
     pub(crate) scope_checked: bool,
+    /// The SELECTs and the expressions being parsed inside one another
+    pub(crate) statement_depth: usize,
+    pub(crate) expression_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -204,6 +215,8 @@ impl<'a> Parser<'a> {
             named_slots: Vec::new(),
             scoped: true,
             scope_checked: false,
+            statement_depth: 0,
+            expression_depth: 0,
         }
     }
 

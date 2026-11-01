@@ -17,7 +17,7 @@
 use crate::common::SmartString;
 
 use super::ast::*;
-use super::parser::Parser;
+use super::parser::{Parser, MAX_EXPRESSION_DEPTH};
 use super::precedence::Precedence;
 use super::token::{Keyword, Token, TokenType};
 
@@ -29,8 +29,23 @@ fn identifier_token(ident: &Identifier) -> Token {
 }
 
 impl Parser<'_> {
-    /// Parse an expression with the given precedence
+    /// Parse an expression with the given precedence, refusing one nested
+    /// past [`MAX_EXPRESSION_DEPTH`] before any later stage recurses that deep
     pub fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
+        if self.expression_depth == MAX_EXPRESSION_DEPTH {
+            self.add_error(format!(
+                "statement nested too deeply: more than {MAX_EXPRESSION_DEPTH} expressions inside one another"
+            ));
+            return None;
+        }
+        self.expression_depth += 1;
+        let expr = self.parse_operators(precedence);
+        self.expression_depth -= 1;
+        expr
+    }
+
+    /// [`Self::parse_expression`] within the depth it allows
+    fn parse_operators(&mut self, precedence: Precedence) -> Option<Expression> {
         // Parse prefix expression
         let mut left = self.parse_prefix_expression()?;
 

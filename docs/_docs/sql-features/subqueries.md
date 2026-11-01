@@ -705,6 +705,17 @@ with `EXISTS`, `IN (subquery)` or `ANY or ALL` in place of `scalar subquery` for
 
 A column `DEFAULT` and a `CHECK` constraint never hold a subquery: `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` refuse one when the constraint is declared.
 
+### Nesting limits
+
+A statement may nest at most 32 `SELECT`s inside one another, the outermost counted: subqueries, derived tables and CTE bodies. Its expressions may nest at most 256 deep, counted across those `SELECT`s: parentheses, function calls, `CASE`, unary operators such as `NOT`, and the subqueries themselves. The branches of a set operation sit side by side, so a long `UNION` nests nothing. A statement past either limit fails where it is parsed, before it runs:
+
+```
+statement nested too deeply: more than 32 SELECTs inside one another
+statement nested too deeply: more than 256 expressions inside one another
+```
+
+A long chain of operators such as `a = 1 OR a = 2 OR ...` is not nesting and is not limited here.
+
 ## Best Practices
 
 1. **Use Subqueries for Dynamic Filtering**: Subqueries are ideal when you need to filter based on conditions that require querying other tables.

@@ -953,7 +953,7 @@ fn test_uncorrelated_blocks_run_once_when_needed() {
 #[test]
 fn test_scope_chain_depth() {
     let _guard = serial();
-    // The general path recurses per scope and needs more than a test thread's stack
+    // A chain of scopes recurses per scope, so it runs on a larger stack
     std::thread::Builder::new()
         .stack_size(16 << 20)
         .spawn(scope_chain_depth)
@@ -991,17 +991,13 @@ fn scope_chain_depth() {
     assert_eq!(prepared_selects_built() - built, 1);
 
     let too_deep = chain(33);
-    assert_eq!(
-        prepared_line(&db, &too_deep),
-        "Prepared: no (more than 32 scopes in a chain)"
+    let refused = db.query(&too_deep, ()).err().map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("more than 32 SELECTs")),
+        "{refused:?}"
     );
-    let built = prepared_selects_built();
-    assert_eq!(
-        ids(&db, &too_deep, ()),
-        (vec![1, 2, 3], 0),
-        "the old path answers"
-    );
-    assert_eq!(prepared_selects_built() - built, 0);
 }
 
 #[test]

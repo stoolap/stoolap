@@ -125,7 +125,7 @@ pub use ast::{
 
 pub use error::{ParseError, ParseErrors};
 pub use lexer::Lexer;
-pub use parser::Parser;
+pub use parser::{Parser, MAX_EXPRESSION_DEPTH, MAX_STATEMENT_DEPTH};
 pub use precedence::Precedence;
 pub use token::{
     is_operator, is_punctuator, lookup_keyword, Keyword, Position, Token, TokenType, OPERATORS,
