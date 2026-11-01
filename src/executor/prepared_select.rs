@@ -970,6 +970,23 @@ pub(crate) fn first_branch_of(stmt: &SelectStatement) -> std::borrow::Cow<'_, Se
     }
 }
 
+/// [`first_branch_of`] as a prepared select runs it, without the whole set
+/// operation's DISTINCT ON too, which reads its rows by their columns, and
+/// whether there is one, which the branch's layout then binds
+pub(crate) fn prepared_branch(
+    stmt: &SelectStatement,
+) -> (std::borrow::Cow<'_, SelectStatement>, bool) {
+    let keyed = !stmt.set_operations.is_empty() && !stmt.distinct_on.is_empty();
+    let branch = match first_branch_of(stmt) {
+        std::borrow::Cow::Owned(branch) => std::borrow::Cow::Owned(SelectStatement {
+            distinct_on: Vec::new(),
+            ..branch
+        }),
+        borrowed => borrowed,
+    };
+    (branch, keyed)
+}
+
 /// A set operation whose ORDER BY holds a subquery, as the statement that
 /// orders and limits its rows read as a derived table, whose columns the keys
 /// read; any other statement as it is
@@ -1140,10 +1157,6 @@ impl Executor {
                 .any(|ob| mentions_subquery(&ob.expression))
             {
                 return Err("an ORDER BY subquery over a set operation");
-            }
-            // Its DISTINCT ON reads the first branch's items over every row
-            if !stmt.distinct_on.is_empty() {
-                return Err("a DISTINCT ON over a set operation");
             }
         } else {
             // A DISTINCT ON key is computed for each row as an ORDER BY key is
@@ -7874,7 +7887,10 @@ type OutputsBound = SmallVec<[Option<BoundOutput>; 4]>;
 
 impl PreparedSelect {
     /// Prepare `stmt` over its table, named `scope_name` and holding
-    /// `columns`, for executions with `param_count` positional parameters
+    /// `columns`, for executions with `param_count` positional parameters;
+    /// `keyed_branch` when it is a set operation's first branch whose rows
+    /// the whole one's DISTINCT ON reads by the layout
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
@@ -7883,6 +7899,7 @@ impl PreparedSelect {
         scope_name: &SmartString,
         param_count: usize,
         epoch: u64,
+        keyed_branch: bool,
     ) -> Result<Self> {
         let registry = &executor.function_registry;
         // A statement with window functions reads its rows as a SELECT * of
@@ -8060,11 +8077,12 @@ impl PreparedSelect {
         output_columns.extend(extra_names);
         // The layout an ORDER BY or DISTINCT ON binds its names by, built
         // with the plan
-        let layout = (!stmt.order_by.is_empty() || !stmt.distinct_on.is_empty()).then(|| {
-            let mut layout = Executor::select_layout(&select, &scope.columns, Some(scope_name));
-            layout.sources.extend(extra_sources);
-            CompactArc::new(layout)
-        });
+        let layout = (keyed_branch || !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty())
+            .then(|| {
+                let mut layout = Executor::select_layout(&select, &scope.columns, Some(scope_name));
+                layout.sources.extend(extra_sources);
+                CompactArc::new(layout)
+            });
         // Each ORDER BY key as the output column it sorts by, when every key is one
         let order_keys = (!stmt.order_by.is_empty())
             .then(|| {
@@ -11207,7 +11225,7 @@ impl Executor {
         let epoch = self.engine.schema_epoch();
         let params = ctx.params().len();
         let prepared =
-            PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch).ok()?;
+            PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch, false).ok()?;
         prepared.explain(stmt, (&scope, &self.function_registry), body, false)
     }
 
@@ -11428,7 +11446,7 @@ impl Executor {
                 }
             }
         }
-        let branch = first_branch_of(stmt);
+        let (branch, keyed_branch) = prepared_branch(stmt);
         let stmt = &*branch;
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
@@ -11438,6 +11456,7 @@ impl Executor {
             scope_name,
             ctx.params().len(),
             epoch,
+            keyed_branch,
         )?);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_select_built();

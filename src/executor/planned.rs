@@ -30,7 +30,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
-use super::prepared_select::{first_branch_of, PreparedSelect};
+use super::prepared_select::{first_branch_of, prepared_branch, PreparedSelect};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
@@ -130,28 +130,34 @@ impl Executor {
         crate::test_failpoints::compile_schema_read();
         let scope = ts.alias.as_ref().map_or(table, |alias| &alias.value_lower);
         let param_count = ctx.params().len();
-        let branch = first_branch_of(stmt);
-        let prepared =
-            PreparedSelect::prepare(self, ctx, &branch, &schema, scope, param_count, epoch)
-                .ok()
-                .map(|mut prepared| {
-                    // A LIMIT or OFFSET read per run leaves the statement to a
-                    // scan, and so do a DISTINCT, which the key read does not
-                    // take, and a set operation, whose rows are its branches' too
-                    let counts = static_row_counts(stmt).filter(|_| {
-                        stmt.set_operations.is_empty()
-                            && !stmt.distinct
-                            && !shape.has_window_functions
-                    });
-                    if let Some(counts) = counts {
-                        prepared.read_by_key(
-                            (table.clone(), &store),
-                            (schema, token),
-                            (counts.offset, counts.limit),
-                        );
-                    }
-                    Arc::new(prepared)
-                });
+        let (branch, keyed_branch) = prepared_branch(stmt);
+        let prepared = PreparedSelect::prepare(
+            self,
+            ctx,
+            &branch,
+            &schema,
+            scope,
+            param_count,
+            epoch,
+            keyed_branch,
+        )
+        .ok()
+        .map(|mut prepared| {
+            // A LIMIT or OFFSET read per run leaves the statement to a
+            // scan, and so do a DISTINCT, which the key read does not
+            // take, and a set operation, whose rows are its branches' too
+            let counts = static_row_counts(stmt).filter(|_| {
+                stmt.set_operations.is_empty() && !stmt.distinct && !shape.has_window_functions
+            });
+            if let Some(counts) = counts {
+                prepared.read_by_key(
+                    (table.clone(), &store),
+                    (schema, token),
+                    (counts.offset, counts.limit),
+                );
+            }
+            Arc::new(prepared)
+        });
         let mut slot = compiled.write().ok()?;
         if matches!(
             &*slot,
