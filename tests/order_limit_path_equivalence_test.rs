@@ -71,27 +71,24 @@ const CASES: &[Case] = &[
          ORDER BY a DESC NULLS FIRST, id",
         Some((5, 0)),
     ),
-    // A derived table's body runs on the general path
+    // A subquery in the SELECT list of a USING join runs on the general path
     case(
         "memory",
         "projected_top",
-        "SELECT * FROM (SELECT id, a * 2 AS d FROM t ORDER BY d, id LIMIT 5 OFFSET 2) s",
-        "SELECT * FROM (SELECT DISTINCT id, a * 2 AS d FROM t ORDER BY d, id) s",
-        Some((5, 2)),
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id + 0 LIMIT 1) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
     ),
     case(
         "sealed",
         "projected_top",
-        "SELECT * FROM (SELECT id, a * 2 AS d FROM t ORDER BY d DESC NULLS FIRST, id LIMIT 5) s",
-        "SELECT * FROM (SELECT DISTINCT id, a * 2 AS d FROM t ORDER BY d DESC NULLS FIRST, id) s",
-        Some((5, 0)),
-    ),
-    case(
-        "memory",
-        "projected_top",
-        "SELECT * FROM (SELECT id FROM t ORDER BY b DESC, a + 0, id LIMIT 4 OFFSET 3) s",
-        "SELECT * FROM (SELECT id FROM t ORDER BY b DESC, a + 0, id) s",
-        Some((4, 3)),
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id + 0 LIMIT 1) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
     ),
     // A statement over a derived table or a view runs on the runner
     case(
@@ -108,61 +105,85 @@ const CASES: &[Case] = &[
         "SELECT id FROM tv ORDER BY a + 0 DESC, id",
         Some((4, 0)),
     ),
+    // A derived table's body runs on the plan
     case(
         "memory",
-        "computed_keys",
-        "SELECT * FROM (SELECT * FROM t ORDER BY a + 0, id LIMIT 4 OFFSET 1) s",
-        "SELECT * FROM (SELECT * FROM t ORDER BY a + 0, id) s",
-        Some((4, 1)),
-    ),
-    case(
-        "sealed",
-        "computed_keys",
-        "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id LIMIT 4) s",
-        "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id) s",
-        Some((4, 0)),
-    ),
-    case(
-        "memory",
-        "deferred_projection",
-        "SELECT * FROM (SELECT id, b FROM t ORDER BY b, id LIMIT 3 OFFSET 1) s",
-        "SELECT * FROM (SELECT DISTINCT id, b FROM t ORDER BY b, id) s",
-        Some((3, 1)),
-    ),
-    case(
-        "sealed",
-        "deferred_projection",
-        "SELECT * FROM (SELECT id, b FROM t ORDER BY b DESC, id LIMIT 3) s",
-        "SELECT * FROM (SELECT DISTINCT id, b FROM t ORDER BY b DESC, id) s",
-        Some((3, 0)),
-    ),
-    case(
-        "memory",
-        "index_ordered",
+        "prepared_index_ordered",
         "SELECT * FROM (SELECT id, b FROM t ORDER BY c DESC NULLS LAST LIMIT 3 OFFSET 1) s",
         "SELECT * FROM (SELECT id, b FROM t ORDER BY c DESC NULLS LAST, id) s",
         Some((3, 1)),
     ),
     case(
-        "sealed",
-        "index_ordered",
-        "SELECT * FROM (SELECT * FROM t ORDER BY id DESC LIMIT 3 OFFSET 2) s",
-        "SELECT * FROM (SELECT DISTINCT * FROM t ORDER BY id DESC) s",
-        Some((3, 2)),
-    ),
-    case(
         "memory",
-        "top_k_scan",
+        "prepared_top_k",
         "SELECT * FROM (SELECT * FROM t WHERE g = 1 ORDER BY n DESC LIMIT 3) s",
         "SELECT * FROM (SELECT DISTINCT * FROM t WHERE g = 1 ORDER BY n DESC) s",
         Some((3, 0)),
     ),
     case(
+        "memory",
+        "prepared_keyset",
+        "SELECT * FROM (SELECT * FROM t WHERE id > 5 ORDER BY id LIMIT 3) s",
+        "SELECT * FROM (SELECT DISTINCT * FROM t WHERE id > 5 ORDER BY id) s",
+        Some((3, 0)),
+    ),
+    case(
+        "sealed",
+        "prepared_project_first",
+        "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id LIMIT 4) s",
+        "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id) s",
+        Some((4, 0)),
+    ),
+    // A join runs on the general path
+    case(
+        "memory",
+        "computed_keys",
+        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0, t.id LIMIT 4 OFFSET 1",
+        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0, t.id",
+        Some((4, 1)),
+    ),
+    case(
+        "sealed",
+        "computed_keys",
+        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0 DESC, t.id LIMIT 4",
+        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0 DESC, t.id",
+        Some((4, 0)),
+    ),
+    case(
+        "memory",
+        "deferred_projection",
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id LIMIT 1) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
+    ),
+    case(
+        "memory",
+        "index_ordered",
+        "SELECT t.id, (SELECT i.id FROM t i ORDER BY i.c DESC NULLS LAST LIMIT 1 OFFSET 1) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT i.id FROM t i ORDER BY i.c + 0 DESC NULLS LAST LIMIT 1 OFFSET 1) \
+         AS x FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
+    ),
+    case(
+        "memory",
+        "top_k_scan",
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.g = 1 AND i.id <> t.id \
+         ORDER BY i.n DESC LIMIT 1) AS x FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.g = 1 AND i.id <> t.id \
+         ORDER BY i.n + 0 DESC LIMIT 1) AS x FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
+    ),
+    case(
         "sealed",
         "top_k_scan",
-        "SELECT * FROM (SELECT * FROM t ORDER BY n LIMIT 3 OFFSET 1) s",
-        "SELECT * FROM (SELECT DISTINCT * FROM t ORDER BY n) s",
-        Some((3, 1)),
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id LIMIT 1) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
     ),
     // The same statements over the table run on the plan
     case(
@@ -257,9 +278,11 @@ const CASES: &[Case] = &[
     case(
         "memory",
         "keyset_pagination",
-        "SELECT * FROM (SELECT * FROM t WHERE id > 5 ORDER BY id LIMIT 3) s",
-        "SELECT * FROM (SELECT DISTINCT * FROM t WHERE id > 5 ORDER BY id) s",
-        Some((3, 0)),
+        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > 5 ORDER BY i.id LIMIT 1) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > 5) AS x \
+         FROM t JOIN u USING (id) ORDER BY t.id",
+        None,
     ),
     case(
         "memory",

@@ -816,6 +816,7 @@ fn test_join_side_reads_hit_the_cache_under_the_statement_snapshot() {
     .unwrap();
     for sql in [
         "SELECT y.id FROM (SELECT * FROM u WHERE a < 3) y JOIN (SELECT * FROM u WHERE b > 4) r ON y.id = r.id",
+        "SELECT y.id FROM (SELECT * FROM u WHERE a < 1 + 2) y JOIN (SELECT * FROM u WHERE b > 2 + 2) r ON y.id = r.id",
         "WITH y AS (SELECT * FROM u WHERE a < 3), r AS (SELECT * FROM u WHERE b > 4) SELECT y.id FROM y JOIN r ON y.id = r.id",
     ] {
         let stmt = db.prepare(sql).unwrap();

@@ -718,7 +718,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "SELECT id FROM t WHERE EXISTS (SELECT x FROM u WHERE x = t.a \
          UNION SELECT x FROM u WHERE x = t.a + 2)",
         "SELECT id FROM t WHERE a IN (1, 2, 3) OR a + 2 IN (1, 2, 3)",
-        Old("7b Phase 3: a statement block's own statement runs on the general executor"),
+        Prepared,
     ),
     (
         "scalar_grouped_block_with_order_and_limit",

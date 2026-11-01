@@ -1775,7 +1775,14 @@ impl Executor {
         // A statement of the prepared family runs on that path and no other,
         // and so does one over a single source with a plan slot to keep
         let slot = compiled.map(NestedPlan::slot);
-        let in_family = self.holds_prepared_select(slot, ctx)
+        // A nested statement is planned into its slot as the router plans
+        // the statement it runs
+        let held = self.holds_prepared_select(slot, ctx)
+            || slot.is_some_and(|slot| {
+                self.with_planned(stmt, slot, plan_classification, Some(ctx), |_| ());
+                self.holds_prepared_select(Some(slot), ctx)
+            });
+        let in_family = held
             || ((classification.where_has_subqueries || classification.output_has_subqueries)
                 && self.prepared_family(stmt, Some(ctx)).is_ok())
             || (slot.is_some()
@@ -1930,7 +1937,30 @@ impl Executor {
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let mut distinct_applied = false;
-        let executed = if in_family {
+        // The WHERE as the cache reads and keeps it, simplified by the
+        // statement's start or here
+        let simplified = match (semantic_stamp, stmt.where_clause.as_deref()) {
+            (Some(_), Some(where_expr)) if ctx.semantic_miss(stmt).is_none() => {
+                ExpressionSimplifier::new().try_simplify(where_expr)
+            }
+            _ => None,
+        };
+        // A statement of the family the start did not look up, a nested one,
+        // reads the cache first, as the table scan does, unless its snapshot
+        // keeps a point of its own, which the stamp may predate
+        let cached = match (in_family, semantic_stamp, stmt.where_clause.as_deref()) {
+            (true, Some((source, stamp)), Some(where_expr))
+                if ctx.semantic_miss(stmt).is_none() && Self::reads_cacheable_rows(ctx) =>
+            {
+                let predicate = simplified.as_ref().unwrap_or(where_expr);
+                let params = classification.where_has_parameters.then(|| ctx.params());
+                self.semantic_source_answer(source, stmt, predicate, params, stamp, ctx)?
+            }
+            _ => None,
+        };
+        let executed = if let Some(answer) = cached {
+            answer
+        } else if in_family {
             // DISTINCT reads every row before a LIMIT counts them; a set
             // operation's branch takes the bound its whole one allows
             let (limit, offset) = match (stmt.set_operations.is_empty(), stmt.distinct) {
@@ -1951,13 +1981,9 @@ impl Executor {
             let result = match (semantic_stamp, stmt.where_clause.as_deref()) {
                 (Some((source, stamp)), Some(where_expr)) => {
                     let rows = Self::materialize_result(result)?;
-                    let simplified;
                     let predicate = match ctx.semantic_miss(stmt) {
                         Some(miss) => miss.simplified.as_deref().unwrap_or(where_expr),
-                        None => {
-                            simplified = ExpressionSimplifier::new().try_simplify(where_expr);
-                            simplified.as_ref().unwrap_or(where_expr)
-                        }
+                        None => simplified.as_ref().unwrap_or(where_expr),
                     };
                     let table_name = &source.name.value_lower;
                     let params = classification.where_has_parameters.then(|| ctx.params());
@@ -3570,6 +3596,43 @@ impl Executor {
             Some(predicate),
             stamp,
         );
+    }
+
+    /// The cached answer to `stmt`, a SELECT * of `source` filtered by
+    /// `where_expr`, shaped as the table scan shapes the answers it takes
+    /// from the cache; None on a miss
+    fn semantic_source_answer(
+        &self,
+        source: &SimpleTableSource,
+        stmt: &SelectStatement,
+        where_expr: &Expression,
+        params: Option<&[Value]>,
+        stamp: super::semantic_cache::CacheStamp,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<SelectOutput>> {
+        let table_name = &source.name.value_lower;
+        let table = self.prepared_table(table_name, ctx, None)?;
+        let all_columns = table.schema().column_names_arc();
+        let alias = source.alias.as_ref().map_or(table_name, |a| &a.value_lower);
+        let Some((result, columns)) = self.semantic_cache_answer(
+            table_name,
+            stmt,
+            &all_columns,
+            Some(alias),
+            where_expr,
+            params,
+            stamp,
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = SelectShape::laid_out(Self::shared_result_layout(
+            stmt,
+            &all_columns,
+            Some(alias),
+            &columns,
+        ));
+        Ok(Some((result, columns, false, shape)))
     }
 
     /// The cached answer to `stmt` whose WHERE the cache reads as

@@ -108,3 +108,34 @@ fn test_table_replaced_while_the_stamp_is_read_is_not_cached_away() {
     writer.execute("INSERT INTO t VALUES (2, 20)", ()).unwrap();
     assert_eq!(reader.query(CACHED, ()).unwrap().count(), 2);
 }
+
+#[test]
+fn test_a_branch_answered_from_the_cache_reads_what_the_statement_snapshot_reads() {
+    let reader = Database::open("memory://semantic_stamp_branches").unwrap();
+    reader
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    reader
+        .execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    reader
+        .execute("SET isolation_level = 'SNAPSHOT'", ())
+        .unwrap();
+    assert_eq!(reader.query(CACHED, ()).unwrap().count(), 2);
+    let writer = reader.clone();
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    stoolap::test_failpoints::after_cache_stamp_publish_read(move || {
+        writer.execute("INSERT INTO t VALUES (3, 30)", ()).unwrap();
+        hook_fired.set(true);
+    });
+    let rows = reader
+        .query(&format!("{CACHED} UNION ALL {CACHED}"), ())
+        .unwrap()
+        .count();
+    assert!(fired.get(), "the insert committed after the stamp was read");
+    assert_eq!(rows, 6, "both branches read the statement's snapshot");
+    reader
+        .execute("SET isolation_level = 'READ COMMITTED'", ())
+        .unwrap();
+}

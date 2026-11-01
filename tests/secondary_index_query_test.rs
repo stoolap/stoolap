@@ -84,6 +84,14 @@ fn insert(db: &Database, from: i64, to: i64) {
     }
 }
 
+/// A one-row hot table to run a SELECT-list subquery over, so its reads
+/// are the only ones of the sealed table
+fn hot_outer(db: &Database) {
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1)", ()).unwrap();
+}
+
 fn ids_db(db: &Database, sql: &str, params: &[i64]) -> Vec<i64> {
     let mut out: Vec<i64> = match params {
         [] => db.query(sql, ()).unwrap(),
@@ -917,6 +925,7 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
             .unwrap();
     }
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    hot_outer(&db);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first = Arc::clone(&calls);
     let second = Arc::clone(&calls);
@@ -929,9 +938,10 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
             INDEX_PAGES.set_budget_bytes(0);
         });
     });
-    // A derived table's body reads in batches; the statement's own plan streams
-    let sql =
-        "SELECT id FROM (SELECT id FROM t WHERE k >= 0 AND k <= 1 AND ABS(id - 904) = 0 LIMIT 2) s";
+    // A subquery in a USING join's SELECT list reads in batches; a
+    // statement's own plan streams
+    let sql = "SELECT (SELECT i.id FROM t i WHERE i.k >= 0 AND i.k <= 1 \
+               AND ABS(i.id - 904) = 0 LIMIT 2) FROM o x JOIN o y USING (id)";
     let rows = ids_db(&db, sql, &[]);
     stoolap::test_failpoints::after_cold_volumes_taken(|| {});
     db.execute("PRAGMA INDEX_CACHE_MB = 16", ()).unwrap();
@@ -953,10 +963,16 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
     insert(&db, 1, ROWS);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    hot_outer(&db);
     // A hundred keys, eight hundred candidates: 3,200 bytes of positions
-    // A derived table's body reads by the ordered collector
-    let sql =
-        "SELECT id FROM (SELECT id FROM t WHERE k >= 100 AND k <= 199 AND ABS(id + 1) > 0 LIMIT 5) s";
+    // A subquery in a USING join's SELECT list reads by the ordered
+    // collector, once per execution of its own text
+    let sql = |offset: usize| {
+        format!(
+            "SELECT (SELECT i.id FROM t i WHERE i.k >= 100 AND i.k <= 199 \
+             AND ABS(i.id + 1) > 0 LIMIT 1 OFFSET {offset}) FROM o x JOIN o y USING (id)"
+        )
+    };
     let want = expected_range(100, 199);
     let positions = 800 * std::mem::size_of::<u32>();
     INDEX_PAGES.clear();
@@ -964,10 +980,10 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     // Room for the walk's reader, not for its positions
     INDEX_PAGES.set_budget_bytes((idle + reader_bytes(SIDE_WINDOW) + positions / 2) as u64);
     let before = reads(&db);
-    let rows = ids_db(&db, sql, &[]);
+    let rows = ids_db(&db, &sql(4), &[]);
     let after = reads(&db);
     INDEX_PAGES.set_budget_bytes(16 * 1024 * 1024);
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 1);
     assert!(rows.iter().all(|id| want.contains(id)));
     assert_eq!(
         delta(&after, &before, "refused"),
@@ -979,9 +995,9 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     INDEX_PAGES.reset_peak();
     let idle = INDEX_PAGES.stats().charged_bytes;
     let before = reads(&db);
-    let rows = ids_db(&db, sql, &[]);
+    let rows = ids_db(&db, &sql(3), &[]);
     let after = reads(&db);
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 1);
     assert_eq!(delta(&after, &before, "refused"), 0);
     assert!(
         INDEX_PAGES.stats().peak_bytes >= idle + reader_bytes(SIDE_WINDOW) + positions,
