@@ -84,6 +84,14 @@ fn insert(db: &Database, from: i64, to: i64) {
     }
 }
 
+/// A one-row hot table to run a SELECT-list subquery over, so its reads
+/// are the only ones of the sealed table
+fn hot_outer(db: &Database) {
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1)", ()).unwrap();
+}
+
 fn ids_db(db: &Database, sql: &str, params: &[i64]) -> Vec<i64> {
     let mut out: Vec<i64> = match params {
         [] => db.query(sql, ()).unwrap(),
@@ -917,6 +925,7 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
             .unwrap();
     }
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    hot_outer(&db);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first = Arc::clone(&calls);
     let second = Arc::clone(&calls);
@@ -932,7 +941,7 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
     // A subquery in a USING join's SELECT list reads in batches; a
     // statement's own plan streams
     let sql = "SELECT (SELECT i.id FROM t i WHERE i.k >= 0 AND i.k <= 1 \
-               AND ABS(i.id - 904) = 0 LIMIT 2) FROM t x JOIN t y USING (id) WHERE x.id = 1";
+               AND ABS(i.id - 904) = 0 LIMIT 2) FROM o x JOIN o y USING (id)";
     let rows = ids_db(&db, sql, &[]);
     stoolap::test_failpoints::after_cold_volumes_taken(|| {});
     db.execute("PRAGMA INDEX_CACHE_MB = 16", ()).unwrap();
@@ -954,14 +963,14 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
     insert(&db, 1, ROWS);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    hot_outer(&db);
     // A hundred keys, eight hundred candidates: 3,200 bytes of positions
     // A subquery in a USING join's SELECT list reads by the ordered
     // collector, once per execution of its own text
     let sql = |offset: usize| {
         format!(
             "SELECT (SELECT i.id FROM t i WHERE i.k >= 100 AND i.k <= 199 \
-             AND ABS(i.id + 1) > 0 LIMIT 1 OFFSET {offset}) FROM t x JOIN t y USING (id) \
-             WHERE x.id = 1"
+             AND ABS(i.id + 1) > 0 LIMIT 1 OFFSET {offset}) FROM o x JOIN o y USING (id)"
         )
     };
     let want = expected_range(100, 199);

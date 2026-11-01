@@ -1937,14 +1937,24 @@ impl Executor {
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
         let mut distinct_applied = false;
+        // The WHERE as the cache reads and keeps it, simplified by the
+        // statement's start or here
+        let simplified = match (semantic_stamp, stmt.where_clause.as_deref()) {
+            (Some(_), Some(where_expr)) if ctx.semantic_miss(stmt).is_none() => {
+                ExpressionSimplifier::new().try_simplify(where_expr)
+            }
+            _ => None,
+        };
         // A statement of the family the start did not look up, a nested one,
-        // reads the cache first, as the table scan does
+        // reads the cache first, as the table scan does, unless its snapshot
+        // keeps a point of its own, which the stamp may predate
         let cached = match (in_family, semantic_stamp, stmt.where_clause.as_deref()) {
             (true, Some((source, stamp)), Some(where_expr))
-                if ctx.semantic_miss(stmt).is_none() =>
+                if ctx.semantic_miss(stmt).is_none() && Self::reads_cacheable_rows(ctx) =>
             {
+                let predicate = simplified.as_ref().unwrap_or(where_expr);
                 let params = classification.where_has_parameters.then(|| ctx.params());
-                self.semantic_source_answer(source, stmt, where_expr, params, stamp, ctx)?
+                self.semantic_source_answer(source, stmt, predicate, params, stamp, ctx)?
             }
             _ => None,
         };
@@ -1971,13 +1981,9 @@ impl Executor {
             let result = match (semantic_stamp, stmt.where_clause.as_deref()) {
                 (Some((source, stamp)), Some(where_expr)) => {
                     let rows = Self::materialize_result(result)?;
-                    let simplified;
                     let predicate = match ctx.semantic_miss(stmt) {
                         Some(miss) => miss.simplified.as_deref().unwrap_or(where_expr),
-                        None => {
-                            simplified = ExpressionSimplifier::new().try_simplify(where_expr);
-                            simplified.as_ref().unwrap_or(where_expr)
-                        }
+                        None => simplified.as_ref().unwrap_or(where_expr),
                     };
                     let table_name = &source.name.value_lower;
                     let params = classification.where_has_parameters.then(|| ctx.params());
