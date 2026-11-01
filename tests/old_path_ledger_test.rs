@@ -774,7 +774,7 @@ const QUERIES: &[(&str, &str, &str, Path)] = &[
         "exists_ordered_by_a_subquery_key",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a ORDER BY (SELECT 1) LIMIT 1)",
         "SELECT id FROM t WHERE a IN (1, 2, 3)",
-        Old("the binder: an EXISTS binds the ORDER BY it drops, once, as a statement binds it"),
+        Prepared,
     ),
     (
         "exists_ordered_by_position_over_a_using_join",

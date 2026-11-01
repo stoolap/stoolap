@@ -669,12 +669,6 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
              GROUP BY u.id ORDER BY u.id * 9223372036854775807) ORDER BY id",
             vec![1, 2],
         ),
-        // An EXISTS orders no row: (SELECT id FROM v), two rows, is never read
-        (
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
-             GROUP BY u.id ORDER BY (SELECT id FROM v)) ORDER BY id",
-            vec![1, 2],
-        ),
     ] {
         let ids: Vec<i64> = db
             .query(sql, ())
@@ -683,6 +677,19 @@ fn a_block_key_s_subquery_answers_whatever_it_reads() {
             .collect();
         assert_eq!(ids, want, "{sql}");
     }
+    // A grouped EXISTS whose key holds a subquery runs as written: (SELECT id
+    // FROM v) gives two rows
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.id > 0 \
+               GROUP BY u.id ORDER BY (SELECT id FROM v)) ORDER BY id";
+    let got = db
+        .query(sql, ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+    assert!(
+        got.as_ref()
+            .is_err_and(|e| e.to_string().contains("more than one row")),
+        "{sql}: {:?}",
+        got.map(|rows| rows.len())
+    );
 }
 
 /// The same rows hot in memory and sealed into a volume
