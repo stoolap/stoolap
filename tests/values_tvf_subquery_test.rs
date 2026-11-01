@@ -12,11 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use stoolap::executor::Executor;
+use stoolap::functions::registry::FunctionRegistry;
+use stoolap::functions::{
+    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+};
+use stoolap::storage::mvcc::engine::MVCCEngine;
 use stoolap::{Database, Value};
 
-// The general path counters are process-wide
+// The general path counters and the calls counted are process-wide
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -243,6 +250,65 @@ fn a_table_function_a_false_where_keeps_no_row_of_computes_no_argument() {
         ),
     ] {
         assert_eq!(rows(&db, sql), Ok(want), "{sql}");
+    }
+}
+
+static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns its argument and counts its calls
+#[derive(Default)]
+struct Counted;
+
+impl ScalarFunction for Counted {
+    fn name(&self) -> &str {
+        "COUNTED"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "COUNTED",
+            FunctionType::Scalar,
+            "test counter",
+            FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn evaluate(&self, args: &[Value]) -> stoolap::core::Result<Value> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(Counted)
+    }
+}
+
+#[test]
+fn a_table_function_a_false_where_keeps_no_row_of_runs_no_argument_subquery() {
+    let _guard = serial();
+    let registry = FunctionRegistry::new();
+    registry.register_scalar::<Counted>();
+    let mut engine = MVCCEngine::in_memory();
+    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO u VALUES (1, 1), (2, 2), (3, 3)",
+    ] {
+        executor.execute(sql).unwrap();
+    }
+    let series = "SELECT value FROM generate_series(1, (SELECT COUNTED(v) FROM u WHERE id = 3))";
+    for (sql, want_rows, want_calls) in [
+        (format!("{series} WHERE 1 = 0"), 0, 0),
+        (series.to_string(), 3, 1),
+    ] {
+        let before = CALLS.load(Ordering::Relaxed);
+        let mut rows = executor
+            .execute(&sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let mut found = 0;
+        while rows.next() {
+            found += 1;
+        }
+        let calls = CALLS.load(Ordering::Relaxed) - before;
+        assert_eq!((found, calls), (want_rows, want_calls), "{sql}");
     }
 }
 

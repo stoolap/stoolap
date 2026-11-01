@@ -5595,11 +5595,10 @@ impl Builder<'_> {
 
     /// `stmt`'s VALUES rows or table function arguments when a value holds a
     /// subquery, each rewritten by `rewrite` over no row, as a FROM sees none
-    /// of its statement's, and each uncorrelated value it reads a run slot
+    /// of its statement's; a block among them runs only where the values are read
     fn prepare_source_values(
         &mut self,
         stmt: &SelectStatement,
-        run_slots: &mut Vec<(usize, Expression)>,
         rewrite: fn(&mut Self, &Chain<'_>, &Expression) -> Result<Expression>,
     ) -> Result<Option<Vec<Vec<Expression>>>> {
         let Some(rows) = source_values(stmt.table_expr.as_deref()) else {
@@ -5608,20 +5607,15 @@ impl Builder<'_> {
         let no_row = ScopeTable::unnamed();
         let scopes = [&no_row];
         let chain = Chain { scopes: &scopes };
-        let first = run_slots.len();
         let mut prepared = Vec::with_capacity(rows.len());
         for row in rows {
             let mut values = Vec::with_capacity(row.len());
             for value in row {
                 self.note_params(value);
-                let rewritten = rewrite(self, &chain, value)?;
-                values.push(self.slotted(&rewritten, run_slots)?);
+                values.push(rewrite(self, &chain, value)?);
             }
             prepared.push(values);
         }
-        // A run that reads no source row raises no error of its values
-        self.where_slots
-            .extend(run_slots[first..].iter().map(|(slot, _)| *slot));
         Ok(Some(prepared))
     }
 
@@ -7898,7 +7892,7 @@ impl PreparedSelect {
         let (order_by, order_reads) = keys(&mut stmt.order_by.iter().map(|ob| &ob.expression))?;
         let (distinct_on, distinct_reads) = keys(&mut stmt.distinct_on.iter())?;
         let output_blocks = first_output_block..builder.subqueries.len();
-        let source = builder.prepare_source_values(stmt, &mut run_slots, |b, chain, value| {
+        let source = builder.prepare_source_values(stmt, |b, chain, value| {
             b.rewrite(chain, None, value, &mut Rewritten::default())
         })?;
         let mut read_as = FxHashMap::default();
@@ -8657,8 +8651,7 @@ impl PreparedGrouped {
             }
         }
         let blocks_read = builder.subqueries.len();
-        let source_rows =
-            builder.prepare_source_values(stmt, &mut run_slots, Builder::rewrite_blocks)?;
+        let source_rows = builder.prepare_source_values(stmt, Builder::rewrite_blocks)?;
         let values = CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
         let source_values = source_rows
             .map(|rows| source_programs(&rows, |expr| compile_with(&values, expr)))
