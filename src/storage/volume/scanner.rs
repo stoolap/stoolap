@@ -1140,12 +1140,24 @@ impl VolumeScanner {
         col_idx: usize,
         global_idx: usize,
     ) -> Result<(&super::column::ColumnData, usize)> {
-        if let Some(ref cache) = self.group_cache {
+        Self::column_at(self.group_cache.as_ref(), &self.volume, col_idx, global_idx)
+    }
+
+    /// [`Self::col_and_idx`] over the scanner's group `cache` and `volume`
+    /// alone, for a caller that writes its row while it reads them
+    #[inline(always)]
+    fn column_at<'a>(
+        cache: Option<&'a GroupColumnCache>,
+        volume: &'a FrozenVolume,
+        col_idx: usize,
+        global_idx: usize,
+    ) -> Result<(&'a super::column::ColumnData, usize)> {
+        if let Some(cache) = cache {
             if let Some(pair) = cache.col_and_local(col_idx, global_idx) {
                 return Ok(pair);
             }
         }
-        Ok((self.volume.columns.get(col_idx)?, global_idx))
+        Ok((volume.columns.get(col_idx)?, global_idx))
     }
 
     /// Load group cache for a new row group. Decompresses only the columns
@@ -1287,21 +1299,25 @@ impl VolumeScanner {
     fn materialize_row(&mut self, idx: usize) -> Result<bool> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::row_materialized();
+        // The needed columns of the volume's own layout are written into the
+        // scanner's row, from the row group's cache or the volume, and the
+        // filter judges the row there
+        if self.is_full_projection && self.row_mapping().is_none() {
+            if let Some(needed) = self.needed_cols.as_deref() {
+                let cache = self.group_cache.as_ref();
+                Self::write_needed(cache, &self.volume, needed, idx, &mut self.current_row)?;
+                return match &self.filter {
+                    Some(filter) => {
+                        passes(filter.as_ref(), self.filter_fallible, &self.current_row)
+                    }
+                    None => Ok(true),
+                };
+            }
+        }
         if self.group_cache.is_some() {
             return self.materialize_row_from_cache(idx);
         }
 
-        let unmapped = self.row_mapping().is_none();
-        if let (Some(filter), Some(mask), true, true) = (
-            &self.filter,
-            &self.needed_cols,
-            unmapped,
-            self.is_full_projection,
-        ) {
-            self.volume
-                .fill_row_needed(idx, mask, &mut self.current_row)?;
-            return passes(filter.as_ref(), self.filter_fallible, &self.current_row);
-        }
         if let Some(ref filter) = self.filter {
             let full_row = match (&self.needed_cols, self.row_mapping()) {
                 (Some(mask), Some(mapping)) => {
@@ -1340,13 +1356,51 @@ impl VolumeScanner {
             };
         } else if !self.is_full_projection {
             self.current_row = self.volume.get_row_projected(idx, &self.project_cols)?;
-        } else if let Some(mask) = &self.needed_cols {
-            self.volume
-                .fill_row_needed(idx, mask, &mut self.current_row)?;
         } else {
             self.current_row = self.volume.get_row(idx)?;
         }
         Ok(true)
+    }
+
+    /// The `needed` columns of row `idx` written over `row`, keeping its
+    /// allocation: `row` is empty, or the last row this wrote from `volume`
+    /// with the same `needed`, which holds the unneeded columns' NULLs
+    /// already. Kept out of the scan loops that call it
+    #[inline(never)]
+    fn write_needed(
+        cache: Option<&GroupColumnCache>,
+        volume: &FrozenVolume,
+        needed: &[bool],
+        idx: usize,
+        row: &mut Row,
+    ) -> Result<()> {
+        let width = volume.columns.len();
+        let values = row.values_mut();
+        if values.len() == width {
+            for (ci, value) in values.iter_mut().enumerate() {
+                if ci < needed.len() && needed[ci] {
+                    let (col, local) = Self::column_at(cache, volume, ci, idx)?;
+                    *value = col.get_value(local);
+                } else {
+                    debug_assert!(
+                        matches!(value, Value::Null(t) if *t == volume.columns.data_type(ci)),
+                        "an unneeded column holds a value"
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let mut fresh = Vec::with_capacity(width);
+        for ci in 0..width {
+            fresh.push(if ci < needed.len() && needed[ci] {
+                let (col, local) = Self::column_at(cache, volume, ci, idx)?;
+                col.get_value(local)
+            } else {
+                Value::Null(volume.columns.data_type(ci))
+            });
+        }
+        *row = Row::from_values(fresh);
+        Ok(())
     }
 
     /// Build a row from the per-group column cache (avoids full-column decompression).
@@ -1975,5 +2029,45 @@ mod tests {
 
         let scanner = VolumeScanner::with_range(vol, vec![], 2, 4, None).unwrap();
         assert_eq!(scanner.estimated_count(), Some(2));
+    }
+
+    fn null_types(row: &Row) -> Vec<Option<DataType>> {
+        row.iter()
+            .map(|value| match value {
+                Value::Null(t) => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_written_again_with_its_mask_reads_as_a_new_one() {
+        let vol = make_test_volume();
+        let needed = [false, true, true];
+        let mut row = Row::new();
+        for idx in [0, 1, 4, 0] {
+            VolumeScanner::write_needed(None, &vol, &needed, idx, &mut row).unwrap();
+            let fresh = vol.get_row_needed(idx, &needed).unwrap();
+            assert_eq!(row.as_slice(), fresh.as_slice(), "row {idx}");
+            assert_eq!(null_types(&row), null_types(&fresh), "row {idx}");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an unneeded column holds a value")]
+    fn a_row_of_another_volume_is_refused() {
+        let vol = make_test_volume();
+        let schema = SchemaBuilder::new("other")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("b", DataType::Integer, false, false)
+            .build();
+        let mut builder = VolumeBuilder::with_capacity(&schema, 1);
+        builder.add_row(1, &Row::from_values((1..=3).map(Value::Integer).collect()));
+        let other = builder.finish().unwrap();
+        let needed = [true, false, false];
+        let mut row = vol.get_row_needed(0, &needed).unwrap();
+        let _ = VolumeScanner::write_needed(None, &other, &needed, 0, &mut row);
     }
 }
