@@ -85,6 +85,27 @@ const ANSWERS: &[(&str, &[&str])] = &[
         "SELECT t.k, GROUPING(k), COUNT(*) FROM t GROUP BY ROLLUP (t.k)",
         &["0|0|4", "1|0|4", "2|0|4", "NULL|1|12"],
     ),
+    (
+        "SELECT t.k AS g, COUNT(*) OVER (PARTITION BY GROUPING(k)) FROM t GROUP BY ROLLUP (g)",
+        &["0|3", "1|3", "2|3", "NULL|1"],
+    ),
+    (
+        "SELECT t.k, COUNT(*) OVER (PARTITION BY GROUPING(k)) FROM t GROUP BY ROLLUP (1)",
+        &["0|3", "1|3", "2|3", "NULL|1"],
+    ),
+    (
+        "SELECT k AS g, GROUPING(g), GROUPING(k), COUNT(*) FROM t GROUP BY ROLLUP (g)",
+        &["0|0|0|4", "1|0|0|4", "2|0|0|4", "NULL|1|1|12"],
+    ),
+    (
+        "SELECT GROUPING(\"οσ\"), COUNT(*) FROM u GROUP BY ROLLUP (\"ΟΣ\", \"οσ\")",
+        &["0|1", "1|1", "1|1"],
+    ),
+    (
+        "SELECT COUNT(*) OVER (PARTITION BY GROUPING(\"οσ\")) FROM u \
+         GROUP BY ROLLUP (\"ΟΣ\", \"οσ\")",
+        &["1", "2", "2"],
+    ),
 ];
 
 fn open(dir: &tempfile::TempDir, sealed: bool, name: &str) -> Database {
@@ -95,6 +116,9 @@ fn open(dir: &tempfile::TempDir, sealed: bool, name: &str) -> Database {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, j INTEGER, a INTEGER)",
         "INSERT INTO t SELECT value, value % 3, value % 2, value FROM generate_series(1, 12)",
+        // Two columns whose names differ only in case
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"ΟΣ\" INTEGER, \"οσ\" INTEGER)",
+        "INSERT INTO u VALUES (1, 10, 20)",
     ] {
         db.execute(sql, ()).unwrap();
     }

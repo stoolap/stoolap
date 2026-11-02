@@ -2333,37 +2333,45 @@ impl Executor {
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
     ) -> Option<usize> {
-        // The item written as the argument is, else the one item its column
-        // names, qualified or not; two items of its name leave it unnamed
+        // The one item the argument names: a column, or the column an alias
+        // or a position groups by, of its name and, when both have one, its
+        // qualifier, as a column binds; that alias; or an expression written
+        // as the argument is. Two items it names leave it unnamed
         let arg = func.arguments.first()?;
-        let key = ExprKey::of(arg);
-        if let Some(at) = group_by_columns
-            .iter()
-            .position(|item| group_by_item_key(item) == key)
-        {
-            return Some(at);
-        }
-        let (qualifier, name) = match arg {
-            Expression::Identifier(id) => (None, id.value_lower.as_str()),
-            Expression::QualifiedIdentifier(qid) => (
+        let column = match arg {
+            Expression::Identifier(id) => Some((None, id.value_lower.as_str())),
+            Expression::QualifiedIdentifier(qid) => Some((
                 Some(qid.qualifier.value_lower.as_str()),
                 qid.name.value_lower.as_str(),
-            ),
-            _ => return None,
+            )),
+            _ => None,
         };
+        let names = |table: Option<&str>, name: &str| {
+            column.is_some_and(|(qualifier, arg)| {
+                eq_folded(name, arg)
+                    && qualifier
+                        .zip(table)
+                        .is_none_or(|(arg, item)| eq_folded(item, arg))
+            })
+        };
+        let key = ExprKey::of(arg);
         let mut named = group_by_columns
             .iter()
             .enumerate()
             .filter(|(_, item)| match item {
-                GroupByItem::Column(column) => {
-                    let table = split_qualified(column).map(|(table, _)| table);
-                    eq_folded(bare_name(column), name)
-                        && qualifier
-                            .zip(table)
-                            .is_none_or(|(arg, item)| eq_folded(item, arg))
-                }
-                GroupByItem::Expression { display_name, .. } => {
-                    qualifier.is_none() && eq_folded(display_name, name)
+                GroupByItem::Column(name) => names(
+                    split_qualified(name).map(|(table, _)| table),
+                    bare_name(name),
+                ),
+                GroupByItem::Expression { expr, display_name } => {
+                    let grouped = match expr {
+                        Expression::Identifier(id) => names(None, &id.value),
+                        Expression::QualifiedIdentifier(qid) => {
+                            names(Some(&qid.qualifier.value), &qid.name.value)
+                        }
+                        expr => ExprKey::of(expr) == key,
+                    };
+                    grouped || names(None, display_name) && column.is_some_and(|(q, _)| q.is_none())
                 }
             });
         match (named.next(), named.next()) {
