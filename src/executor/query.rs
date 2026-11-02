@@ -12377,6 +12377,18 @@ impl Executor {
             .columns
             .iter()
             .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+        // A set operation's rows hold its first branch's items alone, so a
+        // single star fills the columns the other items leave
+        let stars: smallvec::SmallVec<[usize; 1]> = (0..stmt.columns.len())
+            .filter(|&i| is_star_item(&stmt.columns[i]))
+            .collect();
+        let star_fill = match stars.as_slice() {
+            [at] if set_operation && any_item => columns
+                .len()
+                .checked_sub(stmt.columns.len() - 1)
+                .map(|fill| (*at, fill)),
+            _ => None,
+        };
         for (i, col) in stmt.columns.iter().enumerate() {
             // No sort key names a star
             if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
@@ -12387,9 +12399,10 @@ impl Executor {
             }
             // An item's column by the layout; without one, by its index
             // while no star moves the positions
-            let Some(position) = (match layout {
-                Some(layout) => layout.item_position(i),
-                None => (!star).then_some(i),
+            let Some(position) = (match (layout, star_fill) {
+                (Some(layout), _) => layout.item_position(i),
+                (None, Some((at, fill))) => Some(if i < at { i } else { i + fill - 1 }),
+                (None, None) => (!star).then_some(i),
             }) else {
                 continue;
             };

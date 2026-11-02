@@ -245,6 +245,30 @@ fn a_key_holding_a_subquery_reads_the_first_select_s_item_or_names_no_column() {
                 }
             }
         }
+        // One star fills the columns the other items leave, beside a window too
+        for (sql, want) in [
+            (
+                "SELECT DISTINCT ON ((SELECT 1)) *, ROW_NUMBER() OVER (ORDER BY id), (SELECT 1) \
+                 FROM t UNION ALL SELECT 9, 9, 9, 9, 9 ORDER BY 1",
+                [
+                    "Integer(1),Integer(30),Integer(1),Integer(1),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9),Integer(9),Integer(9)",
+                ],
+            ),
+            (
+                "SELECT DISTINCT ON ((SELECT 1)) (SELECT 1), t.*, ROW_NUMBER() OVER (ORDER BY id) \
+                 FROM t UNION ALL SELECT 9, 9, 9, 9, 9 ORDER BY 2",
+                [
+                    "Integer(1),Integer(1),Integer(30),Integer(1),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9),Integer(9),Integer(9)",
+                ],
+            ),
+        ] {
+            let got = rows(&db, sql);
+            if got != Ok(want.iter().map(|r| r.to_string()).collect()) {
+                wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+            }
+        }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
