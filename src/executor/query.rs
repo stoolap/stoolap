@@ -4087,7 +4087,8 @@ impl Executor {
                 }) => {
                     let read = (*source, (group.as_str(), *at), *walks);
                     let calls = aggregations.as_slice();
-                    self.grouped_aggregate(table.as_ref(), stmt, calls, read, ctx, &all_columns)?
+                    let run = (ctx, blocks);
+                    self.grouped_aggregate(table.as_ref(), stmt, calls, read, run, &all_columns)?
                 }
                 None => None,
             };

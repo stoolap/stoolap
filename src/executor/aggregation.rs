@@ -1654,56 +1654,69 @@ impl Executor {
             )?
         };
 
-        // Apply HAVING clause BEFORE projection (HAVING may reference aggregates not in SELECT)
-        let (having_columns, having_rows) = if let Some(ref having) = stmt.having {
-            // Pre-process scalar subqueries in HAVING clause
-            // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values.
-            // One that reads the group is left as written; apply_having
-            // runs it once per group with that group as the outer row
-            let has_correlated_having = Self::has_correlated_subqueries(having);
-            let processed_having = if has_correlated_having || blocks.is_some() {
-                (**having).clone()
-            } else {
-                self.process_where_subqueries(having, ctx)?
-            };
-            let outer_table: Option<String> =
-                stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
-                    Expression::TableSource(source) => Some(
-                        source
-                            .alias
-                            .as_ref()
-                            .map(|a| a.value_lower.to_string())
-                            .unwrap_or_else(|| source.name.value_lower.to_string()),
-                    ),
-                    Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
-                    _ => None,
-                });
+        let groups = (group_by_columns.as_slice(), aggregations);
+        let having_rows =
+            self.having_groups(stmt, groups, ctx, (&result_columns, result_rows), blocks)?;
+        Ok((result_columns, having_rows, group_by_columns))
+    }
 
-            // HAVING reads every group item and aggregate from its slot
-            let slots = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
-            let tmp_result = Box::new(ExecutorResult::new(result_columns.clone(), result_rows));
-            let mut having_result = self.apply_having(
-                tmp_result,
-                &processed_having,
-                &result_columns,
-                &slots,
-                outer_table.as_deref(),
-                ctx,
-                blocks,
-            )?;
-
-            // Collect rows after HAVING filter
-            let mut filtered_rows = RowVec::new();
-            let mut row_id = 0i64;
-            while having_result.next() {
-                filtered_rows.push((row_id, having_result.take_row()));
-                row_id += 1;
-            }
-            (result_columns, filtered_rows)
-        } else {
-            (result_columns, result_rows)
+    /// The groups of `rows`, slot rows of `columns` holding the group items
+    /// and then `aggregations`, that `stmt`'s HAVING keeps: all without one
+    pub(super) fn having_groups(
+        &self,
+        stmt: &SelectStatement,
+        (group_by_columns, aggregations): (&[GroupByItem], &[SqlAggregateFunction]),
+        ctx: &ExecutionContext,
+        (columns, rows): (&[String], RowVec),
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<RowVec> {
+        let Some(having) = stmt.having.as_deref() else {
+            return Ok(rows);
         };
-        Ok((having_columns, having_rows, group_by_columns))
+        // Pre-process scalar subqueries in HAVING clause
+        // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values.
+        // One that reads the group is left as written; apply_having
+        // runs it once per group with that group as the outer row
+        let has_correlated_having = Self::has_correlated_subqueries(having);
+        let processed_having = if has_correlated_having || blocks.is_some() {
+            having.clone()
+        } else {
+            self.process_where_subqueries(having, ctx)?
+        };
+        let outer_table: Option<String> =
+            stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
+                Expression::TableSource(source) => Some(
+                    source
+                        .alias
+                        .as_ref()
+                        .map(|a| a.value_lower.to_string())
+                        .unwrap_or_else(|| source.name.value_lower.to_string()),
+                ),
+                Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
+                _ => None,
+            });
+
+        // HAVING reads every group item and aggregate from its slot
+        let slots = aggregate_slot_keys(group_by_columns, aggregations, &stmt.columns);
+        let tmp_result = Box::new(ExecutorResult::new(columns.to_vec(), rows));
+        let mut having_result = self.apply_having(
+            tmp_result,
+            &processed_having,
+            columns,
+            &slots,
+            outer_table.as_deref(),
+            ctx,
+            blocks,
+        )?;
+
+        // Collect rows after HAVING filter
+        let mut filtered_rows = RowVec::new();
+        let mut row_id = 0i64;
+        while having_result.next() {
+            filtered_rows.push((row_id, having_result.take_row()));
+            row_id += 1;
+        }
+        Ok(filtered_rows)
     }
 
     /// The output names of `stmt` when its SELECT list is nothing but its

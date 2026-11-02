@@ -103,6 +103,40 @@ fn a_prepared_grouping_answers_each_run_s_parameters() {
 }
 
 #[test]
+fn a_having_over_the_groups_the_table_computes_reads_each_run_s_parameter() {
+    const HAVING: &str =
+        "SELECT k, COUNT(*), SUM(a) FROM t GROUP BY k HAVING SUM(a) > $1 ORDER BY k";
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = match sealed {
+            true => Database::open(&format!("file://{}", dir.path().display())).unwrap(),
+            false => Database::open("memory://runner_grouped_aggregate_having").unwrap(),
+        };
+        fill(&db, 500);
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        let stmt = db.prepare(HAVING).unwrap();
+        for least in [0, 2400, 2500, 1_000_000] {
+            let got = grouped(stmt.query((least,)).unwrap());
+            assert_eq!(got, expected(&db, -1, least), "sealed {sealed}, {least}");
+        }
+        let mut tx = db.begin().unwrap();
+        tx.execute("INSERT INTO t VALUES (1000, 5000, 6, 3)", ())
+            .unwrap();
+        let got = grouped(tx.query(HAVING, (2500,)).unwrap());
+        let mut want = expected(&db, -1, 0);
+        for group in want.iter_mut().filter(|group| group.0 == 3) {
+            group.1 += 1;
+            group.2 += 5000;
+        }
+        want.retain(|group| group.2 > 2500);
+        assert_eq!(got, want, "sealed {sealed}, the transaction's own row");
+        tx.rollback().unwrap();
+    }
+}
+
+#[test]
 fn a_grouping_in_a_transaction_reads_its_own_writes() {
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();

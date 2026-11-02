@@ -221,11 +221,12 @@ Aggregate SUM(value)
 
 ### Aggregation
 
-A GROUP BY of one column with no WHERE shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`); groups read in the order of the column's index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped:
+A GROUP BY of one column with no WHERE shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`); groups read in the order of the column's index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. A HAVING naming no column but the group's judges the groups the table computes when the index walk does not take it:
 
 ```sql
 EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category;
 EXPLAIN SELECT category, COUNT(*) FROM products GROUP BY category HAVING COUNT(*) > 1;
+EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category HAVING SUM(value) > 100;
 ```
 
 Output:
@@ -241,6 +242,13 @@ plan
 Having (COUNT(*) > 1)
   Aggregate category, COUNT(*) by category
     SortedStream products (category)
+    else SeqScan products
+
+plan
+----
+Having (SUM(value) > 100)
+  Aggregate category, SUM(value) by category
+    StorageGrouped products (category)
     else SeqScan products
 ```
 

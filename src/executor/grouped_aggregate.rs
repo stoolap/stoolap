@@ -22,7 +22,7 @@ use crate::storage::traits::{QueryResult, Table};
 
 use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateFunction};
 use super::context::ExecutionContext;
-use super::expression::ExprVM;
+use super::expression::{ExprVM, SubqueryExecutor};
 use super::planned_aggregate::{AggregatePlan, AggregateRead};
 use super::query_classification::QueryClassification;
 use super::row_count::rows_needed;
@@ -64,17 +64,18 @@ impl Executor {
         {
             return GroupedSource::Hash;
         }
-        // The table computes counts, sums, averages and bounds of columns
-        let stored = stmt.having.is_none()
+        // The table computes counts, sums, averages and bounds of columns; a
+        // HAVING the index walk does not judge, naming no column but the
+        // group's, judges the groups the table gives
+        let sorts = Self::sorts_groups(stmt, classification, aggregations, grouped_names);
+        let stored = (stmt.having.is_none() || (grouped_names && !sorts))
             && aggregations
                 .iter()
                 .all(|agg| matches!(agg.name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"));
-        if stored {
-            return GroupedSource::Storage;
-        }
-        match Self::sorts_groups(stmt, classification, aggregations, grouped_names) {
-            true => GroupedSource::SortedStream,
-            false => GroupedSource::Hash,
+        match (stored, sorts) {
+            (true, _) => GroupedSource::Storage,
+            (false, true) => GroupedSource::SortedStream,
+            (false, false) => GroupedSource::Hash,
         }
     }
 
@@ -178,8 +179,9 @@ impl Executor {
 
     /// `stmt`'s groups of `aggregations` over `table` by the column `group`,
     /// named and placed, from `source`, else by the index walk when `walks`;
-    /// None for the hash grouping, which the scan does. Inlined into the
-    /// table scan, it costs that scan's loop more per row
+    /// None for the hash grouping, which the scan does. Its `blocks` answer
+    /// the subqueries of its HAVING and SELECT list. Inlined into the table
+    /// scan, it costs that scan's loop more per row
     #[inline(never)]
     pub(crate) fn grouped_aggregate(
         &self,
@@ -187,7 +189,7 @@ impl Executor {
         stmt: &SelectStatement,
         aggregations: &[SqlAggregateFunction],
         (source, (group, group_index), walks): (GroupedSource, (&str, usize), bool),
-        ctx: &ExecutionContext,
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
         all_columns: &[String],
     ) -> Result<Option<Box<dyn QueryResult>>> {
         let columns = Self::call_columns(aggregations, all_columns);
@@ -197,7 +199,16 @@ impl Executor {
             }
             GroupedSource::SortedStream | GroupedSource::Hash => None,
         };
+        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
+        slot_columns.push(all_columns[group_index].clone());
+        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
         let rows = match stored {
+            Some(rows) if stmt.having.is_some() => {
+                let items = self.parse_group_by(stmt, all_columns)?;
+                let groups = (items.as_slice(), aggregations);
+                let kept = self.having_groups(stmt, groups, ctx, (&slot_columns, rows), blocks)?;
+                (AggregatePath::StorageGrouped, kept)
+            }
             Some(rows) => (AggregatePath::StorageGrouped, rows),
             None if walks => {
                 let group = (group, group_index);
@@ -217,16 +228,13 @@ impl Executor {
             None => return Ok(None),
         };
         let (path, rows) = rows;
-        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
-        slot_columns.push(all_columns[group_index].clone());
-        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
         let slots = AggregateSlots {
             stmt,
             written_stmt: stmt,
             aggregations,
             group_by_count: 1,
             source_columns: all_columns,
-            blocks: None,
+            blocks,
             alone: None,
         };
         self.finish_aggregation(path, slots, ctx, slot_columns, rows)

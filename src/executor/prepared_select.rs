@@ -12409,8 +12409,9 @@ impl Executor {
         if PreparedSelect::groups(stmt) || windows {
             let columns = table.schema().column_names_arc();
             if let Some(read) = plan.and_then(|plan| plan.read.grouped()) {
+                let run = (ctx, None);
                 if let Some(result) =
-                    self.grouped_aggregate(table, stmt, aggregations, read, ctx, &columns)?
+                    self.grouped_aggregate(table, stmt, aggregations, read, run, &columns)?
                 {
                     return Ok((result, None));
                 }
