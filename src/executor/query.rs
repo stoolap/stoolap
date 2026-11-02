@@ -5596,12 +5596,6 @@ impl Executor {
         let Some(sides @ [left, right]) = sides else {
             return Err("a side not named before it is read");
         };
-        // The blocks qualify each side's columns by its name, a joined
-        // side's by its tables'
-        let named = |alias: Option<&str>, side: &JoinSide| alias.is_some() || side.leaves.len() > 1;
-        if !named(left_alias, left) || !named(right_alias, right) {
-            return Err("a side without a name");
-        }
         let split = [
             SplitSide::of(left_alias, left),
             SplitSide::of(right_alias, right),
