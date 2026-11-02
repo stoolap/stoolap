@@ -418,7 +418,6 @@ impl Executor {
         stmt: &SelectStatement,
         (classification, plan): (&QueryClassification, &AggregatePlan),
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
         let AggregateRead::Global { source, pushed } = &plan.read else {
             return Ok(None);
@@ -429,13 +428,11 @@ impl Executor {
         let scan = || match stmt.where_clause.is_none()
             && Self::streams_calls(classification, aggregations, plan.plain)
         {
-            true => self
-                .global_scan_rows(table, aggregations, ctx, blocks)
-                .map(Some),
+            true => self.global_scan_rows(table, aggregations, ctx).map(Some),
             false => Ok(None),
         };
         let source = (*source, pushed.as_deref());
-        self.global_answer(table, stmt, (aggregations, source), ctx, blocks, scan)
+        self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)
     }
 
     /// `stmt`'s one row of `aggregations` over `table`, from `source` with

@@ -3711,6 +3711,20 @@ struct WherePrograms {
 }
 
 impl WhereParts {
+    /// No conjunct: the scan reads every row with no filter, and takes it whole
+    fn every_row() -> Self {
+        WhereParts {
+            clause: true_literal(),
+            pushed: Some(Vec::new()),
+            scanned: None,
+            narrowed: Vec::new(),
+            set_tests: Vec::new(),
+            point: None,
+            equalities: Vec::new(),
+            conjuncts: 0,
+        }
+    }
+
     /// The WHERE's programs, each compiled by `compile`
     fn programs(
         &self,
@@ -3898,6 +3912,51 @@ pub struct PreparedSelect {
 /// value a program over no row that reads the statement's blocks
 type SourcePrograms = Box<[Box<[SharedProgram]>]>;
 
+/// What a run of a statement that aggregates its rows or computes windows
+/// over them reads them by, as the statement prepared it
+#[derive(Clone, Copy)]
+pub(crate) struct RowsRead<'p> {
+    where_: &'p PreparedWhere,
+    read: Option<&'p Read>,
+    /// The calls, None when a run parses them
+    calls: Option<&'p [SqlAggregateFunction]>,
+    /// The windows run over the groups
+    windowed: bool,
+    constant_where: bool,
+    source_values: Option<&'p [Box<[SharedProgram]>]>,
+    /// The output asks the statement's blocks, which the run answers
+    blocks: bool,
+}
+
+impl RowsRead<'_> {
+    /// Whether a run of `stmt` in `ctx` keeps no row: a constant AND term
+    /// of its WHERE is false or NULL with the functions of `registry`, which
+    /// no read reaches a row before
+    fn keeps_no_row(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        registry: &FunctionRegistry,
+    ) -> bool {
+        // Every value of a VALUES list is evaluated, as the general path does
+        self.constant_where
+            && ctx.outer_row().is_none()
+            && !matches!(
+                stmt.table_expr.as_deref(),
+                Some(Expression::ValuesSource(_))
+            )
+            && stmt
+                .where_clause
+                .as_deref()
+                .is_some_and(|w| true_for_no_row(w, ctx, registry))
+    }
+
+    /// The scan the plan chose
+    fn scan(&self) -> Option<&ScanChoice> {
+        self.read.and_then(Read::scan)
+    }
+}
+
 impl PreparedSelect {
     /// The plan of a statement the planner reads by a scan of `table` or
     /// over a source whose statement's plan is `body`, as EXPLAIN shows it,
@@ -4057,31 +4116,127 @@ impl PreparedSelect {
         });
     }
 
-    /// Whether a run of `stmt` in `ctx` keeps no row: a constant AND term
-    /// of its WHERE is false or NULL with the functions of `registry`, which
-    /// no read reaches a row before
+    /// [`RowsRead::keeps_no_row`] for a run of this statement
     pub(crate) fn keeps_no_row(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         registry: &FunctionRegistry,
     ) -> bool {
-        // Every value of a VALUES list is evaluated, as the general path does
-        self.has_constant_where()
-            && ctx.outer_row().is_none()
-            && !matches!(
-                stmt.table_expr.as_deref(),
-                Some(Expression::ValuesSource(_))
-            )
-            && stmt
-                .where_clause
-                .as_deref()
-                .is_some_and(|w| true_for_no_row(w, ctx, registry))
+        self.rows_read().keeps_no_row(stmt, ctx, registry)
+    }
+
+    /// What a run reads the statement's rows by
+    fn rows_read(&self) -> RowsRead<'_> {
+        RowsRead {
+            where_: &self.where_,
+            read: self.plan.as_ref().map(|plan| &plan.read),
+            calls: self.calls.as_deref(),
+            windowed: self.windowed,
+            constant_where: self.constant_where,
+            source_values: self.source_values.as_deref(),
+            blocks: false,
+        }
     }
 
     /// Whether the WHERE holds a constant AND term, which a run asks first
     pub(crate) fn has_constant_where(&self) -> bool {
         self.constant_where
+    }
+
+    /// Whether `stmt`'s WHERE holds no subquery and a term that is a
+    /// statement constant, with the functions of `registry`
+    fn constant_where(stmt: &SelectStatement, registry: &FunctionRegistry) -> bool {
+        stmt.where_clause
+            .as_deref()
+            .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w, registry))
+    }
+
+    /// The calls of `written`, held when none has a later argument not
+    /// written as a value, which a run reads; None parses them on each run
+    fn held_calls(
+        executor: &Executor,
+        written: &SelectStatement,
+    ) -> Result<Option<Vec<SqlAggregateFunction>>> {
+        Ok(Some(executor.parse_block_aggregations(written)?)
+            .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())))
+    }
+
+    /// `read` under the index read the window rule chooses for `written`'s
+    /// window functions over every row, or the source the aggregate rule
+    /// picks for its calls, over the indexes of `store`; `blocks` when its
+    /// windows ask the statement's blocks
+    fn rows_read_plan(
+        executor: &Executor,
+        written: &SelectStatement,
+        (windowed, aggregated, blocks): (bool, bool, bool),
+        ctx: &ExecutionContext,
+        schema: &Schema,
+        store: &VersionStore,
+        read: Read,
+    ) -> Result<Read> {
+        // Window functions over every row read them through an index
+        // as the window rule chooses
+        let window = (windowed && !aggregated && written.where_clause.is_none())
+            .then(|| {
+                Executor::window_read(
+                    written,
+                    schema,
+                    |column| store.get_index_by_column(column).is_some(),
+                    blocks,
+                )
+            })
+            .flatten();
+        let read = match window {
+            Some(window) => Read::Window {
+                read: window,
+                otherwise: Box::new(read),
+            },
+            None => read,
+        };
+        if !aggregated {
+            return Ok(read);
+        }
+        // The aggregate's row from where the one rule says, else from the
+        // rows the read passes
+        let indexed =
+            |column: &str| super::planned_aggregate::bounds(store.get_index_by_column(column));
+        let classification = get_classification(written);
+        let rule = executor.aggregate_read_plan(
+            written,
+            &classification,
+            (ctx, false),
+            schema,
+            indexed,
+        )?;
+        Ok(match rule {
+            Some(AggregatePlan {
+                aggregations,
+                read: AggregateRead::Global { source, .. },
+                ..
+            }) => Read::Aggregated {
+                source,
+                column: aggregations
+                    .first()
+                    .map(|agg| SmartString::from(bare_name(&agg.column_lower))),
+                otherwise: Box::new(read),
+            },
+            Some(AggregatePlan {
+                read:
+                    AggregateRead::Grouped {
+                        source,
+                        group: (name, at),
+                        walks,
+                    },
+                ..
+            }) => Read::Grouped {
+                source,
+                group: (SmartString::from(name), at),
+                walks,
+                otherwise: Box::new(read),
+            },
+            None => read,
+        })
     }
 
     /// The key read the plan chose, and whether a unique index reads it
@@ -8207,17 +8362,7 @@ impl PreparedSelect {
                 let where_clause = with_aliases(where_clause, &written.columns, &scope.columns);
                 builder.statement_where(&chain, schema, &where_clause, &mut work, &mut run_slots)?
             }
-            // No conjunct: the scan reads every row with no filter, and takes it whole
-            None => WhereParts {
-                clause: true_literal(),
-                pushed: Some(Vec::new()),
-                scanned: None,
-                narrowed: Vec::new(),
-                set_tests: Vec::new(),
-                point: None,
-                equalities: Vec::new(),
-                conjuncts: 0,
-            },
+            None => WhereParts::every_row(),
         };
         // The SELECT items and ORDER BY keys holding subqueries, rewritten for
         // the blocks; an uncorrelated value they read is a run slot, read once
@@ -8466,83 +8611,20 @@ impl PreparedSelect {
                     },
                     None => read,
                 };
-                // Window functions over every row read them through an index
-                // as the window rule chooses
-                let window = (windowed && !aggregated && written.where_clause.is_none())
-                    .then(|| {
-                        Executor::window_read(
-                            written,
-                            schema,
-                            |column| store.get_index_by_column(column).is_some(),
-                            false,
-                        )
-                    })
-                    .flatten();
-                let read = match window {
-                    Some(window) => Read::Window {
-                        read: window,
-                        otherwise: Box::new(read),
-                    },
-                    None => read,
-                };
                 if windowed && !aggregated {
                     steps = Self::window_steps(written, where_.conjuncts > where_.pushed);
                 }
-                // The aggregate's row from where the one rule says, else from
-                // the rows the read passes
-                let read = match aggregated {
-                    true => {
-                        steps = Self::aggregate_steps(written, where_.conjuncts > where_.pushed);
-                        let indexed = |column: &str| {
-                            super::planned_aggregate::bounds(store.get_index_by_column(column))
-                        };
-                        let classification = get_classification(written);
-                        let rule = executor.aggregate_read_plan(
-                            written,
-                            &classification,
-                            (ctx, false),
-                            schema,
-                            indexed,
-                        )?;
-                        match rule {
-                            Some(AggregatePlan {
-                                aggregations,
-                                read: AggregateRead::Global { source, .. },
-                                ..
-                            }) => Read::Aggregated {
-                                source,
-                                column: aggregations
-                                    .first()
-                                    .map(|agg| SmartString::from(bare_name(&agg.column_lower))),
-                                otherwise: Box::new(read),
-                            },
-                            Some(AggregatePlan {
-                                read:
-                                    AggregateRead::Grouped {
-                                        source,
-                                        group: (name, at),
-                                        walks,
-                                    },
-                                ..
-                            }) => Read::Grouped {
-                                source,
-                                group: (SmartString::from(name), at),
-                                walks,
-                                otherwise: Box::new(read),
-                            },
-                            None => read,
-                        }
-                    }
-                    false => read,
-                };
+                if aggregated {
+                    steps = Self::aggregate_steps(written, where_.conjuncts > where_.pushed);
+                }
+                let kind = (windowed, aggregated, false);
+                let read =
+                    Self::rows_read_plan(executor, written, kind, ctx, schema, &store, read)?;
                 plan = Some(Plan { steps, read });
             }
         }
-        // A run reads only a call's later arguments not written as values:
-        // calls without one are held, the others parsed on each run
         let calls = match aggregated {
-            true => Some(executor.parse_block_aggregations(written)?)
-                .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())),
+            true => Self::held_calls(executor, written)?,
             false => None,
         };
         let window = (windowed && !aggregated)
@@ -8569,9 +8651,7 @@ impl PreparedSelect {
             layout,
             order_keys,
             plan,
-            constant_where: stmt.where_clause.as_deref().is_some_and(|w| {
-                !Executor::has_subqueries(w) && has_constant_term(w, &executor.function_registry)
-            }),
+            constant_where: Self::constant_where(stmt, &executor.function_registry),
             windowed,
             aggregated,
             calls,
@@ -8706,8 +8786,15 @@ pub struct PreparedGrouped {
     /// The uncorrelated member blocks past its WHERE, read before any row;
     /// the WHERE's are read by the first row that reaches them
     ahead: Vec<u16>,
-    /// A WHERE holding subqueries, which the table's rows pass before they group
+    /// The WHERE the table's rows pass before they group, or another
+    /// source's rows when it holds subqueries
     where_: Option<PreparedWhere>,
+    /// The table's read the window or aggregate rule chose
+    read: Option<Read>,
+    /// The aggregate calls, None when a run parses them
+    calls: Option<Vec<SqlAggregateFunction>>,
+    /// The WHERE holds no subquery and a term that is a statement constant
+    constant_where: bool,
     /// Its VALUES rows or table function arguments compiled over the blocks
     /// when a value holds a subquery; None evaluates them as written
     source_values: Option<SourcePrograms>,
@@ -8937,13 +9024,7 @@ impl PreparedGrouped {
         // What each input row reads comes first: its blocks' holes read the row
         let mut work = Rewritten::default();
         let where_parts = match stmt.where_clause.as_deref() {
-            Some(where_clause)
-                if match source {
-                    GroupedSource::Table => mentions_subquery(where_clause),
-                    GroupedSource::Rows => true,
-                    GroupedSource::Joined => false,
-                } =>
-            {
+            Some(where_clause) if source != GroupedSource::Joined => {
                 let where_clause = with_aliases(where_clause, &stmt.columns, &scope.columns);
                 Some(builder.statement_where(
                     &chain,
@@ -8953,6 +9034,7 @@ impl PreparedGrouped {
                     &mut run_slots,
                 )?)
             }
+            None if source == GroupedSource::Table => Some(WhereParts::every_row()),
             _ => None,
         };
         // The WHERE's blocks come first; a row that reaches one reads it
@@ -9239,6 +9321,7 @@ impl PreparedGrouped {
         // The statement the grouped run reads names its columns again
         let where_clause = where_parts
             .as_ref()
+            .filter(|_| stmt.where_clause.is_some())
             .map(|parts| spelled_columns(&parts.clause, &scope))
             .transpose()?;
         let where_ = where_parts
@@ -9523,6 +9606,31 @@ impl PreparedGrouped {
         if constants(&stmt, &mentions_subquery) {
             return Ok(None);
         }
+        let classification = super::query_classification::get_classification(&stmt);
+        let (windowed, aggregated) = (
+            classification.has_window_functions,
+            classification.has_aggregation,
+        );
+        let read = match source {
+            GroupedSource::Table => match executor.engine.get_version_store(&schema.table_name) {
+                Ok(store) => Some(PreparedSelect::rows_read_plan(
+                    executor,
+                    &stmt,
+                    (windowed, aggregated, true),
+                    ctx,
+                    &schema,
+                    &store,
+                    Read::Scan(None),
+                )?),
+                Err(_) => None,
+            },
+            GroupedSource::Rows | GroupedSource::Joined => None,
+        };
+        let calls = match aggregated {
+            true => PreparedSelect::held_calls(executor, &stmt)?,
+            false => None,
+        };
+        let constant_where = PreparedSelect::constant_where(&stmt, &executor.function_registry);
         Ok(Some(Self {
             validity,
             cte_scope: ctx.cte_scope(),
@@ -9532,9 +9640,12 @@ impl PreparedGrouped {
             holes: HoleSet { holes },
             ahead,
             where_,
+            read,
+            calls,
+            constant_where,
             source_values,
             late,
-            classification: super::query_classification::get_classification(&stmt),
+            classification,
             stmt,
         }))
     }
@@ -9544,50 +9655,27 @@ impl PreparedGrouped {
         self.late.as_deref()
     }
 
-    /// Whether the table's rows pass a WHERE holding subqueries before they group
-    pub(crate) fn reads_through_where(&self) -> bool {
-        self.where_.is_some()
-    }
-
     /// Whether the statement reads run slots, which its parameters then
     /// carry beside the blocks'
     pub(crate) fn reads_run_slots(&self) -> bool {
         !self.blocks.run_slots.is_empty()
     }
 
-    /// The columns of table `name` and each of its rows the WHERE passes,
-    /// read through the `run`'s blocks as a prepared statement reads them
-    pub(crate) fn passing_rows(
-        &self,
-        executor: &Executor,
-        run: &PreparedRunner<'_>,
-        name: &str,
-        ctx: &ExecutionContext,
-    ) -> Result<(CompactArc<Vec<String>>, RowVec)> {
-        let Some(where_) = &self.where_ else {
-            return Err(Error::internal("a grouped statement without its WHERE"));
-        };
-        let table = executor.prepared_table(name, ctx, None)?;
-        self.table_fits(&table.schema_arc())?;
-        let mut rows = RowVec::new();
-        let keep = |id: i64, _: u64, row: Row| {
-            rows.push((id, row));
-            true
-        };
-        match run.passing_rows(
-            (where_, None),
-            None,
-            table.as_ref(),
-            ctx,
-            None,
-            Take::Kept,
-            keep,
-        )? {
-            Passing::Pruned | Passing::Read => Ok((table.schema().column_names_arc(), rows)),
-            Passing::Answers(_) | Passing::Scan(_) | Passing::Filtered(..) => Err(Error::internal(
-                "a grouped statement read the scan's answers",
-            )),
-        }
+    /// What a run reads the table's rows by, its output asking the blocks;
+    /// None over another source
+    fn rows_read(&self) -> Option<RowsRead<'_>> {
+        Some(RowsRead {
+            where_: self
+                .where_
+                .as_ref()
+                .filter(|_| self.source == GroupedSource::Table)?,
+            read: self.read.as_ref(),
+            calls: self.calls.as_deref(),
+            windowed: self.classification.has_window_functions,
+            constant_where: self.constant_where,
+            source_values: self.source_values.as_deref(),
+            blocks: true,
+        })
     }
 
     /// SchemaChanged when `schema`, which the table's rows were read with,
@@ -12488,6 +12576,32 @@ impl Executor {
         Ok(kept)
     }
 
+    /// The rows of the grouped statement `held` over its `table`, the run
+    /// `run` answering its blocks: its groups and their windows as a
+    /// prepared statement's, or its windows over the rows the WHERE passes
+    pub(crate) fn grouped_table(
+        &self,
+        held: &PreparedGrouped,
+        run: &PreparedRunner<'_>,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<WindowOutput> {
+        let prepared = held
+            .rows_read()
+            .ok_or_else(|| Error::internal("a grouped statement without its table's read"))?;
+        let stmt = &held.stmt;
+        if held.classification.has_aggregation {
+            return self.prepared_aggregate(stmt, ctx, (run, prepared), table);
+        }
+        let names = table.schema().column_names_arc();
+        match self.window_table_rows(stmt, ctx, (run, prepared), table, (&names, None))? {
+            WindowRows::Answer(result) => Ok((result, None)),
+            WindowRows::Rows(rows, sorted, grouped) => {
+                self.window_over(stmt, ctx, (&rows, &names), (sorted, grouped), Some(run))
+            }
+        }
+    }
+
     /// The rows of `stmt`, which aggregates the rows of `table`: its one row
     /// or its groups from where the plan's rule says, else from every row
     /// the WHERE passes fed to the calls; its windows over them
@@ -12495,16 +12609,16 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         table: &dyn Table,
     ) -> Result<WindowOutput> {
         let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
-        let plan = prepared.plan.as_ref();
         let windows = prepared.windowed;
+        let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
         if PreparedSelect::groups(stmt) || windows {
             let columns = table.schema().column_names_arc();
-            if let Some(read) = plan.and_then(|plan| plan.read.grouped()) {
-                let run = (ctx, None);
+            if let Some(read) = prepared.read.and_then(Read::grouped) {
+                let run = (ctx, blocks);
                 if let Some(result) =
                     self.grouped_aggregate(table, stmt, aggregations, read, run, &columns)?
                 {
@@ -12512,10 +12626,10 @@ impl Executor {
                 }
             }
             return self.table_input(stmt, ctx, (runner, prepared), table, |input| {
-                self.grouped_answer(windows, stmt, aggregations, ctx, input, &columns)
+                self.grouped_answer(windows, stmt, (aggregations, blocks), ctx, input, &columns)
             });
         }
-        let source = plan.and_then(|plan| plan.read.aggregated());
+        let source = prepared.read.and_then(Read::aggregated);
         let source = source.unwrap_or(GlobalSource::Scan);
         let pushed = match (source, stmt.where_clause.as_deref()) {
             (GlobalSource::StorageFiltered, Some(where_clause)) => {
@@ -12529,35 +12643,78 @@ impl Executor {
         let scan = || {
             let columns = table.schema().column_names_arc();
             self.table_input(stmt, ctx, (runner, prepared), table, |input| {
-                self.global_row(aggregations, &columns, ctx, None, input)
+                self.global_row(aggregations, &columns, ctx, blocks, input)
                     .map(Some)
             })
         };
         let source = (source, pushed.as_deref());
-        let result = self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)?;
+        let result = self.global_answer(table, stmt, (aggregations, source), ctx, blocks, scan)?;
         let result = result
             .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))?;
         Ok((result, None))
     }
 
+    /// The rows of `table`, of `names`, the window functions of `stmt`
+    /// compute over: through the plan's index read, every row without a
+    /// WHERE, else every row the WHERE passes; or the index read's answer
+    fn window_table_rows(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
+        table: &dyn Table,
+        (names, plan): (&[String], Option<&super::window::WindowPlan<'_>>),
+    ) -> Result<WindowRows> {
+        let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
+        let indexed = match prepared.read.and_then(Read::window) {
+            Some(read) if !keeps_none => {
+                self.read_window_rows(read, (stmt, plan), ctx, table, names)?
+            }
+            _ => None,
+        };
+        if let Some(rows) = indexed {
+            return Ok(rows);
+        }
+        // Without a WHERE the table hands over every row at once
+        if prepared.where_.conjuncts == 0 {
+            return Ok(WindowRows::Rows(table.collect_all_rows(None)?, None, None));
+        }
+        let mut rows = RowVec::new();
+        if !keeps_none {
+            let keep = |id: i64, _: u64, row: Row| {
+                rows.push((id, row));
+                true
+            };
+            let read = (prepared.where_, prepared.scan());
+            match runner.passing_rows(read, None, table, ctx, None, Take::Collected, keep)? {
+                Passing::Pruned | Passing::Read => {}
+                Passing::Answers(answers) => rows = answers,
+                Passing::Scan(scan) => rows = runner.drain(scan, None)?,
+                Passing::Filtered(scan, bound) => rows = runner.drain(scan, Some(bound))?,
+            }
+        }
+        Ok(WindowRows::Rows(rows, None, None))
+    }
+
     /// `stmt`'s groups of `aggregations` from the rows of `input`, of
     /// `columns`: ended as every aggregate path ends them, or the window
-    /// functions over them when `windows`
+    /// functions over them when `windows`; its `blocks` answer its subqueries
     fn grouped_answer(
         &self,
         windows: bool,
         stmt: &SelectStatement,
-        aggregations: &[SqlAggregateFunction],
+        (aggregations, blocks): (&[SqlAggregateFunction], Option<&dyn SubqueryExecutor>),
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         columns: &[String],
     ) -> Result<WindowOutput> {
         let path = AggregatePath::HashGroups;
         if windows {
-            return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, None);
+            return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, blocks);
         }
         let stmts = (stmt, stmt);
-        let result = self.aggregate_input(path, stmts, aggregations, ctx, input, columns, None)?;
+        let result =
+            self.aggregate_input(path, stmts, aggregations, ctx, input, columns, blocks)?;
         Ok((result, None))
     }
 
@@ -12569,18 +12726,21 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         source: StatementSource<'_>,
         columns: &[String],
     ) -> Result<WindowOutput> {
         let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
         let windows = prepared.windowed;
+        let calls = (
+            aggregations,
+            prepared.blocks.then_some(runner as &dyn SubqueryExecutor),
+        );
         // Without a WHERE the rows a source holds are fed as they are, and a
         // stream's as it hands them over, however many: held to split them
         // over the thread pool, every row would be held
         let unfiltered = stmt.where_clause.is_none();
-        let aggregate =
-            |input| self.grouped_answer(windows, stmt, aggregations, ctx, input, columns);
+        let aggregate = |input| self.grouped_answer(windows, stmt, calls, ctx, input, columns);
         let source = match source {
             StatementSource::Rows(_, rows) if unfiltered => {
                 return aggregate(FeedInput::<StreamedRows<'_>>::Rows(&rows))
@@ -12620,18 +12780,18 @@ impl Executor {
             )
         };
         self.passed_input(stmt, ctx, run, (hold, hint), read, |input| {
-            self.grouped_answer(windows, stmt, aggregations, ctx, input, columns)
+            self.grouped_answer(windows, stmt, calls, ctx, input, columns)
         })
     }
 
     /// The calls of `stmt`, which `prepared` holds when no run changes them
     fn prepared_calls<'p>(
         &self,
-        prepared: &'p PreparedSelect,
+        prepared: RowsRead<'p>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<std::borrow::Cow<'p, [SqlAggregateFunction]>> {
-        Ok(match &prepared.calls {
+        Ok(match prepared.calls {
             Some(calls) => std::borrow::Cow::Borrowed(calls),
             None => std::borrow::Cow::Owned(self.parse_aggregations(stmt, Some(ctx))?.0),
         })
@@ -12643,7 +12803,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         table: &dyn Table,
         feed: impl FnOnce(FeedInput<'_, PassedRows<'_, '_>>) -> Result<T>,
     ) -> Result<T> {
@@ -12651,9 +12811,8 @@ impl Executor {
         // rows decoded from volumes stream, unless the feed splits them over
         // the thread pool
         let hold = !table.narrows_scans();
-        let chosen = prepared.plan.as_ref().and_then(|plan| plan.read.scan());
         let read = |take, keep: &mut dyn FnMut(i64, u64, Row) -> bool| {
-            let read = (&prepared.where_, chosen);
+            let read = (prepared.where_, prepared.scan());
             runner.passing_rows(read, None, table, ctx, None, take, keep)
         };
         let run = (runner, prepared);
@@ -12668,18 +12827,19 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         (hold, hint): (bool, usize),
         read: impl FnOnce(Take, &mut dyn FnMut(i64, u64, Row) -> bool) -> Result<Passing>,
         feed: impl FnOnce(FeedInput<'_, PassedRows<'_, '_>>) -> Result<T>,
     ) -> Result<T> {
         let take = if hold { Take::Collected } else { Take::Stream };
-        let mut kept = RowVec::new();
+        // Made on the first row: the scan's own answers need none
+        let mut kept: Option<RowVec> = None;
         let passing = match prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
             true => Passing::Pruned,
             false => {
                 let mut keep = |id: i64, _: u64, row: Row| {
-                    kept.push((id, row));
+                    kept.get_or_insert_with(RowVec::new).push((id, row));
                     true
                 };
                 read(take, &mut keep)?
@@ -12688,7 +12848,7 @@ impl Executor {
         let held: RowVec;
         let input = match passing {
             Passing::Pruned => FeedInput::Rows(&[]),
-            Passing::Read => FeedInput::Rows(&kept),
+            Passing::Read => FeedInput::Rows(kept.as_deref().map_or(&[], Vec::as_slice)),
             Passing::Answers(rows) => {
                 held = rows;
                 FeedInput::Rows(&held)
@@ -12716,7 +12876,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     fn source_read(
         &self,
-        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         stmt: &SelectStatement,
         source: StatementSource<'_>,
         ctx: &ExecutionContext,
@@ -12725,10 +12885,7 @@ impl Executor {
     ) -> Result<SourceRead> {
         let passing = match source {
             StatementSource::Table(table) => runner.passing_rows(
-                (
-                    &prepared.where_,
-                    prepared.plan.as_ref().and_then(|plan| plan.read.scan()),
-                ),
+                (prepared.where_, prepared.scan()),
                 None,
                 &*table,
                 ctx,
@@ -12737,7 +12894,7 @@ impl Executor {
                 &mut keep,
             ),
             StatementSource::Rows(_, rows) => runner.rows_passing(
-                &prepared.where_,
+                prepared.where_,
                 rows.into_iter().map(Ok),
                 ctx,
                 target,
@@ -12745,7 +12902,7 @@ impl Executor {
             ),
             StatementSource::Stream(_, mut result) => {
                 let filtered = stmt.where_clause.is_some();
-                match runner.source_scan(&prepared.where_, filtered, take) {
+                match runner.source_scan(prepared.where_, filtered, take) {
                     Some(bound) if take == Take::Stream => {
                         return Ok(SourceRead::Stream(result, bound))
                     }
@@ -12755,7 +12912,7 @@ impl Executor {
                         bound,
                     )),
                     None => runner.rows_passing(
-                        &prepared.where_,
+                        prepared.where_,
                         result_rows(&mut *result),
                         ctx,
                         target,
@@ -12763,9 +12920,9 @@ impl Executor {
                     ),
                 }
             }
-            StatementSource::Values(_, values) => match prepared.source_values.as_deref() {
+            StatementSource::Values(_, values) => match prepared.source_values {
                 Some(programs) => runner.rows_passing(
-                    &prepared.where_,
+                    prepared.where_,
                     (0i64..)
                         .zip(programs)
                         .map(|(id, row)| runner.source_row(row).map(|row| (id, row))),
@@ -12774,7 +12931,7 @@ impl Executor {
                     &mut keep,
                 ),
                 None => runner.rows_passing(
-                    &prepared.where_,
+                    prepared.where_,
                     (0i64..)
                         .zip(&values.rows)
                         .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
@@ -12784,7 +12941,7 @@ impl Executor {
                 ),
             },
             StatementSource::Cte((_, rows)) => runner.rows_passing(
-                &prepared.where_,
+                prepared.where_,
                 rows.iter().map(|(id, row)| Ok((*id, row))),
                 ctx,
                 target,
@@ -12923,56 +13080,16 @@ impl Executor {
             let (names, rows, order) = match source {
                 StatementSource::Table(table) => {
                     let names = table.schema().column_names_arc();
-                    // The plan's index read, else the scan it falls back to
-                    let indexed = match prepared.plan.as_ref().and_then(|plan| plan.read.window()) {
-                        Some(read) if !keeps_none => {
-                            let plan = prepared.window.as_ref();
-                            self.read_window_rows(read, (stmt, plan), ctx, &*table, &names)?
-                        }
-                        _ => None,
-                    };
-                    let (rows, order) = match indexed {
-                        Some(WindowRows::Answer(result)) => {
+                    let run = (&runner, prepared.rows_read());
+                    let plan = prepared.window.as_ref();
+                    match self.window_table_rows(stmt, ctx, run, &*table, (&names, plan))? {
+                        WindowRows::Answer(result) => {
                             let output_columns = CompactArc::new(result.columns().to_vec());
                             let visible = self.count_select_columns(stmt);
                             return Ok((result, output_columns, false, visible, None, false));
                         }
-                        Some(WindowRows::Rows(rows, sorted, grouped)) => (rows, (sorted, grouped)),
-                        // Without a WHERE the table hands over every row at once
-                        None if prepared.where_.conjuncts == 0 => {
-                            (table.collect_all_rows(None)?, (None, None))
-                        }
-                        None => {
-                            let mut rows = RowVec::new();
-                            if !keeps_none {
-                                let chosen =
-                                    prepared.plan.as_ref().and_then(|plan| plan.read.scan());
-                                let keep = |id: i64, _: u64, row: Row| {
-                                    rows.push((id, row));
-                                    true
-                                };
-                                let read = (&prepared.where_, chosen);
-                                match runner.passing_rows(
-                                    read,
-                                    None,
-                                    &*table,
-                                    ctx,
-                                    None,
-                                    Take::Collected,
-                                    keep,
-                                )? {
-                                    Passing::Pruned | Passing::Read => {}
-                                    Passing::Answers(answers) => rows = answers,
-                                    Passing::Scan(scan) => rows = runner.drain(scan, None)?,
-                                    Passing::Filtered(scan, bound) => {
-                                        rows = runner.drain(scan, Some(bound))?
-                                    }
-                                }
-                            }
-                            (rows, (None, None))
-                        }
-                    };
-                    (names, rows, order)
+                        WindowRows::Rows(rows, sorted, grouped) => (names, rows, (sorted, grouped)),
+                    }
                 }
                 // Without a WHERE a source hands over its rows as they are,
                 // as a table does
@@ -12993,7 +13110,7 @@ impl Executor {
                             rows.push((id, row));
                             true
                         };
-                        let run = (&runner, &*prepared);
+                        let run = (&runner, prepared.rows_read());
                         let take = (None, Take::Collected);
                         match self.source_read(run, stmt, source, ctx, take, keep)? {
                             SourceRead::Passing(Passing::Pruned | Passing::Read) => {}
@@ -13034,7 +13151,7 @@ impl Executor {
                 StatementSource::Table(table) => table.schema().column_names_arc(),
                 other => CompactArc::new(other.columns().unwrap_or_default().to_vec()),
             };
-            let run = (&runner, &*prepared);
+            let run = (&runner, prepared.rows_read());
             let (result, windows_layout) = match source {
                 StatementSource::Table(table) => {
                     self.prepared_aggregate(stmt, ctx, run, &*table)?
@@ -13300,7 +13417,7 @@ impl Executor {
             _ if keeps_none => Passing::Pruned,
             (Some(rows), _) => Passing::Answers(rows),
             (None, source) => {
-                let run = (&runner, &*prepared);
+                let run = (&runner, prepared.rows_read());
                 match self.source_read(run, stmt, source, ctx, (target, take), &mut keep)? {
                     SourceRead::Passing(passing) => passing,
                     SourceRead::Stream(result, bound) => {

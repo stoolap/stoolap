@@ -3473,19 +3473,17 @@ impl Executor {
         )))
     }
 
-    /// The one group of `aggregations`, every row of `table` fed to it; the
-    /// statement's `blocks` answer what the calls ask of each row
+    /// The one group of `aggregations`, every row of `table` fed to it
     pub(super) fn global_scan_rows(
         &self,
         table: &dyn crate::storage::traits::Table,
         aggregations: &[SqlAggregateFunction],
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<RowVec> {
         let columns = table.schema().column_names_lower_arc();
         let mut scanner = table.scan(&[], None)?;
         let input = FeedInput::Each(ScannedRows(&mut *scanner), table.row_count_hint());
-        let rows = self.global_row(aggregations, &columns, ctx, blocks, input)?;
+        let rows = self.global_row(aggregations, &columns, ctx, None, input)?;
         scanner.close()?;
         Ok(rows)
     }
