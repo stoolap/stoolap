@@ -2596,6 +2596,9 @@ impl Executor {
             }
             Expression::Case(case) => {
                 // Extract aggregates from CASE expression
+                if let Some(value) = &case.value {
+                    self.extract_aggregates_from_expr(value, aggregations, non_agg_columns, ctx)?;
+                }
                 for when_clause in &case.when_clauses {
                     self.extract_aggregates_from_expr(
                         &when_clause.condition,
@@ -2642,17 +2645,42 @@ impl Executor {
             Expression::QuantifiedSet(set) => {
                 self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns, ctx)?;
             }
-            Expression::In(in_expr) if expression_contains_aggregate(&in_expr.left) => {
+            Expression::In(in_expr) => {
+                for expr in [&in_expr.left, &in_expr.right] {
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
+                }
+            }
+            Expression::AllAny(all_any) => {
                 self.extract_aggregates_from_expr(
-                    &in_expr.left,
+                    &all_any.left,
                     aggregations,
                     non_agg_columns,
                     ctx,
                 )?;
             }
-            Expression::AllAny(all_any) if expression_contains_aggregate(&all_any.left) => {
+            Expression::Between(between) => {
+                for expr in [&between.expr, &between.lower, &between.upper] {
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
+                }
+            }
+            Expression::Like(like) => {
+                for expr in [&like.left, &like.pattern].into_iter().chain(&like.escape) {
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
+                }
+            }
+            Expression::ExpressionList(list) => {
+                for expr in &list.expressions {
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
+                }
+            }
+            Expression::List(list) => {
+                for expr in &list.elements {
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
+                }
+            }
+            Expression::Distinct(distinct) => {
                 self.extract_aggregates_from_expr(
-                    &all_any.left,
+                    &distinct.expr,
                     aggregations,
                     non_agg_columns,
                     ctx,
@@ -2723,35 +2751,6 @@ impl Executor {
                         self.extract_aggregates_from_expr(arg, aggregations, non_agg_columns, ctx)?;
                     }
                 }
-            }
-            Expression::Case(case) => {
-                // Extract aggregates from CASE, but keep the alias as the column name
-                for when_clause in &case.when_clauses {
-                    self.extract_aggregates_from_expr(
-                        &when_clause.condition,
-                        aggregations,
-                        non_agg_columns,
-                        ctx,
-                    )?;
-                    self.extract_aggregates_from_expr(
-                        &when_clause.then_result,
-                        aggregations,
-                        non_agg_columns,
-                        ctx,
-                    )?;
-                }
-                if let Some(ref else_val) = case.else_value {
-                    self.extract_aggregates_from_expr(
-                        else_val,
-                        aggregations,
-                        non_agg_columns,
-                        ctx,
-                    )?;
-                }
-            }
-            Expression::Cast(cast) => {
-                // Extract aggregates from CAST expression (e.g., CAST(SUM(val) AS TEXT) AS sum_text)
-                self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns, ctx)?;
             }
             _ => {
                 self.extract_aggregates_from_expr(
