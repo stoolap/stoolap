@@ -3665,8 +3665,10 @@ impl FrozenVolume {
         Ok(row)
     }
 
-    /// [`Self::get_row_needed`] written over `row`, whose allocation it keeps
-    pub fn fill_row_needed(
+    /// [`Self::get_row_needed`] written over `row`, whose allocation it keeps:
+    /// `row` is empty, or the last row this call wrote from this volume with
+    /// the same `needed`, as a scanner's own row is
+    pub(super) fn fill_row_needed(
         &self,
         idx: usize,
         needed: &[bool],
@@ -3679,7 +3681,10 @@ impl FrozenVolume {
                 if ci < needed.len() && needed[ci] {
                     *value = self.cell(ci, idx)?;
                 } else {
-                    debug_assert!(value.is_null(), "an unneeded column holds a value");
+                    debug_assert!(
+                        matches!(value, Value::Null(t) if *t == self.columns.data_type(ci)),
+                        "an unneeded column holds a value"
+                    );
                 }
             }
             return Ok(());
@@ -4365,6 +4370,76 @@ mod tests {
             want.to_bits(),
             "typed sum {got}, by rows {want}"
         );
+    }
+
+    /// A volume of `schema` holding `rows`, ids from 1
+    fn frozen(schema: &Schema, rows: Vec<Vec<Value>>) -> FrozenVolume {
+        let mut builder = VolumeBuilder::with_capacity(schema, rows.len());
+        for (id, values) in (1..).zip(rows) {
+            builder.add_row(id, &Row::from_values(values));
+        }
+        builder.finish().unwrap()
+    }
+
+    fn null_types(row: &Row) -> Vec<Option<DataType>> {
+        row.iter()
+            .map(|value| match value {
+                Value::Null(t) => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_filled_again_with_its_mask_reads_as_a_new_one() {
+        let ts = chrono::Utc::now();
+        let volume = frozen(
+            &test_schema(),
+            (1..=3)
+                .map(|i| {
+                    vec![
+                        Value::Integer(i),
+                        Value::Timestamp(ts),
+                        Value::text(format!("x{i}")),
+                        Value::Float(i as f64),
+                    ]
+                })
+                .collect(),
+        );
+        let needed = [false, true, true, false];
+        let mut row = Row::new();
+        for idx in [0, 1, 2, 0] {
+            volume.fill_row_needed(idx, &needed, &mut row).unwrap();
+            let fresh = volume.get_row_needed(idx, &needed).unwrap();
+            assert_eq!(row.as_slice(), fresh.as_slice(), "row {idx}");
+            assert_eq!(null_types(&row), null_types(&fresh), "row {idx}");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an unneeded column holds a value")]
+    fn a_row_of_another_volume_is_refused() {
+        let ts = chrono::Utc::now();
+        let first = frozen(
+            &test_schema(),
+            vec![vec![
+                Value::Integer(1),
+                Value::Timestamp(ts),
+                Value::text("a"),
+                Value::Float(1.0),
+            ]],
+        );
+        let other_schema = SchemaBuilder::new("other")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("b", DataType::Integer, false, false)
+            .column("c", DataType::Integer, false, false)
+            .build();
+        let other = frozen(&other_schema, vec![(1..=4).map(Value::Integer).collect()]);
+        let needed = [true, false, false, false];
+        let mut row = first.get_row_needed(0, &needed).unwrap();
+        let _ = other.fill_row_needed(0, &needed, &mut row);
     }
 
     #[test]
