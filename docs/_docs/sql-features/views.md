@@ -41,6 +41,8 @@ CREATE VIEW v AS SELECT a, a FROM t;        -- error: column 'a' is named more t
 CREATE VIEW v AS SELECT a, a AS a2 FROM t;  -- columns a, a2
 ```
 
+A `SELECT *` over a join names each column by its own name, so a view over `t JOIN u` whose tables share a column name, such as `id`, is refused the same way; select the columns with aliases instead.
+
 A view created by an earlier release has no recorded names: the first query that reads it records the ones its query gives, and a statement that prepares a subquery over it runs it once more for that, the only time it does. The recorded names are the view's columns from then on. Renaming a column of a table the view reads keeps the view's name for it. If the view's query later gives a different number of columns, for example `SELECT *` after `ALTER TABLE ... ADD COLUMN`, reading the view is an error until the view is created again.
 
 ## Dropping Views

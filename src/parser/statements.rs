@@ -591,6 +591,7 @@ impl Parser<'_> {
                     token: self.cur_token.clone(),
                     subquery: Box::new(subquery),
                     alias,
+                    keeps_names: false,
                 })));
             } else if self.cur_token_is_keyword(Keyword::Values) {
                 // Parse VALUES clause as table source

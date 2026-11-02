@@ -1122,19 +1122,12 @@ fn test_classifier_rules() {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
         assert!(error(&db, sql, ()).0.contains(want), "{sql}");
     }
-    let no = [(
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv ON uv.id = u.id) \
-             AS q WHERE q.v = t.a)"
-            .to_string(),
-        "a derived table selecting * over a join",
-    )];
-    for (sql, reason) in &no {
-        assert_eq!(
-            prepared_line(&db, sql),
-            format!("Prepared: no ({reason})"),
-            "{sql}"
-        );
-    }
+    // A derived table over a join's star names each column by its own name,
+    // here v of both sides
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN uv \
+               ON uv.id = u.id) AS q WHERE q.v = t.a)";
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    assert!(error(&db, sql, ()).0.contains("is ambiguous"), "{sql}");
     assert_eq!(
         prepared_line(&db, "SELECT id FROM t WHERE b = 1 ORDER BY id"),
         "",
@@ -3254,6 +3247,9 @@ fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by
                 .to_string(),
             "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 ORDER BY a"
                 .to_string(),
+            "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 \
+             ORDER BY a, (SELECT 1)"
+                .to_string(),
         ] {
             assert_eq!(
                 error(&db, &sql, ()).0,
@@ -3261,10 +3257,6 @@ fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by
                 "{sql}"
             );
         }
-        // The derived table names a star's columns over a join `l.a` and `r.a`
-        let sql = "SELECT * FROM t l CROSS JOIN t r UNION ALL SELECT 0, 0, 0, 0, 0, 0 \
-                   ORDER BY a, (SELECT 1)";
-        assert_eq!(error(&db, sql, ()).0, "column 'a' not found", "{sql}");
         let prepared = db.prepare(&format!("{DUP} ORDER BY a LIMIT $1")).unwrap();
         let err = prepared
             .query((2,))

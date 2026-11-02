@@ -655,6 +655,7 @@ fn substitute_in_table_expr(
                     token: source.token.clone(),
                     subquery: Box::new(select),
                     alias: source.alias.clone(),
+                    keeps_names: source.keeps_names,
                 }))
             })
         }

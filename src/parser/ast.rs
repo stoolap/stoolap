@@ -1501,6 +1501,9 @@ pub struct SubqueryTableSource {
     pub token: Token,
     pub subquery: Box<SelectStatement>,
     pub alias: Option<Identifier>,
+    /// The rows of a set operation its ORDER BY subquery reads, whose columns
+    /// keep the names the set operation shows; false for a written one
+    pub keeps_names: bool,
 }
 
 impl fmt::Display for SubqueryTableSource {
