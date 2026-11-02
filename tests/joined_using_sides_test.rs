@@ -180,8 +180,16 @@ fn check_shapes(db: &Database, context: &str, shapes: &[&str], wrong: &mut Vec<S
                         .replace("{f}", &from_on)
                         .replace("{id}", "t.id");
                     count += 1;
-                    let (got, want) = (answer(db, &sql), answer(db, &want));
-                    if got.is_err() || got != want {
+                    // A prepared statement's bare merged name that another
+                    // table also has is ambiguous
+                    let ambiguous =
+                        shape.contains("{id}") && others.contains(".id") && sql.contains("(SELECT");
+                    let want = match ambiguous {
+                        true => Err("invalid argument: column reference 'id' is ambiguous".into()),
+                        false => answer(db, &want),
+                    };
+                    let got = answer(db, &sql);
+                    if (got.is_err() && !ambiguous) || got != want {
                         wrong.push(format!("{context}: {sql}: {got:?}, want {want:?}"));
                     }
                     let line = prepared_line(db, &sql);
