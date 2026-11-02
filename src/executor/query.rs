@@ -5896,6 +5896,7 @@ impl Executor {
                 let classification = get_classification(stmt);
                 blocks.holds_subqueries = classification.where_has_subqueries
                     || classification.output_has_subqueries
+                    || classification.grouped_has_subqueries
                     || Self::ons_hold_subqueries(join_source);
                 blocks.check_output_names(stmt)?;
             }

@@ -10286,14 +10286,18 @@ impl JoinBlocks {
         }
         let scopes = [&self.scope];
         let chain = Chain { scopes: &scopes };
-        let aliases: Vec<&str> = stmt
-            .columns
-            .iter()
-            .filter_map(|c| match c {
-                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-                _ => None,
-            })
-            .collect();
+        // Only a bare name reads an alias
+        let aliases: Vec<&str> = match self.holds_subqueries {
+            true => stmt
+                .columns
+                .iter()
+                .filter_map(|c| match c {
+                    Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            false => Vec::new(),
+        };
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
         // A named window only as its windows read it
         let windows = Executor::used_window_defs(stmt);
