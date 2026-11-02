@@ -154,6 +154,10 @@ fn check(db: &Database, mode: &str) {
         format!(
             "SELECT ROW_NUMBER() OVER w FROM b JOIN {shared} ON TRUE WINDOW w AS (ORDER BY d.id)"
         ),
+        format!(
+            "SELECT ROW_NUMBER() OVER (w ORDER BY b.y) FROM b JOIN {shared} ON TRUE \
+             WINDOW w AS (PARTITION BY d.id)"
+        ),
     ] {
         match answer(db, &sql) {
             Err(e) if e.contains("is ambiguous") => {}
@@ -187,6 +191,30 @@ fn check(db: &Database, mode: &str) {
             wrong.push(format!(
                 "{mode}: {sql}: {:?}, want {want:?}",
                 answer(db, sql)
+            ));
+        }
+    }
+    // A named window part no window reads names nothing
+    for (sql, want) in [
+        (
+            format!(
+                "SELECT 7 FROM b JOIN {shared} ON TRUE WHERE b.bid = 1 WINDOW w AS (ORDER BY d.id)"
+            ),
+            vec!["7", "7"],
+        ),
+        (
+            format!(
+                "SELECT ROW_NUMBER() OVER (w ORDER BY b.y) FROM b JOIN {shared} ON TRUE \
+                 WHERE b.bid = 1 WINDOW w AS (ORDER BY d.id)"
+            ),
+            vec!["1", "2"],
+        ),
+    ] {
+        let want: Vec<String> = want.into_iter().map(String::from).collect();
+        if answer(db, &sql) != Ok(want.clone()) {
+            wrong.push(format!(
+                "{mode}: {sql}: {:?}, want {want:?}",
+                answer(db, &sql)
             ));
         }
     }

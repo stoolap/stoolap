@@ -10269,19 +10269,19 @@ impl JoinBlocks {
         let scopes = [&self.scope];
         let chain = Chain { scopes: &scopes };
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
-        stmt.columns
+        // A named window only as its windows read it
+        let windows = Executor::used_window_defs(stmt);
+        let checked = stmt
+            .columns
             .iter()
             .map(unaliased)
             .chain(&stmt.group_by.columns)
             .chain(stmt.having.as_deref())
             .chain(keys)
             .chain(&stmt.distinct_on)
-            .chain(
-                stmt.window_defs
-                    .iter()
-                    .flat_map(WindowDefinition::expressions),
-            )
-            .try_for_each(|expr| check(&chain, expr))
+            .chain(windows.iter().flat_map(WindowDefinition::expressions))
+            .try_for_each(|expr| check(&chain, expr));
+        checked
     }
 
     /// Whether a SELECT item, ORDER BY key or DISTINCT ON key runs a block
