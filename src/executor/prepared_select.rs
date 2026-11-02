@@ -3340,16 +3340,15 @@ pub(super) fn names_any(expr: &Expression, matches: &impl Fn(&str) -> bool) -> b
     }
 }
 
-/// Whether a name outside any subquery of `expr`, bare or the column of a
-/// qualified one, passes `matches`
-pub(super) fn names_any_column(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
+/// Whether a qualified name sits outside any subquery or aggregate call of `expr`
+pub(super) fn qualifies_outside_aggregates(expr: &Expression, registry: &FunctionRegistry) -> bool {
     match expr {
-        Expression::Identifier(id) => matches(&id.value_lower),
-        Expression::QualifiedIdentifier(q) => matches(&q.name.value_lower),
+        Expression::QualifiedIdentifier(_) => true,
+        Expression::FunctionCall(call) if registry.is_aggregate(&call.function) => false,
         other => {
             let mut found = false;
             let _ = for_each_child(other, &mut |child| {
-                found |= names_any_column(child, matches);
+                found |= qualifies_outside_aggregates(child, registry);
                 Ok(())
             });
             found

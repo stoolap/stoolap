@@ -199,6 +199,10 @@ fn a_computed_grouped_key_sorts_as_the_same_key_written_as_an_item() {
                 "SELECT k, COUNT(*) AS x FROM t GROUP BY k ORDER BY t.x + 0",
                 "Column 't.x' not found",
             ),
+            (
+                "SELECT COUNT(*) FROM t JOIN u ON t.id = u.id GROUP BY t.s ORDER BY u.s || ''",
+                "Column 'u.s' not found",
+            ),
         ] {
             match rows(&db, sql, 0) {
                 Err(e) if e.contains(error) => {}

@@ -2762,9 +2762,9 @@ impl Executor {
 
     /// The grouped `stmt` with each ORDER BY key computed over its groups,
     /// which no column holds, as a hidden item named by its identity that the
-    /// sort reads as a column. A key holding a subquery or a name, qualified
-    /// or not, that a SELECT alias has stays, and so do keys under ROLLUP,
-    /// CUBE or GROUPING SETS
+    /// sort reads as a column. A key holding a subquery, a name a SELECT alias
+    /// has or a qualified name outside its aggregates stays, and so do keys
+    /// under ROLLUP, CUBE or GROUPING SETS
     pub(crate) fn with_order_by_items(&self, stmt: &SelectStatement) -> Option<SelectStatement> {
         let windowed = stmt
             .columns
@@ -2799,7 +2799,8 @@ impl Executor {
             if read
                 || Self::item_computing(stmt, key).is_some()
                 || Self::has_subqueries(key)
-                || super::prepared_select::names_any_column(key, &alias)
+                || super::prepared_select::names_any(key, &alias)
+                || super::prepared_select::qualifies_outside_aggregates(key, registry)
             {
                 continue;
             }
