@@ -153,6 +153,35 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT g, COUNT(*) AS n FROM t GROUP BY g ORDER BY n, g",
         "SELECT g, COUNT(*) AS n FROM t WHERE id + 0 = id GROUP BY g ORDER BY n, g",
     ),
+    // A WHERE holding subqueries passes the rows the runner aggregates
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, COUNT(*), SUM(a) FROM t WHERE a IN (SELECT a FROM t WHERE id > 1) GROUP BY g",
+        "SELECT g, COUNT(*), SUM(a) FROM t WHERE id + 0 = id \
+         AND a IN (SELECT a FROM t WHERE id > 1) GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, MAX(a) FROM t AS o \
+         WHERE EXISTS (SELECT 1 FROM t WHERE t.g = o.g AND t.id <> o.id) GROUP BY g",
+        "SELECT g, MAX(a) FROM t AS o WHERE id + 0 = id \
+         AND EXISTS (SELECT 1 FROM t WHERE t.g = o.g AND t.id <> o.id) GROUP BY g",
+    ),
+    (
+        "sealed",
+        "global_scan",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE a IN (SELECT a FROM t WHERE id > 1)",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE id + 0 = id \
+         AND a IN (SELECT a FROM t WHERE id > 1)",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT g, COUNT(*) FROM t WHERE a IN (SELECT a FROM t) GROUP BY g",
+        "SELECT g, COUNT(*) FROM t WHERE id + 0 = id AND a IN (SELECT a FROM t) GROUP BY g",
+    ),
     // Only COUNT counts the rows of a star; any other call of one is grouped
     // from the rows the read passes
     (

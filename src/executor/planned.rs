@@ -101,7 +101,7 @@ impl Executor {
         // A statement that aggregates its rows; one whose row the table
         // keeps whole is answered from there before its run
         let aggregating = PreparedSelect::aggregates(stmt);
-        let aggregates = PreparedSelect::runs_aggregate(stmt);
+        let aggregates = PreparedSelect::runs_aggregate(stmt, &shape);
         if aggregates {
             #[cfg(feature = "test-failpoints")]
             if crate::test_failpoints::prepared_families_off() {
@@ -137,7 +137,7 @@ impl Executor {
                 || shape.has_distinct_on
                 || shape.has_set_operations)
         {
-            self.planned_family(stmt, Some(ctx)).ok()?;
+            self.planned_family(stmt, &shape, Some(ctx)).ok()?;
         }
         // Read before the schema: a change in between leaves this behind
         let validity = self.select_validity(stmt, epoch);
