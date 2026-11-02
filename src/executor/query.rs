@@ -667,15 +667,14 @@ fn merged_columns(
     }
 }
 
-/// `all_columns`, the names of joined rows holding each of the pairs
-/// `merges` apart, with each pair's left column named bare, as the
-/// merged column a bare name reads; a right column no qualifier names takes
-/// a name no reference spells, as only that merged column answers its name
-fn merged_names(all_columns: &[String], merges: &[(usize, usize)]) -> Vec<String> {
-    let mut named = all_columns.to_vec();
+/// `named`, the names of joined rows holding each of the pairs `merges`
+/// apart, renamed in place: each pair's left column bare, as the merged
+/// column a bare name reads; a right column no qualifier names takes a name
+/// no reference spells, as only that merged column answers its name
+fn merged_names(mut named: Vec<String>, merges: &[(usize, usize)]) -> Vec<String> {
     for &(left, right) in merges {
-        named[left] = bare_name(&all_columns[left]).to_string();
-        if split_qualified(&all_columns[right]).is_none() {
+        named[left] = bare_name(&named[left]).to_string();
+        if split_qualified(&named[right]).is_none() {
             named[right] = format!("\u{0}merged#{right}");
         }
     }
@@ -9670,7 +9669,7 @@ impl Executor {
         let mut merge = Some(merge);
         // Apart, a bare name reads each pair's left column, as the blocks do
         let (columns, rows) = match apart {
-            Some(blocks) => (merged_names(&columns, blocks.merges()), rows),
+            Some(blocks) => (merged_names(columns, blocks.merges()), rows),
             None => match merge.take() {
                 Some(merge) => merge(columns, rows),
                 None => (columns, rows),
@@ -11775,7 +11774,7 @@ impl Executor {
     ) -> Result<JoinOutput> {
         // The rows hold each merged pair apart: a bare name reads its left
         // column, and a star shows that one alone, as the general path does
-        let named = merged_names(all_columns, blocks.merges());
+        let named = merged_names(all_columns.to_vec(), blocks.merges());
         let shown = blocks.star_columns();
         let star = Some((&shown[..], &named[..]));
         let (projection, extra_names, extra_sources) = PreparedProjection::prepare_joined(
