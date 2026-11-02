@@ -2760,6 +2760,90 @@ impl Executor {
         })
     }
 
+    /// The grouped `stmt` with each ORDER BY key computed over its groups,
+    /// which no column holds, as a hidden item named by its identity that the
+    /// sort reads as a column; a SELECT alias in it reads its item where no
+    /// column of `source_columns` has its name. A key holding a subquery, or
+    /// reading an alias whose item computing again would not give, stays
+    pub(crate) fn with_order_by_items(
+        &self,
+        stmt: &SelectStatement,
+        source_columns: &[String],
+    ) -> Option<SelectStatement> {
+        let windowed = stmt
+            .columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .any(QueryClassification::expression_has_window_function);
+        if stmt.order_by.is_empty()
+            || !stmt.set_operations.is_empty()
+            || windowed
+            || stmt.columns.iter().any(is_star_item)
+        {
+            return None;
+        }
+        let registry = &self.function_registry;
+        let unrepeatable: smallvec::SmallVec<[&str; 2]> = stmt
+            .columns
+            .iter()
+            .filter_map(|column| match column {
+                Expression::Aliased(item)
+                    if Self::has_subqueries(&item.expression)
+                        || expression_volatility(&item.expression, registry)
+                            == Volatility::PerCall =>
+                {
+                    Some(item.alias.value_lower.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        // Built with the first key carried, as a statement with none allocates nothing
+        let mut aliases = None;
+        let mut columns: Option<Vec<Expression>> = None;
+        for ob in &stmt.order_by {
+            let key = &ob.expression;
+            let read = match key {
+                Expression::Identifier(_)
+                | Expression::QualifiedIdentifier(_)
+                | Expression::IntegerLiteral(_) => true,
+                Expression::FunctionCall(call) => registry.is_aggregate(&call.function),
+                _ => false,
+            };
+            if read
+                || Self::item_computing(stmt, key).is_some()
+                || Self::has_subqueries(key)
+                || super::prepared_select::names_any(key, &|name| unrepeatable.contains(&name))
+            {
+                continue;
+            }
+            let name = ExprKey::of(key).hidden_column_name();
+            let columns = columns.get_or_insert_with(|| stmt.columns.clone());
+            if columns
+                .iter()
+                .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == name))
+            {
+                continue;
+            }
+            let aliases = aliases.get_or_insert_with(|| {
+                Self::build_alias_map_excluding(&stmt.columns, Some(source_columns))
+            });
+            let expression = match aliases.is_empty() {
+                true => key.clone(),
+                false => Self::substitute_aliases(key, aliases),
+            };
+            let token = dummy_token(&name, TokenType::Identifier);
+            columns.push(Expression::Aliased(AliasedExpression {
+                token: token.clone(),
+                expression: Box::new(expression),
+                alias: Identifier::new(token, name),
+            }));
+        }
+        columns.map(|columns| SelectStatement {
+            columns,
+            ..stmt.clone()
+        })
+    }
+
     /// Count the number of columns in the SELECT clause
     pub(crate) fn count_select_columns(&self, stmt: &SelectStatement) -> usize {
         // Check for SELECT * or SELECT t.* anywhere in the select list
