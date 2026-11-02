@@ -13448,7 +13448,7 @@ fn with_key_windows(
         keys.resize_with(at, || None);
         keys.push(Some(window_items(
             &ob.expression,
-            registry,
+            (&stmt.window_defs, registry),
             columns,
             &mut drawn,
         )?));
@@ -13467,15 +13467,26 @@ fn with_key_windows(
 /// identity, unless the window draws new values, which gets one at each place
 fn window_items(
     key: &Expression,
-    registry: &FunctionRegistry,
+    (defs, registry): (&[WindowDefinition], &FunctionRegistry),
     columns: &mut Vec<Expression>,
     drawn: &mut usize,
 ) -> Result<Expression> {
     match key {
         Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(key.clone()),
-        Expression::Window(_) => {
+        Expression::Window(window) => {
             let identity = ExprKey::of(key).hidden_column_name();
-            let name = match volatile(key, registry) {
+            // The window a name refers to draws values as its OVER would
+            let draws = volatile(key, registry)
+                || window
+                    .resolved(defs)
+                    .is_some_and(|(partition_by, order_by, frame)| {
+                        partition_by
+                            .iter()
+                            .chain(order_by.iter().map(|ob| &ob.expression))
+                            .chain(frame.into_iter().flat_map(WindowFrame::offsets))
+                            .any(|expr| volatile(expr, registry))
+                    });
+            let name = match draws {
                 true => {
                     *drawn += 1;
                     format!("{identity}#{drawn}")
@@ -13496,7 +13507,7 @@ fn window_items(
             Ok(Expression::Identifier(Identifier::new(token, &name)))
         }
         other => rebuild(other, &mut |child| {
-            window_items(child, registry, columns, drawn)
+            window_items(child, (defs, registry), columns, drawn)
         }),
     }
 }
