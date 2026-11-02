@@ -21,6 +21,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::pattern::Pattern;
 use crate::core::{Operator, Schema};
 use crate::executor::expression::SharedProgram;
+use crate::executor::grouped_aggregate::GroupedSource;
 use crate::executor::planned_aggregate::GlobalSource;
 use crate::executor::prepared_select::PreparedComparison;
 use crate::executor::projection::Projection;
@@ -110,6 +111,15 @@ pub enum Read {
         column: Option<SmartString>,
         otherwise: Box<Read>,
     },
+    /// The groups of an aggregate by the one column `group`, named and
+    /// placed, from `source`, else by the index walk when `walks`; the rows
+    /// of `otherwise` grouped when the table cannot answer so in this run
+    Grouped {
+        source: GroupedSource,
+        group: (SmartString, usize),
+        walks: bool,
+        otherwise: Box<Read>,
+    },
     /// The rows nearest the query vector of an ORDER BY of a vector
     /// distance, as many as the LIMIT and OFFSET keep, for the statement's
     /// sort to order; `otherwise` when the table cannot read them so in
@@ -158,7 +168,8 @@ impl Read {
             Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.scan(),
             Self::DistinctValues { otherwise, .. }
             | Self::Window { otherwise, .. }
-            | Self::Aggregated { otherwise, .. } => otherwise.scan(),
+            | Self::Aggregated { otherwise, .. }
+            | Self::Grouped { otherwise, .. } => otherwise.scan(),
             Self::Source(_) => None,
             Self::Scan(scan)
             | Self::Ordered {
@@ -208,6 +219,20 @@ impl Read {
     pub fn aggregated(&self) -> Option<GlobalSource> {
         match self {
             Self::Aggregated { source, .. } => Some(*source),
+            _ => None,
+        }
+    }
+
+    /// Where an aggregate's groups come from, the group column, and whether
+    /// the index walk reads them, for a plan that groups by one column
+    pub fn grouped(&self) -> Option<(GroupedSource, (&str, usize), bool)> {
+        match self {
+            Self::Grouped {
+                source,
+                group: (name, at),
+                walks,
+                ..
+            } => Some((*source, (name.as_str(), *at), *walks)),
             _ => None,
         }
     }
@@ -374,6 +399,29 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
                     alternative(lines, format!("StorageFiltered {table} {pushed}"))
                 }
                 _ => {}
+            }
+            read_lines(otherwise, text, lines);
+        }
+        (
+            Read::Grouped {
+                source,
+                group: (group, _),
+                walks,
+                otherwise,
+            },
+            _,
+        ) => {
+            let table = text.table;
+            match source {
+                GroupedSource::Storage => {
+                    alternative(lines, format!("StorageGrouped {table} ({group})"));
+                    if *walks {
+                        alternative(lines, format!("SortedStream {table} ({group})"));
+                    }
+                }
+                GroupedSource::SortedStream | GroupedSource::Hash => {
+                    alternative(lines, format!("SortedStream {table} ({group})"));
+                }
             }
             read_lines(otherwise, text, lines);
         }

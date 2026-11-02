@@ -31,7 +31,7 @@ use super::Executor;
 /// Where a statement that groups one table by one column, without WHERE,
 /// reads its groups from
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GroupedSource {
+pub enum GroupedSource {
     /// Every group computed by the table over its rows; a run the table
     /// declines walks the column's index when it may
     Storage,
@@ -113,7 +113,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         classification: &QueryClassification,
-        ctx: &ExecutionContext,
+        (ctx, runs): (&ExecutionContext, bool),
         schema: &Schema,
     ) -> Result<Option<AggregatePlan>> {
         if classification.has_where
@@ -132,7 +132,10 @@ impl Executor {
         else {
             return Ok(None);
         };
-        let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx))?;
+        let (aggregations, non_aggregated) = match runs {
+            true => self.parse_aggregations(stmt, Some(ctx))?,
+            false => self.parse_aggregation_shape(stmt)?,
+        };
         // The SELECT list reads the group column and aggregate calls only
         let group_item = |expr: &Expression| {
             let inner = match expr {
@@ -173,27 +176,20 @@ impl Executor {
         }))
     }
 
-    /// `stmt`'s groups over `table` from the source `plan` holds; None for
-    /// the hash grouping, which the scan does. Inlined into the table scan,
-    /// it costs that scan's loop more per row
+    /// `stmt`'s groups of `aggregations` over `table` by the column `group`,
+    /// named and placed, from `source`, else by the index walk when `walks`;
+    /// None for the hash grouping, which the scan does. Inlined into the
+    /// table scan, it costs that scan's loop more per row
     #[inline(never)]
     pub(crate) fn grouped_aggregate(
         &self,
         table: &dyn Table,
         stmt: &SelectStatement,
-        plan: &AggregatePlan,
+        aggregations: &[SqlAggregateFunction],
+        (source, (group, group_index), walks): (GroupedSource, (&str, usize), bool),
         ctx: &ExecutionContext,
         all_columns: &[String],
     ) -> Result<Option<Box<dyn QueryResult>>> {
-        let AggregateRead::Grouped {
-            source,
-            group: (group, group_index),
-            walks,
-        } = &plan.read
-        else {
-            return Ok(None);
-        };
-        let (aggregations, group_index) = (&plan.aggregations, *group_index);
         let columns = Self::call_columns(aggregations, all_columns);
         let stored = match source {
             GroupedSource::Storage => {
@@ -203,8 +199,8 @@ impl Executor {
         };
         let rows = match stored {
             Some(rows) => (AggregatePath::StorageGrouped, rows),
-            None if *walks => {
-                let group = (group.as_str(), group_index);
+            None if walks => {
+                let group = (group, group_index);
                 match self.sorted_groups(
                     table,
                     stmt,

@@ -154,16 +154,16 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT g, COUNT(*) AS n FROM t WHERE id + 0 = id GROUP BY g ORDER BY n, g",
     ),
     // Only COUNT counts the rows of a star; any other call of one is grouped
-    // by the general path
+    // from the rows the read passes
     (
         "memory",
-        "general",
+        "hash_groups",
         "SELECT g, SUM(*) FROM t GROUP BY g LIMIT 1",
         "SELECT g, SUM(*) FROM t WHERE id + 0 = id GROUP BY g LIMIT 1",
     ),
     (
         "memory",
-        "general",
+        "hash_groups",
         "SELECT g, MAX(*) FROM t GROUP BY g LIMIT 1",
         "SELECT g, MAX(*) FROM t WHERE id + 0 = id GROUP BY g LIMIT 1",
     ),
@@ -331,6 +331,100 @@ const CASES: &[(&str, &str, &str, &str)] = &[
          HAVING COUNT(*) > 1) LIMIT 10",
         "SELECT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u \
          WHERE u.g = t.g AND u.id + 0 = u.id HAVING COUNT(*) > 1) LIMIT 10",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 GROUP BY g, s",
+        "SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 AND id + 0 = id GROUP BY g, s",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 GROUP BY g, s",
+        "SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 AND id + 0 = id GROUP BY g, s",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g + 1 AS k, AVG(a), MIN(s) FROM t GROUP BY g + 1 HAVING COUNT(a) > 0",
+        "SELECT g + 1 AS k, AVG(a), MIN(s) FROM t WHERE id + 0 = id GROUP BY g + 1 \
+         HAVING COUNT(a) > 0",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, SUM(a) FROM t GROUP BY ROLLUP (g, s) ORDER BY 1, 2",
+        "SELECT g, SUM(a) FROM t WHERE id + 0 = id GROUP BY ROLLUP (g, s) ORDER BY 1, 2",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, s, COUNT(*), GROUPING(g) FROM t GROUP BY CUBE (g, s)",
+        "SELECT g, s, COUNT(*), GROUPING(g) FROM t WHERE id + 0 = id GROUP BY CUBE (g, s)",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, s, SUM(a) FROM t GROUP BY GROUPING SETS ((g), (s), ())",
+        "SELECT g, s, SUM(a) FROM t WHERE id + 0 = id GROUP BY GROUPING SETS ((g), (s), ())",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT DISTINCT COUNT(*) FROM t WHERE a > 0 GROUP BY g",
+        "SELECT DISTINCT COUNT(*) FROM t WHERE a > 0 AND id + 0 = id GROUP BY g",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g FROM t WHERE a IS NOT NULL GROUP BY g ORDER BY SUM(a) DESC LIMIT 1 OFFSET 1",
+        "SELECT g FROM t WHERE a IS NOT NULL AND id + 0 = id GROUP BY g ORDER BY SUM(a) DESC \
+         LIMIT 1 OFFSET 1",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT s, COUNT(DISTINCT a), STRING_AGG(s, ',' ORDER BY id) FROM t GROUP BY s",
+        "SELECT s, COUNT(DISTINCT a), STRING_AGG(s, ',' ORDER BY id) FROM t \
+         WHERE id + 0 = id GROUP BY s",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT COUNT(*), SUM(a) FROM t HAVING SUM(a) > 1",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE id + 0 = id HAVING SUM(a) > 1",
+    ),
+    (
+        "memory",
+        "stats",
+        "SELECT DISTINCT SUM(a) > 0 FROM t",
+        "SELECT DISTINCT SUM(a) > 0 FROM t WHERE id + 0 = id",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT COUNT(*), MAX(a) FROM t HAVING COUNT(*) = 0",
+        "SELECT COUNT(*), MAX(a) FROM t WHERE id + 0 = id HAVING COUNT(*) = 0",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT g, COUNT(*) FROM t WHERE a > 0 GROUP BY g",
+        "SELECT g, COUNT(*) FROM t WHERE a > 0 AND id + 0 = id GROUP BY g",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT 42 AS answer, COUNT(*) FROM t WHERE id = 1 GROUP BY GROUPING SETS (())",
+        "SELECT 42 AS answer, COUNT(*) FROM t WHERE id = 1 AND id + 0 = id \
+         GROUP BY GROUPING SETS (())",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, COUNT(*) FROM t WHERE FALSE GROUP BY g",
+        "SELECT g, COUNT(*) FROM t WHERE FALSE AND id + 0 = id GROUP BY g",
     ),
     (
         "empty",
@@ -557,7 +651,7 @@ fn a_having_that_calls_a_scalar_function_is_not_judged_inside_the_index_walk() {
     let (got, taken) = run(&db, sql);
     assert_eq!(
         taken,
-        ["general"],
+        ["hash_groups"],
         "a memory table's B-tree walk holds its index lock while it judges HAVING"
     );
     let (plain, _) = run(&db, "SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 10");
@@ -604,7 +698,7 @@ fn a_having_that_calls_a_native_function_is_not_judged_inside_the_index_walk() {
     let (got, taken) = run(&db, sql);
     assert_eq!(
         taken,
-        ["general"],
+        ["hash_groups"],
         "a native pointer runs user code under the walk's index lock as well"
     );
     let (plain, _) = run(&db, "SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 10");

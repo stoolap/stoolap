@@ -118,13 +118,14 @@ impl Executor {
     /// The plan of `stmt`, which aggregates one table of `schema` whose
     /// ordered indexes `indexed` names: its calls and the source the rules
     /// pick; None for a statement the aggregation of its read rows answers.
-    /// Inlined into the table scan, it costs that scan's loop more per row
+    /// The calls' extra arguments are read only for a run, `runs`. Inlined
+    /// into the table scan, it costs that scan's loop more per row
     #[inline(never)]
     pub(crate) fn aggregate_read_plan(
         &self,
         stmt: &SelectStatement,
         classification: &QueryClassification,
-        ctx: &ExecutionContext,
+        (ctx, runs): (&ExecutionContext, bool),
         schema: &Schema,
         indexed: impl Fn(&str) -> bool,
     ) -> Result<Option<AggregatePlan>> {
@@ -132,7 +133,7 @@ impl Executor {
             return Ok(None);
         }
         if classification.has_group_by {
-            return self.grouped_read_plan(stmt, classification, ctx, schema);
+            return self.grouped_read_plan(stmt, classification, (ctx, runs), schema);
         }
         if classification.has_having {
             return Ok(None);
@@ -142,7 +143,10 @@ impl Executor {
         if classification.has_where && classification.where_has_subqueries {
             return Ok(None);
         }
-        let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx))?;
+        let (aggregations, non_aggregated) = match runs {
+            true => self.parse_aggregations(stmt, Some(ctx))?,
+            false => self.parse_aggregation_shape(stmt)?,
+        };
         let pushed = match stmt.where_clause.as_deref() {
             Some(where_clause) => {
                 match super::pushdown::try_pushdown(where_clause, schema, Some(ctx)) {
@@ -606,7 +610,7 @@ impl Executor {
         let schema = store.schema_and_token().0;
         let indexed = |column: &str| bounds(store.get_index_by_column(column));
         let plan = self
-            .aggregate_read_plan(stmt, &shape, ctx, &schema, indexed)
+            .aggregate_read_plan(stmt, &shape, (ctx, false), &schema, indexed)
             .ok()??;
         let mut reads = Vec::new();
         let mut by = None;
@@ -792,7 +796,7 @@ impl Executor {
         let schema = store.schema_and_token().0;
         let indexed = |column: &str| bounds(store.get_index_by_column(column));
         let plan = self
-            .aggregate_read_plan(stmt, &shape, ctx, &schema, indexed)
+            .aggregate_read_plan(stmt, &shape, (ctx, false), &schema, indexed)
             .ok()??;
         let AggregateRead::Global { source, .. } = plan.read else {
             return None;

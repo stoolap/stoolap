@@ -66,7 +66,7 @@ mod dml;
 mod explain;
 pub(crate) mod expr_key;
 mod foreign_key;
-mod grouped_aggregate;
+pub(crate) mod grouped_aggregate;
 mod index_optimizer;
 mod plan_reads;
 pub(crate) mod planned;

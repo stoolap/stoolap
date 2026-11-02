@@ -462,7 +462,7 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
-use super::planned_aggregate::{bounds, AggregateRead};
+use super::planned_aggregate::{bounds, AggregatePlan, AggregateRead};
 use super::planned_join::{pick_index_join_side, JoinShape};
 use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
@@ -4059,15 +4059,32 @@ impl Executor {
         if classification.has_aggregation && !classification.has_window_functions {
             // One row or the groups, from the source the rules pick
             let indexed = |column: &str| bounds(table.get_index_on_column(column));
+            let run = (ctx, true);
             let plan =
-                self.aggregate_read_plan(stmt, classification, ctx, table.schema(), indexed)?;
+                self.aggregate_read_plan(stmt, classification, run, table.schema(), indexed)?;
             let result = match &plan {
-                Some(plan) if matches!(plan.read, AggregateRead::Global { .. }) => {
+                Some(
+                    plan @ AggregatePlan {
+                        read: AggregateRead::Global { .. },
+                        ..
+                    },
+                ) => {
                     let run = (classification.as_ref(), plan);
                     self.global_aggregate(table.as_ref(), stmt, run, ctx, blocks)?
                 }
-                Some(plan) => {
-                    self.grouped_aggregate(table.as_ref(), stmt, plan, ctx, &all_columns)?
+                Some(AggregatePlan {
+                    aggregations,
+                    read:
+                        AggregateRead::Grouped {
+                            source,
+                            group: (group, at),
+                            walks,
+                        },
+                    ..
+                }) => {
+                    let read = (*source, (group.as_str(), *at), *walks);
+                    let calls = aggregations.as_slice();
+                    self.grouped_aggregate(table.as_ref(), stmt, calls, read, ctx, &all_columns)?
                 }
                 None => None,
             };
