@@ -57,7 +57,9 @@ impl Executor {
             match &*held {
                 CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
                     // The runner reads a statement prepared for the tables as they are
-                    p.key_read()?;
+                    if !p.answers_first() {
+                        return None;
+                    }
                     // A context of other CTEs than it was planned in may hide its table
                     if ctx.is_none_or(|ctx| p.cte_scope.holds(ctx)) {
                         #[cfg(feature = "test-failpoints")]
@@ -78,6 +80,8 @@ impl Executor {
             }
         }
         let planned = self.plan_into(stmt, compiled, classification, ctx?, epoch)?;
+        // The run that plans reads through its view; a count or bound the
+        // table keeps answers the runs after it
         planned.key_read()?;
         Some(run(&planned))
     }
@@ -96,8 +100,8 @@ impl Executor {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
         };
-        // A statement that aggregates its rows, unless the aggregate plan
-        // holds it whole
+        // A statement that aggregates its rows; one whose row the table
+        // keeps whole is answered from there before its run
         let aggregating = PreparedSelect::aggregates(stmt);
         let aggregates = PreparedSelect::runs_aggregate(stmt);
         if aggregates {
@@ -105,10 +109,11 @@ impl Executor {
             if crate::test_failpoints::prepared_families_off() {
                 return None;
             }
-            if self.held_aggregate(stmt, ctx).is_some() {
-                return None;
-            }
         }
+        let quiet = match aggregates {
+            true => self.aggregate_plan(stmt, ctx),
+            false => None,
+        };
         if aggregating && !aggregates
             || shape.has_window_functions
                 && (shape.has_set_operations || shape.grouped_has_subqueries)
@@ -174,6 +179,7 @@ impl Executor {
                     (counts.offset, counts.limit),
                 );
             }
+            prepared.quiet = quiet;
             Arc::new(prepared)
         });
         let mut slot = compiled.write().ok()?;
@@ -200,7 +206,6 @@ impl Executor {
     ) -> Option<Vec<String>> {
         self.explain_planned(stmt, ctx, true)
             .or_else(|| self.explain_over_source(stmt, ctx))
-            .or_else(|| self.explain_aggregate(stmt, ctx))
     }
 
     /// The plan the planner makes of `stmt` over its table in `ctx`, as
@@ -325,6 +330,12 @@ impl Executor {
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         self.with_planned(stmt, compiled, classification, ctx, |planned| {
+            // The table's count or bound sees no open transaction's writes
+            // and no statement's view: those read the plan's rows
+            if let Some(quiet) = &planned.quiet {
+                let ctx = ctx.filter(|ctx| !in_txn && ctx.statement_view().is_none())?;
+                return self.run_quiet_aggregate(stmt, quiet, ctx);
+            }
             if let Some(ctx) = ctx {
                 // In a transaction the normal path arms a timeout; every
                 // statement refuses a cancel

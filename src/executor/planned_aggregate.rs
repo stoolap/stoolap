@@ -15,24 +15,19 @@
 //! A statement that aggregates one table into one row: the one rule that
 //! says where its values come from, and the run of that source
 
-use std::sync::{Arc, RwLock};
-
-use smallvec::SmallVec;
+use std::sync::Arc;
 
 use crate::common::{CompactArc, CompactVec, SmartString};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
-use crate::planner::{steps_over, ScanChoice, Step};
 use crate::storage::expression::Expression as StorageExpr;
-use crate::storage::mvcc::index_plan;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
-use crate::storage::traits::{Engine, Index, QueryResult, Table};
+use crate::storage::traits::{Index, QueryResult, Table};
 
 use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateFunction};
 use super::context::ExecutionContext;
 use super::expression::SubqueryExecutor;
 use super::grouped_aggregate::GroupedSource;
-use super::query_cache::{CompiledExecution, PlanValidity};
 use super::query_classification::{get_classification, QueryClassification};
 use super::Executor;
 
@@ -101,7 +96,8 @@ pub(crate) enum AggregateRead {
 }
 
 /// A statement without WHERE whose one row is one count the table keeps or
-/// an index's bound, planned once and run before the statement is classified
+/// an index's bound, held with its plan and answered before the run opens
+/// the statement's snapshot
 #[derive(Debug)]
 pub struct PlannedAggregate {
     source: GlobalSource,
@@ -111,7 +107,6 @@ pub struct PlannedAggregate {
     source_columns: CompactArc<Vec<String>>,
     /// The output names of a SELECT list of nothing but the calls
     alone: Option<CompactArc<Vec<String>>>,
-    pub(crate) validity: PlanValidity,
 }
 
 impl Executor {
@@ -485,33 +480,15 @@ impl Executor {
         .map(Some)
     }
 
-    /// `stmt` run by the aggregate plan `compiled` holds: one count the table
+    /// `stmt` answered by `planned`, held with its plan: one count the table
     /// keeps or an index's bound, read through committed state. None for the
-    /// regular path to answer, as it does the run that plans
-    pub(crate) fn run_planned_aggregate(
+    /// plan's rows to answer, when the table cannot answer so in this run
+    pub(crate) fn run_quiet_aggregate(
         &self,
         stmt: &SelectStatement,
-        compiled: &RwLock<CompiledExecution>,
+        planned: &PlannedAggregate,
         ctx: &ExecutionContext,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        let epoch = self.engine.schema_epoch();
-        let held = match &*compiled.read().ok()? {
-            CompiledExecution::GlobalAggregate(p) if p.validity.holds(&*self.engine, epoch) => {
-                Some(Arc::clone(p))
-            }
-            CompiledExecution::NotOptimizable(validity) if validity.holds(&*self.engine, epoch) => {
-                return None
-            }
-            CompiledExecution::Unknown
-            | CompiledExecution::NotOptimizable(_)
-            | CompiledExecution::GlobalAggregate(_) => None,
-            _ => return None,
-        };
-        // The run that plans is the regular path's, through its view
-        let Some(planned) = held else {
-            self.plan_aggregate(stmt, compiled, ctx, epoch);
-            return None;
-        };
         if let Err(error) = ctx.check_cancelled() {
             return Some(Err(error));
         }
@@ -552,175 +529,23 @@ impl Executor {
         run().transpose()
     }
 
-    /// The aggregate plan of `stmt`, kept in `compiled`; a statement it does
-    /// not take is kept as one the plan declines while its tables hold
-    fn plan_aggregate(
-        &self,
-        stmt: &SelectStatement,
-        compiled: &RwLock<CompiledExecution>,
-        ctx: &ExecutionContext,
-        epoch: u64,
-    ) {
-        let validity = self.select_validity(stmt, epoch);
-        let planned = self.aggregate_plan(stmt, ctx, validity.clone());
-        let Ok(mut slot) = compiled.write() else {
-            return;
-        };
-        if matches!(
-            &*slot,
-            CompiledExecution::Unknown
-                | CompiledExecution::NotOptimizable(_)
-                | CompiledExecution::GlobalAggregate(_)
-        ) {
-            *slot = match planned {
-                Some(planned) => CompiledExecution::GlobalAggregate(planned),
-                None => CompiledExecution::NotOptimizable(validity),
-            };
-        }
-    }
-
-    /// The plan of `stmt` as EXPLAIN shows it when it aggregates one table
-    /// from the source a rule picks, with the reads a run the table declines
-    /// takes; None for a statement the aggregation of its read rows answers,
-    /// which the general format shows
-    pub(crate) fn explain_aggregate(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-    ) -> Option<Vec<String>> {
-        let shape = get_classification(stmt);
-        if !shape.has_aggregation
-            || shape.has_set_operations
-            || shape.has_cte
-            || shape.has_distinct_on
-            || shape.has_joins
-            || shape.output_has_subqueries
-            || shape.where_has_subqueries
-        {
-            return None;
-        }
-        let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
-            return None;
-        };
-        let table = &ts.name.value_lower;
-        if ts.as_of.is_some() || ctx.get_cte_by_lower(table).is_some() {
-            return None;
-        }
-        let store = self.engine.get_version_store(table).ok()?;
-        let schema = store.schema_and_token().0;
-        let indexed = |column: &str| bounds(store.get_index_by_column(column));
-        let plan = self
-            .aggregate_read_plan(stmt, &shape, (ctx, false), &schema, indexed)
-            .ok()??;
-        let mut reads = Vec::new();
-        let mut by = None;
-        match &plan.read {
-            AggregateRead::Global { source, .. } => match source {
-                GlobalSource::IndexBound => {
-                    let column = bare_column(&plan.aggregations[0]);
-                    reads.push(format!("IndexBound {table} ({column})"));
-                    reads.push(format!("else Stats {table}"));
-                    reads.push(format!("else SeqScan {table}"));
-                }
-                GlobalSource::Stats => {
-                    reads.push(format!("Stats {table}"));
-                    reads.push(format!("else SeqScan {table}"));
-                }
-                // A WHERE the table declines is read by the scan, through the
-                // indexes the WHERE it reads picks
-                GlobalSource::StorageFiltered => {
-                    let where_clause = stmt.where_clause.as_deref()?;
-                    reads.push(format!("StorageFiltered {table} {where_clause}"));
-                    let columns = schema.column_names_arc();
-                    let aliases = Self::build_alias_map_excluding(&stmt.columns, Some(&columns));
-                    let rewritten = Self::scan_where(stmt, &aliases);
-                    let scan_where = rewritten.as_deref().unwrap_or(where_clause);
-                    let scan = super::pushdown::try_pushdown(scan_where, &schema, Some(ctx))
-                        .0
-                        .and_then(|pushed| index_plan::decide(&store, &schema, &*pushed, false))
-                        .map_or(ScanChoice::Seq, |plan| {
-                            ScanChoice::Index(plan, std::sync::Arc::downgrade(&store))
-                        });
-                    let lines = scan.explain(table, Some(scan_where));
-                    for (at, line) in lines.into_iter().enumerate() {
-                        reads.push(if at == 0 {
-                            format!("else {line}")
-                        } else {
-                            line
-                        });
-                    }
-                }
-                GlobalSource::Scan
-                    if stmt.where_clause.is_none()
-                        && Self::streams_calls(&shape, &plan.aggregations, plan.plain) =>
-                {
-                    reads.push(format!("SeqScan {table}"));
-                }
-                GlobalSource::Scan => return None,
-            },
-            AggregateRead::Grouped {
-                source,
-                group: (group, _),
-                walks,
-            } => {
-                match source {
-                    GroupedSource::Storage => {
-                        reads.push(format!("StorageGrouped {table} ({group})"));
-                        if *walks {
-                            reads.push(format!("else SortedStream {table} ({group})"));
-                        }
-                    }
-                    GroupedSource::SortedStream | GroupedSource::Hash => {
-                        reads.push(format!("SortedStream {table} ({group})"));
-                    }
-                }
-                reads.push(format!("else SeqScan {table}"));
-                by = Some(group.clone());
-            }
-        }
-        let items: Vec<String> = stmt.columns.iter().map(super::utils::item_name).collect();
-        let head = match by {
-            Some(group) => format!("Aggregate {} by {group}", items.join(", ")),
-            None => format!("Aggregate {}", items.join(", ")),
-        };
-        let below = std::iter::once(head)
-            .chain(reads.into_iter().map(|line| format!("  {line}")))
-            .collect();
-        // The DISTINCT over the aggregate's rows, and the HAVING over its groups
-        let mut inner = SmallVec::<[Step; 2]>::new();
-        if stmt.distinct {
-            inner.push(Step::Distinct);
-        }
-        if stmt.having.is_some() {
-            inner.push(Step::Having);
-        }
-        let steps = Self::finishing_steps(stmt, &inner);
-        Some(steps_over(
-            &steps,
-            &Self::finishing_text(stmt, table),
-            below,
-        ))
-    }
-
     /// The plan of a statement over one table, without WHERE, grouping,
     /// ORDER BY, LIMIT or OFFSET, whose one row is one count the table keeps
     /// or an index's bound
-    fn aggregate_plan(
+    pub(crate) fn aggregate_plan(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        validity: PlanValidity,
-    ) -> Option<Arc<PlannedAggregate>> {
+    ) -> Option<PlannedAggregate> {
         let (table, schema, aggregations, source) = self.held_aggregate(stmt, ctx)?;
         let source_columns = schema.column_names_arc();
-        Some(Arc::new(PlannedAggregate {
+        Some(PlannedAggregate {
             alone: Self::calls_alone(stmt, &aggregations).map(CompactArc::new),
             source,
             aggregations,
             table,
             source_columns,
-            validity,
-        }))
+        })
     }
 
     /// What [`Self::global_inputs`] gives for a statement the aggregate plan
@@ -728,7 +553,7 @@ impl Executor {
     /// through no view. Several calls each vouch only for their own read,
     /// and a sum or a column's bound may cross a seal: the statement's
     /// snapshot reads those
-    pub(crate) fn held_aggregate(
+    fn held_aggregate(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
