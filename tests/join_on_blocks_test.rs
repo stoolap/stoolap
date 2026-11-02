@@ -695,10 +695,7 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
                 "SELECT d.id, (SELECT * FROM (SELECT id FROM s) a JOIN (SELECT id FROM s) b \
                  USING (id) LIMIT 1) FROM ({join}) d"
             ),
-            vec![
-                "Prepared: no (a subquery block selecting * over a join that merges columns)",
-                yes,
-            ],
+            vec![yes, yes],
         ),
         (
             format!("SELECT d.id, d.k FROM ({join}) d WHERE d.id > (SELECT MIN(id) FROM s)"),

@@ -489,19 +489,6 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        // A star over a join that merges columns is named only by its run,
-        // which counts its values
-        let branches = std::iter::once(sq).chain(sq.set_operations.iter().map(|op| &*op.right));
-        for branch in branches {
-            if branch.table_expr.as_deref().is_some_and(merges_columns)
-                && branch
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, Expression::Star(_)))
-            {
-                return Err("a subquery block selecting * over a join that merges columns");
-            }
-        }
         let registry = &self.executor.function_registry;
         if statement_form_block(sq, counts_rows, registry) {
             return self.derived(sq);
@@ -623,12 +610,6 @@ impl<'a> Family<'a> {
         self.order(sq, scopes, true)?;
         self.block_from(sq.table_expr.as_deref())?;
         let star = |c: &Expression| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_));
-        // Its run reads the ORDER BY for the positions, so every key is one
-        let position =
-            |ob: &OrderByExpression| matches!(ob.expression, Expression::IntegerLiteral(_));
-        if orders_by_merged_star_position(sq) && !sq.order_by.iter().all(position) {
-            return Err("an EXISTS ordered by position in a star over a NATURAL or USING join, and by a key");
-        }
         let mut found = false;
         for column in &sq.columns {
             if !star(column) {
@@ -2272,7 +2253,8 @@ fn output_width(stmt: &SelectStatement, own: &ScopeTable) -> Result<usize> {
     let mut width = 0;
     for item in &stmt.columns {
         width += match item {
-            Expression::Star(_) => own.columns.len(),
+            // A merged pair shows once
+            Expression::Star(_) => star_columns(own.columns.len(), &own.merged).len(),
             Expression::QualifiedStar(star) => qualified_star_columns(star, own)?.len(),
             _ => 1,
         };
