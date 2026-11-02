@@ -1291,6 +1291,17 @@ impl VolumeScanner {
             return self.materialize_row_from_cache(idx);
         }
 
+        let unmapped = self.row_mapping().is_none();
+        if let (Some(filter), Some(mask), true, true) = (
+            &self.filter,
+            &self.needed_cols,
+            unmapped,
+            self.is_full_projection,
+        ) {
+            self.volume
+                .fill_row_needed(idx, mask, &mut self.current_row)?;
+            return passes(filter.as_ref(), self.filter_fallible, &self.current_row);
+        }
         if let Some(ref filter) = self.filter {
             let full_row = match (&self.needed_cols, self.row_mapping()) {
                 (Some(mask), Some(mapping)) => {
@@ -1330,7 +1341,8 @@ impl VolumeScanner {
         } else if !self.is_full_projection {
             self.current_row = self.volume.get_row_projected(idx, &self.project_cols)?;
         } else if let Some(mask) = &self.needed_cols {
-            self.current_row = self.volume.get_row_needed(idx, mask)?;
+            self.volume
+                .fill_row_needed(idx, mask, &mut self.current_row)?;
         } else {
             self.current_row = self.volume.get_row(idx)?;
         }

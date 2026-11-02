@@ -3660,7 +3660,32 @@ impl FrozenVolume {
     /// Uses LazyColumns::data_type() for unneeded columns to avoid decompression.
     #[inline]
     pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> std::io::Result<Row> {
-        let mut values = Vec::with_capacity(self.columns.len());
+        let mut row = Row::with_capacity(self.columns.len());
+        self.fill_row_needed(idx, needed, &mut row)?;
+        Ok(row)
+    }
+
+    /// [`Self::get_row_needed`] written over `row`, whose allocation it keeps
+    pub fn fill_row_needed(
+        &self,
+        idx: usize,
+        needed: &[bool],
+        row: &mut Row,
+    ) -> std::io::Result<()> {
+        let values = row.values_mut();
+        // A row of the volume's width holds its unneeded columns' NULLs already
+        if values.len() == self.columns.len() {
+            for (ci, value) in values.iter_mut().enumerate() {
+                if ci < needed.len() && needed[ci] {
+                    *value = self.cell(ci, idx)?;
+                } else {
+                    debug_assert!(value.is_null(), "an unneeded column holds a value");
+                }
+            }
+            return Ok(());
+        }
+        values.clear();
+        values.reserve(self.columns.len());
         for ci in 0..self.columns.len() {
             values.push(if ci < needed.len() && needed[ci] {
                 self.cell(ci, idx)?
@@ -3668,7 +3693,7 @@ impl FrozenVolume {
                 Value::Null(self.columns.data_type(ci))
             });
         }
-        Ok(Row::from_values(values))
+        Ok(())
     }
 
     /// Get a row using a mapping, materializing only needed columns.
