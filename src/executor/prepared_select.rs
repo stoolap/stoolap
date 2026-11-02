@@ -12567,12 +12567,11 @@ impl Executor {
         let prepared = held
             .rows_read()
             .ok_or_else(|| Error::internal("a grouped statement without its source's read"))?;
-        let Some(columns) = source.columns() else {
+        if source.columns().is_none() {
             return Err(Error::internal(
                 "a grouped statement read its table as rows",
             ));
-        };
-        let columns = CompactArc::new(columns.to_vec());
+        }
         let stmt = &held.stmt;
         // A table function reads its rows once the blocks answer its arguments
         let source = match (source, held.source_values.as_deref()) {
@@ -12588,13 +12587,13 @@ impl Executor {
             }
             (source, _) => source,
         };
-        let output = match held.windows_alone() {
-            false => self.source_aggregate(stmt, ctx, (run, prepared), source, &columns)?,
-            true => {
-                let (names, rows) = self.window_source_rows(stmt, ctx, (run, prepared), source)?;
-                self.window_over(stmt, ctx, (&rows, &names), (None, None), Some(run))?
-            }
-        };
+        if held.windows_alone() {
+            let (names, rows) = self.window_source_rows(stmt, ctx, (run, prepared), source)?;
+            let output = self.window_over(stmt, ctx, (&rows, &names), (None, None), Some(run))?;
+            return Ok(Some((output, names)));
+        }
+        let columns = CompactArc::new(source.columns().unwrap_or_default().to_vec());
+        let output = self.source_aggregate(stmt, ctx, (run, prepared), source, &columns)?;
         Ok(Some((output, columns)))
     }
 
