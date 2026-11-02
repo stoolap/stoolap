@@ -5882,7 +5882,7 @@ impl Executor {
                 .iter()
                 .map(|key| Some(key).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
-            let blocks = self.prepare_join_blocks(
+            let mut blocks = self.prepare_join_blocks(
                 (join_source, on, Self::inner_on(join_source, join_type)),
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
@@ -5892,8 +5892,12 @@ impl Executor {
                 columns.len(),
                 ctx,
             )?;
-            if let Some(blocks) = &blocks {
-                blocks.check_qualified_names(stmt)?;
+            if let Some(blocks) = blocks.as_mut() {
+                let classification = get_classification(stmt);
+                blocks.holds_subqueries = classification.where_has_subqueries
+                    || classification.output_has_subqueries
+                    || Self::ons_hold_subqueries(join_source);
+                blocks.check_output_names(stmt)?;
             }
             Ok(blocks)
         })
@@ -6179,10 +6183,13 @@ impl Executor {
         let side_merged = blocks
             .as_deref()
             .is_some_and(|held| held.side_merges().next().is_some());
-        // An output the blocks run reads every pair apart and shows it merged
+        // Run apart, the output shows both columns of each pair, as only the
+        // standard path does; else one the blocks run reads every pair apart
+        // and shows it merged
+        let output_blocks = blocks.as_deref().filter(|_| !apart);
         let output_apart = !classification.has_aggregation
             && !classification.has_window_functions
-            && blocks.as_deref().is_some_and(JoinBlocks::runs_output);
+            && output_blocks.is_some_and(JoinBlocks::projects_output);
         let side_merged = side_merged && !output_apart;
         let left_read = SideRead {
             filter: match reads_plain[0] {
@@ -7243,7 +7250,7 @@ impl Executor {
                             stmt,
                             &all_columns,
                             order_limit_applied,
-                            blocks.as_deref(),
+                            output_blocks,
                             ctx,
                         )?
                     };
@@ -7554,14 +7561,8 @@ impl Executor {
                 let merging = blocks.as_deref().filter(|_| side_merged && !apart);
                 let (all_cols, joined_rows) =
                     merged_side_rows(stmt, merging, all_cols, join_result.rows);
-                let held = self.held_join_output(
-                    prepared,
-                    stmt,
-                    &all_cols,
-                    false,
-                    blocks.as_deref(),
-                    ctx,
-                )?;
+                let held =
+                    self.held_join_output(prepared, stmt, &all_cols, false, output_blocks, ctx)?;
                 if let Some(output) = held.as_deref().and_then(Option::as_ref) {
                     return output_result(output, joined_rows, false);
                 }
@@ -7848,14 +7849,8 @@ impl Executor {
         }
         let (final_columns, final_rows) = merge(all_columns, filtered_rows);
 
-        let held = self.held_join_output(
-            prepared,
-            stmt,
-            &final_columns,
-            false,
-            blocks.as_deref(),
-            ctx,
-        )?;
+        let held =
+            self.held_join_output(prepared, stmt, &final_columns, false, output_blocks, ctx)?;
         if let Some(output) = held.as_deref().and_then(Option::as_ref) {
             return output_result(output, final_rows, false);
         }
@@ -11728,12 +11723,14 @@ impl Executor {
         blocks: Option<&JoinBlocks>,
         ctx: &ExecutionContext,
     ) -> Result<Option<JoinOutput>> {
-        if let Some(blocks) = blocks.filter(|blocks| blocks.runs_output()) {
+        if let Some(blocks) = blocks.filter(|blocks| blocks.projects_output()) {
             debug_assert_eq!(
                 blocks.all.len(),
                 all_columns.len(),
                 "joined rows of {all_columns:?} for blocks over another layout"
             );
+            // A set operation's keys sort its whole rows, not its first branch's
+            let sorted = sorted || !stmt.set_operations.is_empty();
             return self
                 .blocks_output(stmt, all_columns, sorted, blocks)
                 .map(Some);

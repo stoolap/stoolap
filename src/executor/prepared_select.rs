@@ -10215,6 +10215,9 @@ pub(crate) struct JoinBlocks {
     pub(crate) all: CompactArc<Vec<String>>,
     /// The joined scope, which the output's names bind in
     scope: ScopeTable,
+    /// Whether the statement holds a subquery anywhere, which puts its
+    /// output and its names on the blocks' rules
+    pub(crate) holds_subqueries: bool,
 }
 
 impl JoinBlocks {
@@ -10261,45 +10264,61 @@ impl JoinBlocks {
 
     /// An error when a SELECT item, grouping, HAVING, sort key or named
     /// window of `stmt` names `table.column` and two columns of that table
-    /// carry the name
-    pub(crate) fn check_qualified_names(&self, stmt: &SelectStatement) -> Result<()> {
-        fn check(chain: &Chain<'_>, expr: &Expression) -> Result<()> {
+    /// carry the name; or, when the statement holds a subquery, names a bare
+    /// name two columns carry that no merge makes one, other than an alias
+    pub(crate) fn check_output_names(&self, stmt: &SelectStatement) -> Result<()> {
+        fn names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str], bare: bool) -> Result<()> {
             match expr {
+                Expression::Identifier(id)
+                    if !bare || aliases.contains(&id.value_lower.as_str()) =>
+                {
+                    Ok(())
+                }
                 // A table or column the joined row lacks is an enclosing one
-                Expression::QualifiedIdentifier(q) => {
-                    match chain.qualified(&q.qualifier.value_lower, &q.name.value_lower, q) {
+                Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                    match chain.resolve(expr) {
                         Err(err) if err.to_string().contains("is ambiguous") => Err(err),
                         _ => Ok(()),
                     }
                 }
-                other => for_each_child(other, &mut |child| check(chain, child)),
+                other => for_each_child(other, &mut |child| names(chain, child, aliases, bare)),
             }
         }
         let scopes = [&self.scope];
         let chain = Chain { scopes: &scopes };
+        let aliases: Vec<&str> = stmt
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+                _ => None,
+            })
+            .collect();
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
         // A named window only as its windows read it
         let windows = Executor::used_window_defs(stmt);
-        let checked = stmt
+        let after_items = stmt
+            .group_by
             .columns
             .iter()
-            .map(unaliased)
-            .chain(&stmt.group_by.columns)
             .chain(stmt.having.as_deref())
             .chain(keys)
             .chain(&stmt.distinct_on)
             .chain(windows.iter().flat_map(WindowDefinition::expressions))
-            .try_for_each(|expr| check(&chain, expr));
+            .map(|expr| (expr, &aliases[..]));
+        let checked = stmt
+            .columns
+            .iter()
+            .map(|item| (unaliased(item), &[][..]))
+            .chain(after_items)
+            .try_for_each(|(expr, aliases)| names(&chain, expr, aliases, self.holds_subqueries));
         checked
     }
 
-    /// Whether a SELECT item, ORDER BY key or DISTINCT ON key runs a block
-    pub(crate) fn runs_output(&self) -> bool {
-        self.select
-            .iter()
-            .chain(&self.order_by)
-            .chain(&self.distinct_on)
-            .any(Option::is_some)
+    /// Whether the blocks project the statement's output: it holds a
+    /// subquery, so the whole statement runs on the plan
+    pub(crate) fn projects_output(&self) -> bool {
+        self.holds_subqueries
     }
 
     /// Every pair the joined row merges, the join's own and its sides',
@@ -10629,6 +10648,7 @@ impl JoinBlocks {
             right,
             all: CompactArc::clone(&scope.columns),
             scope,
+            holds_subqueries: false,
         }))
     }
 
