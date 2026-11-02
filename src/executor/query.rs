@@ -41,8 +41,9 @@ use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult, ScanAccess};
 
-/// Maximum depth for nested views to prevent stack overflow
-const MAX_VIEW_DEPTH: usize = 32;
+/// Maximum depth for nested views to prevent stack overflow. Unoptimized
+/// code takes more stack per level, so a debug build allows fewer
+pub const MAX_VIEW_DEPTH: usize = if cfg!(debug_assertions) { 16 } else { 32 };
 
 /// Threshold below which streaming NOT EXISTS with early termination outperforms
 /// bulk anti-join materialization. Queries with LIMIT below this value use the
@@ -12449,16 +12450,6 @@ impl Executor {
                         set_operation,
                         "rows reached ORDER BY {expr} without a layout"
                     );
-                    // A key read from any item reads the one computing its
-                    // column; a qualified name never reads an output name
-                    if any_item {
-                        if let Some(column) = find_column_for(expr) {
-                            return Some(column);
-                        }
-                        if matches!(expr, Expression::QualifiedIdentifier(_)) {
-                            return None;
-                        }
-                    }
                     let name = match expr {
                         Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
                         Expression::Identifier(id) => &id.value_lower,

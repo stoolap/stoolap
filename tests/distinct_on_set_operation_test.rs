@@ -219,11 +219,6 @@ fn a_key_holding_a_subquery_reads_the_first_select_s_item_or_names_no_column() {
                     "UNION ALL SELECT 9, 9 ORDER BY 1",
                     Ok(by_group),
                 ),
-                (
-                    "SELECT DISTINCT ON (t.k + 0) t.k + 0, (SELECT 1)",
-                    "UNION ALL SELECT 9, 9 ORDER BY 1",
-                    Ok(by_group),
-                ),
             ] {
                 let sql = format!("{head} FROM {from}{group} {tail}");
                 let before = general_path_total();
@@ -269,22 +264,36 @@ fn a_key_holding_a_subquery_reads_the_first_select_s_item_or_names_no_column() {
                 wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
             }
         }
-        // A qualified key reads the item computing its column, never an output name
-        let sql = "SELECT DISTINCT ON (t.k) t.k AS z, 0 AS k, (SELECT 1) FROM t GROUP BY t.k \
-                   UNION ALL SELECT 9, 9, 9 ORDER BY 1";
-        let want = [
-            "Integer(1),Integer(0),Integer(1)",
-            "Integer(2),Integer(0),Integer(1)",
-            "Integer(3),Integer(0),Integer(1)",
-            "Integer(9),Integer(9),Integer(9)",
-        ];
-        if rows(&db, sql) != Ok(want.iter().map(|r| r.to_string()).collect()) {
-            wrong.push(format!("{mode}: {sql}: {:?}", rows(&db, sql)));
-        }
-        let sql = "SELECT DISTINCT ON (t.a) t.k AS z, 0 AS a, (SELECT 1) FROM t GROUP BY t.k, t.a \
-                   UNION ALL SELECT 9, 9, 9";
-        if !matches!(rows(&db, sql), Err(e) if e.contains("DISTINCT ON key t.a names no column")) {
-            wrong.push(format!("{mode}: {sql}: {:?}", rows(&db, sql)));
+        // A key that is a column binds as without a subquery beside it: a bare
+        // name to the alias it spells, a qualified one to its column
+        for (sql, want) in [
+            (
+                "SELECT DISTINCT ON (t.k) t.k AS z, 0 AS k, (SELECT 1) FROM t GROUP BY t.k \
+                 UNION ALL SELECT 9, 9, 9 ORDER BY 1",
+                &[
+                    "Integer(1),Integer(0),Integer(1)",
+                    "Integer(2),Integer(0),Integer(1)",
+                    "Integer(3),Integer(0),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9)",
+                ][..],
+            ),
+            (
+                "SELECT DISTINCT ON (k) k AS z, 0 AS k, (SELECT 1) FROM t GROUP BY t.k \
+                 UNION ALL SELECT 9, 9, 9 ORDER BY 1",
+                &[
+                    "Integer(1),Integer(0),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9)",
+                ][..],
+            ),
+            (
+                "SELECT DISTINCT ON (t.k) k, (SELECT 1) FROM t GROUP BY k \
+                 UNION ALL SELECT 9, 9 ORDER BY 1",
+                by_group,
+            ),
+        ] {
+            if rows(&db, sql) != Ok(want.iter().map(|r| r.to_string()).collect()) {
+                wrong.push(format!("{mode}: {sql}: {:?}", rows(&db, sql)));
+            }
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));

@@ -143,6 +143,7 @@ pub use parallel::{
     DEFAULT_PARALLEL_SORT_THRESHOLD,
 };
 pub use planner::{ColumnStatsCache, QueryPlanner, StatsHealth};
+pub use query::MAX_VIEW_DEPTH;
 pub use query_cache::{
     CacheStats, CachedPlanRef, CachedQueryPlan, NestedPlan, QueryCache, DEFAULT_CACHE_SIZE,
 };

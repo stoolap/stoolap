@@ -9207,9 +9207,10 @@ impl PreparedGrouped {
             window_defs,
             ..stmt.clone()
         };
-        // A set operation's DISTINCT ON reads the whole one's rows, after it
+        // A set operation's DISTINCT ON key holding a subquery reads the whole
+        // one's rows, after it: the run carries no column for it
         if !run_stmt.set_operations.is_empty() {
-            run_stmt.distinct_on.clear();
+            run_stmt.distinct_on.retain(|key| !mentions_subquery(key));
         }
         // A key one of whose blocks, nested ones too, reads an alias of an
         // unrepeatable item is computed over the row the run returns, at its
