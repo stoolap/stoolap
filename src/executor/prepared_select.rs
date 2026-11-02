@@ -77,8 +77,8 @@ use super::utils::{
     bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
     extract_literal_value, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
-    order_by_names_an_alias, split_qualified, strip_table_qualifier, value_to_expression,
-    visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
+    order_by_names_an_alias, qualified, split_qualified, strip_table_qualifier,
+    value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::window::{WindowOutput, WindowRows};
@@ -1007,6 +1007,7 @@ pub(crate) fn set_operation_ordered(stmt: SelectStatement) -> SelectStatement {
                 token,
                 subquery: Box::new(rows),
                 alias: None,
+                keeps_names: true,
             },
         )))),
         where_clause: None,
@@ -1320,10 +1321,16 @@ struct ScopeTable {
 
 impl ScopeTable {
     fn of(name: SmartString, schema: &Schema) -> Self {
+        // A column a join's run names under its table is read by its own name
+        let lower = schema.column_names_lower_arc();
+        let lower = match lower.iter().any(|c| c.contains(QUALIFIER_SEP)) {
+            true => CompactArc::new(lower.iter().map(|c| bare_name(c).to_string()).collect()),
+            false => lower,
+        };
         Self {
             tables: smallvec::smallvec![(name, 0)],
             columns: schema.column_names_arc(),
-            lower: schema.column_names_lower_arc(),
+            lower,
             types: schema.columns.iter().map(|c| c.data_type).collect(),
             bare: schema.columns.len(),
             merged: SmallVec::new(),
@@ -1751,7 +1758,7 @@ impl StatementWalk<'_> {
         enclosing: &[&ScopeTable],
         inside: usize,
         check: Check,
-    ) -> Result<(SelectStatement, Option<Vec<String>>, ScopeTable)> {
+    ) -> Result<(SelectStatement, Vec<String>, ScopeTable)> {
         // Its own CTEs are read by it and the statements inside it alone
         let mark = self.ctes.len();
         let walked = self.statement_in_scope(stmt, enclosing, inside, check);
@@ -1770,9 +1777,9 @@ impl StatementWalk<'_> {
     ) -> Result<WithClause> {
         let mut ctes = Vec::with_capacity(with.ctes.len());
         for cte in &with.ctes {
-            let columns = |names: Option<Vec<String>>| -> Result<Vec<String>> {
+            let columns = |names: Vec<String>| -> Result<Vec<String>> {
                 match cte.column_names.is_empty() {
-                    true => named(names),
+                    true => Ok(names),
                     false => Ok(cte
                         .column_names
                         .iter()
@@ -1809,7 +1816,7 @@ impl StatementWalk<'_> {
         enclosing: &[&ScopeTable],
         inside: usize,
         check: Check,
-    ) -> Result<(SelectStatement, Option<Vec<String>>, ScopeTable)> {
+    ) -> Result<(SelectStatement, Vec<String>, ScopeTable)> {
         let with = match &stmt.with {
             Some(with) => Some(self.with_clause(with, enclosing, inside, check)?),
             None => None,
@@ -1851,11 +1858,11 @@ impl StatementWalk<'_> {
             aliases: Vec::new(),
             ..level.clone()
         };
-        let names = output_names(stmt, &own)?;
+        let names = output_names(stmt, &own, false)?;
         // Its ORDER BY positions count the columns it shows, whether or not
         // it ever runs
         if let Some(position) =
-            crate::parser::scope::order_position_outside(stmt, names.as_ref().map(Vec::len))
+            crate::parser::scope::order_position_outside(stmt, Some(names.len()))
         {
             return Err(Error::invalid_argument(
                 crate::parser::scope::order_position_message(position.value),
@@ -2038,10 +2045,14 @@ impl StatementWalk<'_> {
                 ));
             }
             Expression::SubquerySource(derived) => {
-                let (subquery, names, _) =
+                let (subquery, names, own) =
                     self.statement(&derived.subquery, enclosing, inside, check)?;
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
-                let scope = untyped(&name.unwrap_or_default(), &named(names)?);
+                let name = name.unwrap_or_default();
+                let scope = match derived.keeps_names {
+                    true => untyped(&name, &output_names(&derived.subquery, &own, true)?),
+                    false => untyped(&name, &names),
+                };
                 let walked = SubqueryTableSource {
                     subquery: Box::new(subquery),
                     ..(**derived).clone()
@@ -2232,30 +2243,40 @@ fn spelled_as(stands: Expression, name: String) -> Expression {
     }
 }
 
-/// The names `stmt`'s rows have over its FROM's scope `own`: a star's
-/// columns, every other item by `item_name`; None for a star over a join,
-/// whose names only its run gives
-fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Vec<String>>> {
+/// The names `stmt`'s rows have over its FROM's scope `own` as a source
+/// reads them: a star's columns by their own names, a merged pair once,
+/// every other item by `item_name`; as its run names them when `shown`
+fn output_names(stmt: &SelectStatement, own: &ScopeTable, shown: bool) -> Result<Vec<String>> {
+    let column = |at: usize| match shown {
+        true => run_name(own, at),
+        false => bare_name(&own.columns[at]).to_string(),
+    };
     let mut names = Vec::with_capacity(stmt.columns.len());
     for item in &stmt.columns {
         match item {
-            // A join's columns by their own names, a merged pair once
             Expression::Star(_) => names.extend(
                 star_columns(own.columns.len(), &own.merged)
                     .into_iter()
-                    .map(|at| own.columns[at].clone()),
+                    .map(column),
             ),
             Expression::QualifiedStar(star) => {
-                names.extend(
-                    own.columns[qualified_star_columns(star, own)?]
-                        .iter()
-                        .cloned(),
-                );
+                names.extend(qualified_star_columns(star, own)?.map(column))
             }
             _ => names.push(item_name(item)),
         }
     }
-    Ok(Some(names))
+    Ok(names)
+}
+
+/// The name a statement's run gives column `at` of its FROM's scope `own`:
+/// a join's column under its table's name, unless a merged pair's or of a
+/// table without one
+fn run_name(own: &ScopeTable, at: usize) -> String {
+    let (table, _) = own.table(at);
+    match own.tables.len() < 2 || table.is_empty() || own.merged.iter().any(|m| m.0 == at) {
+        true => own.columns[at].clone(),
+        false => qualified(table, &own.columns[at]),
+    }
 }
 
 /// How many values `stmt`'s rows hold over its FROM's scope `own`, a star
@@ -2285,12 +2306,6 @@ fn qualified_star_columns(
         .find(|(name, _)| **name == *qualifier)
         .ok_or_else(|| Error::invalid_argument(unknown_qualifier(&star.qualifier)))?;
     Ok(own.table(*start).1)
-}
-
-/// The names a walked statement's rows have, or the error of a star over
-/// a join, which a source named before its run cannot carry
-fn named(names: Option<Vec<String>>) -> Result<Vec<String>> {
-    names.ok_or_else(|| Error::internal("a star over a join, named only by its run"))
 }
 
 /// The names of `view`'s columns, recorded when it was created; a view
@@ -5438,7 +5453,7 @@ impl Builder<'_> {
         }
         .statement(stmt, outer, 0, Check::Off)?;
         self.max_param = self.max_param.max(max_param);
-        Ok((reads, named(names)?))
+        Ok((reads, names))
     }
 
     /// Bind the ORDER BY the EXISTS block `sq` runs without, as a block binds
@@ -10235,8 +10250,9 @@ impl JoinBlocks {
             .filter(move |&(left, right)| (left < left_width) == (right < left_width))
     }
 
-    /// An error when a SELECT item, grouping, HAVING or sort key of `stmt`
-    /// names `table.column` and two columns of that table carry the name
+    /// An error when a SELECT item, grouping, HAVING, sort key or named
+    /// window of `stmt` names `table.column` and two columns of that table
+    /// carry the name
     pub(crate) fn check_qualified_names(&self, stmt: &SelectStatement) -> Result<()> {
         fn check(chain: &Chain<'_>, expr: &Expression) -> Result<()> {
             match expr {
@@ -10260,6 +10276,11 @@ impl JoinBlocks {
             .chain(stmt.having.as_deref())
             .chain(keys)
             .chain(&stmt.distinct_on)
+            .chain(
+                stmt.window_defs
+                    .iter()
+                    .flat_map(WindowDefinition::expressions),
+            )
             .try_for_each(|expr| check(&chain, expr))
     }
 
@@ -10710,7 +10731,7 @@ impl Executor {
                         visible: Vec::new(),
                         ctes: Vec::new(),
                     };
-                    named(walk.statement(query, &[], 0, Check::Off)?.1)?
+                    walk.statement(query, &[], 0, Check::Off)?.1
                 }
             };
             registry.store(&cte.name.value, columns, RowVec::new());
@@ -11868,7 +11889,7 @@ impl Executor {
             ctes: Vec::new(),
         }
         .statement(stmt, &[], 0, Check::Off)?;
-        named(names)
+        Ok(names)
     }
 
     /// The tables `select` reads, unknown when one of them is a view or it
@@ -12309,7 +12330,7 @@ impl Executor {
             }
             Some(Expression::SubquerySource(ss)) => {
                 let plan = plan.and_then(|plan| plan.from(stmt));
-                let result = self.execute_source_statement(&ss.subquery, inner_ctx, None, plan)?;
+                let result = self.execute_derived(ss, inner_ctx, plan)?;
                 let columns = result.columns().to_vec();
                 (
                     Some(StatementSource::Stream(columns, result)),

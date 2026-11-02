@@ -1693,7 +1693,23 @@ impl Executor {
         Ok(Box::new(AliasedResult::renamed(result, own)))
     }
 
-    fn select_with_plan(
+    /// The rows of the derived table `source`, its columns named as a source's
+    /// are, or as its statement shows them when it keeps those names
+    pub(crate) fn execute_derived(
+        &self,
+        source: &SubqueryTableSource,
+        ctx: &ExecutionContext,
+        compiled: Option<&NestedPlan>,
+    ) -> Result<Box<dyn QueryResult>> {
+        match source.keeps_names {
+            true => self.select_with_plan(&source.subquery, ctx, None, compiled),
+            false => self.execute_source_statement(&source.subquery, ctx, None, compiled),
+        }
+    }
+
+    /// `execute_select_with_plan` with each column under its internal name,
+    /// which its caller shows as a statement's output or a source's columns
+    pub(crate) fn select_with_plan(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
@@ -1772,7 +1788,7 @@ impl Executor {
                 return self.execute_select_with_ctes(stmt, ctx, compiled);
             }
             if let Some(inlined) = self.try_inline_ctes(stmt, with) {
-                return self.execute_select_with_plan(&inlined, ctx, None, compiled);
+                return self.select_with_plan(&inlined, ctx, None, compiled);
             }
             let snapshot = match ctx.statement_snapshot() {
                 Some(_) => None,
@@ -7947,8 +7963,7 @@ impl Executor {
 
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
-        let body = &subquery_source.subquery;
-        let result = self.execute_source_statement(body, &subquery_ctx, None, plan)?;
+        let result = self.execute_derived(subquery_source, &subquery_ctx, plan)?;
         let columns = result.columns().to_vec();
 
         // Materialize the subquery result directly with synthetic row IDs

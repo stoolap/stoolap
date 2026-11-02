@@ -212,7 +212,7 @@ impl Executor {
         // Get the WITH clause
         let with_clause = match &stmt.with {
             Some(with) => with,
-            None => return self.execute_select_with_plan(stmt, ctx, None, plan),
+            None => return self.select_with_plan(stmt, ctx, None, plan),
         };
 
         // CTE INLINING OPTIMIZATION:
@@ -222,7 +222,7 @@ impl Executor {
         // This is similar to PostgreSQL 12+'s CTE inlining behavior
         if let Some(inlined_stmt) = self.try_inline_ctes(stmt, with_clause) {
             // Execute the rewritten query (without WITH clause or with fewer CTEs)
-            return self.execute_select_with_plan(&inlined_stmt, ctx, None, plan);
+            return self.select_with_plan(&inlined_stmt, ctx, None, plan);
         }
 
         self.run_over_cut_ctes(stmt, with_clause, plan, ctx, |cte_registry| {
@@ -626,7 +626,7 @@ impl Executor {
             prepared: None,
         };
 
-        self.execute_select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan)
+        self.select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan)
     }
 
     /// Execute a query on CTE result data
@@ -1512,6 +1512,7 @@ impl Executor {
                         token: Token::new(TokenType::Punctuator, "(", Position::new(0, 0, 0)),
                         subquery: cte.query.clone(),
                         alias: Some(alias),
+                        keeps_names: false,
                     }))
                 })
             }
@@ -1525,6 +1526,7 @@ impl Executor {
                         token: Token::new(TokenType::Punctuator, "(", Position::new(0, 0, 0)),
                         subquery: cte.query.clone(),
                         alias: Some(alias),
+                        keeps_names: false,
                     }))
                 })
             }
@@ -1558,6 +1560,7 @@ impl Executor {
                             token: sq.token.clone(),
                             subquery: Box::new(new_subquery),
                             alias: sq.alias.clone(),
+                            keeps_names: sq.keeps_names,
                         })));
                     }
                 }

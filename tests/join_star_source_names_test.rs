@@ -56,6 +56,26 @@ fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// The column names of `sql` and its rows in order, or the error
+fn shown(db: &Database, sql: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let columns = rows.columns().to_vec();
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push(
+            (0..row.len())
+                .map(|i| match row.get::<Option<String>>(i) {
+                    Ok(value) => value.unwrap_or_else(|| "NULL".into()),
+                    Err(e) => format!("<{e}>"),
+                })
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+    }
+    Ok((columns, out))
+}
+
 fn check(db: &Database, mode: &str) {
     let source = |s: &str| {
         [
@@ -131,6 +151,9 @@ fn check(db: &Database, mode: &str) {
         format!("SELECT b.y FROM b JOIN {shared} ON TRUE ORDER BY d.id"),
         "WITH d AS (SELECT * FROM a JOIN c ON c.id = a.id) SELECT id FROM d".to_string(),
         "SELECT b.y, d.id FROM b JOIN (SELECT 1 AS id, 2 AS id) AS d ON TRUE".to_string(),
+        format!(
+            "SELECT ROW_NUMBER() OVER w FROM b JOIN {shared} ON TRUE WINDOW w AS (ORDER BY d.id)"
+        ),
     ] {
         match answer(db, &sql) {
             Err(e) if e.contains("is ambiguous") => {}
@@ -145,6 +168,40 @@ fn check(db: &Database, mode: &str) {
             "{mode}: {sql}: {:?}, want {want:?}",
             answer(db, sql)
         ));
+    }
+    // A body with its own WITH names its columns the same way
+    for (sql, want) in [
+        (
+            "SELECT (SELECT COUNT(*) FROM (WITH q AS (SELECT 1 AS id) \
+             SELECT * FROM q JOIN (SELECT 2 AS bid) b ON TRUE) d)",
+            vec!["1"],
+        ),
+        (
+            "SELECT d.id, d.bid FROM (WITH q AS (SELECT 1 AS id) \
+             SELECT * FROM q JOIN (SELECT 2 AS bid) b ON TRUE) d WHERE d.id > (SELECT 0)",
+            vec!["1|2"],
+        ),
+    ] {
+        let want: Vec<String> = want.into_iter().map(String::from).collect();
+        if answer(db, sql) != Ok(want.clone()) {
+            wrong.push(format!(
+                "{mode}: {sql}: {:?}, want {want:?}",
+                answer(db, sql)
+            ));
+        }
+    }
+    // A set operation keeps its names and rows when its ORDER BY holds a subquery
+    let set = "SELECT * FROM a JOIN b ON b.k2 = a.k UNION ALL SELECT 0, 0, 0, 0, 0, 0";
+    for keys in ["y DESC", "6 DESC", "k2, x"] {
+        let plain = format!("{set} ORDER BY {keys}");
+        let keyed = format!("{set} ORDER BY {keys}, (SELECT 0)");
+        if shown(db, &keyed) != shown(db, &plain) {
+            wrong.push(format!(
+                "{mode}: {keyed}: {:?}, want {:?}",
+                shown(db, &keyed),
+                shown(db, &plain)
+            ));
+        }
     }
     // A view whose body names a column twice is refused when created
     match db.execute(

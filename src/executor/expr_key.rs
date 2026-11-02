@@ -557,6 +557,7 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
             if let Some(alias) = &sub.alias {
                 hasher.name(&alias.value_lower);
             }
+            hasher.flag(sub.keeps_names);
             write_statement(&sub.subquery, hasher);
         }
         Expression::JoinSource(join) => {
