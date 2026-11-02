@@ -296,6 +296,32 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, COUNT(*) OVER w, 6 FROM t GROUP BY t.a WINDOW w AS (ORDER BY t.a) \
              ORDER BY t.a",
         ),
+        // A window function in a key holding a subquery runs as an item does
+        shape(
+            "SELECT t.id FROM {t} \
+             ORDER BY (SELECT MIN(u.x) FROM u) + ROW_NUMBER() OVER (ORDER BY t.id DESC) LIMIT 5",
+            "SELECT t.id FROM t ORDER BY ROW_NUMBER() OVER (ORDER BY t.id DESC) LIMIT 5",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER () FROM {t} \
+             ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) * 1000 + RANK() OVER (ORDER BY t.id), \
+             t.id LIMIT 7",
+            "SELECT t.id, SUM(t.b) OVER () FROM t \
+             ORDER BY {count} * 1000 + RANK() OVER (ORDER BY t.id), t.id LIMIT 7",
+        ),
+        shape(
+            "SELECT t.a, COUNT(*) FROM {t} GROUP BY t.a \
+             ORDER BY (SELECT MIN(u.x) FROM u) + RANK() OVER (ORDER BY COUNT(*) DESC, t.a)",
+            "SELECT t.a, COUNT(*) FROM t GROUP BY t.a \
+             ORDER BY RANK() OVER (ORDER BY COUNT(*) DESC, t.a)",
+        ),
+        shape(
+            "SELECT t.id, t.b AS y FROM {t} \
+             ORDER BY (SELECT MIN(u.x) FROM u) + y * 1000 + ROW_NUMBER() OVER (ORDER BY t.id), \
+             t.id LIMIT 6",
+            "SELECT t.id, t.b AS y FROM t \
+             ORDER BY t.b * 1000 + ROW_NUMBER() OVER (ORDER BY t.id), t.id LIMIT 6",
+        ),
         // Over rows that do not group, a key reads each row and its aliases
         shape(
             "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id) FROM {t} \

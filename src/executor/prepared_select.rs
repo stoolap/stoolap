@@ -1282,8 +1282,9 @@ impl Executor {
         if let Some(having) = stmt.having.as_deref() {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
         }
+        // A key's window functions run as items do
         for key in keys {
-            family.expression(key, 1, over, &mut found)?;
+            family.expression(key, 1, list, &mut found)?;
         }
         // A DISTINCT ON key is computed as a SELECT item of the statement is
         for key in &stmt.distinct_on {
@@ -8864,6 +8865,10 @@ impl PreparedGrouped {
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
+        // A window function in an ORDER BY key holding a subquery runs as a
+        // hidden item, an unrepeatable alias the key reads after the windows
+        let key_windows = with_key_windows(stmt);
+        let stmt = key_windows.as_ref().unwrap_or(stmt);
         // A DISTINCT ON key rides as an item named by its identity, here or
         // where a caller keyed the statement, and reads as an ORDER BY key does
         let key_names: SmallVec<[String; 1]> = stmt
@@ -9147,7 +9152,7 @@ impl PreparedGrouped {
                 .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == column.value))
             {
                 let key = alias_blocks(
-                    &ob.expression,
+                    &key_window_aliases(&ob.expression)?,
                     &key_chain,
                     width,
                     &stmt.columns,
@@ -13398,6 +13403,71 @@ fn over_late_row(
             }))
         }
         other => rebuild(other, &mut |child| over_late_row(child, place)),
+    }
+}
+
+/// The window functions outside any subquery of `expr`
+fn windows_outside_blocks<'e>(expr: &'e Expression, found: &mut Vec<&'e Expression>) {
+    match expr {
+        Expression::Window(_) => found.push(expr),
+        other => {
+            let _ = for_each_child(other, &mut |child| {
+                windows_outside_blocks(child, found);
+                Ok(())
+            });
+        }
+    }
+}
+
+/// `stmt` with each window function outside the subqueries of an ORDER BY
+/// key holding a subquery as a hidden item named by its identity, which the
+/// key reads by that name once the windows ran; None when there is none
+fn with_key_windows(stmt: &SelectStatement) -> Option<SelectStatement> {
+    if !stmt.set_operations.is_empty() {
+        return None;
+    }
+    let mut columns: Option<Vec<Expression>> = None;
+    let mut found = Vec::new();
+    for ob in stmt
+        .order_by
+        .iter()
+        .filter(|ob| mentions_subquery(&ob.expression))
+    {
+        windows_outside_blocks(&ob.expression, &mut found);
+    }
+    for window in found {
+        let name = ExprKey::of(window).hidden_column_name();
+        let columns = columns.get_or_insert_with(|| stmt.columns.clone());
+        if columns
+            .iter()
+            .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == name))
+        {
+            continue;
+        }
+        let token = Token::new(TokenType::Identifier, &name, Position::default());
+        columns.push(Expression::Aliased(AliasedExpression {
+            token: token.clone(),
+            expression: Box::new(window.clone()),
+            alias: Identifier::new(token, &name),
+        }));
+    }
+    columns.map(|columns| SelectStatement {
+        columns,
+        ..stmt.clone()
+    })
+}
+
+/// `key` with each window function outside its subqueries read by the name
+/// [`with_key_windows`] gives its hidden item
+fn key_window_aliases(key: &Expression) -> Result<Expression> {
+    match key {
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(key.clone()),
+        Expression::Window(_) => {
+            let name = ExprKey::of(key).hidden_column_name();
+            let token = Token::new(TokenType::Identifier, &name, Position::default());
+            Ok(Expression::Identifier(Identifier::new(token, &name)))
+        }
+        other => rebuild(other, &mut key_window_aliases),
     }
 }
 
