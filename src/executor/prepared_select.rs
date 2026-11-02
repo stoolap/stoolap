@@ -8867,7 +8867,7 @@ impl PreparedGrouped {
         let stmt = keyed.as_ref().unwrap_or(stmt);
         // A window function in an ORDER BY key holding a subquery runs as a
         // hidden item, an unrepeatable alias the key reads after the windows
-        let key_windows = with_key_windows(stmt)?;
+        let key_windows = with_key_windows(stmt, &executor.function_registry)?;
         let (stmt, window_keys) = match &key_windows {
             Some((stmt, keys)) => (stmt, keys.as_slice()),
             None => (stmt, &[][..]),
@@ -13428,12 +13428,14 @@ fn windows_outside_blocks<'e>(expr: &'e Expression, found: &mut Vec<&'e Expressi
 #[allow(clippy::type_complexity)]
 fn with_key_windows(
     stmt: &SelectStatement,
+    registry: &FunctionRegistry,
 ) -> Result<Option<(SelectStatement, Vec<Option<Expression>>)>> {
     if !stmt.set_operations.is_empty() {
         return Ok(None);
     }
     let mut columns: Option<Vec<Expression>> = None;
     let mut keys = Vec::new();
+    let mut drawn = 0;
     for (at, ob) in stmt.order_by.iter().enumerate() {
         let mut found = Vec::new();
         if mentions_subquery(&ob.expression) {
@@ -13444,7 +13446,12 @@ fn with_key_windows(
         }
         let columns = columns.get_or_insert_with(|| stmt.columns.clone());
         keys.resize_with(at, || None);
-        keys.push(Some(window_items(&ob.expression, columns)?));
+        keys.push(Some(window_items(
+            &ob.expression,
+            registry,
+            columns,
+            &mut drawn,
+        )?));
     }
     Ok(columns.map(|columns| {
         let stmt = SelectStatement {
@@ -13456,13 +13463,25 @@ fn with_key_windows(
 }
 
 /// `key` with each window function outside its subqueries read by the name
-/// of a hidden item of `columns`, one by its identity, as the window path
-/// runs every window function written alike once
-fn window_items(key: &Expression, columns: &mut Vec<Expression>) -> Result<Expression> {
+/// of a hidden item of `columns`, as SELECT items written alike: one by its
+/// identity, unless the window draws new values, which gets one at each place
+fn window_items(
+    key: &Expression,
+    registry: &FunctionRegistry,
+    columns: &mut Vec<Expression>,
+    drawn: &mut usize,
+) -> Result<Expression> {
     match key {
         Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(key.clone()),
         Expression::Window(_) => {
-            let name = ExprKey::of(key).hidden_column_name();
+            let identity = ExprKey::of(key).hidden_column_name();
+            let name = match volatile(key, registry) {
+                true => {
+                    *drawn += 1;
+                    format!("{identity}#{drawn}")
+                }
+                false => identity,
+            };
             let token = Token::new(TokenType::Identifier, &name, Position::default());
             if !columns
                 .iter()
@@ -13476,7 +13495,9 @@ fn window_items(key: &Expression, columns: &mut Vec<Expression>) -> Result<Expre
             }
             Ok(Expression::Identifier(Identifier::new(token, &name)))
         }
-        other => rebuild(other, &mut |child| window_items(child, columns)),
+        other => rebuild(other, &mut |child| {
+            window_items(child, registry, columns, drawn)
+        }),
     }
 }
 

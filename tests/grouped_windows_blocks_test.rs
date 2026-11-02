@@ -584,6 +584,30 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
 }
 
 #[test]
+fn a_key_s_window_functions_written_alike_over_volatile_partitions_run_apart() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_volatile_partitions").unwrap();
+    fill(&db);
+    let ids: Vec<i64> = db
+        .query(
+            "SELECT t.id FROM t ORDER BY (SELECT 0) \
+             + ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY t.id) \
+             - ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY t.id), t.id",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    // Sharing one item makes the key 0 on every row and the rows keep id
+    // order; two random partitionings of 200 rows do that with no chance
+    assert_ne!(
+        ids,
+        (1..=200).collect::<Vec<i64>>(),
+        "one item ran both windows"
+    );
+}
+
+#[test]
 fn an_ungrouped_key_reading_a_volatile_alias_sorts_by_the_value_each_row_shows() {
     let _guard = serial();
     let db = Database::open("memory://grouped_windows_blocks_volatile").unwrap();
