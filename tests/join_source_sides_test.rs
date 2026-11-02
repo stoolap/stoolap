@@ -259,7 +259,7 @@ const GENERATED: [(usize, usize); 6] = [
 ];
 
 #[test]
-fn a_side_without_a_name_runs_on_the_general_path() {
+fn a_side_without_a_name_runs_prepared() {
     let _guard = serial();
     let db = hot("unnamed");
     for side in ["(VALUES (1), (2))", "(SELECT id FROM u)"] {
@@ -273,13 +273,14 @@ fn a_side_without_a_name_runs_on_the_general_path() {
                 oracle::check_answer(&RECORDED_UNNAMED, &sql, &answer(&db, &sql)),
                 None
             );
-            assert_eq!(
-                prepared_line(&db, &sql),
-                "Prepared: no (a side without a name)",
-                "{sql}"
-            );
+            assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{sql}");
         }
     }
+    // A block reads a column of the side that has no name by its own name
+    let sql = "SELECT t.id, (SELECT COUNT(*) FROM w WHERE w.y = column1) FROM t \
+               JOIN (VALUES (1), (2)) ON TRUE WHERE t.id > (SELECT MIN(y) FROM w) ORDER BY 1, 2";
+    assert!(answer(&db, sql).is_ok(), "{sql}: {:?}", answer(&db, sql));
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
 }
 
 #[test]
