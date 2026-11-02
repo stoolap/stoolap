@@ -296,6 +296,32 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, COUNT(*) OVER w, 6 FROM t GROUP BY t.a WINDOW w AS (ORDER BY t.a) \
              ORDER BY t.a",
         ),
+        // A window function in a key holding a subquery runs as an item does
+        shape(
+            "SELECT t.id FROM {t} \
+             ORDER BY (SELECT MIN(u.x) FROM u) + ROW_NUMBER() OVER (ORDER BY t.id DESC) LIMIT 5",
+            "SELECT t.id FROM t ORDER BY ROW_NUMBER() OVER (ORDER BY t.id DESC) LIMIT 5",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER () FROM {t} \
+             ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) * 1000 + RANK() OVER (ORDER BY t.id), \
+             t.id LIMIT 7",
+            "SELECT t.id, SUM(t.b) OVER () FROM t \
+             ORDER BY {count} * 1000 + RANK() OVER (ORDER BY t.id), t.id LIMIT 7",
+        ),
+        shape(
+            "SELECT t.a, COUNT(*) FROM {t} GROUP BY t.a \
+             ORDER BY (SELECT MIN(u.x) FROM u) + RANK() OVER (ORDER BY COUNT(*) DESC, t.a)",
+            "SELECT t.a, COUNT(*) FROM t GROUP BY t.a \
+             ORDER BY RANK() OVER (ORDER BY COUNT(*) DESC, t.a)",
+        ),
+        shape(
+            "SELECT t.id, t.b AS y FROM {t} \
+             ORDER BY (SELECT MIN(u.x) FROM u) + y * 1000 + ROW_NUMBER() OVER (ORDER BY t.id), \
+             t.id LIMIT 6",
+            "SELECT t.id, t.b AS y FROM t \
+             ORDER BY t.b * 1000 + ROW_NUMBER() OVER (ORDER BY t.id), t.id LIMIT 6",
+        ),
         // Over rows that do not group, a key reads each row and its aliases
         shape(
             "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id) FROM {t} \
@@ -554,6 +580,33 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
         ),
     ] {
         assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
+    }
+}
+
+#[test]
+fn a_key_s_window_functions_written_alike_over_volatile_partitions_run_apart() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_volatile_partitions").unwrap();
+    fill(&db);
+    // Sharing one item makes the key 0 on every row and the rows keep id
+    // order; two random partitionings of 200 rows do that with no chance
+    for sql in [
+        "SELECT t.id FROM t ORDER BY (SELECT 0) \
+         + ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY t.id) \
+         - ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY t.id), t.id",
+        "SELECT t.id FROM t WINDOW w AS (PARTITION BY RANDOM() < 0.5 ORDER BY t.id) \
+         ORDER BY (SELECT 0) + ROW_NUMBER() OVER w - ROW_NUMBER() OVER w, t.id",
+    ] {
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_ne!(
+            ids,
+            (1..=200).collect::<Vec<i64>>(),
+            "one item ran both windows: {sql}"
+        );
     }
 }
 
