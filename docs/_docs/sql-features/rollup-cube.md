@@ -211,6 +211,8 @@ Returns:
 - `0` if the column is part of the current grouping (normal row)
 - `1` if the column is aggregated (super-aggregate row)
 
+The argument names a GROUP BY item as it is written, or by its column, qualified or not: with `GROUP BY ROLLUP(s.region)`, both `GROUPING(s.region)` and `GROUPING(region)` read that item. A bare name two GROUP BY items carry, such as `region` with `ROLLUP(s.region, u.region)`, names neither, and like a column no item names it reads `0`; qualify it to read one of them.
+
 ### Example
 
 ```sql
@@ -246,6 +248,17 @@ SELECT
     CASE WHEN GROUPING(region) = 1 THEN '(All Regions)' ELSE COALESCE(region, 'Unknown') END as region,
     CASE WHEN GROUPING(category) = 1 THEN '(All Categories)' ELSE COALESCE(category, 'Unknown') END as category,
     SUM(amount) as total
+FROM sales
+GROUP BY ROLLUP(region, category);
+```
+
+## Window Functions over Grouping Sets
+
+A window function in a statement with ROLLUP, CUBE or GROUPING SETS runs over every group of every set, subtotals and the grand total included, and may read GROUPING() in its PARTITION BY or ORDER BY:
+
+```sql
+SELECT region, category, SUM(amount),
+       RANK() OVER (PARTITION BY GROUPING(category) ORDER BY SUM(amount) DESC) AS rank_in_level
 FROM sales
 GROUP BY ROLLUP(region, category);
 ```

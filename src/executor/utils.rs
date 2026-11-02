@@ -887,11 +887,16 @@ pub(crate) fn collect_column_names(
     expr: &Expression,
     out: &mut Vec<crate::common::SmartString>,
 ) -> bool {
-    visit_column_refs(expr, &mut |column| match column {
+    visit_column_refs(expr, &mut |column| push_column_name(column, out))
+}
+
+/// The bare name of `column`, a column reference, added to `out`
+fn push_column_name(column: &Expression, out: &mut Vec<crate::common::SmartString>) {
+    match column {
         Expression::Identifier(id) => out.push(id.value_lower.clone()),
         Expression::QualifiedIdentifier(q) => out.push(q.name.value_lower.clone()),
         _ => {}
-    })
+    }
 }
 
 /// Each column reference an expression reads, a bare or a qualified name,
@@ -1004,11 +1009,42 @@ pub(crate) fn needed_columns(
         .chain(stmt.having.as_deref())
         .chain(stmt.order_by.iter().map(|o| &o.expression))
         .chain(where_expr);
+    // A window's columns are its call's, its partition's, its order's and
+    // its frame's; a named window's are read from the definitions, unknown here
+    let window_names = std::cell::RefCell::new(Vec::new());
+    let windows_read = std::cell::Cell::new(true);
+    let skip = |expr: &Expression| {
+        let Expression::Window(window) = expr else {
+            return false;
+        };
+        let call = &window.function;
+        let parts = call
+            .arguments
+            .iter()
+            .filter(|a| !matches!(a, Expression::Star(_)))
+            .chain(call.filter.as_deref())
+            .chain(call.order_by.iter().map(|o| &o.expression))
+            .chain(&window.partition_by)
+            .chain(window.order_by.iter().map(|o| &o.expression))
+            .chain(window.frame.iter().flat_map(|frame| frame.offsets()));
+        let mut window_names = window_names.borrow_mut();
+        let read = window.window_ref.is_none()
+            && parts.fold(true, |read, part| {
+                collect_column_names(part, &mut window_names) & read
+            });
+        windows_read.set(windows_read.get() && read);
+        true
+    };
     for expr in exprs {
-        if !collect_column_names(expr, &mut names) {
+        let read = visit_column_refs_outside(expr, &skip, &mut |c| push_column_name(c, &mut names));
+        if !read {
             return None;
         }
     }
+    if !windows_read.get() {
+        return None;
+    }
+    names.extend(window_names.into_inner());
     let mut mask = vec![false; columns_lower.len()];
     for name in names {
         match columns_lower.iter().position(|c| *c == name.as_str()) {

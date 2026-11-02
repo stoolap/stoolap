@@ -485,6 +485,58 @@ pub(crate) fn aggregate_slot_keys(
     slots
 }
 
+/// The qualifier and name of the column `item` groups by, as written; None
+/// for an item grouped by any other expression
+fn column_parts(item: &GroupByItem) -> Option<(Option<&str>, &str)> {
+    match item {
+        GroupByItem::Column(name) => Some((
+            split_qualified(name).map(|(table, _)| table),
+            bare_name(name),
+        )),
+        GroupByItem::Expression { expr, .. } => match expr {
+            Expression::Identifier(id) => Some((None, &id.value)),
+            Expression::QualifiedIdentifier(qid) => {
+                Some((Some(&qid.qualifier.value), &qid.name.value))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Whether two items group by the same column written alike, its names
+/// lowered as a column binds
+fn same_column(a: &GroupByItem, b: &GroupByItem) -> bool {
+    let same = |a: &str, b: &str| {
+        super::utils::with_lowercase(a, |a| super::utils::with_lowercase(b, |b| a.eq(b)))
+    };
+    match (column_parts(a), column_parts(b)) {
+        (Some((a_table, a_name)), Some((b_table, b_name))) => {
+            same(a_name, b_name)
+                && match (a_table, b_table) {
+                    (Some(a), Some(b)) => same(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// The GROUPING() calls `expr` writes, at any depth
+fn grouping_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
+    match expr {
+        Expression::FunctionCall(call) if call.function.eq_ignore_ascii_case("GROUPING") => {
+            out.push(call)
+        }
+        Expression::Aliased(aliased) => return grouping_calls(&aliased.expression, out),
+        _ => {}
+    }
+    let _ = super::prepared_select::for_each_child(expr, &mut |child| {
+        grouping_calls(child, out);
+        Ok(())
+    });
+}
+
 /// Represents a GROUP BY item - either a column reference or an expression
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -1514,6 +1566,38 @@ impl Executor {
         base_columns: &[String],
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
+        let (columns, rows, group_by_columns) =
+            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, blocks)?;
+        self.finish_aggregation(
+            path,
+            AggregateSlots {
+                stmt,
+                written_stmt,
+                aggregations,
+                group_by_count: group_by_columns.len(),
+                source_columns: base_columns,
+                blocks,
+                alone: None,
+            },
+            ctx,
+            columns,
+            rows,
+        )
+    }
+
+    /// `stmt`'s groups of `aggregations` over the rows of `input`, whose
+    /// columns are `base_columns`: one group, its GROUP BY's or its grouping
+    /// sets', those its HAVING keeps, with their columns and the group items
+    #[allow(clippy::type_complexity)]
+    fn aggregate_groups(
+        &self,
+        stmt: &SelectStatement,
+        aggregations: &[SqlAggregateFunction],
+        ctx: &ExecutionContext,
+        input: FeedInput<'_, impl RowSource>,
+        base_columns: &[String],
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<(Vec<String>, RowVec, Vec<GroupByItem>)> {
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
         // Determine if we can push LIMIT to aggregation for early termination
@@ -1521,10 +1605,12 @@ impl Executor {
         // 1. There's a LIMIT but no ORDER BY (order doesn't matter)
         // 2. No HAVING clause (filtering might reduce groups below limit)
         // 3. No DISTINCT (deduplication might reduce results)
+        // 4. No window function, which reads every group
         let can_push_limit = stmt.limit.is_some()
             && stmt.order_by.is_empty()
             && stmt.having.is_none()
-            && !stmt.distinct;
+            && !stmt.distinct
+            && !super::query_classification::get_classification(stmt).has_window_functions;
 
         // OFFSET is applied after aggregation, so the groups it skips must be
         // built too: the pushed limit is LIMIT + OFFSET
@@ -1617,22 +1703,7 @@ impl Executor {
         } else {
             (result_columns, result_rows)
         };
-
-        self.finish_aggregation(
-            path,
-            AggregateSlots {
-                stmt,
-                written_stmt,
-                aggregations,
-                group_by_count: group_by_columns.len(),
-                source_columns: base_columns,
-                blocks,
-                alone: None,
-            },
-            ctx,
-            having_columns,
-            having_rows,
-        )
+        Ok((having_columns, having_rows, group_by_columns))
     }
 
     /// The output names of `stmt` when its SELECT list is nothing but its
@@ -2299,32 +2370,58 @@ impl Executor {
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
     ) -> Option<usize> {
-        // GROUPING() takes one argument - the column name
-        if func.arguments.is_empty() {
-            return None;
-        }
-
-        let arg = &func.arguments[0];
-        let arg_name: &str = match arg {
-            Expression::Identifier(id) => id.value_lower.as_str(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
-            _ => return None,
+        // The first item written as the argument is: its column, qualified
+        // alike, its alias, or its expression. Else the item whose column
+        // the argument names, qualified or not, as a column binds; several
+        // such items name one only when they all write the same column
+        let arg = func.arguments.first()?;
+        let column = match arg {
+            Expression::Identifier(id) => Some((None, id.value_lower.as_str())),
+            Expression::QualifiedIdentifier(qid) => Some((
+                Some(qid.qualifier.value_lower.as_str()),
+                qid.name.value_lower.as_str(),
+            )),
+            _ => None,
         };
-
-        // Find the matching GROUP BY column
-        for (idx, item) in group_by_columns.iter().enumerate() {
-            let matches = match item {
-                GroupByItem::Column(col_name) => col_name.to_lowercase() == arg_name,
-                GroupByItem::Expression { display_name, .. } => {
-                    display_name.to_lowercase() == arg_name
+        // Some(true) when written alike, Some(false) when named by its column
+        let names = |table: Option<&str>, name: &str| {
+            let (qualifier, arg) = column?;
+            if !eq_folded(name, arg) {
+                return None;
+            }
+            match (qualifier, table) {
+                (Some(arg), Some(item)) => eq_folded(item, arg).then_some(true),
+                (None, None) => Some(true),
+                _ => Some(false),
+            }
+        };
+        let key = ExprKey::of(arg);
+        let mut named: Option<usize> = None;
+        let mut alike = true;
+        for (at, item) in group_by_columns.iter().enumerate() {
+            let read = match (item, column_parts(item)) {
+                (_, Some((table, name))) => names(table, name),
+                (GroupByItem::Expression { expr, .. }, None) => {
+                    (ExprKey::of(expr) == key).then_some(true)
                 }
+                (GroupByItem::Column(_), None) => None,
             };
-            if matches {
-                return Some(idx);
+            let alias = match item {
+                GroupByItem::Expression { display_name, .. } => column
+                    .filter(|(qualifier, _)| qualifier.is_none())
+                    .and_then(|_| names(None, display_name)),
+                GroupByItem::Column(_) => None,
+            };
+            match read.max(alias) {
+                Some(true) => return Some(at),
+                Some(false) => match named {
+                    None => named = Some(at),
+                    Some(first) => alike &= same_column(&group_by_columns[first], item),
+                },
+                None => {}
             }
         }
-
-        None
+        named.filter(|_| alike)
     }
 
     /// The ORDER BY of an aggregate that orders its own input, with the
@@ -2405,86 +2502,47 @@ impl Executor {
             }
             None => (stmt, base_rows, base_columns),
         };
-        let (agg_columns, agg_rows, slots) =
-            self.execute_aggregation_for_window(stmt, ctx, base_rows, base_columns, blocks)?;
-        self.execute_select_with_window_functions_over_groups(
-            stmt,
-            ctx,
-            &agg_rows,
-            &agg_columns,
-            &slots,
-            blocks,
-        )
+        let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
+        let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
+        let path = AggregatePath::General;
+        self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, blocks)
     }
 
-    /// Execute GROUP BY aggregation and return raw columns/rows for window function processing
-    /// This is used when both GROUP BY and window functions are present in the query.
-    /// Window functions operate on the aggregated result.
-    fn execute_aggregation_for_window(
+    /// The window functions of `stmt` over its groups of `aggregations`,
+    /// grouped from the rows of `input` as any aggregation groups them, and
+    /// each GROUPING() call read from its group's flag; `path` grouped them
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn windows_over_groups(
         &self,
+        path: AggregatePath,
         stmt: &SelectStatement,
+        aggregations: &[SqlAggregateFunction],
         ctx: &ExecutionContext,
-        base_rows: &[(i64, Row)],
+        input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
         blocks: Option<&dyn SubqueryExecutor>,
-    ) -> Result<(Vec<String>, RowVec, FxHashMap<ExprKey, usize>)> {
-        // Parse aggregations and group by columns
-        let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
-        let group_by_columns = self.parse_group_by(stmt, base_columns)?;
-
-        // Create column index map for fast lookup
-        let col_index_map = build_column_index_map(base_columns);
-
-        // Build result
-        // Note: No limit pushdown here because window functions need all rows
-        let (result_columns, result_rows) = if group_by_columns.is_empty() {
-            // Global aggregation (no GROUP BY)
-            let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
-            self.execute_global_aggregation(&aggregations, input, base_columns, ctx, blocks)?
-        } else {
-            // Grouped aggregation - no limit since window functions need all groups
-            self.execute_grouped_aggregation(
-                &aggregations,
-                &group_by_columns,
-                stmt,
-                FeedInput::<ScannedRows<'_>>::Rows(base_rows),
-                base_columns,
-                &col_index_map,
-                ctx,
-                None, // Window functions need all groups
-                blocks,
-            )?
-        };
-
-        // Apply HAVING clause filter (in-place)
-        let slots = aggregate_slot_keys(&group_by_columns, &aggregations, &stmt.columns);
-        let mut result_rows_with_ids = RowVec::with_capacity(result_rows.len());
-        if let Some(ref having) = stmt.having {
-            let having_filter = compile_over_slots(
-                having,
-                &result_columns,
-                crate::functions::registry::global_registry(),
-                Some(&slots),
-                None,
-                blocks.is_some(),
-                Some(slot_params(ctx, blocks)),
-            )?;
-            let mut vm = ExprVM::new();
-            for (id, row) in result_rows {
-                if vm.execute_bool_checked(
-                    &having_filter,
-                    &with_blocks(slot_context(&row, ctx), blocks),
-                )? {
-                    result_rows_with_ids.push((id, row));
+    ) -> Result<WindowOutput> {
+        let (columns, rows, items) =
+            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, blocks)?;
+        let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
+        if stmt.group_by.modifier != GroupByModifier::None {
+            let mut calls = Vec::new();
+            let order = stmt.order_by.iter().map(|o| &o.expression);
+            let windows = stmt.window_defs.iter().flat_map(|w| w.expressions());
+            for expr in stmt.columns.iter().chain(order).chain(windows) {
+                grouping_calls(expr, &mut calls);
+            }
+            let flags = items.len() + aggregations.len();
+            for call in calls {
+                if let Some(at) = self.find_grouping_column_index(call, &items) {
+                    slots.entry(ExprKey::of_call(call)).or_insert(flags + at);
                 }
             }
-        } else {
-            for (id, row) in result_rows {
-                result_rows_with_ids.push((id, row));
-            }
         }
-
-        Ok((result_columns, result_rows_with_ids, slots))
+        path.taken();
+        self.execute_select_with_window_functions_over_groups(
+            stmt, ctx, &rows, &columns, &slots, blocks,
+        )
     }
 
     /// Parse aggregate functions from SELECT list; `ctx` binds the parameters
