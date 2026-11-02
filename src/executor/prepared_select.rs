@@ -1086,9 +1086,10 @@ impl Executor {
     pub(crate) fn prepared_family(
         &self,
         stmt: &SelectStatement,
+        shape: &QueryClassification,
         ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
-        self.family(stmt, ctx, true)
+        self.family(stmt, shape, ctx, true)
     }
 
     /// Whether the runner reads `stmt`, a statement over one source that
@@ -1096,19 +1097,21 @@ impl Executor {
     pub(crate) fn planned_family(
         &self,
         stmt: &SelectStatement,
+        shape: &QueryClassification,
         ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
         if matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_))) {
             return Err("a join");
         }
-        self.family(stmt, ctx, false)
+        self.family(stmt, shape, ctx, false)
     }
 
     /// [`Self::prepared_family`], which with `needs_subquery` takes only a
-    /// statement holding one
+    /// statement holding one; `shape` is `stmt`'s classification
     fn family(
         &self,
         stmt: &SelectStatement,
+        shape: &QueryClassification,
         ctx: Option<&ExecutionContext>,
         needs_subquery: bool,
     ) -> std::result::Result<(), OutOfFamily> {
@@ -1121,7 +1124,7 @@ impl Executor {
         }
         // A statement the runner aggregates computes its SELECT list and
         // ORDER BY over its groups, as the aggregation does on any source
-        let aggregates = !needs_subquery && PreparedSelect::runs_aggregate(stmt);
+        let aggregates = PreparedSelect::runs_aggregate(stmt, shape);
         if !aggregates && !plain_statement(stmt) {
             return Err("a clause outside the family");
         }
@@ -8565,17 +8568,16 @@ impl PreparedSelect {
     }
 
     /// Whether the runner aggregates `stmt`: it aggregates its rows and
-    /// holds no named window, set operation, DISTINCT ON or subquery, which
-    /// the grouped family's blocks answer; its windows run over its groups
-    pub(crate) fn runs_aggregate(stmt: &SelectStatement) -> bool {
-        let shape = get_classification(stmt);
-        Self::aggregates(stmt)
-            && !Executor::reads_window_defs(stmt)
+    /// holds no named window, set operation, DISTINCT ON or subquery outside
+    /// its WHERE, which the grouped family's blocks answer; its windows run
+    /// over its groups, its WHERE's subqueries as its blocks
+    pub(crate) fn runs_aggregate(stmt: &SelectStatement, shape: &QueryClassification) -> bool {
+        !shape.grouped_has_subqueries
+            && !shape.output_has_subqueries
             && !shape.has_set_operations
             && !shape.has_distinct_on
-            && !shape.grouped_has_subqueries
-            && !shape.output_has_subqueries
-            && !shape.where_has_subqueries
+            && Self::aggregates(stmt)
+            && !Executor::reads_window_defs(stmt)
     }
 
     /// Whether `stmt` groups its rows or judges them by a HAVING: a GROUP
@@ -11696,7 +11698,7 @@ impl Executor {
         let shape = get_classification(stmt);
         if shape.where_has_subqueries
             || shape.output_has_subqueries
-            || self.planned_family(stmt, Some(ctx)).is_err()
+            || self.planned_family(stmt, &shape, Some(ctx)).is_err()
             || stmt.distinct
             || !stmt.distinct_on.is_empty()
             || !stmt.set_operations.is_empty()

@@ -1725,8 +1725,10 @@ impl Executor {
         // context, materialized under the snapshot its subqueries read and
         // cut as the CTE path cuts them
         if self.has_cte(stmt) {
+            let classified = std::cell::OnceCell::new();
+            let shape = || classified.get_or_init(|| get_classification(stmt));
             let grouped = || {
-                Self::grouped_family_reach(stmt, &get_classification(stmt))
+                Self::grouped_family_reach(stmt, shape())
                     && self.grouped_family(stmt, Some(ctx)).is_ok()
             };
             let with = stmt
@@ -1736,10 +1738,10 @@ impl Executor {
             let slot = compiled.map(NestedPlan::slot);
             if !self.holds_prepared_select(slot, ctx)
                 && !self.holds_prepared_grouped(slot, ctx)
-                && self.prepared_family(stmt, Some(ctx)).is_err()
+                && self.prepared_family(stmt, shape(), Some(ctx)).is_err()
                 && !(slot.is_some()
                     && self.reads_source(stmt, ctx)
-                    && self.planned_family(stmt, Some(ctx)).is_ok())
+                    && self.planned_family(stmt, shape(), Some(ctx)).is_ok())
                 && !grouped()
                 && !self.run_keeps_join_plan(slot, stmt, with, ctx)
             {
@@ -1800,10 +1802,14 @@ impl Executor {
             });
         let in_family = held
             || ((classification.where_has_subqueries || classification.output_has_subqueries)
-                && self.prepared_family(stmt, Some(ctx)).is_ok())
+                && self
+                    .prepared_family(stmt, &classification, Some(ctx))
+                    .is_ok())
             || (slot.is_some()
                 && self.reads_source(stmt, ctx)
-                && self.planned_family(stmt, Some(ctx)).is_ok());
+                && self
+                    .planned_family(stmt, &classification, Some(ctx))
+                    .is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
         // them as its blocks
         let grouped_family = Self::grouped_family_reach(stmt, &classification)

@@ -746,7 +746,7 @@ impl Executor {
             let prepared = match (grouped, join) {
                 (Some(grouped), _) => grouped,
                 (None, Some(join)) => self.join_prepared(select, join, own, select.with.as_ref()),
-                (None, None) => self.prepared_family(select, None),
+                (None, None) => self.prepared_family(select, &classification, None),
             };
             match prepared {
                 Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),
