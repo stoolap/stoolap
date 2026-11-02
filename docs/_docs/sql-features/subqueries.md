@@ -688,7 +688,7 @@ A subquery in these positions is refused with an error rather than answered. Sup
 - Inside an explicit transaction, a subquery in `ON CONFLICT ... DO UPDATE` that reads the target table, in a value that reads the row met or the excluded row
 - Inside an explicit transaction, a subquery in `RETURNING` that reads the target table, in a value that reads the row returned
 - An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one, when one of its subqueries is outside the [prepared](#prepared-subqueries) shape
-- `DISTINCT ON` expressions in a query that neither groups nor has window functions, a `DISTINCT ON` subquery in the first `SELECT` of a set operation, and a `GROUP BY` expression outside the [prepared](#prepared-subqueries) shape
+- `DISTINCT ON` expressions in a query that neither groups nor has window functions, and a `GROUP BY` expression outside the [prepared](#prepared-subqueries) shape
 - `HAVING` in a query that also has window functions, outside the [prepared](#prepared-subqueries) shape
 - A grouped `SELECT` list that holds both a correlated and an uncorrelated subquery
 - A subquery inside a row of a `VALUES` list, and one in the `WHERE`, the `SELECT` list or the `ORDER BY` of a query over a view, a derived table or a `VALUES` list outside the [prepared](#prepared-subqueries) shape

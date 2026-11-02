@@ -2597,9 +2597,8 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let columns = CompactArc::new(result.columns().to_vec());
-        let set_operation = !stmt.set_operations.is_empty();
-        // A set operation's rows keep where its first branch put its items,
-        // which the layout says; only without one do output names stand
+        let set_operation = !stmt.set_operations.is_empty(); // A set operation's rows keep where its first branch put its items,
+                                                             // which the layout says; only without one do output names stand
         let (mut mapped, mut slots) = self.key_columns(
             stmt,
             stmt.distinct_on.iter(),
@@ -9745,7 +9744,18 @@ impl Executor {
             Error::internal("a table's columns changed while the statement prepared")
         })?;
         let output = self.grouped_output(held, &run, grouped, ctx)?;
-        Self::with_late_keys(held, &run, output, ctx)
+        let (result, columns, applied, shape) = Self::with_late_keys(held, &run, output, ctx)?;
+        // A set operation's DISTINCT ON binds its keys by the first branch's
+        // items, which the grouped row holds in order, as a prepared select's
+        // layout binds them
+        let shape = match shape.as_ref().is_none_or(|shape| shape.layout.is_none())
+            && !branch.set_operations.is_empty()
+            && !branch.distinct_on.is_empty()
+        {
+            true => SelectShape::laid_out(Self::result_layout(branch, &[], None, &columns)),
+            false => shape,
+        };
+        Ok((result, columns, applied, shape))
     }
 
     /// `output`, the rows the run `run` of `held` returned, with each late key

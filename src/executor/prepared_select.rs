@@ -1166,6 +1166,10 @@ impl Executor {
             {
                 return Err("an ORDER BY subquery over a set operation");
             }
+            // The first branch's DISTINCT ON keys are its own
+            for key in stmt.distinct_on.iter().filter(|_| !aggregates) {
+                family.expression(key, 1, Site::Subqueries, &mut found)?;
+            }
         } else if !aggregates {
             // A DISTINCT ON key is computed for each row as an ORDER BY key is
             for key in stmt
@@ -1222,10 +1226,6 @@ impl Executor {
         }
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
-        }
-        // A set operation's branch carries no DISTINCT ON key as a column
-        if !stmt.set_operations.is_empty() && stmt.distinct_on.iter().any(mentions_subquery) {
-            return Err("a DISTINCT ON subquery in a set operation's branch");
         }
         let grouped = grouped_block(stmt);
         // A grouped statement's DISTINCT ON key runs as an item, its windows
@@ -8851,6 +8851,19 @@ impl PreparedGrouped {
         epoch: u64,
     ) -> Result<Option<Self>> {
         let validity = executor.select_validity(stmt, epoch);
+        // A set operation's DISTINCT ON reads the whole one's rows, after it
+        let unkeyed;
+        let stmt = match stmt.set_operations.is_empty() || stmt.distinct_on.is_empty() {
+            true => stmt,
+            false => {
+                unkeyed = SelectStatement {
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    ..stmt.clone()
+                };
+                &unkeyed
+            }
+        };
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
