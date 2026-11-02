@@ -1667,6 +1667,32 @@ impl Executor {
         Ok(Box::new(AliasedResult::renamed(result, shown)))
     }
 
+    /// `stmt` run as the source a FROM entry reads: each column by its own
+    /// name, as a qualifier a join's star gives only shows the statement's
+    /// output, so a derived table, CTE or view over it reads `k` and `d.k`
+    pub(crate) fn execute_source_statement(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
+        compiled: Option<&NestedPlan>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let result = self.select_with_plan(stmt, ctx, plan_classification, compiled)?;
+        if !result
+            .columns()
+            .iter()
+            .any(|c| split_qualified(c).is_some())
+        {
+            return Ok(result);
+        }
+        let own = result
+            .columns()
+            .iter()
+            .map(|c| bare_name(c).to_string())
+            .collect();
+        Ok(Box::new(AliasedResult::renamed(result, own)))
+    }
+
     fn select_with_plan(
         &self,
         stmt: &SelectStatement,
@@ -5834,7 +5860,7 @@ impl Executor {
                 .iter()
                 .map(|key| Some(key).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
-            self.prepare_join_blocks(
+            let blocks = self.prepare_join_blocks(
                 (join_source, on, Self::inner_on(join_source, join_type)),
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
@@ -5843,7 +5869,11 @@ impl Executor {
                 sides,
                 columns.len(),
                 ctx,
-            )
+            )?;
+            if let Some(blocks) = &blocks {
+                blocks.check_qualified_names(stmt)?;
+            }
+            Ok(blocks)
         })
     }
 
@@ -7918,7 +7948,7 @@ impl Executor {
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let body = &subquery_source.subquery;
-        let result = self.execute_select_with_plan(body, &subquery_ctx, None, plan)?;
+        let result = self.execute_source_statement(body, &subquery_ctx, None, plan)?;
         let columns = result.columns().to_vec();
 
         // Materialize the subquery result directly with synthetic row IDs
@@ -8148,7 +8178,7 @@ impl Executor {
 
         // Execute the view's query with incremented depth, under its own plan
         let nested_ctx = ctx.with_incremented_view_depth();
-        let result = self.execute_select_with_plan(
+        let result = self.execute_source_statement(
             view_select,
             &nested_ctx,
             Some(&view_plan.classification),
@@ -9267,7 +9297,7 @@ impl Executor {
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
-        let result = self.execute_select_with_plan(&ss.subquery, &subquery_ctx, None, plan)?;
+        let result = self.execute_source_statement(&ss.subquery, &subquery_ctx, None, plan)?;
         let columns = result.columns().to_vec();
 
         // Prefix column names with subquery alias (required for proper ON condition resolution)

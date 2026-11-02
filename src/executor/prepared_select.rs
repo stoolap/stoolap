@@ -238,17 +238,7 @@ impl<'a> Family<'a> {
                     .for_each(|e| nested_statements(e, &mut nested));
             }
             Some(Expression::SubquerySource(derived)) => self.derived(&derived.subquery)?,
-            Some(Expression::JoinSource(join)) => {
-                // A star over a join is named only by its run
-                if stmt
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, Expression::Star(_)))
-                {
-                    return Err("a derived table selecting * over a join");
-                }
-                self.join_from(join)?
-            }
+            Some(Expression::JoinSource(join)) => self.join_from(join)?,
             some => match Self::one_table(some) {
                 Ok(ts) => self.blocks.borrow_mut().push(ts),
                 Err(_) => return Err("a derived table over a source the family does not read"),
@@ -2249,8 +2239,12 @@ fn output_names(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Vec<S
     let mut names = Vec::with_capacity(stmt.columns.len());
     for item in &stmt.columns {
         match item {
-            Expression::Star(_) if own.tables.len() > 1 => return Ok(None),
-            Expression::Star(_) => names.extend(own.columns.iter().cloned()),
+            // A join's columns by their own names, a merged pair once
+            Expression::Star(_) => names.extend(
+                star_columns(own.columns.len(), &own.merged)
+                    .into_iter()
+                    .map(|at| own.columns[at].clone()),
+            ),
             Expression::QualifiedStar(star) => {
                 names.extend(
                     own.columns[qualified_star_columns(star, own)?]
@@ -10241,6 +10235,34 @@ impl JoinBlocks {
             .filter(move |&(left, right)| (left < left_width) == (right < left_width))
     }
 
+    /// An error when a SELECT item, grouping, HAVING or sort key of `stmt`
+    /// names `table.column` and two columns of that table carry the name
+    pub(crate) fn check_qualified_names(&self, stmt: &SelectStatement) -> Result<()> {
+        fn check(chain: &Chain<'_>, expr: &Expression) -> Result<()> {
+            match expr {
+                // A table or column the joined row lacks is an enclosing one
+                Expression::QualifiedIdentifier(q) => {
+                    match chain.qualified(&q.qualifier.value_lower, &q.name.value_lower, q) {
+                        Err(err) if err.to_string().contains("is ambiguous") => Err(err),
+                        _ => Ok(()),
+                    }
+                }
+                other => for_each_child(other, &mut |child| check(chain, child)),
+            }
+        }
+        let scopes = [&self.scope];
+        let chain = Chain { scopes: &scopes };
+        let keys = stmt.order_by.iter().map(|ob| &ob.expression);
+        stmt.columns
+            .iter()
+            .map(unaliased)
+            .chain(&stmt.group_by.columns)
+            .chain(stmt.having.as_deref())
+            .chain(keys)
+            .chain(&stmt.distinct_on)
+            .try_for_each(|expr| check(&chain, expr))
+    }
+
     /// Whether a SELECT item, ORDER BY key or DISTINCT ON key runs a block
     pub(crate) fn runs_output(&self) -> bool {
         self.select
@@ -11872,7 +11894,7 @@ impl Executor {
         run: &StatementRun,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, RowVec)> {
-        let result = self.execute_select_with_plan(
+        let result = self.execute_source_statement(
             &run.statement,
             ctx,
             Some(&run.classification),
@@ -12287,7 +12309,7 @@ impl Executor {
             }
             Some(Expression::SubquerySource(ss)) => {
                 let plan = plan.and_then(|plan| plan.from(stmt));
-                let result = self.execute_select_with_plan(&ss.subquery, inner_ctx, None, plan)?;
+                let result = self.execute_source_statement(&ss.subquery, inner_ctx, None, plan)?;
                 let columns = result.columns().to_vec();
                 (
                     Some(StatementSource::Stream(columns, result)),

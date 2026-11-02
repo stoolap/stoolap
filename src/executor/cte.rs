@@ -395,7 +395,7 @@ impl Executor {
         // Execute as a normal SELECT and materialize
         // Create context with CTE data so tables can resolve CTE references
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
-        let result = self.execute_select_with_plan(stmt, &ctx_with_ctes, None, plan)?;
+        let result = self.execute_source_statement(stmt, &ctx_with_ctes, None, plan)?;
         let columns = result.columns().to_vec();
         let rows = Self::materialize_result(result)?;
 
@@ -457,7 +457,7 @@ impl Executor {
 
         // Taken first, so the body's plans are laid out for the whole body
         let branches = plan.map_or(&[][..], |plan| plan.branches(stmt));
-        let result = self.execute_select_with_plan(&anchor_stmt, ctx, None, plan)?;
+        let result = self.execute_source_statement(&anchor_stmt, ctx, None, plan)?;
         let anchor_columns = result.columns().to_vec();
 
         // Apply column aliases if provided (for recursive CTE column naming)
