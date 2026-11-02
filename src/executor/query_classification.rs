@@ -31,6 +31,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 
+use crate::executor::utils::expression_contains_aggregate;
 use crate::executor::volatility::expression_volatility;
 use crate::functions::Volatility;
 use crate::parser::ast::{
@@ -699,42 +700,7 @@ impl QueryClassification {
 
     /// Check if any column expression contains aggregate functions
     fn check_has_aggregation(stmt: &SelectStatement) -> bool {
-        for col_expr in &stmt.columns {
-            if Self::expression_has_aggregation(col_expr) {
-                return true;
-            }
-        }
-        !stmt.group_by.columns.is_empty()
-    }
-
-    /// Check if an expression contains aggregate functions
-    fn expression_has_aggregation(expr: &Expression) -> bool {
-        match expr {
-            Expression::FunctionCall(func) => {
-                if is_aggregate_function(&func.function) {
-                    return true;
-                }
-                func.arguments.iter().any(Self::expression_has_aggregation)
-            }
-            Expression::Aliased(aliased) => Self::expression_has_aggregation(&aliased.expression),
-            Expression::Infix(infix) => {
-                Self::expression_has_aggregation(&infix.left)
-                    || Self::expression_has_aggregation(&infix.right)
-            }
-            Expression::Prefix(prefix) => Self::expression_has_aggregation(&prefix.right),
-            Expression::Cast(cast) => Self::expression_has_aggregation(&cast.expr),
-            Expression::Case(case) => {
-                case.when_clauses.iter().any(|w| {
-                    Self::expression_has_aggregation(&w.condition)
-                        || Self::expression_has_aggregation(&w.then_result)
-                }) || case
-                    .else_value
-                    .as_ref()
-                    .is_some_and(|e| Self::expression_has_aggregation(e))
-            }
-            Expression::ScalarSubquery(_) | Expression::SubquerySource(_) => false, // Subquery aggregates are handled separately
-            _ => false,
-        }
+        stmt.columns.iter().any(expression_contains_aggregate) || !stmt.group_by.columns.is_empty()
     }
 
     /// Check if any column expression contains window functions
@@ -862,40 +828,6 @@ impl QueryClassification {
     fn expression_has_nondeterministic_functions(expr: &Expression) -> bool {
         expression_volatility(expr, crate::functions::global_registry()) != Volatility::Fixed
     }
-}
-
-/// Check if a function name is an aggregate function
-fn is_aggregate_function(name: &str) -> bool {
-    matches!(
-        name.to_uppercase().as_str(),
-        "COUNT"
-            | "SUM"
-            | "AVG"
-            | "MIN"
-            | "MAX"
-            | "GROUP_CONCAT"
-            | "STRING_AGG"
-            | "ARRAY_AGG"
-            | "STDDEV"
-            | "STDDEV_POP"
-            | "STDDEV_SAMP"
-            | "VARIANCE"
-            | "VAR_POP"
-            | "VAR_SAMP"
-            | "PERCENTILE"
-            | "PERCENTILE_CONT"
-            | "PERCENTILE_DISC"
-            | "MEDIAN"
-            | "MODE"
-            | "BOOL_AND"
-            | "BOOL_OR"
-            | "BIT_AND"
-            | "BIT_OR"
-            | "BIT_XOR"
-            | "FIRST"
-            | "LAST"
-            | "ANY_VALUE"
-    )
 }
 
 /// Compute a cache key for a SELECT statement
