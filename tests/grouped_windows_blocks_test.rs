@@ -41,6 +41,7 @@ fn fill(db: &Database) {
         "INSERT INTO u SELECT g.value, g.value % 11, g.value % 7 FROM generate_series(1, 40) g",
         "INSERT INTO w SELECT g.value, g.value % 4 FROM generate_series(1, 200) g",
         "CREATE VIEW v AS SELECT id, a, b FROM t",
+        "CREATE INDEX t_b ON t(b)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -361,6 +362,44 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, (SELECT MAX(u.x) FROM u WHERE u.k = t.a) AS m FROM t GROUP BY t.a \
              ORDER BY (SELECT COUNT(*) FROM u u1 WHERE u1.id <= \
              (SELECT MAX(u.x) FROM u WHERE u.k = t.a)), t.a",
+        ),
+        // A WHERE without subqueries, an indexed partition, a WHERE keeping no row
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER (PARTITION BY t.a ORDER BY t.id), \
+             (SELECT MAX(u.x) FROM u) FROM {t} WHERE t.b > 3 ORDER BY t.id",
+            "SELECT t.id, ROW_NUMBER() OVER (PARTITION BY t.a ORDER BY t.id), 6 FROM t \
+             WHERE t.b > 3 ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.a) OVER (PARTITION BY t.b), (SELECT MAX(u.x) FROM u) FROM {t} \
+             ORDER BY t.id LIMIT 7",
+            "SELECT t.id, SUM(t.a) OVER (PARTITION BY t.b), 6 FROM t ORDER BY t.id LIMIT 7",
+        ),
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id), (SELECT MAX(u.x) FROM u) FROM {t} \
+             WHERE 1 = 0",
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id), 6 FROM t WHERE 1 = 0",
+        ),
+        shape(
+            "SELECT t.a, SUM(t.b), (SELECT MAX(u.x) FROM u) FROM {t} WHERE t.b > 3 \
+             GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, SUM(t.b), 6 FROM t WHERE t.b > 3 GROUP BY t.a ORDER BY t.a",
+        ),
+        shape(
+            "SELECT t.b, COUNT(*), (SELECT MAX(u.x) FROM u) FROM {t} GROUP BY t.b ORDER BY t.b",
+            "SELECT t.b, COUNT(*), 6 FROM t GROUP BY t.b ORDER BY t.b",
+        ),
+        shape(
+            "SELECT COUNT(*), SUM(t.b) + (SELECT MAX(u.x) FROM u) FROM {t} WHERE t.b > 3",
+            "SELECT COUNT(*), SUM(t.b) + 6 FROM t WHERE t.b > 3",
+        ),
+        shape(
+            "SELECT COUNT(*), MAX(t.b), (SELECT MAX(u.x) FROM u) FROM {t}",
+            "SELECT COUNT(*), MAX(t.b), 6 FROM t",
+        ),
+        shape(
+            "SELECT COUNT(*), (SELECT MAX(u.x) FROM u) FROM {t} WHERE 1 = 0",
+            "SELECT COUNT(*), 6 FROM t WHERE 1 = 0",
         ),
     ]
 }

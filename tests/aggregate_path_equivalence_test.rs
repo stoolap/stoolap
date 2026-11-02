@@ -575,6 +575,83 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT g, COUNT(*), RANK() OVER (ORDER BY g) FROM t GROUP BY g",
         "SELECT g, COUNT(*), RANK() OVER (ORDER BY g) FROM t WHERE id + 0 = id GROUP BY g",
     ),
+    // A statement whose output asks its subqueries, over its table
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) AS n FROM t GROUP BY g",
+        "SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) AS n FROM t GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) AS n FROM t GROUP BY g",
+        "SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) AS n FROM t GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
+    ),
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, SUM(a) AS s FROM t GROUP BY g \
+         ORDER BY (SELECT a FROM t WHERE id = 3) - SUM(a)",
+        "SELECT g, SUM(a) AS s FROM t GROUP BY g \
+         ORDER BY (SELECT a FROM t WHERE id = 3) - SUM(a)",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, SUM(a), RANK() OVER (ORDER BY SUM(a) * (SELECT 2)) FROM t GROUP BY g",
+        "SELECT g, SUM(a), RANK() OVER (ORDER BY SUM(a) * (SELECT 2)) FROM t GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, SUM(a + (SELECT 1)) FROM t WHERE a > 0 GROUP BY g",
+        "SELECT g, SUM(a + (SELECT 1)) FROM t WHERE a > 0 GROUP BY g",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, COUNT(*), (SELECT 5) FROM t WHERE a < (SELECT a FROM t WHERE id = 3) \
+         GROUP BY g",
+        "SELECT g, COUNT(*), (SELECT 5) FROM t WHERE a < (SELECT a FROM t WHERE id = 3) \
+         GROUP BY g",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT g, COUNT(*), (SELECT a FROM t WHERE id = 3) FROM t GROUP BY g",
+        "SELECT g, COUNT(*), (SELECT a FROM t WHERE id = 3) FROM t GROUP BY g",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT COUNT(*), (SELECT a FROM t WHERE id = 3) FROM t WHERE a > 0",
+        "SELECT COUNT(*), (SELECT a FROM t WHERE id = 3) FROM t WHERE a > 0",
+    ),
+    (
+        "sealed",
+        "stats",
+        "SELECT COUNT(*), SUM(a), (SELECT g FROM t WHERE id = 1) FROM t",
+        "SELECT COUNT(*), SUM(a), (SELECT g FROM t WHERE id = 1) FROM t WHERE id + 0 = id",
+    ),
+    (
+        "memory",
+        "global_scan",
+        "SELECT COUNT(*), (SELECT 1) FROM t WHERE 1 = 0",
+        "SELECT COUNT(*), (SELECT 1) FROM t WHERE 1 = 0",
+    ),
 ];
 
 fn open(db: Database, seal: bool, rows: bool) -> Database {

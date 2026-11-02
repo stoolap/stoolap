@@ -2937,7 +2937,7 @@ impl Executor {
                     }
                     return self.execute_view_query(&view_def, stmt, ctx, classification);
                 }
-                self.execute_simple_table_scan(table_source, stmt, ctx, classification, None, None)
+                self.execute_simple_table_scan(table_source, stmt, ctx, classification, None)
             }
             Expression::JoinSource(join_source) => {
                 let slot = compiled.map(NestedPlan::slot);
@@ -3934,7 +3934,6 @@ impl Executor {
         all_columns_lower: &[String],
         table_alias: Option<&str>,
         classification: &QueryClassification,
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> SelectResult {
         let (result, layout) = match (
             classification.has_aggregation,
@@ -3965,7 +3964,7 @@ impl Executor {
                 classification,
                 RowVec::new(),
                 all_columns,
-                blocks,
+                None,
                 |out| Self::shared_result_layout(stmt, all_columns, table_alias, out),
             )?,
         };
@@ -3981,7 +3980,6 @@ impl Executor {
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
         read_out: Option<&mut Option<ReadSchema>>,
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> SelectResult {
         // A table read AS OF is a row source, read once for the statement
         if let Some(as_of) = &table_source.as_of {
@@ -4101,7 +4099,6 @@ impl Executor {
                 &all_columns_lower,
                 table_alias.as_deref(),
                 classification,
-                blocks,
             );
         }
 
@@ -4124,7 +4121,7 @@ impl Executor {
                     },
                 ) => {
                     let run = (classification.as_ref(), plan);
-                    self.global_aggregate(table.as_ref(), stmt, run, ctx, blocks)?
+                    self.global_aggregate(table.as_ref(), stmt, run, ctx)?
                 }
                 Some(AggregatePlan {
                     aggregations,
@@ -4138,7 +4135,7 @@ impl Executor {
                 }) => {
                     let read = (*source, (group.as_str(), *at), *walks);
                     let calls = aggregations.as_slice();
-                    let run = (ctx, blocks);
+                    let run = (ctx, None);
                     self.grouped_aggregate(table.as_ref(), stmt, calls, read, run, &all_columns)?
                 }
                 None => None,
@@ -4304,7 +4301,6 @@ impl Executor {
                         &all_columns_lower,
                         table_alias.as_deref(),
                         classification,
-                        blocks,
                     );
                 }
             }
@@ -5197,7 +5193,7 @@ impl Executor {
                         stmt,
                         table.schema(),
                         |column| table.get_index_on_column(column).is_some(),
-                        blocks.is_some(),
+                        false,
                     )
                 })
                 .flatten();
@@ -5257,7 +5253,7 @@ impl Executor {
                 classification,
                 rows,
                 &all_columns,
-                blocks,
+                None,
                 |out| Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out),
             )?;
             let columns = CompactArc::new(result.columns().to_vec());
@@ -5271,7 +5267,7 @@ impl Executor {
                 ctx,
                 (&rows, &all_columns),
                 (window_presorted_state, window_pregrouped_state),
-                blocks,
+                None,
             )?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
@@ -9117,7 +9113,6 @@ impl Executor {
                     ctx,
                     &classification,
                     read_out,
-                    None,
                 )?;
 
                 // Prefix column names with table alias (or table name if no alias)
@@ -9463,7 +9458,6 @@ impl Executor {
                 ctx,
                 &classification,
                 Some(&mut opened),
-                None,
             )?;
             let token = opened.as_ref().map(|(token, _)| *token);
             if let Some(out) = read_out {
@@ -9863,35 +9857,21 @@ impl Executor {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::grouped_table_opening();
-        if held.reads_through_where() {
-            let name = &table_source.name.value_lower;
-            let (columns, rows) = held.passing_rows(self, run, name, ctx)?;
-            let alias = table_source.alias.as_ref().map_or(name, |a| &a.value_lower);
-            let (result, layout) = self.group_and_window_rows(
-                &held.stmt,
-                ctx,
-                &held.classification,
-                rows,
-                &columns,
-                Some(run),
-                |out| Self::shared_result_layout(&held.stmt, &columns, Some(alias), out),
-            )?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
-        }
-        let mut read = None;
-        let result = self.execute_simple_table_scan(
-            table_source,
-            &held.stmt,
-            ctx,
-            &held.classification,
-            Some(&mut read),
-            Some(run),
-        );
-        if let Some((_, schema)) = &read {
-            held.table_fits(schema)?;
-        }
-        result
+        let name = &table_source.name.value_lower;
+        let table = self.prepared_table(name, ctx, None)?;
+        held.table_fits(&table.schema_arc())?;
+        let (result, layout) = self.grouped_table(held, run, &*table, ctx)?;
+        let columns = CompactArc::new(result.columns().to_vec());
+        // The windows lay out their own rows
+        let layout = match held.classification.has_window_functions {
+            true => layout,
+            false => {
+                let names = table.schema().column_names_arc();
+                let alias = table_source.alias.as_ref().map_or(name, |a| &a.value_lower);
+                Self::shared_result_layout(&held.stmt, &names, Some(alias), &columns)
+            }
+        };
+        Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
