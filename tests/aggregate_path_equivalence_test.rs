@@ -173,6 +173,25 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT g, MAX(a), MAX(a) AS m FROM t GROUP BY g ORDER BY COUNT(*)",
         "SELECT g, MAX(a), MAX(a) AS m FROM t WHERE id + 0 = id GROUP BY g ORDER BY COUNT(*)",
     ),
+    // A HAVING the index walk does not judge judges the groups the table gives
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > 3",
+        "SELECT g, SUM(a) FROM t WHERE id + 0 = id GROUP BY g HAVING SUM(a) > 3",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING COUNT(*) > 1 AND g > 1",
+        "SELECT g, SUM(a) FROM t WHERE id + 0 = id GROUP BY g HAVING COUNT(*) > 1 AND g > 1",
+    ),
+    (
+        "empty",
+        "storage_grouped",
+        "SELECT g, MAX(a) FROM t GROUP BY g HAVING MAX(a) IS NULL",
+        "SELECT g, MAX(a) FROM t WHERE id + 0 = id GROUP BY g HAVING MAX(a) IS NULL",
+    ),
     (
         "memory",
         "streaming_group_by",
