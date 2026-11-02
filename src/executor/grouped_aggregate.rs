@@ -199,16 +199,7 @@ impl Executor {
             }
             GroupedSource::SortedStream | GroupedSource::Hash => None,
         };
-        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
-        slot_columns.push(all_columns[group_index].clone());
-        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
         let rows = match stored {
-            Some(rows) if stmt.having.is_some() => {
-                let items = self.parse_group_by(stmt, all_columns)?;
-                let groups = (items.as_slice(), aggregations);
-                let kept = self.having_groups(stmt, groups, ctx, (&slot_columns, rows), blocks)?;
-                (AggregatePath::StorageGrouped, kept)
-            }
             Some(rows) => (AggregatePath::StorageGrouped, rows),
             None if walks => {
                 let group = (group, group_index);
@@ -228,6 +219,18 @@ impl Executor {
             None => return Ok(None),
         };
         let (path, rows) = rows;
+        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
+        slot_columns.push(all_columns[group_index].clone());
+        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
+        // The walk judged its groups by the HAVING as it read them
+        let rows = match path {
+            AggregatePath::StorageGrouped if stmt.having.is_some() => {
+                let items = self.parse_group_by(stmt, all_columns)?;
+                let groups = (items.as_slice(), aggregations);
+                self.having_groups(stmt, groups, ctx, (&slot_columns, rows), blocks)?
+            }
+            _ => rows,
+        };
         let slots = AggregateSlots {
             stmt,
             written_stmt: stmt,
