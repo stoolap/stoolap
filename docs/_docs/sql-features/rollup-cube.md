@@ -250,6 +250,17 @@ FROM sales
 GROUP BY ROLLUP(region, category);
 ```
 
+## Window Functions over Grouping Sets
+
+A window function in a statement with ROLLUP, CUBE or GROUPING SETS runs over every group of every set, subtotals and the grand total included, and may read GROUPING() in its PARTITION BY or ORDER BY:
+
+```sql
+SELECT region, category, SUM(amount),
+       RANK() OVER (PARTITION BY GROUPING(category) ORDER BY SUM(amount) DESC) AS rank_in_level
+FROM sales
+GROUP BY ROLLUP(region, category);
+```
+
 ## Comparison: ROLLUP vs CUBE vs GROUPING SETS
 
 | Feature | ROLLUP | CUBE | GROUPING SETS |

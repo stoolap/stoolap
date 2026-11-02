@@ -485,6 +485,48 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT COUNT(*), SUM(a) FROM (SELECT a FROM t) d",
         "SELECT COUNT(*), SUM(a) FROM (SELECT a FROM t) d WHERE a = a",
     ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, SUM(a), RANK() OVER (ORDER BY SUM(a) DESC) FROM t GROUP BY g",
+        "SELECT g, SUM(a), RANK() OVER (ORDER BY SUM(a) DESC) FROM t WHERE id + 0 = id \
+         GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, s, SUM(a), ROW_NUMBER() OVER (ORDER BY g, s) FROM t GROUP BY ROLLUP (g, s)",
+        "SELECT g, s, SUM(a), ROW_NUMBER() OVER (ORDER BY g, s) FROM t WHERE id + 0 = id \
+         GROUP BY ROLLUP (g, s)",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, s, COUNT(*), COUNT(*) OVER (PARTITION BY GROUPING(s)) FROM t \
+         GROUP BY CUBE (g, s)",
+        "SELECT g, s, COUNT(*), COUNT(*) OVER (PARTITION BY GROUPING(s)) FROM t \
+         WHERE id + 0 = id GROUP BY CUBE (g, s)",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, SUM(a), SUM(SUM(a)) OVER () FROM (SELECT g, a, s FROM t) d \
+         WHERE a > 0 GROUP BY g HAVING COUNT(*) > 0 ORDER BY g LIMIT 1",
+        "SELECT g, SUM(a), SUM(SUM(a)) OVER () FROM (SELECT g, a, s FROM t) d \
+         WHERE a > 0 AND s = s GROUP BY g HAVING COUNT(*) > 0 ORDER BY g LIMIT 1",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT COUNT(*), ROW_NUMBER() OVER () FROM t WHERE a > 0",
+        "SELECT COUNT(*), ROW_NUMBER() OVER () FROM t WHERE a > 0 AND id + 0 = id",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT g, COUNT(*), RANK() OVER (ORDER BY g) FROM t GROUP BY g",
+        "SELECT g, COUNT(*), RANK() OVER (ORDER BY g) FROM t WHERE id + 0 = id GROUP BY g",
+    ),
 ];
 
 fn open(db: Database, seal: bool, rows: bool) -> Database {

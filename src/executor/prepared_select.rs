@@ -81,7 +81,7 @@ use super::utils::{
     visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
-use super::window::WindowRows;
+use super::window::{WindowOutput, WindowRows};
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
 use crate::planner::{
@@ -2521,7 +2521,7 @@ fn projected_columns(expr: &Expression, from: usize, out: &mut SmallVec<[usize; 
 }
 
 /// Each direct operand of an expression of the family's forms
-fn for_each_child<'e>(
+pub(super) fn for_each_child<'e>(
     expr: &'e Expression,
     f: &mut impl FnMut(&'e Expression) -> Result<()>,
 ) -> Result<()> {
@@ -3943,7 +3943,13 @@ impl PreparedSelect {
                 having: stmt.having.as_deref().map(Expression::to_string),
                 windows,
                 aggregate: self.aggregated.then(|| {
-                    let items: Vec<String> = stmt.columns.iter().map(item_name).collect();
+                    // An item a window computes shows on the Window step
+                    let items: Vec<String> = stmt
+                        .columns
+                        .iter()
+                        .filter(|c| !QueryClassification::expression_has_window_function(c))
+                        .map(item_name)
+                        .collect();
                     let group = stmt.group_by.to_string();
                     match group.is_empty() {
                         true => items.join(", "),
@@ -8138,8 +8144,9 @@ impl PreparedSelect {
             .chain(&stmt.distinct_on)
             .any(QueryClassification::expression_has_window_function);
         // A statement that aggregates its rows reads them as the windowed
-        // one does, its calls computed over them
-        let aggregated = !windowed && Self::aggregates(stmt);
+        // one does, its calls computed over them and its windows over the
+        // groups
+        let aggregated = Self::aggregates(stmt);
         let rows_stmt;
         let written = stmt;
         let stmt = match windowed || aggregated {
@@ -8430,7 +8437,7 @@ impl PreparedSelect {
                 };
                 // Window functions over every row read them through an index
                 // as the window rule chooses
-                let window = (windowed && written.where_clause.is_none())
+                let window = (windowed && !aggregated && written.where_clause.is_none())
                     .then(|| {
                         Executor::window_read(
                             written,
@@ -8447,7 +8454,7 @@ impl PreparedSelect {
                     },
                     None => read,
                 };
-                if windowed {
+                if windowed && !aggregated {
                     steps = Self::window_steps(written, where_.conjuncts > where_.pushed);
                 }
                 // The aggregate's row from where the one rule says, else from
@@ -8507,7 +8514,7 @@ impl PreparedSelect {
                 .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())),
             false => None,
         };
-        let window = windowed
+        let window = (windowed && !aggregated)
             .then(|| {
                 let keyed = Executor::with_distinct_on_items(written, &get_classification(written));
                 let computed = keyed.as_ref().unwrap_or(written);
@@ -8548,12 +8555,12 @@ impl PreparedSelect {
     }
 
     /// Whether the runner aggregates `stmt`: it aggregates its rows and
-    /// holds no window function, set operation, DISTINCT ON or subquery,
-    /// which the grouped family's blocks answer
+    /// holds no named window, set operation, DISTINCT ON or subquery, which
+    /// the grouped family's blocks answer; its windows run over its groups
     pub(crate) fn runs_aggregate(stmt: &SelectStatement) -> bool {
         let shape = get_classification(stmt);
         Self::aggregates(stmt)
-            && !shape.has_window_functions
+            && !Executor::reads_window_defs(stmt)
             && !shape.has_set_operations
             && !shape.has_distinct_on
             && !shape.grouped_has_subqueries
@@ -8570,12 +8577,16 @@ impl PreparedSelect {
     }
 
     /// The steps of `stmt`, which aggregates its rows, over its read,
-    /// outermost first: the finishing steps over the groups its HAVING
-    /// keeps, over the conjuncts the read did not take when `filter`
+    /// outermost first: the finishing steps over its windows, over the
+    /// groups its HAVING keeps, over the conjuncts the read did not take
+    /// when `filter`
     fn aggregate_steps(stmt: &SelectStatement, filter: bool) -> SmallVec<[Step; 4]> {
-        let mut inner = SmallVec::<[Step; 3]>::new();
+        let mut inner = SmallVec::<[Step; 4]>::new();
         if stmt.distinct {
             inner.push(Step::Distinct);
+        }
+        if get_classification(stmt).has_window_functions {
+            inner.push(Step::Window);
         }
         if stmt.having.is_some() {
             inner.push(Step::Having);
@@ -12361,29 +12372,28 @@ impl Executor {
 
     /// The rows of `stmt`, which aggregates the rows of `table`: its one row
     /// or its groups from where the plan's rule says, else from every row
-    /// the WHERE passes fed to the calls
+    /// the WHERE passes fed to the calls; its windows over them
     fn prepared_aggregate(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
         table: &dyn Table,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
         let plan = prepared.plan.as_ref();
-        if PreparedSelect::groups(stmt) {
+        let windows = prepared.windowed;
+        if PreparedSelect::groups(stmt) || windows {
             let columns = table.schema().column_names_arc();
             if let Some(read) = plan.and_then(|plan| plan.read.grouped()) {
                 if let Some(result) =
                     self.grouped_aggregate(table, stmt, aggregations, read, ctx, &columns)?
                 {
-                    return Ok(result);
+                    return Ok((result, None));
                 }
             }
             return self.table_input(stmt, ctx, (runner, prepared), table, |input| {
-                let stmts = (stmt, stmt);
-                let path = AggregatePath::HashGroups;
-                self.aggregate_input(path, stmts, aggregations, ctx, input, &columns, None)
+                self.grouped_answer(windows, stmt, aggregations, ctx, input, &columns)
             });
         }
         let source = plan.and_then(|plan| plan.read.aggregated());
@@ -12405,13 +12415,37 @@ impl Executor {
             })
         };
         let source = (source, pushed.as_deref());
-        self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)?
-            .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))
+        let result = self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)?;
+        let result = result
+            .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))?;
+        Ok((result, None))
+    }
+
+    /// `stmt`'s groups of `aggregations` from the rows of `input`, of
+    /// `columns`: ended as every aggregate path ends them, or the window
+    /// functions over them when `windows`
+    fn grouped_answer(
+        &self,
+        windows: bool,
+        stmt: &SelectStatement,
+        aggregations: &[SqlAggregateFunction],
+        ctx: &ExecutionContext,
+        input: FeedInput<'_, impl RowSource>,
+        columns: &[String],
+    ) -> Result<WindowOutput> {
+        let path = AggregatePath::HashGroups;
+        if windows {
+            return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, None);
+        }
+        let stmts = (stmt, stmt);
+        let result = self.aggregate_input(path, stmts, aggregations, ctx, input, columns, None)?;
+        Ok((result, None))
     }
 
     /// The rows of `stmt`, which aggregates the rows `source` gives, not a
     /// table's, of `columns`: every row the WHERE passes fed to the calls, a
-    /// view's or a derived table's as its stream hands them over
+    /// view's or a derived table's as its stream hands them over; its
+    /// windows over them
     fn source_aggregate(
         &self,
         stmt: &SelectStatement,
@@ -12419,16 +12453,15 @@ impl Executor {
         (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
         source: StatementSource<'_>,
         columns: &[String],
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
-        let path = AggregatePath::HashGroups;
+        let windows = prepared.windowed;
         // Without a WHERE the rows a source holds are fed as they are, and a
         // stream's as it hands them over, however many: held to split them
         // over the thread pool, every row would be held
         let unfiltered = stmt.where_clause.is_none();
-        let aggregate = |input| {
-            self.aggregate_input(path, (stmt, stmt), aggregations, ctx, input, columns, None)
-        };
+        let aggregate =
+            |input| self.grouped_answer(windows, stmt, aggregations, ctx, input, columns);
         let source = match source {
             StatementSource::Rows(_, rows) if unfiltered => {
                 return aggregate(FeedInput::<StreamedRows<'_>>::Rows(&rows))
@@ -12468,7 +12501,7 @@ impl Executor {
             )
         };
         self.passed_input(stmt, ctx, run, (hold, hint), read, |input| {
-            self.aggregate_input(path, (stmt, stmt), aggregations, ctx, input, columns, None)
+            self.grouped_answer(windows, stmt, aggregations, ctx, input, columns)
         })
     }
 
@@ -12763,8 +12796,9 @@ impl Executor {
             (source, _) => source,
         };
         // The window step computes the SELECT list over every row the read
-        // passes; the finishing steps follow it
-        if prepared.windowed {
+        // passes, unless the statement aggregates them; the finishing steps
+        // follow it
+        if prepared.windowed && !prepared.aggregated {
             let StatementSource::Table(table) = &source else {
                 return Err(Error::internal("a windowed statement over a source"));
             };
@@ -12841,7 +12875,7 @@ impl Executor {
                 other => CompactArc::new(other.columns().unwrap_or_default().to_vec()),
             };
             let run = (&runner, &*prepared);
-            let result = match source {
+            let (result, windows_layout) = match source {
                 StatementSource::Table(table) => {
                     self.prepared_aggregate(stmt, ctx, run, &*table)?
                 }
@@ -12849,9 +12883,14 @@ impl Executor {
             };
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
-            let layout =
-                Self::shared_result_layout(stmt, &names, Some(scope_name), &output_columns)
-                    .map(CompactArc::new);
+            // The windows lay out their own rows, as the general path's do
+            let layout = match prepared.windowed {
+                true => windows_layout,
+                false => {
+                    Self::shared_result_layout(stmt, &names, Some(scope_name), &output_columns)
+                }
+            };
+            let layout = layout.map(CompactArc::new);
             return Ok((result, output_columns, false, visible, layout, false));
         }
         let output_columns = CompactArc::clone(&prepared.output_columns);

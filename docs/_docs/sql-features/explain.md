@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY with a window function or a DISTINCT ON, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY with a DISTINCT ON or a named window, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -259,7 +259,23 @@ Aggregate category, SUM(value) by category
     Index idx_value (value range)
 ```
 
-The scan line is the same one a planned statement prints: the access rule that chooses its keys or indexes is one rule for every path. A grouped statement with a window function, a DISTINCT ON or a subquery prints the format of the path that runs it.
+The scan line is the same one a planned statement prints: the access rule that chooses its keys or indexes is one rule for every path. Window functions over the groups show as a `Window` step over the HAVING and the aggregate:
+
+```sql
+EXPLAIN SELECT category, SUM(value), RANK() OVER (ORDER BY SUM(value) DESC) FROM products GROUP BY category HAVING COUNT(*) > 1;
+```
+
+Output:
+```
+plan
+----
+Window RANK() OVER (ORDER BY SUM(value) DESC)
+  Having (COUNT(*) > 1)
+    Aggregate category, SUM(value) by category
+      SeqScan products
+```
+
+A grouped statement with a DISTINCT ON, a named window or a subquery prints the format of the path that runs it.
 
 An aggregate over a view, a CTE, a derived table, a VALUES list or a table function groups the rows its source gives, read once, with the source's plan under it:
 
