@@ -1189,7 +1189,7 @@ impl Executor {
     ) -> bool {
         let rows_where = classification.where_has_subqueries
             && !matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
-        let grouped_keys = classification.has_aggregation
+        let grouped_keys = (classification.has_aggregation || classification.has_window_functions)
             && stmt
                 .order_by
                 .iter()
@@ -1243,17 +1243,13 @@ impl Executor {
         // A set operation's ORDER BY, LIMIT and OFFSET are the whole one's,
         // read over its rows once the blocks gave the first branch's
         let whole = stmt.set_operations.is_empty();
-        // A grouped key holding a subquery is computed for each group
+        // A key holding a subquery is computed for each group or row
         let keys: SmallVec<[&Expression; 2]> = stmt
             .order_by
             .iter()
             .map(|ob| &ob.expression)
             .filter(|key| whole && mentions_subquery(key))
             .collect();
-        // Over rows that are not grouped a key reads no SELECT alias
-        if !keys.is_empty() && !grouped {
-            return Err("an ORDER BY holding a subquery");
-        }
         let windows = Executor::used_window_defs(stmt);
         let family = Family {
             executor: self,
@@ -1284,7 +1280,7 @@ impl Executor {
             family.expression(having, 1, Site::GroupedOutput, &mut found)?;
         }
         for key in keys {
-            family.expression(key, 1, Site::GroupedOutput, &mut found)?;
+            family.expression(key, 1, over, &mut found)?;
         }
         // A DISTINCT ON key is computed as a SELECT item of the statement is
         for key in &stmt.distinct_on {
@@ -8929,12 +8925,15 @@ impl PreparedGrouped {
         // needs the value the row returns, which computing it again over the
         // group's row would not give: a key reading one reads that row
         let registry = &executor.function_registry;
+        // Over rows that do not group, the row a key is asked of is the one
+        // the run returns, so every alias reads its value there
         let unrepeatable = |position: usize| {
-            item_at(position).is_some_and(|item| {
-                mentions_subquery(item)
-                    || volatile(item, registry)
-                    || QueryClassification::expression_has_window_function(item)
-            })
+            !groups
+                || item_at(position).is_some_and(|item| {
+                    mentions_subquery(item)
+                        || volatile(item, registry)
+                        || QueryClassification::expression_has_window_function(item)
+                })
         };
         let keyed = stmt
             .order_by
@@ -8959,7 +8958,7 @@ impl PreparedGrouped {
             let (first, rewritten) = if !groups {
                 let first = run_slots.len();
                 let rewritten =
-                    input_rewrite(&mut builder, &chain, &mut run_slots, &mut input, expr)?;
+                    input_rewrite(&mut builder, over_group, &mut run_slots, &mut input, expr)?;
                 (first, rewritten)
             } else {
                 let read = read_inputs(expr, &items, &mut |call| {
@@ -9243,7 +9242,9 @@ impl PreparedGrouped {
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
         let mut late_holes = Vec::new();
         for (id, sq) in blocks.subqueries.iter().enumerate() {
-            if input.get(id) == Some(&true) {
+            // Over rows that do not group a late key's blocks are asked of a row too
+            let late_input = !groups && late_blocks.get(id) == Some(&true);
+            if input.get(id) == Some(&true) && !late_input {
                 holes.push(std::mem::take(&mut row_holes.holes[id]));
                 continue;
             }

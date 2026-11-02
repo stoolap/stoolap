@@ -296,6 +296,28 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, COUNT(*) OVER w, 6 FROM t GROUP BY t.a WINDOW w AS (ORDER BY t.a) \
              ORDER BY t.a",
         ),
+        // Over rows that do not group, a key reads each row and its aliases
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id) FROM {t} \
+             ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) DESC, t.id",
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id) FROM t ORDER BY {count} DESC, t.id",
+        ),
+        shape(
+            "SELECT t.id, t.b AS y, LAG(t.a) OVER (ORDER BY t.id) FROM {t} \
+             ORDER BY (SELECT y + MIN(u.x) FROM u), t.id",
+            "SELECT t.id, t.b AS y, LAG(t.a) OVER (ORDER BY t.id) FROM t ORDER BY t.b, t.id",
+        ),
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id DESC) AS r FROM {t} \
+             ORDER BY (SELECT r + MIN(u.x) FROM u) LIMIT 5",
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id DESC) AS r FROM t ORDER BY r LIMIT 5",
+        ),
+        shape(
+            "SELECT t.id, SUM(t.b) OVER (PARTITION BY t.a) FROM {t} \
+             ORDER BY EXISTS (SELECT 1 FROM u WHERE u.k = t.a AND u.x = 3), t.id LIMIT 10 OFFSET 5",
+            "SELECT t.id, SUM(t.b) OVER (PARTITION BY t.a) FROM t \
+             ORDER BY t.a IN (2, 3, 5, 6), t.id LIMIT 10 OFFSET 5",
+        ),
     ]
 }
 
@@ -515,6 +537,30 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
     ] {
         assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
     }
+}
+
+#[test]
+fn an_ungrouped_key_reading_a_volatile_alias_sorts_by_the_value_each_row_shows() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_volatile").unwrap();
+    fill(&db);
+    let before = general_hits();
+    let result = db
+        .query(
+            "SELECT t.id, RANDOM() AS z, ROW_NUMBER() OVER (ORDER BY t.id) FROM t \
+             ORDER BY (SELECT 0) + z",
+            (),
+        )
+        .unwrap();
+    let shown: Vec<f64> = result
+        .map(|row| row.unwrap().get::<f64>(1).unwrap())
+        .collect();
+    assert_eq!(general_hits(), before, "the blocks run it");
+    assert_eq!(shown.len(), 200);
+    assert!(
+        shown.windows(2).all(|pair| pair[0] <= pair[1]),
+        "rows sort by the z they show: {shown:?}"
+    );
 }
 
 #[test]
