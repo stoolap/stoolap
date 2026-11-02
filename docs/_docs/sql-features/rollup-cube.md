@@ -211,6 +211,8 @@ Returns:
 - `0` if the column is part of the current grouping (normal row)
 - `1` if the column is aggregated (super-aggregate row)
 
+The argument names a GROUP BY item as it is written, or by its column, qualified or not: with `GROUP BY ROLLUP(s.region)`, both `GROUPING(s.region)` and `GROUPING(region)` read that item. A bare name two GROUP BY items carry, such as `region` with `ROLLUP(s.region, u.region)`, names neither, and like a column no item names it reads `0`; qualify it to read one of them.
+
 ### Example
 
 ```sql

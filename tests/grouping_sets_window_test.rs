@@ -47,6 +47,46 @@ const CASES: &[(&str, &str)] = &[
     ),
 ];
 
+/// (statement, its rows sorted, each written with `|` between its values)
+const ANSWERS: &[(&str, &[&str])] = &[
+    (
+        "SELECT k, j, COUNT(*) OVER (PARTITION BY GROUPING(j)) FROM t GROUP BY ROLLUP (k, j)",
+        &[
+            "0|0|6",
+            "0|1|6",
+            "0|NULL|4",
+            "1|0|6",
+            "1|1|6",
+            "1|NULL|4",
+            "2|0|6",
+            "2|1|6",
+            "2|NULL|4",
+            "NULL|NULL|4",
+        ],
+    ),
+    (
+        "SELECT k, COUNT(*) OVER w FROM t GROUP BY ROLLUP (k) \
+         WINDOW w AS (PARTITION BY GROUPING(k))",
+        &["0|3", "1|3", "2|3", "NULL|1"],
+    ),
+    (
+        "SELECT t.k, COUNT(*) OVER (PARTITION BY GROUPING(t.k)) FROM t GROUP BY ROLLUP (t.k)",
+        &["0|3", "1|3", "2|3", "NULL|1"],
+    ),
+    (
+        "SELECT t.k, GROUPING(t.k), COUNT(*) FROM t GROUP BY ROLLUP (t.k)",
+        &["0|0|4", "1|0|4", "2|0|4", "NULL|1|12"],
+    ),
+    (
+        "SELECT k, GROUPING(t.k), COUNT(*) FROM t GROUP BY ROLLUP (k)",
+        &["0|0|4", "1|0|4", "2|0|4", "NULL|1|12"],
+    ),
+    (
+        "SELECT t.k, GROUPING(k), COUNT(*) FROM t GROUP BY ROLLUP (t.k)",
+        &["0|0|4", "1|0|4", "2|0|4", "NULL|1|12"],
+    ),
+];
+
 fn open(dir: &tempfile::TempDir, sealed: bool, name: &str) -> Database {
     let db = match sealed {
         true => Database::open(&format!("file://{}", dir.path().display())).unwrap(),
@@ -87,6 +127,10 @@ fn check(db: &Database, context: &str) {
         let width = alone.first().map_or(0, Vec::len);
         let grouped: Vec<Vec<String>> = windowed.iter().map(|row| row[..width].to_vec()).collect();
         assert_eq!(grouped, alone, "{context}: {windowed:?}");
+    }
+    for (sql, want) in ANSWERS {
+        let got: Vec<String> = rows(db, sql).iter().map(|row| row.join("|")).collect();
+        assert_eq!(got, *want, "{context}: {sql}");
     }
     // The window counts every group of every set
     let counted = rows(db, "SELECT COUNT(*) OVER () FROM t GROUP BY ROLLUP (k, j)");

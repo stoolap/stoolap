@@ -2333,32 +2333,43 @@ impl Executor {
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
     ) -> Option<usize> {
-        // GROUPING() takes one argument - the column name
-        if func.arguments.is_empty() {
-            return None;
+        // The item written as the argument is, else the one item its column
+        // names, qualified or not; two items of its name leave it unnamed
+        let arg = func.arguments.first()?;
+        let key = ExprKey::of(arg);
+        if let Some(at) = group_by_columns
+            .iter()
+            .position(|item| group_by_item_key(item) == key)
+        {
+            return Some(at);
         }
-
-        let arg = &func.arguments[0];
-        let arg_name: &str = match arg {
-            Expression::Identifier(id) => id.value_lower.as_str(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
+        let (qualifier, name) = match arg {
+            Expression::Identifier(id) => (None, id.value_lower.as_str()),
+            Expression::QualifiedIdentifier(qid) => (
+                Some(qid.qualifier.value_lower.as_str()),
+                qid.name.value_lower.as_str(),
+            ),
             _ => return None,
         };
-
-        // Find the matching GROUP BY column
-        for (idx, item) in group_by_columns.iter().enumerate() {
-            let matches = match item {
-                GroupByItem::Column(col_name) => col_name.to_lowercase() == arg_name,
-                GroupByItem::Expression { display_name, .. } => {
-                    display_name.to_lowercase() == arg_name
+        let mut named = group_by_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| match item {
+                GroupByItem::Column(column) => {
+                    let table = split_qualified(column).map(|(table, _)| table);
+                    eq_folded(bare_name(column), name)
+                        && qualifier
+                            .zip(table)
+                            .is_none_or(|(arg, item)| eq_folded(item, arg))
                 }
-            };
-            if matches {
-                return Some(idx);
-            }
+                GroupByItem::Expression { display_name, .. } => {
+                    qualifier.is_none() && eq_folded(display_name, name)
+                }
+            });
+        match (named.next(), named.next()) {
+            (Some((at, _)), None) => Some(at),
+            _ => None,
         }
-
-        None
     }
 
     /// The ORDER BY of an aggregate that orders its own input, with the
@@ -2465,7 +2476,8 @@ impl Executor {
         if stmt.group_by.modifier != GroupByModifier::None {
             let mut calls = Vec::new();
             let order = stmt.order_by.iter().map(|o| &o.expression);
-            for expr in stmt.columns.iter().chain(order) {
+            let windows = stmt.window_defs.iter().flat_map(|w| w.expressions());
+            for expr in stmt.columns.iter().chain(order).chain(windows) {
                 grouping_calls(expr, &mut calls);
             }
             let flags = items.len() + aggregations.len();
