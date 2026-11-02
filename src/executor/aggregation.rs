@@ -485,6 +485,21 @@ pub(crate) fn aggregate_slot_keys(
     slots
 }
 
+/// The column `item` groups by, lowered as a column binds, qualified as it
+/// is written; None for an item grouped by any other expression
+fn written_column(item: &GroupByItem) -> Option<String> {
+    match item {
+        GroupByItem::Column(name) => Some(name.to_lowercase()),
+        GroupByItem::Expression { expr, .. } => match expr {
+            Expression::Identifier(id) => Some(id.value_lower.to_string()),
+            Expression::QualifiedIdentifier(qid) => {
+                Some(qualified(&qid.qualifier.value_lower, &qid.name.value_lower))
+            }
+            _ => None,
+        },
+    }
+}
+
 /// The GROUPING() calls `expr` writes, at any depth
 fn grouping_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
     match expr {
@@ -2333,10 +2348,10 @@ impl Executor {
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
     ) -> Option<usize> {
-        // The one item the argument names: a column, or the column an alias
-        // or a position groups by, of its name and, when both have one, its
-        // qualifier, as a column binds; that alias; or an expression written
-        // as the argument is. Two items it names leave it unnamed
+        // The first item written as the argument is: its column, qualified
+        // alike, its alias, or its expression. Else the item whose column
+        // the argument names, qualified or not, as a column binds; several
+        // such items name one only when they all write the same column
         let arg = func.arguments.first()?;
         let column = match arg {
             Expression::Identifier(id) => Some((None, id.value_lower.as_str())),
@@ -2346,38 +2361,53 @@ impl Executor {
             )),
             _ => None,
         };
+        // Some(true) when written alike, Some(false) when named by its column
         let names = |table: Option<&str>, name: &str| {
-            column.is_some_and(|(qualifier, arg)| {
-                eq_folded(name, arg)
-                    && qualifier
-                        .zip(table)
-                        .is_none_or(|(arg, item)| eq_folded(item, arg))
-            })
+            let (qualifier, arg) = column?;
+            if !eq_folded(name, arg) {
+                return None;
+            }
+            match (qualifier, table) {
+                (Some(arg), Some(item)) => eq_folded(item, arg).then_some(true),
+                (None, None) => Some(true),
+                _ => Some(false),
+            }
         };
         let key = ExprKey::of(arg);
-        let mut named = group_by_columns
+        let reads: Vec<(usize, bool)> = group_by_columns
             .iter()
             .enumerate()
-            .filter(|(_, item)| match item {
-                GroupByItem::Column(name) => names(
-                    split_qualified(name).map(|(table, _)| table),
-                    bare_name(name),
-                ),
-                GroupByItem::Expression { expr, display_name } => {
-                    let grouped = match expr {
-                        Expression::Identifier(id) => names(None, &id.value),
-                        Expression::QualifiedIdentifier(qid) => {
-                            names(Some(&qid.qualifier.value), &qid.name.value)
-                        }
-                        expr => ExprKey::of(expr) == key,
-                    };
-                    grouped || names(None, display_name) && column.is_some_and(|(q, _)| q.is_none())
-                }
-            });
-        match (named.next(), named.next()) {
-            (Some((at, _)), None) => Some(at),
-            _ => None,
+            .filter_map(|(at, item)| {
+                let read = match item {
+                    GroupByItem::Column(name) => names(
+                        split_qualified(name).map(|(table, _)| table),
+                        bare_name(name),
+                    ),
+                    GroupByItem::Expression { expr, display_name } => {
+                        let grouped = match expr {
+                            Expression::Identifier(id) => names(None, &id.value),
+                            Expression::QualifiedIdentifier(qid) => {
+                                names(Some(&qid.qualifier.value), &qid.name.value)
+                            }
+                            expr => (ExprKey::of(expr) == key).then_some(true),
+                        };
+                        let alias = column
+                            .filter(|(qualifier, _)| qualifier.is_none())
+                            .and_then(|_| names(None, display_name));
+                        grouped.max(alias)
+                    }
+                };
+                read.map(|exact| (at, exact))
+            })
+            .collect();
+        if let Some(&(at, _)) = reads.iter().find(|(_, exact)| *exact) {
+            return Some(at);
         }
+        let (&(first, _), rest) = reads.split_first()?;
+        let written = written_column(&group_by_columns[first]);
+        rest.iter()
+            .all(|&(at, _)| written.is_some() && written_column(&group_by_columns[at]) == written)
+            .then_some(first)
     }
 
     /// The ORDER BY of an aggregate that orders its own input, with the

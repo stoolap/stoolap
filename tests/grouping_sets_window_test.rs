@@ -98,6 +98,32 @@ const ANSWERS: &[(&str, &[&str])] = &[
         &["0|0|0|4", "1|0|0|4", "2|0|0|4", "NULL|1|1|12"],
     ),
     (
+        "SELECT GROUPING(k), COUNT(*) FROM t GROUP BY ROLLUP (k, k)",
+        &["0|4", "0|4", "0|4", "0|4", "0|4", "0|4", "1|12"],
+    ),
+    (
+        "SELECT COUNT(*) OVER (PARTITION BY GROUPING(k)) FROM t GROUP BY ROLLUP (k, k)",
+        &["1", "6", "6", "6", "6", "6", "6"],
+    ),
+    (
+        "SELECT GROUPING(k), GROUPING(t.k), COUNT(*) FROM t GROUP BY ROLLUP (k, t.k)",
+        &[
+            "0|0|4", "0|0|4", "0|0|4", "0|1|4", "0|1|4", "0|1|4", "1|1|12",
+        ],
+    ),
+    (
+        "SELECT COUNT(*) OVER (PARTITION BY GROUPING(k)) FROM t GROUP BY ROLLUP (k, t.k)",
+        &["1", "6", "6", "6", "6", "6", "6"],
+    ),
+    (
+        "SELECT COUNT(*) OVER (PARTITION BY GROUPING(t.k)) FROM t GROUP BY ROLLUP (k, t.k)",
+        &["3", "3", "3", "4", "4", "4", "4"],
+    ),
+    (
+        "SELECT GROUPING(k), COUNT(*) FROM t GROUP BY ROLLUP (t.k, t.k)",
+        &["0|4", "0|4", "0|4", "0|4", "0|4", "0|4", "1|12"],
+    ),
+    (
         "SELECT GROUPING(\"οσ\"), COUNT(*) FROM u GROUP BY ROLLUP (\"ΟΣ\", \"οσ\")",
         &["0|1", "1|1", "1|1"],
     ),
