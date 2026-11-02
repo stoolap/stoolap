@@ -1618,6 +1618,23 @@ fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable;
     ])
 }
 
+/// An error when a column of `merges`, the pairs a NATURAL join or a USING
+/// list merges in `scope`, shares its name with another of its table
+fn merged_once(scope: &ScopeTable, merges: &[(usize, usize)]) -> Result<()> {
+    for &(left, right) in merges {
+        for at in [left, right] {
+            let (table, range) = scope.table(at);
+            let name = scope.lower[at].as_str();
+            let spelled = match table.is_empty() {
+                true => name.to_string(),
+                false => format!("{table}.{name}"),
+            };
+            scope.unique(range.filter(|&i| i != at), name, &spelled)?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether an unqualified name in `clauses` is one two columns of `join`
 /// over `sides` have and no NATURAL or USING join merges, which its blocks
 /// refuse as ambiguous
@@ -10290,10 +10307,12 @@ impl JoinBlocks {
             return Ok(None);
         };
         let left_width = left_scope.columns.len();
+        let inner_merges = left_scope.merged.len() + right_scope.merged.len();
         let scope = ScopeTable::joined(join, left_scope, right_scope).by_position();
         if scope.columns.len() != width {
             return Ok(None);
         }
+        merged_once(&scope, &scope.merged[inner_merges..])?;
         let items = items(star_columns(width, &scope.merged).len());
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
