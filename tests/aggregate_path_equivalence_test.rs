@@ -182,13 +182,13 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "memory",
-        "streaming_derived_table",
+        "hash_groups",
         "SELECT COUNT(*) AS n, s, COUNT(*) FROM (SELECT s FROM t) d GROUP BY s",
         "SELECT COUNT(*) AS n, s, COUNT(*) FROM (SELECT s FROM t) d WHERE s = s GROUP BY s",
     ),
     (
         "sealed",
-        "streaming_derived_table",
+        "hash_groups",
         "SELECT s, MIN(a), MIN(a) AS lo FROM (SELECT s, a FROM t) d GROUP BY s",
         "SELECT s, MIN(a), MIN(a) AS lo FROM (SELECT s, a FROM t) d WHERE s = s GROUP BY s",
     ),
@@ -233,13 +233,13 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "memory",
-        "streaming_derived_table",
+        "hash_groups",
         "SELECT s AS n, COUNT(*) AS s FROM (SELECT s FROM t) d GROUP BY s",
         "SELECT s AS n, COUNT(*) AS s FROM (SELECT s FROM t) d WHERE s = s GROUP BY s",
     ),
     (
         "memory",
-        "streaming_derived_table",
+        "hash_groups",
         "SELECT COUNT(*) FROM (SELECT CAST(a AS TEXT) AS \"x.s\", s FROM t) d GROUP BY \"x.s\"",
         "SELECT COUNT(*) FROM (SELECT CAST(a AS TEXT) AS \"x.s\", s FROM t) d WHERE s = s \
          GROUP BY \"x.s\"",
@@ -428,9 +428,62 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "empty",
-        "streaming_derived_table",
+        "hash_groups",
         "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d GROUP BY s",
         "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d WHERE s = s GROUP BY s",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT COUNT(*), SUM(a), MAX(s) FROM (SELECT s, a FROM t WHERE a > 0) d",
+        "SELECT COUNT(*), SUM(a), MAX(s) FROM (SELECT s, a FROM t WHERE a > 0) d WHERE s = s",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, SUM(a) FROM (SELECT g, a, s FROM t) d WHERE a > 0 GROUP BY g \
+         HAVING COUNT(*) > 0 ORDER BY g",
+        "SELECT g, SUM(a) FROM (SELECT g, a, s FROM t) d WHERE a > 0 AND s = s GROUP BY g \
+         HAVING COUNT(*) > 0 ORDER BY g",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, COUNT(*), MIN(s) FROM tv GROUP BY g",
+        "SELECT g, COUNT(*), MIN(s) FROM tv WHERE s = s GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "WITH c AS (SELECT g, s, a FROM t) SELECT g, s, SUM(a) FROM c GROUP BY ROLLUP (g, s)",
+        "WITH c AS (SELECT g, s, a FROM t) SELECT g, s, SUM(a) FROM c WHERE s = s \
+         GROUP BY ROLLUP (g, s)",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT x, COUNT(*), SUM(y) FROM (VALUES (1, 2), (1, 3), (2, NULL)) AS v(x, y) GROUP BY x",
+        "SELECT x, COUNT(*), SUM(y) FROM (VALUES (1, 2), (1, 3), (2, NULL)) AS v(x, y) \
+         WHERE x = x GROUP BY x",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT value % 3 AS r, COUNT(*) FROM generate_series(1, 10) GROUP BY value % 3",
+        "SELECT value % 3 AS r, COUNT(*) FROM generate_series(1, 10) WHERE value = value \
+         GROUP BY value % 3",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT DISTINCT COUNT(*) FROM (SELECT g FROM t) d GROUP BY g",
+        "SELECT DISTINCT COUNT(*) FROM (SELECT g FROM t) d WHERE g = g GROUP BY g",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT COUNT(*), SUM(a) FROM (SELECT a FROM t) d",
+        "SELECT COUNT(*), SUM(a) FROM (SELECT a FROM t) d WHERE a = a",
     ),
 ];
 
@@ -441,6 +494,8 @@ fn open(db: Database, seal: bool, rows: bool) -> Database {
     )
     .unwrap();
     db.execute("CREATE INDEX t_g ON t(g)", ()).unwrap();
+    db.execute("CREATE VIEW tv AS SELECT g, s, a FROM t WHERE id > 0", ())
+        .unwrap();
     if rows {
         db.execute(
             "INSERT INTO t VALUES (1, 1, '1', 1), (2, 1, '1', 2), (3, 2, '2', 10), \

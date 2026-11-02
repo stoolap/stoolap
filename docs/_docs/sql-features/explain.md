@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY over anything but a table or with a window function or a DISTINCT ON, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY with a window function or a DISTINCT ON, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -260,6 +260,23 @@ Aggregate category, SUM(value) by category
 ```
 
 The scan line is the same one a planned statement prints: the access rule that chooses its keys or indexes is one rule for every path. A grouped statement with a window function, a DISTINCT ON or a subquery prints the format of the path that runs it.
+
+An aggregate over a view, a CTE, a derived table, a VALUES list or a table function groups the rows its source gives, read once, with the source's plan under it:
+
+```sql
+EXPLAIN SELECT category, COUNT(*) FROM (SELECT category FROM products WHERE value > 0) p GROUP BY category;
+```
+
+Output:
+```
+plan
+----
+Aggregate category, COUNT(*) by category
+  Derived p
+    Project category
+      IndexScan products (value > 0)
+        Index idx_value (value range)
+```
 
 ### Views, CTEs and Derived Tables
 
@@ -565,7 +582,7 @@ For a planned single-table SELECT:
 | Derived, View, Cte | The rows of a derived table, a view or a CTE, each judged by the condition after its name; the plan of its query is under it |
 | Values, Function | The rows of a VALUES list or a table function, each judged by the condition after its name |
 | OneRow | The one row a SELECT without FROM reads |
-| Aggregate | The one row of COUNT, SUM, AVG, MIN and MAX over a table, or its groups after `by`, from the line under it |
+| Aggregate | The one row of COUNT, SUM, AVG, MIN and MAX over a table or a source, or its groups after `by`, from the line under it |
 | Stats | Those values from what the table keeps: row count, distinct count, column sum and bounds |
 | IndexBound | A MIN or MAX from the first or last key of the column's index |
 | StorageFiltered | The calls the table computes over the rows the WHERE passes |

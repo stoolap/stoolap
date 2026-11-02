@@ -167,7 +167,7 @@ fn global_aggregates_answer_as_over_the_same_rows() {
     #[cfg(feature = "test-failpoints")]
     {
         let taken = stoolap::test_failpoints::aggregate_paths_taken();
-        for path in ["stats", "storage_filtered", "general"] {
+        for path in ["stats", "storage_filtered", "hash_groups"] {
             assert!(taken.contains(&path), "{path} not taken: {taken:?}");
         }
     }

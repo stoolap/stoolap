@@ -110,6 +110,14 @@ fn an_aggregate_whose_calls_do_not_split_streams_its_decoded_rows() {
             "SELECT COUNT(*), a, b FROM t GROUP BY ROLLUP (a, b)",
             3 * ROWS,
         ),
+        (
+            "SELECT COUNT(*), a FROM (SELECT * FROM t) d GROUP BY a",
+            ROWS,
+        ),
+        (
+            "SELECT COUNT(*), a FROM (SELECT * FROM t) d WHERE b >= 0 GROUP BY a",
+            ROWS,
+        ),
     ] {
         let (got, peak) = summed_and_peak(sql);
         assert_eq!(got, want as i64, "{sql}");
