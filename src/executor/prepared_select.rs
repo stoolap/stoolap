@@ -8867,8 +8867,11 @@ impl PreparedGrouped {
         let stmt = keyed.as_ref().unwrap_or(stmt);
         // A window function in an ORDER BY key holding a subquery runs as a
         // hidden item, an unrepeatable alias the key reads after the windows
-        let key_windows = with_key_windows(stmt);
-        let stmt = key_windows.as_ref().unwrap_or(stmt);
+        let key_windows = with_key_windows(stmt)?;
+        let (stmt, window_keys) = match &key_windows {
+            Some((stmt, keys)) => (stmt, keys.as_slice()),
+            None => (stmt, &[][..]),
+        };
         // A DISTINCT ON key rides as an item named by its identity, here or
         // where a caller keyed the statement, and reads as an ORDER BY key does
         let key_names: SmallVec<[String; 1]> = stmt
@@ -9137,13 +9140,19 @@ impl PreparedGrouped {
         // An ORDER BY key holding a subquery is computed for each group into a
         // column named by its identity, which the sort reads as the key
         let mut order_by = stmt.order_by.clone();
-        for ob in order_by
+        for (at, ob) in order_by
             .iter_mut()
+            .enumerate()
             .filter(|_| stmt.set_operations.is_empty())
         {
             if !mentions_subquery(&ob.expression) {
                 continue;
             }
+            // Its window functions read by the items carrying them
+            let computed = window_keys
+                .get(at)
+                .and_then(Option::as_ref)
+                .unwrap_or(&ob.expression);
             let name = ExprKey::of(&ob.expression).hidden_column_name();
             let token = Token::new(TokenType::Identifier, &name, Position::default());
             let column = Identifier::new(token.clone(), &name);
@@ -9151,13 +9160,7 @@ impl PreparedGrouped {
                 .iter()
                 .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == column.value))
             {
-                let key = alias_blocks(
-                    &key_window_aliases(&ob.expression)?,
-                    &key_chain,
-                    width,
-                    &stmt.columns,
-                    &scope.lower,
-                )?;
+                let key = alias_blocks(computed, &key_chain, width, &stmt.columns, &scope.lower)?;
                 keyed_columns.push((columns.len(), placed(&columns)));
                 columns.push(Expression::Aliased(AliasedExpression {
                     token,
@@ -13420,54 +13423,60 @@ fn windows_outside_blocks<'e>(expr: &'e Expression, found: &mut Vec<&'e Expressi
 }
 
 /// `stmt` with each window function outside the subqueries of an ORDER BY
-/// key holding a subquery as a hidden item named by its identity, which the
-/// key reads by that name once the windows ran; None when there is none
-fn with_key_windows(stmt: &SelectStatement) -> Option<SelectStatement> {
+/// key holding a subquery as a hidden item, and each such key, by its place,
+/// reading those items by name once the windows ran; None when there is none
+#[allow(clippy::type_complexity)]
+fn with_key_windows(
+    stmt: &SelectStatement,
+) -> Result<Option<(SelectStatement, Vec<Option<Expression>>)>> {
     if !stmt.set_operations.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut columns: Option<Vec<Expression>> = None;
-    let mut found = Vec::new();
-    for ob in stmt
-        .order_by
-        .iter()
-        .filter(|ob| mentions_subquery(&ob.expression))
-    {
-        windows_outside_blocks(&ob.expression, &mut found);
-    }
-    for window in found {
-        let name = ExprKey::of(window).hidden_column_name();
-        let columns = columns.get_or_insert_with(|| stmt.columns.clone());
-        if columns
-            .iter()
-            .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == name))
-        {
+    let mut keys = Vec::new();
+    for (at, ob) in stmt.order_by.iter().enumerate() {
+        let mut found = Vec::new();
+        if mentions_subquery(&ob.expression) {
+            windows_outside_blocks(&ob.expression, &mut found);
+        }
+        if found.is_empty() {
             continue;
         }
-        let token = Token::new(TokenType::Identifier, &name, Position::default());
-        columns.push(Expression::Aliased(AliasedExpression {
-            token: token.clone(),
-            expression: Box::new(window.clone()),
-            alias: Identifier::new(token, &name),
-        }));
+        let columns = columns.get_or_insert_with(|| stmt.columns.clone());
+        keys.resize_with(at, || None);
+        keys.push(Some(window_items(&ob.expression, columns)?));
     }
-    columns.map(|columns| SelectStatement {
-        columns,
-        ..stmt.clone()
-    })
+    Ok(columns.map(|columns| {
+        let stmt = SelectStatement {
+            columns,
+            ..stmt.clone()
+        };
+        (stmt, keys)
+    }))
 }
 
 /// `key` with each window function outside its subqueries read by the name
-/// [`with_key_windows`] gives its hidden item
-fn key_window_aliases(key: &Expression) -> Result<Expression> {
+/// of a hidden item of `columns`, one by its identity, as the window path
+/// runs every window function written alike once
+fn window_items(key: &Expression, columns: &mut Vec<Expression>) -> Result<Expression> {
     match key {
         Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(key.clone()),
         Expression::Window(_) => {
             let name = ExprKey::of(key).hidden_column_name();
             let token = Token::new(TokenType::Identifier, &name, Position::default());
+            if !columns
+                .iter()
+                .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value == name))
+            {
+                columns.push(Expression::Aliased(AliasedExpression {
+                    token: token.clone(),
+                    expression: Box::new(key.clone()),
+                    alias: Identifier::new(token.clone(), &name),
+                }));
+            }
             Ok(Expression::Identifier(Identifier::new(token, &name)))
         }
-        other => rebuild(other, &mut key_window_aliases),
+        other => rebuild(other, &mut |child| window_items(child, columns)),
     }
 }
 
