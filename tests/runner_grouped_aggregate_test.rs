@@ -173,13 +173,17 @@ fn an_extra_argument_s_error_reaches_every_source() {
     for sql in [
         "SELECT k, SUM(a, ABS(-9223372036854775808)) FROM t GROUP BY k",
         "SELECT SUM(a, ABS(-9223372036854775808)) FROM t",
-        "SELECT COUNT(*, ABS(-9223372036854775808)) FROM t",
+        "SELECT COUNT(1, ABS(-9223372036854775808)) FROM t",
         "SELECT MIN(b, ABS(-9223372036854775808)) FROM t",
     ] {
         let answer = db
             .query(sql, ())
             .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>());
-        assert!(answer.is_err(), "{sql}: answered past its argument's error");
+        let error = answer.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            error.contains("Integer overflow in ABS"),
+            "{sql}: answered past its argument's error: {error:?}"
+        );
     }
 }
 
