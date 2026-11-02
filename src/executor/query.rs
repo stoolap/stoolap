@@ -669,11 +669,15 @@ fn merged_columns(
 
 /// `all_columns`, the names of joined rows holding each of the pairs
 /// `merges` apart, with each pair's left column named bare, as the
-/// merged column a bare name reads
+/// merged column a bare name reads; a right column no qualifier names takes
+/// a name no reference spells, as only that merged column answers its name
 fn merged_names(all_columns: &[String], merges: &[(usize, usize)]) -> Vec<String> {
     let mut named = all_columns.to_vec();
-    for &(left, _) in merges {
+    for &(left, right) in merges {
         named[left] = bare_name(&all_columns[left]).to_string();
+        if split_qualified(&all_columns[right]).is_none() {
+            named[right] = format!("\u{0}merged#{right}");
+        }
     }
     named
 }
@@ -5781,16 +5785,15 @@ impl Executor {
                 .flatten()
                 .map(|(table, name)| qualified(table, name))
                 .collect();
-            // The equalities of a NATURAL join or a USING list stand for its ON
+            // The equalities of a NATURAL join or a USING list stand for its
+            // ON, each column read by its place, as two sides without a name
+            // spell theirs alike
             let (left, right) = columns.split_at(spelled[0].len());
             let natural =
                 natural_join_condition(join_type, join_source, left, right, |right, i| {
-                    let (table, name) = spelled[usize::from(right)][i];
-                    Expression::QualifiedIdentifier(QualifiedIdentifier {
-                        qualifier: Identifier::new(
-                            Token::new(TokenType::Identifier, table, Position::default()),
-                            table,
-                        ),
+                    let name = spelled[usize::from(right)][i].1;
+                    Expression::Column(ColumnRef {
+                        index: (if right { left.len() + i } else { i }) as u32,
                         name: Identifier::new(
                             Token::new(TokenType::Identifier, name, Position::default()),
                             name,

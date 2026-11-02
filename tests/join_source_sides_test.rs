@@ -284,6 +284,92 @@ fn a_side_without_a_name_runs_prepared() {
 }
 
 #[test]
+fn a_natural_or_using_join_of_sides_without_a_name_merges_each_side_s_column() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let dbs = [("hot", hot("unnamed_using")), ("sealed", sealed(&dir))];
+    let sql =
+        "SELECT column1, (SELECT 1) FROM (VALUES (1), (2)) JOIN (VALUES (2), (3)) USING (column1)";
+    assert_eq!(answer(&dbs[0].1, sql), Ok(vec!["2|1".to_string()]), "{sql}");
+    const PAIR: &str = "(VALUES (1), (2)){l} {join} (VALUES (2), (3)){r}";
+    for (shape, join) in [
+        (
+            "SELECT column1, (SELECT 1) FROM {pair} USING (column1)",
+            "JOIN",
+        ),
+        ("SELECT column1, (SELECT 1) FROM {pair}", "NATURAL JOIN"),
+        ("SELECT column1 FROM {pair} USING (column1)", "JOIN"),
+        ("SELECT column1 FROM {pair}", "NATURAL JOIN"),
+        (
+            "SELECT column1, (SELECT 1) FROM {pair} USING (column1)",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT column1, (SELECT 1) FROM {pair}",
+            "NATURAL LEFT JOIN",
+        ),
+        (
+            "SELECT *, (SELECT 1) FROM {pair} USING (column1)",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT * FROM {pair} USING (column1) WHERE (SELECT 1) = 1",
+            "JOIN",
+        ),
+        (
+            "SELECT column1 FROM {pair} USING (column1) ORDER BY (SELECT 1), column1",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT (SELECT 1), column1 FROM {pair} USING (column1) WHERE column1 = 1",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT column1, (SELECT column1) FROM {pair} USING (column1)",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT column1, column2, (SELECT 1) FROM (VALUES (1, 5), (2, 6)){l} \
+             {join} (VALUES (2, 6), (3, 7)){r} USING (column1, column2)",
+            "JOIN",
+        ),
+        (
+            "SELECT k, (SELECT 1) FROM (SELECT a AS k FROM t){l} \
+             {join} (SELECT x - 6 AS k FROM u){r} USING (k)",
+            "LEFT JOIN",
+        ),
+        (
+            "SELECT k, (SELECT 1) FROM (SELECT a AS k FROM t){l} \
+             {join} (SELECT x - 6 AS k FROM u){r}",
+            "NATURAL JOIN",
+        ),
+    ] {
+        let shape = shape.replace("{pair}", PAIR).replace("{join}", join);
+        let spelled = |l: &str, r: &str| shape.replace("{l}", l).replace("{r}", r);
+        let named = spelled(" AS x", " AS y");
+        for (l, r) in [("", ""), (" AS x", ""), ("", " AS y")] {
+            let sql = spelled(l, r);
+            for (mode, db) in &dbs {
+                assert_eq!(answer(db, &sql), answer(db, &named), "{mode}: {sql}");
+            }
+        }
+    }
+    for sql in [
+        "SELECT t.a FROM t JOIN (SELECT 1 AS id, 2 AS id) USING (id)",
+        "SELECT t.a, (SELECT 1) FROM t JOIN (SELECT 1 AS id, 2 AS id) USING (id)",
+        "SELECT t.a, (SELECT 1) FROM (SELECT 1 AS id, 2 AS id) JOIN t USING (id)",
+    ] {
+        for (mode, db) in &dbs {
+            assert_eq!(
+                answer(db, sql),
+                Err("invalid argument: column reference 'id' is ambiguous".to_string()),
+                "{mode}: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_side_read_as_rows_reads_no_more_of_it_than_the_general_path() {
     use stoolap::test_failpoints::{random_draws, tvf_rows};
     let _guard = serial();
