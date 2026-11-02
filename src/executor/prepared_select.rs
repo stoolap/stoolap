@@ -756,6 +756,7 @@ fn grouped_with_subquery(sq: &SelectStatement) -> bool {
         && sq
             .columns
             .iter()
+            .map(unaliased)
             .chain(sq.having.as_deref())
             .chain(&sq.group_by.columns)
             .any(mentions_subquery)
@@ -5454,13 +5455,16 @@ impl Builder<'_> {
             expr: &Expression,
             registry: &FunctionRegistry,
             group_keys: &[ExprKey],
-            found: &mut impl FnMut(&Expression) -> Result<()>,
+            found: &mut impl FnMut(&SelectStatement) -> Result<()>,
         ) -> Result<()> {
             match expr {
                 Expression::FunctionCall(call) if registry.is_aggregate(&call.function) => Ok(()),
                 _ if group_keys.contains(&ExprKey::of(expr)) => Ok(()),
-                Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => {
-                    found(expr)
+                Expression::ScalarSubquery(block) => found(&block.subquery),
+                Expression::Exists(block) => found(&block.subquery),
+                Expression::AllAny(block) => {
+                    after_grouping(&block.left, registry, group_keys, found)?;
+                    found(&block.subquery)
                 }
                 other => for_each_child(other, &mut |child| {
                     after_grouping(child, registry, group_keys, found)
@@ -5469,7 +5473,7 @@ impl Builder<'_> {
         }
         for item in &sq.columns {
             after_grouping(unaliased(item), registry, &group_keys, &mut |block| {
-                walk.subqueries_of(block, &scopes)
+                walk.statement(block, &scopes, 0, Check::All).map(drop)
             })?;
         }
         Ok(())
