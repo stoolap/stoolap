@@ -231,6 +231,36 @@ fn a_windowed_statement_over_a_source_answers_as_the_general_path() {
 }
 
 #[test]
+fn a_window_over_a_source_under_a_limit_without_order_reads_every_row() {
+    let _guard = serial();
+    let db = hot("source_limit");
+    let tv_rows = answer(&db, "SELECT COUNT(*) FROM tv", &[]).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT SUM(value) OVER () FROM generate_series(1, 3) LIMIT 1",
+            vec!["6".to_string()],
+        ),
+        (
+            "SELECT COUNT(*) OVER () FROM generate_series(1, 3) LIMIT 1",
+            vec!["3".to_string()],
+        ),
+        (
+            "SELECT value, SUM(value) OVER () FROM generate_series(1, 3) LIMIT 1 OFFSET 1",
+            vec!["2|6".to_string()],
+        ),
+        ("SELECT COUNT(*) OVER () FROM tv LIMIT 1", tv_rows),
+        (
+            "SELECT COUNT(*) OVER () FROM (VALUES (1), (2), (3)) AS v(x) LIMIT 2",
+            vec!["3".to_string(), "3".to_string()],
+        ),
+    ] {
+        let got = answer(&db, sql, &[]);
+        assert_eq!(got.as_ref(), Ok(&want), "{sql}");
+        assert_eq!(got, general(|| answer(&db, sql, &[])), "{sql}");
+    }
+}
+
+#[test]
 fn explain_shows_the_window_step_over_a_source() {
     let _guard = serial();
     let db = hot("explain_sources");

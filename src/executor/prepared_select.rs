@@ -8169,12 +8169,7 @@ impl PreparedSelect {
         let registry = &executor.function_registry;
         // A statement with window functions reads its rows as a SELECT * of
         // them would, and its window step computes the SELECT list over them
-        let windowed = stmt
-            .columns
-            .iter()
-            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-            .chain(&stmt.distinct_on)
-            .any(QueryClassification::expression_has_window_function);
+        let windowed = Self::computes_windows(stmt);
         // A statement that aggregates its rows reads them as the windowed
         // one does, its calls computed over them and its windows over the
         // groups
@@ -8584,6 +8579,16 @@ impl PreparedSelect {
             window,
             source_values,
         })
+    }
+
+    /// Whether `stmt` computes window functions over the rows it reads, in
+    /// its SELECT list, ORDER BY or DISTINCT ON keys
+    fn computes_windows(stmt: &SelectStatement) -> bool {
+        stmt.columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on)
+            .any(QueryClassification::expression_has_window_function)
     }
 
     /// Whether `stmt` aggregates its rows: a call, or [`Self::groups`]
@@ -12782,10 +12787,11 @@ impl Executor {
     ) -> Result<PreparedOutput> {
         let inner_ctx = ctx.with_incremented_query_depth();
         // Without a WHERE or an ORDER BY the first rows are the answer,
-        // unless the statement aggregates them
+        // unless the statement aggregates them or computes windows over them
         let first = limit
             .filter(|_| stmt.where_clause.is_none() && stmt.order_by.is_empty())
             .filter(|_| !PreparedSelect::aggregates(stmt))
+            .filter(|_| !PreparedSelect::computes_windows(stmt))
             .map(|limit| limit.saturating_add(offset));
         let (source, scope_name) = self.read_source(stmt, plan, ctx, &inner_ctx, first)?;
         let compiled = plan.map(NestedPlan::slot);
