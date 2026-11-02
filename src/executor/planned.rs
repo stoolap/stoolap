@@ -52,32 +52,30 @@ impl Executor {
         run: impl FnOnce(&PreparedSelect) -> R,
     ) -> Option<R> {
         let epoch = self.engine.schema_epoch();
-        {
-            let held = compiled.read().ok()?;
-            match &*held {
-                CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
-                    // The runner reads a statement prepared for the tables as they are
-                    if !p.answers_first() {
-                        return None;
-                    }
-                    // A context of other CTEs than it was planned in may hide its table
-                    if ctx.is_none_or(|ctx| p.cte_scope.holds(ctx)) {
-                        #[cfg(feature = "test-failpoints")]
-                        crate::test_failpoints::compiled_epoch_checked();
-                        return Some(run(p));
-                    }
+        let held = match &*compiled.read().ok()? {
+            CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
+                // The runner reads a statement prepared for the tables as they are
+                if !p.answers_first() {
+                    return None;
                 }
-                CompiledExecution::NotOptimizable(validity)
-                    if validity.holds(&*self.engine, epoch) =>
-                {
-                    return None
-                }
-                // One prepared for tables since changed is planned again
-                CompiledExecution::Unknown
-                | CompiledExecution::NotOptimizable(_)
-                | CompiledExecution::PreparedSelect(_) => {}
-                _ => return None,
+                // A context of other CTEs than it was planned in may hide its table
+                ctx.is_none_or(|ctx| p.cte_scope.holds(ctx))
+                    .then(|| Arc::clone(p))
             }
+            CompiledExecution::NotOptimizable(validity) if validity.holds(&*self.engine, epoch) => {
+                return None
+            }
+            // One prepared for tables since changed is planned again
+            CompiledExecution::Unknown
+            | CompiledExecution::NotOptimizable(_)
+            | CompiledExecution::PreparedSelect(_) => None,
+            _ => return None,
+        };
+        // The run releases the slot: what it calls may plan the statement again
+        if let Some(p) = held {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::compiled_epoch_checked();
+            return Some(run(&p));
         }
         let planned = self.plan_into(stmt, compiled, classification, ctx?, epoch)?;
         // The run that plans reads through its view; a count or bound the

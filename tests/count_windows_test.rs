@@ -239,6 +239,10 @@ fn count_halfway_through_a_truncate_does_not_bring_deleted_rows_back() {
 
     let (seen_tx, seen) = mpsc::channel();
     let other = db.clone();
+    // The count is planned before: planning reads the row count hint, which waits
+    for _ in 0..2 {
+        assert_eq!(count(&other), 19);
+    }
     let reader = Rc::new(Cell::new(None));
     let spawned = Rc::clone(&reader);
     fp::during_segments_clearing(move || {
