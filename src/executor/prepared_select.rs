@@ -1280,16 +1280,16 @@ impl Executor {
         }
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
-            Some(Expression::JoinSource(join)) => {
-                let side_merges = |side: &Expression| {
-                    matches!(side, Expression::JoinSource(_)) && merges_columns(side)
-                };
-                if join.join_type.to_uppercase().contains("NATURAL")
-                    || !join.using_columns.is_empty()
-                    || side_merges(&join.left)
-                    || side_merges(&join.right)
-                {
-                    return Err("a NATURAL or USING join whose output holds a subquery");
+            // The grouped rows hold each merged pair apart, which a star shows
+            Some(from @ Expression::JoinSource(_)) => {
+                let star = stmt
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+                if star && merges_columns(from) {
+                    return Err(
+                        "a star over a NATURAL or USING join whose output holds a subquery",
+                    );
                 }
             }
             table_expr => {
@@ -9689,17 +9689,22 @@ impl Executor {
     }
 
     /// A grouped join statement prepared over the joined `columns` its join
-    /// path laid out from its `leaves` and `sides`, as `of_join_columns`
-    /// takes them; None when they do not line up or a block reads a column
-    /// outside its groups
+    /// path laid out: over the scope its `blocks` hold, else from its
+    /// `leaves` and `sides`, as `of_join_columns` takes them; None when they
+    /// do not line up or a block reads a column outside its groups
     pub(crate) fn prepare_grouped_join(
         &self,
         stmt: &SelectStatement,
         columns: &[String],
         (leaves, sides): (&[JoinLeaf], (usize, usize)),
+        blocks: Option<&JoinBlocks>,
         ctx: &ExecutionContext,
     ) -> Result<Option<PreparedGrouped>> {
-        let Some(scope) = ScopeTable::of_join_columns(columns, leaves, sides) else {
+        let scope = match blocks {
+            Some(blocks) => Some(blocks.scope.by_position()),
+            None => ScopeTable::of_join_columns(columns, leaves, sides),
+        };
+        let Some(scope) = scope else {
             return Ok(None);
         };
         PreparedGrouped::prepare(
