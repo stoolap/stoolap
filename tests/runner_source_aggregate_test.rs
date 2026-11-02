@@ -142,6 +142,23 @@ fn a_limit_cuts_the_aggregate_s_rows_not_the_source_s() {
 }
 
 #[test]
+fn every_value_of_a_values_list_is_evaluated_under_a_where_that_keeps_no_row() {
+    let db = Database::open("memory://runner_source_aggregate_values_error").unwrap();
+    for sql in [
+        "SELECT COUNT(*) FROM (VALUES (9223372036854775807 + 1)) AS s(x) WHERE FALSE",
+        "SELECT x FROM (VALUES (9223372036854775807 + 1)) AS s(x) WHERE FALSE",
+    ] {
+        let error = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("Integer overflow"), "{sql}: {error:?}");
+    }
+}
+
+#[test]
 fn explain_shows_the_aggregate_over_its_source() {
     let db = Database::open("memory://runner_source_aggregate_explain").unwrap();
     fill(&db);

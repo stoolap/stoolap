@@ -4038,8 +4038,13 @@ impl PreparedSelect {
         ctx: &ExecutionContext,
         registry: &FunctionRegistry,
     ) -> bool {
+        // Every value of a VALUES list is evaluated, as the general path does
         self.has_constant_where()
             && ctx.outer_row().is_none()
+            && !matches!(
+                stmt.table_expr.as_deref(),
+                Some(Expression::ValuesSource(_))
+            )
             && stmt
                 .where_clause
                 .as_deref()
@@ -12390,7 +12395,8 @@ impl Executor {
         let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
         let path = AggregatePath::HashGroups;
         // Without a WHERE the rows a source holds are fed as they are, and a
-        // stream's as it hands them over
+        // stream's as it hands them over, however many: held to split them
+        // over the thread pool, every row would be held
         let unfiltered = stmt.where_clause.is_none();
         let aggregate = |input| {
             self.aggregate_input(path, (stmt, stmt), aggregations, ctx, input, columns, None)
@@ -12403,18 +12409,17 @@ impl Executor {
                 return aggregate(FeedInput::<StreamedRows<'_>>::Rows(rows))
             }
             StatementSource::Stream(_, result) if unfiltered => {
-                let hint = result.estimated_count().unwrap_or(0);
                 let rows = StreamedRows {
                     result,
                     ctx,
                     read: 0,
                 };
-                return aggregate(FeedInput::Each(rows, hint));
+                return aggregate(FeedInput::Each(rows, 0));
             }
             source => source,
         };
         let (hold, hint) = match &source {
-            StatementSource::Stream(_, result) => (false, result.estimated_count().unwrap_or(0)),
+            StatementSource::Stream(..) => (false, 0),
             StatementSource::Rows(_, rows) => (true, rows.len()),
             StatementSource::Values(_, values) => (true, values.rows.len()),
             StatementSource::Cte((_, rows)) => (true, rows.len()),
