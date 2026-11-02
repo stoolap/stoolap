@@ -1138,7 +1138,10 @@ impl Executor {
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
         }
-        if !plain_statement(stmt) {
+        // A statement the runner aggregates computes its SELECT list and
+        // ORDER BY over its groups, as the aggregation does on any source
+        let aggregates = !needs_subquery && PreparedSelect::runs_aggregate(stmt);
+        if !aggregates && !plain_statement(stmt) {
             return Err("a clause outside the family");
         }
         let family = Family {
@@ -1149,7 +1152,7 @@ impl Executor {
         if let Some(where_clause) = stmt.where_clause.as_deref() {
             family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
         }
-        for column in &stmt.columns {
+        for column in stmt.columns.iter().filter(|_| !aggregates) {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 family.expression(unaliased(column), 1, Site::Subqueries, &mut found)?;
             }
@@ -1163,7 +1166,7 @@ impl Executor {
             {
                 return Err("an ORDER BY subquery over a set operation");
             }
-        } else {
+        } else if !aggregates {
             // A DISTINCT ON key is computed for each row as an ORDER BY key is
             for key in stmt
                 .order_by
@@ -3531,6 +3534,14 @@ enum Passing {
     Filtered(Box<dyn Scanner>, SharedProgram),
     /// Every row read that passes went to the caller
     Read,
+}
+
+/// How a statement's source was read: as a table's rows are, or as the
+/// stream of a view or a derived table with the WHERE bound to the run,
+/// for a caller that takes the rows as they come
+enum SourceRead {
+    Passing(Passing),
+    Stream(Box<dyn QueryResult>, Option<SharedProgram>),
 }
 
 /// The rows of a scan a statement's WHERE passes, as an aggregation reads
@@ -8294,13 +8305,18 @@ impl PreparedSelect {
         let distinct = stmt.distinct && stmt.distinct_on.is_empty();
         let mut plan = None;
         if let Some(source) = executor.source_line(stmt, ctx)? {
-            if !stmt.order_by.is_empty() {
-                steps.push(sort);
+            // The source's line shows the WHERE its rows pass whole
+            if aggregated {
+                steps = Self::aggregate_steps(written, false);
+            } else {
+                if !stmt.order_by.is_empty() {
+                    steps.push(sort);
+                }
+                if distinct {
+                    steps.push(Step::Distinct);
+                }
+                steps.push(Step::Project);
             }
-            if distinct {
-                steps.push(Step::Distinct);
-            }
-            steps.push(Step::Project);
             let read = Read::Source(source);
             plan = Some(Plan { steps, read });
         } else if where_.sets.is_empty() && where_.narrowing.is_none() {
@@ -8489,6 +8505,20 @@ impl PreparedSelect {
     /// Whether `stmt` aggregates its rows: a call, or [`Self::groups`]
     pub(crate) fn aggregates(stmt: &SelectStatement) -> bool {
         Self::groups(stmt) || get_classification(stmt).has_aggregation
+    }
+
+    /// Whether the runner aggregates `stmt`: it aggregates its rows and
+    /// holds no window function, set operation, DISTINCT ON or subquery,
+    /// which the grouped family's blocks answer
+    pub(crate) fn runs_aggregate(stmt: &SelectStatement) -> bool {
+        let shape = get_classification(stmt);
+        Self::aggregates(stmt)
+            && !shape.has_window_functions
+            && !shape.has_set_operations
+            && !shape.has_distinct_on
+            && !shape.grouped_has_subqueries
+            && !shape.output_has_subqueries
+            && !shape.where_has_subqueries
     }
 
     /// Whether `stmt` groups its rows or judges them by a HAVING: a GROUP
@@ -12267,26 +12297,18 @@ impl Executor {
         (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
         table: &dyn Table,
     ) -> Result<Box<dyn QueryResult>> {
-        let parsed;
-        let aggregations = match &prepared.calls {
-            Some(calls) => calls,
-            None => {
-                parsed = self.parse_aggregations(stmt, Some(ctx))?.0;
-                &parsed
-            }
-        };
+        let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
         let plan = prepared.plan.as_ref();
         if PreparedSelect::groups(stmt) {
             let columns = table.schema().column_names_arc();
             if let Some(read) = plan.and_then(|plan| plan.read.grouped()) {
-                let calls = aggregations.as_slice();
                 if let Some(result) =
-                    self.grouped_aggregate(table, stmt, calls, read, ctx, &columns)?
+                    self.grouped_aggregate(table, stmt, aggregations, read, ctx, &columns)?
                 {
                     return Ok(result);
                 }
             }
-            return self.passed_input(stmt, ctx, (runner, prepared), table, |input| {
+            return self.table_input(stmt, ctx, (runner, prepared), table, |input| {
                 let stmts = (stmt, stmt);
                 let path = AggregatePath::HashGroups;
                 self.aggregate_input(path, stmts, aggregations, ctx, input, &columns, None)
@@ -12305,7 +12327,7 @@ impl Executor {
         };
         let scan = || {
             let columns = table.schema().column_names_arc();
-            self.passed_input(stmt, ctx, (runner, prepared), table, |input| {
+            self.table_input(stmt, ctx, (runner, prepared), table, |input| {
                 self.global_row(aggregations, &columns, ctx, None, input)
                     .map(Some)
             })
@@ -12315,10 +12337,61 @@ impl Executor {
             .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))
     }
 
-    /// `feed` over the rows of `table` the read of `prepared` passes for
-    /// `stmt`: held at once when the table shares them or is large, else
-    /// handed over as the read decodes them
-    fn passed_input<T>(
+    /// The rows of `stmt`, which aggregates the rows `source` gives, not a
+    /// table's, of `columns`: every row the WHERE passes fed to the calls, a
+    /// view's or a derived table's as its stream hands them over
+    fn source_aggregate(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        source: StatementSource<'_>,
+        columns: &[String],
+    ) -> Result<Box<dyn QueryResult>> {
+        let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
+        let (hold, hint) = match &source {
+            StatementSource::Stream(_, result) => (false, result.estimated_count().unwrap_or(0)),
+            StatementSource::Rows(_, rows) => (true, rows.len()),
+            StatementSource::Values(_, values) => (true, values.rows.len()),
+            StatementSource::Cte((_, rows)) => (true, rows.len()),
+            StatementSource::Table(_) | StatementSource::Function(..) => (true, 0),
+        };
+        let run = (runner, prepared);
+        let read = |take, keep: &mut dyn FnMut(i64, u64, Row) -> bool| {
+            Ok(
+                match self.source_read(run, stmt, source, ctx, (None, take), keep)? {
+                    SourceRead::Passing(passing) => passing,
+                    SourceRead::Stream(result, None) => {
+                        Passing::Scan(Box::new(SourceScanner::new(result)))
+                    }
+                    SourceRead::Stream(result, Some(bound)) => {
+                        Passing::Filtered(Box::new(SourceScanner::new(result)), bound)
+                    }
+                },
+            )
+        };
+        self.passed_input(stmt, ctx, run, (hold, hint), read, |input| {
+            let path = AggregatePath::HashGroups;
+            self.aggregate_input(path, (stmt, stmt), aggregations, ctx, input, columns, None)
+        })
+    }
+
+    /// The calls of `stmt`, which `prepared` holds when no run changes them
+    fn prepared_calls<'p>(
+        &self,
+        prepared: &'p PreparedSelect,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<std::borrow::Cow<'p, [SqlAggregateFunction]>> {
+        Ok(match &prepared.calls {
+            Some(calls) => std::borrow::Cow::Borrowed(calls),
+            None => std::borrow::Cow::Owned(self.parse_aggregations(stmt, Some(ctx))?.0),
+        })
+    }
+
+    /// [`Self::passed_input`] over the rows of `table`, which it holds when
+    /// it shares them
+    fn table_input<T>(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
@@ -12326,23 +12399,42 @@ impl Executor {
         table: &dyn Table,
         feed: impl FnOnce(FeedInput<'_, PassedRows<'_, '_>>) -> Result<T>,
     ) -> Result<T> {
-        let plan = prepared.plan.as_ref();
         // Rows the table shares cost nothing to hold and are read at once;
         // rows decoded from volumes stream, unless the feed splits them over
         // the thread pool
         let hold = !table.narrows_scans();
+        let chosen = prepared.plan.as_ref().and_then(|plan| plan.read.scan());
+        let read = |take, keep: &mut dyn FnMut(i64, u64, Row) -> bool| {
+            let read = (&prepared.where_, chosen);
+            runner.passing_rows(read, None, table, ctx, None, take, keep)
+        };
+        let run = (runner, prepared);
+        self.passed_input(stmt, ctx, run, (hold, table.row_count_hint()), read, feed)
+    }
+
+    /// `feed` over the rows `read` gives, as `take` asks and handing each it
+    /// keeps to its `keep`, the rows of `prepared`'s WHERE for `stmt`: held
+    /// at once when `hold`, else handed over as the read decodes them, about
+    /// `hint` of them
+    fn passed_input<T>(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        (hold, hint): (bool, usize),
+        read: impl FnOnce(Take, &mut dyn FnMut(i64, u64, Row) -> bool) -> Result<Passing>,
+        feed: impl FnOnce(FeedInput<'_, PassedRows<'_, '_>>) -> Result<T>,
+    ) -> Result<T> {
         let take = if hold { Take::Collected } else { Take::Stream };
         let mut kept = RowVec::new();
         let passing = match prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
             true => Passing::Pruned,
             false => {
-                let chosen = plan.and_then(|plan| plan.read.scan());
-                let keep = |id: i64, _: u64, row: Row| {
+                let mut keep = |id: i64, _: u64, row: Row| {
                     kept.push((id, row));
                     true
                 };
-                let read = (&prepared.where_, chosen);
-                runner.passing_rows(read, None, table, ctx, None, take, keep)?
+                read(take, &mut keep)?
             }
         };
         let held: RowVec;
@@ -12361,16 +12453,100 @@ impl Executor {
                 held = runner.drain(scan, Some(bound))?;
                 FeedInput::Rows(&held)
             }
-            Passing::Scan(scan) => FeedInput::Each(
-                PassedRows::new(scan, None, runner, ctx),
-                table.row_count_hint(),
-            ),
-            Passing::Filtered(scan, bound) => FeedInput::Each(
-                PassedRows::new(scan, Some(bound), runner, ctx),
-                table.row_count_hint(),
-            ),
+            Passing::Scan(scan) => FeedInput::Each(PassedRows::new(scan, None, runner, ctx), hint),
+            Passing::Filtered(scan, bound) => {
+                FeedInput::Each(PassedRows::new(scan, Some(bound), runner, ctx), hint)
+            }
         };
         feed(input)
+    }
+
+    /// The rows of `source` that `prepared`'s WHERE passes for `stmt`, read
+    /// as `take` asks, up to `target`, each kept handed to `keep`; a view's
+    /// or a derived table's stream when `take` streams and the WHERE binds
+    /// to the run
+    #[allow(clippy::too_many_arguments)]
+    fn source_read(
+        &self,
+        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        stmt: &SelectStatement,
+        source: StatementSource<'_>,
+        ctx: &ExecutionContext,
+        (target, take): (Option<usize>, Take),
+        mut keep: impl FnMut(i64, u64, Row) -> bool,
+    ) -> Result<SourceRead> {
+        let passing = match source {
+            StatementSource::Table(table) => runner.passing_rows(
+                (
+                    &prepared.where_,
+                    prepared.plan.as_ref().and_then(|plan| plan.read.scan()),
+                ),
+                None,
+                &*table,
+                ctx,
+                target,
+                take,
+                &mut keep,
+            ),
+            StatementSource::Rows(_, rows) => runner.rows_passing(
+                &prepared.where_,
+                rows.into_iter().map(Ok),
+                ctx,
+                target,
+                &mut keep,
+            ),
+            StatementSource::Stream(_, mut result) => {
+                let filtered = stmt.where_clause.is_some();
+                match runner.source_scan(&prepared.where_, filtered, take) {
+                    Some(bound) if take == Take::Stream => {
+                        return Ok(SourceRead::Stream(result, bound))
+                    }
+                    Some(None) => Ok(Passing::Scan(Box::new(SourceScanner::new(result)))),
+                    Some(Some(bound)) => Ok(Passing::Filtered(
+                        Box::new(SourceScanner::new(result)),
+                        bound,
+                    )),
+                    None => runner.rows_passing(
+                        &prepared.where_,
+                        result_rows(&mut *result),
+                        ctx,
+                        target,
+                        &mut keep,
+                    ),
+                }
+            }
+            StatementSource::Values(_, values) => match prepared.source_values.as_deref() {
+                Some(programs) => runner.rows_passing(
+                    &prepared.where_,
+                    (0i64..)
+                        .zip(programs)
+                        .map(|(id, row)| runner.source_row(row).map(|row| (id, row))),
+                    ctx,
+                    target,
+                    &mut keep,
+                ),
+                None => runner.rows_passing(
+                    &prepared.where_,
+                    (0i64..)
+                        .zip(&values.rows)
+                        .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
+                    ctx,
+                    target,
+                    &mut keep,
+                ),
+            },
+            StatementSource::Cte((_, rows)) => runner.rows_passing(
+                &prepared.where_,
+                rows.iter().map(|(id, row)| Ok((*id, row))),
+                ctx,
+                target,
+                &mut keep,
+            ),
+            StatementSource::Function(..) => Err(Error::internal(
+                "a table function read before its blocks answered its arguments",
+            )),
+        };
+        passing.map(SourceRead::Passing)
     }
 
     /// Run an in-family statement: scan its table narrowed by the
@@ -12386,9 +12562,11 @@ impl Executor {
         offset: usize,
     ) -> Result<PreparedOutput> {
         let inner_ctx = ctx.with_incremented_query_depth();
-        // Without a WHERE or an ORDER BY the first rows are the answer
+        // Without a WHERE or an ORDER BY the first rows are the answer,
+        // unless the statement aggregates them
         let first = limit
             .filter(|_| stmt.where_clause.is_none() && stmt.order_by.is_empty())
+            .filter(|_| !PreparedSelect::aggregates(stmt))
             .map(|limit| limit.saturating_add(offset));
         let (source, scope_name) = self.read_source(stmt, plan, ctx, &inner_ctx, first)?;
         let compiled = plan.map(NestedPlan::slot);
@@ -12562,13 +12740,19 @@ impl Executor {
         // The calls over every row the read passes, unless the table answers
         // them; the finishing steps follow
         if prepared.aggregated {
-            let StatementSource::Table(table) = &source else {
-                return Err(Error::internal("an aggregate statement over a source"));
+            let names = match &source {
+                StatementSource::Table(table) => table.schema().column_names_arc(),
+                other => CompactArc::new(other.columns().unwrap_or_default().to_vec()),
             };
-            let result = self.prepared_aggregate(stmt, ctx, (&runner, &prepared), &**table)?;
+            let run = (&runner, &*prepared);
+            let result = match source {
+                StatementSource::Table(table) => {
+                    self.prepared_aggregate(stmt, ctx, run, &*table)?
+                }
+                source => self.source_aggregate(stmt, ctx, run, source, &names)?,
+            };
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
-            let names = table.schema().column_names_arc();
             let layout =
                 Self::shared_result_layout(stmt, &names, Some(scope_name), &output_columns)
                     .map(CompactArc::new);
@@ -12818,80 +13002,20 @@ impl Executor {
             ))
         };
         let read = match (ordered.or(nearest), source) {
-            _ if keeps_none => Ok(Passing::Pruned),
-            (Some(rows), _) => Ok(Passing::Answers(rows)),
-            (None, StatementSource::Table(table)) => runner.passing_rows(
-                (
-                    &prepared.where_,
-                    prepared.plan.as_ref().and_then(|plan| plan.read.scan()),
-                ),
-                None,
-                &*table,
-                ctx,
-                target,
-                take,
-                &mut keep,
-            ),
-            (None, StatementSource::Rows(_, rows)) => runner.rows_passing(
-                &prepared.where_,
-                rows.into_iter().map(Ok),
-                ctx,
-                target,
-                &mut keep,
-            ),
-            (None, StatementSource::Stream(_, mut result)) => {
-                let filtered = stmt.where_clause.is_some();
-                match runner.source_scan(&prepared.where_, filtered, take) {
-                    Some(bound) if take == Take::Stream => {
+            _ if keeps_none => Passing::Pruned,
+            (Some(rows), _) => Passing::Answers(rows),
+            (None, source) => {
+                let run = (&runner, &*prepared);
+                match self.source_read(run, stmt, source, ctx, (target, take), &mut keep)? {
+                    SourceRead::Passing(passing) => passing,
+                    SourceRead::Stream(result, bound) => {
                         return streamed(Flow::Source(result), bound)
                     }
-                    Some(None) => Ok(Passing::Scan(Box::new(SourceScanner::new(result)))),
-                    Some(Some(bound)) => Ok(Passing::Filtered(
-                        Box::new(SourceScanner::new(result)),
-                        bound,
-                    )),
-                    None => runner.rows_passing(
-                        &prepared.where_,
-                        result_rows(&mut *result),
-                        ctx,
-                        target,
-                        &mut keep,
-                    ),
                 }
             }
-            (None, StatementSource::Values(_, values)) => match prepared.source_values.as_deref() {
-                Some(programs) => runner.rows_passing(
-                    &prepared.where_,
-                    (0i64..)
-                        .zip(programs)
-                        .map(|(id, row)| runner.source_row(row).map(|row| (id, row))),
-                    ctx,
-                    target,
-                    &mut keep,
-                ),
-                None => runner.rows_passing(
-                    &prepared.where_,
-                    (0i64..)
-                        .zip(&values.rows)
-                        .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
-                    ctx,
-                    target,
-                    &mut keep,
-                ),
-            },
-            (None, StatementSource::Cte((_, rows))) => runner.rows_passing(
-                &prepared.where_,
-                rows.iter().map(|(id, row)| Ok((*id, row))),
-                ctx,
-                target,
-                &mut keep,
-            ),
-            (None, StatementSource::Function(..)) => Err(Error::internal(
-                "a table function read before its blocks answered its arguments",
-            )),
         };
         let mut scanned = None;
-        let mut rows = match read? {
+        let mut rows = match read {
             Passing::Pruned => {
                 let result = ExecutorResult::with_arc_columns(
                     CompactArc::clone(&output_columns),

@@ -97,13 +97,9 @@ impl Executor {
             None => get_classification(stmt),
         };
         // A statement that aggregates its rows, unless the aggregate plan
-        // holds it whole; one whose grouping reads a subquery is the grouped
-        // family's
+        // holds it whole
         let aggregating = PreparedSelect::aggregates(stmt);
-        let aggregates = aggregating
-            && !shape.has_window_functions
-            && !shape.has_set_operations
-            && !shape.grouped_has_subqueries;
+        let aggregates = PreparedSelect::runs_aggregate(stmt);
         if aggregates {
             #[cfg(feature = "test-failpoints")]
             if crate::test_failpoints::prepared_families_off() {

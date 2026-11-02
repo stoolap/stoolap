@@ -37,7 +37,6 @@ use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{ExprVM, SubqueryExecutor};
 use super::query::order_by_inputs;
-use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{
     bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
@@ -62,7 +61,6 @@ pub(crate) enum AggregatePath {
     GlobalScan,
     StorageGrouped,
     StreamingGroupBy,
-    StreamingDerivedTable,
     /// MIN or MAX read from an index's end
     IndexBound,
     /// A prepared subquery block that aggregates, per call or by key
@@ -85,14 +83,13 @@ impl AggregatePath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl AggregatePath {
-    pub(crate) const ALL: [AggregatePath; 11] = [
+    pub(crate) const ALL: [AggregatePath; 10] = [
         AggregatePath::General,
         AggregatePath::Stats,
         AggregatePath::StorageFiltered,
         AggregatePath::GlobalScan,
         AggregatePath::StorageGrouped,
         AggregatePath::StreamingGroupBy,
-        AggregatePath::StreamingDerivedTable,
         AggregatePath::IndexBound,
         AggregatePath::PreparedBlock,
         AggregatePath::IndexCount,
@@ -107,7 +104,6 @@ impl AggregatePath {
             AggregatePath::GlobalScan => "global_scan",
             AggregatePath::StorageGrouped => "storage_grouped",
             AggregatePath::StreamingGroupBy => "streaming_group_by",
-            AggregatePath::StreamingDerivedTable => "streaming_derived_table",
             AggregatePath::IndexBound => "index_bound",
             AggregatePath::PreparedBlock => "prepared_block",
             AggregatePath::IndexCount => "index_count",
@@ -3447,157 +3443,6 @@ impl Executor {
         )?;
         feed.run_input(&mut groups, input, ctx, blocks)?;
         groups.into_rows()
-    }
-
-    /// Try streaming aggregation for derived tables (FROM subqueries).
-    ///
-    /// OPTIMIZATION: For simple GROUP BY + COUNT(*) on derived tables without WHERE clause,
-    /// stream directly to aggregation HashMap without materializing all rows first.
-    /// This reduces memory allocations from O(N) to O(groups).
-    ///
-    /// Hands `result` back unread when the optimization cannot be applied,
-    /// so the derived table's statement runs once either way.
-    ///
-    /// Supported patterns:
-    /// - Single-column GROUP BY (column reference)
-    /// - Simple aggregates: COUNT(*), COUNT(col), SUM, AVG, MIN, MAX
-    /// - No HAVING, no DISTINCT on non-COUNT aggregates
-    /// - No ORDER BY clause, no LIMIT on groups
-    pub(crate) fn try_streaming_derived_table_aggregation(
-        &self,
-        mut result: Box<dyn QueryResult>,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> Result<std::result::Result<Box<dyn QueryResult>, Box<dyn QueryResult>>> {
-        if Self::aggregates_hold_subquery(stmt) {
-            return Ok(Err(result));
-        }
-
-        // Quick eligibility checks
-        if !classification.has_group_by {
-            return Ok(Err(result));
-        }
-        if classification.has_having {
-            return Ok(Err(result));
-        }
-        if classification.has_window_functions {
-            return Ok(Err(result));
-        }
-        // Skip ROLLUP/CUBE/GROUPING SETS
-        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
-            return Ok(Err(result));
-        }
-
-        // Only single-column GROUP BY for this optimization
-        if stmt.group_by.columns.len() != 1 {
-            return Ok(Err(result));
-        }
-
-        // The derived table's columns carry no qualifier
-        let Some((group_col_name, _)) = self.single_group_column(stmt)? else {
-            return Ok(Err(result));
-        };
-
-        // Build column index map from result columns
-        let source_columns = result.columns().to_vec();
-        let col_index_map: StringMap<usize> = source_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_lowercase(), i))
-            .collect();
-
-        // Find GROUP BY column index
-        let group_col_idx = match col_index_map.get(&group_col_name) {
-            Some(&idx) => idx,
-            None => return Ok(Err(result)),
-        };
-
-        // Parse aggregations
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
-
-        // The select list reads the group column, bare or qualified, and
-        // aggregate calls; the shared end projects the slots onto it
-        let readable = |expr: &crate::parser::ast::Expression| {
-            use crate::parser::ast::Expression;
-            let inner = match expr {
-                Expression::Aliased(aliased) => aliased.expression.as_ref(),
-                other => other,
-            };
-            match inner {
-                Expression::Identifier(id) => id.value_lower.eq_ignore_ascii_case(&group_col_name),
-                Expression::QualifiedIdentifier(qid) => {
-                    qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
-                }
-                Expression::FunctionCall(func) => {
-                    crate::executor::utils::is_aggregate_function(&func.function)
-                }
-                _ => false,
-            }
-        };
-        if !stmt.columns.iter().all(readable)
-            || !non_agg_columns
-                .iter()
-                .all(|column| column.eq_ignore_ascii_case(&group_col_name))
-        {
-            return Ok(Err(result));
-        }
-
-        // Plain COUNT, SUM, AVG, MIN and MAX over the derived table's columns
-        let plain = aggregations.iter().all(|agg| {
-            let column = || Self::lookup_column_index(&agg.column_lower, &col_index_map).is_some();
-            agg.answered_with(Modifiers::NONE)
-                && match agg.name.as_str() {
-                    "COUNT" => agg.column == "*" || column(),
-                    "SUM" | "AVG" | "MIN" | "MAX" => agg.column != "*" && column(),
-                    _ => false,
-                }
-        });
-        if !plain {
-            return Ok(Err(result));
-        }
-
-        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
-        slot_columns.push(source_columns[group_col_idx].clone());
-        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
-
-        let group_items = [GroupByItem::Column(group_col_name)];
-        let mut groups = GroupedAggregates::new(self.call_templates(&aggregations)?, 1);
-        let feed = RowFeed::new(
-            &aggregations,
-            &group_items,
-            Some(stmt),
-            &source_columns,
-            &col_index_map,
-            ctx,
-            None,
-        )?;
-        let mut state = FeedState::default();
-        let reads = RowReads::of(ctx, None);
-        while result.next() {
-            feed.run_one(&mut groups, result.row(), &reads, &mut state)?;
-        }
-        if let Some(err) = result.last_error() {
-            return Err(err);
-        }
-
-        let slots = AggregateSlots {
-            stmt,
-            written_stmt: stmt,
-            aggregations: &aggregations,
-            group_by_count: 1,
-            source_columns: &source_columns,
-            blocks: None,
-            alone: None,
-        };
-        self.finish_aggregation(
-            AggregatePath::StreamingDerivedTable,
-            slots,
-            ctx,
-            slot_columns,
-            groups.into_rows()?,
-        )
-        .map(Ok)
     }
 }
 
