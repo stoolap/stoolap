@@ -5413,16 +5413,24 @@ impl Builder<'_> {
 
     /// The error of a subquery in a SELECT item of the grouped EXISTS block
     /// `sq`, which its run drops, reading a column of `own` outside its
-    /// groups, as running the item would raise
+    /// groups, as running the item would raise; one in an aggregate call or
+    /// in a GROUP BY item reads the rows before they group
     fn check_dropped_items(
         &self,
         sq: &SelectStatement,
         own: &ScopeTable,
         outer: &[&ScopeTable],
     ) -> Result<()> {
-        if !grouped_block(sq) || !sq.columns.iter().any(mentions_subquery) {
+        if !grouped_block(sq) || !sq.columns.iter().map(unaliased).any(mentions_subquery) {
             return Ok(());
         }
+        let registry = &self.executor.function_registry;
+        let group_keys: SmallVec<[ExprKey; 2]> = grouping_items(sq)
+            .into_iter()
+            .map(|key| {
+                ExprKey::of(grouped_item(sq, key).map_or(key, |at| unaliased(&sq.columns[at])))
+            })
+            .collect();
         let mut scopes = Vec::with_capacity(outer.len() + 1);
         scopes.push(own);
         scopes.extend_from_slice(outer);
@@ -5442,8 +5450,27 @@ impl Builder<'_> {
             visible: Vec::new(),
             ctes: self.ctes.clone(),
         };
+        fn after_grouping(
+            expr: &Expression,
+            registry: &FunctionRegistry,
+            group_keys: &[ExprKey],
+            found: &mut impl FnMut(&Expression) -> Result<()>,
+        ) -> Result<()> {
+            match expr {
+                Expression::FunctionCall(call) if registry.is_aggregate(&call.function) => Ok(()),
+                _ if group_keys.contains(&ExprKey::of(expr)) => Ok(()),
+                Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => {
+                    found(expr)
+                }
+                other => for_each_child(other, &mut |child| {
+                    after_grouping(child, registry, group_keys, found)
+                }),
+            }
+        }
         for item in &sq.columns {
-            walk.subqueries_of(item, &scopes)?;
+            after_grouping(unaliased(item), registry, &group_keys, &mut |block| {
+                walk.subqueries_of(block, &scopes)
+            })?;
         }
         Ok(())
     }

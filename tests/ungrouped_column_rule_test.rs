@@ -108,6 +108,8 @@ const SUBQUERY_READS: &[&str] = &[
      FROM u WHERE u.k = t.k GROUP BY k)",
     "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT MAX(u.v)) FROM u WHERE u.k = t.k GROUP BY k)",
     "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT (SELECT u.v)) FROM u WHERE u.k = t.k GROUP BY k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT u.k, (SELECT u.v) AS bad, (SELECT 1) FROM u GROUP BY u.k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT k, SUM(v) + (SELECT u.v) FROM u GROUP BY k)",
     "SELECT id FROM t WHERE EXISTS (SELECT COUNT(*), (SELECT COUNT(*) FROM e WHERE e.id = u.v) \
      FROM u WHERE u.k = t.k)",
     "SELECT id FROM t WHERE EXISTS (SELECT k FROM u WHERE u.k = t.k GROUP BY k \
@@ -204,6 +206,25 @@ const ANSWERED: &[(&str, &[&str])] = &[
     (
         "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT COUNT(*) FROM e WHERE e.id = t.x) \
          FROM u WHERE u.k = t.k GROUP BY k)",
+        &["1", "2", "4"],
+    ),
+    // An aggregate's input and a GROUP BY item read the rows before they group
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT SUM((SELECT u.v)) FROM u WHERE u.k = t.k)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT (SELECT u.v) FROM u WHERE u.k = t.k GROUP BY 1)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT k, COUNT(*) FILTER (WHERE (SELECT u.v) > 0) \
+         FROM u WHERE u.k = t.k GROUP BY k)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT k, STRING_AGG(CAST(v AS TEXT), ',' \
+         ORDER BY (SELECT u.v)) FROM u WHERE u.k = t.k GROUP BY k)",
         &["1", "2", "4"],
     ),
 ];
