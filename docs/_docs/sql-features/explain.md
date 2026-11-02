@@ -325,6 +325,26 @@ Limit 2
 
 A CTE read once, with no column list, runs as a derived table and shows as one. Any other CTE runs before the statement and shows as `Cte`, with its query's plan under it.
 
+Window functions over a source's rows show as a `Window` step over the source, with the ORDER BY and LIMIT above it, as over a table:
+
+```sql
+EXPLAIN SELECT name, ROW_NUMBER() OVER (ORDER BY value DESC) AS rn
+FROM (SELECT name, value FROM products WHERE value > 10) p ORDER BY rn LIMIT 2;
+```
+
+Output:
+```
+plan
+----
+Limit 2
+  TopN rn ASC
+    Window ROW_NUMBER() OVER (ORDER BY value DESC)
+      Derived p
+        Project name, value
+          IndexScan products (value > 10)
+            Index idx_value (value range)
+```
+
 ### Hash Join
 
 When joining tables:
