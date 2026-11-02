@@ -2597,14 +2597,17 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let columns = CompactArc::new(result.columns().to_vec());
-        let set_operation = !stmt.set_operations.is_empty(); // A set operation's rows keep where its first branch put its items,
-                                                             // which the layout says; only without one do output names stand
+        let set_operation = !stmt.set_operations.is_empty();
+        // A set operation's rows keep where its first branch put its items,
+        // which the layout says; only without one do output names stand. A
+        // key reads any item computing it, not only the ones ORDER BY reads
         let (mut mapped, mut slots) = self.key_columns(
             stmt,
             stmt.distinct_on.iter(),
             &columns,
             layout,
             set_operation && layout.is_none(),
+            true,
         );
         // A position names one of the columns the SELECT list shows
         let shown = layout.map_or(columns.len(), |l| l.shown(stmt.columns.len()));
@@ -9744,18 +9747,7 @@ impl Executor {
             Error::internal("a table's columns changed while the statement prepared")
         })?;
         let output = self.grouped_output(held, &run, grouped, ctx)?;
-        let (result, columns, applied, shape) = Self::with_late_keys(held, &run, output, ctx)?;
-        // A set operation's DISTINCT ON binds its keys by the first branch's
-        // items, which the grouped row holds in order, as a prepared select's
-        // layout binds them
-        let shape = match shape.as_ref().is_none_or(|shape| shape.layout.is_none())
-            && !branch.set_operations.is_empty()
-            && !branch.distinct_on.is_empty()
-        {
-            true => SelectShape::laid_out(Self::result_layout(branch, &[], None, &columns)),
-            false => shape,
-        };
-        Ok((result, columns, applied, shape))
+        Self::with_late_keys(held, &run, output, ctx)
     }
 
     /// `output`, the rows the run `run` of `held` returned, with each late key
@@ -12360,10 +12352,11 @@ impl Executor {
         set_operation: bool,
     ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
-        self.key_columns(stmt, keys, columns, layout, set_operation)
+        self.key_columns(stmt, keys, columns, layout, set_operation, false)
     }
 
-    /// `order_by_columns` for any of `stmt`'s sort keys
+    /// `order_by_columns` for any of `stmt`'s sort keys; `any_item` lets a
+    /// set operation's key read every item, not only an aliased or aggregate one
     fn key_columns<'k>(
         &self,
         stmt: &SelectStatement,
@@ -12371,6 +12364,7 @@ impl Executor {
         columns: &[String],
         layout: Option<&OutputLayout>,
         set_operation: bool,
+        any_item: bool,
     ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
         // Each column by the identity of what computed it: the SELECT
         // list in order (unless a star moves the positions), then the
@@ -12388,7 +12382,7 @@ impl Executor {
             if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 continue;
             }
-            if set_operation && !set_operation_key_item(col, &self.function_registry) {
+            if set_operation && !any_item && !set_operation_key_item(col, &self.function_registry) {
                 continue;
             }
             // An item's column by the layout; without one, by its index

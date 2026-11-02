@@ -180,15 +180,22 @@ fn a_key_holding_a_subquery_reads_the_first_select_s_item_or_names_no_column() {
         "Null(Null),Integer(3)",
         "Integer(9),Integer(9)",
     ][..];
+    let by_group = &[
+        "Integer(1),Integer(1)",
+        "Integer(2),Integer(1)",
+        "Integer(3),Integer(1)",
+        "Integer(9),Integer(9)",
+    ][..];
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = setup(&dir, sealed);
         let mode = if sealed { "sealed" } else { "hot" };
-        for group in ["", " GROUP BY k"] {
+        let joined = "t JOIN (SELECT id AS wid FROM t) w ON w.wid = t.id";
+        for (from, group) in [("t", ""), ("t", " GROUP BY k"), (joined, " GROUP BY t.k")] {
             for (head, tail, want) in [
                 (
                     "SELECT DISTINCT ON ((SELECT 1)) (SELECT 1), k",
-                    "UNION ALL SELECT 9, 9",
+                    "UNION ALL SELECT 9, 9 ORDER BY 2",
                     Ok(&["Integer(1),Integer(1)", "Integer(9),Integer(9)"][..]),
                 ),
                 (
@@ -207,8 +214,18 @@ fn a_key_holding_a_subquery_reads_the_first_select_s_item_or_names_no_column() {
                     "EXCEPT SELECT 9, 9",
                     Err("names no column"),
                 ),
+                (
+                    "SELECT DISTINCT ON (k) t.k, (SELECT 1)",
+                    "UNION ALL SELECT 9, 9 ORDER BY 1",
+                    Ok(by_group),
+                ),
+                (
+                    "SELECT DISTINCT ON (t.k + 0) t.k + 0, (SELECT 1)",
+                    "UNION ALL SELECT 9, 9 ORDER BY 1",
+                    Ok(by_group),
+                ),
             ] {
-                let sql = format!("{head} FROM t{group} {tail}");
+                let sql = format!("{head} FROM {from}{group} {tail}");
                 let before = general_path_total();
                 let got = rows(&db, &sql);
                 if general_path_total() != before {

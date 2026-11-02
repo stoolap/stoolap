@@ -8851,19 +8851,6 @@ impl PreparedGrouped {
         epoch: u64,
     ) -> Result<Option<Self>> {
         let validity = executor.select_validity(stmt, epoch);
-        // A set operation's DISTINCT ON reads the whole one's rows, after it
-        let unkeyed;
-        let stmt = match stmt.set_operations.is_empty() || stmt.distinct_on.is_empty() {
-            true => stmt,
-            false => {
-                unkeyed = SelectStatement {
-                    distinct: false,
-                    distinct_on: Vec::new(),
-                    ..stmt.clone()
-                };
-                &unkeyed
-            }
-        };
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
@@ -9220,6 +9207,10 @@ impl PreparedGrouped {
             window_defs,
             ..stmt.clone()
         };
+        // A set operation's DISTINCT ON reads the whole one's rows, after it
+        if !run_stmt.set_operations.is_empty() {
+            run_stmt.distinct_on.clear();
+        }
         // A key one of whose blocks, nested ones too, reads an alias of an
         // unrepeatable item is computed over the row the run returns, at its
         // place there, which the run's own projection holds as NULL
