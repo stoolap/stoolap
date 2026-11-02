@@ -382,7 +382,7 @@ fn a_join_without_a_plan_builds_no_shared_list() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // A windowed statement's ORDER BY subquery keeps the statement off a plan
+    // A windowed statement over a USING join holding a subquery stays off a plan
     let with = |conditions: &[&str]| {
         let on: String = conditions.iter().map(|c| format!(" AND {c}")).collect();
         allocations_per_run(
@@ -390,7 +390,7 @@ fn a_join_without_a_plan_builds_no_shared_list() {
             &format!(
                 "SELECT COUNT(*) OVER (), (SELECT MIN(id) FROM s) FROM \
                  (SELECT l.id, r.id AS rid FROM l JOIN r ON l.g = r.w{on}) AS d \
-                 ORDER BY (SELECT MIN(id) FROM s) + d.id"
+                 JOIN s USING (id)"
             ),
         )
     };
