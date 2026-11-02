@@ -85,6 +85,42 @@ const REFUSED: &[&str] = &[
     "SELECT id FROM t WHERE x = (SELECT COUNT(*) FROM u WHERE u.k = t.k GROUP BY 3)",
 ];
 
+/// Statements reading `u.v` outside its groups inside a subquery, which
+/// fail as the same read outside one does
+const SUBQUERY_READS: &[&str] = &[
+    "SELECT k, (SELECT COUNT(*) FROM t WHERE t.id = u.v) FROM u GROUP BY k",
+    "SELECT k FROM u GROUP BY k HAVING (SELECT COUNT(*) FROM t WHERE t.id = u.v) > 0",
+    "SELECT k FROM u GROUP BY k ORDER BY (SELECT COUNT(*) FROM t WHERE t.id = u.v)",
+    "SELECT k FROM u GROUP BY k ORDER BY (SELECT (SELECT u.v) FROM t WHERE t.id = 1)",
+    // A block aliasing u hides its name, so `u.v` is still the outer row's
+    "SELECT k, (SELECT u2.v FROM u u2 WHERE u2.id = u.v) FROM u GROUP BY k",
+    "SELECT k FROM u GROUP BY k HAVING (SELECT COUNT(*) FROM u u2 WHERE u2.id = u.v) > 0",
+    "SELECT k FROM u GROUP BY k ORDER BY (SELECT u2.v FROM u u2 WHERE u2.id = u.v), k",
+    "SELECT id FROM t WHERE EXISTS (SELECT k FROM u WHERE u.k = t.k GROUP BY k \
+     ORDER BY (SELECT u2.v FROM u u2 WHERE u2.id = u.v))",
+    "SELECT k, (SELECT COUNT(*) FROM t WHERE t.id = u.v + 1) FROM u GROUP BY k",
+    "SELECT DISTINCT ON (k) k FROM u GROUP BY k ORDER BY k, (SELECT COUNT(*) FROM t WHERE t.id = u.v)",
+    "SELECT COUNT(*) FROM u ORDER BY (SELECT COUNT(*) FROM t WHERE t.id = u.v)",
+    "SELECT t.k FROM t JOIN u ON u.k = t.k GROUP BY t.k ORDER BY (SELECT COUNT(*) FROM e WHERE e.id = u.v)",
+    "SELECT id FROM t WHERE EXISTS (SELECT k FROM u WHERE u.k = t.k GROUP BY k \
+     ORDER BY (SELECT COUNT(*) FROM e WHERE e.id = u.v))",
+    "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT COUNT(*) FROM e WHERE e.id = u.v) \
+     FROM u WHERE u.k = t.k GROUP BY k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT MAX(u.v)) FROM u WHERE u.k = t.k GROUP BY k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT (SELECT u.v)) FROM u WHERE u.k = t.k GROUP BY k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT COUNT(*), (SELECT COUNT(*) FROM e WHERE e.id = u.v) \
+     FROM u WHERE u.k = t.k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT k FROM u WHERE u.k = t.k GROUP BY k \
+     HAVING (SELECT COUNT(*) FROM e WHERE e.id = u.v) >= 0)",
+    "SELECT id FROM t WHERE k IN (SELECT k FROM u GROUP BY k \
+     ORDER BY (SELECT COUNT(*) FROM e WHERE e.id = u.v) LIMIT 2)",
+    "SELECT id FROM t WHERE k IN (SELECT (SELECT COUNT(*) FROM e WHERE e.id = u.v) FROM u GROUP BY k)",
+    "SELECT id, (SELECT k FROM u GROUP BY k ORDER BY (SELECT COUNT(*) FROM e WHERE e.id = u.v) LIMIT 1) \
+     FROM t",
+    "SELECT * FROM (SELECT k, (SELECT COUNT(*) FROM e WHERE e.id = u.v) AS c FROM u GROUP BY k) d",
+    "SELECT * FROM (SELECT k FROM u GROUP BY k ORDER BY (SELECT COUNT(*) FROM e WHERE e.id = u.v) LIMIT 2) d",
+];
+
 /// Statements reading their rows only through items and calls, with the
 /// rows each gives, sorted
 const ANSWERED: &[(&str, &[&str])] = &[
@@ -133,6 +169,43 @@ const ANSWERED: &[(&str, &[&str])] = &[
         "SELECT id, (SELECT COUNT(*) FROM u WHERE u.k = t.k GROUP BY k) FROM t ORDER BY id",
         &["1|2", "2|1", "4|1"],
     ),
+    (
+        "SELECT k FROM u GROUP BY k ORDER BY (SELECT COUNT(*) FROM u u2 WHERE u2.k = u.k), k",
+        &["NULL", "1", "2", "4"],
+    ),
+    (
+        "SELECT v AS w FROM u GROUP BY w ORDER BY (SELECT COUNT(*) FROM t WHERE t.id = u.v)",
+        &["1", "10", "4", "NULL"],
+    ),
+    (
+        "SELECT v FROM u GROUP BY 1 HAVING (SELECT COUNT(*) FROM t WHERE t.id = u.v) > 0",
+        &["1", "4"],
+    ),
+    (
+        "SELECT t.k, (SELECT COUNT(*) FROM u u2 WHERE u2.k = t.k) FROM t JOIN u ON u.k = t.k \
+         GROUP BY t.k",
+        &["1|2", "2|1", "4|1"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT COUNT(*) FROM u u2 WHERE u2.k = u.k) \
+         FROM u WHERE u.k = t.k GROUP BY k)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT v AS w, (SELECT COUNT(*) FROM e WHERE e.id = u.v) \
+         FROM u WHERE u.k = t.k GROUP BY w)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT v, (SELECT COUNT(*) FROM e WHERE e.id = u.v) \
+         FROM u WHERE u.k = t.k GROUP BY 1)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS (SELECT k, (SELECT COUNT(*) FROM e WHERE e.id = t.x) \
+         FROM u WHERE u.k = t.k GROUP BY k)",
+        &["1", "2", "4"],
+    ),
 ];
 
 fn check(db: &Database, place: &str) {
@@ -145,6 +218,21 @@ fn check(db: &Database, place: &str) {
         assert!(
             prepared.is_err(),
             "{place}: {sql} prepared answered {prepared:?}"
+        );
+    }
+    for sql in SUBQUERY_READS {
+        let got = answer(db, sql);
+        assert!(
+            matches!(&got, Err(e) if e.contains("Column 'u.v' not found")),
+            "{place}: {sql} gave {got:?}"
+        );
+        let prepared = db
+            .prepare(sql)
+            .and_then(|stmt| stmt.query(()).map(|rows| rows.count()))
+            .map_err(|e| e.to_string());
+        assert!(
+            matches!(&prepared, Err(e) if e.contains("Column 'u.v' not found")),
+            "{place}: {sql} prepared gave {prepared:?}"
         );
     }
     for (sql, want) in ANSWERED {

@@ -5411,6 +5411,43 @@ impl Builder<'_> {
         Ok(())
     }
 
+    /// The error of a subquery in a SELECT item of the grouped EXISTS block
+    /// `sq`, which its run drops, reading a column of `own` outside its
+    /// groups, as running the item would raise
+    fn check_dropped_items(
+        &self,
+        sq: &SelectStatement,
+        own: &ScopeTable,
+        outer: &[&ScopeTable],
+    ) -> Result<()> {
+        if !grouped_block(sq) || !sq.columns.iter().any(mentions_subquery) {
+            return Ok(());
+        }
+        let mut scopes = Vec::with_capacity(outer.len() + 1);
+        scopes.push(own);
+        scopes.extend_from_slice(outer);
+        let held = held_columns(sq, &Chain { scopes: &scopes });
+        let mut on = |reach: Reach<'_>| match reach {
+            Reach::Outer(expr, 1, index) if !held.contains(&Some(index)) => {
+                Err(ungrouped_column(&reference_name(expr)))
+            }
+            Reach::Outer(expr, ..) => Ok(Some(expr.clone())),
+            Reach::Param(_) => Ok(None),
+        };
+        let mut walk = StatementWalk {
+            executor: self.executor,
+            ctx: self.ctx,
+            on: &mut on,
+            runs: true,
+            visible: Vec::new(),
+            ctes: self.ctes.clone(),
+        };
+        for item in &sq.columns {
+            walk.subqueries_of(item, &scopes)?;
+        }
+        Ok(())
+    }
+
     /// Bind the block `sq` over a join as a block over one table is bound
     /// when prepared, computing nothing: its clauses over its FROM's scope
     /// `own` read by position, its grouping and keys checked as `grouping`
@@ -5621,6 +5658,7 @@ impl Builder<'_> {
             },
             true => {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
+                self.check_dropped_items(sq, &own, outer)?;
                 existence(executor, statement, &own.lower, ctx)?
             }
             false => statement,
@@ -9120,16 +9158,7 @@ impl PreparedGrouped {
         // the column it binds to: between several, the one the grouped output
         // reads for what the block wrote, by that output's own keys and item
         // names, which it binds by text until it reads bound columns
-        let held: Vec<Option<usize>> = grouping_items(stmt)
-            .into_iter()
-            .map(|key| {
-                let read = grouped_item(stmt, key).map_or(key, |at| unaliased(&stmt.columns[at]));
-                match chain.resolve(read) {
-                    Ok(Some((0, column))) => Some(column),
-                    _ => None,
-                }
-            })
-            .collect();
+        let held = held_columns(stmt, &chain);
         let names = schema.column_names_arc();
         let item_names = executor.resolve_group_by_column_names_new(
             &group_items,
@@ -9207,19 +9236,23 @@ impl PreparedGrouped {
                     return Ok(None);
                 };
                 let read = match (opened, chain.resolve(written)) {
-                    (Some(opened), _) => match over_items(&opened, &chain, &item_of, None)
-                        .and_then(|expr| compile_with(&slots_ctx, &expr))
-                    {
-                        Ok(program) => Hole::Program(program),
-                        Err(_) => return Ok(None),
-                    },
+                    (Some(opened), _) => {
+                        match compile_with(
+                            &slots_ctx,
+                            &over_items(&opened, &chain, &item_of, None)?,
+                        ) {
+                            Ok(program) => Hole::Program(program),
+                            Err(_) => return Ok(None),
+                        }
+                    }
                     (None, Ok(Some((_, column)))) => match item_of(column, written) {
                         Some(item) => Hole::Column(item),
-                        None => return Ok(None),
+                        None => return Err(ungrouped_column(&reference_name(written))),
                     },
-                    _ => match over_items(written, &chain, &item_of, None)
-                        .and_then(|expr| compile_with(&slots_ctx, &expr))
-                    {
+                    _ => match compile_with(
+                        &slots_ctx,
+                        &over_items(written, &chain, &item_of, None)?,
+                    ) {
                         Ok(program) => Hole::Program(program),
                         Err(_) => return Ok(None),
                     },
@@ -13082,7 +13115,7 @@ fn over_items(
                 None => Ok(expr.clone()),
                 Some((depth, column)) => {
                     let item = item_of(column, expr)
-                        .ok_or_else(|| Error::internal("a column outside the groups"))?;
+                        .ok_or_else(|| ungrouped_column(&reference_name(expr)))?;
                     let name = chain.scopes[depth].lower[column].as_str();
                     Ok(Expression::Column(ColumnRef {
                         index: item as u32,
@@ -13093,6 +13126,29 @@ fn over_items(
         }
         other => rebuild(other, &mut |child| over_items(child, chain, item_of, slots)),
     }
+}
+
+/// A column reference as the error naming it spells it
+fn reference_name(reference: &Expression) -> String {
+    match reference {
+        Expression::Identifier(id) => id.value.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The column of the first scope of `chain` each GROUP BY item of `stmt`
+/// holds, its key read through the item an alias or a position names
+fn held_columns(stmt: &SelectStatement, chain: &Chain<'_>) -> Vec<Option<usize>> {
+    grouping_items(stmt)
+        .into_iter()
+        .map(|key| {
+            let read = grouped_item(stmt, key).map_or(key, |at| unaliased(&stmt.columns[at]));
+            match chain.resolve(read) {
+                Ok(Some((0, column))) => Some(column),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// One source a join reads: the name qualifying its columns, lowercase,
