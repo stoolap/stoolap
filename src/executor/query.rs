@@ -13655,6 +13655,21 @@ impl Executor {
                     .map(|e| Self::substitute_aliases(e, alias_map))
                     .collect(),
             })),
+            Expression::ExpressionList(list) => {
+                Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|e| Self::substitute_aliases(e, alias_map))
+                        .collect(),
+                }))
+            }
+            Expression::Cast(cast) => Expression::Cast(CastExpression {
+                token: cast.token.clone(),
+                expr: Box::new(Self::substitute_aliases(&cast.expr, alias_map)),
+                type_name: cast.type_name.clone(),
+            }),
             Expression::Like(like) => Expression::Like(LikeExpression {
                 token: like.token.clone(),
                 left: Box::new(Self::substitute_aliases(&like.left, alias_map)),
