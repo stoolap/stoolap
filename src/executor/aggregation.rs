@@ -1498,22 +1498,20 @@ impl Executor {
             .collect()
     }
 
-    /// Execute SELECT with aggregation (GROUP BY support); the statement's
-    /// `blocks`, when it has them, answer its SELECT list and HAVING subqueries
+    /// Execute SELECT with aggregation (GROUP BY support)
     pub(crate) fn execute_select_with_aggregation(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: RowVec,
         base_columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
         let written_stmt = stmt;
         // A subquery inside an aggregate is resolved per input row and read
         // back as a column, since an aggregate cannot resolve one itself
         let lifted_stmt;
         let lifted_columns;
-        let lifts = blocks.is_none() && Self::aggregates_hold_subquery(stmt);
+        let lifts = Self::aggregates_hold_subquery(stmt);
         let (stmt, base_rows, base_columns) = match lifts
             .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
             .flatten()
@@ -1548,7 +1546,7 @@ impl Executor {
             ctx,
             input,
             base_columns,
-            blocks,
+            None,
         )
     }
 
@@ -2472,24 +2470,21 @@ impl Executor {
     }
 
     /// Aggregate, then run the window functions over the aggregate's output.
-    /// A subquery inside an aggregate is resolved per input row first, unless
-    /// the statement's `blocks` answer its subqueries, and both stages read
-    /// the same rewritten statement
+    /// A subquery inside an aggregate is resolved per input row first, and
+    /// both stages read the same rewritten statement
     pub(crate) fn execute_aggregation_then_windows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         let lifted_stmt;
         let lifted_rows;
         let lifted_columns;
-        let (stmt, base_rows, base_columns) = match (blocks.is_none()
-            && Self::aggregates_hold_subquery(stmt))
-        .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
-        .flatten()
+        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
+            .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
+            .flatten()
         {
             Some((rewritten, lifted, names)) => {
                 let qualifier = stmt
@@ -2518,7 +2513,7 @@ impl Executor {
         let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
         let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
         let path = AggregatePath::General;
-        self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, blocks)
+        self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, None)
     }
 
     /// The window functions of `stmt` over its groups of `aggregations`,

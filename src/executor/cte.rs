@@ -723,7 +723,6 @@ impl Executor {
                 &classification,
                 filtered_rows,
                 &cte_columns,
-                None,
                 |out| Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), out),
             )?;
             let columns = result.columns().to_vec();

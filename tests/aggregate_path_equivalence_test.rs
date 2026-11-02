@@ -652,6 +652,69 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT COUNT(*), (SELECT 1) FROM t WHERE 1 = 0",
         "SELECT COUNT(*), (SELECT 1) FROM t WHERE 1 = 0",
     ),
+    // The same over another source's rows, and over a join's
+    (
+        "memory",
+        "hash_groups",
+        "SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) FROM (SELECT g, a FROM t) d GROUP BY g",
+        "SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) FROM (SELECT g, a FROM t) d GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, COUNT(*), (SELECT 5) FROM (SELECT g, a FROM t) d \
+         WHERE a < (SELECT a FROM t WHERE id = 3) GROUP BY g",
+        "SELECT g, COUNT(*), (SELECT 5) FROM (SELECT g, a FROM t) d \
+         WHERE a < (SELECT a FROM t WHERE id = 3) GROUP BY g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT g, COUNT(*), (SELECT a FROM t WHERE id = 3) FROM tv GROUP BY g \
+         HAVING COUNT(*) > (SELECT 0)",
+        "SELECT g, COUNT(*), (SELECT a FROM t WHERE id = 3) FROM tv GROUP BY g \
+         HAVING COUNT(*) > (SELECT 0)",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "WITH c AS (SELECT g, a FROM t) SELECT g, SUM(a), (SELECT 5) FROM c GROUP BY g",
+        "WITH c AS (SELECT g, a FROM t) SELECT g, SUM(a), (SELECT 5) FROM c GROUP BY g",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT x, COUNT(*), (SELECT 5) FROM (VALUES (1), (1), (2)) v(x) GROUP BY x",
+        "SELECT x, COUNT(*), (SELECT 5) FROM (VALUES (1), (1), (2)) v(x) GROUP BY x",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT value % 2, COUNT(*), (SELECT 5) FROM generate_series(1, 6) GROUP BY value % 2",
+        "SELECT value % 2, COUNT(*), (SELECT 5) FROM generate_series(1, 6) GROUP BY value % 2",
+    ),
+    (
+        "empty",
+        "hash_groups",
+        "SELECT COUNT(*), (SELECT 5) FROM (SELECT a FROM t) d",
+        "SELECT COUNT(*), (SELECT 5) FROM (SELECT a FROM t) d",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT t.g, SUM(t.a), (SELECT a FROM t WHERE id = 3) FROM t JOIN t t2 ON t2.id = t.id \
+         GROUP BY t.g",
+        "SELECT t.g, SUM(t.a), (SELECT a FROM t WHERE id = 3) FROM t JOIN t t2 ON t2.id = t.id \
+         GROUP BY t.g",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT t.g, COUNT(*), RANK() OVER (ORDER BY COUNT(*) * (SELECT 2)) FROM t \
+         JOIN t t2 ON t2.id = t.id GROUP BY t.g",
+        "SELECT t.g, COUNT(*), RANK() OVER (ORDER BY COUNT(*) * (SELECT 2)) FROM t \
+         JOIN t t2 ON t2.id = t.id GROUP BY t.g",
+    ),
 ];
 
 fn open(db: Database, seal: bool, rows: bool) -> Database {
