@@ -40,6 +40,7 @@ const SETUP: &[&str] = &[
     "CREATE INDEX t_b ON t(b)",
     "INSERT INTO t SELECT g.value, g.value % 7, (g.value * 37) % 1009, \
      CASE WHEN g.value % 5 = 0 THEN NULL ELSE g.value % 13 END FROM generate_series(1, 120) g",
+    "CREATE VIEW tv AS SELECT id, a, b, c FROM t WHERE id > 3",
 ];
 
 fn hot(name: &str) -> Database {
@@ -184,6 +185,113 @@ fn a_windowed_statement_answers_as_the_general_path() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+/// Each statement over `{w}` reading another source than a table
+const SOURCE_SHAPES: &[&str] = &[
+    "SELECT id, {w} AS x FROM tv ORDER BY id",
+    "SELECT id, {w} AS x FROM (SELECT id, a, b, c FROM t WHERE a < 5) AS d ORDER BY id",
+    "WITH s AS (SELECT id, a, b, c FROM t WHERE b > 100) \
+     SELECT id, {w} AS x FROM s ORDER BY x, id LIMIT 7",
+    "SELECT id, {w} + 1 AS x FROM tv WHERE c IS NOT NULL ORDER BY id LIMIT 5 OFFSET 2",
+    "SELECT DISTINCT ON (a) a, id, {w} AS x FROM tv ORDER BY a, id",
+    "SELECT id FROM tv ORDER BY {w}, id LIMIT 10",
+    "SELECT id, {w} AS x FROM (VALUES (1, 1, 5, 2), (2, 1, 3, NULL), (3, 2, 9, 4)) \
+     AS v(id, a, b, c) ORDER BY id",
+];
+
+#[test]
+fn a_windowed_statement_over_a_source_answers_as_the_general_path() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    let mut count = 0;
+    for (context, db) in [("hot", hot("sources")), ("sealed", sealed(&dir))] {
+        for window in WINDOWS {
+            for shape in SOURCE_SHAPES {
+                let sql = shape.replace("{w}", window);
+                count += 1;
+                let planned = answer(&db, &sql, &[]);
+                let reference = general(|| answer(&db, &sql, &[]));
+                if planned.is_err() || planned != reference {
+                    wrong.push(format!(
+                        "{context}: {sql}\n  planned  {planned:?}\n  general  {reference:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(count > 100, "{count} statements");
+    assert!(
+        wrong.is_empty(),
+        "{} of {count} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_window_over_a_source_under_a_limit_without_order_reads_every_row() {
+    let _guard = serial();
+    let db = hot("source_limit");
+    let tv_rows = answer(&db, "SELECT COUNT(*) FROM tv", &[]).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT SUM(value) OVER () FROM generate_series(1, 3) LIMIT 1",
+            vec!["6".to_string()],
+        ),
+        (
+            "SELECT COUNT(*) OVER () FROM generate_series(1, 3) LIMIT 1",
+            vec!["3".to_string()],
+        ),
+        (
+            "SELECT value, SUM(value) OVER () FROM generate_series(1, 3) LIMIT 1 OFFSET 1",
+            vec!["2|6".to_string()],
+        ),
+        ("SELECT COUNT(*) OVER () FROM tv LIMIT 1", tv_rows),
+        (
+            "SELECT COUNT(*) OVER () FROM (VALUES (1), (2), (3)) AS v(x) LIMIT 2",
+            vec!["3".to_string(), "3".to_string()],
+        ),
+    ] {
+        let got = answer(&db, sql, &[]);
+        assert_eq!(got.as_ref(), Ok(&want), "{sql}");
+        assert_eq!(got, general(|| answer(&db, sql, &[])), "{sql}");
+    }
+}
+
+#[test]
+fn explain_shows_the_window_step_over_a_source() {
+    let _guard = serial();
+    let db = hot("explain_sources");
+    for (sql, window, source) in [
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY b) FROM tv ORDER BY id LIMIT 5",
+            "Window ROW_NUMBER() OVER (ORDER BY b ASC)",
+            "View tv",
+        ),
+        (
+            "SELECT id, SUM(c) OVER (PARTITION BY a) FROM (SELECT id, a, c FROM t) AS d",
+            "Window SUM(c) OVER (PARTITION BY a)",
+            "Derived d",
+        ),
+        (
+            "SELECT x, LAG(x) OVER (ORDER BY x) FROM (VALUES (3), (1), (2)) AS v(x) ORDER BY x",
+            "Window LAG(x) OVER (ORDER BY x ASC)",
+            "Values v",
+        ),
+    ] {
+        let got: Vec<String> = db
+            .query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap().trim().to_string())
+            .collect();
+        let at = |line: &str| got.iter().position(|l| l == line);
+        assert!(
+            matches!((at(window), at(source)), (Some(w), Some(s)) if w < s),
+            "{sql}: {got:#?}"
+        );
+    }
 }
 
 #[test]

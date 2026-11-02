@@ -1127,9 +1127,20 @@ impl Executor {
         if let Some(where_clause) = stmt.where_clause.as_deref() {
             family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
         }
+        // A statement that does not aggregate computes its windows over the
+        // rows it reads, when no item or key holds a subquery the window
+        // step would run
+        let list = match !aggregates
+            && stmt.set_operations.is_empty()
+            && shape.has_window_functions
+            && !shape.output_has_subqueries
+        {
+            true => Site::Rows,
+            false => Site::Subqueries,
+        };
         for column in stmt.columns.iter().filter(|_| !aggregates) {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
-                family.expression(unaliased(column), 1, Site::Subqueries, &mut found)?;
+                family.expression(unaliased(column), 1, list, &mut found)?;
             }
         }
         // A set operation's ORDER BY is the whole one's, over its rows
@@ -1153,7 +1164,7 @@ impl Executor {
                 .map(|ob| &ob.expression)
                 .chain(&stmt.distinct_on)
             {
-                family.expression(key, 1, Site::Subqueries, &mut found)?;
+                family.expression(key, 1, list, &mut found)?;
             }
         }
         family.statement_from(stmt.table_expr.as_deref(), &mut found)?;
@@ -8158,12 +8169,7 @@ impl PreparedSelect {
         let registry = &executor.function_registry;
         // A statement with window functions reads its rows as a SELECT * of
         // them would, and its window step computes the SELECT list over them
-        let windowed = stmt
-            .columns
-            .iter()
-            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-            .chain(&stmt.distinct_on)
-            .any(QueryClassification::expression_has_window_function);
+        let windowed = Self::computes_windows(stmt);
         // A statement that aggregates its rows reads them as the windowed
         // one does, its calls computed over them and its windows over the
         // groups
@@ -8378,6 +8384,8 @@ impl PreparedSelect {
             // The source's line shows the WHERE its rows pass whole
             if aggregated {
                 steps = Self::aggregate_steps(written, false);
+            } else if windowed {
+                steps = Self::window_steps(written, false);
             } else {
                 if !stmt.order_by.is_empty() {
                     steps.push(sort);
@@ -8571,6 +8579,16 @@ impl PreparedSelect {
             window,
             source_values,
         })
+    }
+
+    /// Whether `stmt` computes window functions over the rows it reads, in
+    /// its SELECT list, ORDER BY or DISTINCT ON keys
+    fn computes_windows(stmt: &SelectStatement) -> bool {
+        stmt.columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on)
+            .any(QueryClassification::expression_has_window_function)
     }
 
     /// Whether `stmt` aggregates its rows: a call, or [`Self::groups`]
@@ -12793,10 +12811,11 @@ impl Executor {
     ) -> Result<PreparedOutput> {
         let inner_ctx = ctx.with_incremented_query_depth();
         // Without a WHERE or an ORDER BY the first rows are the answer,
-        // unless the statement aggregates them
+        // unless the statement aggregates them or computes windows over them
         let first = limit
             .filter(|_| stmt.where_clause.is_none() && stmt.order_by.is_empty())
             .filter(|_| !PreparedSelect::aggregates(stmt))
+            .filter(|_| !PreparedSelect::computes_windows(stmt))
             .map(|limit| limit.saturating_add(offset));
         let (source, scope_name) = self.read_source(stmt, plan, ctx, &inner_ctx, first)?;
         let compiled = plan.map(NestedPlan::slot);
@@ -12900,57 +12919,97 @@ impl Executor {
         // passes, unless the statement aggregates them; the finishing steps
         // follow it
         if prepared.windowed && !prepared.aggregated {
-            let StatementSource::Table(table) = &source else {
-                return Err(Error::internal("a windowed statement over a source"));
-            };
-            let names = table.schema().column_names_arc();
             let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
-            // The plan's index read, else the scan it falls back to
-            let indexed = match prepared.plan.as_ref().and_then(|plan| plan.read.window()) {
-                Some(read) if !keeps_none => {
-                    let plan = prepared.window.as_ref();
-                    self.read_window_rows(read, (stmt, plan), ctx, &**table, &names)?
+            let (names, rows, order) = match source {
+                StatementSource::Table(table) => {
+                    let names = table.schema().column_names_arc();
+                    // The plan's index read, else the scan it falls back to
+                    let indexed = match prepared.plan.as_ref().and_then(|plan| plan.read.window()) {
+                        Some(read) if !keeps_none => {
+                            let plan = prepared.window.as_ref();
+                            self.read_window_rows(read, (stmt, plan), ctx, &*table, &names)?
+                        }
+                        _ => None,
+                    };
+                    let (rows, order) = match indexed {
+                        Some(WindowRows::Answer(result)) => {
+                            let output_columns = CompactArc::new(result.columns().to_vec());
+                            let visible = self.count_select_columns(stmt);
+                            return Ok((result, output_columns, false, visible, None, false));
+                        }
+                        Some(WindowRows::Rows(rows, sorted, grouped)) => (rows, (sorted, grouped)),
+                        // Without a WHERE the table hands over every row at once
+                        None if prepared.where_.conjuncts == 0 => {
+                            (table.collect_all_rows(None)?, (None, None))
+                        }
+                        None => {
+                            let mut rows = RowVec::new();
+                            if !keeps_none {
+                                let chosen =
+                                    prepared.plan.as_ref().and_then(|plan| plan.read.scan());
+                                let keep = |id: i64, _: u64, row: Row| {
+                                    rows.push((id, row));
+                                    true
+                                };
+                                let read = (&prepared.where_, chosen);
+                                match runner.passing_rows(
+                                    read,
+                                    None,
+                                    &*table,
+                                    ctx,
+                                    None,
+                                    Take::Collected,
+                                    keep,
+                                )? {
+                                    Passing::Pruned | Passing::Read => {}
+                                    Passing::Answers(answers) => rows = answers,
+                                    Passing::Scan(scan) => rows = runner.drain(scan, None)?,
+                                    Passing::Filtered(scan, bound) => {
+                                        rows = runner.drain(scan, Some(bound))?
+                                    }
+                                }
+                            }
+                            (rows, (None, None))
+                        }
+                    };
+                    (names, rows, order)
                 }
-                _ => None,
-            };
-            let (rows, order) = match indexed {
-                Some(WindowRows::Answer(result)) => {
-                    let output_columns = CompactArc::new(result.columns().to_vec());
-                    let visible = self.count_select_columns(stmt);
-                    return Ok((result, output_columns, false, visible, None, false));
+                // Without a WHERE a source hands over its rows as they are,
+                // as a table does
+                StatementSource::Rows(columns, rows) if prepared.where_.conjuncts == 0 => {
+                    (CompactArc::new(columns), rows, (None, None))
                 }
-                Some(WindowRows::Rows(rows, sorted, grouped)) => (rows, (sorted, grouped)),
-                // Without a WHERE the table hands over every row at once
-                None if prepared.where_.conjuncts == 0 => {
-                    (table.collect_all_rows(None)?, (None, None))
+                StatementSource::Stream(columns, mut result) if prepared.where_.conjuncts == 0 => {
+                    let rows = result_rows(&mut *result).collect::<Result<RowVec>>()?;
+                    (CompactArc::new(columns), rows, (None, None))
                 }
-                None => {
+                // Another source's rows are every one its read passes, held
+                // for the windows as a table's are
+                source => {
+                    let names = CompactArc::new(source.columns().unwrap_or_default().to_vec());
                     let mut rows = RowVec::new();
                     if !keeps_none {
-                        let chosen = prepared.plan.as_ref().and_then(|plan| plan.read.scan());
                         let keep = |id: i64, _: u64, row: Row| {
                             rows.push((id, row));
                             true
                         };
-                        let read = (&prepared.where_, chosen);
-                        match runner.passing_rows(
-                            read,
-                            None,
-                            &**table,
-                            ctx,
-                            None,
-                            Take::Collected,
-                            keep,
-                        )? {
-                            Passing::Pruned | Passing::Read => {}
-                            Passing::Answers(answers) => rows = answers,
-                            Passing::Scan(scan) => rows = runner.drain(scan, None)?,
-                            Passing::Filtered(scan, bound) => {
+                        let run = (&runner, &*prepared);
+                        let take = (None, Take::Collected);
+                        match self.source_read(run, stmt, source, ctx, take, keep)? {
+                            SourceRead::Passing(Passing::Pruned | Passing::Read) => {}
+                            SourceRead::Passing(Passing::Answers(answers)) => rows = answers,
+                            SourceRead::Passing(Passing::Scan(scan)) => {
+                                rows = runner.drain(scan, None)?
+                            }
+                            SourceRead::Passing(Passing::Filtered(scan, bound)) => {
                                 rows = runner.drain(scan, Some(bound))?
+                            }
+                            SourceRead::Stream(result, bound) => {
+                                rows = runner.drain(Box::new(SourceScanner::new(result)), bound)?
                             }
                         }
                     }
-                    (rows, (None, None))
+                    (names, rows, (None, None))
                 }
             };
             let (result, layout) = match &prepared.window {
