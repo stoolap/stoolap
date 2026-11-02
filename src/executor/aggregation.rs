@@ -1617,6 +1617,12 @@ impl Executor {
             blocks,
             alone,
         } = slots;
+        // An ORDER BY key computed over the groups is projected with the items
+        let keyed = self.with_order_by_items(stmt);
+        let lifted = !std::ptr::eq(stmt, written_stmt);
+        let stmt = keyed.as_ref().unwrap_or(stmt);
+        let written_stmt = if lifted { written_stmt } else { stmt };
+        let alone = alone.filter(|_| keyed.is_none());
 
         // A SELECT list of nothing but its calls is the row of their values
         if let Some(names) = alone {

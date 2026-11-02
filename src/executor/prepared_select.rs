@@ -3340,6 +3340,22 @@ pub(super) fn names_any(expr: &Expression, matches: &impl Fn(&str) -> bool) -> b
     }
 }
 
+/// Whether a qualified name sits outside any subquery or aggregate call of `expr`
+pub(super) fn qualifies_outside_aggregates(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    match expr {
+        Expression::QualifiedIdentifier(_) => true,
+        Expression::FunctionCall(call) if registry.is_aggregate(&call.function) => false,
+        other => {
+            let mut found = false;
+            let _ = for_each_child(other, &mut |child| {
+                found |= qualifies_outside_aggregates(child, registry);
+                Ok(())
+            });
+            found
+        }
+    }
+}
+
 fn compile_with(ctx: &CompileContext<'_>, expr: &Expression) -> Result<SharedProgram> {
     ExprCompiler::new(ctx)
         .compile(expr)
