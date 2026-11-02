@@ -3860,6 +3860,9 @@ pub struct PreparedSelect {
     /// Those calls, parsed once when each later argument is written as its
     /// value; None parses them on each run
     calls: Option<Vec<SqlAggregateFunction>>,
+    /// The count or bound the table keeps that answers the statement before
+    /// its run, through no transaction's writes and no statement's view
+    pub(crate) quiet: Option<super::planned_aggregate::PlannedAggregate>,
     /// The window step's plan, made once when no run changes it; None makes
     /// it on each run
     window: Option<super::window::WindowPlan<'static>>,
@@ -4065,6 +4068,12 @@ impl PreparedSelect {
             Some(Read::UniqueGet(read)) => Some((read, true)),
             _ => None,
         }
+    }
+
+    /// Whether a run may answer before it opens the statement's snapshot:
+    /// by its key read, or from the count or bound the table keeps
+    pub(crate) fn answers_first(&self) -> bool {
+        self.key_read().is_some() || self.quiet.is_some()
     }
 
     /// Whether a run asks a block: a subquery, a run slot or a read ahead
@@ -8544,6 +8553,7 @@ impl PreparedSelect {
             windowed,
             aggregated,
             calls,
+            quiet: None,
             window,
             source_values,
         })

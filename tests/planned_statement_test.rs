@@ -192,6 +192,35 @@ fn a_cancelled_aggregate_plan_is_refused() {
     }
 }
 
+#[test]
+fn a_count_or_bound_the_table_keeps_answers_a_transaction_with_its_own_writes() {
+    let db = table("planned_aggregate_own_writes");
+    for (sql, inside) in [
+        ("SELECT COUNT(*) FROM t", "1"),
+        ("SELECT MAX(id) FROM t", "1000"),
+        ("SELECT MIN(id) FROM t", "-1"),
+    ] {
+        let read = |rows: stoolap::Rows| -> Vec<String> {
+            rows.map(|row| row.unwrap().get_value(0).unwrap().to_string())
+                .collect()
+        };
+        // The first run plans it, the second reads the table's own count
+        let before = read(db.query(sql, ()).unwrap());
+        assert_eq!(read(db.query(sql, ()).unwrap()), before, "{sql}");
+        let mut tx = db.begin().unwrap();
+        tx.execute("INSERT INTO t (id) VALUES (1000), (-1)", ())
+            .unwrap();
+        let seen = read(tx.query(sql, ()).unwrap());
+        tx.rollback().unwrap();
+        let want = match sql.starts_with("SELECT COUNT") {
+            true => vec![(before[0].parse::<i64>().unwrap() + 2).to_string()],
+            false => vec![inside.to_string()],
+        };
+        assert_eq!(seen, want, "{sql}: the transaction's own rows unseen");
+        assert_eq!(read(db.query(sql, ()).unwrap()), before, "{sql}");
+    }
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_planned_aggregate_of_several_calls_reads_the_statement_view() {

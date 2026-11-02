@@ -913,24 +913,14 @@ impl Executor {
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         match statement {
-            Statement::Select(stmt) => {
-                if let Some(result) = self.run_select_plan(
-                    stmt,
-                    compiled,
-                    Some(classification),
-                    Some(ctx),
-                    ctx.params(),
-                    in_txn,
-                ) {
-                    return Some(result);
-                }
-                // The aggregate plan reads committed state: a view the context
-                // holds is read through by the regular path
-                if in_txn || ctx.statement_view().is_some() {
-                    return None;
-                }
-                self.run_planned_aggregate(stmt, compiled, ctx)
-            }
+            Statement::Select(stmt) => self.run_select_plan(
+                stmt,
+                compiled,
+                Some(classification),
+                Some(ctx),
+                ctx.params(),
+                in_txn,
+            ),
             Statement::Update(stmt) => {
                 let stmt = DmlStatement::Update(stmt);
                 self.run_dml_plan(stmt, compiled, Some(ctx), ctx.params(), in_txn)
