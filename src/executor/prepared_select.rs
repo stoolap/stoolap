@@ -3877,11 +3877,15 @@ impl PreparedSelect {
                 offset,
                 keys,
                 distinct_on,
-                having: None,
+                having: stmt.having.as_deref().map(Expression::to_string),
                 windows,
                 aggregate: self.aggregated.then(|| {
                     let items: Vec<String> = stmt.columns.iter().map(item_name).collect();
-                    items.join(", ")
+                    let group = stmt.group_by.to_string();
+                    match group.is_empty() {
+                        true => items.join(", "),
+                        false => format!("{} by {group}", items.join(", ")),
+                    }
                 }),
                 names: &self.output_columns[..self.visible],
                 pushed,
@@ -7997,9 +8001,9 @@ impl PreparedSelect {
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .chain(&stmt.distinct_on)
             .any(QueryClassification::expression_has_window_function);
-        // A statement that aggregates its rows into one reads them as the
-        // windowed one does, its calls computed over them
-        let aggregated = !windowed && Self::global_aggregate(stmt);
+        // A statement that aggregates its rows reads them as the windowed
+        // one does, its calls computed over them
+        let aggregated = !windowed && Self::aggregates(stmt);
         let rows_stmt;
         let written = stmt;
         let stmt = match windowed || aggregated {
@@ -8333,7 +8337,21 @@ impl PreparedSelect {
                                     .map(|agg| SmartString::from(bare_name(&agg.column_lower))),
                                 otherwise: Box::new(read),
                             },
-                            _ => read,
+                            Some(AggregatePlan {
+                                read:
+                                    AggregateRead::Grouped {
+                                        source,
+                                        group: (name, at),
+                                        walks,
+                                    },
+                                ..
+                            }) => Read::Grouped {
+                                source,
+                                group: (SmartString::from(name), at),
+                                walks,
+                                otherwise: Box::new(read),
+                            },
+                            None => read,
                         }
                     }
                     false => read,
@@ -8383,22 +8401,24 @@ impl PreparedSelect {
         })
     }
 
-    /// Whether `stmt` aggregates its rows into one: a call, and no grouping
-    /// or HAVING
-    fn global_aggregate(stmt: &SelectStatement) -> bool {
-        stmt.group_by.columns.is_empty()
-            && matches!(stmt.group_by.modifier, GroupByModifier::None)
-            && stmt.having.is_none()
-            && get_classification(stmt).has_aggregation
+    /// Whether `stmt` aggregates its rows: a call, a grouping or a HAVING
+    fn aggregates(stmt: &SelectStatement) -> bool {
+        !stmt.group_by.columns.is_empty()
+            || !matches!(stmt.group_by.modifier, GroupByModifier::None)
+            || stmt.having.is_some()
+            || get_classification(stmt).has_aggregation
     }
 
-    /// The steps of `stmt`, which aggregates its rows into one, over its
-    /// read, outermost first: the finishing steps over the aggregate, over
-    /// the conjuncts the read did not take when `filter`
+    /// The steps of `stmt`, which aggregates its rows, over its read,
+    /// outermost first: the finishing steps over the groups its HAVING
+    /// keeps, over the conjuncts the read did not take when `filter`
     fn aggregate_steps(stmt: &SelectStatement, filter: bool) -> SmallVec<[Step; 4]> {
-        let mut inner = SmallVec::<[Step; 2]>::new();
+        let mut inner = SmallVec::<[Step; 3]>::new();
         if stmt.distinct {
             inner.push(Step::Distinct);
+        }
+        if stmt.having.is_some() {
+            inner.push(Step::Having);
         }
         inner.push(Step::Aggregate);
         if filter {
@@ -8407,8 +8427,8 @@ impl PreparedSelect {
         Executor::finishing_steps(stmt, &inner)
     }
 
-    /// The statement a windowed `stmt` reads its rows by: every column of
-    /// its table where its WHERE holds
+    /// The statement a windowed or aggregating `stmt` reads its rows by:
+    /// every column of its table where its WHERE holds
     fn rows_of(stmt: &SelectStatement) -> SelectStatement {
         SelectStatement {
             distinct: false,
@@ -8416,6 +8436,8 @@ impl PreparedSelect {
             columns: vec![Expression::Star(StarExpression {
                 token: Token::new(TokenType::Operator, "*", Position::default()),
             })],
+            group_by: GroupByClause::default(),
+            having: None,
             window_defs: Vec::new(),
             order_by: Vec::new(),
             limit: None,
@@ -12150,11 +12172,10 @@ impl Executor {
         Ok(kept)
     }
 
-    /// The one row of `stmt`, which aggregates the rows of `table` into one:
-    /// from where the plan's rule says, else every row the WHERE passes fed
-    /// to the calls, held at once when the table shares them or is large,
-    /// else as the read decodes them
-    fn prepared_global(
+    /// The rows of `stmt`, which aggregates the rows of `table`: its one row
+    /// or its groups from where the plan's rule says, else from every row
+    /// the WHERE passes fed to the calls
+    fn prepared_aggregate(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
@@ -12170,6 +12191,25 @@ impl Executor {
             }
         };
         let plan = prepared.plan.as_ref();
+        let groups = !stmt.group_by.columns.is_empty()
+            || !matches!(stmt.group_by.modifier, GroupByModifier::None)
+            || stmt.having.is_some();
+        if groups {
+            let columns = table.schema().column_names_arc();
+            if let Some(read) = plan.and_then(|plan| plan.read.grouped()) {
+                let calls = aggregations.as_slice();
+                if let Some(result) =
+                    self.grouped_aggregate(table, stmt, calls, read, ctx, &columns)?
+                {
+                    return Ok(result);
+                }
+            }
+            return self.passed_input(stmt, ctx, (runner, prepared), table, |input| {
+                let stmts = (stmt, stmt);
+                let path = AggregatePath::HashGroups;
+                self.aggregate_input(path, stmts, aggregations, ctx, input, &columns, None)
+            });
+        }
         let source = plan.and_then(|plan| plan.read.aggregated());
         let source = source.unwrap_or(GlobalSource::Scan);
         let pushed = match (source, stmt.where_clause.as_deref()) {
@@ -12183,53 +12223,72 @@ impl Executor {
         };
         let scan = || {
             let columns = table.schema().column_names_arc();
-            let mut kept = RowVec::new();
-            let passing = match prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
-                true => Passing::Pruned,
-                false => {
-                    let chosen = plan.and_then(|plan| plan.read.scan());
-                    let keep = |id: i64, _: u64, row: Row| {
-                        kept.push((id, row));
-                        true
-                    };
-                    let read = (&prepared.where_, chosen);
-                    runner.passing_rows(read, None, table, ctx, None, Take::Stream, keep)?
-                }
-            };
-            // Rows the table shares cost nothing to hold; rows decoded from
-            // volumes stream, unless the feed splits them over the thread pool
-            let hold = !table.narrows_scans();
-            let held: RowVec;
-            let input = match passing {
-                Passing::Pruned => FeedInput::Rows(&[]),
-                Passing::Read => FeedInput::Rows(&kept),
-                Passing::Answers(rows) => {
-                    held = rows;
-                    FeedInput::Rows(&held)
-                }
-                Passing::Scan(scan) if hold => {
-                    held = PassedRows::new(scan, None, runner, ctx).held()?;
-                    FeedInput::Rows(&held)
-                }
-                Passing::Filtered(scan, bound) if hold => {
-                    held = runner.drain(scan, Some(bound))?;
-                    FeedInput::Rows(&held)
-                }
-                Passing::Scan(scan) => FeedInput::Each(
-                    PassedRows::new(scan, None, runner, ctx),
-                    table.row_count_hint(),
-                ),
-                Passing::Filtered(scan, bound) => FeedInput::Each(
-                    PassedRows::new(scan, Some(bound), runner, ctx),
-                    table.row_count_hint(),
-                ),
-            };
-            self.global_row(aggregations, &columns, ctx, None, input)
-                .map(Some)
+            self.passed_input(stmt, ctx, (runner, prepared), table, |input| {
+                self.global_row(aggregations, &columns, ctx, None, input)
+                    .map(Some)
+            })
         };
         let source = (source, pushed.as_deref());
         self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)?
             .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))
+    }
+
+    /// `feed` over the rows of `table` the read of `prepared` passes for
+    /// `stmt`: held at once when the table shares them or is large, else
+    /// handed over as the read decodes them
+    fn passed_input<T>(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        (runner, prepared): (&PreparedRunner<'_>, &PreparedSelect),
+        table: &dyn Table,
+        feed: impl FnOnce(FeedInput<'_, PassedRows<'_, '_>>) -> Result<T>,
+    ) -> Result<T> {
+        let plan = prepared.plan.as_ref();
+        // Rows the table shares cost nothing to hold and are read at once;
+        // rows decoded from volumes stream, unless the feed splits them over
+        // the thread pool
+        let hold = !table.narrows_scans();
+        let take = if hold { Take::Collected } else { Take::Stream };
+        let mut kept = RowVec::new();
+        let passing = match prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
+            true => Passing::Pruned,
+            false => {
+                let chosen = plan.and_then(|plan| plan.read.scan());
+                let keep = |id: i64, _: u64, row: Row| {
+                    kept.push((id, row));
+                    true
+                };
+                let read = (&prepared.where_, chosen);
+                runner.passing_rows(read, None, table, ctx, None, take, keep)?
+            }
+        };
+        let held: RowVec;
+        let input = match passing {
+            Passing::Pruned => FeedInput::Rows(&[]),
+            Passing::Read => FeedInput::Rows(&kept),
+            Passing::Answers(rows) => {
+                held = rows;
+                FeedInput::Rows(&held)
+            }
+            Passing::Scan(scan) if hold => {
+                held = PassedRows::new(scan, None, runner, ctx).held()?;
+                FeedInput::Rows(&held)
+            }
+            Passing::Filtered(scan, bound) if hold => {
+                held = runner.drain(scan, Some(bound))?;
+                FeedInput::Rows(&held)
+            }
+            Passing::Scan(scan) => FeedInput::Each(
+                PassedRows::new(scan, None, runner, ctx),
+                table.row_count_hint(),
+            ),
+            Passing::Filtered(scan, bound) => FeedInput::Each(
+                PassedRows::new(scan, Some(bound), runner, ctx),
+                table.row_count_hint(),
+            ),
+        };
+        feed(input)
     }
 
     /// Run an in-family statement: scan its table narrowed by the
@@ -12424,7 +12483,7 @@ impl Executor {
             let StatementSource::Table(table) = &source else {
                 return Err(Error::internal("an aggregate statement over a source"));
             };
-            let result = self.prepared_global(stmt, ctx, (&runner, &prepared), &**table)?;
+            let result = self.prepared_aggregate(stmt, ctx, (&runner, &prepared), &**table)?;
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
             let names = table.schema().column_names_arc();

@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY other than of one column with no WHERE, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY over anything but a table or with a window function or a DISTINCT ON, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -244,7 +244,7 @@ Having (COUNT(*) > 1)
     else SeqScan products
 ```
 
-Other grouped statements print the format of the path that runs them:
+Any other grouping over one table, with a WHERE, several keys, expressions, ROLLUP, CUBE or GROUPING SETS, groups the rows its read passes, and a HAVING without GROUP BY judges the one row:
 
 ```sql
 EXPLAIN SELECT category, SUM(value) FROM products WHERE value > 0 GROUP BY category;
@@ -254,14 +254,12 @@ Output:
 ```
 plan
 ----
-SELECT
-  Columns: category, SUM(value)
-  -> IndexScan products (value > 0)
-       Index idx_value (value range)
-  Group By: category
+Aggregate category, SUM(value) by category
+  IndexScan products (value > 0)
+    Index idx_value (value range)
 ```
 
-The scan line is the same one a planned statement prints: the access rule that chooses its keys or indexes is one rule for every path.
+The scan line is the same one a planned statement prints: the access rule that chooses its keys or indexes is one rule for every path. A grouped statement with a window function, a DISTINCT ON or a subquery prints the format of the path that runs it.
 
 ### Views, CTEs and Derived Tables
 

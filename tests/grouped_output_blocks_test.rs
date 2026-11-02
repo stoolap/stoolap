@@ -15,7 +15,8 @@
 //! A grouped statement over one table whose SELECT list or HAVING holds a
 //! subquery runs it through prepared blocks: it answers as recorded when the
 //! general path gave the same answer, hot and sealed, and an uncorrelated
-//! value keeps the aggregate path its literal takes
+//! value keeps the aggregate path its literal takes, which the runner groups
+//! where the blocks' rows are grouped by the general aggregation
 
 #![cfg(feature = "test-failpoints")]
 
@@ -36,6 +37,15 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The aggregate path the literal twin of a statement that took `taken`
+/// takes: the runner groups the rows of a statement without subqueries
+fn literal_path(taken: &[&'static str]) -> Vec<&'static str> {
+    match taken {
+        ["general"] => vec!["hash_groups"],
+        other => other.to_vec(),
+    }
 }
 
 /// t: id 1..200, a = id % 9, b = id % 13; u: id 1..40, k = id % 11, x = id % 7
@@ -387,7 +397,7 @@ fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
                 reset_aggregate_paths();
                 let literal_rows = rows(&db, literal);
                 let literal_taken = aggregate_paths_taken();
-                if taken != literal_taken {
+                if literal_path(&taken) != literal_taken {
                     wrong.push(format!(
                         "sealed {sealed}: {sql}: took {taken:?}, its literal {literal_taken:?}"
                     ));
@@ -490,7 +500,7 @@ fn a_grouped_statement_reads_its_input_rows_subqueries_through_its_blocks() {
                 reset_aggregate_paths();
                 let literal_rows = rows(&db, literal);
                 let literal_taken = aggregate_paths_taken();
-                if taken != literal_taken {
+                if literal_path(&taken) != literal_taken {
                     wrong.push(format!(
                         "sealed {sealed}: {sql}: took {taken:?}, its literal {literal_taken:?}"
                     ));

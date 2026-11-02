@@ -96,14 +96,15 @@ impl Executor {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
         };
-        // A statement that aggregates its rows into one, unless the
-        // aggregate plan holds it whole
-        let global = shape.has_aggregation
-            && !shape.has_group_by
-            && !shape.has_having
+        // A statement that aggregates its rows, unless the aggregate plan
+        // holds it whole; one whose grouping reads a subquery is the grouped
+        // family's
+        let aggregating = shape.has_aggregation || shape.has_group_by || shape.has_having;
+        let aggregates = aggregating
             && !shape.has_window_functions
-            && !shape.has_set_operations;
-        if global {
+            && !shape.has_set_operations
+            && !shape.grouped_has_subqueries;
+        if aggregates {
             #[cfg(feature = "test-failpoints")]
             if crate::test_failpoints::prepared_families_off() {
                 return None;
@@ -112,11 +113,9 @@ impl Executor {
                 return None;
             }
         }
-        if shape.has_aggregation && !global
+        if aggregating && !aggregates
             || shape.has_window_functions
                 && (shape.has_set_operations || shape.grouped_has_subqueries)
-            || shape.has_group_by
-            || shape.has_having
             || shape.has_cte
             || shape.output_has_subqueries
             || shape.where_has_subqueries
@@ -132,9 +131,12 @@ impl Executor {
             return None;
         }
         // DISTINCT, DISTINCT ON and set operations as the runner's family
-        // takes them; over a window step they finish the window's rows
+        // takes them; over a window step they finish the window's rows, and
+        // a DISTINCT finishes an aggregate's
         if !shape.has_window_functions
-            && (shape.has_distinct || shape.has_distinct_on || shape.has_set_operations)
+            && (shape.has_distinct && !aggregates
+                || shape.has_distinct_on
+                || shape.has_set_operations)
         {
             self.planned_family(stmt, Some(ctx)).ok()?;
         }
@@ -167,7 +169,7 @@ impl Executor {
                 stmt.set_operations.is_empty()
                     && !stmt.distinct
                     && !shape.has_window_functions
-                    && !global
+                    && !aggregates
             });
             if let Some(counts) = counts {
                 prepared.read_by_key(
