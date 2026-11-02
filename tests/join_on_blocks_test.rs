@@ -831,15 +831,31 @@ fn explain_analyze_says_whether_the_statement_it_ran_held_a_plan() {
             "{from}: run as a parsed statement"
         );
     }
-    let none = ["Prepared: no (a join in a SELECT that holds no plan)"];
+    // Run as a parsed tree, the INSERT's SELECT holds the plan its structure keys
+    let before = stoolap::test_failpoints::general_path_total();
     assert_eq!(
         prepared(executor.execute_program(&program)),
-        none,
+        ["Prepared: yes"],
         "run as a program"
     );
     assert_eq!(
         prepared(executor.execute_statement(&program.statements[0], &ExecutionContext::new())),
-        none,
+        ["Prepared: yes"],
         "run as a parsed statement"
     );
+    let create = stoolap::parser::Parser::new(&format!("CREATE TABLE made AS {body}"))
+        .parse_program()
+        .unwrap();
+    executor.execute_program(&create).unwrap();
+    assert_eq!(
+        stoolap::test_failpoints::general_path_total(),
+        before,
+        "a parsed tree ran a general path"
+    );
+    let mut made = executor.execute("SELECT id FROM made").unwrap();
+    let mut rows = 0;
+    while made.next() {
+        rows += 1;
+    }
+    assert_eq!(rows, 1, "CREATE TABLE AS over the join");
 }

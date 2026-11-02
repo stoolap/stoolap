@@ -204,12 +204,18 @@ impl Executor {
 
         // Handle CREATE TABLE ... AS SELECT ...
         if let Some(ref select_stmt) = stmt.as_select {
+            // Run as a parsed tree, the SELECT holds the plan its structure
+            // keys, as a SELECT run alone does
+            let tree_plan = match plan {
+                Some(_) => None,
+                None => self.query_cache.statement_plan(select_stmt),
+            };
             return self.execute_create_table_as_select(
                 table_name,
                 select_stmt,
                 stmt.if_not_exists,
                 ctx,
-                plan.and_then(NestedPlan::source),
+                plan.and_then(NestedPlan::source).or(tree_plan.as_deref()),
             );
         }
 

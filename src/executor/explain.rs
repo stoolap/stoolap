@@ -142,11 +142,20 @@ impl Executor {
                 }
             }
 
-            // A SELECT run as a parsed tree held the plan its structure keys
+            // A SELECT run as a parsed tree, an INSERT's or a CREATE TABLE's
+            // included, held the plan its structure keys
             let statement_plan = match &*stmt.statement {
                 Statement::Select(select) if plan.is_none() => {
                     self.query_cache.statement_plan(select)
                 }
+                Statement::Insert(insert) if plan.is_none() => insert
+                    .select
+                    .as_ref()
+                    .and_then(|select| self.query_cache.statement_plan(select)),
+                Statement::CreateTable(create) if plan.is_none() => create
+                    .as_select
+                    .as_ref()
+                    .and_then(|select| self.query_cache.statement_plan(select)),
                 _ => None,
             };
             let held = plan.is_some() || statement_plan.is_some();

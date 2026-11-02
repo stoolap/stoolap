@@ -1063,7 +1063,13 @@ impl Executor {
             // to ensure statement atomicity: a late runtime error (e.g., invalid REGEXP)
             // won't leave partial inserts pending for commit. Auto-commit transactions
             // stream rows directly since the standalone transaction rolls back on drop.
-            let source = plan.and_then(NestedPlan::source);
+            // Run as a parsed tree, the SELECT holds the plan its structure
+            // keys, as a SELECT run alone does
+            let tree_plan = match plan {
+                Some(_) => None,
+                None => self.query_cache.statement_plan(select_stmt),
+            };
+            let source = plan.and_then(NestedPlan::source).or(tree_plan.as_deref());
             let mut select_result =
                 self.execute_select_with_plan(select_stmt, ctx, None, source)?;
             if !should_auto_commit {
