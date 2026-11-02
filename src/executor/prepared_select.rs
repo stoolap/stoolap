@@ -8187,7 +8187,9 @@ impl PreparedSelect {
         let mut run_slots = Vec::new();
         let parts = match stmt.where_clause.as_deref() {
             Some(where_clause) => {
-                let where_clause = with_aliases(where_clause, &stmt.columns, &scope.columns);
+                // A WHERE reads the aliases the statement writes, not the
+                // rows' own list an aggregating or windowed one reads by
+                let where_clause = with_aliases(where_clause, &written.columns, &scope.columns);
                 builder.statement_where(&chain, schema, &where_clause, &mut work, &mut run_slots)?
             }
             // No conjunct: the scan reads every row with no filter, and takes it whole

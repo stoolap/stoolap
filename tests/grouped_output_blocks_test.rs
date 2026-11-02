@@ -726,6 +726,47 @@ fn a_where_naming_a_select_alias_reads_that_item() {
 }
 
 #[test]
+fn an_aggregate_whose_only_subqueries_are_in_its_where_reads_a_select_alias_there() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_where_alias_runner").unwrap();
+    fill(&db);
+    for (sql, item) in [
+        (
+            "SELECT a AS z, COUNT(*) FROM t WHERE z IN (SELECT u.k FROM u WHERE u.x > 3) \
+             GROUP BY a ORDER BY 1",
+            "a",
+        ),
+        (
+            "SELECT a + 1 AS z, SUM(b) FROM t WHERE z IN (SELECT u.k + 1 FROM u) \
+             GROUP BY a + 1 ORDER BY 1",
+            "a + 1",
+        ),
+        (
+            "SELECT a AS z, COUNT(*) FROM t WHERE z = (SELECT MIN(u.k) + 3 FROM u) GROUP BY a",
+            "a",
+        ),
+        (
+            "SELECT a AS z, SUM(b), RANK() OVER (ORDER BY SUM(b)) FROM t \
+             WHERE z IN (SELECT u.k FROM u) GROUP BY a ORDER BY 1",
+            "a",
+        ),
+        (
+            "SELECT b AS z, COUNT(*) FROM t WHERE z > (SELECT MIN(u.x) FROM u) GROUP BY b \
+             HAVING COUNT(*) > 1 ORDER BY 1",
+            "b",
+        ),
+    ] {
+        let got = rows(&db, sql);
+        assert!(
+            got.as_ref().is_ok_and(|rows| !rows.is_empty()),
+            "{sql}: {got:?}"
+        );
+        let written = sql.replace("WHERE z", &format!("WHERE {item}"));
+        assert_eq!(got, rows(&db, &written), "{sql}");
+    }
+}
+
+#[test]
 fn a_grouped_statement_s_subqueries_read_parameters_and_the_transaction_s_writes() {
     let _guard = serial();
     let db = Database::open("memory://grouped_output_blocks_params").unwrap();
