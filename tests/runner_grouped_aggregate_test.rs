@@ -167,6 +167,23 @@ fn an_empty_grouping_set_over_a_key_read_computes_its_select_list() {
 }
 
 #[test]
+fn an_extra_argument_s_error_reaches_every_source() {
+    let db = Database::open("memory://runner_grouped_aggregate_extra_error").unwrap();
+    fill(&db, 20);
+    for sql in [
+        "SELECT k, SUM(a, ABS(-9223372036854775808)) FROM t GROUP BY k",
+        "SELECT SUM(a, ABS(-9223372036854775808)) FROM t",
+        "SELECT COUNT(*, ABS(-9223372036854775808)) FROM t",
+        "SELECT MIN(b, ABS(-9223372036854775808)) FROM t",
+    ] {
+        let answer = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>());
+        assert!(answer.is_err(), "{sql}: answered past its argument's error");
+    }
+}
+
+#[test]
 fn explain_shows_the_groups_over_the_rows_the_read_passes() {
     let db = Database::open("memory://runner_grouped_aggregate_explain").unwrap();
     fill(&db, 50);

@@ -534,6 +534,8 @@ pub struct SqlAggregateFunction {
     pub distinct: bool,
     /// Extra arguments (e.g., separator for STRING_AGG)
     pub extra_args: Vec<Value>,
+    /// Whether the call writes arguments after the first, read or not
+    pub(crate) extra_written: bool,
     /// The error an extra argument gave when evaluated, the result of
     /// every group that reads this call
     pub(crate) extra_error: Option<crate::core::Error>,
@@ -569,7 +571,7 @@ impl SqlAggregateFunction {
         if self.expression.is_some() {
             modifiers = modifiers.and(Modifiers::EXPRESSION);
         }
-        if !self.extra_args.is_empty() {
+        if self.extra_written {
             modifiers = modifiers.and(Modifiers::EXTRA_ARGS);
         }
         modifiers
@@ -2639,6 +2641,7 @@ impl Executor {
                         alias: None,
                         distinct: distinct || func.is_distinct,
                         extra_args,
+                        extra_written: func.arguments.len() > 1,
                         extra_error,
                         extra_exprs: ctx.written(&func.arguments),
                         expression,
@@ -2804,6 +2807,7 @@ impl Executor {
                         alias: Some(aliased.alias.value.to_string()),
                         distinct: distinct || func.is_distinct,
                         extra_args,
+                        extra_written: func.arguments.len() > 1,
                         extra_error,
                         extra_exprs: ctx.written(&func.arguments),
                         expression,
