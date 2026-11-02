@@ -12379,15 +12379,18 @@ impl Executor {
             .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
         // A set operation's rows hold its first branch's items alone, so a
         // single star fills the columns the other items leave
-        let stars: smallvec::SmallVec<[usize; 1]> = (0..stmt.columns.len())
-            .filter(|&i| is_star_item(&stmt.columns[i]))
-            .collect();
-        let star_fill = match stars.as_slice() {
-            [at] if set_operation && any_item => columns
-                .len()
-                .checked_sub(stmt.columns.len() - 1)
-                .map(|fill| (*at, fill)),
-            _ => None,
+        let star_fill = match star && set_operation && any_item && layout.is_none() {
+            true => {
+                let mut stars = (0..stmt.columns.len()).filter(|&i| is_star_item(&stmt.columns[i]));
+                match (stars.next(), stars.next()) {
+                    (Some(at), None) => columns
+                        .len()
+                        .checked_sub(stmt.columns.len() - 1)
+                        .map(|fill| (at, fill)),
+                    _ => None,
+                }
+            }
+            false => None,
         };
         for (i, col) in stmt.columns.iter().enumerate() {
             // No sort key names a star
@@ -12446,6 +12449,16 @@ impl Executor {
                         set_operation,
                         "rows reached ORDER BY {expr} without a layout"
                     );
+                    // A key read from any item reads the one computing its
+                    // column; a qualified name never reads an output name
+                    if any_item {
+                        if let Some(column) = find_column_for(expr) {
+                            return Some(column);
+                        }
+                        if matches!(expr, Expression::QualifiedIdentifier(_)) {
+                            return None;
+                        }
+                    }
                     let name = match expr {
                         Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
                         Expression::Identifier(id) => &id.value_lower,
