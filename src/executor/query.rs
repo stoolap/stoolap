@@ -5616,6 +5616,16 @@ impl Executor {
         }
     }
 
+    /// Whether the join statement `stmt` over `join` holds a subquery in any
+    /// clause, which puts its output and its names on its blocks' rules
+    fn join_holds_subqueries(stmt: &SelectStatement, join: &JoinTableSource) -> bool {
+        let classification = get_classification(stmt);
+        classification.where_has_subqueries
+            || classification.output_has_subqueries
+            || classification.grouped_has_subqueries
+            || Self::ons_hold_subqueries(join)
+    }
+
     /// Whether the ON of `join`, or of a join it holds as a side, holds a
     /// subquery
     pub(crate) fn ons_hold_subqueries(join: &JoinTableSource) -> bool {
@@ -5668,10 +5678,7 @@ impl Executor {
         self.join_output_family(stmt)?;
         // A join without a subquery reads a name both sources have from its
         // left source, which its blocks refuse as ambiguous
-        let classification = get_classification(stmt);
-        let holds_subquery = classification.where_has_subqueries
-            || classification.output_has_subqueries
-            || Self::ons_hold_subqueries(join_source);
+        let holds_subquery = Self::join_holds_subqueries(stmt, join_source);
         // Each WHERE part as its site reads it, the SELECT aliases it names
         // opened over the joined columns the sides lay out
         let columns: Vec<String> = sides
@@ -5893,11 +5900,7 @@ impl Executor {
                 ctx,
             )?;
             if let Some(blocks) = blocks.as_mut() {
-                let classification = get_classification(stmt);
-                blocks.holds_subqueries = classification.where_has_subqueries
-                    || classification.output_has_subqueries
-                    || classification.grouped_has_subqueries
-                    || Self::ons_hold_subqueries(join_source);
+                blocks.holds_subqueries = Self::join_holds_subqueries(stmt, join_source);
                 blocks.check_output_names(stmt)?;
             }
             Ok(blocks)

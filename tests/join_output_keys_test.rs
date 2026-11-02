@@ -120,6 +120,7 @@ fn check(db: &Database, mode: &str) -> Vec<String> {
         "SELECT t.a, (SELECT id) FROM {m}",
         "SELECT id + (SELECT 0) FROM {m}",
         "SELECT id, COUNT(*) FROM {m} GROUP BY id HAVING COUNT(*) > (SELECT 0)",
+        "SELECT t.a, COUNT(*) FROM {m} WHERE id > 0 GROUP BY t.a HAVING COUNT(*) > (SELECT 0)",
         "SELECT id, ROW_NUMBER() OVER w FROM {m} WINDOW w AS (ORDER BY t.a + (SELECT 0))",
     ] {
         let sql = clause.replace("{m}", merged);
