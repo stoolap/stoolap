@@ -318,6 +318,24 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.id, SUM(t.b) OVER (PARTITION BY t.a) FROM t \
              ORDER BY t.a IN (2, 3, 5, 6), t.id LIMIT 10 OFFSET 5",
         ),
+        shape(
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id DESC) AS r FROM {t} \
+             ORDER BY (SELECT COUNT(*) FROM u WHERE u.id <= r + 0), t.id LIMIT 5",
+            "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id DESC) AS r FROM t \
+             ORDER BY t.id DESC LIMIT 5",
+        ),
+        shape(
+            "SELECT t.*, ROW_NUMBER() OVER (ORDER BY t.id) AS r FROM {t} \
+             ORDER BY (SELECT 0) + r DESC LIMIT 3",
+            "SELECT t.*, ROW_NUMBER() OVER (ORDER BY t.id) AS r FROM t ORDER BY r DESC LIMIT 3",
+        ),
+        shape(
+            "SELECT t.a, (SELECT MAX(u.x) FROM u WHERE u.k = t.a) AS m FROM {t} GROUP BY t.a \
+             ORDER BY (SELECT COUNT(*) FROM u WHERE u.id <= m + 0), t.a",
+            "SELECT t.a, (SELECT MAX(u.x) FROM u WHERE u.k = t.a) AS m FROM t GROUP BY t.a \
+             ORDER BY (SELECT COUNT(*) FROM u u1 WHERE u1.id <= \
+             (SELECT MAX(u.x) FROM u WHERE u.k = t.a)), t.a",
+        ),
     ]
 }
 
