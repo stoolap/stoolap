@@ -143,7 +143,7 @@ CREATE VIEW senior_engineers AS
 SELECT * FROM senior_employees WHERE department = 'Engineering';
 ```
 
-The maximum nesting depth of 32 levels prevents infinite recursion from circular view definitions. Since `CREATE VIEW` runs the view's query, a view nested deeper than that is refused when it is created.
+The maximum nesting depth of 32 levels prevents infinite recursion from circular view definitions; a debug build of Stoolap, whose unoptimized code takes more stack for each level, allows 16. Since `CREATE VIEW` runs the view's query, a view nested deeper than that is refused when it is created.
 
 ## View Metadata
 

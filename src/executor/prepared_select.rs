@@ -1166,6 +1166,10 @@ impl Executor {
             {
                 return Err("an ORDER BY subquery over a set operation");
             }
+            // The first branch's DISTINCT ON keys are its own
+            for key in stmt.distinct_on.iter().filter(|_| !aggregates) {
+                family.expression(key, 1, Site::Subqueries, &mut found)?;
+            }
         } else if !aggregates {
             // A DISTINCT ON key is computed for each row as an ORDER BY key is
             for key in stmt
@@ -1222,10 +1226,6 @@ impl Executor {
         }
         if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
             return Err("it runs for a row of an enclosing statement");
-        }
-        // A set operation's branch carries no DISTINCT ON key as a column
-        if !stmt.set_operations.is_empty() && stmt.distinct_on.iter().any(mentions_subquery) {
-            return Err("a DISTINCT ON subquery in a set operation's branch");
         }
         let grouped = grouped_block(stmt);
         // A grouped statement's DISTINCT ON key runs as an item, its windows
@@ -9207,6 +9207,11 @@ impl PreparedGrouped {
             window_defs,
             ..stmt.clone()
         };
+        // A set operation's DISTINCT ON key holding a subquery reads the whole
+        // one's rows, after it: the run carries no column for it
+        if !run_stmt.set_operations.is_empty() {
+            run_stmt.distinct_on.retain(|key| !mentions_subquery(key));
+        }
         // A key one of whose blocks, nested ones too, reads an alias of an
         // unrepeatable item is computed over the row the run returns, at its
         // place there, which the run's own projection holds as NULL

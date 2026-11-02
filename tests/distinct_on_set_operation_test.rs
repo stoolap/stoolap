@@ -171,6 +171,135 @@ fn a_set_operation_s_distinct_on_reads_its_rows_over_a_prepared_first_select() {
 }
 
 #[test]
+fn a_key_holding_a_subquery_reads_the_first_select_s_item_or_names_no_column() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    let by_key = &[
+        "Integer(5),Integer(1)",
+        "Integer(7),Integer(2)",
+        "Null(Null),Integer(3)",
+        "Integer(9),Integer(9)",
+    ][..];
+    let by_group = &[
+        "Integer(1),Integer(1)",
+        "Integer(2),Integer(1)",
+        "Integer(3),Integer(1)",
+        "Integer(9),Integer(9)",
+    ][..];
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup(&dir, sealed);
+        let mode = if sealed { "sealed" } else { "hot" };
+        let joined = "t JOIN (SELECT id AS wid FROM t) w ON w.wid = t.id";
+        for (from, group) in [("t", ""), ("t", " GROUP BY k"), (joined, " GROUP BY t.k")] {
+            for (head, tail, want) in [
+                (
+                    "SELECT DISTINCT ON ((SELECT 1)) (SELECT 1), k",
+                    "UNION ALL SELECT 9, 9 ORDER BY 2",
+                    Ok(&["Integer(1),Integer(1)", "Integer(9),Integer(9)"][..]),
+                ),
+                (
+                    "SELECT DISTINCT ON ((SELECT MAX(v) FROM u WHERE u.k = t.k)) \
+                     (SELECT MAX(v) FROM u WHERE u.k = t.k), k",
+                    "UNION ALL SELECT 9, 9 ORDER BY 2",
+                    Ok(by_key),
+                ),
+                (
+                    "SELECT DISTINCT ON ((SELECT 1)) k, k",
+                    "UNION ALL SELECT 9, 9",
+                    Err("DISTINCT ON key (SELECT 1) names no column"),
+                ),
+                (
+                    "SELECT DISTINCT ON ((SELECT MAX(v) FROM u WHERE u.k = t.k)) k, k",
+                    "EXCEPT SELECT 9, 9",
+                    Err("names no column"),
+                ),
+                (
+                    "SELECT DISTINCT ON (k) t.k, (SELECT 1)",
+                    "UNION ALL SELECT 9, 9 ORDER BY 1",
+                    Ok(by_group),
+                ),
+            ] {
+                let sql = format!("{head} FROM {from}{group} {tail}");
+                let before = general_path_total();
+                let got = rows(&db, &sql);
+                if general_path_total() != before {
+                    wrong.push(format!("{mode}: {sql} ran a general path mechanism"));
+                }
+                let right = match (&got, want) {
+                    (Ok(got), Ok(want)) => got == want,
+                    (Err(e), Err(want)) => e.contains(want),
+                    _ => false,
+                };
+                if !right {
+                    wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+                }
+                let line = prepared_line(&db, &sql);
+                if line != "Prepared: yes" {
+                    wrong.push(format!("{mode}: {sql} says {line}"));
+                }
+            }
+        }
+        // One star fills the columns the other items leave, beside a window too
+        for (sql, want) in [
+            (
+                "SELECT DISTINCT ON ((SELECT 1)) *, ROW_NUMBER() OVER (ORDER BY id), (SELECT 1) \
+                 FROM t UNION ALL SELECT 9, 9, 9, 9, 9 ORDER BY 1",
+                [
+                    "Integer(1),Integer(30),Integer(1),Integer(1),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9),Integer(9),Integer(9)",
+                ],
+            ),
+            (
+                "SELECT DISTINCT ON ((SELECT 1)) (SELECT 1), t.*, ROW_NUMBER() OVER (ORDER BY id) \
+                 FROM t UNION ALL SELECT 9, 9, 9, 9, 9 ORDER BY 2",
+                [
+                    "Integer(1),Integer(1),Integer(30),Integer(1),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9),Integer(9),Integer(9)",
+                ],
+            ),
+        ] {
+            let got = rows(&db, sql);
+            if got != Ok(want.iter().map(|r| r.to_string()).collect()) {
+                wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+            }
+        }
+        // A key that is a column binds as without a subquery beside it: a bare
+        // name to the alias it spells, a qualified one to its column
+        for (sql, want) in [
+            (
+                "SELECT DISTINCT ON (t.k) t.k AS z, 0 AS k, (SELECT 1) FROM t GROUP BY t.k \
+                 UNION ALL SELECT 9, 9, 9 ORDER BY 1",
+                &[
+                    "Integer(1),Integer(0),Integer(1)",
+                    "Integer(2),Integer(0),Integer(1)",
+                    "Integer(3),Integer(0),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9)",
+                ][..],
+            ),
+            (
+                "SELECT DISTINCT ON (k) k AS z, 0 AS k, (SELECT 1) FROM t GROUP BY t.k \
+                 UNION ALL SELECT 9, 9, 9 ORDER BY 1",
+                &[
+                    "Integer(1),Integer(0),Integer(1)",
+                    "Integer(9),Integer(9),Integer(9)",
+                ][..],
+            ),
+            (
+                "SELECT DISTINCT ON (t.k) k, (SELECT 1) FROM t GROUP BY k \
+                 UNION ALL SELECT 9, 9 ORDER BY 1",
+                by_group,
+            ),
+        ] {
+            if rows(&db, sql) != Ok(want.iter().map(|r| r.to_string()).collect()) {
+                wrong.push(format!("{mode}: {sql}: {:?}", rows(&db, sql)));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
 fn the_first_branch_keeps_its_repeated_rows_and_its_layout() {
     let _guard = serial();
     let db = Database::open("memory://distinct_on_set_operation_branch").unwrap();

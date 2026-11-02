@@ -42,7 +42,7 @@ See [Temporal Queries]({{ '/docs/sql-features/temporal-queries/' | relative_url 
 
 - **Read-only**: INSERT, UPDATE, and DELETE on views are not supported.
 - **Shared namespace**: View names and table names share the same namespace and cannot conflict.
-- **Nesting limit**: Maximum nesting depth of 32 levels prevents infinite recursion from circular definitions.
+- **Nesting limit**: Maximum nesting depth of 32 levels (16 in a debug build) prevents infinite recursion from circular definitions.
 
 See [Views]({{ '/docs/sql-features/views/' | relative_url }}) for view documentation.
 

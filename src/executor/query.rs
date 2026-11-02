@@ -41,8 +41,9 @@ use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult, ScanAccess};
 
-/// Maximum depth for nested views to prevent stack overflow
-const MAX_VIEW_DEPTH: usize = 32;
+/// Maximum depth for nested views to prevent stack overflow. Unoptimized
+/// code takes more stack per level, so a debug build allows fewer
+pub const MAX_VIEW_DEPTH: usize = if cfg!(debug_assertions) { 16 } else { 32 };
 
 /// Threshold below which streaming NOT EXISTS with early termination outperforms
 /// bulk anti-join materialization. Queries with LIMIT below this value use the
@@ -2599,13 +2600,15 @@ impl Executor {
         let columns = CompactArc::new(result.columns().to_vec());
         let set_operation = !stmt.set_operations.is_empty();
         // A set operation's rows keep where its first branch put its items,
-        // which the layout says; only without one do output names stand
+        // which the layout says; only without one do output names stand. A
+        // key reads any item computing it, not only the ones ORDER BY reads
         let (mut mapped, mut slots) = self.key_columns(
             stmt,
             stmt.distinct_on.iter(),
             &columns,
             layout,
             set_operation && layout.is_none(),
+            true,
         );
         // A position names one of the columns the SELECT list shows
         let shown = layout.map_or(columns.len(), |l| l.shown(stmt.columns.len()));
@@ -12350,10 +12353,11 @@ impl Executor {
         set_operation: bool,
     ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
-        self.key_columns(stmt, keys, columns, layout, set_operation)
+        self.key_columns(stmt, keys, columns, layout, set_operation, false)
     }
 
-    /// `order_by_columns` for any of `stmt`'s sort keys
+    /// `order_by_columns` for any of `stmt`'s sort keys; `any_item` lets a
+    /// set operation's key read every item, not only an aliased or aggregate one
     fn key_columns<'k>(
         &self,
         stmt: &SelectStatement,
@@ -12361,6 +12365,7 @@ impl Executor {
         columns: &[String],
         layout: Option<&OutputLayout>,
         set_operation: bool,
+        any_item: bool,
     ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
         // Each column by the identity of what computed it: the SELECT
         // list in order (unless a star moves the positions), then the
@@ -12373,19 +12378,35 @@ impl Executor {
             .columns
             .iter()
             .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+        // A set operation's rows hold its first branch's items alone, so a
+        // single star fills the columns the other items leave
+        let star_fill = match star && set_operation && any_item && layout.is_none() {
+            true => {
+                let mut stars = (0..stmt.columns.len()).filter(|&i| is_star_item(&stmt.columns[i]));
+                match (stars.next(), stars.next()) {
+                    (Some(at), None) => columns
+                        .len()
+                        .checked_sub(stmt.columns.len() - 1)
+                        .map(|fill| (at, fill)),
+                    _ => None,
+                }
+            }
+            false => None,
+        };
         for (i, col) in stmt.columns.iter().enumerate() {
             // No sort key names a star
             if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 continue;
             }
-            if set_operation && !set_operation_key_item(col, &self.function_registry) {
+            if set_operation && !any_item && !set_operation_key_item(col, &self.function_registry) {
                 continue;
             }
             // An item's column by the layout; without one, by its index
             // while no star moves the positions
-            let Some(position) = (match layout {
-                Some(layout) => layout.item_position(i),
-                None => (!star).then_some(i),
+            let Some(position) = (match (layout, star_fill) {
+                (Some(layout), _) => layout.item_position(i),
+                (None, Some((at, fill))) => Some(if i < at { i } else { i + fill - 1 }),
+                (None, None) => (!star).then_some(i),
             }) else {
                 continue;
             };

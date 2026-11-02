@@ -651,18 +651,22 @@ fn test_view_depth_limit() {
     db.execute("INSERT INTO t VALUES (1, 100)", ())
         .expect("Failed to insert");
 
-    // Create a chain of nested views up to the limit of 32
+    // Create a chain of nested views up to the limit
+    let limit = stoolap::executor::MAX_VIEW_DEPTH;
     db.execute("CREATE VIEW v0 AS SELECT * FROM t", ())
         .expect("Failed to create v0");
 
-    for i in 1..32 {
+    for i in 1..limit {
         let sql = format!("CREATE VIEW v{} AS SELECT * FROM v{}", i, i - 1);
         db.execute(&sql, ())
             .unwrap_or_else(|_| panic!("Failed to create v{}", i));
     }
 
     // A view one deeper runs its query when it is created, past the limit
-    let result = db.execute("CREATE VIEW v32 AS SELECT * FROM v31", ());
+    let result = db.execute(
+        &format!("CREATE VIEW v{limit} AS SELECT * FROM v{}", limit - 1),
+        (),
+    );
     match result {
         Err(e) => {
             let err_msg = e.to_string();
@@ -675,10 +679,10 @@ fn test_view_depth_limit() {
         Ok(_) => panic!("Expected error due to view depth limit exceeded"),
     }
 
-    // Querying a view within the limit should still work (v30 = 31 levels deep)
+    // Querying a view within the limit should still work
     let rows = db
-        .query("SELECT * FROM v30", ())
-        .expect("Failed to query v30");
+        .query(&format!("SELECT * FROM v{}", limit - 2), ())
+        .expect("Failed to query a view within the limit");
     let results: Vec<_> = rows.collect_vec().expect("Failed to collect rows");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get::<i64>(0).unwrap(), 1);
