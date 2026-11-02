@@ -2762,14 +2762,9 @@ impl Executor {
 
     /// The grouped `stmt` with each ORDER BY key computed over its groups,
     /// which no column holds, as a hidden item named by its identity that the
-    /// sort reads as a column; a SELECT alias in it reads its item where no
-    /// column of `source_columns` has its name. A key holding a subquery, or
-    /// reading an alias whose item computing again would not give, stays
-    pub(crate) fn with_order_by_items(
-        &self,
-        stmt: &SelectStatement,
-        source_columns: &[String],
-    ) -> Option<SelectStatement> {
+    /// sort reads as a column. A key holding a subquery or reading a SELECT
+    /// alias stays, and so do keys under ROLLUP, CUBE or GROUPING SETS
+    pub(crate) fn with_order_by_items(&self, stmt: &SelectStatement) -> Option<SelectStatement> {
         let windowed = stmt
             .columns
             .iter()
@@ -2779,26 +2774,20 @@ impl Executor {
             || !stmt.set_operations.is_empty()
             || windowed
             || stmt.columns.iter().any(is_star_item)
+            || stmt.group_by.modifier != GroupByModifier::None
         {
             return None;
         }
         let registry = &self.function_registry;
-        let unrepeatable: smallvec::SmallVec<[&str; 2]> = stmt
+        let aliases: smallvec::SmallVec<[&str; 4]> = stmt
             .columns
             .iter()
             .filter_map(|column| match column {
-                Expression::Aliased(item)
-                    if Self::has_subqueries(&item.expression)
-                        || expression_volatility(&item.expression, registry)
-                            == Volatility::PerCall =>
-                {
-                    Some(item.alias.value_lower.as_str())
-                }
+                Expression::Aliased(item) => Some(item.alias.value_lower.as_str()),
                 _ => None,
             })
             .collect();
         // Built with the first key carried, as a statement with none allocates nothing
-        let mut aliases = None;
         let mut columns: Option<Vec<Expression>> = None;
         for ob in &stmt.order_by {
             let key = &ob.expression;
@@ -2812,7 +2801,7 @@ impl Executor {
             if read
                 || Self::item_computing(stmt, key).is_some()
                 || Self::has_subqueries(key)
-                || super::prepared_select::names_any(key, &|name| unrepeatable.contains(&name))
+                || super::prepared_select::names_any(key, &|name| aliases.contains(&name))
             {
                 continue;
             }
@@ -2824,17 +2813,10 @@ impl Executor {
             {
                 continue;
             }
-            let aliases = aliases.get_or_insert_with(|| {
-                Self::build_alias_map_excluding(&stmt.columns, Some(source_columns))
-            });
-            let expression = match aliases.is_empty() {
-                true => key.clone(),
-                false => Self::substitute_aliases(key, aliases),
-            };
             let token = dummy_token(&name, TokenType::Identifier);
             columns.push(Expression::Aliased(AliasedExpression {
                 token: token.clone(),
-                expression: Box::new(expression),
+                expression: Box::new(key.clone()),
                 alias: Identifier::new(token, name),
             }));
         }

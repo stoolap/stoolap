@@ -1618,7 +1618,7 @@ impl Executor {
             alone,
         } = slots;
         // An ORDER BY key computed over the groups is projected with the items
-        let keyed = self.with_order_by_items(stmt, source_columns);
+        let keyed = self.with_order_by_items(stmt);
         let lifted = !std::ptr::eq(stmt, written_stmt);
         let stmt = keyed.as_ref().unwrap_or(stmt);
         let written_stmt = if lifted { written_stmt } else { stmt };

@@ -83,10 +83,6 @@ fn a_computed_grouped_key_sorts_as_the_same_key_written_as_an_item() {
                 "SELECT k, MAX(v) + 1 AS o FROM u GROUP BY k ORDER BY o DESC",
             ),
             (
-                "SELECT k, SUM(a) AS z FROM t GROUP BY k ORDER BY z + 1, k",
-                "SELECT k, SUM(a) AS z, SUM(a) + 1 AS o FROM t GROUP BY k ORDER BY o, k",
-            ),
-            (
                 "SELECT COUNT(*) FROM t GROUP BY k ORDER BY k + 0",
                 "SELECT COUNT(*), k + 0 AS o FROM t GROUP BY k ORDER BY o",
             ),
@@ -106,19 +102,10 @@ fn a_computed_grouped_key_sorts_as_the_same_key_written_as_an_item() {
                  ORDER BY o, k",
             ),
             (
-                "SELECT k, SUM(a) FROM t GROUP BY ROLLUP (k) ORDER BY COALESCE(k, 99) + 0",
-                "SELECT k, SUM(a), COALESCE(k, 99) + 0 AS o FROM t GROUP BY ROLLUP (k) ORDER BY o",
-            ),
-            (
                 "SELECT t.k, COUNT(*) FROM t JOIN u ON u.k = t.k GROUP BY t.k \
                  ORDER BY SUM(u.v) + 0, t.k",
                 "SELECT t.k, COUNT(*), SUM(u.v) + 0 AS o FROM t JOIN u ON u.k = t.k GROUP BY t.k \
                  ORDER BY o, t.k",
-            ),
-            (
-                "SELECT k, MAX(a) AS m FROM t GROUP BY k ORDER BY m * 2, k LIMIT 1 OFFSET 1",
-                "SELECT k, MAX(a) AS m, MAX(a) * 2 AS o FROM t GROUP BY k ORDER BY o, k \
-                 LIMIT 1 OFFSET 1",
             ),
             (
                 "SELECT k, COUNT(*) FROM t WHERE a > (SELECT 0) GROUP BY k \
@@ -144,6 +131,48 @@ fn a_computed_grouped_key_sorts_as_the_same_key_written_as_an_item() {
             }
             let want = rows(&db, twin, 1);
             if got != want {
+                wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+            }
+        }
+        // A key reading an alias, or under ROLLUP where a group key reads NULL, stays with the sort
+        for (sql, want) in [
+            (
+                "SELECT k, SUM(a) + 1 AS x FROM t GROUP BY k ORDER BY CAST(x AS INTEGER), k",
+                vec![
+                    "Integer(2),Integer(21)",
+                    "Integer(3),Integer(21)",
+                    "Integer(1),Integer(31)",
+                ],
+            ),
+            (
+                "SELECT k, MAX(a) AS m FROM t GROUP BY k ORDER BY m * 2, k LIMIT 1 OFFSET 1",
+                vec!["Integer(3),Integer(20)"],
+            ),
+            (
+                "SELECT k AS x, COUNT(*) FROM t WHERE k < 3 GROUP BY ROLLUP (k, k + 1) \
+                 ORDER BY x + 1 NULLS LAST, x",
+                vec![
+                    "Integer(1),Integer(2)",
+                    "Integer(1),Integer(2)",
+                    "Integer(2),Integer(2)",
+                    "Integer(2),Integer(2)",
+                    "Null(Null),Integer(4)",
+                ],
+            ),
+            (
+                "SELECT k, COUNT(*) FROM t WHERE k < 3 GROUP BY ROLLUP (k, k + 1) \
+                 ORDER BY k + 1 NULLS LAST, k",
+                vec![
+                    "Integer(1),Integer(2)",
+                    "Integer(1),Integer(2)",
+                    "Integer(2),Integer(2)",
+                    "Integer(2),Integer(2)",
+                    "Null(Null),Integer(4)",
+                ],
+            ),
+        ] {
+            let got = rows(&db, sql, 0);
+            if got != Ok(want.iter().map(|r| r.to_string()).collect()) {
                 wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
             }
         }
