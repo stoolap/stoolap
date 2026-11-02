@@ -161,5 +161,10 @@ fn a_window_on_the_left_of_a_quantified_test_runs_as_the_windows_do() {
     let db = open(&format!("file://{}/db", dir.path().display()));
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     wrong.extend(check(&db, "sealed"));
-    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
