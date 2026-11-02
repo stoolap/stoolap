@@ -2762,8 +2762,9 @@ impl Executor {
 
     /// The grouped `stmt` with each ORDER BY key computed over its groups,
     /// which no column holds, as a hidden item named by its identity that the
-    /// sort reads as a column. A key holding a subquery or reading a SELECT
-    /// alias stays, and so do keys under ROLLUP, CUBE or GROUPING SETS
+    /// sort reads as a column. A key holding a subquery or a name, qualified
+    /// or not, that a SELECT alias has stays, and so do keys under ROLLUP,
+    /// CUBE or GROUPING SETS
     pub(crate) fn with_order_by_items(&self, stmt: &SelectStatement) -> Option<SelectStatement> {
         let windowed = stmt
             .columns
@@ -2779,14 +2780,11 @@ impl Executor {
             return None;
         }
         let registry = &self.function_registry;
-        let aliases: smallvec::SmallVec<[&str; 4]> = stmt
-            .columns
-            .iter()
-            .filter_map(|column| match column {
-                Expression::Aliased(item) => Some(item.alias.value_lower.as_str()),
-                _ => None,
-            })
-            .collect();
+        let alias = |name: &str| {
+            stmt.columns.iter().any(
+                |column| matches!(column, Expression::Aliased(item) if item.alias.value_lower == name),
+            )
+        };
         // Built with the first key carried, as a statement with none allocates nothing
         let mut columns: Option<Vec<Expression>> = None;
         for ob in &stmt.order_by {
@@ -2801,7 +2799,7 @@ impl Executor {
             if read
                 || Self::item_computing(stmt, key).is_some()
                 || Self::has_subqueries(key)
-                || super::prepared_select::names_any(key, &|name| aliases.contains(&name))
+                || super::prepared_select::names_any_column(key, &alias)
             {
                 continue;
             }

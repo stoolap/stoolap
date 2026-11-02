@@ -3340,6 +3340,23 @@ pub(super) fn names_any(expr: &Expression, matches: &impl Fn(&str) -> bool) -> b
     }
 }
 
+/// Whether a name outside any subquery of `expr`, bare or the column of a
+/// qualified one, passes `matches`
+pub(super) fn names_any_column(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
+    match expr {
+        Expression::Identifier(id) => matches(&id.value_lower),
+        Expression::QualifiedIdentifier(q) => matches(&q.name.value_lower),
+        other => {
+            let mut found = false;
+            let _ = for_each_child(other, &mut |child| {
+                found |= names_any_column(child, matches);
+                Ok(())
+            });
+            found
+        }
+    }
+}
+
 fn compile_with(ctx: &CompileContext<'_>, expr: &Expression) -> Result<SharedProgram> {
     ExprCompiler::new(ctx)
         .compile(expr)
