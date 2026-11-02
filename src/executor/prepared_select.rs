@@ -8321,7 +8321,7 @@ impl PreparedSelect {
                         let rule = executor.aggregate_read_plan(
                             written,
                             &classification,
-                            ctx,
+                            (ctx, false),
                             schema,
                             indexed,
                         )?;
@@ -8401,12 +8401,17 @@ impl PreparedSelect {
         })
     }
 
-    /// Whether `stmt` aggregates its rows: a call, a grouping or a HAVING
-    fn aggregates(stmt: &SelectStatement) -> bool {
+    /// Whether `stmt` aggregates its rows: a call, or [`Self::groups`]
+    pub(crate) fn aggregates(stmt: &SelectStatement) -> bool {
+        Self::groups(stmt) || get_classification(stmt).has_aggregation
+    }
+
+    /// Whether `stmt` groups its rows or judges them by a HAVING: a GROUP
+    /// BY, an empty grouping set included, or a HAVING
+    fn groups(stmt: &SelectStatement) -> bool {
         !stmt.group_by.columns.is_empty()
             || !matches!(stmt.group_by.modifier, GroupByModifier::None)
             || stmt.having.is_some()
-            || get_classification(stmt).has_aggregation
     }
 
     /// The steps of `stmt`, which aggregates its rows, over its read,
@@ -12191,10 +12196,7 @@ impl Executor {
             }
         };
         let plan = prepared.plan.as_ref();
-        let groups = !stmt.group_by.columns.is_empty()
-            || !matches!(stmt.group_by.modifier, GroupByModifier::None)
-            || stmt.having.is_some();
-        if groups {
+        if PreparedSelect::groups(stmt) {
             let columns = table.schema().column_names_arc();
             if let Some(read) = plan.and_then(|plan| plan.read.grouped()) {
                 let calls = aggregations.as_slice();

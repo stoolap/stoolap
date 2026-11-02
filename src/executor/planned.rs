@@ -99,7 +99,7 @@ impl Executor {
         // A statement that aggregates its rows, unless the aggregate plan
         // holds it whole; one whose grouping reads a subquery is the grouped
         // family's
-        let aggregating = shape.has_aggregation || shape.has_group_by || shape.has_having;
+        let aggregating = PreparedSelect::aggregates(stmt);
         let aggregates = aggregating
             && !shape.has_window_functions
             && !shape.has_set_operations

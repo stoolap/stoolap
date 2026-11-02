@@ -3994,8 +3994,9 @@ impl Executor {
         if classification.has_aggregation && !classification.has_window_functions {
             // One row or the groups, from the source the rules pick
             let indexed = |column: &str| bounds(table.get_index_on_column(column));
+            let run = (ctx, true);
             let plan =
-                self.aggregate_read_plan(stmt, classification, ctx, table.schema(), indexed)?;
+                self.aggregate_read_plan(stmt, classification, run, table.schema(), indexed)?;
             let result = match &plan {
                 Some(
                     plan @ AggregatePlan {

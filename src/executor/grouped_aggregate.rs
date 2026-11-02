@@ -113,7 +113,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         classification: &QueryClassification,
-        ctx: &ExecutionContext,
+        (ctx, runs): (&ExecutionContext, bool),
         schema: &Schema,
     ) -> Result<Option<AggregatePlan>> {
         if classification.has_where
@@ -132,7 +132,10 @@ impl Executor {
         else {
             return Ok(None);
         };
-        let (aggregations, non_aggregated) = self.parse_aggregations(stmt, Some(ctx))?;
+        let (aggregations, non_aggregated) = match runs {
+            true => self.parse_aggregations(stmt, Some(ctx))?,
+            false => self.parse_aggregation_shape(stmt)?,
+        };
         // The SELECT list reads the group column and aggregate calls only
         let group_item = |expr: &Expression| {
             let inner = match expr {

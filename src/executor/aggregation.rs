@@ -2494,6 +2494,15 @@ impl Executor {
         self.parse_calls(stmt, ExtraArgsRead::With(ctx))
     }
 
+    /// [`Self::parse_aggregations`] with the calls' extra arguments unread,
+    /// for the shape of a plan that does not run them
+    pub(crate) fn parse_aggregation_shape(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(Vec<SqlAggregateFunction>, Vec<String>)> {
+        self.parse_calls(stmt, ExtraArgsRead::Unread)
+    }
+
     /// The aggregate calls of `stmt` for their identities alone, their extra
     /// arguments unread: a block's name an enclosing row before it binds
     pub(crate) fn parse_aggregation_calls(
@@ -2858,6 +2867,15 @@ impl Executor {
 
         let extra = match ctx {
             ExtraArgsRead::With(ctx) => aggregate_extra_args(args, ctx)?,
+            // A call that reads one of them for each run keeps them all written
+            ExtraArgsRead::Block if written_extra_args(args).is_some() => {
+                for arg in args.iter().skip(1) {
+                    if !is_literal_extra_arg(arg) {
+                        extra_arg_constant(arg)?;
+                    }
+                }
+                (Vec::new(), None)
+            }
             ExtraArgsRead::Block => aggregate_extra_args(args, None)?,
             ExtraArgsRead::Unread => (Vec::new(), None),
         };

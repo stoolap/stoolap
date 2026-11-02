@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A window aggregate's argument after the first is read once per run of
-//! the statement, never while it is prepared or explained. The only test of
-//! this binary: it registers a function process-wide
+//! A window or grouping aggregate's argument after the first is read once
+//! per run of the statement, never while it is prepared or explained. The
+//! only test of this binary: it registers a function process-wide
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -59,20 +59,41 @@ fn a_window_argument_is_read_once_per_run_and_never_by_explain() {
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", ())
         .unwrap();
-    let sql = "SELECT STRING_AGG(CAST(a AS TEXT), COUNTED_SEPARATOR()) OVER () FROM t";
-    db.query(&format!("EXPLAIN {sql}"), ())
-        .unwrap()
-        .for_each(drop);
-    assert_eq!(
-        CALLS.load(Ordering::Relaxed),
-        0,
-        "EXPLAIN read the argument"
-    );
-    let rows: Vec<String> = db
-        .query(sql, ())
-        .unwrap()
-        .map(|row| row.unwrap().get::<String>(0).unwrap())
-        .collect();
-    assert_eq!(rows, vec!["1,2,3"; 3]);
-    assert_eq!(CALLS.load(Ordering::Relaxed), 1, "the first run read it");
+    for (sql, want) in [
+        (
+            "SELECT STRING_AGG(CAST(a AS TEXT), COUNTED_SEPARATOR()) OVER () FROM t",
+            vec!["1,2,3"; 3],
+        ),
+        (
+            "SELECT STRING_AGG(CAST(a AS TEXT), COUNTED_SEPARATOR() ORDER BY a) FROM t \
+             WHERE a > 0 GROUP BY a > 1 ORDER BY 1",
+            vec!["1", "2,3"],
+        ),
+        (
+            "SELECT STRING_AGG(CAST(a AS TEXT), COUNTED_SEPARATOR() ORDER BY a) FROM t \
+             WHERE a > 0",
+            vec!["1,2,3"],
+        ),
+    ] {
+        CALLS.store(0, Ordering::Relaxed);
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .for_each(drop);
+        assert_eq!(
+            CALLS.load(Ordering::Relaxed),
+            0,
+            "EXPLAIN read the argument: {sql}"
+        );
+        let rows: Vec<String> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(rows, want, "{sql}");
+        assert_eq!(
+            CALLS.load(Ordering::Relaxed),
+            1,
+            "the first run read it: {sql}"
+        );
+    }
 }

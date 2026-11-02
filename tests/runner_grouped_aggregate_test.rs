@@ -156,6 +156,17 @@ fn a_limit_without_order_caps_the_groups_each_whole() {
 }
 
 #[test]
+fn an_empty_grouping_set_over_a_key_read_computes_its_select_list() {
+    let db = Database::open("memory://runner_grouped_aggregate_empty_set").unwrap();
+    fill(&db, 20);
+    let sql = "SELECT 42 AS answer FROM t WHERE id = 1 GROUP BY GROUPING SETS (())";
+    let rows = db.query(sql, ()).unwrap();
+    assert_eq!(rows.columns(), ["answer"]);
+    let got: Vec<i64> = rows.map(|row| row.unwrap().get(0).unwrap()).collect();
+    assert_eq!(got, [42]);
+}
+
+#[test]
 fn explain_shows_the_groups_over_the_rows_the_read_passes() {
     let db = Database::open("memory://runner_grouped_aggregate_explain").unwrap();
     fill(&db, 50);

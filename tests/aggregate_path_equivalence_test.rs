@@ -416,6 +416,13 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
         "hash_groups",
+        "SELECT 42 AS answer, COUNT(*) FROM t WHERE id = 1 GROUP BY GROUPING SETS (())",
+        "SELECT 42 AS answer, COUNT(*) FROM t WHERE id = 1 AND id + 0 = id \
+         GROUP BY GROUPING SETS (())",
+    ),
+    (
+        "memory",
+        "hash_groups",
         "SELECT g, COUNT(*) FROM t WHERE FALSE GROUP BY g",
         "SELECT g, COUNT(*) FROM t WHERE FALSE AND id + 0 = id GROUP BY g",
     ),
