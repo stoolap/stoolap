@@ -82,6 +82,27 @@ const SHAPES: &[(&str, &str)] = &[
         "SELECT id FROM t WHERE EXISTS \
          (SELECT u.id FROM u JOIN t t2 ON t2.id = u.id WHERE u.k = t.k AND t2.a > 15) ORDER BY id",
     ),
+    // A star over a join that merges columns shows each merged pair once
+    (
+        "SELECT id FROM t WHERE (t.id, t.k) IN \
+         (SELECT * FROM (SELECT id, k FROM u) a1 JOIN (SELECT id, k FROM u) b1 USING (id, k)) \
+         ORDER BY id",
+        "SELECT id FROM t WHERE (t.id, t.k) IN \
+         (SELECT id, k FROM (SELECT id, k FROM u) a1 JOIN (SELECT id, k FROM u) b1 USING (id, k)) \
+         ORDER BY id",
+    ),
+    (
+        "SELECT id, (SELECT * FROM (SELECT id FROM u) a1 NATURAL JOIN (SELECT id FROM u) b1 \
+         WHERE id = t.id) FROM t ORDER BY id",
+        "SELECT id, (SELECT id FROM (SELECT id FROM u) a1 NATURAL JOIN (SELECT id FROM u) b1 \
+         WHERE id = t.id) FROM t ORDER BY id",
+    ),
+    (
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT * FROM u JOIN u u2 USING (k) WHERE u.k = t.k ORDER BY 1, u.v LIMIT 1) ORDER BY id",
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT 1 FROM u JOIN u u2 USING (k) WHERE u.k = t.k) ORDER BY id",
+    ),
 ];
 
 #[test]
@@ -120,31 +141,15 @@ fn a_star_over_a_join_counts_every_column_of_its_sources() {
              (SELECT * FROM u JOIN (SELECT id AS x FROM t) t2 ON t2.x = u.id)",
             "a subquery selects 4 values where its place takes 3",
         ),
+        // id is merged: u's three columns and t2's a and k
+        (
+            "SELECT id FROM t WHERE (t.id, t.k, t.a) IN (SELECT * FROM u JOIN t t2 USING (id))",
+            "a subquery selects 5 values where its place takes 3",
+        ),
     ] {
         let got = rows(&db, sql).expect_err(sql);
         assert!(got.contains(want), "{sql}: {got}");
     }
-}
-
-#[test]
-fn a_star_over_a_join_that_merges_columns_stays_unprepared() {
-    let _guard = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = setup("join_star_blocks_merged", &dir, false);
-    let sql = "SELECT id FROM t WHERE (t.id, t.k, t.a) IN (SELECT * FROM u JOIN t t2 USING (id))";
-    let plan = rows(&db, &format!("EXPLAIN {sql}")).unwrap();
-    let line = plan
-        .iter()
-        .filter_map(|row| match row.first() {
-            Some(Value::Text(text)) => Some(text.to_string()),
-            _ => None,
-        })
-        .find(|line| line.trim_start().starts_with("Prepared:"))
-        .unwrap_or_default();
-    assert_eq!(
-        line.trim(),
-        "Prepared: no (a subquery block selecting * over a join that merges columns)"
-    );
 }
 
 #[cfg(feature = "test-failpoints")]
