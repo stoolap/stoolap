@@ -2473,79 +2473,17 @@ impl Executor {
         }
     }
 
-    /// Recursively find a window expression inside an expression
-    /// Returns the first Window expression found, if any
-    /// Collect all window expressions found anywhere in an expression tree (depth-first order).
+    /// Each window expression of `expr` outside its subqueries, in the order
+    /// the children rule meets them, which `replace_windows_with_identifiers`
+    /// replaces them in
     pub(crate) fn collect_all_windows_in_expression<'a>(
         expr: &'a Expression,
         out: &mut impl Extend<&'a WindowExpression>,
     ) {
-        match expr {
-            Expression::Window(w) => out.extend([&**w]),
-            Expression::Infix(infix) => {
-                Self::collect_all_windows_in_expression(&infix.left, out);
-                Self::collect_all_windows_in_expression(&infix.right, out);
-            }
-            Expression::Prefix(prefix) => {
-                Self::collect_all_windows_in_expression(&prefix.right, out);
-            }
-            Expression::FunctionCall(f) => {
-                for arg in &f.arguments {
-                    Self::collect_all_windows_in_expression(arg, out);
-                }
-            }
-            Expression::Aliased(a) => {
-                Self::collect_all_windows_in_expression(&a.expression, out);
-            }
-            Expression::Cast(cast) => {
-                Self::collect_all_windows_in_expression(&cast.expr, out);
-            }
-            Expression::Distinct(d) => {
-                Self::collect_all_windows_in_expression(&d.expr, out);
-            }
-            Expression::Case(c) => {
-                if let Some(v) = &c.value {
-                    Self::collect_all_windows_in_expression(v, out);
-                }
-                for clause in &c.when_clauses {
-                    Self::collect_all_windows_in_expression(&clause.condition, out);
-                    Self::collect_all_windows_in_expression(&clause.then_result, out);
-                }
-                if let Some(else_val) = &c.else_value {
-                    Self::collect_all_windows_in_expression(else_val, out);
-                }
-            }
-            Expression::Between(b) => {
-                Self::collect_all_windows_in_expression(&b.expr, out);
-                Self::collect_all_windows_in_expression(&b.lower, out);
-                Self::collect_all_windows_in_expression(&b.upper, out);
-            }
-            Expression::In(i) => {
-                Self::collect_all_windows_in_expression(&i.left, out);
-                Self::collect_all_windows_in_expression(&i.right, out);
-            }
-            Expression::QuantifiedSet(set) => {
-                Self::collect_all_windows_in_expression(&set.left, out);
-            }
-            Expression::Like(l) => {
-                Self::collect_all_windows_in_expression(&l.left, out);
-                Self::collect_all_windows_in_expression(&l.pattern, out);
-                if let Some(esc) = &l.escape {
-                    Self::collect_all_windows_in_expression(esc, out);
-                }
-            }
-            Expression::List(l) => {
-                for elem in &l.elements {
-                    Self::collect_all_windows_in_expression(elem, out);
-                }
-            }
-            Expression::ExpressionList(l) => {
-                for elem in &l.expressions {
-                    Self::collect_all_windows_in_expression(elem, out);
-                }
-            }
-            _ => {}
-        }
+        let _ = expr.try_for_each_window(&mut |window| {
+            out.extend([window]);
+            Ok::<(), ()>(())
+        });
     }
 
     /// Replace window expressions in an expression tree with identifier references.
@@ -2567,152 +2505,17 @@ impl Executor {
                 let dummy_token = Token::new(TokenType::Identifier, name, Position::new(0, 0, 0));
                 Expression::Identifier(Identifier::new(dummy_token, name.to_string()))
             }
-            Expression::Infix(infix) => Expression::Infix(InfixExpression {
-                token: infix.token.clone(),
-                left: Box::new(Self::replace_windows_with_identifiers(
-                    &infix.left,
-                    wf_names,
-                    counter,
-                )),
-                operator: infix.operator.clone(),
-                op_type: infix.op_type,
-                right: Box::new(Self::replace_windows_with_identifiers(
-                    &infix.right,
-                    wf_names,
-                    counter,
-                )),
-            }),
-            Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression {
-                token: prefix.token.clone(),
-                operator: prefix.operator.clone(),
-                op_type: prefix.op_type,
-                right: Box::new(Self::replace_windows_with_identifiers(
-                    &prefix.right,
-                    wf_names,
-                    counter,
-                )),
-            }),
-            Expression::FunctionCall(f) => Expression::FunctionCall(Box::new(FunctionCall {
-                token: f.token.clone(),
-                function: f.function.clone(),
-                arguments: f
-                    .arguments
-                    .iter()
-                    .map(|a| Self::replace_windows_with_identifiers(a, wf_names, counter))
-                    .collect(),
-                is_distinct: f.is_distinct,
-                order_by: f.order_by.clone(),
-                filter: f.filter.clone(),
-            })),
-            Expression::Aliased(a) => Expression::Aliased(AliasedExpression {
-                token: a.token.clone(),
-                expression: Box::new(Self::replace_windows_with_identifiers(
-                    &a.expression,
-                    wf_names,
-                    counter,
-                )),
-                alias: a.alias.clone(),
-            }),
-            Expression::Cast(cast) => Expression::Cast(CastExpression {
-                token: cast.token.clone(),
-                expr: Box::new(Self::replace_windows_with_identifiers(
-                    &cast.expr, wf_names, counter,
-                )),
-                type_name: cast.type_name.clone(),
-            }),
-            Expression::Distinct(d) => Expression::Distinct(DistinctExpression {
-                token: d.token.clone(),
-                expr: Box::new(Self::replace_windows_with_identifiers(
-                    &d.expr, wf_names, counter,
-                )),
-            }),
-            Expression::Case(case) => {
-                let new_value = case.value.as_ref().map(|v| {
-                    Box::new(Self::replace_windows_with_identifiers(v, wf_names, counter))
+            other => {
+                let replaced = other.try_map_children(&mut |child| {
+                    Ok::<_, std::convert::Infallible>(Self::replace_windows_with_identifiers(
+                        child, wf_names, counter,
+                    ))
                 });
-                let new_whens: Vec<WhenClause> = case
-                    .when_clauses
-                    .iter()
-                    .map(|w| WhenClause {
-                        token: w.token.clone(),
-                        condition: Self::replace_windows_with_identifiers(
-                            &w.condition,
-                            wf_names,
-                            counter,
-                        ),
-                        then_result: Self::replace_windows_with_identifiers(
-                            &w.then_result,
-                            wf_names,
-                            counter,
-                        ),
-                    })
-                    .collect();
-                let new_else = case.else_value.as_ref().map(|e| {
-                    Box::new(Self::replace_windows_with_identifiers(e, wf_names, counter))
-                });
-                Expression::Case(Box::new(CaseExpression {
-                    token: case.token.clone(),
-                    value: new_value,
-                    when_clauses: new_whens,
-                    else_value: new_else,
-                }))
+                match replaced {
+                    Ok(replaced) => replaced,
+                    Err(never) => match never {},
+                }
             }
-            Expression::Between(b) => Expression::Between(BetweenExpression {
-                token: b.token.clone(),
-                expr: Box::new(Self::replace_windows_with_identifiers(
-                    &b.expr, wf_names, counter,
-                )),
-                lower: Box::new(Self::replace_windows_with_identifiers(
-                    &b.lower, wf_names, counter,
-                )),
-                upper: Box::new(Self::replace_windows_with_identifiers(
-                    &b.upper, wf_names, counter,
-                )),
-                not: b.not,
-            }),
-            Expression::In(i) => Expression::In(InExpression {
-                token: i.token.clone(),
-                left: Box::new(Self::replace_windows_with_identifiers(
-                    &i.left, wf_names, counter,
-                )),
-                right: Box::new(Self::replace_windows_with_identifiers(
-                    &i.right, wf_names, counter,
-                )),
-                not: i.not,
-            }),
-            Expression::QuantifiedSet(set) => set.with_left(
-                Self::replace_windows_with_identifiers(&set.left, wf_names, counter),
-            ),
-            Expression::Like(l) => Expression::Like(LikeExpression {
-                token: l.token.clone(),
-                left: Box::new(Self::replace_windows_with_identifiers(
-                    &l.left, wf_names, counter,
-                )),
-                pattern: Box::new(Self::replace_windows_with_identifiers(
-                    &l.pattern, wf_names, counter,
-                )),
-                operator: l.operator.clone(),
-                escape: l.escape.as_ref().map(|e| {
-                    Box::new(Self::replace_windows_with_identifiers(e, wf_names, counter))
-                }),
-            }),
-            Expression::List(l) => Expression::List(Box::new(ListExpression {
-                token: l.token.clone(),
-                elements: l
-                    .elements
-                    .iter()
-                    .map(|e| Self::replace_windows_with_identifiers(e, wf_names, counter))
-                    .collect(),
-            })),
-            Expression::ExpressionList(l) => Expression::ExpressionList(Box::new(ExpressionList {
-                token: l.token.clone(),
-                expressions: l
-                    .expressions
-                    .iter()
-                    .map(|e| Self::replace_windows_with_identifiers(e, wf_names, counter))
-                    .collect(),
-            })),
-            _ => expr.clone(),
         }
     }
 

@@ -255,6 +255,487 @@ impl Expression {
         }
     }
 
+    /// Each direct operand of this expression, every field that holds one, in
+    /// the order written: the one children rule, which `try_map_children`
+    /// follows. A subquery's statement and a FROM entry are no operand
+    pub fn try_for_each_child<'e, E>(
+        &'e self,
+        f: &mut impl FnMut(&'e Expression) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        match self {
+            Expression::Prefix(PrefixExpression {
+                token: _,
+                operator: _,
+                op_type: _,
+                right,
+            }) => f(right),
+            Expression::Infix(InfixExpression {
+                token: _,
+                left,
+                operator: _,
+                op_type: _,
+                right,
+            }) => {
+                f(left)?;
+                f(right)
+            }
+            Expression::List(list) => {
+                let ListExpression { token: _, elements } = &**list;
+                elements.iter().try_for_each(f)
+            }
+            Expression::ExpressionList(list) => {
+                let ExpressionList {
+                    token: _,
+                    expressions,
+                } = &**list;
+                expressions.iter().try_for_each(f)
+            }
+            Expression::Distinct(DistinctExpression { token: _, expr }) => f(expr),
+            Expression::AllAny(AllAnyExpression {
+                token: _,
+                left,
+                operator: _,
+                all_any_type: _,
+                subquery: _,
+            }) => f(left),
+            // An IN list's members are the test's operands, not the list
+            Expression::In(InExpression {
+                token: _,
+                left,
+                right,
+                not: _,
+            }) => {
+                f(left)?;
+                match &**right {
+                    Expression::List(list) => {
+                        let ListExpression { token: _, elements } = &**list;
+                        elements.iter().try_for_each(f)
+                    }
+                    Expression::ExpressionList(list) => {
+                        let ExpressionList {
+                            token: _,
+                            expressions,
+                        } = &**list;
+                        expressions.iter().try_for_each(f)
+                    }
+                    other => f(other),
+                }
+            }
+            Expression::InHashSet(InHashSetExpression {
+                token: _,
+                column,
+                values: _,
+                not: _,
+            }) => f(column),
+            Expression::QuantifiedSet(set) => {
+                let QuantifiedSetExpression {
+                    token: _,
+                    left,
+                    operator: _,
+                    all: _,
+                    members: _,
+                    has_null: _,
+                } = &**set;
+                f(left)
+            }
+            Expression::Between(BetweenExpression {
+                token: _,
+                expr,
+                lower,
+                upper,
+                not: _,
+            }) => {
+                f(expr)?;
+                f(lower)?;
+                f(upper)
+            }
+            Expression::Like(LikeExpression {
+                token: _,
+                left,
+                pattern,
+                operator: _,
+                escape,
+            }) => {
+                f(left)?;
+                f(pattern)?;
+                escape.as_deref().map_or(Ok(()), f)
+            }
+            Expression::Case(case) => {
+                let CaseExpression {
+                    token: _,
+                    value,
+                    when_clauses,
+                    else_value,
+                } = &**case;
+                if let Some(value) = value.as_deref() {
+                    f(value)?;
+                }
+                for WhenClause {
+                    token: _,
+                    condition,
+                    then_result,
+                } in when_clauses
+                {
+                    f(condition)?;
+                    f(then_result)?;
+                }
+                else_value.as_deref().map_or(Ok(()), f)
+            }
+            Expression::Cast(CastExpression {
+                token: _,
+                expr,
+                type_name: _,
+            }) => f(expr),
+            Expression::FunctionCall(call) => call.try_for_each_operand(f),
+            Expression::Aliased(AliasedExpression {
+                token: _,
+                expression,
+                alias: _,
+            }) => f(expression),
+            Expression::Window(window) => {
+                let WindowExpression {
+                    token: _,
+                    function,
+                    window_ref: _,
+                    partition_by,
+                    order_by,
+                    frame,
+                } = &**window;
+                function.try_for_each_operand(f)?;
+                partition_by.iter().try_for_each(&mut *f)?;
+                order_by.iter().try_for_each(|o| f(&o.expression))?;
+                frame.iter().flat_map(WindowFrame::offsets).try_for_each(f)
+            }
+            Expression::Identifier(_)
+            | Expression::QualifiedIdentifier(_)
+            | Expression::Column(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Exists(_)
+            | Expression::ScalarSubquery(_)
+            | Expression::TableSource(_)
+            | Expression::JoinSource(_)
+            | Expression::SubquerySource(_)
+            | Expression::ValuesSource(_)
+            | Expression::CteReference(_)
+            | Expression::FunctionTableSource(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => Ok(()),
+        }
+    }
+
+    /// Each window function of this expression outside its subqueries, in the
+    /// order `try_for_each_child` meets them; one inside a window's operands
+    /// belongs to that window
+    pub fn try_for_each_window<'e, E>(
+        &'e self,
+        f: &mut impl FnMut(&'e WindowExpression) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        match self {
+            Expression::Window(window) => f(window),
+            other => other.try_for_each_child(&mut |child| child.try_for_each_window(f)),
+        }
+    }
+
+    /// Whether this expression holds a window function outside its subqueries
+    pub fn holds_window(&self) -> bool {
+        self.try_for_each_window(&mut |_| Err(())).is_err()
+    }
+
+    /// This expression with each direct operand `try_for_each_child` names
+    /// replaced by what `f` makes of it, the rest kept
+    pub fn try_map_children<E>(
+        &self,
+        f: &mut impl FnMut(&Expression) -> std::result::Result<Expression, E>,
+    ) -> std::result::Result<Expression, E> {
+        fn boxed<E>(
+            f: &mut impl FnMut(&Expression) -> std::result::Result<Expression, E>,
+            e: &Expression,
+        ) -> std::result::Result<Box<Expression>, E> {
+            f(e).map(Box::new)
+        }
+        fn each<E>(
+            f: &mut impl FnMut(&Expression) -> std::result::Result<Expression, E>,
+            exprs: &[Expression],
+        ) -> std::result::Result<Vec<Expression>, E> {
+            exprs.iter().map(f).collect()
+        }
+        Ok(match self {
+            Expression::Prefix(PrefixExpression {
+                token,
+                operator,
+                op_type,
+                right,
+            }) => Expression::Prefix(PrefixExpression {
+                token: token.clone(),
+                operator: operator.clone(),
+                op_type: *op_type,
+                right: boxed(f, right)?,
+            }),
+            Expression::Infix(InfixExpression {
+                token,
+                left,
+                operator,
+                op_type,
+                right,
+            }) => Expression::Infix(InfixExpression {
+                token: token.clone(),
+                left: boxed(f, left)?,
+                operator: operator.clone(),
+                op_type: *op_type,
+                right: boxed(f, right)?,
+            }),
+            Expression::List(list) => {
+                let ListExpression { token, elements } = &**list;
+                Expression::List(Box::new(ListExpression {
+                    token: token.clone(),
+                    elements: each(f, elements)?,
+                }))
+            }
+            Expression::ExpressionList(list) => {
+                let ExpressionList { token, expressions } = &**list;
+                Expression::ExpressionList(Box::new(ExpressionList {
+                    token: token.clone(),
+                    expressions: each(f, expressions)?,
+                }))
+            }
+            Expression::Distinct(DistinctExpression { token, expr }) => {
+                Expression::Distinct(DistinctExpression {
+                    token: token.clone(),
+                    expr: boxed(f, expr)?,
+                })
+            }
+            Expression::AllAny(AllAnyExpression {
+                token,
+                left,
+                operator,
+                all_any_type,
+                subquery,
+            }) => Expression::AllAny(AllAnyExpression {
+                token: token.clone(),
+                left: boxed(f, left)?,
+                operator: operator.clone(),
+                all_any_type: *all_any_type,
+                subquery: subquery.clone(),
+            }),
+            Expression::In(InExpression {
+                token,
+                left,
+                right,
+                not,
+            }) => {
+                let left = boxed(f, left)?;
+                let right = match &**right {
+                    Expression::List(list) => {
+                        let ListExpression { token, elements } = &**list;
+                        Expression::List(Box::new(ListExpression {
+                            token: token.clone(),
+                            elements: each(f, elements)?,
+                        }))
+                    }
+                    Expression::ExpressionList(list) => {
+                        let ExpressionList { token, expressions } = &**list;
+                        Expression::ExpressionList(Box::new(ExpressionList {
+                            token: token.clone(),
+                            expressions: each(f, expressions)?,
+                        }))
+                    }
+                    other => f(other)?,
+                };
+                Expression::In(InExpression {
+                    token: token.clone(),
+                    left,
+                    right: Box::new(right),
+                    not: *not,
+                })
+            }
+            Expression::InHashSet(InHashSetExpression {
+                token,
+                column,
+                values,
+                not,
+            }) => Expression::InHashSet(InHashSetExpression {
+                token: token.clone(),
+                column: boxed(f, column)?,
+                values: values.clone(),
+                not: *not,
+            }),
+            Expression::QuantifiedSet(set) => {
+                let QuantifiedSetExpression {
+                    token,
+                    left,
+                    operator,
+                    all,
+                    members,
+                    has_null,
+                } = &**set;
+                Expression::QuantifiedSet(Box::new(QuantifiedSetExpression {
+                    token: token.clone(),
+                    left: boxed(f, left)?,
+                    operator: operator.clone(),
+                    all: *all,
+                    members: members.clone(),
+                    has_null: *has_null,
+                }))
+            }
+            Expression::Between(BetweenExpression {
+                token,
+                expr,
+                lower,
+                upper,
+                not,
+            }) => Expression::Between(BetweenExpression {
+                token: token.clone(),
+                expr: boxed(f, expr)?,
+                lower: boxed(f, lower)?,
+                upper: boxed(f, upper)?,
+                not: *not,
+            }),
+            Expression::Like(LikeExpression {
+                token,
+                left,
+                pattern,
+                operator,
+                escape,
+            }) => Expression::Like(LikeExpression {
+                token: token.clone(),
+                left: boxed(f, left)?,
+                pattern: boxed(f, pattern)?,
+                operator: operator.clone(),
+                escape: escape.as_deref().map(|e| boxed(f, e)).transpose()?,
+            }),
+            Expression::Case(case) => {
+                let CaseExpression {
+                    token,
+                    value,
+                    when_clauses,
+                    else_value,
+                } = &**case;
+                let value = value.as_deref().map(|e| boxed(f, e)).transpose()?;
+                let when_clauses = when_clauses
+                    .iter()
+                    .map(
+                        |WhenClause {
+                             token,
+                             condition,
+                             then_result,
+                         }| {
+                            Ok(WhenClause {
+                                token: token.clone(),
+                                condition: f(condition)?,
+                                then_result: f(then_result)?,
+                            })
+                        },
+                    )
+                    .collect::<std::result::Result<_, E>>()?;
+                Expression::Case(Box::new(CaseExpression {
+                    token: token.clone(),
+                    value,
+                    when_clauses,
+                    else_value: else_value.as_deref().map(|e| boxed(f, e)).transpose()?,
+                }))
+            }
+            Expression::Cast(CastExpression {
+                token,
+                expr,
+                type_name,
+            }) => Expression::Cast(CastExpression {
+                token: token.clone(),
+                expr: boxed(f, expr)?,
+                type_name: type_name.clone(),
+            }),
+            Expression::FunctionCall(call) => {
+                Expression::FunctionCall(Box::new(call.try_map_operands(f)?))
+            }
+            Expression::Aliased(AliasedExpression {
+                token,
+                expression,
+                alias,
+            }) => Expression::Aliased(AliasedExpression {
+                token: token.clone(),
+                expression: boxed(f, expression)?,
+                alias: alias.clone(),
+            }),
+            Expression::Window(window) => {
+                let WindowExpression {
+                    token,
+                    function,
+                    window_ref,
+                    partition_by,
+                    order_by,
+                    frame,
+                } = &**window;
+                let function = Box::new(function.try_map_operands(f)?);
+                let partition_by = each(f, partition_by)?;
+                let order_by = map_order_by(f, order_by)?;
+                let frame = match frame {
+                    Some(WindowFrame { unit, start, end }) => {
+                        let mut bound = |bound: &WindowFrameBound| {
+                            Ok(match bound {
+                                WindowFrameBound::Preceding(offset) => {
+                                    WindowFrameBound::Preceding(boxed(f, offset)?)
+                                }
+                                WindowFrameBound::Following(offset) => {
+                                    WindowFrameBound::Following(boxed(f, offset)?)
+                                }
+                                WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+                                WindowFrameBound::UnboundedPreceding => {
+                                    WindowFrameBound::UnboundedPreceding
+                                }
+                                WindowFrameBound::UnboundedFollowing => {
+                                    WindowFrameBound::UnboundedFollowing
+                                }
+                            })
+                        };
+                        let start = bound(start)?;
+                        let end = end.as_ref().map(&mut bound).transpose()?;
+                        Some(WindowFrame {
+                            unit: *unit,
+                            start,
+                            end,
+                        })
+                    }
+                    None => None,
+                };
+                Expression::Window(Box::new(WindowExpression {
+                    token: token.clone(),
+                    function,
+                    window_ref: window_ref.clone(),
+                    partition_by,
+                    order_by,
+                    frame,
+                }))
+            }
+            Expression::Identifier(_)
+            | Expression::QualifiedIdentifier(_)
+            | Expression::Column(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Exists(_)
+            | Expression::ScalarSubquery(_)
+            | Expression::TableSource(_)
+            | Expression::JoinSource(_)
+            | Expression::SubquerySource(_)
+            | Expression::ValuesSource(_)
+            | Expression::CteReference(_)
+            | Expression::FunctionTableSource(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => self.clone(),
+        })
+    }
+
     /// Get the position of this expression
     pub fn position(&self) -> Position {
         match self {
@@ -1150,6 +1631,81 @@ impl FunctionCall {
             .iter_mut()
             .for_each(|o| o.expression.rename_references(binds, new));
     }
+
+    /// The call's operands as `Expression::try_for_each_child` names them:
+    /// its arguments, FILTER and ORDER BY
+    fn try_for_each_operand<'e, E>(
+        &'e self,
+        f: &mut impl FnMut(&'e Expression) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let FunctionCall {
+            token: _,
+            function: _,
+            arguments,
+            is_distinct: _,
+            order_by,
+            filter,
+        } = self;
+        arguments.iter().try_for_each(&mut *f)?;
+        if let Some(filter) = filter.as_deref() {
+            f(filter)?;
+        }
+        order_by.iter().try_for_each(|o| f(&o.expression))
+    }
+
+    /// The call with each operand replaced by what `f` makes of it
+    fn try_map_operands<E>(
+        &self,
+        f: &mut impl FnMut(&Expression) -> std::result::Result<Expression, E>,
+    ) -> std::result::Result<FunctionCall, E> {
+        let FunctionCall {
+            token,
+            function,
+            arguments,
+            is_distinct,
+            order_by,
+            filter,
+        } = self;
+        let arguments = arguments
+            .iter()
+            .map(&mut *f)
+            .collect::<std::result::Result<_, E>>()?;
+        let filter = match filter.as_deref() {
+            Some(filter) => Some(Box::new(f(filter)?)),
+            None => None,
+        };
+        Ok(FunctionCall {
+            token: token.clone(),
+            function: function.clone(),
+            arguments,
+            is_distinct: *is_distinct,
+            order_by: map_order_by(f, order_by)?,
+            filter,
+        })
+    }
+}
+
+/// `order_by` with each key replaced by what `f` makes of it
+fn map_order_by<E>(
+    f: &mut impl FnMut(&Expression) -> std::result::Result<Expression, E>,
+    order_by: &[OrderByExpression],
+) -> std::result::Result<Vec<OrderByExpression>, E> {
+    order_by
+        .iter()
+        .map(
+            |OrderByExpression {
+                 expression,
+                 ascending,
+                 nulls_first,
+             }| {
+                Ok(OrderByExpression {
+                    expression: f(expression)?,
+                    ascending: *ascending,
+                    nulls_first: *nulls_first,
+                })
+            },
+        )
+        .collect()
 }
 
 impl fmt::Display for FunctionCall {

@@ -317,7 +317,7 @@ impl<'a> Family<'a> {
                     if !subqueries {
                         return Err("a subquery outside WHERE and the subquery blocks");
                     }
-                    self.expression(row, scopes, site.operand(), found)?;
+                    self.expression(row, scopes, site, found)?;
                     *found = true;
                     return self.block(&sq.subquery, scopes + 1, true);
                 }
@@ -343,7 +343,7 @@ impl<'a> Family<'a> {
                         if !subqueries {
                             return Err("a subquery outside WHERE and the subquery blocks");
                         }
-                        self.expression(&in_expr.left, scopes, site.operand(), found)?;
+                        self.expression(&in_expr.left, scopes, site, found)?;
                         *found = true;
                         return self.block(&sq.subquery, scopes + 1, false);
                     }
@@ -404,7 +404,7 @@ impl<'a> Family<'a> {
                 if QuantifiedMembers::operator(&all_any.operator).is_none() {
                     return Err("an operator outside the family");
                 }
-                self.expression(&all_any.left, scopes, site.operand(), found)?;
+                self.expression(&all_any.left, scopes, site, found)?;
                 *found = true;
                 self.block(&all_any.subquery, scopes + 1, false)
             }
@@ -662,18 +662,6 @@ enum Site {
 
 /// Whether a block aggregates its rows: it groups, has HAVING, or its
 /// SELECT list calls an aggregate
-impl Site {
-    /// What the left of a set test over a block may hold: no window function,
-    /// which the window path computes only outside one
-    fn operand(self) -> Site {
-        match self {
-            Site::Rows => Site::Subqueries,
-            Site::GroupedList => Site::GroupedOutput,
-            other => other,
-        }
-    }
-}
-
 fn grouped_block(sq: &SelectStatement) -> bool {
     !sq.group_by.columns.is_empty()
         || matches!(sq.group_by.modifier, GroupByModifier::GroupingSets(_))
@@ -2543,257 +2531,21 @@ fn projected_columns(expr: &Expression, from: usize, out: &mut SmallVec<[usize; 
     });
 }
 
-/// Each direct operand of an expression of the family's forms
+/// Each direct operand of an expression, by the one children rule
 pub(super) fn for_each_child<'e>(
     expr: &'e Expression,
     f: &mut impl FnMut(&'e Expression) -> Result<()>,
 ) -> Result<()> {
-    match expr {
-        Expression::Infix(infix) => {
-            f(&infix.left)?;
-            f(&infix.right)
-        }
-        Expression::Prefix(prefix) => f(&prefix.right),
-        Expression::Between(between) => {
-            f(&between.expr)?;
-            f(&between.lower)?;
-            f(&between.upper)
-        }
-        Expression::In(in_expr) => {
-            f(&in_expr.left)?;
-            match &*in_expr.right {
-                Expression::List(list) => list.elements.iter().try_for_each(f),
-                Expression::ExpressionList(list) => list.expressions.iter().try_for_each(f),
-                other => f(other),
-            }
-        }
-        Expression::Like(like) => {
-            f(&like.left)?;
-            f(&like.pattern)?;
-            like.escape.as_deref().map_or(Ok(()), f)
-        }
-        Expression::Case(case) => {
-            if let Some(value) = case.value.as_deref() {
-                f(value)?;
-            }
-            for when in &case.when_clauses {
-                f(&when.condition)?;
-                f(&when.then_result)?;
-            }
-            case.else_value.as_deref().map_or(Ok(()), f)
-        }
-        Expression::Cast(cast) => f(&cast.expr),
-        Expression::FunctionCall(call) => {
-            call.arguments.iter().try_for_each(&mut *f)?;
-            if let Some(filter) = call.filter.as_deref() {
-                f(filter)?;
-            }
-            call.order_by.iter().try_for_each(|o| f(&o.expression))
-        }
-        Expression::AllAny(all_any) => f(&all_any.left),
-        Expression::List(list) => list.elements.iter().try_for_each(f),
-        Expression::ExpressionList(list) => list.expressions.iter().try_for_each(f),
-        Expression::Window(window) => {
-            let call = &window.function;
-            call.arguments.iter().try_for_each(&mut *f)?;
-            if let Some(filter) = call.filter.as_deref() {
-                f(filter)?;
-            }
-            call.order_by.iter().try_for_each(|o| f(&o.expression))?;
-            window.partition_by.iter().try_for_each(&mut *f)?;
-            window.order_by.iter().try_for_each(|o| f(&o.expression))?;
-            window.frame_offsets().try_for_each(f)
-        }
-        _ => Ok(()),
-    }
+    expr.try_for_each_child(f)
 }
 
-/// `expr` with each direct operand replaced by what `f` makes of it
+/// `expr` with each direct operand replaced by what `f` makes of it, by the
+/// one children rule
 pub(super) fn rebuild(
     expr: &Expression,
     f: &mut impl FnMut(&Expression) -> Result<Expression>,
 ) -> Result<Expression> {
-    fn boxed(
-        f: &mut impl FnMut(&Expression) -> Result<Expression>,
-        e: &Expression,
-    ) -> Result<Box<Expression>> {
-        f(e).map(Box::new)
-    }
-    Ok(match expr {
-        Expression::Infix(infix) => Expression::Infix(InfixExpression {
-            token: infix.token.clone(),
-            left: boxed(f, &infix.left)?,
-            operator: infix.operator.clone(),
-            op_type: infix.op_type,
-            right: boxed(f, &infix.right)?,
-        }),
-        Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression {
-            token: prefix.token.clone(),
-            operator: prefix.operator.clone(),
-            op_type: prefix.op_type,
-            right: boxed(f, &prefix.right)?,
-        }),
-        Expression::Between(between) => Expression::Between(BetweenExpression {
-            token: between.token.clone(),
-            expr: boxed(f, &between.expr)?,
-            lower: boxed(f, &between.lower)?,
-            upper: boxed(f, &between.upper)?,
-            not: between.not,
-        }),
-        Expression::In(in_expr) => {
-            let left = boxed(f, &in_expr.left)?;
-            let right = match &*in_expr.right {
-                Expression::List(list) => Expression::List(Box::new(ListExpression {
-                    token: list.token.clone(),
-                    elements: list.elements.iter().map(&mut *f).collect::<Result<_>>()?,
-                })),
-                Expression::ExpressionList(list) => {
-                    Expression::ExpressionList(Box::new(ExpressionList {
-                        token: list.token.clone(),
-                        expressions: list
-                            .expressions
-                            .iter()
-                            .map(&mut *f)
-                            .collect::<Result<_>>()?,
-                    }))
-                }
-                other => f(other)?,
-            };
-            Expression::In(InExpression {
-                token: in_expr.token.clone(),
-                left,
-                right: Box::new(right),
-                not: in_expr.not,
-            })
-        }
-        Expression::Like(like) => Expression::Like(LikeExpression {
-            token: like.token.clone(),
-            left: boxed(f, &like.left)?,
-            pattern: boxed(f, &like.pattern)?,
-            operator: like.operator.clone(),
-            escape: like.escape.as_deref().map(|e| boxed(f, e)).transpose()?,
-        }),
-        Expression::Case(case) => Expression::Case(Box::new(CaseExpression {
-            token: case.token.clone(),
-            value: case.value.as_deref().map(|e| boxed(f, e)).transpose()?,
-            when_clauses: case
-                .when_clauses
-                .iter()
-                .map(|when| {
-                    Ok(WhenClause {
-                        token: when.token.clone(),
-                        condition: f(&when.condition)?,
-                        then_result: f(&when.then_result)?,
-                    })
-                })
-                .collect::<Result<_>>()?,
-            else_value: case
-                .else_value
-                .as_deref()
-                .map(|e| boxed(f, e))
-                .transpose()?,
-        })),
-        Expression::Cast(cast) => Expression::Cast(CastExpression {
-            token: cast.token.clone(),
-            expr: boxed(f, &cast.expr)?,
-            type_name: cast.type_name.clone(),
-        }),
-        Expression::FunctionCall(call) => Expression::FunctionCall(Box::new(FunctionCall {
-            token: call.token.clone(),
-            function: call.function.clone(),
-            arguments: call.arguments.iter().map(&mut *f).collect::<Result<_>>()?,
-            is_distinct: call.is_distinct,
-            order_by: call
-                .order_by
-                .iter()
-                .map(|o| {
-                    Ok(OrderByExpression {
-                        expression: f(&o.expression)?,
-                        ascending: o.ascending,
-                        nulls_first: o.nulls_first,
-                    })
-                })
-                .collect::<Result<_>>()?,
-            filter: call.filter.as_deref().map(|e| boxed(f, e)).transpose()?,
-        })),
-        Expression::AllAny(all_any) => Expression::AllAny(AllAnyExpression {
-            token: all_any.token.clone(),
-            left: boxed(f, &all_any.left)?,
-            operator: all_any.operator.clone(),
-            all_any_type: all_any.all_any_type,
-            subquery: all_any.subquery.clone(),
-        }),
-        Expression::List(list) => Expression::List(Box::new(ListExpression {
-            token: list.token.clone(),
-            elements: list.elements.iter().map(&mut *f).collect::<Result<_>>()?,
-        })),
-        Expression::ExpressionList(list) => Expression::ExpressionList(Box::new(ExpressionList {
-            token: list.token.clone(),
-            expressions: list
-                .expressions
-                .iter()
-                .map(&mut *f)
-                .collect::<Result<_>>()?,
-        })),
-        Expression::Window(window) => {
-            let mut order_by = |order: &[OrderByExpression]| {
-                order
-                    .iter()
-                    .map(|o| {
-                        Ok(OrderByExpression {
-                            expression: f(&o.expression)?,
-                            ascending: o.ascending,
-                            nulls_first: o.nulls_first,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()
-            };
-            let call = &window.function;
-            let call_order_by = order_by(&call.order_by)?;
-            let window_order_by = order_by(&window.order_by)?;
-            Expression::Window(Box::new(WindowExpression {
-                token: window.token.clone(),
-                function: Box::new(FunctionCall {
-                    token: call.token.clone(),
-                    function: call.function.clone(),
-                    arguments: call.arguments.iter().map(&mut *f).collect::<Result<_>>()?,
-                    is_distinct: call.is_distinct,
-                    order_by: call_order_by,
-                    filter: call.filter.as_deref().map(|e| boxed(f, e)).transpose()?,
-                }),
-                window_ref: window.window_ref.clone(),
-                partition_by: window
-                    .partition_by
-                    .iter()
-                    .map(&mut *f)
-                    .collect::<Result<_>>()?,
-                order_by: window_order_by,
-                frame: window
-                    .frame
-                    .as_ref()
-                    .map(|frame| {
-                        let mut bound = |bound: &WindowFrameBound| -> Result<WindowFrameBound> {
-                            Ok(match bound {
-                                WindowFrameBound::Preceding(offset) => {
-                                    WindowFrameBound::Preceding(boxed(f, offset)?)
-                                }
-                                WindowFrameBound::Following(offset) => {
-                                    WindowFrameBound::Following(boxed(f, offset)?)
-                                }
-                                other => other.clone(),
-                            })
-                        };
-                        Ok::<_, Error>(WindowFrame {
-                            unit: frame.unit,
-                            start: bound(&frame.start)?,
-                            end: frame.end.as_ref().map(&mut bound).transpose()?,
-                        })
-                    })
-                    .transpose()?,
-            }))
-        }
-        other => other.clone(),
-    })
+    expr.try_map_children(f)
 }
 
 /// `expr` with each parameter replaced by the literal its value in
@@ -13663,19 +13415,6 @@ fn over_late_row(
     }
 }
 
-/// The window functions outside any subquery of `expr`
-fn windows_outside_blocks<'e>(expr: &'e Expression, found: &mut Vec<&'e Expression>) {
-    match expr {
-        Expression::Window(_) => found.push(expr),
-        other => {
-            let _ = for_each_child(other, &mut |child| {
-                windows_outside_blocks(child, found);
-                Ok(())
-            });
-        }
-    }
-}
-
 /// `stmt` with each window function outside the subqueries of an ORDER BY
 /// key holding a subquery as a hidden item, and each such key, by its place,
 /// reading those items by name once the windows ran; None when there is none
@@ -13691,11 +13430,7 @@ fn with_key_windows(
     let mut keys = Vec::new();
     let mut drawn = 0;
     for (at, ob) in stmt.order_by.iter().enumerate() {
-        let mut found = Vec::new();
-        if mentions_subquery(&ob.expression) {
-            windows_outside_blocks(&ob.expression, &mut found);
-        }
-        if found.is_empty() {
+        if !mentions_subquery(&ob.expression) || !ob.expression.holds_window() {
             continue;
         }
         let columns = columns.get_or_insert_with(|| stmt.columns.clone());
