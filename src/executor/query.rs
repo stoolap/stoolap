@@ -3964,7 +3964,6 @@ impl Executor {
                 classification,
                 RowVec::new(),
                 all_columns,
-                None,
                 |out| Self::shared_result_layout(stmt, all_columns, table_alias, out),
             )?,
         };
@@ -5247,15 +5246,10 @@ impl Executor {
         let has_agg = classification.has_aggregation;
 
         if has_agg {
-            let (result, layout) = self.group_and_window_rows(
-                stmt,
-                ctx,
-                classification,
-                rows,
-                &all_columns,
-                None,
-                |out| Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out),
-            )?;
+            let (result, layout) =
+                self.group_and_window_rows(stmt, ctx, classification, rows, &all_columns, |out| {
+                    Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out)
+                })?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
@@ -9593,9 +9587,7 @@ impl Executor {
     /// The aggregation and window functions of `stmt` over a source's rows,
     /// the one dispatch every source hands its rows to: GROUP BY and then
     /// the windows over the groups, the windows alone, or the aggregation
-    /// alone, whose layout `aggregate_layout` builds from its columns, its
-    /// subqueries answered by the statement's `blocks`
-    #[allow(clippy::too_many_arguments)]
+    /// alone, whose layout `aggregate_layout` builds from its columns
     pub(crate) fn group_and_window_rows(
         &self,
         stmt: &SelectStatement,
@@ -9603,22 +9595,16 @@ impl Executor {
         classification: &QueryClassification,
         rows: RowVec,
         columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
         aggregate_layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
     ) -> Result<WindowOutput> {
         match (
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
-            (true, true) => {
-                self.execute_aggregation_then_windows(stmt, ctx, &rows, columns, blocks)
-            }
-            (false, true) => {
-                self.execute_select_with_window_functions(stmt, ctx, &rows, columns, blocks)
-            }
+            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns),
+            (false, true) => self.execute_select_with_window_functions(stmt, ctx, &rows, columns),
             _ => {
-                let result =
-                    self.execute_select_with_aggregation(stmt, ctx, rows, columns, blocks)?;
+                let result = self.execute_select_with_aggregation(stmt, ctx, rows, columns)?;
                 let layout = aggregate_layout(result.columns());
                 Ok((result, layout))
             }
@@ -9637,7 +9623,7 @@ impl Executor {
         table_alias: Option<&str>,
     ) -> SelectResult {
         let (result, layout) =
-            self.group_and_window_rows(stmt, ctx, classification, rows, columns, None, |out| {
+            self.group_and_window_rows(stmt, ctx, classification, rows, columns, |out| {
                 Self::result_layout(stmt, columns, table_alias, out)
             })?;
         let columns = CompactArc::new(result.columns().to_vec());
@@ -9773,21 +9759,18 @@ impl Executor {
             }
             false => ctx,
         };
-        let (result, layout) = self.group_and_window_rows(
-            &held.stmt,
-            ctx,
-            &held.classification,
-            rows,
-            columns,
-            Some(run),
-            layout,
-        )?;
+        let (result, windows) = self.grouped_rows(held, run, &rows, columns, ctx)?;
+        // The windows lay out their own rows
+        let layout = match held.classification.has_window_functions {
+            true => windows,
+            false => layout(result.columns()),
+        };
         let columns = CompactArc::new(result.columns().to_vec());
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
     /// A grouped statement whose subqueries run as `grouped` prepared them:
-    /// over a source's rows, or a table's, the general aggregation asking
+    /// over a source's rows, or a table's, the runner's aggregation asking
     /// the blocks of each group
     fn execute_prepared_grouped(
         &self,
@@ -9797,7 +9780,7 @@ impl Executor {
     ) -> SelectResult {
         let Some(held) = grouped.held.clone() else {
             // The general path groups the rows the source gave, as `branch`
-            let Some((columns, rows)) = grouped.source_rows(None, ctx)? else {
+            let Some((columns, rows)) = grouped.source_rows(ctx)? else {
                 return Err(Error::internal("a grouped statement without its rows"));
             };
             return self.execute_query_on_memory_result(branch, ctx, columns.to_vec(), rows);
@@ -9836,15 +9819,6 @@ impl Executor {
         grouped: super::prepared_select::GroupedRun<'_>,
         ctx: &ExecutionContext,
     ) -> SelectResult {
-        let alias = grouped.scope_name().map(SmartString::from);
-        if let Some((columns, rows)) = grouped.source_rows(Some(run), ctx)? {
-            return self.group_held_rows(held, run, ctx, rows, &columns, |out| {
-                Self::shared_result_layout(&held.stmt, &columns, alias.as_deref(), out)
-            });
-        }
-        let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
-            return Err(Error::internal("a grouped statement without its table"));
-        };
         // A value read once for the statement reads its run slot as a parameter
         let slots_ctx;
         let ctx = match held.reads_run_slots() {
@@ -9854,6 +9828,23 @@ impl Executor {
                 &slots_ctx
             }
             false => ctx,
+        };
+        let alias = grouped.scope_name().map(SmartString::from);
+        if let Some(((result, layout), columns)) =
+            self.grouped_over_source(held, run, grouped, ctx)?
+        {
+            let output = CompactArc::new(result.columns().to_vec());
+            // The windows lay out their own rows
+            let layout = match held.classification.has_window_functions {
+                true => layout,
+                false => {
+                    Self::shared_result_layout(&held.stmt, &columns, alias.as_deref(), &output)
+                }
+            };
+            return Ok((result, output, false, SelectShape::laid_out(layout)));
+        }
+        let Some(Expression::TableSource(table_source)) = held.stmt.table_expr.as_deref() else {
+            return Err(Error::internal("a grouped statement without its table"));
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::grouped_table_opening();

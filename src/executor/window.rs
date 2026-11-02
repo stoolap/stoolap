@@ -1023,15 +1023,13 @@ impl Executor {
         )
     }
 
-    /// Window functions over the rows, the statement's subqueries answered
-    /// by its `blocks`
+    /// Window functions over the rows
     pub(crate) fn execute_select_with_window_functions(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -1041,7 +1039,7 @@ impl Executor {
             &FxHashMap::default(),
             None,
             None,
-            blocks,
+            None,
         )
     }
 
