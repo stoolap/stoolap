@@ -12944,6 +12944,15 @@ impl Executor {
                     };
                     (names, rows, order)
                 }
+                // Without a WHERE a source hands over its rows as they are,
+                // as a table does
+                StatementSource::Rows(columns, rows) if prepared.where_.conjuncts == 0 => {
+                    (CompactArc::new(columns), rows, (None, None))
+                }
+                StatementSource::Stream(columns, mut result) if prepared.where_.conjuncts == 0 => {
+                    let rows = result_rows(&mut *result).collect::<Result<RowVec>>()?;
+                    (CompactArc::new(columns), rows, (None, None))
+                }
                 // Another source's rows are every one its read passes, held
                 // for the windows as a table's are
                 source => {
