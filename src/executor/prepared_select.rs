@@ -8913,7 +8913,7 @@ impl PreparedGrouped {
             Expression::QualifiedStar(q) => scope
                 .tables
                 .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(&q.qualifier))
+                .find(|(name, _)| super::utils::eq_folded(&q.qualifier, name))
                 .map_or(0, |(_, start)| scope.table(*start).1.len()),
             Expression::Star(_) => width,
             _ => 1,

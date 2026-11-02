@@ -582,6 +582,29 @@ fn an_ungrouped_key_reading_a_volatile_alias_sorts_by_the_value_each_row_shows()
 }
 
 #[test]
+fn a_star_qualified_by_a_folded_alias_fills_its_table_s_columns() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_windows_blocks_folded_star").unwrap();
+    fill(&db);
+    for (sql, twin) in [
+        (
+            "SELECT \"Ä\".*, ROW_NUMBER() OVER (ORDER BY id) AS r FROM t AS \"Ä\" \
+             ORDER BY (SELECT 0) + r DESC LIMIT 3",
+            "SELECT \"Ä\".*, ROW_NUMBER() OVER (ORDER BY id) AS r FROM t AS \"Ä\" \
+             ORDER BY r DESC LIMIT 3",
+        ),
+        (
+            "SELECT \"Ä\".*, ROW_NUMBER() OVER (ORDER BY \"Ä\".id) AS r \
+             FROM t AS \"Ä\" JOIN w ON w.id = \"Ä\".id ORDER BY (SELECT 0) + r DESC LIMIT 3",
+            "SELECT \"Ä\".*, ROW_NUMBER() OVER (ORDER BY \"Ä\".id) AS r \
+             FROM t AS \"Ä\" JOIN w ON w.id = \"Ä\".id ORDER BY r DESC LIMIT 3",
+        ),
+    ] {
+        assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
+    }
+}
+
+#[test]
 fn an_item_holding_a_subquery_keeps_the_name_it_is_written_under() {
     let _guard = serial();
     let db = Database::open("memory://grouped_windows_blocks_names").unwrap();
