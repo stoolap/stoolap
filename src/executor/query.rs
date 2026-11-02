@@ -5723,11 +5723,12 @@ impl Executor {
         Ok(())
     }
 
-    /// Whether a join's output groups its rows, so the grouped blocks or the
-    /// general path run its subqueries after the join, never its join blocks
+    /// Whether a join's output groups its rows or computes windows over them,
+    /// so the grouped blocks or the general path run its subqueries after
+    /// the join, never its join blocks
     fn grouped_join_output(stmt: &SelectStatement) -> bool {
         let classification = get_classification(stmt);
-        classification.has_aggregation && !classification.has_window_functions
+        classification.has_aggregation || classification.has_window_functions
     }
 
     /// Why the subqueries of the SELECT list, the ORDER BY or the DISTINCT ON
@@ -7215,9 +7216,21 @@ impl Executor {
                     let merging = blocks
                         .as_deref()
                         .filter(|_| side_merged && !apart && projection_pushdown.is_none());
+                    if has_agg || has_window {
+                        let laid_out = blocks.as_deref().filter(|_| projection_pushdown.is_none());
+                        return self.grouped_join_select(
+                            grouped_plan.as_deref(),
+                            stmt,
+                            ctx,
+                            classification,
+                            (final_rows, all_columns),
+                            |columns, rows| merged_side_rows(stmt, merging, columns, rows),
+                            (left_cols.len(), laid_out),
+                        );
+                    }
                     let (all_columns, final_rows) =
                         merged_side_rows(stmt, merging, all_columns, final_rows);
-                    let held = if has_agg || has_window || projection_pushdown.is_some() {
+                    let held = if projection_pushdown.is_some() {
                         None
                     } else {
                         self.held_join_output(
@@ -7229,17 +7242,7 @@ impl Executor {
                             ctx,
                         )?
                     };
-                    if has_agg || has_window {
-                        return self.grouped_join_select(
-                            grouped_plan.as_deref(),
-                            stmt,
-                            ctx,
-                            classification,
-                            final_rows,
-                            &all_columns,
-                            left_cols.len(),
-                        );
-                    } else if let Some(output) = held.as_deref().and_then(Option::as_ref) {
+                    if let Some(output) = held.as_deref().and_then(Option::as_ref) {
                         return output_result(output, final_rows, order_limit_applied);
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
@@ -7819,27 +7822,26 @@ impl Executor {
             result_rows
         };
 
-        let (mut final_columns, final_rows) = merged_columns(
-            stmt,
-            &all_columns,
-            filtered_rows,
-            (&excluded_column_indices, &join_col_renames),
-        );
-        for (at, name) in side_names {
-            final_columns[at] = name;
-        }
-
+        let merged = (&excluded_column_indices[..], &join_col_renames[..]);
+        let merge = |all_columns: Vec<String>, rows| {
+            let (mut columns, rows) = merged_columns(stmt, &all_columns, rows, merged);
+            for (at, name) in side_names {
+                columns[at] = name;
+            }
+            (columns, rows)
+        };
         if classification.has_aggregation || classification.has_window_functions {
             return self.grouped_join_select(
                 grouped_plan.as_deref(),
                 stmt,
                 ctx,
                 classification,
-                final_rows,
-                &final_columns,
-                left_columns.len(),
+                (filtered_rows, all_columns),
+                merge,
+                (left_columns.len(), blocks.as_deref()),
             );
         }
+        let (final_columns, final_rows) = merge(all_columns, filtered_rows);
 
         let held = self.held_join_output(
             prepared,
@@ -9644,10 +9646,11 @@ impl Executor {
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
-    /// A join's grouped output over its joined `rows` of `columns`, the first
-    /// `left_width` its left side's as read: through the grouped blocks when
-    /// the statement belongs to their family, held with the `plan`; else as
-    /// any grouped statement groups its rows
+    /// A join's grouped output over its joined `rows` of `columns`, each
+    /// merged pair apart, the first `left_width` its left side's as read:
+    /// through the grouped blocks when the statement belongs to their family,
+    /// held with the `plan`, over the scope its `blocks` laid out when it has
+    /// them; else over the rows `merge` shows, as any grouped statement
     #[allow(clippy::too_many_arguments)]
     fn grouped_join_select(
         &self,
@@ -9655,15 +9658,26 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &QueryClassification,
-        rows: RowVec,
-        columns: &[String],
-        left_width: usize,
+        (rows, columns): (RowVec, Vec<String>),
+        merge: impl FnOnce(Vec<String>, RowVec) -> (Vec<String>, RowVec),
+        (left_width, blocks): (usize, Option<&JoinBlocks>),
     ) -> SelectResult {
         let in_family = Self::grouped_family_reach(stmt, classification) && {
             let decide = || self.grouped_family(stmt, Some(ctx)).is_ok();
             plan.map_or_else(decide, |plan| plan.grouped(decide))
         };
+        let apart = blocks.filter(|_| in_family);
+        let mut merge = Some(merge);
+        // Apart, a bare name reads each pair's left column, as the blocks do
+        let (columns, rows) = match apart {
+            Some(blocks) => (merged_names(&columns, blocks.merges()), rows),
+            None => match merge.take() {
+                Some(merge) => merge(columns, rows),
+                None => (columns, rows),
+            },
+        };
         if in_family {
+            let columns = &columns[..];
             let build = || {
                 let mut leaves = Vec::new();
                 let mut left_leaves = 0;
@@ -9673,7 +9687,7 @@ impl Executor {
                     self.join_leaves(&join.right, ctx, &mut leaves);
                 }
                 let sides = (left_leaves, left_width);
-                self.prepare_grouped_join(stmt, columns, (&leaves, sides), ctx)
+                self.prepare_grouped_join(stmt, columns, (&leaves, sides), blocks, ctx)
             };
             let held = match plan {
                 Some(plan) => plan.grouped_blocks(columns, ctx.params().len(), build)?,
@@ -9689,7 +9703,11 @@ impl Executor {
                 return Self::with_late_keys(held, &run, output, ctx);
             }
         }
-        self.grouped_select(stmt, ctx, classification, rows, columns, None)
+        let (columns, rows) = match merge {
+            Some(merge) => merge(columns, rows),
+            None => (columns, rows),
+        };
+        self.grouped_select(stmt, ctx, classification, rows, &columns, None)
     }
 
     /// Each source the join `expr` reads, left to right, with its column

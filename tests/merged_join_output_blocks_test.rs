@@ -304,24 +304,52 @@ fn a_star_lines_up_with_the_items_and_qualified_stars_beside_it() {
 }
 
 #[test]
-fn a_merging_join_that_groups_or_has_windows_stays_out_of_the_family() {
+fn a_merging_join_that_groups_or_has_windows_runs_its_grouped_blocks() {
+    use stoolap::test_failpoints::general_path_total;
     let _guard = serial();
     let db = Database::open("memory://merged_join_output_grouped").unwrap();
     fill(&db);
-    for sql in [
-        "SELECT ROW_NUMBER() OVER () AS rn, (SELECT 1) AS x FROM l JOIN r USING (id)",
-        "SELECT k, COUNT(*), (SELECT MAX(s.a) FROM s) AS m FROM l JOIN r USING (k) \
-         GROUP BY k ORDER BY k",
+    for (sql, twin) in [
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, (SELECT 1) AS x \
+             FROM l JOIN r USING (id)",
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, 1 AS x FROM l JOIN r USING (id)",
+        ),
+        (
+            "SELECT k, COUNT(*), (SELECT MAX(s.a) FROM s) AS m FROM l JOIN r USING (k) \
+             GROUP BY k ORDER BY k",
+            "SELECT k, COUNT(*), 30 AS m FROM l JOIN r USING (k) GROUP BY k ORDER BY k",
+        ),
+        (
+            "SELECT k, SUM(l.g), (SELECT COUNT(*) FROM s WHERE s.b = k) FROM l LEFT JOIN r \
+             USING (k) GROUP BY k HAVING SUM(l.g) > (SELECT 0) ORDER BY k",
+            "SELECT k, SUM(l.g), CASE WHEN k < 7 THEN 10 ELSE 0 END FROM l LEFT JOIN r \
+             USING (k) GROUP BY k HAVING SUM(l.g) > 0 ORDER BY k",
+        ),
+        (
+            "SELECT k, MAX(l.g) OVER (PARTITION BY k), (SELECT 2) FROM l JOIN q USING (k) \
+             ORDER BY 1, 2",
+            "SELECT k, MAX(l.g) OVER (PARTITION BY k), 2 FROM l JOIN q USING (k) ORDER BY 1, 2",
+        ),
     ] {
-        assert_eq!(
-            prepared_line(&db, sql),
-            "Prepared: no (a NATURAL or USING join whose output holds a subquery)",
-            "{sql}"
-        );
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let before = general_path_total();
         let answer = rows(&db, sql);
+        assert_eq!(general_path_total(), before, "{sql}: a general path ran");
         assert!(
             answer.as_ref().is_ok_and(|r| r.len() > 1),
             "{sql}: {answer:?}"
         );
+        let values = |rows: Result<Vec<String>, String>| rows.map(|r| r[1..].to_vec());
+        assert_eq!(values(answer), values(rows(&db, twin)), "{sql}");
     }
+    // A star there shows each merged pair once, which the grouped rows hold apart
+    let sql = "SELECT *, ROW_NUMBER() OVER (ORDER BY l.id) AS rn, (SELECT 1) AS x \
+               FROM l JOIN r USING (id)";
+    assert_eq!(
+        prepared_line(&db, sql),
+        "Prepared: no (a star over a NATURAL or USING join whose output holds a subquery)",
+        "{sql}"
+    );
+    assert!(rows(&db, sql).is_ok_and(|r| r.len() > 1), "{sql}");
 }
