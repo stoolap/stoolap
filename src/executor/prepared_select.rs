@@ -3617,6 +3617,45 @@ impl RowSource for PassedRows<'_, '_> {
     }
 }
 
+/// A view's or a derived table's rows with no WHERE to pass, as an
+/// aggregation reads them one at a time, the cancel checked every hundred
+struct StreamedRows<'c> {
+    result: Box<dyn QueryResult>,
+    ctx: &'c ExecutionContext,
+    read: u64,
+}
+
+impl RowSource for StreamedRows<'_> {
+    fn held(mut self) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(self.result.estimated_count().unwrap_or(64));
+        while self.result.next() {
+            self.read += 1;
+            if self.read.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            rows.push((0, self.result.take_row()));
+        }
+        match self.result.last_error() {
+            Some(err) => Err(err),
+            None => Ok(rows),
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<&Row>> {
+        if !self.result.next() {
+            return match self.result.last_error() {
+                Some(err) => Err(err),
+                None => Ok(None),
+            };
+        }
+        self.read += 1;
+        if self.read.is_multiple_of(100) {
+            self.ctx.check_cancelled()?;
+        }
+        Ok(Some(self.result.row()))
+    }
+}
+
 /// A statement's WHERE rewritten for its blocks, before it compiles
 struct WhereParts {
     clause: Expression,
@@ -12349,6 +12388,31 @@ impl Executor {
         columns: &[String],
     ) -> Result<Box<dyn QueryResult>> {
         let aggregations = &*self.prepared_calls(prepared, stmt, ctx)?;
+        let path = AggregatePath::HashGroups;
+        // Without a WHERE the rows a source holds are fed as they are, and a
+        // stream's as it hands them over
+        let unfiltered = stmt.where_clause.is_none();
+        let aggregate = |input| {
+            self.aggregate_input(path, (stmt, stmt), aggregations, ctx, input, columns, None)
+        };
+        let source = match source {
+            StatementSource::Rows(_, rows) if unfiltered => {
+                return aggregate(FeedInput::<StreamedRows<'_>>::Rows(&rows))
+            }
+            StatementSource::Cte((_, rows)) if unfiltered => {
+                return aggregate(FeedInput::<StreamedRows<'_>>::Rows(rows))
+            }
+            StatementSource::Stream(_, result) if unfiltered => {
+                let hint = result.estimated_count().unwrap_or(0);
+                let rows = StreamedRows {
+                    result,
+                    ctx,
+                    read: 0,
+                };
+                return aggregate(FeedInput::Each(rows, hint));
+            }
+            source => source,
+        };
         let (hold, hint) = match &source {
             StatementSource::Stream(_, result) => (false, result.estimated_count().unwrap_or(0)),
             StatementSource::Rows(_, rows) => (true, rows.len()),
@@ -12371,7 +12435,6 @@ impl Executor {
             )
         };
         self.passed_input(stmt, ctx, run, (hold, hint), read, |input| {
-            let path = AggregatePath::HashGroups;
             self.aggregate_input(path, (stmt, stmt), aggregations, ctx, input, columns, None)
         })
     }
