@@ -284,75 +284,77 @@ fn a_conflict_update_reads_a_bare_name_from_the_row_met() {
 fn a_select_alias_spares_a_bare_name_only_where_the_alias_is_read() {
     let db = hot("alias_contexts");
     let mut wrong = Vec::new();
-    // Each statement with `{k}` for a name both sources have, which its
-    // SELECT alias `id` gives as `10 - t.id`, and whether `{k}` reads it
-    for (shape, reads_alias) in [
+    // Each statement with `{k}` for a name both sources have, which a
+    // SELECT alias `id` also gives, and the alias's item when `{k}` reads it
+    let f = "FROM t JOIN u ON u.id = t.a";
+    let first = "10 - t.id";
+    let max = "MAX(t.id)";
+    for (shape, reads) in [
         (
-            "SELECT 10 - t.id AS id, t.id FROM t JOIN u ON u.id = t.a ORDER BY {k}, t.id",
-            true,
+            "SELECT 10 - t.id AS id, t.id {f} ORDER BY {k}, t.id",
+            Some(first),
         ),
         (
-            "SELECT DISTINCT ON ({k}) 10 - t.id AS id, t.id FROM t JOIN u ON u.id = t.a \
-             ORDER BY {k}, t.id",
-            true,
+            "SELECT DISTINCT ON ({k}) 10 - t.id AS id, t.id {f} ORDER BY {k}, t.id",
+            Some(first),
         ),
         (
-            "SELECT 10 - t.id AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY {k}",
-            true,
+            "SELECT 10 - t.id AS id, COUNT(*) {f} GROUP BY {k}",
+            Some(first),
+        ),
+        ("SELECT MAX(t.id) AS id {f} HAVING {k} > 0", Some(max)),
+        (
+            "SELECT MAX(t.id) AS id {f} HAVING {k} > (SELECT 0)",
+            Some(max),
         ),
         (
-            "SELECT 10 - t.id AS id, t.id FROM t JOIN u ON u.id = t.a ORDER BY {k} + 0",
-            false,
+            "SELECT MAX(t.id) AS id, t.a {f} GROUP BY t.a HAVING {k} + 0 > 1",
+            Some(max),
         ),
         (
-            "SELECT 10 - t.id AS id, t.id FROM t JOIN u ON u.id = t.a \
-             ORDER BY ROW_NUMBER() OVER (ORDER BY {k})",
-            false,
+            "SELECT t.a AS id, COUNT(*) {f} GROUP BY t.a HAVING {k} > 1",
+            Some("t.a"),
+        ),
+        ("SELECT 10 - t.id AS id, t.id {f} ORDER BY {k} + 0", None),
+        (
+            "SELECT 10 - t.id AS id, t.id {f} ORDER BY ROW_NUMBER() OVER (ORDER BY {k})",
+            None,
         ),
         (
-            "SELECT 10 - t.id AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY t.id \
-             ORDER BY MAX({k})",
-            false,
+            "SELECT 10 - t.id AS id, COUNT(*) {f} GROUP BY t.id ORDER BY MAX({k})",
+            None,
+        ),
+        ("SELECT 0 AS id, COUNT(*) {f} GROUP BY {k} + 1", None),
+        (
+            "SELECT 10 - t.id AS id, COUNT(*) {f} GROUP BY t.id HAVING {k} > 1",
+            None,
         ),
         (
-            "SELECT 0 AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY {k} + 1",
-            false,
+            "SELECT MAX(t.id) AS id, t.a {f} GROUP BY t.a HAVING MIN({k}) > 1",
+            None,
+        ),
+        ("SELECT 10 - t.id AS id {f} WHERE {k} > 1", None),
+        (
+            "SELECT 10 - t.id AS id, ROW_NUMBER() OVER (ORDER BY {k}, t.id) {f}",
+            None,
         ),
         (
-            "SELECT 10 - t.id AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY t.id \
-             HAVING {k} > 1",
-            false,
+            "SELECT 10 - t.id AS id, COUNT(*) OVER (PARTITION BY {k}) {f}",
+            None,
         ),
         (
-            "SELECT 10 - t.id AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY t.id \
-             HAVING MAX({k}) > 1",
-            false,
-        ),
-        (
-            "SELECT 10 - t.id AS id FROM t JOIN u ON u.id = t.a WHERE {k} > 1",
-            false,
-        ),
-        (
-            "SELECT 10 - t.id AS id, ROW_NUMBER() OVER (ORDER BY {k}, t.id) FROM t \
-             JOIN u ON u.id = t.a",
-            false,
-        ),
-        (
-            "SELECT 10 - t.id AS id, COUNT(*) OVER (PARTITION BY {k}) FROM t \
-             JOIN u ON u.id = t.a",
-            false,
-        ),
-        (
-            "SELECT 10 - t.id AS id, ROW_NUMBER() OVER w FROM t JOIN u ON u.id = t.a \
-             WINDOW w AS (ORDER BY {k}, t.id)",
-            false,
+            "SELECT 10 - t.id AS id, ROW_NUMBER() OVER w {f} WINDOW w AS (ORDER BY {k}, t.id)",
+            None,
         ),
     ] {
+        let shape = shape.replace("{f}", f);
         let bare = shape.replace("{k}", "id");
         let got = answer(&db, &bare);
-        let right = match reads_alias {
-            true => got.is_ok() && got == answer(&db, &shape.replace("{k}", "(10 - t.id)")),
-            false => got
+        let right = match reads {
+            Some(item) => {
+                got.is_ok() && got == answer(&db, &shape.replace("{k}", &format!("({item})")))
+            }
+            None => got
                 .as_ref()
                 .is_err_and(|e| e.contains("column reference 'id' is ambiguous")),
         };

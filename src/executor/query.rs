@@ -5015,7 +5015,7 @@ impl Executor {
                 ctx,
             )?;
             if let Some(blocks) = blocks.as_ref() {
-                blocks.check_output_names(stmt)?;
+                blocks.check_output_names(self, stmt)?;
             }
             Ok(blocks)
         })

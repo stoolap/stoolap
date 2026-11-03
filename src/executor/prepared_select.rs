@@ -10176,8 +10176,12 @@ impl JoinBlocks {
     /// An error when a SELECT item, grouping, HAVING, sort key or named
     /// window of `stmt` names `table.column` and two columns of that table
     /// carry the name, or names a bare name two columns carry that no merge
-    /// makes one, other than a key that is an alias
-    pub(crate) fn check_output_names(&self, stmt: &SelectStatement) -> Result<()> {
+    /// makes one, other than an alias where `executor` binds one
+    pub(crate) fn check_output_names(
+        &self,
+        executor: &Executor,
+        stmt: &SelectStatement,
+    ) -> Result<()> {
         fn names(chain: &Chain<'_>, expr: &Expression) -> Result<()> {
             match expr {
                 // A table or column the joined row lacks is an enclosing one
@@ -10193,7 +10197,7 @@ impl JoinBlocks {
         let scopes = [&self.scope];
         let chain = Chain { scopes: &scopes };
         // An ORDER BY, DISTINCT ON or GROUP BY key that is a bare alias reads
-        // it; a name inside a key, HAVING and a window read the row's columns
+        // it; a name inside a key and a window read the row's columns
         let alias = |key: &Expression| match key {
             Expression::Identifier(id) => stmt.columns.iter().any(
                 |c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower),
@@ -10207,6 +10211,12 @@ impl JoinBlocks {
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .chain(&stmt.distinct_on)
             .filter(|key| !alias(key));
+        // HAVING as it binds the aliases of the groups' items
+        let having = stmt
+            .having
+            .as_deref()
+            .map(|having| grouped_having(executor, stmt, having))
+            .transpose()?;
         // A named window only as its windows read it
         let windows = Executor::used_window_defs(stmt);
         let checked = stmt
@@ -10214,7 +10224,7 @@ impl JoinBlocks {
             .iter()
             .map(unaliased)
             .chain(keys)
-            .chain(stmt.having.as_deref())
+            .chain(having.as_ref())
             .chain(windows.iter().flat_map(WindowDefinition::expressions))
             .try_for_each(|expr| names(&chain, expr));
         checked
