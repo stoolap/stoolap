@@ -17,7 +17,7 @@
 
 use super::compiler::{literal_value, parameter_slot, CompileContext, CompileError, ExprCompiler};
 use super::program::Program;
-use super::vm::{ExecuteContext, ExprVM};
+use super::vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 use crate::core::{Error, Result, Row, Value};
 use crate::executor::context::ExecutionContext;
 use crate::functions::{global_registry, FunctionRegistry};
@@ -27,17 +27,27 @@ fn compile_error(e: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", e))
 }
 
-/// Compile `expr` over no columns, as a one-shot evaluation does
-pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
-    compile_once_in(expr, global_registry())
+/// Compile `expr` over no columns, as a one-shot evaluation does, its
+/// subqueries answered by a statement's blocks when `blocks`
+pub(crate) fn compile_once(expr: &Expression, blocks: bool) -> Result<Program> {
+    compile_once_in(expr, global_registry(), blocks)
 }
 
 /// [`compile_once`] with the functions of `registry`
-fn compile_once_in(expr: &Expression, registry: &FunctionRegistry) -> Result<Program> {
+fn compile_once_in(
+    expr: &Expression,
+    registry: &FunctionRegistry,
+    blocks: bool,
+) -> Result<Program> {
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::one_shot_compiled();
     let empty: &[String] = &[];
-    ExprCompiler::new(&CompileContext::new(empty, registry))
+    let compile = CompileContext::new(empty, registry);
+    let compile = match blocks {
+        true => compile.with_prepared_subqueries(),
+        false => compile,
+    };
+    ExprCompiler::new(&compile)
         .compile(expr)
         .map_err(compile_error)
 }
@@ -66,13 +76,22 @@ pub(crate) fn evaluate_once_in(
         let index = parameter_slot(param).map_err(compile_error)?;
         return exec.param_ref(index as usize).cloned();
     }
-    run(&compile_once_in(expr, registry)?, &exec)
+    run(&compile_once_in(expr, registry, false)?, &exec)
 }
 
-/// What [`evaluate_once`] does after compiling
-pub(crate) fn execute_once(program: &Program, ctx: Option<&ExecutionContext>) -> Result<Value> {
+/// What [`evaluate_once`] does after compiling, the program's subqueries
+/// answered by `blocks`
+pub(crate) fn execute_once(
+    program: &Program,
+    ctx: Option<&ExecutionContext>,
+    blocks: Option<&dyn SubqueryExecutor>,
+) -> Result<Value> {
     let row = Row::new();
-    run(program, &execute_context(&row, ctx))
+    let exec = execute_context(&row, ctx);
+    run(
+        program,
+        &crate::executor::aggregation::with_blocks(exec, blocks),
+    )
 }
 
 /// The VM context for `row` with `ctx`'s parameters, outer row and transaction

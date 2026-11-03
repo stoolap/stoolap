@@ -33,6 +33,7 @@ pub(crate) fn expression_volatility(expr: &Expression, registry: &FunctionRegist
         constant: false,
         whole_blocks: false,
         draws: true,
+        reads_parent: &|_| true,
     }
     .expression(expr)
 }
@@ -50,6 +51,7 @@ pub(crate) fn statement_draws_per_call(
         constant: false,
         whole_blocks: true,
         draws: true,
+        reads_parent: &|_| true,
     }
     .statement(stmt)
         == Volatility::PerCall
@@ -66,20 +68,7 @@ pub(crate) fn statement_constant(expr: &Expression, registry: &FunctionRegistry)
         constant: true,
         whole_blocks: false,
         draws: true,
-    }
-    .expression(expr)
-        != Volatility::PerCall
-}
-
-/// Whether `expr` reads nothing of a row, as [`statement_constant`] asks,
-/// whatever its functions draw
-pub(crate) fn reads_no_row(expr: &Expression, registry: &FunctionRegistry) -> bool {
-    Walk {
-        registry,
-        statement_rows: &|_| false,
-        constant: true,
-        whole_blocks: false,
-        draws: false,
+        reads_parent: &|_| true,
     }
     .expression(expr)
         != Volatility::PerCall
@@ -126,15 +115,26 @@ pub(crate) fn reads_row(what: &str) -> crate::core::Error {
 }
 
 /// An error unless `arg`, which its call reads once rather than for each
-/// row, reads nothing of a row; `what` names it in the error
+/// row, is one value for the call as [`statement_constant`] asks, except
+/// that a prepared block counts as one unless `reads_parent` holds for it,
+/// and a function drawing a value per call counts only when `draws`
 pub(crate) fn read_once(
     arg: &Expression,
     registry: &FunctionRegistry,
     what: &str,
+    (draws, reads_parent): (bool, &dyn Fn(u16) -> bool),
 ) -> crate::core::Result<()> {
-    match reads_no_row(arg, registry) {
-        true => Ok(()),
-        false => Err(reads_row(what)),
+    let walk = Walk {
+        registry,
+        statement_rows: &|_| false,
+        constant: true,
+        whole_blocks: false,
+        draws,
+        reads_parent,
+    };
+    match walk.expression(arg) {
+        Volatility::PerCall => Err(reads_row(what)),
+        Volatility::Fixed | Volatility::PerStatement => Ok(()),
     }
 }
 
@@ -153,6 +153,7 @@ pub(crate) fn statement_volatility_in(
         constant: false,
         whole_blocks: false,
         draws: true,
+        reads_parent: &|_| true,
     }
     .statement(stmt)
 }
@@ -169,6 +170,7 @@ pub(crate) fn expression_volatility_in(
         constant: false,
         whole_blocks: false,
         draws: true,
+        reads_parent: &|_| true,
     }
     .expression(expr)
 }
@@ -185,6 +187,8 @@ struct Walk<'a> {
     whole_blocks: bool,
     /// Whether a call counts what its function draws
     draws: bool,
+    /// Whether a prepared block, by its id, reads the row of its caller
+    reads_parent: &'a dyn Fn(u16) -> bool,
 }
 
 impl Walk<'_> {
@@ -324,7 +328,10 @@ impl Walk<'_> {
     /// once per statement at most, seen from outside it
     fn block(&self, stmt: &SelectStatement) -> Volatility {
         if self.constant {
-            return Volatility::PerCall;
+            return match stmt.prepared {
+                Some(id) if !(self.reads_parent)(id) => Volatility::PerStatement,
+                _ => Volatility::PerCall,
+            };
         }
         if self.whole_blocks {
             return self.statement(stmt);

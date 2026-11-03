@@ -162,7 +162,7 @@ impl<'a> RowPrograms<'a> {
 enum ArgSource {
     Literal(Value),
     Parameter,
-    Program(OnceLock<Result<Program>>),
+    Program(OnceLock<Result<SharedProgram>>),
 }
 
 impl ArgSource {
@@ -172,6 +172,20 @@ impl ArgSource {
             None if matches!(expr, Expression::Parameter(_)) => ArgSource::Parameter,
             None => ArgSource::Program(OnceLock::new()),
         }
+    }
+
+    /// The program of `expr` over `columns`, compiled on its first read
+    fn program<'p>(
+        program: &'p OnceLock<Result<SharedProgram>>,
+        expr: &Expression,
+        columns: &[String],
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+    ) -> Result<&'p SharedProgram> {
+        let program = program.get_or_init(|| {
+            let outer = super::query::outer_column_names(ctx);
+            row_program(expr, columns, None, outer.as_deref(), ctx, blocks)
+        });
+        program.as_ref().map_err(Clone::clone)
     }
 }
 
@@ -186,10 +200,17 @@ struct ConstArg<'w> {
 }
 
 impl<'w> ConstArg<'w> {
-    fn new(expr: &'w Expression, registry: &FunctionRegistry, what: &str) -> Self {
+    /// `expr`, the argument `what`, a block in it answered by `blocks`
+    fn new(
+        expr: &'w Expression,
+        registry: &FunctionRegistry,
+        what: &str,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Self {
         let source = ArgSource::of(expr);
+        let reads_parent = |id| blocks.is_none_or(|blocks| blocks.reads_parent(id));
         let reads_row = match source {
-            ArgSource::Program(_) => read_once(expr, registry, what).err(),
+            ArgSource::Program(_) => read_once(expr, registry, what, (false, &reads_parent)).err(),
             ArgSource::Literal(_) | ArgSource::Parameter => None,
         };
         Self {
@@ -200,18 +221,29 @@ impl<'w> ConstArg<'w> {
         }
     }
 
-    fn evaluate(&self, ctx: &ExecutionContext) -> Result<Value> {
+    fn evaluate(
+        &self,
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+    ) -> Result<Value> {
         if let Some(error) = &self.reads_row {
             return Err(error.clone());
         }
         match &self.source {
             ArgSource::Literal(value) => Ok(value.clone()),
             ArgSource::Parameter => evaluate_once(self.expr, Some(ctx)),
-            ArgSource::Program(program) => match program.get_or_init(|| compile_once(self.expr)) {
-                Ok(program) => execute_once(program, Some(ctx)),
-                Err(e) => Err(e.clone()),
-            },
+            ArgSource::Program(program) => {
+                let program = program.get_or_init(|| {
+                    compile_once(self.expr, blocks.is_some()).map(SharedProgram::new)
+                });
+                execute_once(program.as_ref().map_err(Clone::clone)?, Some(ctx), blocks)
+            }
         }
+    }
+
+    /// Whether the argument holds a subquery, which only the statement's
+    /// blocks answer
+    fn reads_blocks(&self) -> bool {
+        Executor::has_subqueries(self.expr)
     }
 }
 
@@ -227,14 +259,14 @@ impl<'a, 'w> PartitionArg<'a, 'w> {
         Self { arg, cached: None }
     }
 
-    fn value(&mut self, ctx: &ExecutionContext) -> Result<Value> {
+    fn value(&mut self, read: (&ExecutionContext, Option<&dyn SubqueryExecutor>)) -> Result<Value> {
         if !self.arg.deterministic {
-            return self.arg.evaluate(ctx);
+            return self.arg.evaluate(read);
         }
         if let Some(v) = &self.cached {
             return Ok(v.clone());
         }
-        let v = self.arg.evaluate(ctx)?;
+        let v = self.arg.evaluate(read)?;
         self.cached = Some(v.clone());
         Ok(v)
     }
@@ -249,8 +281,6 @@ struct CallArgs<'w> {
     count: Option<ConstArg<'w>>,
     /// LAG and LEAD's default, which may read the row
     default: Option<(&'w Expression, ArgSource)>,
-    /// The default's program, as a row program reads it
-    default_program: OnceLock<Result<SharedProgram>>,
     /// A value function's first argument for each row, when it is not a column
     input: Vec<Value>,
 }
@@ -280,10 +310,15 @@ impl ValueInput<'_> {
 }
 
 impl<'w> CallArgs<'w> {
-    fn of(wf_info: &'w WindowFunctionInfo, registry: &FunctionRegistry) -> Self {
+    /// The arguments of `wf_info`, a block in them answered by `blocks`
+    fn of(
+        wf_info: &'w WindowFunctionInfo,
+        registry: &FunctionRegistry,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Self {
         let offset_of = |bound: &'w WindowFrameBound| match bound {
             WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
-                Some(ConstArg::new(expr, registry, FRAME_OFFSET))
+                Some(ConstArg::new(expr, registry, FRAME_OFFSET, blocks))
             }
             _ => None,
         };
@@ -296,43 +331,38 @@ impl<'w> CallArgs<'w> {
                 wf_info
                     .arguments
                     .get(at)
-                    .map(|expr| ConstArg::new(expr, registry, what))
+                    .map(|expr| ConstArg::new(expr, registry, what, blocks))
             }),
             default: wf_info
                 .arguments
                 .get(2)
                 .filter(|_| lead_lag)
                 .map(|expr| (expr, ArgSource::of(expr))),
-            default_program: OnceLock::new(),
             input: Vec::new(),
         }
     }
 
     /// The default's program over the input `columns`, compiled on first
-    /// read as the input's is; None when there is no default or it is read
-    /// without one
+    /// read; None when there is no default or it is read without one
     fn default_program(
         &self,
         columns: &[String],
-        ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Option<&Program>> {
-        let Some((expr, ArgSource::Program(_))) = &self.default else {
+        let Some((expr, ArgSource::Program(program))) = &self.default else {
             return Ok(None);
         };
-        let program = self.default_program.get_or_init(|| {
-            let outer = super::query::outer_column_names(ctx);
-            row_program(expr, columns, None, outer.as_deref(), ctx, blocks)
-        });
-        program.as_deref().map(Some).map_err(Clone::clone)
+        ArgSource::program(program, expr, columns, read).map(|program| Some(&**program))
     }
 
-    /// Whether the default reads a subquery, which only the statement's
-    /// blocks answer
-    fn default_reads_blocks(&self) -> bool {
-        self.default
-            .as_ref()
-            .is_some_and(|(expr, _)| Executor::has_subqueries(expr))
+    /// Whether the default or the count read a subquery, which only the
+    /// statement's blocks answer, so the partitions read them on this thread
+    fn reads_blocks(&self) -> bool {
+        self.count.as_ref().is_some_and(ConstArg::reads_blocks)
+            || self
+                .default
+                .as_ref()
+                .is_some_and(|(expr, _)| Executor::has_subqueries(expr))
     }
 
     /// LAG and LEAD's default for the current `row`, NULL without one
@@ -406,7 +436,11 @@ struct Frame {
 }
 
 impl Frame {
-    fn read(wf_info: &WindowFunctionInfo, args: &CallArgs, ctx: &ExecutionContext) -> Result<Self> {
+    fn read(
+        wf_info: &WindowFunctionInfo,
+        args: &CallArgs,
+        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+    ) -> Result<Self> {
         let Some(frame) = &wf_info.frame else {
             let end = if wf_info.order_by.is_empty() {
                 FrameEdge::UnboundedFollowing
@@ -424,7 +458,7 @@ impl Frame {
             let arg = arg
                 .as_ref()
                 .ok_or_else(|| Error::internal("a frame offset with no argument"))?;
-            let value = arg.evaluate(ctx)?;
+            let value = arg.evaluate(read)?;
             Ok(if range {
                 FrameOffset::Range(range_distance(&value)?)
             } else {
@@ -960,7 +994,7 @@ impl Executor {
                                 std::borrow::Cow::Borrowed(stmt),
                                 (columns, columns.len(), stmt.columns.len()),
                                 &FxHashMap::default(),
-                                ctx,
+                                (ctx, None),
                             )?;
                             &made
                         }
@@ -1175,7 +1209,7 @@ impl Executor {
             stmt,
             (base_columns, visible_columns, written_items),
             group_slots,
-            ctx,
+            (ctx, blocks),
         )?;
         self.run_window(
             &plan,
@@ -1228,7 +1262,7 @@ impl Executor {
             std::borrow::Cow::Owned(extended),
             (columns, columns.len(), stmt.columns.len()),
             &FxHashMap::default(),
-            ctx,
+            (ctx, None),
         )
         .map(Some)
     }
@@ -1241,10 +1275,11 @@ impl Executor {
         stmt: std::borrow::Cow<'s, SelectStatement>,
         (base_columns, visible_columns, written_items): (&[String], usize, usize),
         group_slots: &FxHashMap<ExprKey, usize>,
-        ctx: &ExecutionContext,
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<WindowPlan<'s>> {
         // Parse window functions from the SELECT list
-        let mut window_functions = self.parse_window_functions(&stmt, base_columns, ctx)?;
+        let mut window_functions =
+            self.parse_window_functions(&stmt, base_columns, (ctx, blocks))?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
 
         // LIMIT pushdown for PARTITION BY queries is safe only when there is
@@ -1705,7 +1740,7 @@ impl Executor {
                 } else {
                     self.function_registry.get_window(&wf.name)
                 };
-                let mut args = CallArgs::of(wf, &self.function_registry);
+                let mut args = CallArgs::of(wf, &self.function_registry, blocks);
                 args.input = self.window_input(
                     wf,
                     base_rows,
@@ -1921,7 +1956,12 @@ impl Executor {
                 } else {
                     self.function_registry.get_window(&wf.name)
                 };
-                (wf, func, is_agg, CallArgs::of(wf, &self.function_registry))
+                (
+                    wf,
+                    func,
+                    is_agg,
+                    CallArgs::of(wf, &self.function_registry, None),
+                )
             })
             .collect();
 
@@ -2390,7 +2430,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         _base_columns: &[String],
-        ctx: &ExecutionContext,
+        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Vec<WindowFunctionInfo>> {
         let mut window_functions = Vec::new();
         let mut col_idx = 0;
@@ -2399,7 +2439,7 @@ impl Executor {
             match col_expr {
                 Expression::Window(window_expr) => {
                     let mut wf_info =
-                        self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
+                        self.extract_window_function_info(window_expr, &stmt.window_defs, read)?;
                     // Two unaliased windows of the same function would share a
                     // name; the internal one is unique, the output keeps the
                     // function's own
@@ -2409,8 +2449,11 @@ impl Executor {
                 }
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
-                        let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
+                        let mut wf_info = self.extract_window_function_info(
+                            window_expr,
+                            &stmt.window_defs,
+                            read,
+                        )?;
                         // The alias is only the output name; the internal name
                         // cannot collide with an alias or another window
                         wf_info.column_name = format!("__wf_{}_0", col_idx);
@@ -2426,7 +2469,7 @@ impl Executor {
                             let mut wf_info = self.extract_window_function_info(
                                 window_expr,
                                 &stmt.window_defs,
-                                ctx,
+                                read,
                             )?;
                             wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                             window_functions.push(wf_info);
@@ -2438,8 +2481,11 @@ impl Executor {
                     let mut windows = Vec::new();
                     Self::collect_all_windows_in_expression(col_expr, &mut windows);
                     for (i, window_expr) in windows.into_iter().enumerate() {
-                        let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
+                        let mut wf_info = self.extract_window_function_info(
+                            window_expr,
+                            &stmt.window_defs,
+                            read,
+                        )?;
                         wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                         window_functions.push(wf_info);
                     }
@@ -2566,7 +2612,7 @@ impl Executor {
         &self,
         window_expr: &WindowExpression,
         window_defs: &[WindowDefinition],
-        ctx: &ExecutionContext,
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
 
@@ -2600,7 +2646,7 @@ impl Executor {
         // Build column name
         let column_name = format!("{}()", func.function);
         let (extra_args, extra_error) = if self.function_registry.is_aggregate(&func.function) {
-            super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx))?
+            super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx), blocks)?
         } else {
             (Vec::new(), None)
         };
@@ -2852,7 +2898,7 @@ impl Executor {
                 pre_sorted,
                 cached_order_by,
                 partition_cache,
-                &CallArgs::of(wf_info, &self.function_registry),
+                &CallArgs::of(wf_info, &self.function_registry, blocks),
                 blocks,
             );
         }
@@ -2895,7 +2941,7 @@ impl Executor {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let mut args = CallArgs::of(wf_info, &self.function_registry);
+        let mut args = CallArgs::of(wf_info, &self.function_registry, blocks);
         args.input = self.window_input(
             wf_info,
             rows,
@@ -2905,7 +2951,7 @@ impl Executor {
             ctx,
             blocks,
         )?;
-        let frame = Frame::read(wf_info, &args, ctx)?;
+        let frame = Frame::read(wf_info, &args, (ctx, blocks))?;
 
         // If there's no partitioning, all rows form one partition
         if wf_info.partition_by_exprs.is_empty() {
@@ -2934,9 +2980,7 @@ impl Executor {
         // Compute window function for each partition
         // Use parallel execution for large number of partitions
         let partition_count = partitions.len();
-        // A default reading a subquery reads the statement's blocks, which stay on this thread
-        let use_parallel =
-            partition_count >= 10 && rows.len() >= 1000 && !args.default_reads_blocks();
+        let use_parallel = partition_count >= 10 && rows.len() >= 1000 && !args.reads_blocks();
 
         if use_parallel {
             // Parallel execution: process partitions concurrently
@@ -2947,7 +2991,7 @@ impl Executor {
             // Each partition writes to its own row indices (guaranteed disjoint).
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
-            let lead_lag_default = args.default_program(columns, ctx, blocks)?;
+            let lead_lag_default = args.default_program(columns, (ctx, blocks))?;
 
             // A default holding a REGEXP is copied once per thread, not per job
             #[cfg(feature = "parallel")]
@@ -3078,14 +3122,14 @@ impl Executor {
         if row_indices.is_empty() {
             return Ok((Vec::new(), row_indices));
         }
-        let frame = Frame::read(wf_info, args, ctx)?;
+        let frame = Frame::read(wf_info, args, (ctx, blocks))?;
         let mut results = Vec::with_capacity(row_indices.len());
         self.compute_sorted_partition(
             window_func,
             wf_info,
             &frame,
             args,
-            args.default_program(columns, ctx, blocks)?,
+            args.default_program(columns, (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3158,7 +3202,7 @@ impl Executor {
                 "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
                     wf_info.name == "LEAD",
                     match &mut count_arg {
-                        Some(arg) => window_count(&arg.value(ctx)?, lead_lag_offset, 0)?,
+                        Some(arg) => window_count(&arg.value((ctx, blocks))?, lead_lag_offset, 0)?,
                         None => 1,
                     },
                     args.default_value(
@@ -3174,9 +3218,11 @@ impl Executor {
                 )?,
                 "NTILE" => Self::compute_ntile(
                     match &mut count_arg {
-                        Some(arg) => {
-                            window_count(&arg.value(ctx)?, "the bucket count of NTILE", 1)?
-                        }
+                        Some(arg) => window_count(
+                            &arg.value((ctx, blocks))?,
+                            "the bucket count of NTILE",
+                            1,
+                        )?,
                         None => 1,
                     },
                     partition_len,
@@ -3204,7 +3250,11 @@ impl Executor {
                         )?,
                         "NTH_VALUE" => match &mut count_arg {
                             Some(arg) if frame_start < frame_end => {
-                                let n = window_count(&arg.value(ctx)?, "the n of NTH_VALUE", 1)?;
+                                let n = window_count(
+                                    &arg.value((ctx, blocks))?,
+                                    "the n of NTH_VALUE",
+                                    1,
+                                )?;
                                 Self::compute_nth_value_indexed(
                                     n,
                                     all_rows,
@@ -3287,7 +3337,7 @@ impl Executor {
             wf_info,
             frame,
             args,
-            args.default_program(columns, ctx, blocks)?,
+            args.default_program(columns, (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -4286,7 +4336,7 @@ impl Executor {
         if let Some(error) = &wf_info.extra_error {
             return Err(error.clone());
         }
-        let frame = Frame::read(wf_info, args, ctx)?;
+        let frame = Frame::read(wf_info, args, (ctx, blocks))?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
         for row_indices in partitions.iter() {

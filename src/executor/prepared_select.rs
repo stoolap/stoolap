@@ -80,9 +80,7 @@ use super::utils::{
     order_by_names_an_alias, qualified, split_qualified, strip_table_qualifier,
     value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
-use super::volatility::{
-    expression_volatility, read_once_argument, statement_constant, statement_draws_per_call,
-};
+use super::volatility::{expression_volatility, read_once_argument, statement_draws_per_call};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
@@ -2472,15 +2470,6 @@ impl Chain<'_> {
     }
 }
 
-/// The arguments `call`, a window function's when `over`, reads once
-fn read_once_operands(call: &FunctionCall, over: bool) -> impl Iterator<Item = &Expression> {
-    call.arguments
-        .iter()
-        .enumerate()
-        .filter(move |(at, _)| read_once_argument(&call.function, *at, over).is_some())
-        .map(|(_, arg)| arg)
-}
-
 /// Each column of the projected row `expr` reads past the statement's first
 /// `from` columns, by its position on that row
 fn projected_columns(expr: &Expression, from: usize, out: &mut SmallVec<[usize; 2]>) {
@@ -3879,7 +3868,7 @@ impl PreparedSelect {
         executor: &Executor,
         written: &SelectStatement,
     ) -> Result<Option<Vec<SqlAggregateFunction>>> {
-        Ok(Some(executor.parse_block_aggregations(written)?)
+        Ok(Some(executor.parse_held_aggregations(written)?)
             .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())))
     }
 
@@ -5890,90 +5879,8 @@ impl Builder<'_> {
                 Ok(slot_parameter(slot))
             }
             (Some(_), false) => Ok(expr.clone()),
-            (None, _) => match self.read_once_slotted(expr, run_slots)? {
-                Some(call) => rebuild(&call, &mut |child| self.slotted(child, run_slots)),
-                None => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
-            },
+            (None, _) => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
         }
-    }
-
-    /// The call `expr` with each argument it reads once slotted by
-    /// [`Self::slotted_once`]; None when none of them holds a block
-    fn read_once_slotted(
-        &mut self,
-        expr: &Expression,
-        run_slots: &mut Vec<(usize, Expression)>,
-    ) -> Result<Option<Expression>> {
-        let holds = match expr {
-            Expression::Window(window) => read_once_operands(&window.function, true)
-                .chain(window.frame_offsets())
-                .any(mentions_subquery),
-            Expression::FunctionCall(call) => {
-                read_once_operands(call, false).any(mentions_subquery)
-            }
-            _ => false,
-        };
-        if !holds {
-            return Ok(None);
-        }
-        let mut call = expr.clone();
-        let (function, frame, over) = match &mut call {
-            Expression::Window(window) => (&mut *window.function, window.frame.as_mut(), true),
-            Expression::FunctionCall(function) => (&mut **function, None, false),
-            _ => return Ok(None),
-        };
-        let name = &function.function;
-        let arguments = function
-            .arguments
-            .iter_mut()
-            .enumerate()
-            .filter(|(at, _)| read_once_argument(name, *at, over).is_some())
-            .map(|(_, arg)| arg);
-        for arg in arguments.chain(frame.into_iter().flat_map(WindowFrame::offsets_mut)) {
-            *arg = self.slotted_once(arg, run_slots)?;
-        }
-        Ok(Some(call))
-    }
-
-    /// `expr`, which its call reads once, with each block that binds no row
-    /// a run slot as [`Self::slotted`] makes one, and so a windowed block's
-    /// value and a member test whose left side is one value; the rest is
-    /// read where the call reads it
-    fn slotted_once(
-        &mut self,
-        expr: &Expression,
-        run_slots: &mut Vec<(usize, Expression)>,
-    ) -> Result<Expression> {
-        let registry = &self.executor.function_registry;
-        let unbound = |block: &SelectStatement| {
-            block
-                .prepared
-                .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
-                .filter(|sq| sq.uncorrelated() && sq.parent.is_none())
-        };
-        let once = match expr {
-            Expression::ScalarSubquery(sq) => unbound(&sq.subquery).is_some_and(|sq| {
-                !matches!(&sq.answer, Answer::Members(..))
-                    && !matches!(&sq.answer, Answer::Statement(_, block)
-                        if matches!(block.form, StatementForm::Members(..)))
-            }),
-            Expression::Exists(exists) => unbound(&exists.subquery).is_some(),
-            Expression::In(in_expr) => {
-                matches!(&*in_expr.right, Expression::ScalarSubquery(sq)
-                    if unbound(&sq.subquery).is_some())
-                    && statement_constant(&in_expr.left, registry)
-            }
-            Expression::AllAny(all_any) => {
-                unbound(&all_any.subquery).is_some() && statement_constant(&all_any.left, registry)
-            }
-            _ => false,
-        };
-        if once {
-            let slot = self.slot();
-            run_slots.push((slot, expr.clone()));
-            return Ok(slot_parameter(slot));
-        }
-        rebuild(expr, &mut |child| self.slotted_once(child, run_slots))
     }
 
     /// [`Self::rewrite`] of `expr` for a look at its bound form only: its
@@ -12429,7 +12336,7 @@ impl Executor {
         if held.windows_alone() {
             return self.grouped_windows(held, run, (rows, columns), (None, None), ctx);
         }
-        let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, ctx)?;
+        let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
         let windows = held.classification.has_window_functions;
         let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
         let calls = (aggregations, Some(run as &dyn SubqueryExecutor));
@@ -12492,7 +12399,7 @@ impl Executor {
         (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         table: &dyn Table,
     ) -> Result<WindowOutput> {
-        let aggregations = &*self.prepared_calls(prepared.calls, stmt, ctx)?;
+        let aggregations = &*self.prepared_calls(prepared.calls, stmt, (ctx, runner))?;
         let windows = prepared.windowed;
         let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
         if QueryClassification::groups(stmt) || windows {
@@ -12610,7 +12517,7 @@ impl Executor {
         source: StatementSource<'_>,
         columns: &[String],
     ) -> Result<WindowOutput> {
-        let aggregations = &*self.prepared_calls(prepared.calls, stmt, ctx)?;
+        let aggregations = &*self.prepared_calls(prepared.calls, stmt, (ctx, runner))?;
         let windows = prepared.windowed;
         let calls = (
             aggregations,
@@ -12669,11 +12576,11 @@ impl Executor {
         &self,
         held: Option<&'p [SqlAggregateFunction]>,
         stmt: &SelectStatement,
-        ctx: &ExecutionContext,
+        (ctx, run): (&ExecutionContext, &PreparedRunner<'_>),
     ) -> Result<std::borrow::Cow<'p, [SqlAggregateFunction]>> {
         Ok(match held {
             Some(calls) => std::borrow::Cow::Borrowed(calls),
-            None => std::borrow::Cow::Owned(self.parse_aggregations(stmt, Some(ctx))?.0),
+            None => std::borrow::Cow::Owned(self.parse_aggregations_in(stmt, ctx, run)?),
         })
     }
 
@@ -15525,6 +15432,13 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         }
     }
 
+    fn reads_parent(&self, subquery_index: u16) -> bool {
+        self.prepared
+            .subqueries
+            .get(subquery_index as usize)
+            .is_none_or(|sq| !sq.uncorrelated() || sq.parent.is_some())
+    }
+
     fn params(&self) -> Option<&[Value]> {
         Some(&self.base)
     }
@@ -15601,6 +15515,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
         self.runner.kept_members(subquery_index)
+    }
+
+    fn reads_parent(&self, subquery_index: u16) -> bool {
+        self.runner.reads_parent(subquery_index)
     }
 
     fn params(&self) -> Option<&[Value]> {

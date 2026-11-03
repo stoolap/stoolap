@@ -218,6 +218,36 @@ fn shapes() -> Vec<(String, String)> {
              OVER (ORDER BY t.id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM t \
              WHERE t.id = 1",
         ),
+        shape(
+            "SELECT t.id, NTH_VALUE(t.id, CASE WHEN ABS(-9223372036854775808) IN \
+             (SELECT u.x FROM u) THEN 1 ELSE 2 END) \
+             OVER (ORDER BY t.id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM {t} \
+             WHERE t.id = 1",
+            "SELECT t.id, NTH_VALUE(t.id, 1) \
+             OVER (ORDER BY t.id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM t \
+             WHERE t.id = 1",
+        ),
+        // A member test's left side may be any value that reads no row
+        shape(
+            "SELECT t.id, NTILE(CASE WHEN (SELECT MAX(u.x) FROM u) - 3 IN (SELECT u.x FROM u) \
+             THEN 3 ELSE 4 END) OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, NTILE(CASE WHEN (SELECT MAX(u.x) FROM u) - 3 = ANY (SELECT u.x FROM u) \
+             THEN 3 ELSE 4 END) OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, NTILE(CASE WHEN CAST(RANDOM() * 0 AS INTEGER) + 3 IN \
+             (SELECT u.x FROM u) THEN 3 ELSE 4 END) OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT STRING_AGG(CAST(t.b AS TEXT), CASE WHEN 3 IN (SELECT u.x FROM u) THEN '0' END \
+             ORDER BY t.id) FROM {t}",
+            "SELECT STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.id) FROM t",
+        ),
         // A default is read for each row
         shape(
             "SELECT t.id, LAG(t.b, 1, (SELECT COUNT(*) FROM u WHERE u.k = t.a)) \

@@ -462,6 +462,11 @@ pub trait SubqueryExecutor {
         None
     }
 
+    /// Whether the block reads a row of the statement that calls it
+    fn reads_parent(&self, _subquery_index: u16) -> bool {
+        true
+    }
+
     /// The parameters the statement's programs read beside these blocks:
     /// its own, then the values its run computed once; None when the
     /// caller's own parameters are all there are

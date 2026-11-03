@@ -3161,7 +3161,7 @@ impl Executor {
     /// row, so a subquery there answers for the whole partition. The lift
     /// leaves it where it is; this resolves the ones that read no row either,
     /// before the argument is compiled against no columns at all. A block a
-    /// prepared plan left there binds the row, which the call refuses
+    /// prepared plan made is answered by its blocks where the call reads it
     pub(crate) fn fold_window_control_arguments(
         &self,
         window_functions: &mut [super::window::WindowFunctionInfo],
