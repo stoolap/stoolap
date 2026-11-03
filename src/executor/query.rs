@@ -5280,12 +5280,36 @@ impl Executor {
                 self.read_join_side(expr, ctx, side, Some(&none), Some(0), 0)
                     .map(|(_, columns, _, _)| columns)
             };
-            let left_cols = columns_of(&join_source.left, left_read)?;
-            let right_cols = columns_of(&join_source.right, right_read)?;
-            if let Some(where_clause) = &where_for_join {
-                let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
-                Self::bind_empty_where(stmt, where_clause, &joined)?;
-            }
+            // The blocks name the sides' columns and bound the WHERE when
+            // they prepared; without them each side is read for its names
+            let (left_cols, right_cols) = match (statement_run, block_sides.as_ref()) {
+                (Some(run), Some(sides)) => {
+                    // A table side still has the columns they were prepared over
+                    let entries = [&join_source.left, &join_source.right];
+                    for (i, entry) in entries.into_iter().enumerate() {
+                        if let (false, Expression::TableSource(ts)) = (rows_sides[i], &**entry) {
+                            let schema = self.engine.get_table_schema(&ts.name.value_lower)?;
+                            run.blocks.side_fits(i, &schema)?;
+                        }
+                    }
+                    let names = |side: &JoinSide| -> Vec<String> {
+                        side.columns()
+                            .map(|(table, name)| qualified(table, name))
+                            .collect()
+                    };
+                    (names(&sides[0]), names(&sides[1]))
+                }
+                _ => {
+                    let left_cols = columns_of(&join_source.left, left_read)?;
+                    let right_cols = columns_of(&join_source.right, right_read)?;
+                    if let Some(where_clause) = &where_for_join {
+                        let joined: Vec<String> =
+                            left_cols.iter().chain(&right_cols).cloned().collect();
+                        Self::bind_empty_where(stmt, where_clause, &joined)?;
+                    }
+                    (left_cols, right_cols)
+                }
+            };
             (
                 CompactArc::new(Vec::new()),
                 left_cols,
