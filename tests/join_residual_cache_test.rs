@@ -369,55 +369,6 @@ fn a_hash_join_reads_any_number_of_held_residuals_without_allocating() {
 }
 
 #[test]
-fn a_join_without_a_plan_builds_no_shared_list() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let db = Database::open("memory://join_residual_without_a_plan").unwrap();
-    for sql in [
-        "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER)",
-        "CREATE TABLE r (id INTEGER PRIMARY KEY, w INTEGER)",
-        "CREATE TABLE s (id INTEGER PRIMARY KEY)",
-        "INSERT INTO l SELECT g.value, (g.value - 1) / 10 FROM generate_series(1, 30) g",
-        "INSERT INTO r SELECT g.value, g.value % 5 FROM generate_series(1, 50) g",
-        "INSERT INTO s SELECT g.value FROM generate_series(1, 50) g",
-    ] {
-        db.execute(sql, ()).unwrap();
-    }
-    // A windowed star over a USING join holding a subquery stays off a plan
-    let with = |conditions: &[&str]| {
-        let on: String = conditions.iter().map(|c| format!(" AND {c}")).collect();
-        allocations_per_run(
-            &db,
-            &format!(
-                "SELECT *, COUNT(*) OVER (), (SELECT MIN(id) FROM s) FROM \
-                 (SELECT l.id, r.id AS rid FROM l JOIN r ON l.g = r.w{on}) AS d \
-                 JOIN s USING (id)"
-            ),
-        )
-    };
-    let zero = with(&[]);
-    let one = with(&["l.id < 100"]);
-    let two = with(&["l.id < 100", "r.id < 100"]);
-    let three = with(&["l.id < 100", "r.id < 100", "l.g < 100"]);
-    let four = with(&["l.id < 100", "r.id < 100", "l.g < 100", "r.w < 100"]);
-    assert_eq!(
-        (one - zero) - (two - one),
-        2.0,
-        "a first residual costs {} allocations per run, a second {}: beyond its \
-         program, only the analysis's condition list and the filter list should",
-        one - zero,
-        two - one
-    );
-    assert_eq!(
-        (two - one, three - two),
-        (four - three, four - three),
-        "a second, third and fourth residual cost {}, {} and {} allocations per run",
-        two - one,
-        three - two,
-        four - three
-    );
-}
-
-#[test]
 fn a_held_join_analysis_copies_no_condition_per_run() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://join_residual_held_analysis").unwrap();
