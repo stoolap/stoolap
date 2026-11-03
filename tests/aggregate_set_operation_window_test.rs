@@ -180,3 +180,25 @@ fn a_grouped_family_branch_groups_no_more_than_its_union_all_needs() {
         assert!(!taken.contains(&"general"), "{sql}: took {taken:?}");
     }
 }
+
+#[test]
+fn a_union_all_branch_reads_only_the_groups_its_limit_needs() {
+    let _guard = serial();
+    let db = Database::open("memory://aggregate_set_operation_window_bound").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, a INTEGER)",
+        "CREATE INDEX t_g ON t(g)",
+        "INSERT INTO t VALUES (1, 1, 0), (2, 2, 9223372036854775807), (3, 2, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING g > 0 UNION ALL SELECT 0, 0 LIMIT 1",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING COUNT(*) > 0 UNION ALL SELECT 0, 0 LIMIT 1",
+        "SELECT g, SUM(a) FROM t GROUP BY g HAVING g > 0 UNION ALL SELECT 0, 0 LIMIT 1 OFFSET 0",
+    ] {
+        let want = vec!["Integer(1)|Integer(0)".to_string()];
+        assert_eq!(rows(&db, sql).map(|(_, rows)| rows), Ok(want), "{sql}");
+        assert_eq!(rows(&db, sql), general(&db, sql), "{sql}");
+    }
+}

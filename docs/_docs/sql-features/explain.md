@@ -551,6 +551,8 @@ Limit 5
         -> Seq Scan on products
 ```
 
+A UNION ALL without ORDER BY or DISTINCT needs at most LIMIT + OFFSET rows from its first branch, which shows that bound as a `Limit` step of its own, `Limit (2 + 1)` under `LIMIT 2 OFFSET 1`; a grouped branch reads only the groups the bound needs where the table's index walk can stop.
+
 ## EXPLAIN ANALYZE
 
 Executes the query and shows actual runtime statistics.

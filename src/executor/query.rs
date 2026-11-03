@@ -1958,11 +1958,7 @@ impl Executor {
         // A pure UNION ALL without ORDER BY or DISTINCT needs LIMIT + OFFSET
         // rows at most from each branch, so that many bound the first
         // branch and the set operation; the whole is cut below
-        let all_union_all = stmt
-            .set_operations
-            .iter()
-            .all(|op| matches!(op.operation, SetOperationType::UnionAll));
-        let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
+        let set_limit = if super::prepared_select::bounds_first_branch(stmt) {
             // A sum past i64 is no bound the branch can take
             limit
                 .and_then(|l| l.checked_add(offset))
@@ -9771,7 +9767,10 @@ impl Executor {
     /// operation's branch
     fn group_held_rows(
         &self,
-        (held, bound): (&super::prepared_select::PreparedGrouped, Option<usize>),
+        (held, bound): (
+            &super::prepared_select::PreparedGrouped,
+            super::prepared_select::BranchBound,
+        ),
         run: &super::prepared_select::PreparedRunner<'_>,
         ctx: &ExecutionContext,
         rows: RowVec,
@@ -9823,12 +9822,13 @@ impl Executor {
     }
 
     /// The rows a set operation needs from `branch`, its first branch as the
-    /// general path runs it, which carries that bound as its LIMIT; None for
-    /// a statement of its own, whose LIMIT the prepared one holds
-    fn branch_bound(branch: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
-        (!branch.set_operations.is_empty())
-            .then(|| super::row_count::rows_needed(branch, ctx))
-            .flatten()
+    /// general path runs it, which carries that bound as its LIMIT; a
+    /// statement of its own holds its LIMIT in the prepared one
+    fn branch_bound(
+        branch: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> super::prepared_select::BranchBound {
+        (!branch.set_operations.is_empty()).then(|| super::row_count::rows_needed(branch, ctx))
     }
 
     /// `output`, the rows the run `run` of `held` returned, with each late key
@@ -9853,7 +9853,10 @@ impl Executor {
     /// as `bound` when it is a set operation's branch
     fn grouped_output(
         &self,
-        (held, bound): (&super::prepared_select::PreparedGrouped, Option<usize>),
+        (held, bound): (
+            &super::prepared_select::PreparedGrouped,
+            super::prepared_select::BranchBound,
+        ),
         run: &super::prepared_select::PreparedRunner<'_>,
         grouped: super::prepared_select::GroupedRun<'_>,
         ctx: &ExecutionContext,
