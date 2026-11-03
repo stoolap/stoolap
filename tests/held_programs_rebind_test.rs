@@ -57,6 +57,10 @@ const SHAPES: &[&str] = &[
     "SELECT a, SUM(a) FILTER (WHERE a > $1) OVER (ORDER BY a) FROM t ORDER BY a",
     "SELECT a, FIRST_VALUE(a + $1) OVER (ORDER BY a) FROM t ORDER BY a",
     "SELECT a, STRING_AGG(b, ',' ORDER BY a % $1, a) OVER () FROM t ORDER BY a",
+    "SELECT a % 2, STRING_AGG(CAST(a * $1 AS TEXT), CAST($1 AS TEXT) ORDER BY a) FROM t GROUP BY a % 2 ORDER BY 1",
+    "SELECT a, LAG(a * $1, $1 - 1, a + $1) OVER (ORDER BY a) FROM t ORDER BY a",
+    "SELECT a, STRING_AGG(b, CAST($1 AS TEXT) ORDER BY a * $1) OVER (ORDER BY a) FROM t ORDER BY a",
+    "SELECT a, a * $1 + ROW_NUMBER() OVER (ORDER BY a) FROM t UNION ALL SELECT 0, 0 LIMIT 3",
 ];
 
 #[test]

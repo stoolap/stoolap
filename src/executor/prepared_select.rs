@@ -82,7 +82,9 @@ use super::utils::{
     QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, read_once_argument, statement_draws_per_call};
-use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
+use super::window::{
+    HeldWindow, WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows,
+};
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
 use crate::planner::{
@@ -3629,8 +3631,11 @@ pub struct PreparedSelect {
     /// Those calls, parsed once when each later argument is written as its
     /// value; None parses them on each run
     calls: Option<Vec<SqlAggregateFunction>>,
-    /// The programs feeding those calls, compiled by the first run
+    /// The programs feeding its calls, held or parsed on each run, compiled
+    /// by the first run
     feed: HeldFeed,
+    /// The programs of its windows, which every plan of them holds
+    windows: HeldWindow,
     /// The statement the window step or the aggregation computes: the one
     /// prepared, a set operation's first branch, with each DISTINCT ON key
     /// its list does not compute riding along as a hidden item
@@ -3665,8 +3670,10 @@ pub(crate) struct RowsRead<'p> {
     read: Option<&'p Read>,
     /// The calls, None when a run parses them
     calls: Option<&'p [SqlAggregateFunction]>,
-    /// The programs feeding the held calls
+    /// The programs feeding the calls
     feed: Option<&'p HeldFeed>,
+    /// The programs of the statement's windows
+    windows: Option<&'p HeldWindow>,
     /// The windows run over the groups
     windowed: bool,
     constant_where: bool,
@@ -3878,7 +3885,8 @@ impl PreparedSelect {
             where_: &self.where_,
             read: self.plan.as_ref().map(|plan| &plan.read),
             calls: self.calls.as_deref(),
-            feed: self.calls.as_ref().map(|_| &self.feed),
+            feed: Some(&self.feed),
+            windows: Some(&self.windows),
             windowed: self.windowed,
             constant_where: self.constant_where,
             source_values: self.source_values.as_deref(),
@@ -8460,10 +8468,11 @@ impl PreparedSelect {
             true => Self::held_calls(executor, computed)?,
             false => None,
         };
+        let windows = HeldWindow::default();
         let window = (windowed && !aggregated)
             .then(|| {
                 executor
-                    .prepared_window_plan(computed, &schema.column_names_arc(), ctx)
+                    .prepared_window_plan(computed, &schema.column_names_arc(), ctx, &windows)
                     .ok()
                     .flatten()
             })
@@ -8487,6 +8496,7 @@ impl PreparedSelect {
             aggregated,
             calls,
             feed: HeldFeed::new(),
+            windows,
             computed: computed_stmt,
             quiet: None,
             window,
@@ -8614,8 +8624,11 @@ pub struct PreparedGrouped {
     read: Option<Read>,
     /// The aggregate calls, None when a run parses them
     calls: Option<Vec<SqlAggregateFunction>>,
-    /// The programs feeding those calls, compiled by the first run
+    /// The programs feeding its calls, held or parsed on each run, compiled
+    /// by the first run
     feed: HeldFeed,
+    /// The programs of its windows, which every plan of them holds
+    windows: HeldWindow,
     /// The WHERE holds no subquery and a term that is a statement constant
     constant_where: bool,
     /// The plan of the windows it computes without grouping, made once when
@@ -9388,10 +9401,11 @@ impl PreparedGrouped {
             false => None,
         };
         let constant_where = PreparedSelect::constant_where(&stmt, &executor.function_registry);
+        let windows = HeldWindow::default();
         let window = (windowed && !aggregated)
             .then(|| {
                 executor
-                    .prepared_window_plan(&stmt, &schema.column_names_arc(), ctx)
+                    .prepared_window_plan(&stmt, &schema.column_names_arc(), ctx, &windows)
                     .ok()
                     .flatten()
             })
@@ -9408,6 +9422,7 @@ impl PreparedGrouped {
             read,
             calls,
             feed: HeldFeed::new(),
+            windows,
             constant_where,
             window,
             source_values,
@@ -9452,7 +9467,8 @@ impl PreparedGrouped {
                 .filter(|_| self.source != GroupedSource::Joined)?,
             read: self.read.as_ref(),
             calls: self.calls.as_deref(),
-            feed: self.calls.as_ref().map(|_| &self.feed),
+            feed: Some(&self.feed),
+            windows: Some(&self.windows),
             windowed: self.classification.has_window_functions,
             constant_where: self.constant_where,
             source_values: self.source_values.as_deref(),
@@ -12555,7 +12571,8 @@ impl Executor {
             (Some(plan), None) => self.window_by_plan(plan, ctx, rows, order, Some(run)),
             _ => {
                 let stmt = &*bounded_branch(&held.stmt, bound);
-                self.window_over(stmt, ctx, rows, order, Some(run))
+                let run = (Some(run as &dyn SubqueryExecutor), Some(&held.windows));
+                self.window_over(stmt, ctx, rows, order, run)
             }
         }
     }
@@ -12628,8 +12645,11 @@ impl Executor {
         let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
         let windows = held.classification.has_window_functions;
         let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
-        let feed = held.calls.as_ref().map(|_| &held.feed);
-        let calls = (aggregations, Some(run as &dyn SubqueryExecutor), feed);
+        let calls = (
+            aggregations,
+            Some(run as &dyn SubqueryExecutor),
+            Some(&held.feed),
+        );
         self.grouped_answer(windows, stmt, calls, ctx, input, columns)
     }
 
@@ -12746,7 +12766,7 @@ impl Executor {
         let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
         let indexed = match prepared.read.and_then(Read::window) {
             Some(read) if !keeps_none => {
-                self.read_window_rows(read, (stmt, plan), ctx, table, names)?
+                self.read_window_rows(read, (stmt, plan, prepared.windows), ctx, table, names)?
             }
             _ => None,
         };
@@ -13191,7 +13211,10 @@ impl Executor {
             // The visible width trims a DISTINCT ON key's hidden item after
             let (result, layout) = match window {
                 Some(plan) => self.window_by_plan(plan, ctx, (&rows, &names), order, None)?,
-                None => self.window_over(computed, ctx, (&rows, &names), order, None)?,
+                None => {
+                    let run = (None, Some(&prepared.windows));
+                    self.window_over(computed, ctx, (&rows, &names), order, run)?
+                }
             };
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);

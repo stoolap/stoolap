@@ -109,11 +109,49 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &[],
         &["Integer(2)", "Integer(3)"],
     ),
+    ("SELECT SUM(a * $1) FROM t", &[2], &["Integer(120)"]),
+    (
+        "SELECT id % 2, SUM(a + $1) FROM t GROUP BY id % 2 ORDER BY 1",
+        &[1],
+        &["Integer(0)|Integer(21)", "Integer(1)|Integer(42)"],
+    ),
+    (
+        "SELECT id, SUM(a * $1) OVER (ORDER BY id) FROM t ORDER BY id",
+        &[2],
+        &[
+            "Integer(1)|Integer(20)",
+            "Integer(2)|Integer(60)",
+            "Integer(3)|Integer(120)",
+        ],
+    ),
+    (
+        "SELECT id, a * $1 + ROW_NUMBER() OVER (ORDER BY id) FROM t UNION ALL SELECT 9, 9 LIMIT 2",
+        &[2],
+        &["Integer(1)|Integer(21)", "Integer(2)|Integer(42)"],
+    ),
 ];
 
-#[test]
-fn a_run_after_the_first_compiles_nothing() {
-    let db = Database::open("memory://runner_held_programs").unwrap();
+/// Statements with an argument after the first that is no literal, which
+/// each run reads once, their parameters and their answers
+const READ_ARGUMENTS: &[(&str, &[i64], &[&str])] = &[
+    (
+        "SELECT STRING_AGG(CAST(a * $1 AS TEXT), CAST($1 AS TEXT) ORDER BY id) FROM t",
+        &[2],
+        &["Text(\"20240260\")"],
+    ),
+    (
+        "SELECT id, LAG(a * $1, $1 - 1, a + $1) OVER (ORDER BY id) FROM t ORDER BY id",
+        &[2],
+        &[
+            "Integer(1)|Integer(12)",
+            "Integer(2)|Integer(20)",
+            "Integer(3)|Integer(40)",
+        ],
+    ),
+];
+
+fn open(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
         "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
@@ -121,19 +159,49 @@ fn a_run_after_the_first_compiles_nothing() {
     ] {
         db.execute(sql, ()).unwrap();
     }
+    db
+}
+
+/// What a second run of `sql` compiled, through the bridge and in all; a
+/// wrong answer of either run goes to `wrong`
+fn compiled_again(
+    db: &Database,
+    (sql, params, answer): (&str, &[i64], &[&str]),
+    wrong: &mut Vec<String>,
+) -> (usize, usize) {
+    let first = rows(db, sql, params);
+    let (bridge, programs) = (bridge_compiles(), program_compiles());
+    let again = rows(db, sql, params);
+    let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+    if first != answer || again != answer {
+        wrong.push(format!(
+            "{sql}: {first:?} then {again:?}, expected {answer:?}"
+        ));
+    }
+    compiled
+}
+
+#[test]
+fn a_run_after_the_first_compiles_nothing() {
+    let db = open("runner_held_programs");
     let mut wrong = Vec::new();
     for &(sql, params, answer) in CASES {
-        let first = rows(&db, sql, params);
-        let (bridge, programs) = (bridge_compiles(), program_compiles());
-        let again = rows(&db, sql, params);
-        let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+        let compiled = compiled_again(&db, (sql, params, answer), &mut wrong);
         if compiled != (0, 0) {
             wrong.push(format!("{sql}: run again, compiled {compiled:?}"));
         }
-        if first != answer || again != answer {
-            wrong.push(format!(
-                "{sql}: {first:?} then {again:?}, expected {answer:?}"
-            ));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_run_reading_its_arguments_compiles_nothing_through_the_bridge() {
+    let db = open("runner_held_programs_arguments");
+    let mut wrong = Vec::new();
+    for &(sql, params, answer) in READ_ARGUMENTS {
+        let (bridge, _) = compiled_again(&db, (sql, params, answer), &mut wrong);
+        if bridge != 0 {
+            wrong.push(format!("{sql}: run again, {bridge} through the bridge"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
