@@ -910,18 +910,38 @@ fn named_star_columns(stmt: &SelectStatement, scope: &ScopeTable) -> SelectState
 }
 
 /// A set operation's first branch, which runs without the whole one's
-/// ORDER BY, LIMIT and OFFSET; any other statement as it is
-fn first_branch(stmt: SelectStatement) -> SelectStatement {
-    match stmt.set_operations.is_empty() {
-        true => stmt,
-        false => SelectStatement {
-            set_operations: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            ..stmt
-        },
+/// ORDER BY, LIMIT and OFFSET, limited only where the whole one bounds the
+/// branch: to LIMIT + OFFSET rows, the bound each run sets; any other
+/// statement as it is
+fn first_branch(mut stmt: SelectStatement) -> SelectStatement {
+    if stmt.set_operations.is_empty() {
+        return stmt;
     }
+    let bounded = bounds_first_branch(&stmt);
+    let limit = match (stmt.limit.take(), stmt.offset.take()) {
+        (Some(limit), None) if bounded => Some(limit),
+        (Some(limit), Some(offset)) if bounded => Some(Box::new(Expression::Infix(
+            InfixExpression::new(stmt.token.clone(), limit, "+", offset),
+        ))),
+        _ => None,
+    };
+    SelectStatement {
+        set_operations: Vec::new(),
+        order_by: Vec::new(),
+        limit,
+        offset: None,
+        ..stmt
+    }
+}
+
+/// Whether a set operation needs at most LIMIT + OFFSET rows from each of
+/// its branches: every one a UNION ALL, without ORDER BY or DISTINCT
+pub(crate) fn bounds_first_branch(stmt: &SelectStatement) -> bool {
+    stmt.set_operations
+        .iter()
+        .all(|op| matches!(op.operation, SetOperationType::UnionAll))
+        && stmt.order_by.is_empty()
+        && !stmt.distinct
 }
 
 /// [`first_branch`] of a borrowed statement, copied only for a set operation
@@ -952,23 +972,31 @@ pub(crate) fn prepared_branch(
     (branch, keyed)
 }
 
+/// The rows a run of a set operation needs from its first branch, None
+/// when it needs every row; the outer None for a statement of its own
+pub(crate) type BranchBound = Option<Option<usize>>;
+
 /// `computed`, the statement an aggregation computes for a set operation's
-/// first branch, with `bound`, the rows its whole one needs from it, as its
-/// LIMIT, as the general path's branch takes it; as it is without one
+/// first branch, with the run's `bound` as its LIMIT, as the general path's
+/// branch takes it; a statement of its own as it is
 pub(crate) fn bounded_branch(
     computed: &SelectStatement,
-    bound: Option<usize>,
+    bound: BranchBound,
 ) -> std::borrow::Cow<'_, SelectStatement> {
-    let Some(bound) = bound else {
-        return std::borrow::Cow::Borrowed(computed);
-    };
-    std::borrow::Cow::Owned(SelectStatement {
-        limit: Some(Box::new(Expression::IntegerLiteral(IntegerLiteral {
-            token: computed.token.clone(),
-            value: i64::try_from(bound).unwrap_or(i64::MAX),
-        }))),
-        ..computed.clone()
-    })
+    match bound {
+        Some(bound) if bound.is_some() || computed.limit.is_some() => {
+            std::borrow::Cow::Owned(SelectStatement {
+                limit: bound.map(|bound| {
+                    Box::new(Expression::IntegerLiteral(IntegerLiteral {
+                        token: computed.token.clone(),
+                        value: i64::try_from(bound).unwrap_or(i64::MAX),
+                    }))
+                }),
+                ..computed.clone()
+            })
+        }
+        _ => std::borrow::Cow::Borrowed(computed),
+    }
 }
 
 /// A set operation whose ORDER BY holds a subquery, as the statement that
@@ -12312,7 +12340,7 @@ impl Executor {
     /// or its windows over the rows the WHERE passes
     pub(crate) fn grouped_table(
         &self,
-        (held, bound): (&PreparedGrouped, Option<usize>),
+        (held, bound): (&PreparedGrouped, BranchBound),
         run: &PreparedRunner<'_>,
         table: &dyn Table,
         ctx: &ExecutionContext,
@@ -12359,7 +12387,7 @@ impl Executor {
     /// passes; with the source's columns. None over a table
     pub(crate) fn grouped_over_source(
         &self,
-        (held, bound): (&PreparedGrouped, Option<usize>),
+        (held, bound): (&PreparedGrouped, BranchBound),
         run: &PreparedRunner<'_>,
         grouped: GroupedRun<'_>,
         ctx: &ExecutionContext,
@@ -12407,7 +12435,7 @@ impl Executor {
     /// branch, and their windows, or its windows over the rows
     pub(crate) fn grouped_rows(
         &self,
-        (held, bound): (&PreparedGrouped, Option<usize>),
+        (held, bound): (&PreparedGrouped, BranchBound),
         run: &PreparedRunner<'_>,
         rows: &[(i64, Row)],
         columns: &[String],
@@ -12984,7 +13012,7 @@ impl Executor {
             };
             let run = (&runner, prepared.rows_read());
             let computed = prepared.computed.as_ref().unwrap_or(stmt);
-            let bound = limit.filter(|_| !stmt.set_operations.is_empty());
+            let bound = (!stmt.set_operations.is_empty()).then_some(limit);
             let computed = &*bounded_branch(computed, bound);
             let (result, windows_layout) = match source {
                 StatementSource::Table(table) => {
