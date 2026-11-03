@@ -351,17 +351,20 @@ mod counted {
             db.execute(&format!("INSERT INTO {table} VALUES (1, 1, 999)"), ())
                 .unwrap();
         }
-        for sql in [
-            // The first equality names two inner columns; the outer side is a
-            // join, so no left alias qualifies the outer column
-            "SELECT t.id FROM p JOIN q USING (k, v) JOIN t ON t.k = t.v AND t.k = p.k",
-            // An unqualified name the inner table also has
-            "SELECT t.id FROM p JOIN q USING (k, v) JOIN t ON t.k = v",
-        ] {
-            let (found, counts) = run(&db, sql);
-            assert_eq!(counts.narrowed, 0, "an unsure key narrowed: {sql}");
-            assert_eq!(found, same_as_control(&db, sql), "{sql}");
-        }
+        // The first equality names two inner columns; the outer side is a
+        // join, so no left alias qualifies the outer column
+        let sql = "SELECT t.id FROM p JOIN q USING (k, v) JOIN t ON t.k = t.v AND t.k = p.k";
+        let (found, counts) = run(&db, sql);
+        assert_eq!(counts.narrowed, 0, "an unsure key narrowed: {sql}");
+        assert_eq!(found, same_as_control(&db, sql), "{sql}");
+        // An unqualified name the inner table also has is ambiguous
+        let sql = "SELECT t.id FROM p JOIN q USING (k, v) JOIN t ON t.k = v";
+        let err = db.query(sql, ()).map(|rows| rows.count()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: column reference 'v' is ambiguous",
+            "{sql}"
+        );
     }
 
     #[test]

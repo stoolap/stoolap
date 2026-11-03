@@ -73,6 +73,22 @@ const SHAPES: &[&str] = &[
     "SELECT t.b FROM {f}{on} AND {id} > (SELECT 0)",
 ];
 
+/// The same rule in statements holding no subquery
+const PLAIN_SHAPES: &[&str] = &[
+    "SELECT {id} FROM {f}",
+    "SELECT {id} + 1 FROM {f}",
+    "SELECT t.b FROM {f} WHERE {id} > 1",
+    "SELECT t.b FROM {f} WHERE {id} > $1",
+    "SELECT t.b FROM {f} WHERE CASE WHEN {id} > 1 THEN 1 ELSE 0 END = 1",
+    "SELECT COUNT(*) FROM {f} GROUP BY {id}",
+    "SELECT SUM({id}) FROM {f}",
+    "SELECT COUNT(*) FROM {f} GROUP BY t.b HAVING MAX({id}) > 0",
+    "SELECT ROW_NUMBER() OVER (ORDER BY {id}) FROM {f}",
+    "SELECT t.b FROM {f} ORDER BY {id}",
+    "SELECT DISTINCT ON ({id}) t.b FROM {f} ORDER BY {id}",
+    "SELECT t.b FROM {f}{on} AND {id} > 0",
+];
+
 fn answer(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
     let rows = db.query(sql, (1,)).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -108,7 +124,9 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
                 ),
                 (format!("t {join} {side}"), " ON s.id = t.a".to_string()),
             ] {
-                for shape in SHAPES {
+                let shapes = SHAPES.iter().map(|s| (s, true));
+                for (shape, holds_subquery) in shapes.chain(PLAIN_SHAPES.iter().map(|s| (s, false)))
+                {
                     if shape.contains("{on}") != !on.is_empty() {
                         continue;
                     }
@@ -123,7 +141,7 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
                         wrong.push(format!("{context} {kind}: {qualified}: {e}"));
                     }
                     let line = prepared_line(db, &qualified);
-                    if line != "Prepared: yes" {
+                    if holds_subquery && line != "Prepared: yes" {
                         wrong.push(format!("{context} {kind}: {qualified}: {line}"));
                     }
                 }
@@ -158,6 +176,14 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
              WHERE id > (SELECT 0)",
             "q.id",
         ),
+        (
+            "SELECT t.b FROM t JOIN u USING (id) JOIN u AS q ON q.id = t.a WHERE id > 1",
+            "id",
+        ),
+        (
+            "SELECT id, t.b FROM t LEFT JOIN u USING (id) JOIN u AS q ON q.id = t.a",
+            "id",
+        ),
     ] {
         match answer(db, sql) {
             Err(e) if e.contains(&format!("column reference '{name}' is ambiguous")) => {}
@@ -173,6 +199,15 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
         (
             "SELECT t.b FROM t JOIN u USING (id, a) WHERE a < (SELECT MAX(y) + 9 FROM w)",
             vec![],
+        ),
+        ("SELECT t.b FROM t JOIN u USING (id) WHERE id > 1", vec![20]),
+        (
+            "SELECT t.id AS id FROM t JOIN u ON u.id = t.a ORDER BY id DESC",
+            vec![1, 2],
+        ),
+        (
+            "SELECT t.b FROM t JOIN u USING (id) JOIN w ON w.k = t.id WHERE id > 1",
+            vec![20],
         ),
         (
             "SELECT t.b FROM t NATURAL JOIN u WHERE id > (SELECT MIN(y) FROM w)",
@@ -243,4 +278,89 @@ fn a_conflict_update_reads_a_bare_name_from_the_row_met() {
     .unwrap();
     let b: i64 = db.query_one("SELECT b FROM t WHERE id = 1", ()).unwrap();
     assert_eq!(b, 16, "b = 10 + 5, then + 1");
+}
+
+#[test]
+fn a_select_alias_spares_a_bare_name_only_where_the_alias_is_read() {
+    let db = hot("alias_contexts");
+    let mut wrong = Vec::new();
+    // Each statement with `{k}` for a name both sources have, which a
+    // SELECT alias `id` also gives, and the alias's item when `{k}` reads it
+    let f = "FROM t JOIN u ON u.id = t.a";
+    let first = "10 - t.id";
+    let max = "MAX(t.id)";
+    for (shape, reads) in [
+        (
+            "SELECT 10 - t.id AS id, t.id {f} ORDER BY {k}, t.id",
+            Some(first),
+        ),
+        (
+            "SELECT DISTINCT ON ({k}) 10 - t.id AS id, t.id {f} ORDER BY {k}, t.id",
+            Some(first),
+        ),
+        (
+            "SELECT 10 - t.id AS id, COUNT(*) {f} GROUP BY {k}",
+            Some(first),
+        ),
+        ("SELECT MAX(t.id) AS id {f} HAVING {k} > 0", Some(max)),
+        (
+            "SELECT MAX(t.id) AS id {f} HAVING {k} > (SELECT 0)",
+            Some(max),
+        ),
+        (
+            "SELECT MAX(t.id) AS id, t.a {f} GROUP BY t.a HAVING {k} + 0 > 1",
+            Some(max),
+        ),
+        (
+            "SELECT t.a AS id, COUNT(*) {f} GROUP BY t.a HAVING {k} > 1",
+            Some("t.a"),
+        ),
+        ("SELECT 10 - t.id AS id, t.id {f} ORDER BY {k} + 0", None),
+        (
+            "SELECT 10 - t.id AS id, t.id {f} ORDER BY ROW_NUMBER() OVER (ORDER BY {k})",
+            None,
+        ),
+        (
+            "SELECT 10 - t.id AS id, COUNT(*) {f} GROUP BY t.id ORDER BY MAX({k})",
+            None,
+        ),
+        ("SELECT 0 AS id, COUNT(*) {f} GROUP BY {k} + 1", None),
+        (
+            "SELECT 10 - t.id AS id, COUNT(*) {f} GROUP BY t.id HAVING {k} > 1",
+            None,
+        ),
+        (
+            "SELECT MAX(t.id) AS id, t.a {f} GROUP BY t.a HAVING MIN({k}) > 1",
+            None,
+        ),
+        ("SELECT 10 - t.id AS id {f} WHERE {k} > 1", None),
+        (
+            "SELECT 10 - t.id AS id, ROW_NUMBER() OVER (ORDER BY {k}, t.id) {f}",
+            None,
+        ),
+        (
+            "SELECT 10 - t.id AS id, COUNT(*) OVER (PARTITION BY {k}) {f}",
+            None,
+        ),
+        (
+            "SELECT 10 - t.id AS id, ROW_NUMBER() OVER w {f} WINDOW w AS (ORDER BY {k}, t.id)",
+            None,
+        ),
+    ] {
+        let shape = shape.replace("{f}", f);
+        let bare = shape.replace("{k}", "id");
+        let got = answer(&db, &bare);
+        let right = match reads {
+            Some(item) => {
+                got.is_ok() && got == answer(&db, &shape.replace("{k}", &format!("({item})")))
+            }
+            None => got
+                .as_ref()
+                .is_err_and(|e| e.contains("column reference 'id' is ambiguous")),
+        };
+        if !right {
+            wrong.push(format!("{bare}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
