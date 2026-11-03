@@ -103,3 +103,51 @@ fn a_run_after_the_first_compiles_nothing() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// Each statement whose VALUES block holds a value that fails to compile,
+/// and its answer, or the error it raises when a row reads the block
+const UNREAD: &[(&str, Result<&[&str], &str>)] = &[
+    (
+        "SELECT CASE WHEN id = 1 THEN 1 ELSE \
+         (SELECT k FROM (VALUES ('a' REGEXP '[')) AS v(k) WHERE t.id = 1) END \
+         FROM t WHERE id = 1",
+        Ok(&["Integer(1)"]),
+    ),
+    (
+        "SELECT id FROM t WHERE id = 9 AND EXISTS (SELECT 1 FROM (VALUES ('a' REGEXP '[')) AS v(k))",
+        Ok(&[]),
+    ),
+    (
+        "SELECT CASE WHEN id = 1 THEN 1 ELSE \
+         (SELECT k FROM (VALUES ('a' REGEXP '[')) AS v(k) WHERE t.id = 1) END \
+         FROM t WHERE id = 2",
+        Err("Invalid regex"),
+    ),
+];
+
+#[test]
+fn a_values_block_raises_its_error_only_when_read() {
+    let db = Database::open("memory://runner_held_programs_unread").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for &(sql, answer) in UNREAD {
+        let got = db.query(sql, ()).and_then(|rows| {
+            rows.map(|row| row.map(|row| format!("{:?}", row.get_value(0).unwrap())))
+                .collect::<stoolap::Result<Vec<_>>>()
+        });
+        let right = match (&got, answer) {
+            (Ok(rows), Ok(answer)) => rows == answer,
+            (Err(e), Err(error)) => e.to_string().contains(error),
+            _ => false,
+        };
+        if !right {
+            wrong.push(format!("{sql}: {got:?}, expected {answer:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

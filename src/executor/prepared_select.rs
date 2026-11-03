@@ -4342,8 +4342,12 @@ enum BlockSource {
     /// statement reads
     Derived(Box<StatementRun>, Option<Vec<SmartString>>),
     Cte(SmartString),
-    /// A VALUES list, with its rows compiled
-    Values(Box<ValuesTableSource>, SourcePrograms),
+    /// A VALUES list, with its rows compiled or the error compiling them
+    /// raises when the block reads them
+    Values(
+        Box<ValuesTableSource>,
+        std::result::Result<SourcePrograms, Error>,
+    ),
     /// A table read AS OF
     AsOf(SmartString, Box<AsOfClause>),
     /// A table function, with the WHERE's conjuncts that narrow its range,
@@ -6253,7 +6257,7 @@ impl Builder<'_> {
                     .flatten()
                     .for_each(|v| self.note_params(v));
                 let own = CompileContext::bound(registry);
-                let rows = source_programs(&values.rows, |v| compile_with(&own, v))?;
+                let rows = source_programs(&values.rows, |v| compile_with(&own, v));
                 over_source(
                     values
                         .alias
@@ -11869,6 +11873,7 @@ impl Executor {
             BlockSource::Derived(run, ..) => self.statement_rows(run, ctx)?,
             BlockSource::AsOf(name, as_of) => self.as_of_rows(name, as_of, ctx)?,
             BlockSource::Values(values, programs) => {
+                let programs = programs.as_ref().map_err(Clone::clone)?;
                 let empty = Row::new();
                 let exec =
                     ExecuteContext::with_common_params(&empty, ctx.params(), ctx.transaction_id());
