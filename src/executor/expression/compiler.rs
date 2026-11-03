@@ -382,6 +382,11 @@ impl<'a> CompileContext<'a> {
     }
 }
 
+/// The error of a subquery of `form` compiled where no prepared plan runs it
+fn outside_plan(form: &str) -> CompileError {
+    CompileError::UnsupportedExpression(format!("{form} outside a prepared plan"))
+}
+
 /// Expression compiler
 pub struct ExprCompiler<'a> {
     ctx: &'a CompileContext<'a>,
@@ -401,9 +406,7 @@ impl<'a> ExprCompiler<'a> {
     /// into the program; any other caller substitutes its result first
     fn subquery_id(&self, block: &SelectStatement, form: &str) -> Result<u16, CompileError> {
         if !self.ctx.prepared_subqueries {
-            return Err(CompileError::UnsupportedExpression(format!(
-                "{form} outside a prepared plan"
-            )));
+            return Err(outside_plan(form));
         }
         block
             .prepared
@@ -416,6 +419,10 @@ impl<'a> ExprCompiler<'a> {
         crate::test_failpoints::program_compiled();
         let mut builder = ProgramBuilder::new();
         self.compile_expr(expr, &mut builder)?;
+        // A subquery a folding step dropped is still one no plan runs
+        if !self.ctx.prepared_subqueries && crate::executor::Executor::has_subqueries(expr) {
+            return Err(outside_plan("subquery"));
+        }
         builder.emit(Op::Return);
         Ok(builder.build())
     }
