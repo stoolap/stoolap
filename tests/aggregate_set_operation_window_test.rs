@@ -108,10 +108,6 @@ const SHAPES: &[&str] = &[
     "SELECT g, COUNT(*) FROM (VALUES (1), (2)) t(g) GROUP BY g EXCEPT SELECT 1, 1 LIMIT 1",
     "SELECT g, SUM(a) FROM (VALUES (1, 0), (2, 9223372036854775807), (2, 1)) t(g, a) GROUP BY g \
      UNION ALL SELECT 0, 0 LIMIT 1",
-    "SELECT g, SUM(a), (SELECT 5) FROM (VALUES (1, 0), (2, 9223372036854775807), (2, 1)) t(g, a) \
-     GROUP BY g UNION ALL SELECT 0, 0, 0 LIMIT 1",
-    "SELECT t.g, SUM(t.a), (SELECT 5) FROM (VALUES (1, 0), (2, 9223372036854775807), (2, 1)) \
-     t(g, a) JOIN (VALUES (1)) w(k) ON w.k = 1 GROUP BY t.g UNION ALL SELECT 0, 0, 0 LIMIT 1",
     "SELECT g, SUM(a), RANK() OVER w FROM {s} GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) \
      ORDER BY g",
     "SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM {s} GROUP BY g \
@@ -162,4 +158,25 @@ fn an_aggregate_in_a_set_operation_or_with_a_named_window_answers_as_the_general
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_grouped_family_branch_groups_no_more_than_its_union_all_needs() {
+    let _guard = serial();
+    let db = open("memory://aggregate_set_operation_window_family", false);
+    let values = "(VALUES (1, 0), (2, 9223372036854775807), (2, 1)) t(g, a)";
+    for sql in [
+        format!("SELECT g, SUM(a), (SELECT 5) FROM {values} GROUP BY g UNION ALL SELECT 0, 0, 0 LIMIT 1"),
+        format!(
+            "SELECT t.g, SUM(t.a), (SELECT 5) FROM {values} JOIN (VALUES (1)) w(k) ON w.k = 1 \
+             GROUP BY t.g UNION ALL SELECT 0, 0, 0 LIMIT 1"
+        ),
+    ] {
+        reset_aggregate_paths();
+        let got = rows(&db, &sql);
+        let taken = aggregate_paths_taken();
+        let want = vec!["Integer(1)|Integer(0)|Integer(5)".to_string()];
+        assert_eq!(got.map(|(_, rows)| rows), Ok(want), "{sql}");
+        assert!(!taken.contains(&"general"), "{sql}: took {taken:?}");
+    }
 }
