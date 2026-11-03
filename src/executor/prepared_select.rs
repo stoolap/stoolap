@@ -81,8 +81,7 @@ use super::utils::{
     value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
 use super::volatility::{
-    expression_volatility, read_once_argument, reads_no_row, reads_row, statement_constant,
-    statement_draws_per_call, FRAME_OFFSET,
+    expression_volatility, read_once_argument, statement_constant, statement_draws_per_call,
 };
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
 use super::Executor;
@@ -420,7 +419,7 @@ impl<'a> Family<'a> {
                 // An argument the call reads once runs a subquery once
                 let call = &window.function;
                 for (i, arg) in call.arguments.iter().enumerate() {
-                    let at = match read_once_argument(&call.function, i) {
+                    let at = match read_once_argument(&call.function, i, true) {
                         Some(_) => Site::Subqueries,
                         None => inner,
                     };
@@ -2471,6 +2470,15 @@ impl Chain<'_> {
             None => rebuild(expr, &mut |child| self.in_scope(child)),
         }
     }
+}
+
+/// The arguments `call`, a window function's when `over`, reads once
+fn read_once_operands(call: &FunctionCall, over: bool) -> impl Iterator<Item = &Expression> {
+    call.arguments
+        .iter()
+        .enumerate()
+        .filter(move |(at, _)| read_once_argument(&call.function, *at, over).is_some())
+        .map(|(_, arg)| arg)
 }
 
 /// Each column of the projected row `expr` reads past the statement's first
@@ -5889,20 +5897,29 @@ impl Builder<'_> {
         }
     }
 
-    /// The call `expr` with each argument it reads once that holds a block
-    /// one run slot, None when it has none
+    /// The call `expr` with each argument it reads once slotted by
+    /// [`Self::slotted_once`]; None when none of them holds a block
     fn read_once_slotted(
         &mut self,
         expr: &Expression,
         run_slots: &mut Vec<(usize, Expression)>,
     ) -> Result<Option<Expression>> {
-        if !matches!(expr, Expression::Window(_) | Expression::FunctionCall(_)) {
+        let holds = match expr {
+            Expression::Window(window) => read_once_operands(&window.function, true)
+                .chain(window.frame_offsets())
+                .any(mentions_subquery),
+            Expression::FunctionCall(call) => {
+                read_once_operands(call, false).any(mentions_subquery)
+            }
+            _ => false,
+        };
+        if !holds {
             return Ok(None);
         }
         let mut call = expr.clone();
-        let (function, frame) = match &mut call {
-            Expression::Window(window) => (&mut *window.function, window.frame.as_mut()),
-            Expression::FunctionCall(function) => (&mut **function, None),
+        let (function, frame, over) = match &mut call {
+            Expression::Window(window) => (&mut *window.function, window.frame.as_mut(), true),
+            Expression::FunctionCall(function) => (&mut **function, None, false),
             _ => return Ok(None),
         };
         let name = &function.function;
@@ -5910,58 +5927,53 @@ impl Builder<'_> {
             .arguments
             .iter_mut()
             .enumerate()
-            .filter_map(|(at, arg)| Some((arg, read_once_argument(name, at)?)));
-        let offsets = frame.into_iter().flat_map(WindowFrame::offsets_mut);
-        let mut slotted = false;
-        for (arg, what) in arguments.chain(offsets.map(|offset| (offset, FRAME_OFFSET))) {
-            slotted |= self.read_once_slot(arg, what, run_slots)?;
+            .filter(|(at, _)| read_once_argument(name, *at, over).is_some())
+            .map(|(_, arg)| arg);
+        for arg in arguments.chain(frame.into_iter().flat_map(WindowFrame::offsets_mut)) {
+            *arg = self.slotted_once(arg, run_slots)?;
         }
-        Ok(slotted.then_some(call))
+        Ok(Some(call))
     }
 
-    /// `arg`, read once for its call, made one run slot when it holds a
-    /// block: an error when it reads the row, left to its call to read when
-    /// it draws a value; whether it was made one
-    fn read_once_slot(
+    /// `expr`, which its call reads once, with each block that binds no row
+    /// a run slot as [`Self::slotted`] makes one, and so a windowed block's
+    /// value and a member test whose left side is one value; the rest is
+    /// read where the call reads it
+    fn slotted_once(
         &mut self,
-        arg: &mut Expression,
-        what: &str,
+        expr: &Expression,
         run_slots: &mut Vec<(usize, Expression)>,
-    ) -> Result<bool> {
-        if !mentions_subquery(arg) {
-            return Ok(false);
-        }
-        let mut binds_row = false;
-        let unblocked = self.unblocked(arg, &mut binds_row)?;
+    ) -> Result<Expression> {
         let registry = &self.executor.function_registry;
-        if binds_row || !reads_no_row(&unblocked, registry) {
-            return Err(reads_row(what));
-        }
-        if !statement_constant(&unblocked, registry) {
-            return Ok(false);
-        }
-        let slot = self.slot();
-        run_slots.push((slot, std::mem::replace(arg, slot_parameter(slot))));
-        Ok(true)
-    }
-
-    /// `expr` with each block it reads one value, `binds_row` set when one
-    /// binds the statement's row
-    fn unblocked(&self, expr: &Expression, binds_row: &mut bool) -> Result<Expression> {
-        let (block, left) = match expr {
-            Expression::ScalarSubquery(sq) => (&sq.subquery, None),
-            Expression::Exists(exists) => (&exists.subquery, None),
-            Expression::AllAny(all_any) => (&all_any.subquery, Some(&*all_any.left)),
-            _ => return rebuild(expr, &mut |child| self.unblocked(child, binds_row)),
+        let unbound = |block: &SelectStatement| {
+            block
+                .prepared
+                .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
+                .filter(|sq| sq.uncorrelated() && sq.parent.is_none())
         };
-        *binds_row |= block
-            .prepared
-            .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
-            .is_none_or(|sq| !sq.uncorrelated());
-        match left {
-            Some(left) => self.unblocked(left, binds_row),
-            None => Ok(slot_parameter(0)),
+        let once = match expr {
+            Expression::ScalarSubquery(sq) => unbound(&sq.subquery).is_some_and(|sq| {
+                !matches!(&sq.answer, Answer::Members(..))
+                    && !matches!(&sq.answer, Answer::Statement(_, block)
+                        if matches!(block.form, StatementForm::Members(..)))
+            }),
+            Expression::Exists(exists) => unbound(&exists.subquery).is_some(),
+            Expression::In(in_expr) => {
+                matches!(&*in_expr.right, Expression::ScalarSubquery(sq)
+                    if unbound(&sq.subquery).is_some())
+                    && statement_constant(&in_expr.left, registry)
+            }
+            Expression::AllAny(all_any) => {
+                unbound(&all_any.subquery).is_some() && statement_constant(&all_any.left, registry)
+            }
+            _ => false,
+        };
+        if once {
+            let slot = self.slot();
+            run_slots.push((slot, expr.clone()));
+            return Ok(slot_parameter(slot));
         }
+        rebuild(expr, &mut |child| self.slotted_once(child, run_slots))
     }
 
     /// [`Self::rewrite`] of `expr` for a look at its bound form only: its

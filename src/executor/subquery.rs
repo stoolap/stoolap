@@ -3160,7 +3160,8 @@ impl Executor {
     /// A window function reads an argument `read_once_argument` names off no
     /// row, so a subquery there answers for the whole partition. The lift
     /// leaves it where it is; this resolves the ones that read no row either,
-    /// before the argument is compiled against no columns at all
+    /// before the argument is compiled against no columns at all. A block a
+    /// prepared plan left there binds the row, which the call refuses
     pub(crate) fn fold_window_control_arguments(
         &self,
         window_functions: &mut [super::window::WindowFunctionInfo],
@@ -3172,10 +3173,13 @@ impl Executor {
                 .arguments
                 .iter_mut()
                 .enumerate()
-                .filter(|(at, _)| read_once_argument(name, *at).is_some())
+                .filter(|(at, _)| read_once_argument(name, *at, true).is_some())
                 .map(|(_, argument)| argument);
             for argument in read_once {
-                if !Self::has_subqueries(argument) || Self::has_correlated_subqueries(argument) {
+                if !Self::has_subqueries(argument)
+                    || Self::has_correlated_subqueries(argument)
+                    || holds_prepared_block(argument)
+                {
                     continue;
                 }
                 if let Some(folded) = self.try_process_expression_subqueries(argument, ctx)? {
@@ -3186,17 +3190,18 @@ impl Executor {
         Ok(())
     }
 
+    /// `func`'s arguments lifted; `over` when it is a window function, which
+    /// reads an argument it reads once off no row at all, so a column put
+    /// there would never resolve
     fn lift_subqueries_in_call(
         func: &FunctionCall,
-        inside_aggregate: bool,
+        (inside_aggregate, over): (bool, bool),
         windows: bool,
         lifted: &mut Vec<(Expression, String)>,
         base_columns: &[String],
     ) -> FunctionCall {
         let inside =
             inside_aggregate || (!windows && super::utils::is_aggregate_function(&func.function));
-        // A window function reads an argument it reads once off no row at
-        // all, so a column put there would never resolve
         FunctionCall {
             token: func.token.clone(),
             function: func.function.clone(),
@@ -3205,7 +3210,7 @@ impl Executor {
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    if windows && read_once_argument(&func.function, i).is_some() {
+                    if over && read_once_argument(&func.function, i, true).is_some() {
                         a.clone()
                     } else {
                         Self::lift_subqueries_in(a, inside, windows, lifted, base_columns)
@@ -3267,7 +3272,7 @@ impl Executor {
             Expression::FunctionCall(func) => {
                 Expression::FunctionCall(Box::new(Self::lift_subqueries_in_call(
                     func,
-                    inside_aggregate,
+                    (inside_aggregate, false),
                     windows,
                     lifted,
                     base_columns,
@@ -3283,7 +3288,7 @@ impl Executor {
                     token: window.token.clone(),
                     function: Box::new(Self::lift_subqueries_in_call(
                         &window.function,
-                        true,
+                        (true, true),
                         windows,
                         lifted,
                         base_columns,
@@ -5046,6 +5051,23 @@ impl Executor {
             Self::collect_table_names_from_source(expr.as_ref(), &mut tables);
         }
         tables.into_iter().map(str::to_string).collect()
+    }
+}
+
+/// Whether `expr` holds a block a prepared plan made, outside its subqueries
+fn holds_prepared_block(expr: &Expression) -> bool {
+    match expr {
+        Expression::ScalarSubquery(sq) => sq.subquery.prepared.is_some(),
+        Expression::Exists(exists) => exists.subquery.prepared.is_some(),
+        Expression::AllAny(all_any) => {
+            all_any.subquery.prepared.is_some() || holds_prepared_block(&all_any.left)
+        }
+        other => other
+            .try_for_each_child(&mut |child| match holds_prepared_block(child) {
+                true => Err(()),
+                false => Ok(()),
+            })
+            .is_err(),
     }
 }
 

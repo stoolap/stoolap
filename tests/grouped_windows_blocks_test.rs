@@ -204,6 +204,20 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.b, t.id) FROM t \
              GROUP BY t.a ORDER BY t.a",
         ),
+        shape(
+            "SELECT t.id, NTILE(CASE WHEN 3 IN (SELECT u.x FROM u) THEN 3 ELSE 4 END \
+             + CAST(RANDOM() * 0 AS INTEGER)) OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        // The rest of an argument read once is computed where its call reads it
+        shape(
+            "SELECT t.id, NTH_VALUE(t.id, ABS(-9223372036854775808) + (SELECT MIN(u.x) FROM u)) \
+             OVER (ORDER BY t.id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM {t} \
+             WHERE t.id = 1",
+            "SELECT t.id, NTH_VALUE(t.id, 1) \
+             OVER (ORDER BY t.id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM t \
+             WHERE t.id = 1",
+        ),
         // A default is read for each row
         shape(
             "SELECT t.id, LAG(t.b, 1, (SELECT COUNT(*) FROM u WHERE u.k = t.a)) \

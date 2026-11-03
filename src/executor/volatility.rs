@@ -108,11 +108,11 @@ pub(crate) fn window_count_argument(function: &str) -> Option<(usize, &'static s
     }
 }
 
-/// The name of argument `at` of a call to `function` when the call reads it
-/// once rather than for each row: an aggregate's after its first, or the
-/// one [`window_count_argument`] gives
-pub(crate) fn read_once_argument(function: &str, at: usize) -> Option<&'static str> {
-    match window_count_argument(function) {
+/// The name of argument `at` of a call to `function`, a window function's
+/// when `over`, when the call reads it once rather than for each row: an
+/// aggregate's after its first, or the one [`window_count_argument`] gives
+pub(crate) fn read_once_argument(function: &str, at: usize, over: bool) -> Option<&'static str> {
+    match window_count_argument(function).filter(|_| over) {
         Some((count_at, what)) => (count_at == at).then_some(what),
         None => {
             (at > 0 && super::utils::is_aggregate_function(function)).then_some(AGGREGATE_ARGUMENT)
