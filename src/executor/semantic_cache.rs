@@ -83,7 +83,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::common::{CompactArc, StringMap};
-use crate::core::{Result, Row};
+use crate::core::{Error, Result, Row};
 
 /// Convert to lowercase without allocation if already lowercase ASCII.
 /// Returns Cow::Borrowed for those (zero allocation); any other name is
@@ -99,7 +99,7 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, InfixOperator};
 
-use super::expression::ExpressionEval;
+use super::expression::{CompileContext, ExecuteContext, ExprCompiler, ExprVM};
 use super::utils::{column_name_of, expressions_equivalent, extract_and_conditions};
 
 /// Maximum number of cached query results per table+column combination.
@@ -794,13 +794,16 @@ impl SemanticCache {
         columns: &[String],
         _function_registry: &FunctionRegistry,
     ) -> Result<Vec<Row>> {
-        let columns_vec: Vec<String> = columns.to_vec();
         // CRITICAL: Propagate compilation errors instead of returning unfiltered data
-        let mut eval = ExpressionEval::compile(filter, &columns_vec)?;
+        let compile = CompileContext::with_global_registry(columns);
+        let program = ExprCompiler::new(&compile)
+            .compile(filter)
+            .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
+        let mut vm = ExprVM::new();
 
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
-            if eval.eval_bool_checked(&row)? {
+            if vm.execute_bool_checked(&program, &ExecuteContext::new(&row))? {
                 result.push(row);
             }
         }
