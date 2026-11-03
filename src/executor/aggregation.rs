@@ -760,25 +760,34 @@ pub(crate) fn extra_args_failure(
     aggregations.iter().find_map(|agg| agg.extra_error.as_ref())
 }
 
-/// The extra arguments of an aggregate call (a STRING_AGG separator), each
-/// one value for the statement, read once with the parameters of `ctx` and
-/// a block in them answered by `blocks`. An argument that fails to evaluate
-/// is NULL here and its error comes second, for the first group or frame
-/// that reads the call to report
+/// The extra arguments of an aggregate call (a STRING_AGG separator), the
+/// ones after its first in `extra`, each one value for the statement, read
+/// once with the parameters of `ctx` and a block in them answered by
+/// `blocks`; a prepared statement's programs from `held`, one for each. An
+/// argument that fails to evaluate is NULL here and its error comes second,
+/// for the first group or frame that reads the call to report
 pub(crate) fn aggregate_extra_args(
-    args: &[Expression],
+    extra: &[Expression],
     ctx: Option<&ExecutionContext>,
     blocks: Option<&dyn SubqueryExecutor>,
+    held: Option<&[super::expression::HeldOnce]>,
 ) -> Result<ExtraArgs> {
-    let mut values = Vec::with_capacity(args.len().saturating_sub(1));
+    let mut values = Vec::with_capacity(extra.len());
     let mut failed = None;
-    for arg in args.iter().skip(1) {
+    for (at, arg) in extra.iter().enumerate() {
         let value = match literal_extra_arg(arg) {
             Some(value) => value,
             None => {
                 extra_arg_constant(arg, blocks)?;
-                let program = super::expression::compile_once(arg, blocks.is_some())?;
-                super::expression::execute_once(&program, ctx, blocks).unwrap_or_else(|error| {
+                let compiled;
+                let program = match held.and_then(|held| held.get(at)) {
+                    Some(held) => super::expression::held_once(held, arg, blocks.is_some())?,
+                    None => {
+                        compiled = super::expression::compile_once(arg, blocks.is_some())?;
+                        &compiled
+                    }
+                };
+                super::expression::execute_once(program, ctx, blocks).unwrap_or_else(|error| {
                     failed.get_or_insert(error);
                     Value::null_unknown()
                 })
@@ -2378,19 +2387,6 @@ impl Executor {
         self.parse_calls(stmt, ExtraArgsRead::With(ctx, None))
     }
 
-    /// [`Self::parse_aggregations`] of a statement whose subqueries run as
-    /// its `blocks`
-    pub(crate) fn parse_aggregations_in(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        blocks: &dyn SubqueryExecutor,
-    ) -> Result<Vec<SqlAggregateFunction>> {
-        Ok(self
-            .parse_calls(stmt, ExtraArgsRead::With(Some(ctx), Some(blocks)))?
-            .0)
-    }
-
     /// [`Self::parse_aggregations`] with the calls' extra arguments unread,
     /// for the shape of a plan that does not run them
     pub(crate) fn parse_aggregation_shape(
@@ -2773,8 +2769,9 @@ impl Executor {
             }
         };
 
+        let later = args.get(1..).unwrap_or_default();
         let extra = match ctx {
-            ExtraArgsRead::With(ctx, blocks) => aggregate_extra_args(args, ctx, blocks)?,
+            ExtraArgsRead::With(ctx, blocks) => aggregate_extra_args(later, ctx, blocks, None)?,
             // A call that reads one of them for each run keeps them all written
             ExtraArgsRead::Block if written_extra_args(args).is_some() => {
                 for arg in args.iter().skip(1) {
@@ -2785,7 +2782,9 @@ impl Executor {
                 (Vec::new(), None)
             }
             ExtraArgsRead::Held if written_extra_args(args).is_some() => (Vec::new(), None),
-            ExtraArgsRead::Block | ExtraArgsRead::Held => aggregate_extra_args(args, None, None)?,
+            ExtraArgsRead::Block | ExtraArgsRead::Held => {
+                aggregate_extra_args(later, None, None, None)?
+            }
             ExtraArgsRead::Unread => (Vec::new(), None),
         };
         Ok((column, distinct, extra, expression))

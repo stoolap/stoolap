@@ -123,6 +123,12 @@ pub(crate) struct WindowPrograms {
     filter: [HeldProgram; 1],
     call_order: Box<[HeldProgram]>,
     default: HeldProgram,
+    /// The arguments read once for the call: an aggregate's after its first,
+    /// the frame's offsets, the count of NTILE, NTH_VALUE, LAG or LEAD
+    extra: Box<[HeldOnce]>,
+    frame_start: HeldOnce,
+    frame_end: HeldOnce,
+    count: HeldOnce,
 }
 
 /// The programs of a held plan's expression items: those `run_window`
@@ -256,15 +262,18 @@ struct ConstArg<'w> {
     source: ArgSource,
     /// The error of an argument that reads the row, raised when it is read
     reads_row: Option<Error>,
+    /// Its program when a prepared statement holds it
+    held: Option<&'w HeldOnce>,
 }
 
 impl<'w> ConstArg<'w> {
-    /// `expr`, the argument `what`, a block in it answered by `blocks`
+    /// `expr`, the argument `what`, a block in it answered by `blocks`, its
+    /// program `held` when a prepared statement holds it
     fn new(
         expr: &'w Expression,
         registry: &FunctionRegistry,
         what: &str,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&'w HeldOnce>),
     ) -> Self {
         let source = ArgSource::of(expr);
         let reads_parent = |id| blocks.is_none_or(|blocks| blocks.reads_parent(id));
@@ -277,6 +286,7 @@ impl<'w> ConstArg<'w> {
             deterministic: expr_is_deterministic(expr, registry),
             source,
             reads_row,
+            held,
         }
     }
 
@@ -291,8 +301,8 @@ impl<'w> ConstArg<'w> {
             ArgSource::Literal(value) => Ok(value.clone()),
             ArgSource::Parameter => evaluate_once(self.expr, Some(ctx)),
             ArgSource::Program(program) => {
-                let program = program.get_or_init(|| compile_once(self.expr, blocks.is_some()));
-                execute_once(program.as_ref().map_err(Clone::clone)?, Some(ctx), blocks)
+                let program = held_once(self.held.unwrap_or(program), self.expr, blocks.is_some())?;
+                execute_once(program, Some(ctx), blocks)
             }
         }
     }
@@ -377,22 +387,25 @@ impl<'w> CallArgs<'w> {
         registry: &FunctionRegistry,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Self {
-        let offset_of = |bound: &'w WindowFrameBound| match bound {
+        let held = wf_info.held.as_deref();
+        let offset_of = |bound: &'w WindowFrameBound, held: Option<&'w HeldOnce>| match bound {
             WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
-                Some(ConstArg::new(expr, registry, FRAME_OFFSET, blocks))
+                Some(ConstArg::new(expr, registry, FRAME_OFFSET, (blocks, held)))
             }
             _ => None,
         };
         let frame = wf_info.frame.as_ref();
         let lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
         Self {
-            frame_start: frame.and_then(|f| offset_of(&f.start)),
-            frame_end: frame.and_then(|f| f.end.as_ref()).and_then(offset_of),
+            frame_start: frame.and_then(|f| offset_of(&f.start, held.map(|h| &h.frame_start))),
+            frame_end: (frame.and_then(|f| f.end.as_ref()))
+                .and_then(|end| offset_of(end, held.map(|h| &h.frame_end))),
             count: window_count_argument(&wf_info.name).and_then(|(at, what)| {
+                let held = held.map(|h| &h.count);
                 wf_info
                     .arguments
                     .get(at)
-                    .map(|expr| ConstArg::new(expr, registry, what, blocks))
+                    .map(|expr| ConstArg::new(expr, registry, what, (blocks, held)))
             }),
             default: wf_info
                 .arguments
@@ -689,12 +702,14 @@ use crate::functions::{Volatility, WindowFunction};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::aggregation::{compile_over_slots, slot_context, slot_params, with_blocks};
+use super::aggregation::{
+    aggregate_extra_args, compile_over_slots, slot_context, slot_params, with_blocks,
+};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
-    bind_params, compile_expression, compile_once, compute_expression_hash, evaluate_once,
-    execute_once, literal_value, ExprVM, Program, SharedProgram, SubqueryExecutor,
+    bind_params, compile_expression, compute_expression_hash, evaluate_once, execute_once,
+    held_once, literal_value, ExprVM, HeldOnce, Program, SharedProgram, SubqueryExecutor,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
@@ -821,6 +836,7 @@ impl WindowPlan<'_> {
                         partition: held_programs(wf.partition_by_exprs.len()),
                         order: held_programs(wf.order_by.len()),
                         call_order: held_programs(wf.call_order_by.len()),
+                        extra: (1..wf.arguments.len()).map(|_| HeldOnce::new()).collect(),
                         ..WindowPrograms::default()
                     })
                 })
@@ -1103,16 +1119,12 @@ impl Executor {
                     let plan = match plan {
                         Some(plan) => plan,
                         None => {
-                            let plan = self.window_plan(
+                            made = self.window_plan(
                                 std::borrow::Cow::Borrowed(stmt),
                                 (columns, columns.len(), stmt.columns.len()),
                                 &FxHashMap::default(),
-                                (ctx, None),
+                                (ctx, None, held),
                             )?;
-                            made = match held {
-                                Some(held) => plan.holding(held),
-                                None => plan,
-                            };
                             &made
                         }
                     };
@@ -1291,12 +1303,8 @@ impl Executor {
             stmt,
             (base_columns, visible_columns, written_items),
             group_slots,
-            (ctx, blocks),
+            (ctx, blocks, held),
         )?;
-        let plan = match held {
-            Some(held) => plan.holding(held),
-            None => plan,
-        };
         self.run_window(
             &plan,
             ctx,
@@ -1350,23 +1358,29 @@ impl Executor {
             std::borrow::Cow::Owned(extended),
             (columns, columns.len(), stmt.columns.len()),
             &FxHashMap::default(),
-            (ctx, None),
+            (ctx, None, Some(held)),
         )
-        .map(|plan| Some(plan.holding(held)))
+        .map(Some)
     }
 
     /// The window plan of `stmt` over rows of `base_columns`, of which the
     /// first `visible_columns` are the read's own, its first `written_items`
-    /// items the ones it wrote
+    /// items the ones it wrote; holding the programs `held` keeps for it,
+    /// through which it reads each aggregate's later arguments
     fn window_plan<'s>(
         &self,
         stmt: std::borrow::Cow<'s, SelectStatement>,
         (base_columns, visible_columns, written_items): (&[String], usize, usize),
         group_slots: &FxHashMap<ExprKey, usize>,
-        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+        (ctx, blocks, held): (
+            &ExecutionContext,
+            Option<&dyn SubqueryExecutor>,
+            Option<&HeldWindow>,
+        ),
     ) -> Result<WindowPlan<'s>> {
         // Parse window functions from the SELECT list
-        let window_functions = self.parse_window_functions(&stmt, base_columns, (ctx, blocks))?;
+        let read = held.is_none().then_some((ctx, blocks));
+        let window_functions = self.parse_window_functions(&stmt, base_columns, read)?;
 
         // LIMIT pushdown for PARTITION BY queries is safe only when there is
         // no top-level ORDER BY, when every window function shares the same
@@ -1425,7 +1439,7 @@ impl Executor {
                 }
             }
         }
-        Ok(WindowPlan {
+        let plan = WindowPlan {
             stmt,
             written_items,
             window_functions,
@@ -1437,7 +1451,20 @@ impl Executor {
             extended_columns,
             added_wf_names,
             held: None,
-        })
+        };
+        let Some(held) = held else {
+            return Ok(plan);
+        };
+        let mut plan = plan.holding(held);
+        for wf in &mut plan.window_functions {
+            if self.function_registry.is_aggregate(&wf.name) {
+                let later = wf.arguments.get(1..).unwrap_or_default();
+                let held = wf.held.as_deref().map(|held| &*held.extra);
+                let read = aggregate_extra_args(later, Some(ctx), blocks, held)?;
+                (wf.extra_args, wf.extra_error) = read;
+            }
+        }
+        Ok(plan)
     }
 
     /// The window functions of `plan` over `base_rows`, read in the order or
@@ -2540,11 +2567,12 @@ impl Executor {
 
     /// Parse window functions from SELECT list.
     /// Collects ALL window functions, including multiple ones nested in a single expression.
+    /// An aggregate's later arguments are read as `read` says, else left unread
     fn parse_window_functions(
         &self,
         stmt: &SelectStatement,
         _base_columns: &[String],
-        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+        read: Option<(&ExecutionContext, Option<&dyn SubqueryExecutor>)>,
     ) -> Result<Vec<WindowFunctionInfo>> {
         let mut window_functions = Vec::new();
         let mut col_idx = 0;
@@ -2711,7 +2739,7 @@ impl Executor {
         &self,
         window_expr: &WindowExpression,
         window_defs: &[WindowDefinition],
-        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+        read: Option<(&ExecutionContext, Option<&dyn SubqueryExecutor>)>,
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
 
@@ -2744,10 +2772,12 @@ impl Executor {
 
         // Build column name
         let column_name = format!("{}()", func.function);
-        let (extra_args, extra_error) = if self.function_registry.is_aggregate(&func.function) {
-            super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx), blocks)?
-        } else {
-            (Vec::new(), None)
+        let (extra_args, extra_error) = match read {
+            Some((ctx, blocks)) if self.function_registry.is_aggregate(&func.function) => {
+                let later = func.arguments.get(1..).unwrap_or_default();
+                super::aggregation::aggregate_extra_args(later, Some(ctx), blocks, None)?
+            }
+            _ => (Vec::new(), None),
         };
 
         // OPTIMIZATION: func.function is already uppercase from parsing
