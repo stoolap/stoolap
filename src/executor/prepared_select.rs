@@ -7240,8 +7240,16 @@ fn source_programs(
     rows: &[Vec<Expression>],
     compile: impl Fn(&Expression) -> Result<SharedProgram>,
 ) -> Result<SourcePrograms> {
+    // A value written again shares its program, and a constant it folds
+    let mut compiled: FxHashMap<ExprKey, SharedProgram> = FxHashMap::default();
+    let mut program = |value: &Expression| match compiled.entry(ExprKey::of(value)) {
+        std::collections::hash_map::Entry::Occupied(held) => Ok(CompactArc::clone(held.get())),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            Ok(CompactArc::clone(slot.insert(compile(value)?)))
+        }
+    };
     rows.iter()
-        .map(|row| row.iter().map(&compile).collect())
+        .map(|row| row.iter().map(&mut program).collect())
         .collect()
 }
 

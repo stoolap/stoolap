@@ -13,13 +13,15 @@
 // limitations under the License.
 
 //! A VALUES row its WHERE filters out is let go before the next row is
-//! evaluated, counted in the peak live bytes of the whole process
+//! evaluated, and a value written again is held once by the plan, counted
+//! in the live bytes of the whole process
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
 
 use stoolap::Database;
 
@@ -53,8 +55,12 @@ static COUNTING: Counting = Counting;
 const ROWS: usize = 300;
 const VALUE_BYTES: i64 = 64 * 1024;
 
+// The byte counters are process-wide, so the tests in this file never overlap
+static SERIAL: Mutex<()> = Mutex::new(());
+
 #[test]
 fn a_values_row_filtered_out_is_not_kept() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://values_source_memory").unwrap();
     db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
         .unwrap();
@@ -90,5 +96,34 @@ fn a_values_row_filtered_out_is_not_kept() {
     assert!(
         peaks.iter().all(|&(_, peak)| peak < 16 * VALUE_BYTES),
         "{ROWS} rows of {VALUE_BYTES} bytes, all filtered out, peaked at (path, bytes) {peaks:?}"
+    );
+}
+
+#[test]
+fn a_value_written_again_is_held_once() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://values_source_memory_held").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1)", ()).unwrap();
+    let value = format!("(REPEAT('x', {VALUE_BYTES}))");
+    let rows = vec![value.as_str(); ROWS].join(", ");
+    let mut held = Vec::new();
+    for sql in [
+        format!("SELECT x FROM (VALUES {rows}) AS s(x) WHERE LENGTH(x) = 0"),
+        format!(
+            "SELECT 1 FROM u WHERE EXISTS \
+             (SELECT 1 FROM (VALUES {rows}) AS s(x) WHERE LENGTH(x) = 0)"
+        ),
+    ] {
+        let before = LIVE.load(Ordering::Relaxed);
+        let statement = db.prepare(&sql).unwrap();
+        assert_eq!(statement.query(()).unwrap().count(), 0, "{sql}");
+        held.push(LIVE.load(Ordering::Relaxed) - before);
+        drop(statement);
+    }
+    assert!(
+        held.iter().all(|&bytes| bytes < 16 * VALUE_BYTES),
+        "{ROWS} copies of one {VALUE_BYTES}-byte constant, held after a run: {held:?} bytes"
     );
 }
