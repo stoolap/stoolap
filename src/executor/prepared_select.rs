@@ -10946,24 +10946,30 @@ impl Executor {
         let Some(SideSource::Rows(source, schema)) = &held.side_sources[side] else {
             return Ok(None);
         };
+        // Rows read for this run move on as they are; a CTE's are shared
         let rows = match (source, limit) {
             (BlockSource::Function(function, range, _), Some(limit)) => {
                 let first = Some(limit.saturating_add(offset));
                 let (rows, _) = self.tvf_rows(function, None, range.as_deref(), first, ctx)?;
                 let mut rows = rows.into_vec();
                 rows.drain(..offset.min(rows.len()));
-                CompactArc::new(rows)
+                Ok(rows)
             }
-            _ => self
-                .source_rows(source, schema, ctx)?
-                .ok_or_else(|| Error::SchemaChanged {
+            _ => {
+                let rows = self.source_rows(source, schema, ctx)?;
+                let rows = rows.ok_or_else(|| Error::SchemaChanged {
                     table: name.to_string(),
-                })?,
+                })?;
+                CompactArc::try_unwrap(rows)
+            }
         };
         let bounded = limit.is_some() && matches!(source, BlockSource::Function(..));
         let columns = schema.column_names_arc();
         let Some(where_) = &held.side_wheres[side] else {
-            let rows = RowVec::from_vec((*rows).clone());
+            let rows = match rows {
+                Ok(rows) => RowVec::from_vec(rows),
+                Err(shared) => RowVec::from_vec((*shared).clone()),
+            };
             let result = ExecutorResult::with_arc_columns(columns, rows);
             return Ok(Some((Box::new(result), bounded)));
         };
@@ -10972,8 +10978,13 @@ impl Executor {
             kept.push((id, row));
             true
         };
-        let source = rows.iter().map(|(id, row)| Ok((*id, row)));
-        run.rows_passing(where_, source, ctx, None, keep)?;
+        match rows {
+            Ok(rows) => run.rows_passing(where_, rows.into_iter().map(Ok), ctx, None, keep)?,
+            Err(shared) => {
+                let rows = shared.iter().map(|(id, row)| Ok((*id, row)));
+                run.rows_passing(where_, rows, ctx, None, keep)?
+            }
+        };
         let result = ExecutorResult::with_arc_columns(columns, kept);
         Ok(Some((Box::new(result), bounded)))
     }
