@@ -34,7 +34,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::common::{CompactVec, SmartString, StringMap};
 use crate::core::row_vec::RowVec;
@@ -115,13 +115,14 @@ fn row_program(
 type HeldProgram = OnceLock<Result<SharedProgram>>;
 
 /// The programs of a held plan's window function, one per expression
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct WindowPrograms {
     partition: Box<[HeldProgram]>,
     order: Box<[HeldProgram]>,
     argument: [HeldProgram; 1],
     filter: [HeldProgram; 1],
     call_order: Box<[HeldProgram]>,
+    default: HeldProgram,
 }
 
 /// The programs of a held plan's expression items: those `run_window`
@@ -131,6 +132,18 @@ struct ItemPrograms {
     base: Box<[HeldProgram]>,
     ext: Box<[HeldProgram]>,
     items: Box<[HeldProgram]>,
+}
+
+/// A prepared statement's window programs, made for the first plan of it
+/// and held by every plan made for it after, each run's alike in shape
+#[derive(Debug, Default)]
+pub(crate) struct HeldWindow(OnceLock<PlanPrograms>);
+
+/// The programs of one plan's shape: each window's, then the items'
+#[derive(Debug)]
+struct PlanPrograms {
+    windows: Box<[Arc<WindowPrograms>]>,
+    items: Arc<ItemPrograms>,
 }
 
 /// `n` held programs, none compiled yet
@@ -327,6 +340,8 @@ struct CallArgs<'w> {
     default: Option<(&'w Expression, ArgSource)>,
     /// The default's program, as the input's is compiled
     default_program: OnceLock<Result<SharedProgram>>,
+    /// The default's program when a prepared statement holds it
+    held_default: Option<&'w HeldProgram>,
     /// A value function's first argument for each row, when it is not a column
     input: Vec<Value>,
 }
@@ -385,6 +400,7 @@ impl<'w> CallArgs<'w> {
                 .filter(|_| lead_lag)
                 .map(|expr| (expr, ArgSource::of(expr))),
             default_program: OnceLock::new(),
+            held_default: wf_info.held.as_ref().map(|held| &held.default),
             input: Vec::new(),
         }
     }
@@ -401,7 +417,10 @@ impl<'w> CallArgs<'w> {
         };
         let program = self
             .default_program
-            .get_or_init(|| row_program(expr, columns, None, ctx, blocks));
+            .get_or_init(|| match self.held_default {
+                Some(held) => held_program(expr, held, columns, None, ctx, blocks),
+                None => row_program(expr, columns, None, ctx, blocks),
+            });
         program.as_deref().map(Some).map_err(Clone::clone)
     }
 
@@ -761,7 +780,7 @@ pub struct WindowFunctionInfo {
     pub(crate) order_key: OrderByKey,
     pub(crate) over_key: OverClauseKey,
     /// Its programs when a held plan holds it
-    pub(crate) held: Option<Box<WindowPrograms>>,
+    pub(crate) held: Option<Arc<WindowPrograms>>,
 }
 
 /// A window result, with the layout its ORDER BY reads when it has one
@@ -787,29 +806,41 @@ pub(crate) struct WindowPlan<'s> {
     /// The input columns, then the windows an expression item reads
     extended_columns: Vec<String>,
     added_wf_names: Vec<String>,
-    /// The item programs, when a prepared plan holds the plan
-    held: Option<Box<ItemPrograms>>,
+    /// The item programs, when a prepared statement holds them
+    held: Option<Arc<ItemPrograms>>,
 }
 
 impl WindowPlan<'_> {
-    /// This plan holding its programs, each compiled by its first run
-    fn holding(mut self) -> Self {
-        for wf in &mut self.window_functions {
-            wf.held = Some(Box::new(WindowPrograms {
-                partition: held_programs(wf.partition_by_exprs.len()),
-                order: held_programs(wf.order_by.len()),
-                call_order: held_programs(wf.call_order_by.len()),
-                ..WindowPrograms::default()
-            }));
+    /// This plan holding the programs `held` keeps for its statement, each
+    /// compiled by its first run
+    fn holding(mut self, held: &HeldWindow) -> Self {
+        let PlanPrograms { windows, items } = held.0.get_or_init(|| {
+            let windows = (self.window_functions.iter())
+                .map(|wf| {
+                    Arc::new(WindowPrograms {
+                        partition: held_programs(wf.partition_by_exprs.len()),
+                        order: held_programs(wf.order_by.len()),
+                        call_order: held_programs(wf.call_order_by.len()),
+                        ..WindowPrograms::default()
+                    })
+                })
+                .collect();
+            let base = (self.select_items.iter())
+                .filter(|item| matches!(item.source, SelectItemSource::Expression(_)))
+                .count();
+            let items = Arc::new(ItemPrograms {
+                base: held_programs(base),
+                ext: held_programs(self.transformed.iter().flatten().count()),
+                items: held_programs(self.select_items.len()),
+            });
+            PlanPrograms { windows, items }
+        });
+        debug_assert_eq!(windows.len(), self.window_functions.len());
+        debug_assert_eq!(items.items.len(), self.select_items.len());
+        for (wf, held) in self.window_functions.iter_mut().zip(windows.iter()) {
+            wf.held = Some(Arc::clone(held));
         }
-        let base = (self.select_items.iter())
-            .filter(|item| matches!(item.source, SelectItemSource::Expression(_)))
-            .count();
-        self.held = Some(Box::new(ItemPrograms {
-            base: held_programs(base),
-            ext: held_programs(self.transformed.iter().flatten().count()),
-            items: held_programs(self.select_items.len()),
-        }));
+        self.held = Some(Arc::clone(items));
         self
     }
 }
@@ -1049,12 +1080,17 @@ impl Executor {
     }
 
     /// The rows `read` takes of `table`, holding `columns`, for the window
-    /// functions of `stmt`, or a partition-at-a-time read's whole answer;
+    /// functions of `stmt`, by its `plan` or one made now holding the
+    /// programs `held` keeps, or a partition-at-a-time read's whole answer;
     /// None when the table cannot read them so in this run
     pub(crate) fn read_window_rows(
         &self,
         read: &crate::planner::WindowRead,
-        (stmt, plan): (&SelectStatement, Option<&WindowPlan<'_>>),
+        (stmt, plan, held): (
+            &SelectStatement,
+            Option<&WindowPlan<'_>>,
+            Option<&HeldWindow>,
+        ),
         ctx: &ExecutionContext,
         table: &dyn Table,
         columns: &[String],
@@ -1067,12 +1103,16 @@ impl Executor {
                     let plan = match plan {
                         Some(plan) => plan,
                         None => {
-                            made = self.window_plan(
+                            let plan = self.window_plan(
                                 std::borrow::Cow::Borrowed(stmt),
                                 (columns, columns.len(), stmt.columns.len()),
                                 &FxHashMap::default(),
                                 (ctx, None),
                             )?;
+                            made = match held {
+                                Some(held) => plan.holding(held),
+                                None => plan,
+                            };
                             &made
                         }
                     };
@@ -1129,14 +1169,14 @@ impl Executor {
 
     /// Window functions over `rows` of `columns`, read in the order or the
     /// partitions `sorted` or `grouped` says, the statement's subqueries
-    /// answered by its `blocks`
+    /// answered by its `blocks`, its programs those `held` keeps for it
     pub(crate) fn window_over(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         (rows, columns): (&[(i64, Row)], &[String]),
         (sorted, grouped): (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
-        blocks: Option<&dyn SubqueryExecutor>,
+        run: (Option<&dyn SubqueryExecutor>, Option<&HeldWindow>),
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -1146,7 +1186,7 @@ impl Executor {
             &FxHashMap::default(),
             sorted,
             grouped,
-            blocks,
+            run,
         )
     }
 
@@ -1198,7 +1238,7 @@ impl Executor {
             &FxHashMap::default(),
             None,
             None,
-            None,
+            (None, None),
         )
     }
 
@@ -1221,7 +1261,7 @@ impl Executor {
             group_slots,
             None,
             None,
-            blocks,
+            (blocks, None),
         )
     }
 
@@ -1236,7 +1276,7 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldWindow>),
     ) -> Result<WindowOutput> {
         // A window over a row reads its named window's parts
         Self::named_window_failure(blocks, base_rows)?;
@@ -1253,6 +1293,10 @@ impl Executor {
             group_slots,
             (ctx, blocks),
         )?;
+        let plan = match held {
+            Some(held) => plan.holding(held),
+            None => plan,
+        };
         self.run_window(
             &plan,
             ctx,
@@ -1277,13 +1321,15 @@ impl Executor {
     }
 
     /// The window plan of a windowed statement a prepared plan runs, over
-    /// rows of `columns`, made once with the statement; None, read nothing,
-    /// when a run would change it
+    /// rows of `columns`, made once with the statement and holding the
+    /// programs `held` keeps for it; None, read nothing, when a run would
+    /// change it
     pub(crate) fn prepared_window_plan(
         &self,
         stmt: &SelectStatement,
         columns: &[String],
         ctx: &ExecutionContext,
+        held: &HeldWindow,
     ) -> Result<Option<WindowPlan<'static>>> {
         let extended = Self::with_hidden_order_by_windows(stmt).into_owned();
         // An argument after the first that is no literal is read with the
@@ -1306,7 +1352,7 @@ impl Executor {
             &FxHashMap::default(),
             (ctx, None),
         )
-        .map(|plan| Some(plan.holding()))
+        .map(|plan| Some(plan.holding(held)))
     }
 
     /// The window plan of `stmt` over rows of `base_columns`, of which the

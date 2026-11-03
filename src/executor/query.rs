@@ -4361,7 +4361,8 @@ impl Executor {
                 .flatten();
             let rows = match read {
                 Some(read) => {
-                    self.read_window_rows(&read, (stmt, None), ctx, table.as_ref(), &all_columns)?
+                    let plan = (stmt, None, None);
+                    self.read_window_rows(&read, plan, ctx, table.as_ref(), &all_columns)?
                 }
                 None => None,
             };
@@ -4424,7 +4425,7 @@ impl Executor {
                 ctx,
                 (&rows, &all_columns),
                 (window_presorted_state, window_pregrouped_state),
-                None,
+                (None, None),
             )?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
