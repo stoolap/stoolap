@@ -12997,13 +12997,14 @@ impl Executor {
                 }
             };
             // The window step lays out a set operation's branch for its
-            // DISTINCT ON, as the general path's does
+            // DISTINCT ON, as the general path's does, carrying no key
             let keyed;
             let computed = match stmt.set_operations.is_empty() || stmt.distinct_on.is_empty() {
                 true => computed,
                 false => {
                     keyed = SelectStatement {
                         distinct_on: stmt.distinct_on.clone(),
+                        set_operations: stmt.set_operations.clone(),
                         ..computed.clone()
                     };
                     &keyed
