@@ -2529,21 +2529,6 @@ impl Executor {
             .collect()
     }
 
-    /// Whether a window `stmt` reads names one of its definitions, which
-    /// `used_window_defs` then keeps; each window is asked as the walk
-    /// meets it, so nothing is collected or copied
-    pub(crate) fn reads_window_defs(stmt: &SelectStatement) -> bool {
-        if stmt.window_defs.is_empty() {
-            return false;
-        }
-        let mut reads = ReadsDefinition {
-            defs: &stmt.window_defs,
-            found: false,
-        };
-        Self::windows_read(stmt, &mut reads);
-        reads.found
-    }
-
     /// Every window `stmt` reads, in its SELECT list, ORDER BY and DISTINCT
     /// ON, into `out`
     fn windows_read<'a>(stmt: &'a SelectStatement, out: &mut impl Extend<&'a WindowExpression>) {
@@ -4444,20 +4429,6 @@ impl Executor {
             .into_iter()
             .map(|opt| opt.unwrap_or(NULL_VALUE))
             .collect())
-    }
-}
-
-/// Whether a window given to it reads one of `defs`
-struct ReadsDefinition<'d> {
-    defs: &'d [WindowDefinition],
-    found: bool,
-}
-
-impl<'a> Extend<&'a WindowExpression> for ReadsDefinition<'_> {
-    fn extend<I: IntoIterator<Item = &'a WindowExpression>>(&mut self, windows: I) {
-        for window in windows {
-            self.found |= definition_read(window, self.defs).is_some();
-        }
     }
 }
 

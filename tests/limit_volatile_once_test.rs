@@ -87,6 +87,9 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT id, COUNT(*), (SELECT 0) FROM t GROUP BY id UNION ALL SELECT 99, 0, 0",
         "SELECT id, ROW_NUMBER() OVER (PARTITION BY 1 ORDER BY id) + (SELECT 0) AS rn FROM t \
          UNION ALL SELECT 99, 0",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY a ORDER BY id) FROM t UNION ALL SELECT 99, 0",
+        "SELECT id, ROW_NUMBER() OVER w FROM v WINDOW w AS (PARTITION BY a ORDER BY id) \
+         UNION ALL SELECT 99, 0",
         "WITH c(x) AS (SELECT id FROM t) SELECT x FROM c ORDER BY x",
         "WITH c AS (SELECT id FROM t) SELECT c.id FROM c JOIN c d ON d.id = c.id ORDER BY c.id",
     ] {
