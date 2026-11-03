@@ -12,26 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A prepared statement with ORDER BY and LIMIT answers as the general path
-//! does, whether it chooses its rows before or after projecting them
-
-use std::sync::{Mutex, MutexGuard};
+//! A prepared statement with ORDER BY and LIMIT answers as the statement
+//! with its subquery's value written in does, whether it chooses its rows
+//! before or after projecting them
 
 use stoolap::Database;
 
 mod oracle;
 
-// Recording turns the prepared families off process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Each statement's answer, recorded when the general path gave the same
+/// Each statement's answer, recorded when its literal twin gave the same
 const RECORDED: oracle::Answers = answers!("prepared_order_limit");
 
-const PREPARED: &str = "(SELECT v FROM u WHERE u.id = 1)";
+/// The subquery each statement holds, written as `({SUBQUERY})`
+const SUBQUERY: &str = "SELECT v FROM u WHERE u.id = 1";
 
 fn setup(db: &Database) {
     db.execute(
@@ -99,22 +92,20 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT id, a + 1 AS a1 FROM t WHERE c > {sq} ORDER BY a1, id OFFSET 390",
         "SELECT id FROM t WHERE c > {sq} ORDER BY c * 2, id LIMIT $1",
     ] {
-        let prepared = shape.replace("{sq}", PREPARED);
+        let prepared = shape.replace("{sq}", &format!("({SUBQUERY})"));
         if prepared_line(db, &prepared) != "Prepared: yes" {
             wrong.push(format!("{phase}: not prepared: {prepared}"));
         }
         let key = format!("{phase}: {prepared}");
-        let general = || oracle::general_answer(&prepared, |twin| answer(db, twin));
-        if let Some(why) = oracle::check_confirmed(&RECORDED, &key, &answer(db, &prepared), general)
-        {
+        let twin = || answer(db, &oracle::literal_twin(db, &prepared, SUBQUERY, false));
+        if let Some(why) = oracle::check_confirmed(&RECORDED, &key, &answer(db, &prepared), twin) {
             wrong.push(why);
         }
     }
 }
 
 #[test]
-fn a_prepared_order_by_with_a_limit_answers_as_the_general_path() {
-    let _guard = serial();
+fn a_prepared_order_by_with_a_limit_answers_as_its_literal_twin() {
     let mut wrong = Vec::new();
     let db = Database::open("memory://prepared_order_limit_hot").unwrap();
     setup(&db);
@@ -133,7 +124,6 @@ fn a_prepared_order_by_with_a_limit_answers_as_the_general_path() {
 
 #[test]
 fn a_computed_item_of_a_row_the_limit_drops_raises_no_error() {
-    let _guard = serial();
     let db = Database::open("memory://prepared_order_limit_errors").unwrap();
     setup(&db);
     // The product overflows for a > 1 only
@@ -141,7 +131,7 @@ fn a_computed_item_of_a_row_the_limit_drops_raises_no_error() {
         answer(
             &db,
             &format!(
-                "SELECT id, a * 9223372036854775807 FROM t WHERE c > {PREPARED} \
+                "SELECT id, a * 9223372036854775807 FROM t WHERE c > ({SUBQUERY}) \
                  ORDER BY {order} LIMIT 3"
             ),
         )

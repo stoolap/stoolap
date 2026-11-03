@@ -28,6 +28,8 @@ use stoolap::test_failpoints::{
 };
 use stoolap::Database;
 
+mod oracle;
+
 // The families' switch is process-wide
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -50,8 +52,35 @@ fn families_off<T>(run: impl FnOnce() -> T) -> T {
     run()
 }
 
+/// The uncorrelated subqueries the references hold, each written in as its
+/// answer before a reference runs, an `IN` list when marked, so the general
+/// path reads no subquery
+const WRITTEN_IN: &[(&str, bool)] = &[
+    ("SELECT a FROM t WHERE id = 3", false),
+    ("SELECT a FROM t WHERE id = 1", false),
+    ("SELECT g FROM t WHERE id = 1", false),
+    ("SELECT a FROM t WHERE id > 1", true),
+    ("SELECT 0", false),
+    ("SELECT 1", false),
+    ("SELECT 2", false),
+    ("SELECT 5", false),
+];
+
+/// `reference` with each subquery `WRITTEN_IN` names written in over `db`
+fn written_in(db: &Database, reference: &str) -> String {
+    WRITTEN_IN
+        .iter()
+        .fold(reference.to_string(), |sql, &(subquery, list)| {
+            match sql.contains(&format!("({subquery})")) {
+                true => oracle::literal_twin(db, &sql, subquery, list),
+                false => sql,
+            }
+        })
+}
+
 /// (context, path the query takes there, query, the same query forced
-/// onto the general path, run with the prepared families refused)
+/// onto the general path, run with the prepared families refused; a
+/// correlated subquery written as a join)
 const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
@@ -166,8 +195,9 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "hash_groups",
         "SELECT g, MAX(a) FROM t AS o \
          WHERE EXISTS (SELECT 1 FROM t WHERE t.g = o.g AND t.id <> o.id) GROUP BY g",
-        "SELECT g, MAX(a) FROM t AS o WHERE id + 0 = id \
-         AND EXISTS (SELECT 1 FROM t WHERE t.g = o.g AND t.id <> o.id) GROUP BY g",
+        "SELECT o.g AS g, MAX(o.a) AS \"MAX(a)\" FROM t AS o \
+         JOIN (SELECT g FROM t WHERE id + 0 = id GROUP BY g HAVING COUNT(*) > 1) k \
+         ON k.g = o.g WHERE o.id + 0 = o.id GROUP BY o.g",
     ),
     (
         "sealed",
@@ -180,7 +210,7 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "empty",
         "hash_groups",
         "SELECT g, COUNT(*) FROM t WHERE a IN (SELECT a FROM t) GROUP BY g",
-        "SELECT g, COUNT(*) FROM t WHERE id + 0 = id AND a IN (SELECT a FROM t) GROUP BY g",
+        "SELECT g, COUNT(*) FROM t WHERE id + 0 = id AND a IS NOT NULL GROUP BY g",
     ),
     // Only COUNT counts the rows of a star; any other call of one is grouped
     // from the rows the read passes
@@ -350,35 +380,37 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "memory",
         "prepared_block",
         "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
-        "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+        "SELECT t.id AS id FROM t JOIN (SELECT g, MAX(a) AS m FROM t WHERE id + 0 = id GROUP BY g) u \
+         ON u.g = t.g WHERE t.a <= u.m",
     ),
     (
         "sealed",
         "prepared_block",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
-        "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+        "SELECT t.id AS id FROM t JOIN (SELECT g, COUNT(a) AS c FROM t WHERE id + 0 = id GROUP BY g) u \
+         ON u.g = t.g WHERE 1 < u.c",
     ),
     (
         "memory",
         "index_count",
         "SELECT id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u WHERE u.g = t.g) LIMIT 10",
-        "SELECT id FROM t WHERE 1 < (SELECT COUNT(*) FROM t AS u \
-         WHERE u.g = t.g AND u.id + 0 = u.id) LIMIT 10",
+        "SELECT t.id AS id FROM t JOIN (SELECT g, COUNT(*) AS c FROM t WHERE id + 0 = id GROUP BY g) u \
+         ON u.g = t.g WHERE 1 < u.c LIMIT 10",
     ),
     (
         "memory",
         "index_count",
         "SELECT id, (SELECT COUNT(*) FROM t AS u WHERE u.g = t.a) AS n FROM t LIMIT 10",
-        "SELECT id, (SELECT COUNT(*) FROM t AS u \
-         WHERE u.g = t.a AND u.id + 0 = u.id) AS n FROM t LIMIT 10",
+        "SELECT t.id AS id, COALESCE(u.c, 0) AS n FROM t \
+         LEFT JOIN (SELECT g, COUNT(*) AS c FROM t WHERE id + 0 = id GROUP BY g) u ON u.g = t.a LIMIT 10",
     ),
     (
         "memory",
         "index_count",
         "SELECT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u WHERE u.g = t.g \
          HAVING COUNT(*) > 1) LIMIT 10",
-        "SELECT id FROM t WHERE 4 = (SELECT COUNT(*) + COUNT(*) FROM t AS u \
-         WHERE u.g = t.g AND u.id + 0 = u.id HAVING COUNT(*) > 1) LIMIT 10",
+        "SELECT t.id AS id FROM t JOIN (SELECT g, COUNT(*) AS c FROM t WHERE id + 0 = id GROUP BY g) u \
+         ON u.g = t.g WHERE u.c = 2 LIMIT 10",
     ),
     (
         "memory",
@@ -592,20 +624,22 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "sealed",
         "storage_grouped",
         "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
-        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
+        "SELECT g, SUM(a) FROM t WHERE id + 0 = id GROUP BY g \
+         HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
     ),
     (
         "memory",
         "storage_grouped",
         "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
-        "SELECT g, SUM(a) FROM t GROUP BY g HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
+        "SELECT g, SUM(a) FROM t WHERE id + 0 = id GROUP BY g \
+         HAVING SUM(a) > (SELECT a FROM t WHERE id = 1)",
     ),
     (
         "sealed",
         "hash_groups",
         "SELECT g, SUM(a) AS s FROM t GROUP BY g \
          ORDER BY (SELECT a FROM t WHERE id = 3) - SUM(a)",
-        "SELECT g, SUM(a) AS s FROM t GROUP BY g \
+        "SELECT g, SUM(a) AS s FROM t WHERE id + 0 = id GROUP BY g \
          ORDER BY (SELECT a FROM t WHERE id = 3) - SUM(a)",
     ),
     (
@@ -851,11 +885,19 @@ fn every_aggregate_path_answers_as_the_general_path() {
             _ => &memory,
         };
         let (got, taken) = run(db, sql);
-        let (want, reference_taken) = families_off(|| run(db, reference));
+        let written = written_in(db, reference);
+        let (want, reference_taken) = families_off(|| run(db, &written));
+        // A value written in names its column by the value: the rows compare
+        let rows_only = |answer: Answer| answer.map(|(_, rows)| (Vec::new(), rows));
+        let (got, want) = match written == reference {
+            true => (got, want),
+            false => (rows_only(got), rows_only(want)),
+        };
+        let reference = written;
         if taken != [path] {
             wrong.push(format!("{ctx}: {sql}: took {taken:?}, expected [{path}]"));
         }
-        if reference_taken != ["general"] {
+        if reference_taken.is_empty() || reference_taken.iter().any(|p| *p != "general") {
             wrong.push(format!("{ctx}: {reference}: took {reference_taken:?}"));
         }
         if got != want {

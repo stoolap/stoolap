@@ -14,16 +14,17 @@
 
 //! A prepared first branch of a set operation that removes duplicates keeps
 //! one row of each value as it reads, and the set operation answers as it
-//! does over the general path's branch
+//! does with the subquery's value written in
 
 use stoolap::Database;
 
 mod oracle;
 
-/// Each statement's answer, recorded when the general path gave the same
+/// Each statement's answer, recorded when its literal twin gave the same
 const RECORDED: oracle::Answers = answers!("prepared_set_branch");
 
-const PREPARED: &str = "(SELECT v FROM u WHERE u.id = 1)";
+/// The subquery each first branch holds, written as `({SUBQUERY})`
+const SUBQUERY: &str = "SELECT v FROM u WHERE u.id = 1";
 
 fn setup(db: &Database) {
     db.execute(
@@ -104,7 +105,7 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "SELECT a FROM t WHERE c > {sq} AND id > $1 INTERSECT SELECT a FROM t WHERE id < 20",
         "SELECT a + 1 AS a1 FROM t WHERE c > {sq} UNION SELECT a FROM t WHERE id < 10",
     ] {
-        let prepared = shape.replace("{sq}", PREPARED);
+        let prepared = shape.replace("{sq}", &format!("({SUBQUERY})"));
         // A LIMIT without ORDER BY may keep any rows of the whole answer,
         // which is the one recorded
         let unordered_limit = prepared
@@ -113,8 +114,8 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         let whole = unordered_limit.map_or(prepared.as_str(), |(all, _)| all);
         let all = answer(db, whole);
         let key = format!("{phase}: {whole}");
-        let general = || oracle::general_answer(whole, |twin| answer(db, twin));
-        if let Some(why) = oracle::check_confirmed(&RECORDED, &key, &all, general) {
+        let twin = || answer(db, &oracle::literal_twin(db, whole, SUBQUERY, false));
+        if let Some(why) = oracle::check_confirmed(&RECORDED, &key, &all, twin) {
             wrong.push(why);
         }
         if let Some((_, limit)) = unordered_limit {
@@ -130,7 +131,7 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
 }
 
 #[test]
-fn a_deduplicating_set_operation_answers_as_over_the_general_branch() {
+fn a_deduplicating_set_operation_answers_as_its_literal_twin() {
     let mut wrong = Vec::new();
     let db = Database::open("memory://prepared_set_branch_hot").unwrap();
     setup(&db);

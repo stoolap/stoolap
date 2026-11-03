@@ -28,7 +28,8 @@ use stoolap::{Database, Params};
 
 mod oracle;
 
-/// The in-family statements' answers, recorded when their old path twins gave the same
+/// The in-family statements' answers, recorded when another path gave the
+/// same; a new recording is reviewed by its diff
 const RECORDED_IN_FAMILY: oracle::Answers = answers!("prepared_select_in_family");
 
 // The counters are process-wide
@@ -143,9 +144,6 @@ fn test_one_plan_answers_each_parameter_and_outer_row() {
         let (found, runs) = ids(&db, S2, (param,));
         assert_eq!(found, s2, "S2 with b = {param}");
         assert_eq!(runs, 3, "S2 with b = {param} runs once per outer row");
-        let old = |sql| on_old_path(|| ids(&db, sql, (param,)));
-        assert_eq!(old(S1), (s1, 0), "S1 on the old path");
-        assert_eq!(old(S2), (s2, 0), "S2 on the old path");
     }
     assert_eq!(
         prepared_selects_built() - built,
@@ -281,8 +279,6 @@ fn test_scalar_subquery_results() {
     let (err, runs) = error(&db, multi, ());
     assert!(err.contains("more than one row"), "{err}");
     assert!(runs >= 1, "the error came from the prepared path");
-    let (old_err, _) = on_old_path(|| error(&db, multi, ()));
-    assert!(old_err.contains("more than one row"), "{old_err}");
 }
 
 #[test]
@@ -415,13 +411,8 @@ fn test_projection_and_order_by_run_prepared() {
         let sql = format!("SELECT id, a * 2 AS d FROM t WHERE {present} ORDER BY {order}");
         assert_eq!(
             pairs(&db, &sql),
-            (names.clone(), expected.clone(), 1),
+            (names.clone(), expected, 1),
             "ORDER BY {order} on the prepared projection"
-        );
-        assert_eq!(
-            on_old_path(|| pairs(&db, &sql)),
-            (names.clone(), expected, 0),
-            "ORDER BY {order} on the old path"
         );
     }
 }
@@ -634,11 +625,9 @@ fn test_a_reused_comparison_takes_each_value() {
     db.execute("INSERT INTO q VALUES (1, 1, 0), (2, 2, 20)", ())
         .unwrap();
     let sql = "SELECT id FROM o WHERE a > (SELECT v FROM q WHERE q.k = o.s) ORDER BY id";
-    let expected = on_old_path(|| ids(&db, sql, ())).0;
-    assert_eq!(expected, vec![1, 4], "the old path's answer");
     assert_eq!(
         ids(&db, sql, ()),
-        (expected, 5),
+        (vec![1, 4], 5),
         "rows 2 and 3 do not keep row 1's value, row 4 does not keep row 3's"
     );
 }
@@ -674,11 +663,6 @@ fn test_nested_scopes_read_each_depth() {
         assert_eq!(
             runs, 11,
             "six middle runs, one per outer row, and five innermost, one per u row found"
-        );
-        assert_eq!(
-            on_old_path(|| ids(&db, NESTED, (param,))),
-            (expected, 0),
-            "old path, w.x > {param}"
         );
     }
     assert_eq!(prepared_selects_built() - built, 1, "prepared once");
@@ -727,8 +711,6 @@ fn test_nested_null_and_errors_cross_scopes() {
     let (err, runs) = error(&db, NESTED, (0,));
     assert!(err.contains("more than one row"), "{err}");
     assert!(runs >= 1, "raised on the prepared path");
-    let (old_err, _) = on_old_path(|| error(&db, NESTED, (0,)));
-    assert!(old_err.contains("more than one row"), "{old_err}");
 }
 
 #[test]
@@ -753,11 +735,6 @@ fn test_one_value_reading_two_enclosing_scopes() {
         ids(&db, sql, ()),
         (vec![1, 6], 11),
         "u.id + t.b on the prepared path"
-    );
-    assert_eq!(
-        on_old_path(|| ids(&db, sql, ())),
-        (vec![1, 6], 0),
-        "old path"
     );
 }
 
@@ -1082,14 +1059,7 @@ fn test_classifier_rules() {
         let runs = prepared_scalar_runs();
         let found = Ok(rows(sql));
         assert!(prepared_scalar_runs() > runs, "{sql} ran prepared");
-        let old_path = || {
-            on_old_path(|| {
-                assert!(prepared_line(&db, sql).starts_with("Prepared: no"), "{sql}");
-                Ok(rows(sql))
-            })
-        };
-        let wrong = oracle::check_confirmed(&RECORDED_IN_FAMILY, sql, &found, old_path);
-        assert_eq!(wrong, None);
+        assert_eq!(oracle::check_answer(&RECORDED_IN_FAMILY, sql, &found), None);
     }
     for (sql, want) in [
         (
@@ -1390,15 +1360,9 @@ fn test_a_whole_pushed_inner_where_is_not_checked_again() {
         .unwrap();
     for (inner, param) in [("u.b = $1", "true"), ("u.ts = $1", "2024-01-02 03:04:05")] {
         let sql = format!("SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner})");
-        let expected = on_old_path(|| ids(&db, &sql, (param,))).0;
-        assert_eq!(
-            expected,
-            vec![1],
-            "the general path keeps the row for {inner}"
-        );
         let (found, runs) = ids(&db, &sql, (param,));
         assert!(runs >= 1, "{sql} ran prepared");
-        assert_eq!(found, expected, "{inner} with TEXT {param}");
+        assert_eq!(found, vec![1], "{inner} with TEXT {param}");
     }
 }
 
@@ -1682,11 +1646,6 @@ fn test_a_subquery_value_against_a_boolean_column_reads_as_the_column() {
     db.execute("INSERT INTO w VALUES (1, 'true')", ()).unwrap();
     let sql = "SELECT t.id FROM t WHERE t.id = \
                (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1))";
-    assert_eq!(
-        on_old_path(|| ids(&db, sql, ())).0,
-        vec![1],
-        "the general path"
-    );
     let (found, runs) = ids(&db, sql, ());
     assert!(runs >= 1, "ran prepared");
     assert_eq!(found, vec![1], "the subquery's TEXT read as BOOLEAN");

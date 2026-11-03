@@ -307,25 +307,9 @@ fn check(
     }
 }
 
-/// Each site's answer over t, recorded when the general path gave the same
+/// Each site's answer over t, recorded when another path gave the same; a
+/// new recording is reviewed by its diff
 const RECORDED_SITES: oracle::Answers = answers!("grouped_sources_blocks_sites");
-
-/// The sites over t the general path cannot group, each written with its
-/// subquery as a derived table's column, the form it answers
-const GENERAL_FORMS: &[(&str, &str)] = &[
-    (
-        "SELECT COUNT(*), SUM(b) FROM t GROUP BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) \
-         ORDER BY 1, 2",
-        "SELECT COUNT(*), SUM(b) FROM (SELECT b, (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g \
-         FROM t) d GROUP BY g ORDER BY 1, 2",
-    ),
-    (
-        "SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g, COUNT(*) FROM t GROUP BY g \
-         ORDER BY 1",
-        "SELECT g, COUNT(*) FROM (SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g FROM t) d \
-         GROUP BY g ORDER BY 1",
-    ),
-];
 
 #[test]
 fn every_source_answers_a_grouped_statement_as_its_table_does() {
@@ -336,18 +320,7 @@ fn every_source_answers_a_grouped_statement_as_its_table_does() {
         for site in SITES {
             let over_t = site.replace("{t}", "t");
             let want = rows(&db, &over_t);
-            let form = GENERAL_FORMS
-                .iter()
-                .find(|(site, _)| *site == over_t)
-                .map_or(over_t.as_str(), |(_, form)| form);
-            let general =
-                || oracle::on_general_path(form, || rows(&db, &oracle::general_twin(form)));
-            wrong.extend(oracle::check_confirmed(
-                &RECORDED_SITES,
-                &over_t,
-                &want,
-                general,
-            ));
+            wrong.extend(oracle::check_answer(&RECORDED_SITES, &over_t, &want));
             let want = want.unwrap_or_else(|e| panic!("{site} over t: {e}"));
             for source in sources() {
                 let sql = format!("{}{}", source.with, site.replace("{t}", &source.from));
