@@ -359,6 +359,26 @@ impl SelectShape {
             visible: None,
         })
     }
+
+    /// This shape over a statement whose stars were written out, each of
+    /// its items the item of the statement as written that `items` gives,
+    /// the items past them, which the run adds, following the `written`
+    fn written_from(&mut self, items: &[usize], written: usize) {
+        let Some(laid_out) = self.layout.take() else {
+            return;
+        };
+        let mut layout = match laid_out {
+            LaidOut::Built(layout) => layout,
+            LaidOut::Shared(layout) => (*layout).clone(),
+        };
+        for source in &mut layout.sources {
+            source.item = source.item.map(|item| match items.get(item) {
+                Some(&from) => from,
+                None => item - items.len() + written,
+            });
+        }
+        self.layout = Some(LaidOut::Built(layout));
+    }
 }
 
 /// Type alias for select execution results: (result, column_names, limit_offset_applied, shape)
@@ -9682,10 +9702,16 @@ impl Executor {
                     Error::internal("a table's columns changed while the statement prepared")
                 })?;
                 let held_run = (held, Self::branch_bound(stmt, ctx));
-                let output = self.group_held_rows(held_run, &run, ctx, rows, columns, |out| {
-                    Self::result_layout(&held.stmt, columns, None, out)
-                })?;
-                return Self::with_late_keys(held, &run, output, ctx);
+                let (result, names, applied, mut shape) =
+                    self.group_held_rows(held_run, &run, ctx, rows, columns, |out| {
+                        Self::result_layout(&held.stmt, columns, None, out)
+                    })?;
+                // The rows were laid out by the items the stars were written
+                // out in, each of which stands for the item it comes from
+                if let (Some(items), Some(shape)) = (held.star_items(), shape.as_mut()) {
+                    shape.written_from(items, stmt.columns.len());
+                }
+                return Self::with_late_keys(held, &run, (result, names, applied, shape), ctx);
             }
         }
         let (columns, rows) = match merge {

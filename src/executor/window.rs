@@ -2269,6 +2269,11 @@ impl Executor {
                         }
                     }
                 }
+                // A column a star shows, read by its position under its name
+                Expression::Column(column) => items.push(SelectItem {
+                    output_name: column.name.value.to_string(),
+                    source: SelectItemSource::BaseColumn(column.index as usize),
+                }),
                 Expression::Identifier(id) => {
                     // Simple column reference - use pre-computed lowercase
                     if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
