@@ -257,13 +257,12 @@ fn test_distinct_on_expression() {
 
 #[test]
 fn test_window_control_argument_reading_the_row() {
-    // What a control argument that reads the row means is open (plan 5.8)
     let db = setup("site_window_control");
     let sql = "SELECT id, NTILE((SELECT MAX(x) FROM u WHERE u.x = t.a)) OVER (ORDER BY id) FROM t ORDER BY id";
     let got = rows(&db, sql);
     assert!(
-        got.is_err(),
-        "{sql} answered {got:?} before its rule is set"
+        matches!(&got, Err(e) if e.contains("the bucket count of NTILE must not read the row")),
+        "{sql} answered {got:?}"
     );
 }
 

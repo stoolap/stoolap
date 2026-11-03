@@ -55,7 +55,7 @@ use super::utils::{
     bare_name, crossing_key_pair, dummy_token, dummy_token_clone, name_text, qualified,
     split_qualified, value_to_expression,
 };
-use super::volatility::{expression_volatility_in, statement_volatility_in};
+use super::volatility::{expression_volatility_in, read_once_argument, statement_volatility_in};
 use super::Executor;
 use crate::core::predicate::{kind, KeySide, PredicateSet};
 use crate::core::NULL_VALUE;
@@ -3157,46 +3157,33 @@ impl Executor {
         ))
     }
 
-    /// A navigation function reads its control argument off no row, so a
-    /// subquery there answers for the whole partition. The lift leaves it
-    /// where it is; this resolves the ones that read no row either, before
-    /// the argument is compiled against no columns at all
+    /// A window function reads an argument `read_once_argument` names off no
+    /// row, so a subquery there answers for the whole partition. The lift
+    /// leaves it where it is; this resolves the ones that read no row either,
+    /// before the argument is compiled against no columns at all
     pub(crate) fn fold_window_control_arguments(
         &self,
         window_functions: &mut [super::window::WindowFunctionInfo],
         ctx: &ExecutionContext,
     ) -> Result<()> {
         for window in window_functions {
-            let Some(index) = Self::window_control_argument(&window.name) else {
-                continue;
-            };
-            let Some(argument) = window.arguments.get(index) else {
-                continue;
-            };
-            if !Self::has_subqueries(argument) || Self::has_correlated_subqueries(argument) {
-                continue;
-            }
-            if let Some(folded) = self.try_process_expression_subqueries(argument, ctx)? {
-                window.arguments[index] = folded;
+            let name = &window.name;
+            let read_once = window
+                .arguments
+                .iter_mut()
+                .enumerate()
+                .filter(|(at, _)| read_once_argument(name, *at).is_some())
+                .map(|(_, argument)| argument);
+            for argument in read_once {
+                if !Self::has_subqueries(argument) || Self::has_correlated_subqueries(argument) {
+                    continue;
+                }
+                if let Some(folded) = self.try_process_expression_subqueries(argument, ctx)? {
+                    *argument = folded;
+                }
             }
         }
         Ok(())
-    }
-
-    /// The argument a navigation window function reads once, off no row:
-    /// the offset of LEAD and LAG, the group count of NTILE, the n of
-    /// NTH_VALUE
-    pub(crate) fn window_control_argument(function: &str) -> Option<usize> {
-        if function.eq_ignore_ascii_case("NTILE") {
-            Some(0)
-        } else if function.eq_ignore_ascii_case("LEAD")
-            || function.eq_ignore_ascii_case("LAG")
-            || function.eq_ignore_ascii_case("NTH_VALUE")
-        {
-            Some(1)
-        } else {
-            None
-        }
     }
 
     fn lift_subqueries_in_call(
@@ -3208,11 +3195,8 @@ impl Executor {
     ) -> FunctionCall {
         let inside =
             inside_aggregate || (!windows && super::utils::is_aggregate_function(&func.function));
-        // A navigation window function reads its control argument off no row
-        // at all, so a column put there would never resolve
-        let control = windows
-            .then(|| Self::window_control_argument(&func.function))
-            .flatten();
+        // A window function reads an argument it reads once off no row at
+        // all, so a column put there would never resolve
         FunctionCall {
             token: func.token.clone(),
             function: func.function.clone(),
@@ -3221,7 +3205,7 @@ impl Executor {
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    if control == Some(i) {
+                    if windows && read_once_argument(&func.function, i).is_some() {
                         a.clone()
                     } else {
                         Self::lift_subqueries_in(a, inside, windows, lifted, base_columns)

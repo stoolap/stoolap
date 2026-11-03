@@ -189,6 +189,29 @@ fn shapes() -> Vec<(String, String)> {
             "SELECT t.id, LAG(t.b, 2, 6) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
         ),
         shape(
+            "SELECT t.id, NTILE(CASE WHEN 3 IN (SELECT u.x FROM u) THEN 3 ELSE 4 END) \
+             OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.id, NTILE((SELECT ROW_NUMBER() OVER (ORDER BY u.id) + 2 FROM u \
+             ORDER BY u.id LIMIT 1)) OVER (ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+        ),
+        shape(
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CASE WHEN 3 IN (SELECT u.x FROM u) \
+             THEN '0' END ORDER BY t.b, t.id) FROM {t} GROUP BY t.a ORDER BY t.a",
+            "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), '0' ORDER BY t.b, t.id) FROM t \
+             GROUP BY t.a ORDER BY t.a",
+        ),
+        // A default is read for each row
+        shape(
+            "SELECT t.id, LAG(t.b, 1, (SELECT COUNT(*) FROM u WHERE u.k = t.a)) \
+             OVER (PARTITION BY t.b ORDER BY t.id) FROM {t} ORDER BY t.id",
+            "SELECT t.id, LAG(t.b, 1, t.c) OVER (PARTITION BY t.b ORDER BY t.id) \
+             FROM (SELECT id, b, {count} AS c FROM t) t ORDER BY t.id",
+        ),
+        shape(
             "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN (SELECT MIN(u.x) + 2 FROM u) \
              PRECEDING AND CURRENT ROW) FROM {t} ORDER BY t.id",
             "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) \
@@ -550,14 +573,107 @@ fn a_where_set_raises_its_error_only_for_a_row_that_reaches_it() {
 #[test]
 fn an_argument_read_once_that_reads_the_row_is_an_error() {
     let _guard = serial();
-    let db = Database::open("memory://grouped_windows_blocks_row_argument").unwrap();
-    fill(&db);
-    for sql in [
-        "SELECT t.id, NTILE((SELECT COUNT(*) FROM u WHERE u.k = t.a)) OVER (ORDER BY t.id) FROM t",
-        "SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CAST((SELECT COUNT(*) FROM u \
-         WHERE u.k = t.a) AS TEXT)) FROM t GROUP BY t.a",
-    ] {
-        assert!(rows(&db, sql).is_err(), "{sql}");
+    let dir = tempfile::tempdir().unwrap();
+    let hot = Database::open("memory://grouped_windows_blocks_row_argument").unwrap();
+    fill(&hot);
+    let sealed = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    fill(&sealed);
+    sealed.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let reads = "(SELECT COUNT(*) FROM u WHERE u.k = t.a)";
+    let mut wrong = Vec::new();
+    for db in [&hot, &sealed] {
+        for (call, what) in [
+            (
+                "NTILE({r}) OVER (ORDER BY t.id)",
+                "the bucket count of NTILE",
+            ),
+            (
+                "NTILE(t.a) OVER (ORDER BY t.id)",
+                "the bucket count of NTILE",
+            ),
+            (
+                "NTILE(t.a + (SELECT 1)) OVER (ORDER BY t.id)",
+                "the bucket count of NTILE",
+            ),
+            ("LAG(t.b, {r}) OVER (ORDER BY t.id)", "the offset of LAG"),
+            ("LAG(t.b, t.a) OVER (ORDER BY t.id)", "the offset of LAG"),
+            (
+                "LEAD(t.b, {r}, 0) OVER (ORDER BY t.id)",
+                "the offset of LEAD",
+            ),
+            (
+                "NTH_VALUE(t.b, {r}) OVER (ORDER BY t.id)",
+                "the n of NTH_VALUE",
+            ),
+            (
+                "SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN {r} PRECEDING AND CURRENT ROW)",
+                "a frame offset",
+            ),
+            (
+                "STRING_AGG(CAST(t.b AS TEXT), CAST({r} AS TEXT)) OVER (ORDER BY t.id)",
+                "an aggregate argument after the first",
+            ),
+        ] {
+            let call = call.replace("{r}", reads);
+            for sql in [
+                format!("SELECT t.id, {call} FROM t"),
+                format!("SELECT t.id, {call}, {reads} FROM t"),
+            ] {
+                check_reads_row(db, &sql, what, &mut wrong);
+            }
+        }
+        for sql in [
+            format!("SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CAST({reads} AS TEXT)) FROM t GROUP BY t.a"),
+            format!("SELECT t.a, NTILE({reads}) OVER (ORDER BY t.a) FROM t GROUP BY t.a"),
+            format!(
+                "SELECT t.id, SUM(t.b) OVER w FROM t \
+                 WINDOW w AS (ORDER BY t.id ROWS BETWEEN {reads} PRECEDING AND CURRENT ROW)"
+            ),
+        ] {
+            let what = match sql.contains("STRING_AGG") {
+                true => "an aggregate argument after the first",
+                false if sql.contains("NTILE") => "the bucket count of NTILE",
+                false => "a frame offset",
+            };
+            check_reads_row(db, &sql, what, &mut wrong);
+        }
+    }
+    let sql = format!("SELECT t.id, NTILE($1 + {reads}) OVER (ORDER BY t.id) FROM t");
+    match hot.query(&sql, (1,)).map(|rows| rows.count()) {
+        Err(e)
+            if e.to_string()
+                .contains("the bucket count of NTILE must not read the row") => {}
+        other => wrong.push(format!("{sql}: {other:?}")),
+    }
+    let sql = "SELECT NTILE($1 + (SELECT MIN(u.x) FROM u)) OVER (ORDER BY t.id) FROM t \
+               ORDER BY t.id";
+    let ntile = |result: stoolap::Rows| -> Vec<i64> {
+        result
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    let got = ntile(hot.query(sql, (3,)).unwrap());
+    let want = ntile(
+        hot.query(
+            "SELECT NTILE(3) OVER (ORDER BY t.id) FROM t ORDER BY t.id",
+            (),
+        )
+        .unwrap(),
+    );
+    if got != want {
+        wrong.push(format!("{sql}: {got:?}"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `sql` refused with the error of the argument `what`, read once, that
+/// reads the row, and no general mechanism run for it
+fn check_reads_row(db: &Database, sql: &str, what: &str, wrong: &mut Vec<String>) {
+    let before = general_hits();
+    let got = rows(db, sql);
+    let refused = matches!(&got, Err(e) if e.contains(&format!("{what} must not read the row")));
+    if !refused || general_hits() != before {
+        wrong.push(format!("{sql}\n  got {got:?}"));
     }
 }
 

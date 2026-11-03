@@ -171,18 +171,29 @@ struct ConstArg<'w> {
     expr: &'w Expression,
     deterministic: bool,
     source: ArgSource,
+    /// The error of an argument that reads the row, raised when it is read
+    reads_row: Option<Error>,
 }
 
 impl<'w> ConstArg<'w> {
-    fn new(expr: &'w Expression, registry: &FunctionRegistry) -> Self {
+    fn new(expr: &'w Expression, registry: &FunctionRegistry, what: &str) -> Self {
+        let source = ArgSource::of(expr);
+        let reads_row = match source {
+            ArgSource::Program(_) => read_once(expr, registry, what).err(),
+            ArgSource::Literal(_) | ArgSource::Parameter => None,
+        };
         Self {
             expr,
             deterministic: expr_is_deterministic(expr, registry),
-            source: ArgSource::of(expr),
+            source,
+            reads_row,
         }
     }
 
     fn evaluate(&self, ctx: &ExecutionContext) -> Result<Value> {
+        if let Some(error) = &self.reads_row {
+            return Err(error.clone());
+        }
         match &self.source {
             ArgSource::Literal(value) => Ok(value.clone()),
             ArgSource::Parameter => evaluate_once(self.expr, Some(ctx)),
@@ -221,7 +232,7 @@ impl<'a, 'w> PartitionArg<'a, 'w> {
 
 /// The arguments of one window function call that are not its input:
 /// the frame offsets, LAG and LEAD's offset and default, NTILE's and
-/// NTH_VALUE's n. Built once per call; each compiles on first read
+/// NTH_VALUE's n. Built once per call; the ones read once compile on first read
 struct CallArgs<'w> {
     frame_start: Option<ConstArg<'w>>,
     frame_end: Option<ConstArg<'w>>,
@@ -230,6 +241,8 @@ struct CallArgs<'w> {
     default: Option<(&'w Expression, ArgSource)>,
     /// A value function's first argument for each row, when it is not a column
     input: Vec<Value>,
+    /// The default for each row, when it is no literal or parameter
+    defaults: Vec<Value>,
 }
 
 /// How a value function reads its first argument at a row: from its column,
@@ -260,59 +273,59 @@ impl<'w> CallArgs<'w> {
     fn of(wf_info: &'w WindowFunctionInfo, registry: &FunctionRegistry) -> Self {
         let offset_of = |bound: &'w WindowFrameBound| match bound {
             WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
-                Some(ConstArg::new(expr, registry))
+                Some(ConstArg::new(expr, registry, FRAME_OFFSET))
             }
             _ => None,
         };
         let frame = wf_info.frame.as_ref();
         let lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
-        let count_at = match wf_info.name.as_str() {
-            "LEAD" | "LAG" | "NTH_VALUE" => Some(1),
-            "NTILE" => Some(0),
-            _ => None,
-        };
         Self {
             frame_start: frame.and_then(|f| offset_of(&f.start)),
             frame_end: frame.and_then(|f| f.end.as_ref()).and_then(offset_of),
-            count: count_at
-                .and_then(|at| wf_info.arguments.get(at))
-                .map(|expr| ConstArg::new(expr, registry)),
+            count: window_count_argument(&wf_info.name).and_then(|(at, what)| {
+                wf_info
+                    .arguments
+                    .get(at)
+                    .map(|expr| ConstArg::new(expr, registry, what))
+            }),
             default: wf_info
                 .arguments
                 .get(2)
                 .filter(|_| lead_lag)
                 .map(|expr| (expr, ArgSource::of(expr))),
             input: Vec::new(),
+            defaults: Vec::new(),
         }
     }
 
-    /// The default's program over the input `columns`, compiled on first
-    /// read; None when there is no default or it is read without one
-    fn default_program(&self, columns: &[String]) -> Result<Option<&Program>> {
-        let Some((expr, ArgSource::Program(program))) = &self.default else {
-            return Ok(None);
+    /// The default for each of `rows` when it is no literal or parameter,
+    /// read once ahead of the partitions as the input is
+    fn read_defaults(
+        &mut self,
+        rows: &[(i64, Row)],
+        columns: &[String],
+        ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<()> {
+        let expr = match &self.default {
+            Some((expr, ArgSource::Program(_))) => *expr,
+            _ => return Ok(()),
         };
-        let program = program.get_or_init(|| {
-            ExprCompiler::new(&CompileContext::with_global_registry(columns))
-                .compile(expr)
-                .map_err(|e| Error::internal(format!("Compile error: {}", e)))
-        });
-        program.as_ref().map(Some).map_err(Clone::clone)
+        let mut eval = RowPrograms::compile([expr], columns, None, ctx, blocks)?;
+        self.defaults = rows
+            .iter()
+            .map(|(_, row)| eval.eval(row))
+            .collect::<Result<_>>()?;
+        Ok(())
     }
 
-    /// LAG and LEAD's default for the current `row`, NULL without one
-    fn default_value(
-        &self,
-        program: Option<&Program>,
-        vm: &mut ExprVM,
-        row: &Row,
-        ctx: &ExecutionContext,
-    ) -> Result<Value> {
-        match (program, &self.default) {
-            (Some(program), _) => vm.execute(program, &execute_context(row, Some(ctx))),
-            (None, Some((_, ArgSource::Literal(value)))) => Ok(value.clone()),
-            (None, Some((expr, _))) => evaluate_once(expr, Some(ctx)),
-            (None, None) => Ok(Value::null_unknown()),
+    /// LAG and LEAD's default for the row at `row_idx`, NULL without one
+    fn default_value(&self, row_idx: usize, ctx: &ExecutionContext) -> Result<Value> {
+        match &self.default {
+            Some((_, ArgSource::Literal(value))) => Ok(value.clone()),
+            Some((expr, ArgSource::Parameter)) => evaluate_once(expr, Some(ctx)),
+            Some((_, ArgSource::Program(_))) => Ok(self.defaults[row_idx].clone()),
+            None => Ok(Value::null_unknown()),
         }
     }
 }
@@ -556,8 +569,7 @@ use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
     bind_params, compile_expression, compile_once, compute_expression_hash, evaluate_once,
-    execute_context, execute_once, literal_value, CompileContext, ExprCompiler, ExprVM, Program,
-    SharedProgram, SubqueryExecutor,
+    execute_once, literal_value, ExprVM, Program, SharedProgram, SubqueryExecutor,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
@@ -566,7 +578,7 @@ use super::utils::{
     get_table_alias_from_expr, item_name, qualified, qualified_index, qualified_key_index,
     split_qualified,
 };
-use super::volatility::expression_volatility;
+use super::volatility::{expression_volatility, read_once, window_count_argument, FRAME_OFFSET};
 use super::Executor;
 
 /// Wrapper for parallel writes to disjoint indices in a Vec<Value>.
@@ -1681,6 +1693,7 @@ impl Executor {
                     ctx,
                     blocks,
                 )?;
+                args.read_defaults(base_rows, base_columns, ctx, blocks)?;
                 Ok((wf, func, is_agg, args))
             })
             .collect::<Result<_>>()?;
@@ -1752,7 +1765,6 @@ impl Executor {
                         base_rows,
                         row_indices.clone(),
                         precomputed_order_by,
-                        base_columns,
                         col_index_map,
                         group_slots,
                         ctx,
@@ -1970,6 +1982,7 @@ impl Executor {
                     ctx,
                     None,
                 )?;
+                args.read_defaults(&partition_rows, base_columns, ctx, None)?;
 
                 if *is_agg {
                     let agg_results = self.compute_aggregate_window_function(
@@ -1994,7 +2007,6 @@ impl Executor {
                         &partition_rows,
                         row_indices.clone(),
                         precomputed_order_by,
-                        base_columns,
                         col_index_map,
                         &group_slots,
                         ctx,
@@ -2871,6 +2883,7 @@ impl Executor {
             ctx,
             blocks,
         )?;
+        args.read_defaults(rows, columns, ctx, blocks)?;
         let frame = Frame::read(wf_info, &args, ctx)?;
 
         // If there's no partitioning, all rows form one partition
@@ -2885,7 +2898,6 @@ impl Executor {
                 partitions[0].clone(),
                 true,
                 precomputed_order_by,
-                columns,
                 col_index_map,
                 group_slots,
                 ctx,
@@ -2911,43 +2923,27 @@ impl Executor {
             // Each partition writes to its own row indices (guaranteed disjoint).
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
-            let lead_lag_default = args.default_program(columns)?;
 
-            // A default holding a REGEXP is copied once per thread, not per job
-            #[cfg(feature = "parallel")]
-            let min_len = match lead_lag_default.is_some_and(Program::holds_thread_state) {
-                true => partitions.len().div_ceil(rayon::current_num_threads()),
-                false => 1,
-            };
             #[cfg(feature = "parallel")]
             let iter_result = partitions
                 .par_iter()
-                .with_min_len(min_len)
-                .try_for_each_init(
-                    || {
-                        lead_lag_default
-                            .filter(|program| program.holds_thread_state())
-                            .map(Program::worker_copy)
-                    },
-                    |worker, row_indices| -> Result<()> {
-                        // Direct writing: each partition writes to its own indices
-                        self.compute_window_for_partition_parallel(
-                            &*window_func,
-                            wf_info,
-                            rows,
-                            row_indices.clone(),
-                            true,
-                            precomputed_order_by,
-                            col_index_map,
-                            group_slots,
-                            ctx,
-                            &frame,
-                            &args,
-                            worker.as_ref().or(lead_lag_default),
-                            &parallel_results,
-                        )
-                    },
-                );
+                .try_for_each(|row_indices| -> Result<()> {
+                    // Direct writing: each partition writes to its own indices
+                    self.compute_window_for_partition_parallel(
+                        &*window_func,
+                        wf_info,
+                        rows,
+                        row_indices.clone(),
+                        true,
+                        precomputed_order_by,
+                        col_index_map,
+                        group_slots,
+                        ctx,
+                        &frame,
+                        &args,
+                        &parallel_results,
+                    )
+                });
             #[cfg(not(feature = "parallel"))]
             let iter_result = partitions.iter().try_for_each(|row_indices| -> Result<()> {
                 // Direct writing: each partition writes to its own indices
@@ -2963,7 +2959,6 @@ impl Executor {
                     ctx,
                     &frame,
                     &args,
-                    lead_lag_default,
                     &parallel_results,
                 )
             });
@@ -2986,7 +2981,6 @@ impl Executor {
                     row_indices.clone(),
                     true,
                     precomputed_order_by,
-                    columns,
                     col_index_map,
                     group_slots,
                     ctx,
@@ -3017,7 +3011,6 @@ impl Executor {
         all_rows: &[(i64, Row)],
         mut row_indices: Vec<usize>,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
-        columns: &[String],
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
@@ -3049,7 +3042,6 @@ impl Executor {
             wf_info,
             &frame,
             args,
-            args.default_program(columns)?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3070,7 +3062,6 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         frame: &Frame,
         args: &CallArgs,
-        lead_lag_default: Option<&Program>,
         all_rows: &[(i64, Row)],
         row_indices: &[usize],
         order_by_values: &ColumnarOrderByValues,
@@ -3107,7 +3098,6 @@ impl Executor {
 
         // NTH_VALUE's n evaluates only for a frame that is not empty
         let mut count_arg = args.count.as_ref().map(PartitionArg::new);
-        let mut default_vm = ExprVM::new();
         let lead_lag_offset = if wf_info.name == "LEAD" {
             "the offset of LEAD"
         } else {
@@ -3125,12 +3115,7 @@ impl Executor {
                         Some(arg) => window_count(&arg.value(ctx)?, lead_lag_offset, 0)?,
                         None => 1,
                     },
-                    args.default_value(
-                        lead_lag_default,
-                        &mut default_vm,
-                        &all_rows[row_idx].1,
-                        ctx,
-                    )?,
+                    args.default_value(row_idx, ctx)?,
                     all_rows,
                     row_indices,
                     input,
@@ -3219,7 +3204,6 @@ impl Executor {
         mut row_indices: Vec<usize>,
         already_sorted: bool,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
-        columns: &[String],
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
@@ -3251,7 +3235,6 @@ impl Executor {
             wf_info,
             frame,
             args,
-            args.default_program(columns)?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3281,7 +3264,6 @@ impl Executor {
         ctx: &ExecutionContext,
         frame: &Frame,
         args: &CallArgs,
-        lead_lag_default: Option<&Program>,
         results: &ParallelVec,
     ) -> Result<()> {
         // Empty fallback for when no precomputed values are provided
@@ -3308,7 +3290,6 @@ impl Executor {
             wf_info,
             frame,
             args,
-            lead_lag_default,
             all_rows,
             &row_indices,
             order_by_values,

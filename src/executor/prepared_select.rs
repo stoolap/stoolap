@@ -80,7 +80,10 @@ use super::utils::{
     order_by_names_an_alias, qualified, split_qualified, strip_table_qualifier,
     value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
-use super::volatility::{expression_volatility, statement_draws_per_call};
+use super::volatility::{
+    expression_volatility, read_once_argument, reads_no_row, reads_row, statement_constant,
+    statement_draws_per_call, FRAME_OFFSET,
+};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
@@ -414,12 +417,13 @@ impl<'a> Family<'a> {
                     Site::GroupedList => Site::GroupedOutput,
                     _ => return Err("a window function outside the SELECT list"),
                 };
-                // NTILE's argument, the ones after a call's first and the frame
-                // offsets are read once for the call: a subquery there runs once
+                // An argument the call reads once runs a subquery once
                 let call = &window.function;
-                let inputs = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
                 for (i, arg) in call.arguments.iter().enumerate() {
-                    let at = if i < inputs { inner } else { Site::Subqueries };
+                    let at = match read_once_argument(&call.function, i) {
+                        Some(_) => Site::Subqueries,
+                        None => inner,
+                    };
                     if !matches!(arg, Expression::Star(_)) {
                         self.expression(arg, scopes, at, found)?;
                     }
@@ -2465,52 +2469,6 @@ impl Chain<'_> {
         match self.resolve(expr)? {
             Some((depth, index)) => Ok(self.column(depth, index)),
             None => rebuild(expr, &mut |child| self.in_scope(child)),
-        }
-    }
-}
-
-/// Whether an argument a call in `expr` reads once rather than for each row
-/// passes `matches`: an aggregate's after its first, a window function's
-/// after its first (each of NTILE's), and a frame offset
-fn constant_args_any(expr: &Expression, matches: &impl Fn(&Expression) -> bool) -> bool {
-    let within = |input: &Expression| constant_args_any(input, matches);
-    match expr {
-        Expression::ScalarSubquery(_) | Expression::Exists(_) => false,
-        Expression::Window(window) => {
-            let call = &window.function;
-            let first = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
-            call.arguments
-                .iter()
-                .skip(first)
-                .chain(window.frame_offsets())
-                .any(matches)
-                || call
-                    .arguments
-                    .iter()
-                    .take(first)
-                    .chain(call.filter.as_deref())
-                    .chain(call.order_by.iter().map(|o| &o.expression))
-                    .chain(&window.partition_by)
-                    .chain(window.order_by.iter().map(|o| &o.expression))
-                    .any(within)
-        }
-        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
-            call.arguments.iter().skip(1).any(matches)
-                || call
-                    .arguments
-                    .iter()
-                    .take(1)
-                    .chain(call.filter.as_deref())
-                    .chain(call.order_by.iter().map(|o| &o.expression))
-                    .any(within)
-        }
-        other => {
-            let mut found = false;
-            let _ = for_each_child(other, &mut |child| {
-                found |= within(child);
-                Ok(())
-            });
-            found
         }
     }
 }
@@ -5924,7 +5882,85 @@ impl Builder<'_> {
                 Ok(slot_parameter(slot))
             }
             (Some(_), false) => Ok(expr.clone()),
-            (None, _) => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
+            (None, _) => match self.read_once_slotted(expr, run_slots)? {
+                Some(call) => rebuild(&call, &mut |child| self.slotted(child, run_slots)),
+                None => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
+            },
+        }
+    }
+
+    /// The call `expr` with each argument it reads once that holds a block
+    /// one run slot, None when it has none
+    fn read_once_slotted(
+        &mut self,
+        expr: &Expression,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<Option<Expression>> {
+        if !matches!(expr, Expression::Window(_) | Expression::FunctionCall(_)) {
+            return Ok(None);
+        }
+        let mut call = expr.clone();
+        let (function, frame) = match &mut call {
+            Expression::Window(window) => (&mut *window.function, window.frame.as_mut()),
+            Expression::FunctionCall(function) => (&mut **function, None),
+            _ => return Ok(None),
+        };
+        let name = &function.function;
+        let arguments = function
+            .arguments
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(at, arg)| Some((arg, read_once_argument(name, at)?)));
+        let offsets = frame.into_iter().flat_map(WindowFrame::offsets_mut);
+        let mut slotted = false;
+        for (arg, what) in arguments.chain(offsets.map(|offset| (offset, FRAME_OFFSET))) {
+            slotted |= self.read_once_slot(arg, what, run_slots)?;
+        }
+        Ok(slotted.then_some(call))
+    }
+
+    /// `arg`, read once for its call, made one run slot when it holds a
+    /// block: an error when it reads the row, left to its call to read when
+    /// it draws a value; whether it was made one
+    fn read_once_slot(
+        &mut self,
+        arg: &mut Expression,
+        what: &str,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<bool> {
+        if !mentions_subquery(arg) {
+            return Ok(false);
+        }
+        let mut binds_row = false;
+        let unblocked = self.unblocked(arg, &mut binds_row)?;
+        let registry = &self.executor.function_registry;
+        if binds_row || !reads_no_row(&unblocked, registry) {
+            return Err(reads_row(what));
+        }
+        if !statement_constant(&unblocked, registry) {
+            return Ok(false);
+        }
+        let slot = self.slot();
+        run_slots.push((slot, std::mem::replace(arg, slot_parameter(slot))));
+        Ok(true)
+    }
+
+    /// `expr` with each block it reads one value, `binds_row` set when one
+    /// binds the statement's row
+    fn unblocked(&self, expr: &Expression, binds_row: &mut bool) -> Result<Expression> {
+        let (block, left) = match expr {
+            Expression::ScalarSubquery(sq) => (&sq.subquery, None),
+            Expression::Exists(exists) => (&exists.subquery, None),
+            Expression::AllAny(all_any) => (&all_any.subquery, Some(&*all_any.left)),
+            _ => return rebuild(expr, &mut |child| self.unblocked(child, binds_row)),
+        };
+        *binds_row |= block
+            .prepared
+            .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
+            .is_none_or(|sq| !sq.uncorrelated());
+        match left {
+            Some(left) => self.unblocked(left, binds_row),
+            None => Ok(slot_parameter(0)),
         }
     }
 
@@ -9289,19 +9325,6 @@ impl PreparedGrouped {
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
         let stmt = first_branch(run_stmt);
-        // An argument read once for its call holds only run slots: one reading
-        // the row is the general path's to refuse
-        // The ORDER BY keys a hidden item computes count with the list
-        let constants = |stmt: &SelectStatement, matches: &dyn Fn(&Expression) -> bool| {
-            stmt.columns
-                .iter()
-                .chain(stmt.having.as_deref())
-                .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-                .any(|e| constant_args_any(e, &matches))
-        };
-        if constants(&stmt, &mentions_subquery) {
-            return Ok(None);
-        }
         let classification = super::query_classification::get_classification(&stmt);
         let (windowed, aggregated) = (
             classification.has_window_functions,

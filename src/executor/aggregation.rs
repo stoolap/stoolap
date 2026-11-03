@@ -889,10 +889,9 @@ fn extra_arg_constant(arg: &Expression) -> Result<()> {
     if super::volatility::statement_constant(arg, crate::functions::registry::global_registry()) {
         return Ok(());
     }
-    Err(crate::core::Error::invalid_argument(format!(
-        "an aggregate argument after the first must not read the row: {}",
-        arg
-    )))
+    Err(super::volatility::reads_row(
+        super::volatility::AGGREGATE_ARGUMENT,
+    ))
 }
 
 /// What one aggregate call reads from each input row, compiled once: the

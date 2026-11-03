@@ -32,6 +32,7 @@ pub(crate) fn expression_volatility(expr: &Expression, registry: &FunctionRegist
         statement_rows: &|_| false,
         constant: false,
         whole_blocks: false,
+        draws: true,
     }
     .expression(expr)
 }
@@ -48,6 +49,7 @@ pub(crate) fn statement_draws_per_call(
         statement_rows: &|_| false,
         constant: false,
         whole_blocks: true,
+        draws: true,
     }
     .statement(stmt)
         == Volatility::PerCall
@@ -63,9 +65,77 @@ pub(crate) fn statement_constant(expr: &Expression, registry: &FunctionRegistry)
         statement_rows: &|_| false,
         constant: true,
         whole_blocks: false,
+        draws: true,
     }
     .expression(expr)
         != Volatility::PerCall
+}
+
+/// Whether `expr` reads nothing of a row, as [`statement_constant`] asks,
+/// whatever its functions draw
+pub(crate) fn reads_no_row(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    Walk {
+        registry,
+        statement_rows: &|_| false,
+        constant: true,
+        whole_blocks: false,
+        draws: false,
+    }
+    .expression(expr)
+        != Volatility::PerCall
+}
+
+/// The name of a window frame offset, which its window reads once
+pub(crate) const FRAME_OFFSET: &str = "a frame offset";
+
+/// The name of an aggregate's argument after its first, which it reads once
+pub(crate) const AGGREGATE_ARGUMENT: &str = "an aggregate argument after the first";
+
+/// The argument a window function that is no aggregate reads once rather
+/// than for each row, by its position and name
+pub(crate) fn window_count_argument(function: &str) -> Option<(usize, &'static str)> {
+    let named = |name: &str| function.eq_ignore_ascii_case(name);
+    if named("NTILE") {
+        Some((0, "the bucket count of NTILE"))
+    } else if named("LEAD") {
+        Some((1, "the offset of LEAD"))
+    } else if named("LAG") {
+        Some((1, "the offset of LAG"))
+    } else if named("NTH_VALUE") {
+        Some((1, "the n of NTH_VALUE"))
+    } else {
+        None
+    }
+}
+
+/// The name of argument `at` of a call to `function` when the call reads it
+/// once rather than for each row: an aggregate's after its first, or the
+/// one [`window_count_argument`] gives
+pub(crate) fn read_once_argument(function: &str, at: usize) -> Option<&'static str> {
+    match window_count_argument(function) {
+        Some((count_at, what)) => (count_at == at).then_some(what),
+        None => {
+            (at > 0 && super::utils::is_aggregate_function(function)).then_some(AGGREGATE_ARGUMENT)
+        }
+    }
+}
+
+/// The error of an argument `what`, read once, that reads the row
+pub(crate) fn reads_row(what: &str) -> crate::core::Error {
+    crate::core::Error::invalid_argument(format!("{what} must not read the row"))
+}
+
+/// An error unless `arg`, which its call reads once rather than for each
+/// row, reads nothing of a row; `what` names it in the error
+pub(crate) fn read_once(
+    arg: &Expression,
+    registry: &FunctionRegistry,
+    what: &str,
+) -> crate::core::Result<()> {
+    match reads_no_row(arg, registry) {
+        true => Ok(()),
+        false => Err(reads_row(what)),
+    }
 }
 
 /// The volatility of everything `stmt` evaluates, its CTEs, set operations
@@ -82,6 +152,7 @@ pub(crate) fn statement_volatility_in(
         statement_rows,
         constant: false,
         whole_blocks: false,
+        draws: true,
     }
     .statement(stmt)
 }
@@ -97,6 +168,7 @@ pub(crate) fn expression_volatility_in(
         statement_rows,
         constant: false,
         whole_blocks: false,
+        draws: true,
     }
     .expression(expr)
 }
@@ -111,6 +183,8 @@ struct Walk<'a> {
     /// A nested block keeps its own volatility instead of counting once per
     /// statement at most
     whole_blocks: bool,
+    /// Whether a call counts what its function draws
+    draws: bool,
 }
 
 impl Walk<'_> {
@@ -262,9 +336,11 @@ impl Walk<'_> {
         if self.constant && self.registry.is_aggregate(&call.function) {
             return Volatility::PerCall;
         }
-        self.registry
-            .volatility(&call.function)
-            .max(self.all(&call.arguments))
+        let own = match self.draws {
+            true => self.registry.volatility(&call.function),
+            false => Volatility::Fixed,
+        };
+        own.max(self.all(&call.arguments))
             .max(self.ordered(&call.order_by))
             .max(
                 call.filter
