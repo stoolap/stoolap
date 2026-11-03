@@ -1299,18 +1299,7 @@ impl Executor {
         }
         // A join's rows pass its ON and WHERE as the join path asks them
         match stmt.table_expr.as_deref() {
-            // The grouped rows hold each merged pair apart, which a star shows
-            Some(from @ Expression::JoinSource(_)) => {
-                let star = stmt
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
-                if star && merges_columns(from) {
-                    return Err(
-                        "a star over a NATURAL or USING join whose output holds a subquery",
-                    );
-                }
-            }
+            Some(Expression::JoinSource(_)) => {}
             table_expr => {
                 if let Some(where_clause) = stmt.where_clause.as_deref() {
                     family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
@@ -8528,6 +8517,9 @@ pub struct PreparedGrouped {
     /// The keys computed over the rows the run returns, when a key reads an
     /// alias of an item that computing again would not give
     late: Option<Box<LateKeys>>,
+    /// For a statement whose stars were written out, the item each written
+    /// item comes from
+    star_items: Option<Box<[usize]>>,
     pub(crate) stmt: SelectStatement,
     pub(crate) classification: Arc<super::query_classification::QueryClassification>,
 }
@@ -9309,6 +9301,7 @@ impl PreparedGrouped {
             window,
             source_values,
             late,
+            star_items: None,
             classification,
             stmt,
         }))
@@ -9317,6 +9310,12 @@ impl PreparedGrouped {
     /// The keys computed over the rows the run returns, when there are any
     pub(crate) fn late_keys(&self) -> Option<&LateKeys> {
         self.late.as_deref()
+    }
+
+    /// The item each item of the statement it runs comes from, when its
+    /// stars were written out
+    pub(crate) fn star_items(&self) -> Option<&[usize]> {
+        self.star_items.as_deref()
     }
 
     /// Whether the statement reads run slots, which its parameters then
@@ -9484,16 +9483,29 @@ impl Executor {
         let Some(scope) = scope else {
             return Ok(None);
         };
-        PreparedGrouped::prepare(
+        // The windows lay out the rows by the stars written out, as a
+        // statement that does not group shows them
+        let classification = get_classification(stmt);
+        let stars = match blocks {
+            Some(blocks) if !classification.has_aggregation && !classification.has_group_by => {
+                blocks.written_stars(stmt, columns)?
+            }
+            _ => None,
+        };
+        let prepared = PreparedGrouped::prepare(
             self,
             ctx,
-            stmt,
+            stars.as_ref().map_or(stmt, |(written, _)| written),
             scope,
             CompactArc::new(untyped_schema("", columns)),
             GroupedSource::Joined,
             ctx.params().len(),
             self.engine.schema_epoch(),
-        )
+        )?;
+        Ok(prepared.map(|prepared| PreparedGrouped {
+            star_items: stars.map(|(_, items)| items),
+            ..prepared
+        }))
     }
 
     /// Whether the plan holds a grouped statement prepared for the current
@@ -10111,6 +10123,53 @@ impl JoinBlocks {
     /// The columns of the joined row a `*` the blocks project shows
     pub(crate) fn star_columns(&self) -> Vec<usize> {
         star_columns(self.all.len(), &self.scope.merged)
+    }
+
+    /// `stmt` with each star written as the joined row's columns the join's
+    /// output shows for it, each read by its position: a `*` those of
+    /// `star_columns` under their `named` names, a `t.*` the columns of t
+    /// under their own; with the item of `stmt` each item comes from. None
+    /// when no item is a star
+    fn written_stars(
+        &self,
+        stmt: &SelectStatement,
+        named: &[String],
+    ) -> Result<Option<(SelectStatement, Box<[usize]>)>> {
+        let star =
+            |item: &Expression| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_));
+        if !stmt.columns.iter().any(star) {
+            return Ok(None);
+        }
+        let column = |index: usize, name: &str, lower: &str| {
+            Expression::Column(ColumnRef {
+                index: index as u32,
+                name: ident(name, lower),
+            })
+        };
+        let mut columns = Vec::with_capacity(stmt.columns.len() + named.len());
+        let mut items = Vec::with_capacity(stmt.columns.len() + named.len());
+        for (at, item) in stmt.columns.iter().enumerate() {
+            match item {
+                Expression::Star(_) => columns.extend(self.star_columns().into_iter().map(|i| {
+                    let name = &named[i];
+                    column(i, name, &name.to_lowercase())
+                })),
+                Expression::QualifiedStar(star) => {
+                    let [left, right] = &self.side_columns;
+                    columns.extend(qualified_star_columns(star, &self.scope)?.map(|i| {
+                        let side = left.get(i).unwrap_or_else(|| &right[i - left.len()]);
+                        column(i, &side.name, &self.scope.lower[i])
+                    }))
+                }
+                item => columns.push(item.clone()),
+            }
+            items.resize(columns.len(), at);
+        }
+        let written = SelectStatement {
+            columns,
+            ..stmt.clone()
+        };
+        Ok(Some((written, items.into_boxed_slice())))
     }
 
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read

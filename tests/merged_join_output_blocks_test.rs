@@ -345,13 +345,83 @@ fn a_merging_join_that_groups_or_has_windows_runs_its_grouped_blocks() {
         let values = |rows: Result<Vec<String>, String>| rows.map(|r| r[1..].to_vec());
         assert_eq!(values(answer), values(rows(&db, twin)), "{sql}");
     }
-    // A star there shows each merged pair once, which the grouped rows hold apart
-    let sql = "SELECT *, ROW_NUMBER() OVER (ORDER BY l.id) AS rn, (SELECT 1) AS x \
-               FROM l JOIN r USING (id)";
-    assert_eq!(
-        prepared_line(&db, sql),
-        "Prepared: no (a star over a NATURAL or USING join whose output holds a subquery)",
-        "{sql}"
-    );
-    assert!(rows(&db, sql).is_ok_and(|r| r.len() > 1), "{sql}");
+}
+
+#[test]
+fn a_star_over_a_merging_join_with_windows_shows_the_join_s_columns() {
+    use stoolap::test_failpoints::general_path_total;
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let star = "l.id AS \"l.id\", l.k AS k, l.g AS \"l.g\", r.id AS \"r.id\", r.w AS \"r.w\"";
+    let mut wrong = Vec::new();
+    for (context, db) in databases(&dir) {
+        for (sql, twin) in [
+            (
+                "SELECT *, ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn, (SELECT 1) AS x \
+                 FROM l JOIN r USING (k) ORDER BY rn"
+                    .to_string(),
+                format!(
+                    "SELECT {star}, ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn, 1 AS x \
+                     FROM l JOIN r ON r.k = l.k ORDER BY rn"
+                ),
+            ),
+            (
+                "SELECT *, COUNT(*) OVER (PARTITION BY k) AS n, (SELECT 1) AS x \
+                 FROM l LEFT JOIN r USING (k) ORDER BY 1, 4"
+                    .to_string(),
+                format!(
+                    "SELECT {star}, COUNT(*) OVER (PARTITION BY l.k) AS n, 1 AS x \
+                     FROM l LEFT JOIN r ON r.k = l.k ORDER BY 1, 4"
+                ),
+            ),
+            (
+                "SELECT l.*, r.*, ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn, (SELECT 1) AS x \
+                 FROM l JOIN r USING (k) ORDER BY rn DESC LIMIT 7 OFFSET 2"
+                    .to_string(),
+                "SELECT l.id AS id, l.k AS k, l.g AS g, r.id AS id, r.k AS k, r.w AS w, \
+                 ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn, 1 AS x \
+                 FROM l JOIN r ON r.k = l.k ORDER BY rn DESC LIMIT 7 OFFSET 2"
+                    .to_string(),
+            ),
+            (
+                "SELECT DISTINCT ON (k) *, SUM(l.g) OVER w AS s, (SELECT 1) AS x \
+                 FROM l JOIN r USING (k) WINDOW w AS (PARTITION BY k ORDER BY l.id, r.id) \
+                 ORDER BY k, l.id, r.id"
+                    .to_string(),
+                format!(
+                    "SELECT DISTINCT ON (l.k) {star}, SUM(l.g) OVER w AS s, 1 AS x \
+                     FROM l JOIN r ON r.k = l.k WINDOW w AS (PARTITION BY l.k ORDER BY l.id, r.id) \
+                     ORDER BY l.k, l.id, r.id"
+                ),
+            ),
+            (
+                "SELECT *, ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn FROM l JOIN r USING (k) \
+                 ORDER BY (SELECT 0) + rn LIMIT 5"
+                    .to_string(),
+                format!(
+                    "SELECT {star}, ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn \
+                     FROM l JOIN r ON r.k = l.k ORDER BY rn LIMIT 5"
+                ),
+            ),
+        ] {
+            let line = prepared_line(&db, &sql);
+            let before = general_path_total();
+            let got = rows(&db, &sql);
+            let general = general_path_total() != before;
+            let want = rows(&db, &twin);
+            if line != "Prepared: yes" || general || got != want || want.is_err() {
+                wrong.push(format!(
+                    "{context}: {sql}\n  [{line}] general {general}\n  got  {got:?}\n  want {want:?}"
+                ));
+            }
+        }
+        // A bare name both sides carry is ambiguous beside a subquery
+        let sql = "SELECT *, ROW_NUMBER() OVER (ORDER BY l.id, r.id) AS rn, (SELECT 1) AS x \
+                   FROM l JOIN r USING (k) ORDER BY id";
+        match rows(&db, sql) {
+            Err(e) if e.contains("column reference 'id' is ambiguous") => {}
+            other => wrong.push(format!("{context}: {sql}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
