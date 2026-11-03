@@ -45,9 +45,9 @@ use crate::storage::traits::{
 };
 
 use super::aggregation::{
-    aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
-    grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, FeedInput,
-    GroupByItem, HeldFeed, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
+    aggregate_alias_key, aggregate_extra_args, aggregate_group_key, aggregate_slot_keys,
+    check_grouped_reads, grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs,
+    FeedInput, GroupByItem, HeldFeed, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -56,8 +56,8 @@ use super::context::{
 use super::expr_key::ExprKey;
 use super::expression::{
     known_params, more_than_one_row, parameter_slot, CompareOp, CompileContext, CompileError,
-    ExecuteContext, ExprCompiler, ExprVM, Op, QuantifiedMembers, RowComparison, RowFilter,
-    RowMembers, RowTest, SharedProgram, SubqueryExecutor,
+    ExecuteContext, ExprCompiler, ExprVM, HeldOnce, Op, QuantifiedMembers, RowComparison,
+    RowFilter, RowMembers, RowTest, SharedProgram, SubqueryExecutor,
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::planned_aggregate::{AggregatePlan, AggregateRead, GlobalSource};
@@ -3628,11 +3628,10 @@ pub struct PreparedSelect {
     /// The statement aggregates its rows into one: they are read whole and
     /// fed to its calls, unless the table answers them
     aggregated: bool,
-    /// Those calls, parsed once when each later argument is written as its
-    /// value; None parses them on each run
-    calls: Option<Vec<SqlAggregateFunction>>,
-    /// The programs feeding its calls, held or parsed on each run, compiled
-    /// by the first run
+    /// Those calls, parsed once, each later argument not written as its
+    /// value read by each run
+    calls: Option<PreparedCalls>,
+    /// The programs feeding its calls, compiled by the first run
     feed: HeldFeed,
     /// The programs of its windows, which every plan of them holds
     windows: HeldWindow,
@@ -3655,6 +3654,14 @@ pub struct PreparedSelect {
 /// value a program over no row that reads the statement's blocks
 type SourcePrograms = Box<[Box<[SharedProgram]>]>;
 
+/// A statement's aggregate calls, with a held program for each later
+/// argument a call keeps as written, one list for each call
+#[derive(Debug)]
+pub(crate) struct PreparedCalls {
+    calls: Vec<SqlAggregateFunction>,
+    arguments: Box<[Box<[HeldOnce]>]>,
+}
+
 /// A run's aggregate calls, the blocks answering them and their held feed
 type HeldCalls<'a> = (
     &'a [SqlAggregateFunction],
@@ -3668,8 +3675,8 @@ type HeldCalls<'a> = (
 pub(crate) struct RowsRead<'p> {
     where_: &'p PreparedWhere,
     read: Option<&'p Read>,
-    /// The calls, None when a run parses them
-    calls: Option<&'p [SqlAggregateFunction]>,
+    /// The calls, None when the statement does not aggregate
+    calls: Option<&'p PreparedCalls>,
     /// The programs feeding the calls
     feed: Option<&'p HeldFeed>,
     /// The programs of the statement's windows
@@ -3884,7 +3891,7 @@ impl PreparedSelect {
         RowsRead {
             where_: &self.where_,
             read: self.plan.as_ref().map(|plan| &plan.read),
-            calls: self.calls.as_deref(),
+            calls: self.calls.as_ref(),
             feed: Some(&self.feed),
             windows: Some(&self.windows),
             windowed: self.windowed,
@@ -3907,14 +3914,18 @@ impl PreparedSelect {
             .is_some_and(|w| !Executor::has_subqueries(w) && has_constant_term(w, registry))
     }
 
-    /// The calls of `written`, held when none has a later argument not
-    /// written as a value, which a run reads; None parses them on each run
-    fn held_calls(
-        executor: &Executor,
-        written: &SelectStatement,
-    ) -> Result<Option<Vec<SqlAggregateFunction>>> {
-        Ok(Some(executor.parse_held_aggregations(written)?)
-            .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())))
+    /// The calls of `written`, a later argument not written as a value kept
+    /// as written for each run to read through its held program
+    fn held_calls(executor: &Executor, written: &SelectStatement) -> Result<PreparedCalls> {
+        let calls = executor.parse_held_aggregations(written)?;
+        let arguments = calls
+            .iter()
+            .map(|call| {
+                let written = call.extra_exprs.as_deref().map_or(0, <[Expression]>::len);
+                (0..written).map(|_| HeldOnce::new()).collect()
+            })
+            .collect();
+        Ok(PreparedCalls { calls, arguments })
     }
 
     /// `read` under the index read the window rule chooses for `written`'s
@@ -8465,7 +8476,7 @@ impl PreparedSelect {
             }
         }
         let calls = match aggregated {
-            true => Self::held_calls(executor, computed)?,
+            true => Some(Self::held_calls(executor, computed)?),
             false => None,
         };
         let windows = HeldWindow::default();
@@ -8622,10 +8633,9 @@ pub struct PreparedGrouped {
     where_: Option<PreparedWhere>,
     /// The table's read the window or aggregate rule chose
     read: Option<Read>,
-    /// The aggregate calls, None when a run parses them
-    calls: Option<Vec<SqlAggregateFunction>>,
-    /// The programs feeding its calls, held or parsed on each run, compiled
-    /// by the first run
+    /// The aggregate calls, None when it does not aggregate
+    calls: Option<PreparedCalls>,
+    /// The programs feeding its calls, compiled by the first run
     feed: HeldFeed,
     /// The programs of its windows, which every plan of them holds
     windows: HeldWindow,
@@ -9397,7 +9407,7 @@ impl PreparedGrouped {
             GroupedSource::Rows | GroupedSource::Joined => None,
         };
         let calls = match aggregated {
-            true => PreparedSelect::held_calls(executor, &stmt)?,
+            true => Some(PreparedSelect::held_calls(executor, &stmt)?),
             false => None,
         };
         let constant_where = PreparedSelect::constant_where(&stmt, &executor.function_registry);
@@ -9466,7 +9476,7 @@ impl PreparedGrouped {
                 .as_ref()
                 .filter(|_| self.source != GroupedSource::Joined)?,
             read: self.read.as_ref(),
-            calls: self.calls.as_deref(),
+            calls: self.calls.as_ref(),
             feed: Some(&self.feed),
             windows: Some(&self.windows),
             windowed: self.classification.has_window_functions,
@@ -12642,7 +12652,7 @@ impl Executor {
             return self.grouped_windows((held, bound), run, (rows, columns), (None, None), ctx);
         }
         let stmt = &*bounded_branch(&held.stmt, bound);
-        let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
+        let aggregations = &*self.prepared_calls(held.calls.as_ref(), (ctx, run))?;
         let windows = held.classification.has_window_functions;
         let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
         let calls = (
@@ -12709,7 +12719,7 @@ impl Executor {
         (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         table: &dyn Table,
     ) -> Result<WindowOutput> {
-        let aggregations = &*self.prepared_calls(prepared.calls, stmt, (ctx, runner))?;
+        let aggregations = &*self.prepared_calls(prepared.calls, (ctx, runner))?;
         let windows = prepared.windowed;
         let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
         if QueryClassification::groups(stmt) || windows {
@@ -12828,7 +12838,7 @@ impl Executor {
         source: StatementSource<'_>,
         columns: &[String],
     ) -> Result<WindowOutput> {
-        let aggregations = &*self.prepared_calls(prepared.calls, stmt, (ctx, runner))?;
+        let aggregations = &*self.prepared_calls(prepared.calls, (ctx, runner))?;
         let windows = prepared.windowed;
         let calls = (
             aggregations,
@@ -12883,17 +12893,26 @@ impl Executor {
         })
     }
 
-    /// The calls of `stmt`, `held` when no run changes them
+    /// The `held` calls of a statement, as they are when no later argument
+    /// is read, else with each read for this run of `ctx`
     fn prepared_calls<'p>(
         &self,
-        held: Option<&'p [SqlAggregateFunction]>,
-        stmt: &SelectStatement,
+        held: Option<&'p PreparedCalls>,
         (ctx, run): (&ExecutionContext, &PreparedRunner<'_>),
     ) -> Result<std::borrow::Cow<'p, [SqlAggregateFunction]>> {
-        Ok(match held {
-            Some(calls) => std::borrow::Cow::Borrowed(calls),
-            None => std::borrow::Cow::Owned(self.parse_aggregations_in(stmt, ctx, run)?),
-        })
+        let held = held.ok_or_else(|| Error::internal("an aggregate without its calls"))?;
+        if held.calls.iter().all(|call| call.extra_exprs.is_none()) {
+            return Ok(std::borrow::Cow::Borrowed(&held.calls));
+        }
+        let mut calls = held.calls.clone();
+        for (call, arguments) in calls.iter_mut().zip(held.arguments.iter()) {
+            if let Some(extra) = call.extra_exprs.take() {
+                let blocks = Some(run as &dyn SubqueryExecutor);
+                let read = aggregate_extra_args(&extra, Some(ctx), blocks, Some(arguments))?;
+                (call.extra_args, call.extra_error) = read;
+            }
+        }
+        Ok(std::borrow::Cow::Owned(calls))
     }
 
     /// [`Self::passed_input`] over the rows of `table`, which it holds when

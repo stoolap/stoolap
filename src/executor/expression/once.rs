@@ -33,6 +33,21 @@ pub(crate) fn compile_once(expr: &Expression, blocks: bool) -> Result<Program> {
     compile_once_in(expr, global_registry(), blocks)
 }
 
+/// A one-shot program a prepared statement holds, compiled by its first run
+pub(crate) type HeldOnce = std::sync::OnceLock<Result<Program>>;
+
+/// `expr`'s program in `held`, compiled as [`compile_once`] compiles it on
+/// the first read
+pub(crate) fn held_once<'h>(
+    held: &'h HeldOnce,
+    expr: &Expression,
+    blocks: bool,
+) -> Result<&'h Program> {
+    held.get_or_init(|| compile_once(expr, blocks))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 /// [`compile_once`] with the functions of `registry`
 fn compile_once_in(
     expr: &Expression,

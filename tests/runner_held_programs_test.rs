@@ -129,11 +129,6 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &[2],
         &["Integer(1)|Integer(21)", "Integer(2)|Integer(42)"],
     ),
-];
-
-/// Statements with an argument after the first that is no literal, which
-/// each run reads once, their parameters and their answers
-const READ_ARGUMENTS: &[(&str, &[i64], &[&str])] = &[
     (
         "SELECT STRING_AGG(CAST(a * $1 AS TEXT), CAST($1 AS TEXT) ORDER BY id) FROM t",
         &[2],
@@ -146,6 +141,35 @@ const READ_ARGUMENTS: &[(&str, &[i64], &[&str])] = &[
             "Integer(1)|Integer(12)",
             "Integer(2)|Integer(20)",
             "Integer(3)|Integer(40)",
+        ],
+    ),
+    (
+        "SELECT id, STRING_AGG(CAST(a AS TEXT), CAST($1 AS TEXT)) OVER (ORDER BY id) FROM t \
+         ORDER BY id",
+        &[2],
+        &[
+            "Integer(1)|Text(\"10\")",
+            "Integer(2)|Text(\"10220\")",
+            "Integer(3)|Text(\"10220230\")",
+        ],
+    ),
+    (
+        "SELECT id, NTILE($1 + 1) OVER (ORDER BY id) FROM t ORDER BY id",
+        &[1],
+        &[
+            "Integer(1)|Integer(1)",
+            "Integer(2)|Integer(1)",
+            "Integer(3)|Integer(2)",
+        ],
+    ),
+    (
+        "SELECT id, SUM(a) OVER (ORDER BY id ROWS BETWEEN $1 - 1 PRECEDING AND CURRENT ROW) \
+         FROM t ORDER BY id",
+        &[2],
+        &[
+            "Integer(1)|Integer(10)",
+            "Integer(2)|Integer(30)",
+            "Integer(3)|Integer(50)",
         ],
     ),
 ];
@@ -189,19 +213,6 @@ fn a_run_after_the_first_compiles_nothing() {
         let compiled = compiled_again(&db, (sql, params, answer), &mut wrong);
         if compiled != (0, 0) {
             wrong.push(format!("{sql}: run again, compiled {compiled:?}"));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-#[test]
-fn a_run_reading_its_arguments_compiles_nothing_through_the_bridge() {
-    let db = open("runner_held_programs_arguments");
-    let mut wrong = Vec::new();
-    for &(sql, params, answer) in READ_ARGUMENTS {
-        let (bridge, _) = compiled_again(&db, (sql, params, answer), &mut wrong);
-        if bridge != 0 {
-            wrong.push(format!("{sql}: run again, {bridge} through the bridge"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
