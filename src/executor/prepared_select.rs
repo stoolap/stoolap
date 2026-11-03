@@ -7306,6 +7306,16 @@ fn source_programs(
         .collect()
 }
 
+/// Whether a source's rows of `columns` still have the columns `schema`
+/// was prepared over, in its order
+fn source_fits(columns: &[String], schema: &Schema) -> bool {
+    columns.len() == schema.columns.len()
+        && columns
+            .iter()
+            .zip(&schema.columns)
+            .all(|(c, s)| c.eq_ignore_ascii_case(&s.name))
+}
+
 /// The rows of a VALUES list, or the arguments of a table function as one
 /// row, when a value in them holds a subquery
 fn source_values(table_expr: Option<&Expression>) -> Option<&[Vec<Expression>]> {
@@ -10950,7 +10960,13 @@ impl Executor {
         let rows = match (source, limit) {
             (BlockSource::Function(function, range, _), Some(limit)) => {
                 let first = Some(limit.saturating_add(offset));
-                let (rows, _) = self.tvf_rows(function, None, range.as_deref(), first, ctx)?;
+                let (rows, columns) =
+                    self.tvf_rows(function, None, range.as_deref(), first, ctx)?;
+                if !source_fits(&columns, schema) {
+                    return Err(Error::SchemaChanged {
+                        table: name.to_string(),
+                    });
+                }
                 let mut rows = rows.into_vec();
                 rows.drain(..offset.min(rows.len()));
                 Ok(rows)
@@ -12008,13 +12024,7 @@ impl Executor {
         schema: &Schema,
         ctx: &ExecutionContext,
     ) -> Result<Option<SourceRows>> {
-        let fits = |columns: &[String]| {
-            columns.len() == schema.columns.len()
-                && columns
-                    .iter()
-                    .zip(&schema.columns)
-                    .all(|(c, s)| c.eq_ignore_ascii_case(&s.name))
-        };
+        let fits = |columns: &[String]| source_fits(columns, schema);
         let (columns, rows) = match source {
             BlockSource::Cte(name) => {
                 let (columns, rows) = ctx
