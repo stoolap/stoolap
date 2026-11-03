@@ -30,16 +30,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
-// Cache size limits for subquery caches to prevent unbounded memory growth.
-// These are per-thread limits since the caches are thread-local.
-const SCALAR_SUBQUERY_CACHE_SIZE: usize = 128;
-const IN_SUBQUERY_CACHE_SIZE: usize = 128;
-const SEMI_JOIN_CACHE_SIZE: usize = 256;
-
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString, StringMap};
 use crate::core::predicate::PredicateSet;
-use crate::core::{Result, Row, Value, ValueMap};
+use crate::core::{Result, Row, Value};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
@@ -50,11 +44,6 @@ static EMPTY_DATABASE: LazyLock<Arc<Option<String>>> = LazyLock::new(|| Arc::new
 static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
     LazyLock::new(|| Arc::new(AHashMap::new()));
 
-// Cache for scalar subquery results to avoid re-execution.
-// Thread-local to avoid synchronization overhead.
-// Uses SQL string as key (not hash) to avoid collision risk.
-// Each result serves only a lookup under the stamp it was read under.
-// LRU-bounded to prevent unbounded memory growth.
 use smallvec::SmallVec;
 
 /// What a cached subquery result was read under: its engine, the schema
@@ -65,130 +54,6 @@ pub struct SubqueryStamp {
     pub engine: u64,
     pub schema: u64,
     pub publish: SmallVec<[u64; 2]>,
-}
-
-/// Cached scalar subquery entry: the stamp it was read under, and the value
-type ScalarSubqueryCacheEntry = (SubqueryStamp, Value);
-
-thread_local! {
-    static SCALAR_SUBQUERY_CACHE: RefCell<LruCache<String, ScalarSubqueryCacheEntry>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(SCALAR_SUBQUERY_CACHE_SIZE).unwrap()));
-}
-
-/// Clear the scalar subquery cache completely.
-pub fn clear_scalar_subquery_cache() {
-    SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// The cached scalar subquery result of `key` read under `stamp`; an
-/// entry read under another stamp is dropped
-pub fn get_cached_scalar_subquery(key: &str, stamp: &SubqueryStamp) -> Option<Value> {
-    SCALAR_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        match c.get(key) {
-            Some((kept, value)) if kept == stamp => {
-                #[cfg(any(test, feature = "test-failpoints"))]
-                crate::test_failpoints::subquery_cache_hit();
-                Some(value.clone())
-            }
-            Some(_) => {
-                c.pop(key);
-                None
-            }
-            None => None,
-        }
-    })
-}
-
-/// Cache a scalar subquery result under the stamp taken before its read
-pub fn cache_scalar_subquery(key: String, stamp: SubqueryStamp, value: Value) {
-    SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (stamp, value));
-    });
-}
-
-// Cache for IN subquery results to avoid re-execution.
-// Thread-local to avoid synchronization overhead.
-// Uses SQL string as key (not hash) to avoid collision risk.
-// Each result serves only a lookup under the stamp it was read under.
-// LRU-bounded to prevent unbounded memory growth.
-
-/// Cached IN subquery entry: (the stamp it was read under, result values,
-/// lazily built shared hash set for single-column IN)
-type InSubqueryCacheEntry = (SubqueryStamp, Vec<Value>, Option<CompactArc<PredicateSet>>);
-
-thread_local! {
-    static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(IN_SUBQUERY_CACHE_SIZE).unwrap()));
-}
-
-/// Clear the IN subquery cache completely.
-pub fn clear_in_subquery_cache() {
-    IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// The cache entry of `key` read under `stamp`, dropping one read under another
-fn with_in_subquery_entry<T>(
-    key: &str,
-    stamp: &SubqueryStamp,
-    read: impl FnOnce(&mut InSubqueryCacheEntry) -> T,
-) -> Option<T> {
-    IN_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        match c.get_mut(key) {
-            Some(entry) if entry.0 == *stamp => {
-                #[cfg(any(test, feature = "test-failpoints"))]
-                crate::test_failpoints::subquery_cache_hit();
-                Some(read(entry))
-            }
-            Some(_) => {
-                c.pop(key);
-                None
-            }
-            None => None,
-        }
-    })
-}
-
-/// The cached IN subquery result of `key` read under `stamp`
-pub fn get_cached_in_subquery(key: &str, stamp: &SubqueryStamp) -> Option<Vec<Value>> {
-    with_in_subquery_entry(key, stamp, |entry| entry.1.clone())
-}
-
-/// Get a cached IN subquery result as a shared hash set, building and
-/// memoizing the set inside the entry on first request. Later hits are
-/// an Arc clone: no value clones, no set rebuild.
-pub fn get_cached_in_subquery_set(
-    key: &str,
-    stamp: &SubqueryStamp,
-) -> Option<CompactArc<PredicateSet>> {
-    with_in_subquery_entry(key, stamp, |entry| {
-        if entry.2.is_none() {
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::in_subquery_set_built();
-            let members = CompactArc::new(entry.1.iter().cloned().collect());
-            entry.2 = Some(CompactArc::new(PredicateSet::of(members)));
-        }
-        entry.2.clone()
-    })
-    .flatten()
-}
-
-/// Cache an IN subquery result under the stamp taken before its read. A
-/// result holding a NULL is not kept: the negated form of the same subquery
-/// reads this cache and keeps no row for such a set, which its readers
-/// decide on a fresh list alone
-pub fn cache_in_subquery(key: String, stamp: SubqueryStamp, values: Vec<Value>) {
-    if values.iter().any(Value::is_null) {
-        return;
-    }
-    IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (stamp, values, None));
-    });
 }
 
 use crate::parser::ast::{Expression, SelectStatement, WindowFrameBound};
@@ -386,31 +251,11 @@ fn bound_tables(bound: &WindowFrameBound, tables: &mut CacheTables) -> Option<()
     }
 }
 
-// Cache for semi-join (EXISTS) hash sets to avoid re-execution.
-// Thread-local to avoid synchronization overhead.
-// Keyed by a u64 hash, checked against the entry's origin on every hit.
-// LRU-bounded to prevent unbounded memory growth.
 use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
-/// What a semi-join set is taken for: the inner table, column and alias,
-/// the inner filter, and the statement's parameter values
-pub struct SemiJoinOrigin<'a> {
-    pub table: &'a str,
-    pub column: &'a str,
-    pub alias: Option<&'a str>,
-    pub filter: Option<&'a Arc<crate::parser::ast::Expression>>,
-    pub params: &'a [Value],
-}
-
-/// A `SemiJoinOrigin` as its cache entry keeps it
-struct KeptOrigin {
-    table: CompactArc<str>,
-    column: String,
-    alias: Option<String>,
-    filter: Option<Arc<crate::parser::ast::Expression>>,
-    params: Vec<Value>,
-}
+/// Answers a block cache keeps per thread, the least recently used dropped first
+const BLOCK_ANSWER_CACHE_SIZE: usize = 256;
 
 /// Whether two parameter values are one input: of one type, a NULL of one
 /// type and a FLOAT of one bit pattern. `Value`'s equality is wider (INTEGER
@@ -431,106 +276,6 @@ fn hash_parameter<H: Hasher>(value: &Value, state: &mut H) {
         Value::Float(f) => f.to_bits().hash(state),
         _ => value.hash(state),
     }
-}
-
-impl SemiJoinOrigin<'_> {
-    /// The cache key: a hash of every part, taken without allocation
-    pub fn key(&self) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
-        self.table.hash(&mut hasher);
-        self.column.hash(&mut hasher);
-        self.alias.hash(&mut hasher);
-        self.filter
-            .map(|filter| super::expression::compute_expression_hash(filter))
-            .hash(&mut hasher);
-        self.params.len().hash(&mut hasher);
-        for value in self.params {
-            hash_parameter(value, &mut hasher);
-        }
-        hasher.finish()
-    }
-
-    fn is(&self, kept: &KeptOrigin) -> bool {
-        let same_filter = match (self.filter, &kept.filter) {
-            (None, None) => true,
-            (Some(filter), Some(kept)) => Arc::ptr_eq(filter, kept) || **filter == **kept,
-            _ => false,
-        };
-        same_filter
-            && *kept.table == *self.table
-            && kept.column == self.column
-            && kept.alias.as_deref() == self.alias
-            && kept.params.len() == self.params.len()
-            && kept
-                .params
-                .iter()
-                .zip(self.params)
-                .all(|(kept, value)| same_parameter(kept, value))
-    }
-
-    fn keep(&self) -> KeptOrigin {
-        KeptOrigin {
-            table: CompactArc::from(self.table),
-            column: self.column.to_string(),
-            alias: self.alias.map(str::to_string),
-            filter: self.filter.cloned(),
-            params: self.params.to_vec(),
-        }
-    }
-}
-
-/// Cached semi-join entry: its origin, checked on a hit, the stamp the set
-/// was read under, and the set
-type SemiJoinCacheEntry = (KeptOrigin, SubqueryStamp, CompactArc<PredicateSet>);
-
-thread_local! {
-    static SEMI_JOIN_CACHE: RefCell<LruCache<u64, SemiJoinCacheEntry>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(SEMI_JOIN_CACHE_SIZE).unwrap()));
-}
-
-/// Clear the semi-join cache completely.
-pub fn clear_semi_join_cache() {
-    SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// The cached semi-join set taken for `origin` under `stamp`, under its
-/// `key`; an entry read under another stamp is dropped
-#[inline]
-pub fn get_cached_semi_join(
-    origin: &SemiJoinOrigin<'_>,
-    key: u64,
-    stamp: &SubqueryStamp,
-) -> Option<CompactArc<PredicateSet>> {
-    SEMI_JOIN_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        match c.get(&key) {
-            Some((kept, kept_stamp, set)) if origin.is(kept) => {
-                if kept_stamp == stamp {
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::subquery_cache_hit();
-                    return Some(CompactArc::clone(set));
-                }
-                c.pop(&key);
-                None
-            }
-            _ => None,
-        }
-    })
-}
-
-/// Cache a semi-join set under the stamp taken before its read
-#[inline]
-pub fn cache_semi_join_arc(
-    origin: &SemiJoinOrigin<'_>,
-    key: u64,
-    stamp: SubqueryStamp,
-    values: CompactArc<PredicateSet>,
-) {
-    SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (origin.keep(), stamp, values));
-    });
 }
 
 /// What the candidates of one key of a prepared EXISTS block met: a row
@@ -696,7 +441,7 @@ impl BlockOrigin<'_> {
 thread_local! {
     static BLOCK_ANSWER_CACHE: RefCell<
         LruCache<u64, (KeptBlockOrigin, SubqueryStamp, BlockAnswer)>,
-    > = RefCell::new(LruCache::new(NonZeroUsize::new(SEMI_JOIN_CACHE_SIZE).unwrap()));
+    > = RefCell::new(LruCache::new(NonZeroUsize::new(BLOCK_ANSWER_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the prepared EXISTS answer cache completely
@@ -743,295 +488,10 @@ pub(crate) fn cache_block_answer(
     BLOCK_ANSWER_CACHE.with(|cache| cache.borrow_mut().put(key, (kept, stamp, answer)));
 }
 
-// Cache for EXISTS predicate filters to avoid re-compilation per row.
-// The key is the predicate expression string (after alias stripping).
-// The value is the compiled RowFilter.
-use super::expression::RowFilter;
-thread_local! {
-    static EXISTS_PREDICATE_CACHE: RefCell<FxHashMap<String, RowFilter>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the EXISTS predicate cache. Should be called at the start of each top-level query.
-pub fn clear_exists_predicate_cache() {
-    EXISTS_PREDICATE_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Get a cached EXISTS predicate filter by key.
-pub fn get_cached_exists_predicate(key: &str) -> Option<RowFilter> {
-    EXISTS_PREDICATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
-}
-
-/// Cache an EXISTS predicate filter.
-pub fn cache_exists_predicate(key: String, filter: RowFilter) {
-    EXISTS_PREDICATE_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, filter);
-    });
-}
-
-// Cache for table schema column names to avoid repeated get_table_schema() calls.
-// The key is the table name, the value is the list of column names.
-thread_local! {
-    static EXISTS_SCHEMA_CACHE: RefCell<FxHashMap<String, ExistsColumns>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the EXISTS schema cache. Should be called at the start of each top-level query.
-pub fn clear_exists_schema_cache() {
-    EXISTS_SCHEMA_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// An EXISTS probe table's column names and the token their positions hold for
-pub type ExistsColumns = (
-    CompactArc<Vec<String>>,
-    crate::storage::mvcc::version_store::LayoutToken,
-);
-
-/// Get cached table column names by table name.
-pub fn get_cached_exists_schema(key: &str) -> Option<ExistsColumns> {
-    EXISTS_SCHEMA_CACHE.with(|cache| cache.borrow().get(key).cloned())
-}
-
-/// Cache table column names (takes Arc for zero-copy sharing).
-pub fn cache_exists_schema(key: String, columns: ExistsColumns) {
-    EXISTS_SCHEMA_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, columns);
-    });
-}
-
-// Cache for pre-computed EXISTS predicate cache keys to avoid expensive format!("{:?}") on every probe.
-// The key is the subquery pointer address (usize), the value is the predicate cache key.
-thread_local! {
-    static EXISTS_PRED_KEY_CACHE: RefCell<FxHashMap<usize, String>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the EXISTS predicate key cache.
-pub fn clear_exists_pred_key_cache() {
-    EXISTS_PRED_KEY_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Get cached predicate cache key by subquery pointer address.
-#[inline]
-pub fn get_cached_exists_pred_key(subquery_ptr: usize) -> Option<String> {
-    EXISTS_PRED_KEY_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
-}
-
-/// Cache a predicate cache key.
-#[inline]
-pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
-    EXISTS_PRED_KEY_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_ptr, pred_key);
-    });
-}
-
-// Cache for batch aggregate subquery results (e.g., COUNT(*) GROUP BY user_id).
-// Thread-local to avoid synchronization overhead.
-// The key is the subquery's address, as for the lookup info; the value maps a group key to its aggregate.
-thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<usize, CompactArc<BatchAggregate>>> = RefCell::new(FxHashMap::default());
-}
-
-/// A batch aggregate's results by group key, with the kinds of the keys
-pub struct BatchAggregate {
-    pub values: ValueMap<Value>,
-    /// As `core::predicate::kind` names them
-    pub kinds: u8,
-}
-
-/// Clear the batch aggregate cache. Should be called at the start of each top-level query.
-pub fn clear_batch_aggregate_cache() {
-    BATCH_AGGREGATE_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-}
-
-/// Get a cached batch aggregate result map by subquery address.
-pub fn get_cached_batch_aggregate(subquery_ptr: usize) -> Option<CompactArc<BatchAggregate>> {
-    BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
-}
-
-/// Cache a batch aggregate result map.
-pub fn cache_batch_aggregate(subquery_ptr: usize, aggregate: BatchAggregate) {
-    BATCH_AGGREGATE_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(subquery_ptr, CompactArc::new(aggregate));
-    });
-}
-
-/// Pre-computed info for batch aggregate lookups to avoid per-row allocations.
-#[derive(Clone)]
-pub struct BatchAggregateLookupInfo {
-    /// The outer column name (lowercase) to look up in outer_row
-    pub outer_column_lower: String,
-    /// Optional qualified outer column name (e.g., "u.id")
-    pub outer_qualified_lower: Option<String>,
-    /// Whether this is a COUNT expression (returns 0 for missing keys)
-    pub is_count: bool,
-}
-
-// Cache for batch aggregate lookup info to avoid recomputing per row.
-// The key is the subquery pointer address (usize), avoiding expensive to_string() per row.
-// Value is Arc-wrapped to avoid cloning strings on every lookup.
-thread_local! {
-    static BATCH_AGGREGATE_INFO_CACHE: RefCell<FxHashMap<usize, Option<Arc<BatchAggregateLookupInfo>>>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the batch aggregate info cache.
-pub fn clear_batch_aggregate_info_cache() {
-    BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-}
-
-/// Get cached batch aggregate lookup info by subquery pointer address.
-/// Returns Arc to avoid cloning strings on every lookup.
-#[inline]
-pub fn get_cached_batch_aggregate_info(
-    subquery_ptr: usize,
-) -> Option<Option<Arc<BatchAggregateLookupInfo>>> {
-    BATCH_AGGREGATE_INFO_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
-}
-
-/// Cache batch aggregate lookup info and return the Arc-wrapped version.
-/// Returns None if info was None (not batchable).
-#[inline]
-pub fn cache_batch_aggregate_info(
-    subquery_ptr: usize,
-    info: Option<BatchAggregateLookupInfo>,
-) -> Option<Arc<BatchAggregateLookupInfo>> {
-    let arc_info = info.map(Arc::new);
-    let result = arc_info.clone();
-    BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_ptr, arc_info);
-    });
-    result
-}
-
-/// Pre-computed info for index nested loop EXISTS lookups to avoid per-row string operations.
-/// This caches the pre-computed lowercase column names for O(1) outer row lookups.
-#[derive(Clone)]
-pub struct ExistsCorrelationInfo {
-    /// The outer column name in original case
-    pub outer_column: String,
-    /// The outer table name (optional)
-    pub outer_table: Option<String>,
-    /// The inner column name
-    pub inner_column: String,
-    /// The inner table name
-    pub inner_table: String,
-    /// Pre-computed lowercase outer column name for fast HashMap lookup
-    pub outer_column_lower: String,
-    /// Pre-computed qualified outer column name (e.g., "u.id") in lowercase
-    pub outer_qualified_lower: Option<String>,
-    /// The additional predicate beyond the correlation (if any)
-    pub additional_predicate: Option<Expression>,
-}
-
-// Cache for EXISTS correlation info to avoid per-row extraction.
-// The key is the subquery pointer address (usize), avoiding format! allocation.
-// Value is Arc-wrapped to avoid cloning strings on every lookup.
-thread_local! {
-    static EXISTS_CORRELATION_CACHE: RefCell<FxHashMap<usize, Option<Arc<ExistsCorrelationInfo>>>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the EXISTS correlation cache.
-pub fn clear_exists_correlation_cache() {
-    EXISTS_CORRELATION_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-// The semi-join set an EXISTS answers a refused probe from, built on its
-// first refusal in the statement, by subquery address.
-thread_local! {
-    static EXISTS_PROBE_FALLBACKS: RefCell<FxHashMap<usize, CompactArc<PredicateSet>>> = RefCell::new(FxHashMap::default());
-}
-
-/// Get the probe fallback kept for a subquery address.
-pub fn get_exists_probe_fallback(subquery_ptr: usize) -> Option<CompactArc<PredicateSet>> {
-    EXISTS_PROBE_FALLBACKS.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
-}
-
-/// Keep the probe fallback for a subquery address.
-pub fn cache_exists_probe_fallback(subquery_ptr: usize, set: CompactArc<PredicateSet>) {
-    EXISTS_PROBE_FALLBACKS.with(|cache| {
-        cache.borrow_mut().insert(subquery_ptr, set);
-    });
-}
-
-/// Clear the caches one statement keeps by subquery address or for its own
-/// reads. Called when a statement starts, since a later statement may reuse
-/// an address and must not read an earlier statement's results.
-pub fn clear_statement_caches() {
-    clear_exists_predicate_cache();
-    clear_exists_schema_cache();
-    clear_exists_pred_key_cache();
-    clear_exists_correlation_cache();
-    EXISTS_PROBE_FALLBACKS.with(|cache| cache.borrow_mut().clear());
-    clear_batch_aggregate_cache();
-    clear_batch_aggregate_info_cache();
-}
-
 /// Clear ALL thread-local caches to release memory.
 /// Call this when a database is dropped to prevent memory leaks.
-/// This also shrinks all cache capacities to zero where applicable.
 pub fn clear_all_thread_local_caches() {
-    // Clear LRU-bounded caches (no shrink_to_fit needed - fixed capacity)
-    SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-    IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-    SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
     clear_block_answer_cache();
-    // Clear and shrink unbounded caches
-    EXISTS_PREDICATE_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    EXISTS_SCHEMA_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    EXISTS_PRED_KEY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    BATCH_AGGREGATE_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    BATCH_AGGREGATE_INFO_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    EXISTS_CORRELATION_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    EXISTS_PROBE_FALLBACKS.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
 
     // Clear storage expression caches (regex patterns)
     crate::core::pattern::clear_regex_cache();
@@ -1046,30 +506,6 @@ pub fn clear_all_thread_local_caches() {
     // Clear global LRU caches
     super::expression::clear_program_cache();
     super::query_classification::clear_classification_cache();
-}
-
-/// Get cached EXISTS correlation info by subquery pointer address.
-/// Returns Arc to avoid cloning strings on every lookup.
-#[inline]
-pub fn get_cached_exists_correlation(
-    subquery_ptr: usize,
-) -> Option<Option<Arc<ExistsCorrelationInfo>>> {
-    EXISTS_CORRELATION_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
-}
-
-/// Cache EXISTS correlation info and return the Arc-wrapped version.
-/// Returns None if info was None (correlation not extractable).
-#[inline]
-pub fn cache_exists_correlation(
-    subquery_ptr: usize,
-    info: Option<ExistsCorrelationInfo>,
-) -> Option<Arc<ExistsCorrelationInfo>> {
-    let arc_info = info.map(Arc::new);
-    let result = arc_info.clone();
-    EXISTS_CORRELATION_CACHE.with(|cache| {
-        cache.borrow_mut().insert(subquery_ptr, arc_info);
-    });
-    result
 }
 
 /// Execution context for SQL queries
@@ -1095,13 +531,7 @@ struct SnapshotState {
     /// What is written through its transaction: nothing for the executor's
     /// own, maybe anything for one a caller gave through `get_table`
     table_use: TableUse,
-    /// The first table the statement's correlated probes read, read without a lock
-    first_probe_table: std::sync::OnceLock<ProbeTable>,
-    /// Any further tables they read, taken once each
-    probe_tables: Mutex<SmallVec<[ProbeTable; 1]>>,
 }
-
-type ProbeTable = (SmartString, Box<dyn crate::storage::traits::Table>);
 
 impl StatementSnapshot {
     /// The statement's reads through `transaction`, begun at `isolation`,
@@ -1135,8 +565,6 @@ impl StatementSnapshot {
             reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
             view,
             table_use,
-            first_probe_table: std::sync::OnceLock::new(),
-            probe_tables: Mutex::new(SmallVec::new()),
         }))
     }
 
@@ -1163,15 +591,6 @@ impl StatementSnapshot {
         self.0.transaction.lock().get_table(name)
     }
 
-    /// The table the executor's own statements use, without the write gate,
-    /// read through the statement's view when it has one
-    pub(crate) fn statement_table(
-        &self,
-        name: &str,
-    ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
-        self.statement_table_at(name, self.0.view.as_ref())
-    }
-
     /// The table read through `view`, None reading the newest committed state
     pub(crate) fn statement_table_at(
         &self,
@@ -1191,49 +610,6 @@ impl StatementSnapshot {
         point: &crate::storage::mvcc::commit_log::ReadPoint,
     ) -> crate::core::Result<crate::core::RowVec> {
         self.0.transaction.lock().rows_at(name, point)
-    }
-
-    /// Runs `f` on the table every correlated probe of the statement reads,
-    /// taken on the first. None when there is no such table, as for a view
-    pub(crate) fn with_probe_table<T>(
-        &self,
-        name: &str,
-        f: impl FnOnce(&dyn crate::storage::traits::Table) -> crate::core::Result<T>,
-    ) -> crate::core::Result<Option<T>> {
-        let first = &self.0.first_probe_table;
-        if first.get().is_none() {
-            let table = match self.statement_table(name) {
-                Err(crate::core::Error::TableNotFound(_)) => return Ok(None),
-                table => table?,
-            };
-            // A probe on another thread may have set it first; either serves
-            let _ = first.set((SmartString::from(name), table));
-        }
-        if let Some((n, table)) = first.get() {
-            if n.eq_ignore_ascii_case(name) {
-                return f(&**table).map(Some);
-            }
-        }
-        let mut tables = self
-            .0
-            .probe_tables
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let at = match tables
-            .iter()
-            .position(|(n, _)| n.eq_ignore_ascii_case(name))
-        {
-            Some(at) => at,
-            None => {
-                let table = match self.statement_table(name) {
-                    Err(crate::core::Error::TableNotFound(_)) => return Ok(None),
-                    table => table?,
-                };
-                tables.push((SmartString::from(name), table));
-                tables.len() - 1
-            }
-        };
-        f(&*tables[at].1).map(Some)
     }
 }
 
@@ -1262,13 +638,6 @@ pub struct ExecutionContext {
     /// Query execution depth (0 = top-level query, >0 = subquery/nested)
     /// Used to ensure TimeoutGuard is only created once at the top level
     pub(crate) query_depth: usize,
-    /// Outer row context for correlated subqueries
-    /// Maps column name (lowercase) to value from the outer query
-    /// Uses FxHashMap<CompactArc<str>, Value> for zero-cost key cloning in hot loops
-    /// pub(crate) to allow taking ownership back for reuse in optimized loops
-    pub(crate) outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
-    /// Outer row column names (for qualified identifier resolution) - wrapped in Arc
-    outer_columns: Option<CompactArc<Vec<String>>>,
     /// CTE data for subqueries to reference CTEs from outer query
     /// Maps CTE name (lowercase) to (columns, rows)
     cte_data: Option<Arc<CteDataMap>>,
@@ -1383,8 +752,6 @@ impl ExecutionContext {
             timeout_ms: 0,
             view_depth: 0,
             query_depth: 0,
-            outer_row: None,
-            outer_columns: None,
             cte_data: None,
             transaction_id: None,
             statement_snapshot: None,
@@ -1541,8 +908,6 @@ impl ExecutionContext {
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth + 1,
             query_depth: self.query_depth + 1, // Views are nested queries
-            outer_row: self.outer_row.clone(),
-            outer_columns: self.outer_columns.clone(),
             cte_data: None,
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
@@ -1568,61 +933,7 @@ impl ExecutionContext {
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth,
             query_depth: self.query_depth + 1,
-            outer_row: self.outer_row.clone(),
-            outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
-            transaction_id: self.transaction_id,
-            statement_snapshot: self.statement_snapshot.clone(),
-            statement_view: self.statement_view.clone(),
-            newest_target: self.newest_target.clone(),
-            table_use: self.table_use,
-            semantic_miss: None,
-            literal_params: false,
-            read_counts: None,
-            historical_cut: self.historical_cut.clone(),
-        }
-    }
-
-    /// Get the outer row context for correlated subqueries
-    pub fn outer_row(&self) -> Option<&FxHashMap<CompactArc<str>, Value>> {
-        self.outer_row.as_ref()
-    }
-
-    /// Get the outer row columns for correlated subqueries
-    pub fn outer_columns(&self) -> Option<&[String]> {
-        self.outer_columns.as_ref().map(|v| v.as_slice())
-    }
-
-    /// Create a new context with outer row context for correlated subqueries.
-    /// The outer_row maps lowercase column names (as CompactArc<str>) to their values.
-    /// NOTE: This is now cheap to clone due to Arc wrapping of immutable fields.
-    pub fn with_outer_row(
-        &self,
-        outer_row: FxHashMap<CompactArc<str>, Value>,
-        outer_columns: CompactArc<Vec<String>>,
-    ) -> Self {
-        // A subquery inside a subquery reads the row its grandparent sits
-        // on as well, with the nearer scope winning where both name a column
-        let outer_row = match &self.outer_row {
-            Some(grandparent) if !grandparent.is_empty() => {
-                let mut merged = grandparent.clone();
-                merged.extend(outer_row);
-                merged
-            }
-            _ => outer_row,
-        };
-        Self {
-            params: self.params.clone(), // Arc clone = cheap
-            auto_commit: self.auto_commit,
-            cancelled: self.cancelled.clone(), // Arc clone = cheap
-            current_database: self.current_database.clone(), // Arc clone = cheap
-            session_vars: self.session_vars.clone(), // Arc clone = cheap
-            timeout_ms: self.timeout_ms,
-            view_depth: self.view_depth,
-            query_depth: self.query_depth + 1, // Increment for subquery
-            outer_row: Some(outer_row),
-            outer_columns: Some(outer_columns), // Arc clone = cheap
-            cte_data: self.cte_data.clone(),    // Arc clone = cheap
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
@@ -1698,8 +1009,6 @@ impl ExecutionContext {
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth,
             query_depth: self.query_depth,
-            outer_row: self.outer_row.clone(),
-            outer_columns: self.outer_columns.clone(),
             cte_data: Some(cte_data),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
@@ -1889,8 +1198,6 @@ impl ExecutionContext {
             timeout_ms: self.timeout_ms,
             view_depth: self.view_depth,
             query_depth: self.query_depth,
-            outer_row: self.outer_row.clone(),
-            outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
@@ -2250,8 +1557,6 @@ impl Default for ExecutionContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::DataType;
-    use rustc_hash::FxHashMap;
 
     #[test]
     fn test_context_new() {
@@ -2318,7 +1623,6 @@ mod tests {
         let derived = [
             ctx.with_incremented_view_depth(),
             ctx.with_incremented_query_depth(),
-            ctx.with_outer_row(FxHashMap::default(), CompactArc::new(Vec::new())),
             ctx.with_cte_data(Arc::new(CteDataMap::default())),
             ctx.with_transaction_id(1),
             ctx.clone(),
@@ -2391,56 +1695,5 @@ mod tests {
         assert!(!ctx.auto_commit());
         assert_eq!(ctx.current_database(), Some("mydb"));
         assert_eq!(ctx.timeout_ms(), 5000);
-    }
-
-    #[test]
-    fn a_semi_join_set_answers_only_its_own_origin_under_a_shared_key() {
-        let origin = |table, params| SemiJoinOrigin {
-            table,
-            column: "bid",
-            alias: None,
-            filter: None,
-            params,
-        };
-        let taken = origin("semi_join_origin_test", &[Value::Integer(10)]);
-        let key = taken.key();
-        let set = || {
-            CompactArc::new(PredicateSet::of(CompactArc::new(
-                [Value::Integer(1)].into_iter().collect(),
-            )))
-        };
-        let stamp = |publish| SubqueryStamp {
-            engine: 0,
-            schema: 0,
-            publish: smallvec::smallvec![publish],
-        };
-        cache_semi_join_arc(&taken, key, stamp(1), set());
-        assert!(get_cached_semi_join(&taken, key, &stamp(1)).is_some());
-        for other in [
-            origin("semi_join_origin_test", &[Value::Integer(20)]),
-            origin("semi_join_origin_test", &[Value::Float(10.0)]),
-            origin("semi_join_origin_other", &[Value::Integer(10)]),
-        ] {
-            assert!(
-                get_cached_semi_join(&other, key, &stamp(1)).is_none(),
-                "a set kept under the key answered another origin"
-            );
-        }
-        assert!(
-            get_cached_semi_join(&taken, key, &stamp(2)).is_none(),
-            "a set read under one stamp answered another"
-        );
-        assert!(
-            get_cached_semi_join(&taken, key, &stamp(1)).is_none(),
-            "a set seen under a newer stamp stayed"
-        );
-
-        let null = origin("semi_join_origin_test", &[Value::Null(DataType::Integer)]);
-        let null_key = null.key();
-        let other_null = origin("semi_join_origin_test", &[Value::Null(DataType::Float)]);
-        assert_ne!(null_key, other_null.key());
-        cache_semi_join_arc(&null, null_key, stamp(1), set());
-        assert!(get_cached_semi_join(&other_null, null_key, &stamp(1)).is_none());
-        clear_semi_join_cache();
     }
 }

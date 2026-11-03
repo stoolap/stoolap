@@ -23,9 +23,7 @@ mod oracle;
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{
-    general_path_hits, prepared_strategy_runs, tvf_rows, GeneralPath, PreparedStrategy,
-};
+use stoolap::test_failpoints::{prepared_strategy_runs, tvf_rows, PreparedStrategy};
 use stoolap::Database;
 
 // The general path counters are process-wide
@@ -67,42 +65,32 @@ struct Source {
     from: String,
     /// The WITH the source needs
     with: &'static str,
-    /// A join whose WHERE subqueries the join blocks run: two tables
-    where_blocks: bool,
 }
 
 fn sources() -> Vec<Source> {
-    let source = |name, from: &str, with, where_blocks| Source {
+    let source = |name, from: &str, with| Source {
         name,
         from: from.to_string(),
         with,
-        where_blocks,
     };
     vec![
-        source("table", "t", "", true),
-        source("derived", "(SELECT id, a, b FROM t) t", "", true),
-        source("view", "v t", "", true),
-        source("cte", "c t", "WITH c AS (SELECT id, a, b FROM t) ", true),
-        source("values", &values_source(), "", true),
-        source("join", "t JOIN w ON w.id = t.id", "", true),
-        source("join right", "w JOIN t ON t.id = w.id", "", true),
-        source(
-            "left join",
-            "t LEFT JOIN w ON w.id = t.id AND w.z < 0",
-            "",
-            true,
-        ),
+        source("table", "t", ""),
+        source("derived", "(SELECT id, a, b FROM t) t", ""),
+        source("view", "v t", ""),
+        source("cte", "c t", "WITH c AS (SELECT id, a, b FROM t) "),
+        source("values", &values_source(), ""),
+        source("join", "t JOIN w ON w.id = t.id", ""),
+        source("join right", "w JOIN t ON t.id = w.id", ""),
+        source("left join", "t LEFT JOIN w ON w.id = t.id AND w.z < 0", ""),
         source(
             "three-way join",
             "t JOIN w ON w.id = t.id JOIN w w2 ON w2.id = t.id",
             "",
-            false,
         ),
         source(
             "join with a derived side",
             "(SELECT id, a, b FROM t) t JOIN w ON w.id = t.id",
             "",
-            false,
         ),
     ]
 }
@@ -219,36 +207,6 @@ const FUNCTION_SITES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The mechanisms a statement the blocks run never reaches
-const GENERAL: &[GeneralPath] = &[
-    GeneralPath::LiftedSubqueries,
-    GeneralPath::SelectFold,
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
-    GeneralPath::ExistsSubquery,
-    GeneralPath::InSubquery,
-];
-
-/// Those a grouped statement's own subqueries never reach, when the WHERE
-/// of a join outside the join blocks reads its subqueries the general way
-const GROUPED: &[GeneralPath] = &[GeneralPath::LiftedSubqueries, GeneralPath::SelectFold];
-
-/// The mechanisms `sql` over `source` must not reach
-fn general_for(source: &Source, site: &str) -> &'static [GeneralPath] {
-    match source.where_blocks || !site.contains("{t} WHERE") {
-        true => GENERAL,
-        false => GROUPED,
-    }
-}
-
-fn general_hits(general: &[GeneralPath]) -> Vec<usize> {
-    general
-        .iter()
-        .map(|path| general_path_hits(*path))
-        .collect()
-}
-
 /// Each row, without the column names
 fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let result = db.query(sql, ()).map_err(|e| e.to_string())?;
@@ -283,27 +241,12 @@ fn databases(dir: &tempfile::TempDir, name: &str) -> [(bool, Database); 2] {
     [(false, hot), (true, sealed)]
 }
 
-/// Runs `sql` and checks it answers `want` without reaching `general`
-fn check(
-    db: &Database,
-    sql: &str,
-    want: &[String],
-    general: &[GeneralPath],
-    wrong: &mut Vec<String>,
-) {
+/// Runs `sql` and checks it answers `want` on its plan
+fn check(db: &Database, sql: &str, want: &[String], wrong: &mut Vec<String>) {
     let line = prepared_line(db, sql);
-    let before = general_hits(general);
     let got = rows(db, sql);
-    let general: Vec<String> = general
-        .iter()
-        .zip(general_hits(general).iter().zip(&before))
-        .filter(|(_, (after, before))| after != before)
-        .map(|(path, _)| format!("{path:?}"))
-        .collect();
-    if got.as_deref() != Ok(want) || line != "Prepared: yes" || !general.is_empty() {
-        wrong.push(format!(
-            "{sql}\n  [{line}] general {general:?}\n  got {got:?}\n  want {want:?}"
-        ));
+    if got.as_deref() != Ok(want) || line != "Prepared: yes" {
+        wrong.push(format!("{sql}\n  [{line}]\n  got {got:?}\n  want {want:?}"));
     }
 }
 
@@ -325,7 +268,7 @@ fn every_source_answers_a_grouped_statement_as_its_table_does() {
             for source in sources() {
                 let sql = format!("{}{}", source.with, site.replace("{t}", &source.from));
                 let mut found = Vec::new();
-                check(&db, &sql, &want, general_for(&source, site), &mut found);
+                check(&db, &sql, &want, &mut found);
                 let name = source.name;
                 wrong.extend(
                     found
@@ -349,7 +292,7 @@ fn every_source_answers_a_grouping_modifier_and_a_set_operation_as_their_twins()
             for source in sources() {
                 let sql = format!("{}{}", source.with, shape.replace("{t}", &source.from));
                 let mut found = Vec::new();
-                check(&db, &sql, &want, general_for(&source, shape), &mut found);
+                check(&db, &sql, &want, &mut found);
                 let name = source.name;
                 wrong.extend(
                     found
@@ -389,9 +332,7 @@ fn a_held_plan_reads_each_execution_s_parameters_over_every_source() {
         };
         assert_eq!(prepared_line(&db, &sql), "Prepared: yes", "{}", source.name);
         for params in [(0, 0, 20), (100, 1, 21), (7, 2, 0)] {
-            let before = general_hits(GROUPED);
             let got = read(&sql, params);
-            assert_eq!(general_hits(GROUPED), before, "{}: {params:?}", source.name);
             assert_eq!(got, read(table, params), "{}: {params:?}", source.name);
         }
     }
@@ -411,11 +352,9 @@ fn a_grouped_join_reads_the_transaction_s_own_writes() {
          WHERE t.a = 4 GROUP BY t.a",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-        let before = general_hits(GROUPED);
         let mut seen = tx.query(sql, ()).unwrap();
         let row = seen.next().unwrap().unwrap();
         assert_eq!(row.get::<i64>(1).unwrap(), 99, "{sql}");
-        assert_eq!(general_hits(GROUPED), before, "{sql}");
     }
     tx.rollback().unwrap();
 }
@@ -433,7 +372,7 @@ fn a_grouped_statement_beside_a_with_it_does_not_read_runs_its_blocks() {
     )
     .unwrap();
     let mut wrong = Vec::new();
-    check(&db, sql, &want, GENERAL, &mut wrong);
+    check(&db, sql, &want, &mut wrong);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -517,7 +456,7 @@ fn a_group_by_position_reads_the_source_column_it_names() {
             "SELECT t.a, (SELECT MAX(u.x) FROM u WHERE u.k = t.a) FROM {from} WHERE t.a >= 0 \
              GROUP BY 1 ORDER BY 1"
         );
-        check(&db, &sql, &want, GENERAL, &mut wrong);
+        check(&db, &sql, &want, &mut wrong);
     }
     let want = rows(
         &db,
@@ -530,7 +469,6 @@ fn a_group_by_position_reads_the_source_column_it_names() {
         "SELECT g.value, (SELECT MAX(u.x) FROM u WHERE u.k = g.value) \
          FROM generate_series(1, 60) g GROUP BY 1 ORDER BY 1",
         &want,
-        GENERAL,
         &mut wrong,
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -580,7 +518,6 @@ fn a_join_scope_keeps_a_column_whose_name_holds_a_dot() {
         &db,
         "SELECT SUM((SELECT u.x FROM u WHERE u.id = l.k + 1)) FROM l JOIN r ON l.id = r.id",
         &want,
-        GENERAL,
         &mut wrong,
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -609,7 +546,6 @@ fn a_group_column_named_like_a_qualified_one_reads_its_own_cell() {
                  JOIN r ON r.id = t.id GROUP BY t.a, t.\"t.a\""
             ),
             &["Integer(1)|Integer(20)".to_string()],
-            GENERAL,
             &mut wrong,
         );
     }
@@ -638,7 +574,6 @@ fn a_join_scope_keeps_an_alias_another_alias_begins_with() {
         "SELECT SUM((SELECT s.a FROM s WHERE s.id = \"a.b\".k)) \
          FROM l a CROSS JOIN r \"a.b\" CROSS JOIN q c",
         &["Integer(42)".to_string()],
-        GENERAL,
         &mut wrong,
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -762,7 +697,6 @@ fn a_join_of_two_derived_tables_groups_by_a_subquery() {
         "SELECT COUNT(*) FROM (SELECT id, k FROM l) a CROSS JOIN (SELECT id FROM r) b \
          GROUP BY (SELECT s.a FROM s WHERE s.id = a.k)",
         &["Integer(1)".to_string()],
-        GENERAL,
         &mut wrong,
     );
     // Dotted names the text splits two ways; the join read its sides apart
@@ -772,7 +706,6 @@ fn a_join_of_two_derived_tables_groups_by_a_subquery() {
          FROM (SELECT id, k AS \"b.k\" FROM l) a CROSS JOIN (SELECT id FROM r) \"a.b\" \
          GROUP BY (SELECT s.a FROM s WHERE s.id = a.id)",
         &["Integer(1)|Integer(41)".to_string()],
-        GENERAL,
         &mut wrong,
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -803,7 +736,7 @@ fn a_table_function_answers_a_grouped_statement_as_a_table_of_its_rows() {
         for (sql, twin) in FUNCTION_SITES {
             let want = rows(&db, twin).unwrap_or_else(|e| panic!("{twin}: {e}"));
             let mut found = Vec::new();
-            check(&db, sql, &want, GENERAL, &mut found);
+            check(&db, sql, &want, &mut found);
             wrong.extend(found.into_iter().map(|w| format!("sealed {sealed}: {w}")));
         }
     }

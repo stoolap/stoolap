@@ -1100,9 +1100,6 @@ impl Database {
         let result = self.inner.shared.engine.restore_snapshot(timestamp)?;
         // Clear all query caches since all data has changed.
         self.inner.executor.clear_semantic_cache();
-        crate::executor::context::clear_scalar_subquery_cache();
-        crate::executor::context::clear_in_subquery_cache();
-        crate::executor::context::clear_semi_join_cache();
         crate::executor::context::clear_block_answer_cache();
         Ok(result)
     }

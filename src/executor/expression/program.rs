@@ -40,9 +40,6 @@ pub struct Program {
     /// The operation sequence
     ops: Vec<Op>,
 
-    /// Whether this program needs outer row context (correlated subquery)
-    needs_outer_context: bool,
-
     /// Whether this program needs second row (join evaluation)
     needs_second_row: bool,
 
@@ -77,7 +74,6 @@ impl Program {
         // Apply peephole optimizations
         let ops = Self::peephole_optimize(ops, &mut folds);
 
-        let needs_outer_context = ops.iter().any(|op| matches!(op, Op::LoadOuterColumn(_)));
         let needs_second_row = ops.iter().any(|op| matches!(op, Op::LoadColumn2(_)));
         let has_subqueries = ops.iter().any(|op| {
             matches!(
@@ -96,7 +92,6 @@ impl Program {
 
         Self {
             ops,
-            needs_outer_context,
             needs_second_row,
             has_subqueries,
             predicate_chain,
@@ -114,7 +109,6 @@ impl Program {
     /// Create a new program without peephole optimization.
     /// Use this for testing or when optimization is not desired.
     pub fn new_unoptimized(ops: Vec<Op>) -> Self {
-        let needs_outer_context = ops.iter().any(|op| matches!(op, Op::LoadOuterColumn(_)));
         let needs_second_row = ops.iter().any(|op| matches!(op, Op::LoadColumn2(_)));
         let has_subqueries = ops.iter().any(|op| {
             matches!(
@@ -133,7 +127,6 @@ impl Program {
 
         Self {
             ops,
-            needs_outer_context,
             needs_second_row,
             has_subqueries,
             predicate_chain,
@@ -451,12 +444,6 @@ impl Program {
     #[inline]
     pub fn ops(&self) -> &[Op] {
         &self.ops
-    }
-
-    /// Check if this program needs outer row context
-    #[inline]
-    pub fn needs_outer_context(&self) -> bool {
-        self.needs_outer_context
     }
 
     /// Check if this program needs a second row (for joins)
@@ -866,7 +853,6 @@ impl std::fmt::Debug for Program {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Program")
             .field("ops_count", &self.ops.len())
-            .field("needs_outer_context", &self.needs_outer_context)
             .field("needs_second_row", &self.needs_second_row)
             .field("has_subqueries", &self.has_subqueries)
             .finish()
@@ -999,7 +985,6 @@ mod tests {
     fn test_program_null() {
         let prog = Program::null();
         assert!(!prog.is_empty());
-        assert!(!prog.needs_outer_context());
         assert!(!prog.needs_second_row());
         assert!(!prog.has_subqueries());
     }
@@ -1008,7 +993,6 @@ mod tests {
     fn test_program_constant() {
         let prog = Program::constant(Value::Integer(42));
         assert!(!prog.is_empty());
-        assert!(!prog.needs_outer_context());
         assert!(!prog.needs_second_row());
     }
 
@@ -1029,15 +1013,6 @@ mod tests {
     // =========================================================================
     // Metadata detection
     // =========================================================================
-
-    #[test]
-    fn test_needs_outer_context() {
-        let prog = Program::new_unoptimized(vec![Op::LoadOuterColumn("col".into()), Op::Return]);
-        assert!(prog.needs_outer_context());
-
-        let prog2 = Program::new_unoptimized(vec![Op::LoadColumn(0), Op::Return]);
-        assert!(!prog2.needs_outer_context());
-    }
 
     #[test]
     fn test_needs_second_row() {

@@ -107,14 +107,7 @@ const SHAPES: &[(&str, [&str; 2])] = &[
 ];
 
 /// The paths a statement the blocks run never reaches
-const GENERAL: &[GeneralPath] = &[
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
-    GeneralPath::OrderByEvaluator,
-    GeneralPath::ExistsSubquery,
-    GeneralPath::InSubquery,
-];
+const GENERAL: &[GeneralPath] = &[GeneralPath::OrderByEvaluator];
 
 fn general_hits() -> Vec<usize> {
     GENERAL

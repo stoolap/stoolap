@@ -444,16 +444,13 @@ pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<Share
     compile_expression_cached(expr, columns)
 }
 
-/// Compile an expression with full context (parameters, outer columns, etc.)
-///
-/// Use this when you need parameters or correlated subquery support.
+/// Compile an expression with a function registry of its own
 pub fn compile_expression_with_context(
     expr: &Expression,
     columns: &[String],
-    outer_columns: Option<&[String]>,
     function_registry: &FunctionRegistry,
 ) -> Result<SharedProgram> {
-    compile_expression_with_params(expr, columns, outer_columns, &[], function_registry)
+    compile_expression_with_params(expr, columns, &[], function_registry)
 }
 
 /// [`compile_expression_with_context`] for one execution, each parameter
@@ -461,14 +458,10 @@ pub fn compile_expression_with_context(
 pub(crate) fn compile_expression_with_params(
     expr: &Expression,
     columns: &[String],
-    outer_columns: Option<&[String]>,
     params: &[Value],
     function_registry: &FunctionRegistry,
 ) -> Result<SharedProgram> {
     let mut ctx = CompileContext::new(columns, function_registry);
-    if let Some(outer_cols) = outer_columns {
-        ctx = ctx.with_outer_columns(outer_cols);
-    }
     if !params.is_empty() {
         ctx = ctx.with_params(params);
     }
@@ -863,8 +856,6 @@ pub struct ExpressionEval {
     vm: ExprVM,
     /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
     params: CompactArc<ParamVec>,
-    /// Outer row context for correlated subqueries
-    outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
     /// Transaction ID
     transaction_id: Option<u64>,
 }
@@ -877,7 +868,6 @@ impl ExpressionEval {
             program,
             vm: ExprVM::new(),
             params: EMPTY_PARAMS.clone(),
-            outer_row: None,
             transaction_id: None,
         })
     }
@@ -889,11 +879,6 @@ impl ExpressionEval {
         // Share params Arc - no cloning needed
         self.params = CompactArc::clone(ctx.params_arc());
         self.program = bind_params(self.program, &self.params);
-        if let Some(outer) = ctx.outer_row() {
-            // Clone the map directly (CompactArc<str> clones are cheap)
-            let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            self.outer_row = Some(arc_map);
-        }
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -905,9 +890,6 @@ impl ExpressionEval {
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
@@ -922,9 +904,6 @@ impl ExpressionEval {
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
         }
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
-        }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         self.vm.execute_bool_checked(&self.program, &ctx)
@@ -937,9 +916,6 @@ impl ExpressionEval {
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
@@ -999,9 +975,7 @@ const LOCAL_PROGRAM_CACHE_MAX: usize = 128;
 /// - [`RowFilter`] - WHERE clause filtering (thread-safe)
 ///
 /// **Use CompiledEvaluator when:**
-/// - Expressions change per-row (e.g., after `process_correlated_expression`)
 /// - You need dynamic/lazy expression compilation
-/// - Complex scenarios with correlated subqueries
 pub struct CompiledEvaluator<'a> {
     /// Function registry for compilation
     function_registry: &'a FunctionRegistry,
@@ -1009,14 +983,8 @@ pub struct CompiledEvaluator<'a> {
     /// Column names for compilation context (Arc for zero-copy sharing)
     columns: CompactArc<Vec<String>>,
 
-    /// Outer query columns (for correlated subqueries)
-    outer_columns: Option<Vec<String>>,
-
     /// Query parameters (positional) - uses CompactArc<Vec<Value>> to match ExecutionContext
     params: CompactArc<ParamVec>,
-
-    /// Outer row context for correlated subqueries
-    outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
 
     /// Current transaction ID
     transaction_id: Option<u64>,
@@ -1044,9 +1012,7 @@ impl<'a> CompiledEvaluator<'a> {
         Self {
             function_registry,
             columns: CompactArc::new(Vec::new()),
-            outer_columns: None,
             params: EMPTY_PARAMS.clone(),
-            outer_row: None,
             transaction_id: None,
             expression_aliases: FxHashMap::default(),
             vm: ExprVM::new(),
@@ -1069,21 +1035,6 @@ impl<'a> CompiledEvaluator<'a> {
         if !CompactArc::ptr_eq(&self.params, ctx.params_arc()) {
             self.params = CompactArc::clone(ctx.params_arc());
             self.local_cache.clear();
-        }
-
-        // Set outer row context for correlated subqueries
-        if let Some(outer) = ctx.outer_row() {
-            // Clone the map directly (CompactArc<str> clones are cheap)
-            let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            // Convert CompactArc<str> keys to String for outer_columns (needed for compilation)
-            let outer_cols: Vec<String> = outer.keys().map(|k| k.to_string()).collect();
-            self.outer_row = Some(arc_map);
-            // Also set up outer_columns for compilation
-            if !outer_cols.is_empty() {
-                self.outer_columns = Some(outer_cols);
-                // Invalidate local cache since compilation context changed
-                self.local_cache.clear();
-            }
         }
 
         self.transaction_id = ctx.transaction_id();
@@ -1134,41 +1085,6 @@ impl<'a> CompiledEvaluator<'a> {
     #[inline]
     pub fn set_row_array(&mut self, row: &Row) {
         self.current_row = Some(row.clone());
-    }
-
-    /// Set the outer row context by taking ownership
-    /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
-    #[inline]
-    pub fn set_outer_row_owned(&mut self, outer_row: FxHashMap<CompactArc<str>, Value>) {
-        // The compiled programs depend on the outer column *names*, not the
-        // values. A correlated loop hands the same key set back every row, so
-        // when it matches what was compiled against, the values are swapped
-        // in and the cache is kept. Rebuilding the name list and clearing the
-        // cache here recompiled every correlated expression on every row.
-        let same_columns = match &self.outer_columns {
-            Some(cols) => {
-                cols.len() == outer_row.len()
-                    && outer_row
-                        .keys()
-                        .all(|k| cols.binary_search_by(|c| c.as_str().cmp(k)).is_ok())
-            }
-            None => outer_row.is_empty(),
-        };
-        if !same_columns && !outer_row.is_empty() {
-            let mut sorted_cols: Vec<String> = outer_row.keys().map(|k| k.to_string()).collect();
-            sorted_cols.sort();
-            self.outer_columns = Some(sorted_cols);
-            // Invalidate local cache since compilation context changed
-            self.local_cache.clear();
-        }
-        self.outer_row = Some(outer_row);
-    }
-
-    /// Take ownership of the outer row back (for reuse)
-    /// Returns CompactArc<str> keys directly to avoid conversion overhead.
-    #[inline]
-    pub fn take_outer_row(&mut self) -> FxHashMap<CompactArc<str>, Value> {
-        self.outer_row.take().unwrap_or_default()
     }
 
     /// Compute hash of expression content for local cache key.
@@ -1462,11 +1378,7 @@ impl<'a> CompiledEvaluator<'a> {
 
         // Cache miss: compile the expression
         let program = CompactArc::new(self.compile_expression(expr)?);
-        // A correlated WHERE substitutes each outer row's subquery result
-        // into the expression, so with the cache kept across rows every
-        // distinct result would compile its own program and an IN program
-        // would keep its whole set alive. Bounding the cache keeps the win
-        // when results repeat and caps memory when they do not.
+        // Bounded, so an evaluator kept across many expressions caps its memory
         if self.local_cache.len() >= LOCAL_PROGRAM_CACHE_MAX {
             self.local_cache.clear();
         }
@@ -1479,11 +1391,6 @@ impl<'a> CompiledEvaluator<'a> {
     /// Compile an expression to a Program
     fn compile_expression(&self, expr: &Expression) -> Result<Program> {
         let mut ctx = CompileContext::new(&self.columns, self.function_registry);
-
-        // Add outer columns if available
-        if let Some(ref outer_cols) = self.outer_columns {
-            ctx = ctx.with_outer_columns(outer_cols);
-        }
 
         // Add expression aliases
         if !self.expression_aliases.is_empty() {
@@ -1520,11 +1427,6 @@ impl<'a> CompiledEvaluator<'a> {
             ctx = ctx.with_params(&self.params);
         }
 
-        // Add outer row
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
-        }
-
         // Add transaction ID
         ctx = ctx.with_transaction_id(self.transaction_id);
 
@@ -1545,9 +1447,6 @@ impl<'a> CompiledEvaluator<'a> {
         let mut ctx = ExecuteContext::new(row);
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
         self.vm.execute(program, &ctx)
@@ -1572,11 +1471,6 @@ impl<'a> CompiledEvaluator<'a> {
         // Add parameters
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-
-        // Add outer row
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
         }
 
         // Add transaction ID

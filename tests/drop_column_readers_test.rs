@@ -443,35 +443,24 @@ fn a_correlated_exists_probes_across_a_drop() {
     let _guard = fp::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let mut report = Vec::new();
-    // The prepared families off keep the EXISTS on the general path's probe;
-    // the family's blocks are the others
     type Install = fn(Box<dyn FnOnce() + Send>);
-    let general: Install = |hook| fp::before_correlated_fetch(hook);
     let prepared: Install = |hook| fp::before_prepared_exists(hook);
     let prepared_scalar: Install = |hook| fp::before_prepared_scalar(hook);
     let exists = "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) \
                   ORDER BY p.id LIMIT 10";
-    for (sql, install, families_off) in [
-        (exists, general, true),
+    for (sql, install) in [
         (
             "SELECT p.id, (SELECT COUNT(*) FROM c WHERE c.pid = p.v) FROM p ORDER BY p.id LIMIT 10",
             prepared_scalar,
-            false,
         ),
-        (exists, prepared, false),
+        (exists, prepared),
     ] {
         let expected = expected_probe(sql);
-        let path = if families_off {
-            "general path"
-        } else {
-            "prepared"
-        };
         for (engine, dsn) in engines(&dir, "exists") {
             let db = Database::open(&dsn).unwrap();
             probe_setup(&db, &dsn);
             let other = db.clone();
             let reader = db.clone();
-            let _families = FamiliesOff::set(families_off);
             let (got, fired, paths) = on_thread(
                 install,
                 move || {
@@ -479,27 +468,11 @@ fn a_correlated_exists_probes_across_a_drop() {
                 },
                 move || rows(&reader, sql),
             );
-            let label = format!("{engine} {path}: {sql}");
+            let label = format!("{engine} prepared: {sql}");
             report.push(outcome(&label, got, &expected, fired, &paths));
         }
     }
     finish(report);
-}
-
-/// The prepared families refused while it lives, as `families_off` says
-struct FamiliesOff;
-
-impl FamiliesOff {
-    fn set(families_off: bool) -> Self {
-        fp::PREPARED_FAMILIES_OFF.store(families_off, Ordering::Relaxed);
-        FamiliesOff
-    }
-}
-
-impl Drop for FamiliesOff {
-    fn drop(&mut self) {
-        fp::PREPARED_FAMILIES_OFF.store(false, Ordering::Relaxed);
-    }
 }
 
 /// A join that opened its inner table probes it after a drop on it

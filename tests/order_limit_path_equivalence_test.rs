@@ -77,20 +77,16 @@ const CASES: &[Case] = &[
     case(
         "memory, families off",
         "projected_top",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id + 0 LIMIT 1) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
+        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id LIMIT 3 OFFSET 1",
+        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id",
+        Some((3, 1)),
     ),
     case(
         "sealed, families off",
         "projected_top",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id + 0 LIMIT 1) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
+        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id LIMIT 3",
+        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id",
+        Some((3, 0)),
     ),
     // A statement over a derived table or a view runs on the runner
     case(
@@ -154,11 +150,9 @@ const CASES: &[Case] = &[
     case(
         "memory, families off",
         "deferred_projection",
-        "SELECT t.id, (SELECT i.id FROM t i WHERE i.id > t.id ORDER BY i.id LIMIT 1) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        "SELECT t.id, (SELECT MIN(i.id) FROM t i WHERE i.id > t.id) AS x \
-         FROM t JOIN u USING (id) ORDER BY t.id",
-        None,
+        "SELECT id, a FROM t ORDER BY id LIMIT 3 OFFSET 1",
+        "SELECT id, a FROM t ORDER BY id",
+        Some((3, 1)),
     ),
     // The same statements over the table run on the plan
     case(

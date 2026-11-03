@@ -1125,10 +1125,6 @@ impl Executor {
         >,
         compiled: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
-        // A SELECT clears them where its top level starts
-        if !matches!(statement, Statement::Select(_)) {
-            context::clear_statement_caches();
-        }
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
         // and the statement's view goes into the same context: one the caller

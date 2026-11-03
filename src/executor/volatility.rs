@@ -138,27 +138,9 @@ pub(crate) fn read_once(
     }
 }
 
-/// The volatility of everything `stmt` evaluates, its CTEs, set operations
-/// and the blocks nested in it included, inside a running statement where a
-/// table `name` for which `statement_rows(name)` holds is one of its CTEs:
-/// rows that are the statement's own, so one per statement
-pub(crate) fn statement_volatility_in(
-    stmt: &SelectStatement,
-    registry: &FunctionRegistry,
-    statement_rows: &dyn Fn(&str) -> bool,
-) -> Volatility {
-    Walk {
-        registry,
-        statement_rows,
-        constant: false,
-        whole_blocks: false,
-        draws: true,
-        reads_parent: &|_| true,
-    }
-    .statement(stmt)
-}
-
-/// [`expression_volatility`] inside a running statement, as for [`statement_volatility_in`]
+/// [`expression_volatility`] inside a running statement where a table `name`
+/// for which `statement_rows(name)` holds is one of its CTEs: rows that are
+/// the statement's own, so one per statement
 pub(crate) fn expression_volatility_in(
     expr: &Expression,
     registry: &FunctionRegistry,
@@ -389,6 +371,22 @@ mod tests {
 
     fn statement_volatility(stmt: &SelectStatement, registry: &FunctionRegistry) -> Volatility {
         statement_volatility_in(stmt, registry, &|_| false)
+    }
+
+    fn statement_volatility_in(
+        stmt: &SelectStatement,
+        registry: &FunctionRegistry,
+        statement_rows: &dyn Fn(&str) -> bool,
+    ) -> Volatility {
+        Walk {
+            registry,
+            statement_rows,
+            constant: false,
+            whole_blocks: false,
+            draws: true,
+            reads_parent: &|_| true,
+        }
+        .statement(stmt)
     }
 
     fn select(sql: &str) -> SelectStatement {

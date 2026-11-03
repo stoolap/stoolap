@@ -54,11 +54,6 @@ pub enum Op {
     /// Stack: [] -> [value]
     LoadColumn2(u16),
 
-    /// Load from outer row context (for correlated subqueries)
-    /// Uses pre-resolved key
-    /// Stack: [] -> [value]
-    LoadOuterColumn(CompactArc<str>),
-
     /// Load constant value (pre-cloned at compile time)
     /// Stack: [] -> [value]
     LoadConst(Value),
@@ -888,7 +883,6 @@ impl std::fmt::Debug for Op {
         match self {
             Op::LoadColumn(idx) => write!(f, "LoadColumn({})", idx),
             Op::LoadColumn2(idx) => write!(f, "LoadColumn2({})", idx),
-            Op::LoadOuterColumn(name) => write!(f, "LoadOuterColumn({})", name),
             Op::LoadConst(v) => write!(f, "LoadConst({:?})", v),
             Op::LoadParam(idx) => write!(f, "LoadParam({})", idx),
             Op::LoadNull(dt) => write!(f, "LoadNull({:?})", dt),

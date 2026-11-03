@@ -77,7 +77,7 @@ fn accumulate_ordered_frame(
 }
 
 /// Programs over the rows a window statement reads, each run with the
-/// statement's parameters, outer row and transaction, and its subqueries
+/// statement's parameters and transaction, and its subqueries
 /// answered by the statement's `blocks`
 struct RowPrograms<'a> {
     programs: SmallVec<[SharedProgram; 1]>,
@@ -86,17 +86,15 @@ struct RowPrograms<'a> {
     blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
-/// `expr` over `columns` as [`RowPrograms`] compiles it, an enclosing row's
-/// columns read by their `outer` names
+/// `expr` over `columns` as [`RowPrograms`] compiles it
 fn row_program(
     expr: &Expression,
     columns: &[String],
     slots: Option<&FxHashMap<ExprKey, usize>>,
-    outer: Option<&[String]>,
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
-    if blocks.is_none() && slots.is_none() && outer.is_none() {
+    if blocks.is_none() && slots.is_none() {
         return compile_expression(expr, columns).map(|program| bind_params(program, ctx.params()));
     }
     let program = compile_over_slots(
@@ -104,7 +102,6 @@ fn row_program(
         columns,
         global_registry(),
         slots,
-        outer,
         blocks.is_some(),
         Some(slot_params(ctx, blocks)),
     )?;
@@ -123,11 +120,9 @@ impl<'a> RowPrograms<'a> {
         ctx: &'a ExecutionContext,
         blocks: Option<&'a dyn SubqueryExecutor>,
     ) -> Result<Self> {
-        // A statement run for an enclosing row reads that row's columns by name
-        let outer = super::query::outer_column_names(ctx);
         let programs = exprs
             .into_iter()
-            .map(|expr| row_program(expr, columns, slots, outer.as_deref(), ctx, blocks))
+            .map(|expr| row_program(expr, columns, slots, ctx, blocks))
             .collect::<Result<_>>()?;
         Ok(Self {
             programs,
@@ -339,10 +334,9 @@ impl<'w> CallArgs<'w> {
         let Some((expr, ArgSource::Program(_))) = &self.default else {
             return Ok(None);
         };
-        let program = self.default_program.get_or_init(|| {
-            let outer = super::query::outer_column_names(ctx);
-            row_program(expr, columns, None, outer.as_deref(), ctx, blocks)
-        });
+        let program = self
+            .default_program
+            .get_or_init(|| row_program(expr, columns, None, ctx, blocks));
         program.as_deref().map(Some).map_err(Clone::clone)
     }
 
@@ -1156,45 +1150,10 @@ impl Executor {
         Self::named_window_failure(blocks, base_rows)?;
         // A window function in ORDER BY that the select list does not carry
         // is computed into a column of its own, named after it, which the
-        // sort reads and the projection then drops. It goes in before the
-        // subqueries are lifted, so one inside it is lifted with the rest
+        // sort reads and the projection then drops
         let written_items = stmt.columns.len();
         let stmt = Self::with_hidden_order_by_windows(stmt);
-
-        // A subquery inside a window function or its OVER clause is resolved
-        // per input row first, unless the blocks answer it; the columns it
-        // adds stay out of SELECT *
         let visible_columns = base_columns.len();
-        let lifted_rows;
-        let lifted_columns;
-        let (stmt, base_rows, base_columns) = match (blocks.is_none()
-            && Self::windows_hold_subquery(&stmt))
-        .then(|| Self::lift_subqueries_in_windows(&stmt, base_columns))
-        .flatten()
-        {
-            Some((rewritten, lifted, names)) => {
-                let qualifier = stmt
-                    .table_expr
-                    .as_deref()
-                    .and_then(super::utils::get_table_alias_from_expr);
-                let (rows, all_columns) = self.materialize_lifted_subqueries(
-                    &lifted,
-                    &names,
-                    ctx,
-                    base_rows,
-                    base_columns,
-                    qualifier.as_deref(),
-                )?;
-                lifted_rows = rows;
-                lifted_columns = all_columns;
-                (
-                    std::borrow::Cow::Owned(rewritten),
-                    lifted_rows.as_slice(),
-                    lifted_columns.as_slice(),
-                )
-            }
-            None => (stmt, base_rows, base_columns),
-        };
 
         let plan = self.window_plan(
             stmt,
@@ -1269,9 +1228,7 @@ impl Executor {
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<WindowPlan<'s>> {
         // Parse window functions from the SELECT list
-        let mut window_functions =
-            self.parse_window_functions(&stmt, base_columns, (ctx, blocks))?;
-        self.fold_window_control_arguments(&mut window_functions, ctx)?;
+        let window_functions = self.parse_window_functions(&stmt, base_columns, (ctx, blocks))?;
 
         // LIMIT pushdown for PARTITION BY queries is safe only when there is
         // no top-level ORDER BY, when every window function shares the same

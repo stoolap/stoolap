@@ -37,7 +37,7 @@ use super::prepared_select::{explain_held_blocks, OutOfFamily};
 use super::pushdown;
 use super::query::{split_join_where, CteNames, JoinIndexUse, SplitSide};
 use super::query_cache::NestedPlan;
-use super::query_classification::{get_classification, QueryClassification};
+use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::utils::get_table_alias_from_expr;
 use super::Executor;
@@ -242,11 +242,7 @@ impl Executor {
 
                 // FROM clause with access plan
                 if let Some(ref table_expr) = select.table_expr {
-                    let classification = get_classification(select);
-                    let grouped = Self::grouped_family_reach(select, &classification)
-                        .then(|| self.grouped_family(select, None));
-                    let from_plan =
-                        Self::sources_hold_plan(select, &classification, grouped.as_ref(), held);
+                    let from_plan = held;
                     self.explain_table_expr_with_where_and_stats(
                         table_expr,
                         select.where_clause.as_deref(),
@@ -649,9 +645,6 @@ impl Executor {
             Some(_) => return Err("a WITH clause"),
             None => ExecutionContext::new(),
         };
-        if Self::folds_select_subqueries(select, &get_classification(select)) {
-            return Err("a grouped SELECT list whose subqueries are read first");
-        }
         // EXPLAIN runs no view to name it
         let sides = self.join_side_schemas(join, &ctx, false);
         self.join_blocks_family(
@@ -675,19 +668,6 @@ impl Executor {
                 .is_ok(),
             _ => false,
         }
-    }
-
-    /// Whether a derived FROM or join side of `select` holds a plan in its
-    /// statement's, `own` when `select` holds one: a statement reading its
-    /// SELECT list's subqueries first outside the grouped family keeps none
-    fn sources_hold_plan(
-        select: &SelectStatement,
-        classification: &QueryClassification,
-        grouped: Option<&std::result::Result<(), OutOfFamily>>,
-        own: bool,
-    ) -> bool {
-        own && !(Self::folds_select_subqueries(select, classification)
-            && !matches!(grouped, Some(Ok(()))))
     }
 
     /// Generate EXPLAIN output for a SELECT statement; `own` when it holds a
@@ -742,8 +722,8 @@ impl Executor {
         let on_subqueries = join.is_some_and(Self::ons_hold_subqueries);
         let classification = get_classification(select);
         let grouped_output = Self::grouped_family_reach(select, &classification);
-        let grouped = grouped_output.then(|| self.grouped_family(select, None));
-        let from_plan = Self::sources_hold_plan(select, &classification, grouped.as_ref(), own);
+        let grouped = grouped_output.then(|| self.grouped_family(select));
+        let from_plan = own;
         if on_subqueries
             || classification.output_has_subqueries
             || grouped_output
@@ -755,7 +735,7 @@ impl Executor {
             let prepared = match (grouped, join) {
                 (Some(grouped), _) => grouped,
                 (None, Some(join)) => self.join_prepared(select, join, own, select.with.as_ref()),
-                (None, None) => self.prepared_family(select, &classification, None),
+                (None, None) => self.prepared_family(select, &classification),
             };
             match prepared {
                 Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),

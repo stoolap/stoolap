@@ -233,9 +233,7 @@ fn not_exists_sees_its_own_transaction() {
 #[test]
 fn exists_over_a_key_held_by_many_rows_builds_the_semi_join_once() {
     let _serial = serial();
-    use stoolap::test_failpoints::{
-        equality_candidate_ids_copied_count, exists_subquery_runs, inner_table_reads,
-    };
+    use stoolap::test_failpoints::{equality_candidate_ids_copied_count, inner_table_reads};
     for using in ["BTREE", "HASH", "BITMAP"] {
         let db = heavy_key_tables(&format!("exists_heavy_key_{using}"), using);
         for test in ["EXISTS", "NOT EXISTS"] {
@@ -243,18 +241,13 @@ fn exists_over_a_key_held_by_many_rows_builds_the_semi_join_once() {
                 "SELECT o.id FROM o WHERE {test} (SELECT 1 FROM {{i}} WHERE {{i}}.c = o.k)"
             );
             let case = format!("{using}: {sql}");
-            let (copied, reads, runs) = (
-                equality_candidate_ids_copied_count(),
-                inner_table_reads(),
-                exists_subquery_runs(),
-            );
+            let (copied, reads) = (equality_candidate_ids_copied_count(), inner_table_reads());
             let got = ids(&db, &sql.replace("{i}", "h"));
             let copied = equality_candidate_ids_copied_count() - copied;
             let reads = inner_table_reads() - reads;
             assert_eq!(got, ids(&db, &sql.replace("{i}", "hw")), "{case}");
             assert!(copied <= 1024, "{case}: copied {copied} ids");
             assert!(reads <= 1, "{case}: inner table read whole {reads} times");
-            assert_eq!(exists_subquery_runs() - runs, 0, "{case}: subqueries run");
         }
     }
 }
@@ -312,28 +305,6 @@ fn a_correlated_count_still_counts_a_key_held_by_many_rows_from_the_index() {
     let runs = prepared_scalar_runs();
     assert_eq!(count("h"), want);
     assert!(prepared_scalar_runs() > runs, "the count ran prepared");
-}
-
-/// Inside a transaction that changed the inner table its index answers no
-/// probe, so the semi-join is chosen and no probe is asked
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn exists_after_local_changes_asks_no_probe() {
-    let _serial = serial();
-    use stoolap::test_failpoints::{correlated_probes_asked, exists_subquery_runs};
-    let db = Database::open("memory://exists_local_changes").unwrap();
-    create(&db);
-    db.execute("BEGIN", ()).unwrap();
-    db.execute("DELETE FROM t WHERE c = 194", ()).unwrap();
-    for test in ["EXISTS", "NOT EXISTS"] {
-        let sql =
-            format!("SELECT few.id FROM few WHERE {test} (SELECT 1 FROM t WHERE t.c = few.k)");
-        let (asked, runs) = (correlated_probes_asked(), exists_subquery_runs());
-        ids(&db, &sql);
-        assert_eq!(correlated_probes_asked() - asked, 0, "{sql}: probes asked");
-        assert_eq!(exists_subquery_runs() - runs, 0, "{sql}: subqueries run");
-    }
-    db.execute("ROLLBACK", ()).unwrap();
 }
 
 /// An EXISTS over a recursive CTE sees the rows of the round that asks

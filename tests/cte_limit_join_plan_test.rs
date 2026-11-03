@@ -30,14 +30,7 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const MECHANISMS: [GeneralPath; 6] = [
-    GeneralPath::ProjectionEvaluator,
-    GeneralPath::ScalarSubquery,
-    GeneralPath::CorrelatedExpression,
-    GeneralPath::OuterBinding,
-    GeneralPath::SelectFold,
-    GeneralPath::LiftedSubqueries,
-];
+const MECHANISMS: [GeneralPath; 1] = [GeneralPath::ProjectionEvaluator];
 
 fn hits() -> Vec<usize> {
     MECHANISMS

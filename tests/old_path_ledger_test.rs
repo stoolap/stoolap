@@ -43,22 +43,10 @@ enum Path {
 
 use Path::{Old, Prepared};
 
-const ALL: [GeneralPath; 15] = [
-    GeneralPath::CorrelatedScan,
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
+const ALL: [GeneralPath; 3] = [
     GeneralPath::PushdownConstant,
     GeneralPath::ProjectionEvaluator,
     GeneralPath::OrderByEvaluator,
-    GeneralPath::AntiJoin,
-    GeneralPath::ExistsSemiJoin,
-    GeneralPath::ExistsSubquery,
-    GeneralPath::InSubquery,
-    GeneralPath::ScalarSubquery,
-    GeneralPath::SelectFold,
-    GeneralPath::CorrelatedExpression,
-    GeneralPath::LiftedSubqueries,
 ];
 
 fn hits() -> Vec<usize> {

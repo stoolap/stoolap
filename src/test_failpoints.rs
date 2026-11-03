@@ -1193,19 +1193,6 @@ pub(crate) fn in_subquery_ran() {
     IN_SUBQUERY_RUNS.with(|n| n.set(n.get() + 1));
 }
 
-/// Process-wide: EXISTS subqueries run whole for one outer row
-static EXISTS_SUBQUERY_RUNS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// EXISTS subqueries run whole for one outer row, so far
-pub fn exists_subquery_runs() -> usize {
-    EXISTS_SUBQUERY_RUNS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub(crate) fn exists_subquery_ran() {
-    EXISTS_SUBQUERY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Process-wide: IN members read by a table's candidates, and by a scan
 static IN_MEMBER_READS: [std::sync::atomic::AtomicUsize; 2] = [
     std::sync::atomic::AtomicUsize::new(0),
@@ -1488,7 +1475,6 @@ pub fn take_read_paths() -> Vec<&'static str> {
 
 thread_local! {
     static FK_CHILD_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
-    static CORRELATED_FETCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static INDEX_VISITED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ADD_COLUMN_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SNAPSHOT_SCHEMA_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -1992,42 +1978,17 @@ pub(crate) fn tvf_rows_generated(rows: usize) {
 /// longer reaches
 #[derive(Clone, Copy, Debug)]
 pub enum GeneralPath {
-    /// The single-table scan's per-row branch for a correlated WHERE
-    CorrelatedScan,
-    /// `process_correlated_where`
-    CorrelatedWhere,
-    /// Outer references bound into a subquery before it runs
-    OuterBinding,
-    /// `substitute_outer_references` in either form
-    OuterSubstitution,
     /// A constant the pushdown evaluates itself
     PushdownConstant,
     /// The projection's `CompiledEvaluator` for computed columns
     ProjectionEvaluator,
     /// The sort's `CompiledEvaluator` for ORDER BY keys no column holds
     OrderByEvaluator,
-    /// The single-table scan's NOT EXISTS anti-join
-    AntiJoin,
-    /// An EXISTS or NOT EXISTS rewritten into a semi-join set
-    ExistsSemiJoin,
-    /// `execute_exists_subquery`
-    ExistsSubquery,
-    /// `execute_in_subquery` or `execute_in_subquery_rows`, which read an IN,
-    /// ANY or ALL block's values
-    InSubquery,
-    /// `execute_scalar_subquery`
-    ScalarSubquery,
-    /// `try_process_select_subqueries`, which folds a SELECT list's subqueries
-    SelectFold,
-    /// `process_correlated_expression`
-    CorrelatedExpression,
-    /// `materialize_lifted_subqueries`, which reads an aggregate's subquery per row
-    LiftedSubqueries,
 }
 
 /// Process-wide: how often each general path mechanism ran
-static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 15] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 15];
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 3] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
 
 /// How often `path` ran, so far
 pub fn general_path_hits(path: GeneralPath) -> usize {
@@ -2102,16 +2063,6 @@ pub fn before_fk_child_probe(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn fk_child_probe_next() {
     run_hook(&FK_CHILD_PROBE_HOOK);
-}
-
-/// Run once on this thread when its next correlated EXISTS probe has
-/// checked its token and has not yet fetched a row
-pub fn before_correlated_fetch(hook: impl FnOnce() + 'static) {
-    CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-}
-
-pub(crate) fn correlated_fetch_next() {
-    run_hook(&CORRELATED_FETCH_HOOK);
 }
 
 /// Run once on this thread when its next walk of a store's index map,
@@ -2476,7 +2427,6 @@ thread_local! {
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MIN_MAX_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUALITY_CANDIDATE_IDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CORRELATED_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
@@ -3257,15 +3207,6 @@ pub(crate) fn equality_candidate_ids_copied(count: usize) {
     EQUALITY_CANDIDATE_IDS_COPIED.with(|n| n.set(n.get() + count));
 }
 
-/// Correlated EXISTS probes this thread asked an inner table for, so far
-pub fn correlated_probes_asked() -> usize {
-    CORRELATED_PROBES.with(std::cell::Cell::get)
-}
-
-pub(crate) fn correlated_probe_asked() {
-    CORRELATED_PROBES.with(|n| n.set(n.get() + 1));
-}
-
 /// Hot rows this thread's index-walking top-k scans visited, so far
 pub fn hot_top_k_visits() -> usize {
     HOT_TOP_K_VISITS.with(std::cell::Cell::get)
@@ -3381,7 +3322,6 @@ pub(crate) fn group_column_decoded(col: usize, group: usize) {
 thread_local! {
     static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static IN_SUBQUERY_SETS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STREAMING_JOINS_STREAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIMIT_HASH_LEFT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3424,15 +3364,6 @@ pub fn join_side_runs() -> usize {
 
 pub(crate) fn join_side_ran() {
     JOIN_SIDE_RUNS.with(|n| n.set(n.get() + 1));
-}
-
-/// Shared sets this thread built from cached IN subquery lists, so far
-pub fn in_subquery_sets_built() -> usize {
-    IN_SUBQUERY_SETS_BUILT.with(std::cell::Cell::get)
-}
-
-pub(crate) fn in_subquery_set_built() {
-    IN_SUBQUERY_SETS_BUILT.with(|n| n.set(n.get() + 1));
 }
 
 /// Streaming LIMIT joins this thread ran as they stream, without leaving
@@ -3560,7 +3491,6 @@ pub fn reset_all() {
     SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     READ_PATHS.with(|paths| paths.borrow_mut().clear());
     FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);
-    CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEX_VISITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
