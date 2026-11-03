@@ -279,3 +279,61 @@ fn a_conflict_update_reads_a_bare_name_from_the_row_met() {
     let b: i64 = db.query_one("SELECT b FROM t WHERE id = 1", ()).unwrap();
     assert_eq!(b, 16, "b = 10 + 5, then + 1");
 }
+
+#[test]
+fn a_select_alias_spares_a_bare_name_only_where_the_alias_is_read() {
+    let db = hot("alias_contexts");
+    let mut wrong = Vec::new();
+    // Each statement with `{k}` for the key, and whether it reads the alias
+    for (shape, reads_alias) in [
+        (
+            "SELECT u.id AS id, t.id FROM t JOIN u ON u.id = t.a ORDER BY {k}, t.id",
+            true,
+        ),
+        (
+            "SELECT DISTINCT ON ({k}) u.id AS id, t.id FROM t JOIN u ON u.id = t.a \
+             ORDER BY {k}, t.id",
+            true,
+        ),
+        (
+            "SELECT u.id AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY {k}",
+            true,
+        ),
+        (
+            "SELECT u.id AS id, COUNT(*) FROM t JOIN u ON u.id = t.a GROUP BY u.id \
+             HAVING {k} > 1",
+            true,
+        ),
+        (
+            "SELECT u.id AS id FROM t JOIN u ON u.id = t.a WHERE {k} > 1",
+            false,
+        ),
+        (
+            "SELECT u.id AS id, ROW_NUMBER() OVER (ORDER BY {k}, t.id) FROM t \
+             JOIN u ON u.id = t.a",
+            false,
+        ),
+        (
+            "SELECT u.id AS id, COUNT(*) OVER (PARTITION BY {k}) FROM t JOIN u ON u.id = t.a",
+            false,
+        ),
+        (
+            "SELECT u.id AS id, ROW_NUMBER() OVER w FROM t JOIN u ON u.id = t.a \
+             WINDOW w AS (ORDER BY {k}, t.id)",
+            false,
+        ),
+    ] {
+        let bare = shape.replace("{k}", "id");
+        let got = answer(&db, &bare);
+        let right = match reads_alias {
+            true => got == answer(&db, &shape.replace("{k}", "u.id")),
+            false => got
+                .as_ref()
+                .is_err_and(|e| e.contains("column reference 'id' is ambiguous")),
+        };
+        if !right {
+            wrong.push(format!("{bare}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

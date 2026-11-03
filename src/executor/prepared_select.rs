@@ -10203,7 +10203,8 @@ impl JoinBlocks {
             })
             .collect();
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
-        // A named window only as its windows read it
+        // A named window only as its windows read it, over the row's
+        // columns as an inline one: it reads no alias
         let windows = Executor::used_window_defs(stmt);
         let after_items = stmt
             .group_by
@@ -10212,13 +10213,18 @@ impl JoinBlocks {
             .chain(stmt.having.as_deref())
             .chain(keys)
             .chain(&stmt.distinct_on)
-            .chain(windows.iter().flat_map(WindowDefinition::expressions))
             .map(|expr| (expr, &aliases[..]));
         let checked = stmt
             .columns
             .iter()
             .map(|item| (unaliased(item), &[][..]))
             .chain(after_items)
+            .chain(
+                windows
+                    .iter()
+                    .flat_map(WindowDefinition::expressions)
+                    .map(|expr| (expr, &[][..])),
+            )
             .try_for_each(|(expr, aliases)| names(&chain, expr, aliases));
         checked
     }
