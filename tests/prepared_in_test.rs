@@ -453,9 +453,7 @@ fn test_a_probe_reads_only_members_its_equality_answers() {
         assert_eq!(ids(&db, sql), Ok(expected), "{sql}");
     }
     let json = "SELECT id FROM j WHERE doc IN (SELECT doc FROM j WHERE id = 2) ORDER BY id";
-    let general =
-        "SELECT DISTINCT id FROM j WHERE doc IN (SELECT doc FROM j WHERE id = 2) ORDER BY id";
-    assert_eq!(ids(&db, json), ids(&db, general), "{json}");
+    assert_eq!(ids(&db, json), Ok(vec![2]), "{json}");
 }
 
 #[test]

@@ -14,8 +14,8 @@
 
 //! A NATURAL or USING join whose SELECT list or ORDER BY holds a subquery
 //! runs it through the plan's blocks, its rows read with each merged pair
-//! apart and shown merged: it answers as the general path does, hot and
-//! sealed, and a subquery reads a merged column by its bare name
+//! apart and shown merged: it answers as recorded, hot and sealed, and a
+//! subquery reads a merged column by its bare name
 
 #![cfg(feature = "test-failpoints")]
 
@@ -158,7 +158,7 @@ fn a_merging_join_answers_as_the_join_on_its_equalities() {
 }
 
 #[test]
-fn a_merging_join_runs_its_output_subqueries_as_the_general_path_does() {
+fn a_merging_join_runs_its_output_subqueries_as_recorded() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let mut wrong = Vec::new();
@@ -173,9 +173,8 @@ fn a_merging_join_runs_its_output_subqueries_as_the_general_path_does() {
                         wrong.push(format!("{context}: {sql}: {line}"));
                     }
                     let answer = rows(&db, &sql);
-                    let general = || oracle::general_answer(&sql, |twin| rows(&db, twin));
                     wrong.extend(
-                        oracle::check_confirmed(&RECORDED, &sql, &answer, general)
+                        oracle::check_answer(&RECORDED, &sql, &answer)
                             .map(|why| format!("{context}: {why}")),
                     );
                 }
@@ -284,8 +283,11 @@ fn a_star_lines_up_with_the_items_and_qualified_stars_beside_it() {
         // An alias after the star is read where the projection put it
         let sql = "SELECT *, l.id AS x, (SELECT MAX(s.a) FROM s WHERE s.id = r.id) AS c \
                    FROM l JOIN r USING (k) ORDER BY x + 0 DESC, r.id";
-        let general = oracle::general_answer(sql, |twin| rows(&db, twin));
-        assert_eq!(rows(&db, sql), general, "{context}: {sql}");
+        let twin = "SELECT l.id AS \"l.id\", l.k AS k, l.g AS \"l.g\", r.id AS \"r.id\", \
+                    r.w AS \"r.w\", l.id AS x, \
+                    (SELECT MAX(s.a) FROM s WHERE s.id = r.id) AS c \
+                    FROM l JOIN r ON r.k = l.k ORDER BY x + 0 DESC, r.id";
+        assert_eq!(rows(&db, sql), rows(&db, twin), "{context}: {sql}");
         // Each name stands over its own value
         let sql = "SELECT *, r.*, (SELECT 7) AS x FROM l JOIN r USING (k)";
         let result = db.query(sql, ()).unwrap();

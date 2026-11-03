@@ -45,8 +45,8 @@ fn sorted(db: &Database, sql: &str) -> Vec<String> {
 }
 
 fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
-    // The first SELECT, written bare and in the general path's and the
-    // prepared path's forms
+    // The first SELECT, written bare and holding a subquery, which the
+    // expected answer writes in as its value
     for first in [
         "SELECT DISTINCT a FROM t",
         "SELECT DISTINCT a FROM t WHERE id > (SELECT MIN(id) FROM t) - 1",
@@ -67,7 +67,8 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
             "EXCEPT ALL",
         ] {
             let sql = format!("{first} {op} {other}");
-            let want = format!("SELECT {columns} FROM ({first}) d {op} {other}");
+            let written = first.replace("(SELECT MIN(id) FROM t)", "1");
+            let want = format!("SELECT {columns} FROM ({written}) d {op} {other}");
             let (got, want_rows) = (sorted(db, &sql), sorted(db, &want));
             if got != want_rows {
                 wrong.push(format!(
