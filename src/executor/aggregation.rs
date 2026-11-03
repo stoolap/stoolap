@@ -842,6 +842,7 @@ fn extra_arg_constant(arg: &Expression, blocks: Option<&dyn SubqueryExecutor>) -
 /// What one aggregate call reads from each input row, compiled once: the
 /// FILTER that decides whether the row counts, the argument expression, and
 /// the keys of the call's own ORDER BY
+#[derive(Clone, Debug)]
 pub(crate) struct CallInputs {
     filter: Option<super::expression::SharedProgram>,
     argument: Option<super::expression::SharedProgram>,
@@ -944,6 +945,7 @@ pub(crate) static COUNT_STAR: Value = Value::Integer(1);
 const PARALLEL_ROWS: usize = 100_000;
 
 /// One GROUP BY item as each row is read for it
+#[derive(Clone, Debug)]
 enum KeyItem {
     Column(usize),
     Program(super::expression::SharedProgram),
@@ -1048,8 +1050,8 @@ impl<'b> RowReads<'b> {
 
 /// What an aggregation reads from each input row, compiled once over the
 /// input's columns: the group key, and each call's column or inputs
-struct RowFeed<'a> {
-    aggregations: &'a [SqlAggregateFunction],
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledFeed {
     inputs: Vec<CallInputs>,
     /// Each call's column; None for COUNT(*) and an argument expression
     columns: Vec<Option<usize>>,
@@ -1060,11 +1062,30 @@ struct RowFeed<'a> {
     programs: bool,
 }
 
+/// A plan's feed, compiled on its first run over the columns it reads
+pub(crate) type HeldFeed = std::sync::OnceLock<Result<CompiledFeed>>;
+
+/// The feed of one execution's aggregation
+struct RowFeed<'a> {
+    aggregations: &'a [SqlAggregateFunction],
+    feed: std::borrow::Cow<'a, CompiledFeed>,
+}
+
+impl std::ops::Deref for RowFeed<'_> {
+    type Target = CompiledFeed;
+
+    fn deref(&self) -> &CompiledFeed {
+        &self.feed
+    }
+}
+
 impl<'a> RowFeed<'a> {
     /// The feed of `aggregations` grouped by `group_items`, the keys `stmt`
     /// writes, over `columns`, for this execution of `ctx`'s statement: its
     /// subqueries run as the statement's `blocks`, each set they read tested
-    /// in place, and what reads a parameter folds it
+    /// in place, and what reads a parameter folds it. A plan's `held` feed
+    /// is compiled once, and bound to each execution
+    #[allow(clippy::too_many_arguments)]
     fn new(
         aggregations: &'a [SqlAggregateFunction],
         group_items: &[GroupByItem],
@@ -1072,24 +1093,54 @@ impl<'a> RowFeed<'a> {
         columns: &[String],
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&'a HeldFeed>),
     ) -> Result<Self> {
-        let compile = |expr: &Expression| {
-            if blocks.is_none() && !super::utils::expression_has_parameters(expr) {
-                return super::expression::compile_expression(expr, columns);
+        let at = (group_items, stmt, col_index_map);
+        let registry = crate::functions::registry::global_registry();
+        let feed = match held {
+            Some(held) => {
+                let compiled = held.get_or_init(|| {
+                    CompiledFeed::compile(aggregations, at, |expr| {
+                        compile_over_slots(expr, columns, registry, None, blocks.is_some(), None)
+                    })
+                });
+                let compiled = compiled.as_ref().map_err(Clone::clone)?;
+                compiled.bound(slot_params(ctx, blocks), blocks)
             }
-            let program = compile_over_slots(
-                expr,
-                columns,
-                crate::functions::registry::global_registry(),
-                None,
-                blocks.is_some(),
-                Some(slot_params(ctx, blocks)),
-            )?;
-            Ok(blocks
-                .and_then(|blocks| blocks.bind_members(&program))
-                .unwrap_or(program))
+            None => std::borrow::Cow::Owned(CompiledFeed::compile(aggregations, at, |expr| {
+                if blocks.is_none() && !super::utils::expression_has_parameters(expr) {
+                    return super::expression::compile_expression(expr, columns);
+                }
+                let program = compile_over_slots(
+                    expr,
+                    columns,
+                    registry,
+                    None,
+                    blocks.is_some(),
+                    Some(slot_params(ctx, blocks)),
+                )?;
+                Ok(blocks
+                    .and_then(|blocks| blocks.bind_members(&program))
+                    .unwrap_or(program))
+            })?),
         };
+        Ok(Self { aggregations, feed })
+    }
+}
+
+impl CompiledFeed {
+    /// The feed of `aggregations` grouped by `group_items`, the keys `stmt`
+    /// writes, over the columns `col_index_map` finds, each program made by
+    /// `compile`
+    fn compile(
+        aggregations: &[SqlAggregateFunction],
+        (group_items, stmt, col_index_map): (
+            &[GroupByItem],
+            Option<&SelectStatement>,
+            &StringMap<usize>,
+        ),
+        compile: impl Fn(&Expression) -> Result<super::expression::SharedProgram>,
+    ) -> Result<Self> {
         let items = group_items
             .iter()
             .enumerate()
@@ -1138,7 +1189,6 @@ impl<'a> RowFeed<'a> {
                 .iter()
                 .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
         Ok(Self {
-            aggregations,
             inputs: CallInputs::compile_with(aggregations, compile)?,
             columns: aggregations
                 .iter()
@@ -1162,6 +1212,68 @@ impl<'a> RowFeed<'a> {
         })
     }
 
+    /// This feed with each program bound to `params` and to the sets
+    /// `blocks` hold for the execution; itself when there is nothing to bind
+    fn bound(
+        &self,
+        params: &[Value],
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> std::borrow::Cow<'_, Self> {
+        if params.is_empty() && blocks.is_none() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let bind = |program: &super::expression::SharedProgram| {
+            let program = super::expression::bind_params(program.clone(), params);
+            blocks
+                .and_then(|blocks| blocks.bind_members(&program))
+                .unwrap_or(program)
+        };
+        let first = self.programs().enumerate().find_map(|(at, program)| {
+            let held = bind(program);
+            (!CompactArc::ptr_eq(&held, program)).then_some((at, held))
+        });
+        let Some((at, held)) = first else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+        let mut bound = self.clone();
+        let mut slots = bound.programs_mut().skip(at);
+        if let Some(slot) = slots.next() {
+            *slot = held;
+        }
+        for slot in slots {
+            *slot = bind(slot);
+        }
+        std::borrow::Cow::Owned(bound)
+    }
+
+    /// Every program of the feed: each call's inputs, then the key's
+    fn programs(&self) -> impl Iterator<Item = &super::expression::SharedProgram> {
+        let inputs = self.inputs.iter().flat_map(|inputs| {
+            (inputs.filter.iter())
+                .chain(&inputs.argument)
+                .chain(&inputs.order)
+        });
+        inputs.chain(self.items.iter().filter_map(|item| match item {
+            KeyItem::Program(program) => Some(program),
+            KeyItem::Column(_) => None,
+        }))
+    }
+
+    /// Every program of the feed, in the order `programs` hands them over
+    fn programs_mut(&mut self) -> impl Iterator<Item = &mut super::expression::SharedProgram> {
+        let inputs = self.inputs.iter_mut().flat_map(|inputs| {
+            (inputs.filter.iter_mut())
+                .chain(&mut inputs.argument)
+                .chain(&mut inputs.order)
+        });
+        inputs.chain(self.items.iter_mut().filter_map(|item| match item {
+            KeyItem::Program(program) => Some(program),
+            KeyItem::Column(_) => None,
+        }))
+    }
+}
+
+impl<'a> RowFeed<'a> {
     /// Reads every item of the row's key into `key`
     fn read_key(
         &self,
@@ -1453,7 +1565,7 @@ impl Executor {
             ctx,
             input,
             base_columns,
-            None,
+            (None, None),
         )
     }
 
@@ -1469,10 +1581,11 @@ impl Executor {
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<Box<dyn QueryResult>> {
+        let run = (blocks, held);
         let (columns, rows, group_by_columns) =
-            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, blocks)?;
+            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
         self.finish_aggregation(
             path,
             AggregateSlots {
@@ -1501,8 +1614,9 @@ impl Executor {
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
+        run: (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<(Vec<String>, RowVec, Vec<GroupByItem>)> {
+        let blocks = run.0;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
         // Determine if we can push LIMIT to aggregation for early termination
@@ -1529,7 +1643,7 @@ impl Executor {
         let col_index_map;
         let (result_columns, result_rows) = if group_by_columns.is_empty() {
             // Global aggregation (no GROUP BY)
-            self.execute_global_aggregation(aggregations, input, base_columns, ctx, blocks)?
+            self.execute_global_aggregation(aggregations, input, base_columns, ctx, run)?
         } else if stmt.group_by.modifier != GroupByModifier::None {
             // ROLLUP or CUBE aggregation
             col_index_map = build_column_index_map(base_columns);
@@ -1541,7 +1655,7 @@ impl Executor {
                 &col_index_map,
                 stmt,
                 ctx,
-                blocks,
+                run,
             )?
         } else {
             // Regular grouped aggregation - pass limit for early termination
@@ -1555,7 +1669,7 @@ impl Executor {
                 &col_index_map,
                 ctx,
                 aggregation_limit,
-                blocks,
+                run,
             )?
         };
 
@@ -2211,7 +2325,8 @@ impl Executor {
         let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
         let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
         let path = AggregatePath::General;
-        self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, None)
+        let run = (None, None);
+        self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, run)
     }
 
     /// The window functions of `stmt` over its groups of `aggregations`,
@@ -2226,10 +2341,11 @@ impl Executor {
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<WindowOutput> {
+        let run = (blocks, held);
         let (columns, rows, items) =
-            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, blocks)?;
+            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
         let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
         if stmt.group_by.modifier != GroupByModifier::None {
             let mut calls = Vec::new();
@@ -2825,9 +2941,9 @@ impl Executor {
         input: FeedInput<'_, impl RowSource>,
         columns: &[String],
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        run: (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<(Vec<String>, RowVec)> {
-        let rows = self.global_row(aggregations, columns, ctx, blocks, input)?;
+        let rows = self.global_row(aggregations, columns, ctx, run, input)?;
         let result_columns = aggregations.iter().map(|a| a.get_column_name()).collect();
         Ok((result_columns, rows))
     }
@@ -2845,7 +2961,7 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
         limit: Option<usize>,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<(Vec<String>, RowVec)> {
         let mut groups =
             GroupedAggregates::new(self.call_templates(aggregations)?, group_by_items.len());
@@ -2859,7 +2975,7 @@ impl Executor {
             columns,
             col_index_map,
             ctx,
-            blocks,
+            (blocks, held),
         )?
         .run_input(&mut groups, input, ctx, blocks)?;
 
@@ -2889,7 +3005,7 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<(Vec<String>, RowVec)> {
         // Generate grouping sets based on modifier type
         let grouping_sets = match &stmt.group_by.modifier {
@@ -2913,7 +3029,7 @@ impl Executor {
             columns,
             col_index_map,
             ctx,
-            blocks,
+            (blocks, held),
         )?;
         let picks: Vec<Vec<usize>> = grouping_sets
             .iter()
@@ -3145,7 +3261,7 @@ impl Executor {
         let columns = table.schema().column_names_lower_arc();
         let mut scanner = table.scan(&[], None)?;
         let input = FeedInput::Each(ScannedRows(&mut *scanner), table.row_count_hint());
-        let rows = self.global_row(aggregations, &columns, ctx, None, input)?;
+        let rows = self.global_row(aggregations, &columns, ctx, (None, None), input)?;
         scanner.close()?;
         Ok(rows)
     }
@@ -3158,7 +3274,7 @@ impl Executor {
         aggregations: &[SqlAggregateFunction],
         columns: &[String],
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
         input: FeedInput<'_, impl RowSource>,
     ) -> Result<RowVec> {
         let col_index_map = build_column_index_map(columns);
@@ -3170,7 +3286,7 @@ impl Executor {
             columns,
             &col_index_map,
             ctx,
-            blocks,
+            (blocks, held),
         )?;
         feed.run_input(&mut groups, input, ctx, blocks)?;
         groups.into_rows()

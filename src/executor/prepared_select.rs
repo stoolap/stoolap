@@ -47,7 +47,7 @@ use crate::storage::traits::{
 use super::aggregation::{
     aggregate_alias_key, aggregate_group_key, aggregate_slot_keys, check_grouped_reads,
     grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs, FeedInput,
-    GroupByItem, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
+    GroupByItem, HeldFeed, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -3629,6 +3629,8 @@ pub struct PreparedSelect {
     /// Those calls, parsed once when each later argument is written as its
     /// value; None parses them on each run
     calls: Option<Vec<SqlAggregateFunction>>,
+    /// The programs feeding those calls, compiled by the first run
+    feed: HeldFeed,
     /// The statement the window step or the aggregation computes: the one
     /// prepared, a set operation's first branch, with each DISTINCT ON key
     /// its list does not compute riding along as a hidden item
@@ -3648,6 +3650,13 @@ pub struct PreparedSelect {
 /// value a program over no row that reads the statement's blocks
 type SourcePrograms = Box<[Box<[SharedProgram]>]>;
 
+/// A run's aggregate calls, the blocks answering them and their held feed
+type HeldCalls<'a> = (
+    &'a [SqlAggregateFunction],
+    Option<&'a dyn SubqueryExecutor>,
+    Option<&'a HeldFeed>,
+);
+
 /// What a run of a statement that aggregates its rows or computes windows
 /// over them reads them by, as the statement prepared it
 #[derive(Clone, Copy)]
@@ -3656,6 +3665,8 @@ pub(crate) struct RowsRead<'p> {
     read: Option<&'p Read>,
     /// The calls, None when a run parses them
     calls: Option<&'p [SqlAggregateFunction]>,
+    /// The programs feeding the held calls
+    feed: Option<&'p HeldFeed>,
     /// The windows run over the groups
     windowed: bool,
     constant_where: bool,
@@ -3867,6 +3878,7 @@ impl PreparedSelect {
             where_: &self.where_,
             read: self.plan.as_ref().map(|plan| &plan.read),
             calls: self.calls.as_deref(),
+            feed: self.calls.as_ref().map(|_| &self.feed),
             windowed: self.windowed,
             constant_where: self.constant_where,
             source_values: self.source_values.as_deref(),
@@ -8396,6 +8408,7 @@ impl PreparedSelect {
             windowed,
             aggregated,
             calls,
+            feed: HeldFeed::new(),
             computed: computed_stmt,
             quiet: None,
             window,
@@ -8523,6 +8536,8 @@ pub struct PreparedGrouped {
     read: Option<Read>,
     /// The aggregate calls, None when a run parses them
     calls: Option<Vec<SqlAggregateFunction>>,
+    /// The programs feeding those calls, compiled by the first run
+    feed: HeldFeed,
     /// The WHERE holds no subquery and a term that is a statement constant
     constant_where: bool,
     /// The plan of the windows it computes without grouping, made once when
@@ -9314,6 +9329,7 @@ impl PreparedGrouped {
             where_,
             read,
             calls,
+            feed: HeldFeed::new(),
             constant_where,
             window,
             source_values,
@@ -9358,6 +9374,7 @@ impl PreparedGrouped {
                 .filter(|_| self.source != GroupedSource::Joined)?,
             read: self.read.as_ref(),
             calls: self.calls.as_deref(),
+            feed: self.calls.as_ref().map(|_| &self.feed),
             windowed: self.classification.has_window_functions,
             constant_where: self.constant_where,
             source_values: self.source_values.as_deref(),
@@ -12433,7 +12450,8 @@ impl Executor {
         let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
         let windows = held.classification.has_window_functions;
         let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
-        let calls = (aggregations, Some(run as &dyn SubqueryExecutor));
+        let feed = held.calls.as_ref().map(|_| &held.feed);
+        let calls = (aggregations, Some(run as &dyn SubqueryExecutor), feed);
         self.grouped_answer(windows, stmt, calls, ctx, input, columns)
     }
 
@@ -12506,8 +12524,9 @@ impl Executor {
                     return Ok((result, None));
                 }
             }
+            let calls = (aggregations, blocks, prepared.feed);
             return self.table_input(stmt, ctx, (runner, prepared), table, |input| {
-                self.grouped_answer(windows, stmt, (aggregations, blocks), ctx, input, &columns)
+                self.grouped_answer(windows, stmt, calls, ctx, input, &columns)
             });
         }
         let source = prepared.read.and_then(Read::aggregated);
@@ -12524,7 +12543,7 @@ impl Executor {
         let scan = || {
             let columns = table.schema().column_names_arc();
             self.table_input(stmt, ctx, (runner, prepared), table, |input| {
-                self.global_row(aggregations, &columns, ctx, blocks, input)
+                self.global_row(aggregations, &columns, ctx, (blocks, prepared.feed), input)
                     .map(Some)
             })
         };
@@ -12584,18 +12603,18 @@ impl Executor {
         &self,
         windows: bool,
         stmt: &SelectStatement,
-        (aggregations, blocks): (&[SqlAggregateFunction], Option<&dyn SubqueryExecutor>),
+        (aggregations, blocks, feed): HeldCalls<'_>,
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         columns: &[String],
     ) -> Result<WindowOutput> {
         let path = AggregatePath::HashGroups;
+        let run = (blocks, feed);
         if windows {
-            return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, blocks);
+            return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, run);
         }
         let stmts = (stmt, stmt);
-        let result =
-            self.aggregate_input(path, stmts, aggregations, ctx, input, columns, blocks)?;
+        let result = self.aggregate_input(path, stmts, aggregations, ctx, input, columns, run)?;
         Ok((result, None))
     }
 
@@ -12616,6 +12635,7 @@ impl Executor {
         let calls = (
             aggregations,
             prepared.blocks.then_some(runner as &dyn SubqueryExecutor),
+            prepared.feed,
         );
         // Without a WHERE the rows a source holds are fed as they are, and a
         // stream's as it hands them over, however many: held to split them
