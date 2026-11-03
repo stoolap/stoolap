@@ -4252,7 +4252,7 @@ impl PreparedSubquery {
             (Answer::Statement(..), ..) => "a statement".to_string(),
             (_, Some(BlockSource::View(name, ..) | BlockSource::Cte(name)), _) => name.to_string(),
             (_, Some(BlockSource::Derived(..)), _) => "a derived table".to_string(),
-            (_, Some(BlockSource::Values(_)), _) => "VALUES".to_string(),
+            (_, Some(BlockSource::Values(..)), _) => "VALUES".to_string(),
             (_, Some(BlockSource::AsOf(name, _)), _) => format!("{name} AS OF"),
             (_, Some(BlockSource::Function(..)), _) => "a table function".to_string(),
             (_, None, Some(table)) => table.to_string(),
@@ -4354,7 +4354,12 @@ enum BlockSource {
     /// statement reads
     Derived(Box<StatementRun>, Option<Vec<SmartString>>),
     Cte(SmartString),
-    Values(Box<ValuesTableSource>),
+    /// A VALUES list, with its rows compiled or the error compiling them
+    /// raises when the block reads them
+    Values(
+        Box<ValuesTableSource>,
+        std::result::Result<SourcePrograms, Error>,
+    ),
     /// A table read AS OF
     AsOf(SmartString, Box<AsOfClause>),
     /// A table function, with the WHERE's conjuncts that narrow its range,
@@ -5857,16 +5862,21 @@ impl Builder<'_> {
         Ok((Some(self.slotted(&rewritten, run_slots)?), reads))
     }
 
-    /// `stmt`'s VALUES rows or table function arguments when a value holds a
-    /// subquery, each rewritten by `rewrite` over no row, as a FROM sees none
-    /// of its statement's; a block among them runs only where the values are read
+    /// `stmt`'s VALUES rows, or its table function arguments when a value
+    /// holds a subquery, each rewritten by `rewrite` over no row, as a FROM
+    /// sees none of its statement's; a block among them runs only where the
+    /// values are read
     fn prepare_source_values(
         &mut self,
         stmt: &SelectStatement,
         rewrite: fn(&mut Self, &Chain<'_>, &Expression) -> Result<Expression>,
     ) -> Result<Option<Vec<Vec<Expression>>>> {
-        let Some(rows) = source_values(stmt.table_expr.as_deref()) else {
-            return Ok(None);
+        let rows = match stmt.table_expr.as_deref() {
+            Some(Expression::ValuesSource(values)) => values.rows.as_slice(),
+            other => match source_values(other) {
+                Some(rows) => rows,
+                None => return Ok(None),
+            },
         };
         let no_row = ScopeTable::unnamed();
         let scopes = [&no_row];
@@ -6252,15 +6262,24 @@ impl Builder<'_> {
                     }
                 }
             }
-            Some(Expression::ValuesSource(values)) => over_source(
+            Some(Expression::ValuesSource(values)) => {
                 values
-                    .alias
-                    .as_ref()
-                    .map(|a| a.value_lower.clone())
-                    .unwrap_or_default(),
-                BlockSource::Values(values.clone()),
-                Executor::values_columns(values),
-            ),
+                    .rows
+                    .iter()
+                    .flatten()
+                    .for_each(|v| self.note_params(v));
+                let own = CompileContext::bound(registry);
+                let rows = source_programs(&values.rows, |v| compile_with(&own, v));
+                over_source(
+                    values
+                        .alias
+                        .as_ref()
+                        .map(|a| a.value_lower.clone())
+                        .unwrap_or_default(),
+                    BlockSource::Values(values.clone(), rows),
+                    Executor::values_columns(values),
+                )
+            }
             Some(Expression::FunctionTableSource(function)) => {
                 let name = &function
                     .alias
@@ -7233,8 +7252,16 @@ fn source_programs(
     rows: &[Vec<Expression>],
     compile: impl Fn(&Expression) -> Result<SharedProgram>,
 ) -> Result<SourcePrograms> {
+    // A value written again shares its program, and a constant it folds
+    let mut compiled: FxHashMap<ExprKey, SharedProgram> = FxHashMap::default();
+    let mut program = |value: &Expression| match compiled.entry(ExprKey::exact(value)) {
+        std::collections::hash_map::Entry::Occupied(held) => Ok(CompactArc::clone(held.get())),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            Ok(CompactArc::clone(slot.insert(compile(value)?)))
+        }
+    };
     rows.iter()
-        .map(|row| row.iter().map(&compile).collect())
+        .map(|row| row.iter().map(&mut program).collect())
         .collect()
 }
 
@@ -11870,10 +11897,16 @@ impl Executor {
             }
             BlockSource::Derived(run, ..) => self.statement_rows(run, ctx)?,
             BlockSource::AsOf(name, as_of) => self.as_of_rows(name, as_of, ctx)?,
-            BlockSource::Values(values) => {
-                let mut rows = RowVec::with_capacity(values.rows.len());
-                for (id, exprs) in (0i64..).zip(&values.rows) {
-                    rows.push((id, Self::values_row(exprs, ctx)?));
+            BlockSource::Values(values, programs) => {
+                let programs = programs.as_ref().map_err(Clone::clone)?;
+                let empty = Row::new();
+                let exec =
+                    ExecuteContext::with_common_params(&empty, ctx.params(), ctx.transaction_id());
+                let mut vm = ExprVM::new();
+                let mut rows = RowVec::with_capacity(programs.len());
+                for (id, row) in (0i64..).zip(programs) {
+                    let values = row.iter().map(|program| vm.execute(program, &exec));
+                    rows.push((id, Row::from_values(values.collect::<Result<_>>()?)));
                 }
                 (Self::values_columns(values), rows)
             }
@@ -12821,8 +12854,11 @@ impl Executor {
                     ),
                 }
             }
-            StatementSource::Values(_, values) => match prepared.source_values {
-                Some(programs) => runner.rows_passing(
+            StatementSource::Values(..) => {
+                let programs = prepared
+                    .source_values
+                    .ok_or_else(|| Error::internal("a VALUES source read without its programs"))?;
+                runner.rows_passing(
                     prepared.where_,
                     (0i64..)
                         .zip(programs)
@@ -12830,17 +12866,8 @@ impl Executor {
                     ctx,
                     target,
                     &mut keep,
-                ),
-                None => runner.rows_passing(
-                    prepared.where_,
-                    (0i64..)
-                        .zip(&values.rows)
-                        .map(|(id, exprs)| Self::values_row(exprs, ctx).map(|row| (id, row))),
-                    ctx,
-                    target,
-                    &mut keep,
-                ),
-            },
+                )
+            }
             StatementSource::Cte((_, rows)) => runner.rows_passing(
                 prepared.where_,
                 rows.iter().map(|(id, row)| Ok((*id, row))),
