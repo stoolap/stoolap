@@ -91,4 +91,14 @@ fn held_update_values_read_each_execution_parameter() {
             .collect();
         assert_eq!(rows, expected, "UPDATE with {param}");
     }
+    let stmt = db
+        .prepare("UPDATE t SET a = id * $1 + 1 WHERE id = $2")
+        .unwrap();
+    for (param, id) in [(7, 2), (11, 4), (13, 2)] {
+        stmt.execute(vec![Value::Integer(param), Value::Integer(id)])
+            .unwrap();
+        let rows = collect(db.query("SELECT a FROM t WHERE id = $1", vec![Value::Integer(id)]));
+        let expected = vec![vec![Value::Integer(id * param + 1)]];
+        assert_eq!(rows.unwrap(), expected, "UPDATE of {id} with {param}");
+    }
 }

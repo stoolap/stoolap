@@ -1222,24 +1222,28 @@ impl CompiledFeed {
         if params.is_empty() && blocks.is_none() {
             return std::borrow::Cow::Borrowed(self);
         }
-        let mut bound: Option<Self> = None;
-        for (at, program) in self.programs().enumerate() {
-            let held = super::expression::bind_params(program.clone(), params);
-            let held = blocks
-                .and_then(|blocks| blocks.bind_members(&held))
-                .unwrap_or(held);
-            if CompactArc::ptr_eq(&held, program) {
-                continue;
-            }
-            let feed = bound.get_or_insert_with(|| self.clone());
-            if let Some(slot) = feed.programs_mut().nth(at) {
-                *slot = held;
-            }
+        let bind = |program: &super::expression::SharedProgram| {
+            let program = super::expression::bind_params(program.clone(), params);
+            blocks
+                .and_then(|blocks| blocks.bind_members(&program))
+                .unwrap_or(program)
+        };
+        let first = self.programs().enumerate().find_map(|(at, program)| {
+            let held = bind(program);
+            (!CompactArc::ptr_eq(&held, program)).then_some((at, held))
+        });
+        let Some((at, held)) = first else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+        let mut bound = self.clone();
+        let mut slots = bound.programs_mut().skip(at);
+        if let Some(slot) = slots.next() {
+            *slot = held;
         }
-        match bound {
-            Some(bound) => std::borrow::Cow::Owned(bound),
-            None => std::borrow::Cow::Borrowed(self),
+        for slot in slots {
+            *slot = bind(slot);
         }
+        std::borrow::Cow::Owned(bound)
     }
 
     /// Every program of the feed: each call's inputs, then the key's
