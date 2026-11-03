@@ -1010,13 +1010,17 @@ pub(crate) fn needed_columns(
         .chain(stmt.having.as_deref())
         .chain(stmt.order_by.iter().map(|o| &o.expression))
         .chain(where_expr);
-    // A window's columns are its call's, its partition's, its order's and
-    // its frame's; a named window's are read from the definitions, unknown here
+    // A window's columns are its call's, and its partition's, its order's and
+    // its frame's as it runs with them, a named window's from its definition
     let window_names = std::cell::RefCell::new(Vec::new());
     let windows_read = std::cell::Cell::new(true);
     let skip = |expr: &Expression| {
         let Expression::Window(window) = expr else {
             return false;
+        };
+        let Some((partition_by, order_by, frame)) = window.resolved(&stmt.window_defs) else {
+            windows_read.set(false);
+            return true;
         };
         let call = &window.function;
         let parts = call
@@ -1025,14 +1029,13 @@ pub(crate) fn needed_columns(
             .filter(|a| !matches!(a, Expression::Star(_)))
             .chain(call.filter.as_deref())
             .chain(call.order_by.iter().map(|o| &o.expression))
-            .chain(&window.partition_by)
-            .chain(window.order_by.iter().map(|o| &o.expression))
-            .chain(window.frame.iter().flat_map(|frame| frame.offsets()));
+            .chain(partition_by)
+            .chain(order_by.iter().map(|o| &o.expression))
+            .chain(frame.into_iter().flat_map(|frame| frame.offsets()));
         let mut window_names = window_names.borrow_mut();
-        let read = window.window_ref.is_none()
-            && parts.fold(true, |read, part| {
-                collect_column_names(part, &mut window_names) & read
-            });
+        let read = parts.fold(true, |read, part| {
+            collect_column_names(part, &mut window_names) & read
+        });
         windows_read.set(windows_read.get() && read);
         true
     };

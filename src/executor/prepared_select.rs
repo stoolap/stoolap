@@ -8393,15 +8393,11 @@ impl PreparedSelect {
     }
 
     /// Whether the runner aggregates `stmt`: it aggregates its rows and
-    /// holds no named window, set operation or subquery outside its WHERE,
-    /// which the grouped family's blocks answer; its windows run over its
-    /// groups, its WHERE's subqueries as its blocks
+    /// holds no subquery outside its WHERE, which the grouped family's
+    /// blocks answer; its windows run over its groups, its WHERE's
+    /// subqueries as its blocks
     pub(crate) fn runs_aggregate(stmt: &SelectStatement, shape: &QueryClassification) -> bool {
-        !shape.grouped_has_subqueries
-            && !shape.output_has_subqueries
-            && !shape.has_set_operations
-            && Self::aggregates(stmt)
-            && !Executor::reads_window_defs(stmt)
+        !shape.grouped_has_subqueries && !shape.output_has_subqueries && Self::aggregates(stmt)
     }
 
     /// The steps of `stmt`, which aggregates its rows, over its read,
