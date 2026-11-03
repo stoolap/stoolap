@@ -5092,6 +5092,9 @@ pub(crate) struct PreparedProjection {
     slots: usize,
     /// Whether a key reads SELECT aliases from the projected row
     alias_keys: bool,
+    /// The shared projection of every output, built by the first run when
+    /// no output binds to a run
+    held: std::sync::OnceLock<Option<Projection>>,
 }
 
 /// A SELECT list's items, each `*` spelled out as its columns
@@ -7760,6 +7763,7 @@ impl PreparedProjection {
                 columns: column_outputs,
                 slots,
                 alias_keys,
+                held: std::sync::OnceLock::new(),
             },
             extra_names,
             extra_sources,
@@ -7788,8 +7792,20 @@ impl PreparedProjection {
         }
         let mut vm = ExprVM::new();
         let mut bound = self.unbound();
+        // With no output bound to a run, every run projects alike
+        let built;
+        let shared = match self.slots {
+            0 => self
+                .held
+                .get_or_init(|| self.shared(run, &mut bound, None))
+                .as_ref(),
+            _ => {
+                built = self.shared(run, &mut bound, None);
+                built.as_ref()
+            }
+        };
         // Each row's output takes its place
-        if let Some(shared) = self.shared(run, &mut bound, None) {
+        if let Some(shared) = shared {
             for (row_id, (id, row)) in rows.iter_mut().enumerate() {
                 let mut out = Row::with_capacity(shared.width());
                 let exec = run.exec_over(row, &run.base);
