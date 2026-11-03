@@ -3604,9 +3604,10 @@ pub struct PreparedSelect {
     /// Those calls, parsed once when each later argument is written as its
     /// value; None parses them on each run
     calls: Option<Vec<SqlAggregateFunction>>,
-    /// The statement the window step or the aggregation computes, when a
-    /// DISTINCT ON key its list does not compute rides along as a hidden item
-    keyed: Option<SelectStatement>,
+    /// The statement the window step or the aggregation computes: the one
+    /// prepared, a set operation's first branch, with each DISTINCT ON key
+    /// its list does not compute riding along as a hidden item
+    computed: Option<SelectStatement>,
     /// The count or bound the table keeps that answers the statement before
     /// its run, through no transaction's writes and no statement's view
     pub(crate) quiet: Option<super::planned_aggregate::PlannedAggregate>,
@@ -8041,10 +8042,11 @@ impl PreparedSelect {
         let aggregated = Self::aggregates(stmt);
         // A DISTINCT ON key the list does not compute rides along as a
         // hidden item, computed over the rows or the groups
-        let keyed_stmt = (windowed || aggregated)
-            .then(|| Executor::with_distinct_on_items(stmt, &get_classification(stmt)))
-            .flatten();
-        let computed = keyed_stmt.as_ref().unwrap_or(stmt);
+        let computed_stmt = (windowed || aggregated).then(|| {
+            Executor::with_distinct_on_items(stmt, &get_classification(stmt))
+                .unwrap_or_else(|| stmt.clone())
+        });
+        let computed = computed_stmt.as_ref().unwrap_or(stmt);
         let rows_stmt;
         let written = stmt;
         let stmt = match windowed || aggregated {
@@ -8369,7 +8371,7 @@ impl PreparedSelect {
             windowed,
             aggregated,
             calls,
-            keyed: keyed_stmt,
+            computed: computed_stmt,
             quiet: None,
             window,
             source_values,
@@ -12859,12 +12861,13 @@ impl Executor {
         // passes, unless the statement aggregates them; the finishing steps
         // follow it
         if prepared.windowed && !prepared.aggregated {
+            let computed = prepared.computed.as_ref().unwrap_or(stmt);
             let (names, rows, order) = match source {
                 StatementSource::Table(table) => {
                     let names = table.schema().column_names_arc();
                     let run = (&runner, prepared.rows_read());
                     let plan = prepared.window.as_ref();
-                    match self.window_table_rows(stmt, ctx, run, &*table, (&names, plan))? {
+                    match self.window_table_rows(computed, ctx, run, &*table, (&names, plan))? {
                         WindowRows::Answer(result) => {
                             let output_columns = CompactArc::new(result.columns().to_vec());
                             let visible = self.count_select_columns(stmt);
@@ -12875,17 +12878,14 @@ impl Executor {
                 }
                 source => {
                     let run = (&runner, prepared.rows_read());
-                    let (names, rows) = self.window_source_rows(stmt, ctx, run, source)?;
+                    let (names, rows) = self.window_source_rows(computed, ctx, run, source)?;
                     (names, rows, (None, None))
                 }
             };
+            // The visible width trims a DISTINCT ON key's hidden item after
             let (result, layout) = match &prepared.window {
                 Some(plan) => self.window_by_plan(plan, ctx, (&rows, &names), order, None)?,
-                None => {
-                    // The visible width trims a DISTINCT ON key's hidden item after
-                    let computed = prepared.keyed.as_ref().unwrap_or(stmt);
-                    self.window_over(computed, ctx, (&rows, &names), order, None)?
-                }
+                None => self.window_over(computed, ctx, (&rows, &names), order, None)?,
             };
             let output_columns = CompactArc::new(result.columns().to_vec());
             let visible = self.count_select_columns(stmt);
@@ -12900,7 +12900,7 @@ impl Executor {
                 other => CompactArc::new(other.columns().unwrap_or_default().to_vec()),
             };
             let run = (&runner, prepared.rows_read());
-            let computed = prepared.keyed.as_ref().unwrap_or(stmt);
+            let computed = prepared.computed.as_ref().unwrap_or(stmt);
             let (result, windows_layout) = match source {
                 StatementSource::Table(table) => {
                     self.prepared_aggregate(computed, ctx, run, &*table)?
