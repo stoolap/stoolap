@@ -110,20 +110,85 @@ fn row_program(
         .unwrap_or(program))
 }
 
+/// One expression's program in a held plan, compiled over its columns by
+/// the first run and bound to each run
+type HeldProgram = OnceLock<Result<SharedProgram>>;
+
+/// The programs of a held plan's window function, one per expression
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WindowPrograms {
+    partition: Box<[HeldProgram]>,
+    order: Box<[HeldProgram]>,
+    argument: [HeldProgram; 1],
+    filter: [HeldProgram; 1],
+    call_order: Box<[HeldProgram]>,
+}
+
+/// The programs of a held plan's expression items: those `run_window`
+/// computes over the input and over the windows, and each item's own
+#[derive(Debug)]
+struct ItemPrograms {
+    base: Box<[HeldProgram]>,
+    ext: Box<[HeldProgram]>,
+    items: Box<[HeldProgram]>,
+}
+
+/// `n` held programs, none compiled yet
+fn held_programs(n: usize) -> Box<[HeldProgram]> {
+    (0..n).map(|_| HeldProgram::new()).collect()
+}
+
+/// `expr`'s program in `held`, compiled over `columns` as [`RowPrograms`]
+/// compiles it by the first run, bound to this run's parameters and blocks
+fn held_program(
+    expr: &Expression,
+    held: &HeldProgram,
+    columns: &[String],
+    slots: Option<&FxHashMap<ExprKey, usize>>,
+    ctx: &ExecutionContext,
+    blocks: Option<&dyn SubqueryExecutor>,
+) -> Result<SharedProgram> {
+    let program = held
+        .get_or_init(|| {
+            compile_over_slots(
+                expr,
+                columns,
+                global_registry(),
+                slots,
+                blocks.is_some(),
+                None,
+            )
+        })
+        .clone()?;
+    let program = bind_params(program, slot_params(ctx, blocks));
+    Ok(blocks
+        .and_then(|blocks| blocks.bind_members(&program))
+        .unwrap_or(program))
+}
+
 impl<'a> RowPrograms<'a> {
     /// `exprs` over `columns`, a group item or aggregate read from its slot
-    /// by identity when `slots` are given
+    /// by identity when `slots` are given; a held plan's from `held`, one
+    /// for each expression
     fn compile<'e>(
         exprs: impl IntoIterator<Item = &'e Expression>,
         columns: &[String],
         slots: Option<&FxHashMap<ExprKey, usize>>,
         ctx: &'a ExecutionContext,
         blocks: Option<&'a dyn SubqueryExecutor>,
+        held: Option<&[HeldProgram]>,
     ) -> Result<Self> {
-        let programs = exprs
-            .into_iter()
-            .map(|expr| row_program(expr, columns, slots, ctx, blocks))
-            .collect::<Result<_>>()?;
+        let programs = match held {
+            Some(held) => exprs
+                .into_iter()
+                .zip(held)
+                .map(|(expr, held)| held_program(expr, held, columns, slots, ctx, blocks))
+                .collect::<Result<_>>()?,
+            None => exprs
+                .into_iter()
+                .map(|expr| row_program(expr, columns, slots, ctx, blocks))
+                .collect::<Result<_>>()?,
+        };
         Ok(Self {
             programs,
             vm: ExprVM::new(),
@@ -695,6 +760,8 @@ pub struct WindowFunctionInfo {
     /// clause, which caches of sorted values and partitions are keyed by
     pub(crate) order_key: OrderByKey,
     pub(crate) over_key: OverClauseKey,
+    /// Its programs when a held plan holds it
+    pub(crate) held: Option<Box<WindowPrograms>>,
 }
 
 /// A window result, with the layout its ORDER BY reads when it has one
@@ -720,6 +787,31 @@ pub(crate) struct WindowPlan<'s> {
     /// The input columns, then the windows an expression item reads
     extended_columns: Vec<String>,
     added_wf_names: Vec<String>,
+    /// The item programs, when a prepared plan holds the plan
+    held: Option<Box<ItemPrograms>>,
+}
+
+impl WindowPlan<'_> {
+    /// This plan holding its programs, each compiled by its first run
+    fn holding(mut self) -> Self {
+        for wf in &mut self.window_functions {
+            wf.held = Some(Box::new(WindowPrograms {
+                partition: held_programs(wf.partition_by_exprs.len()),
+                order: held_programs(wf.order_by.len()),
+                call_order: held_programs(wf.call_order_by.len()),
+                ..WindowPrograms::default()
+            }));
+        }
+        let base = (self.select_items.iter())
+            .filter(|item| matches!(item.source, SelectItemSource::Expression(_)))
+            .count();
+        self.held = Some(Box::new(ItemPrograms {
+            base: held_programs(base),
+            ext: held_programs(self.transformed.iter().flatten().count()),
+            items: held_programs(self.select_items.len()),
+        }));
+        self
+    }
 }
 
 impl std::fmt::Debug for WindowPlan<'_> {
@@ -1214,7 +1306,7 @@ impl Executor {
             &FxHashMap::default(),
             (ctx, None),
         )
-        .map(Some)
+        .map(|plan| Some(plan.holding()))
     }
 
     /// The window plan of `stmt` over rows of `base_columns`, of which the
@@ -1298,6 +1390,7 @@ impl Executor {
             transformed,
             extended_columns,
             added_wf_names,
+            held: None,
         })
     }
 
@@ -1369,7 +1462,7 @@ impl Executor {
                 let already_cached = order_by_cache.iter().any(|(key, _)| key == cache_key);
                 if !already_cached {
                     let precomputed = self.precompute_order_by_values(
-                        &wf.order_by,
+                        wf,
                         base_rows,
                         base_columns,
                         col_index_map,
@@ -1453,6 +1546,7 @@ impl Executor {
                 Some(group_slots),
                 ctx,
                 blocks,
+                plan.held.as_ref().map(|held| &*held.base),
             )?)
         } else {
             None
@@ -1468,6 +1562,7 @@ impl Executor {
                 Some(group_slots),
                 ctx,
                 blocks,
+                plan.held.as_ref().map(|held| &*held.ext),
             )?)
         } else {
             None
@@ -1665,7 +1760,7 @@ impl Executor {
                 let already_cached = order_by_cache.iter().any(|(key, _)| key == cache_key);
                 if !already_cached {
                     let precomputed = self.precompute_order_by_values(
-                        &wf.order_by,
+                        wf,
                         base_rows,
                         base_columns,
                         col_index_map,
@@ -1802,14 +1897,18 @@ impl Executor {
             }
             let num_items = select_items.len();
             let mut compiled_items: Vec<CompiledItem<'_, '_>> = Vec::with_capacity(num_items);
-            for item in select_items {
+            for (at, item) in select_items.iter().enumerate() {
+                let held = plan
+                    .held
+                    .as_ref()
+                    .and_then(|held| held.items.get(at..at + 1));
                 compiled_items.push(match &item.source {
                     SelectItemSource::BaseColumn(idx) => CompiledItem::BaseColumn(*idx),
                     SelectItemSource::WindowFunction(name) => {
                         CompiledItem::WindowFunction(name.as_str())
                     }
                     SelectItemSource::Expression(expr) => CompiledItem::Expression(
-                        RowPrograms::compile([expr], base_columns, None, ctx, blocks)?,
+                        RowPrograms::compile([expr], base_columns, None, ctx, blocks, held)?,
                     ),
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
@@ -1819,8 +1918,14 @@ impl Executor {
                         for wf_name in wf_names {
                             ext_columns.push(wf_name.clone());
                         }
-                        let eval =
-                            RowPrograms::compile([&transformed], &ext_columns, None, ctx, blocks)?;
+                        let eval = RowPrograms::compile(
+                            [&transformed],
+                            &ext_columns,
+                            None,
+                            ctx,
+                            blocks,
+                            held,
+                        )?;
                         let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
                         CompiledItem::ExpressionWithWindow(eval, name_refs)
                     }
@@ -1956,7 +2061,7 @@ impl Executor {
                     let already_cached = order_by_cache.iter().any(|(key, _)| key == cache_key);
                     if !already_cached {
                         let precomputed = self.precompute_order_by_values(
-                            &wf.order_by,
+                            wf,
                             &partition_rows,
                             base_columns,
                             col_index_map,
@@ -2041,14 +2146,18 @@ impl Executor {
             }
             let num_items = select_items.len();
             let mut compiled_items: Vec<CompiledItemLazy<'_, '_>> = Vec::with_capacity(num_items);
-            for item in select_items {
+            for (at, item) in select_items.iter().enumerate() {
+                let held = plan
+                    .held
+                    .as_ref()
+                    .and_then(|held| held.items.get(at..at + 1));
                 compiled_items.push(match &item.source {
                     SelectItemSource::BaseColumn(idx) => CompiledItemLazy::BaseColumn(*idx),
                     SelectItemSource::WindowFunction(name) => {
                         CompiledItemLazy::WindowFunction(name.as_str())
                     }
                     SelectItemSource::Expression(expr) => CompiledItemLazy::Expression(
-                        RowPrograms::compile([expr], base_columns, None, ctx, None)?,
+                        RowPrograms::compile([expr], base_columns, None, ctx, None, held)?,
                     ),
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
@@ -2058,8 +2167,14 @@ impl Executor {
                         for wf_name in wf_names {
                             ext_columns.push(wf_name.clone());
                         }
-                        let eval =
-                            RowPrograms::compile([&transformed], &ext_columns, None, ctx, None)?;
+                        let eval = RowPrograms::compile(
+                            [&transformed],
+                            &ext_columns,
+                            None,
+                            ctx,
+                            None,
+                            held,
+                        )?;
                         let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
                         CompiledItemLazy::ExpressionWithWindow(eval, name_refs)
                     }
@@ -2607,6 +2722,7 @@ impl Executor {
             extra_error,
             order_key,
             over_key,
+            held: None,
         })
     }
 
@@ -2782,6 +2898,7 @@ impl Executor {
                 Some(group_slots),
                 ctx,
                 blocks,
+                wf_info.held.as_ref().map(|held| &*held.partition),
             )?;
             let mut values = Vec::with_capacity(wf_info.partition_by_exprs.len());
             for (i, (_, row)) in rows.iter().enumerate() {
@@ -3559,7 +3676,8 @@ impl Executor {
         }) else {
             return Ok(Vec::new());
         };
-        let mut eval = RowPrograms::compile([arg], columns, None, ctx, blocks)?;
+        let held = wf_info.held.as_ref().map(|held| &held.argument[..]);
+        let mut eval = RowPrograms::compile([arg], columns, None, ctx, blocks, held)?;
         rows.iter().map(|(_, row)| eval.eval(row)).collect()
     }
 
@@ -3589,12 +3707,12 @@ impl Executor {
         }
     }
 
-    /// Precompute ORDER BY values for all rows using columnar layout
+    /// Precompute `wf`'s ORDER BY values for all rows using columnar layout
     /// Returns a ColumnarOrderByValues structure for cache-efficient sorting
     #[allow(clippy::too_many_arguments)]
     fn precompute_order_by_values(
         &self,
-        order_by: &[OrderByExpression],
+        wf: &WindowFunctionInfo,
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
@@ -3602,6 +3720,7 @@ impl Executor {
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<ColumnarOrderByValues> {
+        let order_by = &wf.order_by[..];
         let num_rows = rows.len();
         let num_cols = order_by.len();
 
@@ -3659,8 +3778,14 @@ impl Executor {
                 order_by.iter().map(|ob| ob.expression.clone()).collect();
 
             // A group item or aggregate in ORDER BY reads its slot
-            let mut eval =
-                RowPrograms::compile(&order_exprs, columns, Some(group_slots), ctx, blocks)?;
+            let mut eval = RowPrograms::compile(
+                &order_exprs,
+                columns,
+                Some(group_slots),
+                ctx,
+                blocks,
+                wf.held.as_ref().map(|held| &*held.order),
+            )?;
             let mut values = Vec::with_capacity(num_cols);
             for (_, row) in rows {
                 eval.eval_into(row, &mut values)?;
@@ -4066,11 +4191,12 @@ impl Executor {
         }
     }
 
-    /// The aggregate's argument per row, NULL where its FILTER rejects the row
+    /// The aggregate's argument per row, NULL where its FILTER rejects the
+    /// row; a held plan's FILTER program in `held`
     #[allow(clippy::too_many_arguments)]
     fn window_filtered_values(
         &self,
-        filter: &Expression,
+        (filter, held): (&Expression, Option<&[HeldProgram]>),
         rows: &[(i64, Row)],
         columns: &[String],
         ctx: &ExecutionContext,
@@ -4078,7 +4204,7 @@ impl Executor {
         expression_values: &[Value],
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
-        let mut eval = RowPrograms::compile([filter], columns, None, ctx, blocks)?;
+        let mut eval = RowPrograms::compile([filter], columns, None, ctx, blocks, held)?;
         let mut values = Vec::with_capacity(rows.len());
         for (idx, (_, row)) in rows.iter().enumerate() {
             values.push(if matches!(eval.eval(row)?, Value::Boolean(true)) {
@@ -4132,6 +4258,7 @@ impl Executor {
             None,
             ctx,
             blocks,
+            wf_info.held.as_ref().map(|held| &*held.call_order),
         )?;
         let mut sort_keys = Vec::with_capacity(rows.len());
         for (_, row) in rows {
@@ -4179,8 +4306,9 @@ impl Executor {
 
         // Pre-compute expression values for all rows if needed
         let mut expression_values: Vec<Value> = if has_expression_arg {
+            let held = wf_info.held.as_ref().map(|held| &held.argument[..]);
             let mut eval =
-                RowPrograms::compile(&wf_info.arguments[..1], columns, None, ctx, blocks)?;
+                RowPrograms::compile(&wf_info.arguments[..1], columns, None, ctx, blocks, held)?;
             rows.iter()
                 .map(|(_, row)| eval.eval(row))
                 .collect::<Result<_>>()?
@@ -4192,7 +4320,7 @@ impl Executor {
         // aggregate skips, so the frames below read one plain value column
         if let Some(filter) = wf_info.filter.as_deref() {
             expression_values = self.window_filtered_values(
-                filter,
+                (filter, wf_info.held.as_ref().map(|held| &held.filter[..])),
                 rows,
                 columns,
                 ctx,
@@ -4534,6 +4662,7 @@ mod tests {
             extra_error: None,
             order_key: SmallVec::new(),
             over_key: (SmallVec::new(), SmallVec::new()),
+            held: None,
         };
 
         assert_eq!(info.name, "ROW_NUMBER");

@@ -361,9 +361,13 @@ impl Executor {
                 UpdateValueSource::Parameter(param.index.checked_sub(1)?)
             }
             _ if Self::expr_contains_subquery(expr) => return None,
-            _ => UpdateValueSource::Expression(
-                super::expression::compile_expression(expr, columns).ok()?,
-            ),
+            _ => {
+                let compile = super::expression::CompileContext::with_global_registry(columns);
+                let program = super::expression::ExprCompiler::new(&compile)
+                    .compile(expr)
+                    .ok()?;
+                UpdateValueSource::Expression(CompactArc::new(program))
+            }
         })
     }
 
