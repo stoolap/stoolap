@@ -82,6 +82,11 @@ fn check(db: &Database, phase: &str, wrong: &mut Vec<String>) {
         "WITH c(x) AS (SELECT id FROM t) SELECT x, COUNT(*) FROM c GROUP BY x",
         "SELECT id FROM t UNION ALL SELECT id FROM t",
         "SELECT id FROM t UNION SELECT id + 1000 FROM t ORDER BY 1",
+        // A UNION ALL's first branch, bounded, grouped or with windows
+        "SELECT id, COUNT(*) FROM t GROUP BY id UNION ALL SELECT 99, 0",
+        "SELECT id, COUNT(*), (SELECT 0) FROM t GROUP BY id UNION ALL SELECT 99, 0, 0",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY 1 ORDER BY id) + (SELECT 0) AS rn FROM t \
+         UNION ALL SELECT 99, 0",
         "WITH c(x) AS (SELECT id FROM t) SELECT x FROM c ORDER BY x",
         "WITH c AS (SELECT id FROM t) SELECT c.id FROM c JOIN c d ON d.id = c.id ORDER BY c.id",
     ] {
