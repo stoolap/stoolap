@@ -73,6 +73,22 @@ const SHAPES: &[&str] = &[
     "SELECT t.b FROM {f}{on} AND {id} > (SELECT 0)",
 ];
 
+/// The same rule in statements holding no subquery
+const PLAIN_SHAPES: &[&str] = &[
+    "SELECT {id} FROM {f}",
+    "SELECT {id} + 1 FROM {f}",
+    "SELECT t.b FROM {f} WHERE {id} > 1",
+    "SELECT t.b FROM {f} WHERE {id} > $1",
+    "SELECT t.b FROM {f} WHERE CASE WHEN {id} > 1 THEN 1 ELSE 0 END = 1",
+    "SELECT COUNT(*) FROM {f} GROUP BY {id}",
+    "SELECT SUM({id}) FROM {f}",
+    "SELECT COUNT(*) FROM {f} GROUP BY t.b HAVING MAX({id}) > 0",
+    "SELECT ROW_NUMBER() OVER (ORDER BY {id}) FROM {f}",
+    "SELECT t.b FROM {f} ORDER BY {id}",
+    "SELECT DISTINCT ON ({id}) t.b FROM {f} ORDER BY {id}",
+    "SELECT t.b FROM {f}{on} AND {id} > 0",
+];
+
 fn answer(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
     let rows = db.query(sql, (1,)).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -108,7 +124,9 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
                 ),
                 (format!("t {join} {side}"), " ON s.id = t.a".to_string()),
             ] {
-                for shape in SHAPES {
+                let shapes = SHAPES.iter().map(|s| (s, true));
+                for (shape, holds_subquery) in shapes.chain(PLAIN_SHAPES.iter().map(|s| (s, false)))
+                {
                     if shape.contains("{on}") != !on.is_empty() {
                         continue;
                     }
@@ -123,7 +141,7 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
                         wrong.push(format!("{context} {kind}: {qualified}: {e}"));
                     }
                     let line = prepared_line(db, &qualified);
-                    if line != "Prepared: yes" {
+                    if holds_subquery && line != "Prepared: yes" {
                         wrong.push(format!("{context} {kind}: {qualified}: {line}"));
                     }
                 }
@@ -158,6 +176,14 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
              WHERE id > (SELECT 0)",
             "q.id",
         ),
+        (
+            "SELECT t.b FROM t JOIN u USING (id) JOIN u AS q ON q.id = t.a WHERE id > 1",
+            "id",
+        ),
+        (
+            "SELECT id, t.b FROM t LEFT JOIN u USING (id) JOIN u AS q ON q.id = t.a",
+            "id",
+        ),
     ] {
         match answer(db, sql) {
             Err(e) if e.contains(&format!("column reference '{name}' is ambiguous")) => {}
@@ -173,6 +199,15 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
         (
             "SELECT t.b FROM t JOIN u USING (id, a) WHERE a < (SELECT MAX(y) + 9 FROM w)",
             vec![],
+        ),
+        ("SELECT t.b FROM t JOIN u USING (id) WHERE id > 1", vec![20]),
+        (
+            "SELECT t.id AS id FROM t JOIN u ON u.id = t.a ORDER BY id DESC",
+            vec![1, 2],
+        ),
+        (
+            "SELECT t.b FROM t JOIN u USING (id) JOIN w ON w.k = t.id WHERE id > 1",
+            vec![20],
         ),
         (
             "SELECT t.b FROM t NATURAL JOIN u WHERE id > (SELECT MIN(y) FROM w)",

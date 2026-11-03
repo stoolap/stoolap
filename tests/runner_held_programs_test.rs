@@ -254,3 +254,42 @@ fn a_values_block_raises_its_error_only_when_read() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// Each join holding no subquery, its parameter and its answer
+const JOINS: &[(&str, &[i64], &[&str])] = &[
+    (
+        "SELECT t.id + v.a, CASE WHEN v.a > $1 THEN 'big' ELSE 'small' END \
+         FROM t JOIN t AS v ON v.id = t.id ORDER BY t.id DESC LIMIT 2",
+        &[25],
+        &["Integer(33)|Text(\"big\")", "Integer(22)|Text(\"small\")"],
+    ),
+    (
+        "SELECT DISTINCT t.a * 2 FROM t LEFT JOIN t AS v ON v.id = t.id + 1 \
+         WHERE v.a IS NULL OR v.a > $1 ORDER BY t.a * 2",
+        &[0],
+        &["Integer(20)", "Integer(40)", "Integer(60)"],
+    ),
+];
+
+#[test]
+fn a_join_compiles_its_output_without_the_bridge() {
+    let db = Database::open("memory://runner_held_programs_joins").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for &(sql, params, answer) in JOINS {
+        let bridge = bridge_compiles();
+        let first = rows(&db, sql, params);
+        let compiled = bridge_compiles() - bridge;
+        if compiled != 0 || first != answer {
+            wrong.push(format!(
+                "{sql}: {first:?}, expected {answer:?}, {compiled} bridge compiles"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

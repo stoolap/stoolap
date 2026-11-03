@@ -180,10 +180,9 @@ fn check_shapes(db: &Database, context: &str, shapes: &[&str], wrong: &mut Vec<S
                         .replace("{f}", &from_on)
                         .replace("{id}", "t.id");
                     count += 1;
-                    // A prepared statement's bare merged name that another
-                    // table also has is ambiguous
-                    let ambiguous =
-                        shape.contains("{id}") && others.contains(".id") && sql.contains("(SELECT");
+                    // A bare merged name that another table also has is
+                    // ambiguous
+                    let ambiguous = shape.contains("{id}") && others.contains(".id");
                     let want = match ambiguous {
                         true => Err("invalid argument: column reference 'id' is ambiguous".into()),
                         false => answer(db, &want),
@@ -238,8 +237,8 @@ fn a_prepared_join_over_a_merging_side_reads_its_parameters_by_the_same_rule() {
     let db = hot("parameters");
     let stmt = db
         .prepare(
-            "SELECT id, t.id, u.id FROM t LEFT JOIN u USING (id) JOIN s AS r ON r.id = t.id \
-             WHERE COALESCE(u.id, $1) > $2 ORDER BY t.id",
+            "SELECT COALESCE(t.id, u.id), t.id, u.id FROM t LEFT JOIN u USING (id) \
+             JOIN s AS r ON r.id = t.id WHERE COALESCE(u.id, $1) > $2 ORDER BY t.id",
         )
         .unwrap();
     let rows = |a: i64, b: i64| -> Vec<String> {

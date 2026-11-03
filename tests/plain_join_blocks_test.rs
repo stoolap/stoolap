@@ -100,10 +100,13 @@ fn a_computed_value_answers_as_its_literal_in_every_clause_and_join() {
 }
 
 #[test]
-fn a_select_alias_for_a_name_both_sources_have_reads_the_left_one() {
+fn a_select_alias_for_a_name_both_sources_have_is_ambiguous() {
     let db = hot("alias");
     let sql = "SELECT id AS x FROM t JOIN u ON t.id = u.b - 29 WHERE x > $1";
     for _ in 0..2 {
-        assert_eq!(ids(&db, sql, 0), Ok(vec![1]));
+        assert_eq!(
+            ids(&db, sql, 0),
+            Err("invalid argument: column reference 'id' is ambiguous".to_string())
+        );
     }
 }

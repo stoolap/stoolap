@@ -1663,31 +1663,6 @@ fn merged_once(scope: &ScopeTable, merges: &[(usize, usize)]) -> Result<()> {
     Ok(())
 }
 
-/// Whether an unqualified name in `clauses` is one two columns of `join`
-/// over `sides` have and no NATURAL or USING join merges, which its blocks
-/// refuse as ambiguous
-pub(crate) fn join_names_ambiguous(
-    join: &JoinTableSource,
-    sides: &JoinSides,
-    clauses: &[&Expression],
-) -> bool {
-    let Some([left, right]) = side_scopes(join, sides) else {
-        return false;
-    };
-    let scope = ScopeTable::joined(join, left, right);
-    let scopes = [&scope];
-    let chain = Chain { scopes: &scopes };
-    let mut names = FxHashSet::<String>::default();
-    for clause in clauses {
-        crate::executor::utils::collect_unqualified_columns(clause, &mut names);
-    }
-    names.iter().any(|name| {
-        chain
-            .bare(&ident(name, name))
-            .is_err_and(|err| err.to_string().contains("is ambiguous"))
-    })
-}
-
 /// The refusal of a name two columns carry
 pub(crate) fn ambiguous_column(spelled: &dyn std::fmt::Display) -> Error {
     Error::invalid_argument(format!("column reference '{}' is ambiguous", spelled))
@@ -10133,9 +10108,6 @@ pub(crate) struct JoinBlocks {
     pub(crate) all: CompactArc<Vec<String>>,
     /// The joined scope, which the output's names bind in
     scope: ScopeTable,
-    /// Whether the statement holds a subquery anywhere, which puts its
-    /// output and its names on the blocks' rules
-    pub(crate) holds_subqueries: bool,
 }
 
 impl JoinBlocks {
@@ -10187,16 +10159,12 @@ impl JoinBlocks {
 
     /// An error when a SELECT item, grouping, HAVING, sort key or named
     /// window of `stmt` names `table.column` and two columns of that table
-    /// carry the name; or, when the statement holds a subquery, names a bare
-    /// name two columns carry that no merge makes one, other than an alias
+    /// carry the name, or names a bare name two columns carry that no merge
+    /// makes one, other than an alias
     pub(crate) fn check_output_names(&self, stmt: &SelectStatement) -> Result<()> {
-        fn names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str], bare: bool) -> Result<()> {
+        fn names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str]) -> Result<()> {
             match expr {
-                Expression::Identifier(id)
-                    if !bare || aliases.contains(&id.value_lower.as_str()) =>
-                {
-                    Ok(())
-                }
+                Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str()) => Ok(()),
                 // A table or column the joined row lacks is an enclosing one
                 Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
                     match chain.resolve(expr) {
@@ -10204,23 +10172,20 @@ impl JoinBlocks {
                         _ => Ok(()),
                     }
                 }
-                other => for_each_child(other, &mut |child| names(chain, child, aliases, bare)),
+                other => for_each_child(other, &mut |child| names(chain, child, aliases)),
             }
         }
         let scopes = [&self.scope];
         let chain = Chain { scopes: &scopes };
         // Only a bare name reads an alias
-        let aliases: Vec<&str> = match self.holds_subqueries {
-            true => stmt
-                .columns
-                .iter()
-                .filter_map(|c| match c {
-                    Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            false => Vec::new(),
-        };
+        let aliases: Vec<&str> = stmt
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+                _ => None,
+            })
+            .collect();
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
         // A named window only as its windows read it
         let windows = Executor::used_window_defs(stmt);
@@ -10238,14 +10203,8 @@ impl JoinBlocks {
             .iter()
             .map(|item| (unaliased(item), &[][..]))
             .chain(after_items)
-            .try_for_each(|(expr, aliases)| names(&chain, expr, aliases, self.holds_subqueries));
+            .try_for_each(|(expr, aliases)| names(&chain, expr, aliases));
         checked
-    }
-
-    /// Whether the blocks project the statement's output: it holds a
-    /// subquery, so the whole statement runs on the plan
-    pub(crate) fn projects_output(&self) -> bool {
-        self.holds_subqueries
     }
 
     /// Every pair the joined row merges, the join's own and its sides',
@@ -10649,7 +10608,6 @@ impl JoinBlocks {
             right,
             all: CompactArc::clone(&scope.columns),
             scope,
-            holds_subqueries: false,
         }))
     }
 

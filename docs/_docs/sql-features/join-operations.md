@@ -126,11 +126,22 @@ JOIN returns USING (order_id, product_id);
 
 When a side is itself a join holding two columns of the name, a `USING` or `NATURAL` join merges the first of them, the one its bare name reads: in `t LEFT JOIN u ON u.id = t.id JOIN s USING (id)` the condition is `s.id = t.id`, so a `t` row without a `u` row still joins.
 
-A `USING` or `NATURAL` join that is a side of another join keeps its tables' columns their own. In `t LEFT JOIN u USING (id) JOIN s ON s.id = t.id`, `t.id` and `u.id` are each their table's column, `u.id` is NULL where `u` has no row, the bare `id` is the merged column, `u.*` and `t.*` each hold their table's `id`, and `*` shows the merged column once:
+A `USING` or `NATURAL` join that is a side of another join keeps its tables' columns their own. In `t LEFT JOIN u USING (id) JOIN s ON s.id = t.id`, `t.id` and `u.id` are each their table's column, `u.id` is NULL where `u` has no row, `u.*` and `t.*` each hold their table's `id`, and `*` shows the merged column once:
 
 ```sql
-SELECT id, t.id, u.id FROM t LEFT JOIN u USING (id) JOIN s ON s.id = t.id;
--- a t row with no u row: id = t.id, u.id = NULL
+SELECT t.id, u.id FROM t LEFT JOIN u USING (id) JOIN s ON s.id = t.id;
+-- a t row with no u row: t.id, u.id = NULL
+```
+
+### Column names
+
+A bare column name in a join names one column. A name that two sources have, and that no `USING` or `NATURAL` join merges, is an error, `column reference 'id' is ambiguous`, in every clause: the `SELECT` list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `DISTINCT ON`, a window and an aggregate's argument. Qualify it with its source. The bare name of a merged column reads the merged column, unless another source of the join also has a column of that name; then it is ambiguous as well. A `SELECT` alias that a clause reads, such as an `ORDER BY` key, is not ambiguous.
+
+```sql
+SELECT id FROM t JOIN u ON u.id = t.a;                    -- error: ambiguous
+SELECT t.id FROM t JOIN u ON u.id = t.a;                  -- t's id
+SELECT id FROM t JOIN u USING (id);                       -- the merged id
+SELECT id FROM t JOIN u USING (id) JOIN s ON s.id = t.id; -- error: s has an id too
 ```
 
 ## Examples

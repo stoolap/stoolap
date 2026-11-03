@@ -479,8 +479,8 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    ambiguous_column, join_names_ambiguous, joined_aliases, set_operation_key_column,
-    set_operation_key_item, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
+    ambiguous_column, joined_aliases, set_operation_key_column, set_operation_key_item, Bound,
+    JoinBlocks, OutOfFamily, PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -4759,16 +4759,6 @@ impl Executor {
         }
     }
 
-    /// Whether the join statement `stmt` over `join` holds a subquery in any
-    /// clause, which puts its output and its names on its blocks' rules
-    fn join_holds_subqueries(stmt: &SelectStatement, join: &JoinTableSource) -> bool {
-        let classification = get_classification(stmt);
-        classification.where_has_subqueries
-            || classification.output_has_subqueries
-            || classification.grouped_has_subqueries
-            || Self::ons_hold_subqueries(join)
-    }
-
     /// Whether the ON of `join`, or of a join it holds as a side, holds a
     /// subquery
     pub(crate) fn ons_hold_subqueries(join: &JoinTableSource) -> bool {
@@ -4819,9 +4809,6 @@ impl Executor {
             }
         }
         self.join_output_family(stmt)?;
-        // A join without a subquery reads a name both sources have from its
-        // left source, which its blocks refuse as ambiguous
-        let holds_subquery = Self::join_holds_subqueries(stmt, join_source);
         // Each WHERE part as its site reads it, the SELECT aliases it names
         // opened over the joined columns the sides lay out
         let columns: Vec<String> = sides
@@ -4829,21 +4816,6 @@ impl Executor {
             .flat_map(|side| side.columns())
             .map(|(table, name)| qualified(table, name))
             .collect();
-        if !holds_subquery {
-            let opened_where = stmt
-                .where_clause
-                .as_deref()
-                .map(|w| Self::with_select_aliases(stmt, w, &columns).unwrap_or_else(|| w.clone()));
-            let clauses: smallvec::SmallVec<[&Expression; 2]> = join_source
-                .condition
-                .as_deref()
-                .into_iter()
-                .chain(opened_where.as_ref())
-                .collect();
-            if join_names_ambiguous(join_source, sides, &clauses) {
-                return Err("a join without a subquery naming a column both sources have");
-            }
-        }
         let Some(where_clause) = stmt.where_clause.as_deref() else {
             return Ok(());
         };
@@ -5032,7 +5004,7 @@ impl Executor {
                 .iter()
                 .map(|key| Some(key).filter(|e| output && Self::has_subqueries(e)))
                 .collect();
-            let mut blocks = self.prepare_join_blocks(
+            let blocks = self.prepare_join_blocks(
                 (join_source, on, Self::inner_on(join_source, join_type)),
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
@@ -5042,8 +5014,7 @@ impl Executor {
                 columns.len(),
                 ctx,
             )?;
-            if let Some(blocks) = blocks.as_mut() {
-                blocks.holds_subqueries = Self::join_holds_subqueries(stmt, join_source);
+            if let Some(blocks) = blocks.as_ref() {
                 blocks.check_output_names(stmt)?;
             }
             Ok(blocks)
@@ -5220,7 +5191,7 @@ impl Executor {
         let output_blocks = blocks.as_deref().filter(|_| !apart);
         let output_apart = !classification.has_aggregation
             && !classification.has_window_functions
-            && output_blocks.is_some_and(JoinBlocks::projects_output);
+            && output_blocks.is_some();
         let side_merged = side_merged && !output_apart;
         let left_read = SideRead {
             filter: match (sourced[0], reads_plain[0]) {
@@ -10175,7 +10146,7 @@ impl Executor {
         sorted: bool,
         blocks: Option<&JoinBlocks>,
     ) -> Result<Option<JoinOutput>> {
-        if let Some(blocks) = blocks.filter(|blocks| blocks.projects_output()) {
+        if let Some(blocks) = blocks {
             debug_assert_eq!(
                 blocks.all.len(),
                 all_columns.len(),

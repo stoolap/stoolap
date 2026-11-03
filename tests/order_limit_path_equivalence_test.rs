@@ -132,16 +132,17 @@ const CASES: &[Case] = &[
         "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id) s",
         Some((4, 0)),
     ),
-    // A join runs on the general path
+    // A join without its blocks, as with the prepared families off, runs on
+    // the general path
     case(
-        "memory",
+        "memory, families off",
         "computed_keys",
         "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0, t.id LIMIT 4 OFFSET 1",
         "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0, t.id",
         Some((4, 1)),
     ),
     case(
-        "sealed",
+        "sealed, families off",
         "computed_keys",
         "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0 DESC, t.id LIMIT 4",
         "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0 DESC, t.id",
