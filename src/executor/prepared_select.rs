@@ -4385,6 +4385,27 @@ type BlockCounts = (Box<Expression>, Option<Box<Expression>>);
 /// A source a block's FROM names and its columns
 type NamedSource = (BlockSource, Vec<String>);
 
+/// How a join side read as rows is read when its blocks ask all of its
+/// conditions
+#[derive(Debug)]
+enum SideSource {
+    /// Whole from its source, with the columns it was prepared over
+    Rows(BlockSource, CompactArc<Schema>),
+    /// As the general path streams a view's or a derived table's rows, so a
+    /// join that stops early reads no more of them
+    Stream,
+}
+
+/// How a FROM entry other than a join is read, by a block or as a join's side
+enum FromEntry {
+    /// A table, by its name, the name its scope bears and its schema
+    Table(SmartString, SmartString, CompactArc<Schema>),
+    /// A source read once per run, under its name, with its columns
+    Source(SmartString, BlockSource, Vec<String>),
+    /// One whose values read an enclosing scope, which runs as a statement
+    Statement,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Narrowing {
     /// The block's id
@@ -6179,6 +6200,115 @@ impl Builder<'_> {
         Ok(Some((source, named)))
     }
 
+    /// How `entry` is read under the scopes `outer`, a table function's range
+    /// narrowed by `where_clause` and its first rows cut by `counts`
+    fn entry_read(
+        &mut self,
+        entry: &Expression,
+        where_clause: Option<&Expression>,
+        counts: impl FnOnce() -> Option<BlockCounts>,
+        outer: &[&ScopeTable],
+    ) -> Result<FromEntry> {
+        let executor = self.executor;
+        Ok(match entry {
+            // Values naming a column read an enclosing scope
+            Expression::ValuesSource(values)
+                if values.rows.iter().flatten().any(mentions_column) =>
+            {
+                FromEntry::Statement
+            }
+            Expression::FunctionTableSource(function)
+                if function.arguments.iter().any(mentions_column) =>
+            {
+                FromEntry::Statement
+            }
+            Expression::TableSource(ts) => {
+                let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
+                match (self.named_source(&ts.name.value_lower)?, &ts.as_of) {
+                    (Some(_), Some(_)) => {
+                        return Err(Executor::as_of_not_a_table(&ts.name.value_lower))
+                    }
+                    (Some((source, columns)), None) => FromEntry::Source(name, source, columns),
+                    (None, as_of) => {
+                        let schema = executor
+                            .engine
+                            .get_table_schema(&ts.name.value_lower)
+                            .map_err(|e| match e {
+                                Error::TableNotFound(_) => {
+                                    Error::TableOrViewNotFound(ts.name.value.to_string())
+                                }
+                                other => other,
+                            })?;
+                        match as_of {
+                            // A table read AS OF is a source read once per run
+                            Some(as_of) => FromEntry::Source(
+                                name,
+                                BlockSource::AsOf(
+                                    ts.name.value_lower.clone(),
+                                    Box::new(as_of.clone()),
+                                ),
+                                schema.column_names_owned().to_vec(),
+                            ),
+                            None => FromEntry::Table(ts.name.value_lower.clone(), name, schema),
+                        }
+                    }
+                }
+            }
+            Expression::ValuesSource(values) => {
+                values
+                    .rows
+                    .iter()
+                    .flatten()
+                    .for_each(|v| self.note_params(v));
+                let own = CompileContext::bound(&executor.function_registry);
+                let rows = source_programs(&values.rows, |v| compile_with(&own, v));
+                FromEntry::Source(
+                    values
+                        .alias
+                        .as_ref()
+                        .map(|a| a.value_lower.clone())
+                        .unwrap_or_default(),
+                    BlockSource::Values(values.clone(), rows),
+                    Executor::values_columns(values),
+                )
+            }
+            Expression::FunctionTableSource(function) => {
+                let name = &function
+                    .alias
+                    .as_ref()
+                    .unwrap_or(&function.function)
+                    .value_lower;
+                let range = function_range(where_clause, name);
+                FromEntry::Source(
+                    name.clone(),
+                    BlockSource::Function(function.clone(), range, counts()),
+                    Executor::tvf_columns(function)?,
+                )
+            }
+            // A derived table that reads an enclosing scope runs as a
+            // statement; one that reads none, once per run, when first needed
+            Expression::SubquerySource(derived) => {
+                let (reads, columns) = self.reads_enclosing(&derived.subquery, outer)?;
+                if reads {
+                    return Ok(FromEntry::Statement);
+                }
+                let run = StatementRun {
+                    statement: (*derived.subquery).clone(),
+                    classification: std::sync::OnceLock::new(),
+                    compiled: NestedPlan::default(),
+                };
+                let tables = executor.read_tables(&derived.subquery);
+                let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
+                FromEntry::Source(
+                    name.unwrap_or_default(),
+                    BlockSource::Derived(Box::new(run), tables),
+                    columns,
+                )
+            }
+            _ => return Err(Error::internal("a prepared subquery without one table")),
+        })
+    }
+
     /// Prepare `sq`, run once per row of the scope `outer[0]`, as `form`
     /// says. Returns its id, the values it reads from scopes beyond its
     /// parent, and whether it reads its parent's row
@@ -6215,120 +6345,10 @@ impl Builder<'_> {
             (None, Some(source), schema, scope)
         };
         let (table, source, schema, scope) = match sq.table_expr.as_deref() {
-            // Values naming a column read an enclosing scope: the block runs as
-            // one statement for each call
-            Some(Expression::ValuesSource(values))
-                if values.rows.iter().flatten().any(mentions_column) =>
-            {
-                return self.statement_block(sq, outer, parent, form);
-            }
-            Some(Expression::FunctionTableSource(function))
-                if function.arguments.iter().any(mentions_column) =>
-            {
-                return self.statement_block(sq, outer, parent, form);
-            }
-            Some(Expression::TableSource(ts)) => {
-                let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
-                match (self.named_source(&ts.name.value_lower)?, &ts.as_of) {
-                    (Some(_), Some(_)) => {
-                        return Err(Executor::as_of_not_a_table(&ts.name.value_lower))
-                    }
-                    (Some((source, columns)), None) => over_source(name, source, columns),
-                    (None, as_of) => {
-                        let schema = executor
-                            .engine
-                            .get_table_schema(&ts.name.value_lower)
-                            .map_err(|e| match e {
-                                Error::TableNotFound(_) => {
-                                    Error::TableOrViewNotFound(ts.name.value.to_string())
-                                }
-                                other => other,
-                            })?;
-                        match as_of {
-                            // A table read AS OF is a source read once per run
-                            Some(as_of) => over_source(
-                                name,
-                                BlockSource::AsOf(
-                                    ts.name.value_lower.clone(),
-                                    Box::new(as_of.clone()),
-                                ),
-                                schema.column_names_owned().to_vec(),
-                            ),
-                            None => {
-                                let scope = ScopeTable::of(name, &schema);
-                                (Some(ts.name.value_lower.clone()), None, schema, scope)
-                            }
-                        }
-                    }
-                }
-            }
-            Some(Expression::ValuesSource(values)) => {
-                values
-                    .rows
-                    .iter()
-                    .flatten()
-                    .for_each(|v| self.note_params(v));
-                let own = CompileContext::bound(registry);
-                let rows = source_programs(&values.rows, |v| compile_with(&own, v));
-                over_source(
-                    values
-                        .alias
-                        .as_ref()
-                        .map(|a| a.value_lower.clone())
-                        .unwrap_or_default(),
-                    BlockSource::Values(values.clone(), rows),
-                    Executor::values_columns(values),
-                )
-            }
-            Some(Expression::FunctionTableSource(function)) => {
-                let name = &function
-                    .alias
-                    .as_ref()
-                    .unwrap_or(&function.function)
-                    .value_lower;
-                let range = function_range(sq.where_clause.as_deref(), name);
-                // Without a WHERE, an ORDER BY or a DISTINCT ON the first rows
-                // are the answer
-                let counts = sq
-                    .limit
-                    .clone()
-                    .filter(|_| {
-                        sq.where_clause.is_none()
-                            && sq.order_by.is_empty()
-                            && sq.distinct_on.is_empty()
-                    })
-                    .map(|limit| (limit, sq.offset.clone()));
-                over_source(
-                    name.clone(),
-                    BlockSource::Function(function.clone(), range, counts),
-                    Executor::tvf_columns(function)?,
-                )
-            }
             // A join runs with the block as one statement: for each call when
             // it reads an enclosing scope, else once per run
             Some(Expression::JoinSource(_)) => {
                 return self.statement_block(sq, outer, parent, form);
-            }
-            // A derived table that reads an enclosing scope runs with the block
-            // as one statement for each call; one that reads none, once per
-            // run, when a call first needs it
-            Some(Expression::SubquerySource(derived)) => {
-                let (reads, columns) = self.reads_enclosing(&derived.subquery, outer)?;
-                if reads {
-                    return self.statement_block(sq, outer, parent, form);
-                }
-                let run = StatementRun {
-                    statement: (*derived.subquery).clone(),
-                    classification: std::sync::OnceLock::new(),
-                    compiled: NestedPlan::default(),
-                };
-                let tables = executor.read_tables(&derived.subquery);
-                let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
-                over_source(
-                    name.unwrap_or_default(),
-                    BlockSource::Derived(Box::new(run), tables),
-                    columns,
-                )
             }
             // A block without FROM reads one row without columns, under no name
             None => (
@@ -6337,7 +6357,28 @@ impl Builder<'_> {
                 CompactArc::new(Schema::new("", Vec::new())),
                 ScopeTable::unnamed(),
             ),
-            Some(_) => return Err(Error::internal("a prepared subquery without one table")),
+            Some(entry) => {
+                // Without a WHERE, an ORDER BY or a DISTINCT ON a table
+                // function's first rows are the answer
+                let counts = || {
+                    sq.limit
+                        .clone()
+                        .filter(|_| {
+                            sq.where_clause.is_none()
+                                && sq.order_by.is_empty()
+                                && sq.distinct_on.is_empty()
+                        })
+                        .map(|limit| (limit, sq.offset.clone()))
+                };
+                match self.entry_read(entry, sq.where_clause.as_deref(), counts, outer)? {
+                    FromEntry::Statement => return self.statement_block(sq, outer, parent, form),
+                    FromEntry::Table(table, name, schema) => {
+                        let scope = ScopeTable::of(name, &schema);
+                        (Some(table), None, schema, scope)
+                    }
+                    FromEntry::Source(name, source, columns) => over_source(name, source, columns),
+                }
+            }
         };
         // A star stands for its source's columns, which then count
         let starred = match form.width() {
@@ -10030,6 +10071,9 @@ pub(crate) struct JoinBlocks {
     /// The same conditions as their side's scan reads them, TRUE for a
     /// table side without any
     side_wheres: [Option<PreparedWhere>; 2],
+    /// How each side read as rows is read when the blocks ask all of its
+    /// conditions; None for a side that reads those without a block itself
+    side_sources: [Option<SideSource>; 2],
     /// The scan each table side's conditions plan, when they hold no subquery
     side_scans: [Option<ScanChoice>; 2],
     /// The columns of each side the clauses were prepared over
@@ -10096,6 +10140,11 @@ impl JoinBlocks {
     /// Whether the statement holds a condition on side `side` alone
     pub(crate) fn side_asks(&self, side: usize) -> bool {
         self.side_wheres[side].is_some()
+    }
+
+    /// Whether side `side` is read from the source the blocks prepared
+    pub(crate) fn side_sourced(&self, side: usize) -> bool {
+        self.side_sources[side].is_some()
     }
 
     /// The pairs a joined side merges, each its left and right column in the
@@ -10298,10 +10347,30 @@ impl JoinBlocks {
             projected_reads: SmallVec::new(),
             ctes: Vec::new(),
         };
+        // A side read as rows from a source the blocks read, as a block's
+        // FROM, or streamed; one they cannot read keeps its own conditions
+        let mut side_sources: [Option<SideSource>; 2] = [None, None];
+        for (i, entry) in [&*join.left, &*join.right].into_iter().enumerate() {
+            let [(_, schema)] = sides[i].leaves.as_slice() else {
+                continue;
+            };
+            if !rows_sides[i] || matches!(entry, Expression::JoinSource(_)) {
+                continue;
+            }
+            side_sources[i] = match builder.entry_read(entry, side_filters[i], || None, &[])? {
+                FromEntry::Source(_, BlockSource::View(..) | BlockSource::Derived(..), _) => {
+                    Some(SideSource::Stream)
+                }
+                FromEntry::Source(_, source, _) => {
+                    Some(SideSource::Rows(source, CompactArc::clone(schema)))
+                }
+                FromEntry::Table(..) | FromEntry::Statement => None,
+            };
+        }
         // A side read as rows keeps the conditions its read asks: those
-        // without a block, which the read takes, and those whose blocks bind
-        // before its first row; one that asks a block of each row is asked
-        // of the joined row
+        // without a block, which its source's read or else the general read
+        // takes, and those whose blocks bind before its first row; one that
+        // asks a block of each row is asked of the joined row
         let mut kept: [Option<Expression>; 2] = [None, None];
         let mut written: [Option<Expression>; 2] = [None, None];
         let mut crossed = false;
@@ -10342,7 +10411,13 @@ impl JoinBlocks {
             };
             let (mut parts, mut binds) = (Vec::new(), Vec::new());
             conjuncts(filter, &mut parts);
-            for part in parts.into_iter().filter(|part| mentions_subquery(part)) {
+            for part in parts {
+                if !mentions_subquery(part) {
+                    if side_sources[i].is_some() {
+                        binds.push(part.clone());
+                    }
+                    continue;
+                }
                 match builder.binds_before_rows(&side_chain, schema, part)? {
                     true => binds.push(part.clone()),
                     false => moved.push(part.clone()),
@@ -10529,6 +10604,7 @@ impl JoinBlocks {
             sides: side_filters,
             written: crossed.then_some(written),
             side_wheres,
+            side_sources,
             side_scans,
             side_columns,
             fitted: Default::default(),
@@ -10852,6 +10928,43 @@ impl Executor {
             Box::new(ExecutorResult::with_arc_columns(columns, kept.rows()?)),
             token,
         )))
+    }
+
+    /// Side `side` of the join `held` prepared, read from its source as a
+    /// block's FROM is and cut to the rows its conditions pass; None for a
+    /// side the general path reads
+    pub(crate) fn join_sourced_side_rows(
+        &self,
+        held: &JoinBlocks,
+        run: &PreparedRunner<'_>,
+        side: usize,
+        (name, ctx): (&str, &ExecutionContext),
+    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
+        let Some(SideSource::Rows(source, schema)) = &held.side_sources[side] else {
+            return Ok(None);
+        };
+        let rows = self
+            .source_rows(source, schema, ctx)?
+            .ok_or_else(|| Error::SchemaChanged {
+                table: name.to_string(),
+            })?;
+        let columns = schema.column_names_arc();
+        let Some(where_) = &held.side_wheres[side] else {
+            let rows = RowVec::from_vec((*rows).clone());
+            return Ok(Some(Box::new(ExecutorResult::with_arc_columns(
+                columns, rows,
+            ))));
+        };
+        let mut kept = RowVec::new();
+        let keep = |id: i64, _: u64, row: Row| {
+            kept.push((id, row));
+            true
+        };
+        let source = rows.iter().map(|(id, row)| Ok((*id, row)));
+        run.rows_passing(where_, source, ctx, None, keep)?;
+        Ok(Some(Box::new(ExecutorResult::with_arc_columns(
+            columns, kept,
+        ))))
     }
 
     /// `result`, side `expr` as the general path read it with its conditions

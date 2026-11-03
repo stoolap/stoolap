@@ -5160,7 +5160,11 @@ impl Executor {
         let rows_sides = blocks.as_deref().map_or([false; 2], |held| held.rows_sides);
         let joined = [&join_source.left, &join_source.right]
             .map(|side| matches!(**side, Expression::JoinSource(_)));
-        let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i]);
+        // One the blocks read from its source asks them all
+        let sourced = blocks
+            .as_deref()
+            .map_or([false; 2], |held| [0, 1].map(|i| held.side_sourced(i)));
+        let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i] && !sourced[i]);
         let side_plan = |side: usize| plan.as_deref().map(|plan| plan.side_plan(side));
         let plain = |filter: &Option<Expression>, rows: bool| match rows {
             true => filter.as_ref().and_then(|filter| {
@@ -5218,18 +5222,20 @@ impl Executor {
             && output_blocks.is_some_and(JoinBlocks::projects_output);
         let side_merged = side_merged && !output_apart;
         let left_read = SideRead {
-            filter: match reads_plain[0] {
-                true => left_plain.as_ref(),
-                false => left_filter.as_ref(),
+            filter: match (sourced[0], reads_plain[0]) {
+                (true, _) => None,
+                (false, true) => left_plain.as_ref(),
+                (false, false) => left_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 0)),
             plan: side_plan(0),
             apart,
         };
         let right_read = SideRead {
-            filter: match reads_plain[1] {
-                true => right_plain.as_ref(),
-                false => right_filter.as_ref(),
+            filter: match (sourced[1], reads_plain[1]) {
+                (true, _) => None,
+                (false, true) => right_plain.as_ref(),
+                (false, false) => right_filter.as_ref(),
             },
             run: statement_run.map(|run| (run, 1)),
             plan: side_plan(1),
@@ -7963,6 +7969,21 @@ impl Executor {
             Some(_) => (None, 0),
             None => (limit, offset),
         };
+        // A side read from the source the blocks prepared, unless the join
+        // adds conditions of its own to this read
+        if let (Some((run, index)), None) = (rows, extra) {
+            let alias = get_table_alias_from_expr(expr).unwrap_or_default();
+            let read =
+                self.join_sourced_side_rows(run.blocks, run.run, index, (alias.as_str(), ctx))?;
+            if let Some(result) = read {
+                let columns = result
+                    .columns()
+                    .iter()
+                    .map(|c| qualified(&alias, c))
+                    .collect();
+                return Ok((result, columns, false, None));
+            }
+        }
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
             let alias = ts.alias.as_ref().unwrap_or(&ts.name).value.as_str();
             let table = (ts.name.value_lower.as_str(), alias);

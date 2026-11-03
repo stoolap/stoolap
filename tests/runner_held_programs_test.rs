@@ -80,6 +80,35 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &[],
         &["Integer(1)|Integer(5)"],
     ),
+    (
+        "WITH c AS (SELECT id, a FROM t) SELECT t.id FROM t JOIN c ON c.id = t.id \
+         WHERE c.a > 15 ORDER BY t.id",
+        &[],
+        &["Integer(2)", "Integer(3)"],
+    ),
+    (
+        "SELECT t.id, v.s FROM t JOIN (VALUES (1, 'x'), (3, 'y')) AS v(k, s) ON v.k = t.id \
+         WHERE v.s = 'y'",
+        &[],
+        &["Integer(3)|Text(\"y\")"],
+    ),
+    (
+        "SELECT t.id FROM t JOIN (SELECT id, a FROM t) AS d ON d.id = t.id \
+         WHERE d.a < $1 ORDER BY t.id",
+        &[25],
+        &["Integer(1)", "Integer(2)"],
+    ),
+    (
+        "SELECT t.id FROM t JOIN tv ON tv.id = t.id WHERE tv.a = 30",
+        &[],
+        &["Integer(3)"],
+    ),
+    (
+        "SELECT t.id FROM generate_series(1, 3) AS s(n) JOIN t ON t.id = s.n \
+         WHERE s.n > 1 ORDER BY t.id",
+        &[],
+        &["Integer(2)", "Integer(3)"],
+    ),
 ];
 
 #[test]
@@ -88,6 +117,7 @@ fn a_run_after_the_first_compiles_nothing() {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
         "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+        "CREATE VIEW tv AS SELECT id, a FROM t",
     ] {
         db.execute(sql, ()).unwrap();
     }
