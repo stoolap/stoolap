@@ -56,6 +56,11 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &["Integer(1)", "Integer(2)"],
     ),
     (
+        "SELECT x FROM (VALUES (\"A\"), (\"a\")) AS v(x)",
+        &[],
+        &["Text(\"A\")", "Text(\"a\")"],
+    ),
+    (
         "SELECT k FROM (VALUES ($1), ($2 * 10)) AS v(k)",
         &[3, 4],
         &["Integer(3)", "Integer(40)"],

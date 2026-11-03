@@ -7242,7 +7242,7 @@ fn source_programs(
 ) -> Result<SourcePrograms> {
     // A value written again shares its program, and a constant it folds
     let mut compiled: FxHashMap<ExprKey, SharedProgram> = FxHashMap::default();
-    let mut program = |value: &Expression| match compiled.entry(ExprKey::of(value)) {
+    let mut program = |value: &Expression| match compiled.entry(ExprKey::exact(value)) {
         std::collections::hash_map::Entry::Occupied(held) => Ok(CompactArc::clone(held.get())),
         std::collections::hash_map::Entry::Vacant(slot) => {
             Ok(CompactArc::clone(slot.insert(compile(value)?)))
