@@ -138,7 +138,7 @@ impl Executor {
                 || shape.has_distinct_on
                 || shape.has_set_operations)
         {
-            self.planned_family(stmt, &shape, Some(ctx)).ok()?;
+            self.planned_family(stmt, &shape).ok()?;
         }
         // Read before the schema: a change in between leaves this behind
         let validity = self.select_validity(stmt, epoch);

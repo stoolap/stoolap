@@ -16,13 +16,12 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    after_prepared_plan_taken, after_select_table_opened, before_prepared_scalar,
-    general_path_hits, prepared_ordered_reads, prepared_projection_runs, prepared_scalar_runs,
-    prepared_selects_built, random_draws, tvf_rows, GeneralPath, PREPARED_FAMILIES_OFF,
+    after_prepared_plan_taken, before_prepared_scalar, general_path_hits, prepared_ordered_reads,
+    prepared_projection_runs, prepared_scalar_runs, prepared_selects_built, random_draws, tvf_rows,
+    GeneralPath,
 };
 use stoolap::{Database, Params};
 
@@ -101,11 +100,7 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-const ALL_GENERAL: [GeneralPath; 7] = [
-    GeneralPath::CorrelatedScan,
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
+const ALL_GENERAL: [GeneralPath; 3] = [
     GeneralPath::PushdownConstant,
     GeneralPath::ProjectionEvaluator,
     GeneralPath::OrderByEvaluator,
@@ -113,19 +108,6 @@ const ALL_GENERAL: [GeneralPath; 7] = [
 
 fn general_hits() -> Vec<usize> {
     ALL_GENERAL.iter().map(|p| general_path_hits(*p)).collect()
-}
-
-/// What `run` gives with the prepared families refused: the old path's answer
-fn on_old_path<T>(run: impl FnOnce() -> T) -> T {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, Ordering::SeqCst);
-        }
-    }
-    PREPARED_FAMILIES_OFF.store(true, Ordering::SeqCst);
-    let _restore = Restore;
-    run()
 }
 
 #[test]
@@ -317,24 +299,6 @@ fn prepared_with_commit_inside(db: &Database) -> (Vec<i64>, usize) {
     found
 }
 
-/// The rows of S1 on the old path when another handle commits `COMMIT` as
-/// the subquery of the first outer row opens its table
-fn old_with_commit_inside(db: &Database) -> Vec<i64> {
-    let writer = db.clone();
-    let done = Rc::new(Cell::new(false));
-    let flag = Rc::clone(&done);
-    // The first scan opened is the outer table's; the second, the first subquery's
-    after_select_table_opened(move || {
-        after_select_table_opened(move || {
-            writer.execute(COMMIT, ()).unwrap();
-            flag.set(true);
-        });
-    });
-    let found = on_old_path(|| ids(db, S1, (1,))).0;
-    assert!(done.get(), "the commit ran inside the statement");
-    found
-}
-
 #[test]
 fn test_every_outer_row_reads_the_statement_view() {
     let _guard = serial();
@@ -353,15 +317,6 @@ fn test_every_outer_row_reads_the_statement_view() {
             "{level}: the next statement sees the commit"
         );
     }
-}
-
-#[test]
-fn test_old_path_reads_one_view() {
-    let _guard = serial();
-    let db = setup("prepared_one_view_old");
-    db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
-    assert_eq!(old_with_commit_inside(&db), vec![1], "old path");
-    assert_eq!(on_old_path(|| ids(&db, S1, (1,))).0, vec![1, 2, 5]);
 }
 
 #[test]
@@ -1146,10 +1101,6 @@ fn test_in_family_statements_reach_no_general_path_mechanism() {
     );
     assert!(prepared_selects_built() > built, "the corpus was prepared");
     assert!(prepared_scalar_runs() > runs, "the corpus ran prepared");
-
-    let before = general_hits();
-    on_old_path(|| ids(&db, S1, (1,)));
-    assert_ne!(general_hits(), before, "the old path moves the counters");
 }
 
 /// Per comparison: whether the row passes it, its negation, or neither

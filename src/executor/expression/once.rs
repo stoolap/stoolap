@@ -52,8 +52,7 @@ fn compile_once_in(
         .map_err(compile_error)
 }
 
-/// The value of `expr` over no row, with `ctx`'s parameters, outer row and
-/// transaction
+/// The value of `expr` over no row, with `ctx`'s parameters and transaction
 pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -> Result<Value> {
     evaluate_once_in(expr, ctx, global_registry())
 }
@@ -94,7 +93,7 @@ pub(crate) fn execute_once(
     )
 }
 
-/// The VM context for `row` with `ctx`'s parameters, outer row and transaction
+/// The VM context for `row` with `ctx`'s parameters and transaction
 pub(crate) fn execute_context<'a>(
     row: &'a Row,
     ctx: Option<&'a ExecutionContext>,
@@ -104,9 +103,6 @@ pub(crate) fn execute_context<'a>(
         exec = exec
             .with_params(ctx.params())
             .with_transaction_id(ctx.transaction_id());
-        if let Some(outer) = ctx.outer_row() {
-            exec = exec.with_outer_row(outer);
-        }
     }
     exec
 }

@@ -23,7 +23,6 @@
 
 use std::borrow::Cow;
 
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::ops::{row_in, CompareOp, IntervalStep, Op};
@@ -287,9 +286,6 @@ pub struct ExecuteContext<'a> {
     /// Second row for joins (optional)
     pub row2: Option<&'a Row>,
 
-    /// Outer row context for correlated subqueries
-    pub outer_row: Option<&'a FxHashMap<CompactArc<str>, Value>>,
-
     /// Parameter values, by slot
     pub params: &'a [Value],
 
@@ -312,7 +308,6 @@ impl<'a> ExecuteContext<'a> {
         Self {
             row,
             row2: None,
-            outer_row: None,
             params: &[],
             subquery_executor: None,
             transaction_id: None,
@@ -331,7 +326,6 @@ impl<'a> ExecuteContext<'a> {
         Self {
             row,
             row2: None,
-            outer_row: None,
             params,
             subquery_executor: None,
             transaction_id,
@@ -344,7 +338,6 @@ impl<'a> ExecuteContext<'a> {
         Self {
             row: row1,
             row2: Some(row2),
-            outer_row: None,
             params: &[],
             subquery_executor: None,
             transaction_id: None,
@@ -361,12 +354,6 @@ impl<'a> ExecuteContext<'a> {
     /// Add parameters
     pub fn with_params(mut self, params: &'a [Value]) -> Self {
         self.params = params;
-        self
-    }
-
-    /// Add outer row context
-    pub fn with_outer_row(mut self, outer_row: &'a FxHashMap<CompactArc<str>, Value>) -> Self {
-        self.outer_row = Some(outer_row);
         self
     }
 
@@ -1352,8 +1339,7 @@ impl ExprVM {
                     break;
                 }
 
-                op @ (Op::LoadOuterColumn(_)
-                | Op::LoadTransactionId
+                op @ (Op::LoadTransactionId
                 | Op::IsDistinctFrom
                 | Op::IsNotDistinctFrom
                 | Op::CompareRows(..)
@@ -1422,11 +1408,6 @@ impl ExprVM {
         ctx: &'a ExecuteContext<'a>,
     ) -> Result<()> {
         match op {
-            Op::LoadOuterColumn(name) => {
-                let value = ctx.outer_row.and_then(|r| r.get(name.as_ref()));
-                stack.push_ref(value.unwrap_or(&NULL_VALUE));
-            }
-
             Op::LoadTransactionId => {
                 // Load current transaction ID, or NULL if not in a transaction
                 let value = match ctx.transaction_id {
@@ -3057,7 +3038,6 @@ mod tests {
         let ctx = ExecuteContext::new(&row);
         assert_eq!(ctx.row.len(), 2);
         assert!(ctx.row2.is_none());
-        assert!(ctx.outer_row.is_none());
         assert!(ctx.params.is_empty());
     }
 
@@ -3084,15 +3064,6 @@ mod tests {
         let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
         assert_eq!(ctx.transaction_id, Some(12345));
-    }
-
-    #[test]
-    fn test_context_with_outer_row() {
-        let row = Row::from_values(vec![Value::Integer(1)]);
-        let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
-        outer.insert(CompactArc::from("outer_col"), Value::Integer(42));
-        let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
-        assert!(ctx.outer_row.is_some());
     }
 
     // =========================================================================
@@ -3187,20 +3158,6 @@ mod tests {
         let row = Row::new();
         let ctx = ExecuteContext::new(&row);
         assert!(vm.execute(&program, &ctx).unwrap().is_null());
-    }
-
-    #[test]
-    fn test_load_outer_column() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadOuterColumn(CompactArc::from("outer_val")),
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
-        outer.insert(CompactArc::from("outer_val"), Value::Integer(100));
-        let ctx = ExecuteContext::new(&row).with_outer_row(&outer);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(100));
     }
 
     // =========================================================================

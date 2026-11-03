@@ -1597,23 +1597,6 @@ fn test_semi_join_outer_reference_in_like_pattern() {
 }
 
 #[test]
-fn test_semi_join_rejects_outer_reference_in_like_escape() {
-    use stoolap::executor::Executor;
-    use stoolap::parser::ast::{Expression, Statement};
-
-    let statements = stoolap::parser::parse_sql(
-        "SELECT o.id FROM outer_t o WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id AND i.label LIKE 'a!_b' ESCAPE o.escape_char)",
-    ).unwrap();
-    let Statement::Select(select) = &statements[0] else {
-        panic!("expected SELECT");
-    };
-    let Some(Expression::Exists(exists)) = select.where_clause.as_deref() else {
-        panic!("expected EXISTS predicate");
-    };
-    assert!(Executor::try_extract_semi_join_info(exists, false, &["o".into()]).is_none());
-}
-
-#[test]
 fn test_semi_join_outer_reference_in_list_value() {
     assert_semi_join_outer_reference(
         "test_semi_join_outer_reference_in_list_value",

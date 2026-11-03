@@ -153,23 +153,7 @@ fn a_join_reading_a_table_as_of_runs_on_its_plan() {
     let db = Database::open("memory://as_of_sources_join_plan").unwrap();
     let before = setup(&db, false);
     let as_of = format!("u AS OF TIMESTAMP '{before}'");
-    let mechanisms = [
-        CorrelatedScan,
-        CorrelatedWhere,
-        OuterBinding,
-        OuterSubstitution,
-        PushdownConstant,
-        ProjectionEvaluator,
-        OrderByEvaluator,
-        AntiJoin,
-        ExistsSemiJoin,
-        ExistsSubquery,
-        InSubquery,
-        ScalarSubquery,
-        SelectFold,
-        CorrelatedExpression,
-        LiftedSubqueries,
-    ];
+    let mechanisms = [PushdownConstant, ProjectionEvaluator, OrderByEvaluator];
     let hits = || -> usize { mechanisms.iter().map(|m| fp::general_path_hits(*m)).sum() };
     let mut wrong = Vec::new();
     for shape in JOIN_SHAPES {

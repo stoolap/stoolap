@@ -472,18 +472,7 @@ fn shapes() -> Vec<(String, String)> {
 }
 
 /// The mechanisms a statement the blocks run never reaches
-const GENERAL: &[GeneralPath] = &[
-    GeneralPath::LiftedSubqueries,
-    GeneralPath::SelectFold,
-    GeneralPath::ScalarSubquery,
-    GeneralPath::CorrelatedExpression,
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
-    GeneralPath::ExistsSubquery,
-    GeneralPath::InSubquery,
-    GeneralPath::OrderByEvaluator,
-];
+const GENERAL: &[GeneralPath] = &[GeneralPath::OrderByEvaluator];
 
 fn general_hits() -> Vec<usize> {
     GENERAL

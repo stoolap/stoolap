@@ -41,8 +41,8 @@ use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
 use crate::executor::pushdown::read_as_column;
 use crate::executor::utils::{
-    derived_aggregate_column_name, extract_literal_value, qualified, split_qualified,
-    string_literal_value, string_to_datatype,
+    derived_aggregate_column_name, extract_literal_value, split_qualified, string_literal_value,
+    string_to_datatype,
 };
 use crate::executor::volatility::expression_volatility;
 use crate::functions::scalar::vector::read_as_vector;
@@ -125,8 +125,6 @@ pub enum ColumnSource {
 #[derive(Debug)]
 pub(crate) enum Reference {
     Column(ColumnSource),
-    /// A column of the outer row, by its name there
-    Outer(CompactArc<str>),
     /// A double-quoted name no column has: its own text
     Text,
     /// No column has it: the name as the error spells it
@@ -163,9 +161,6 @@ pub struct CompileContext<'a> {
 
     /// Tables that belong to row2 (for tracking which tables are from second row)
     row2_tables: FxHashSet<String>,
-
-    /// Outer query columns (for correlated subqueries)
-    outer_columns: Option<FxHashMap<CompactArc<str>, u16>>,
 
     /// Function registry
     functions: &'a FunctionRegistry,
@@ -220,7 +215,6 @@ impl<'a> CompileContext<'a> {
             qualified_columns: qualified_map,
             columns2: None,
             row2_tables: FxHashSet::default(),
-            outer_columns: None,
             functions,
             expression_aliases: FxHashMap::default(),
             prepared_subqueries: false,
@@ -278,16 +272,6 @@ impl<'a> CompileContext<'a> {
             }
         }
         self.columns2 = Some(col_map);
-        self
-    }
-
-    /// Add outer columns for correlated subqueries
-    pub fn with_outer_columns(mut self, outer_cols: &[String]) -> Self {
-        let mut map = FxHashMap::default();
-        for (i, col) in outer_cols.iter().enumerate() {
-            map.insert(CompactArc::from(col.to_lowercase().as_str()), i as u16);
-        }
-        self.outer_columns = Some(map);
         self
     }
 
@@ -364,18 +348,6 @@ impl<'a> CompileContext<'a> {
             return self.resolve_column(&column_lower).filter(spelled);
         }
 
-        // Check if the FULLY QUALIFIED name (table.column) exists in outer_columns.
-        // This distinguishes between `t.id` (outer reference) and `t2.id` (current row).
-        // Only if the qualified name is in outer context should we skip the fallback.
-        if let Some(ref outer_cols) = self.outer_columns {
-            let qualified_name = qualified(&table_lower, &column_lower);
-            if outer_cols.contains_key(qualified_name.as_str()) {
-                // Qualified name exists in outer context - don't fall back
-                return None;
-            }
-        }
-
-        // Qualified name not in outer context - safe to fall back to unqualified lookup
         self.resolve_column(&column_lower)
     }
 
@@ -385,12 +357,8 @@ impl<'a> CompileContext<'a> {
         let found = |source: Option<ColumnSource>| source.map(Reference::Column);
         Some(match expr {
             Expression::Identifier(id) => match split_qualified(&id.value_lower) {
-                Some((table, column)) => found(self.resolve_qualified(table, column))
-                    .or_else(|| self.resolve_outer_column(column).map(Reference::Outer)),
-                None => found(self.resolve_column(&id.value_lower)).or_else(|| {
-                    self.resolve_outer_column(&id.value_lower)
-                        .map(Reference::Outer)
-                }),
+                Some((table, column)) => found(self.resolve_qualified(table, column)),
+                None => found(self.resolve_column(&id.value_lower)),
             }
             .unwrap_or_else(|| match id.quoted {
                 true => Reference::Text,
@@ -398,29 +366,10 @@ impl<'a> CompileContext<'a> {
             }),
             Expression::QualifiedIdentifier(qid) => {
                 let (table, column) = (&qid.qualifier.value_lower, &qid.name.value_lower);
-                // The qualified name in the outer row first: its bare name may
-                // hold an inner row's column of the same name
                 found(self.resolve_qualified(table, column))
-                    .or_else(|| {
-                        self.resolve_outer_column(&qualified(table, column))
-                            .or_else(|| self.resolve_outer_column(column))
-                            .map(Reference::Outer)
-                    })
                     .unwrap_or_else(|| Reference::Missing(format!("{table}.{column}")))
             }
             _ => return None,
-        })
-    }
-
-    /// Resolve outer column (for correlated subqueries)
-    fn resolve_outer_column(&self, name: &str) -> Option<CompactArc<str>> {
-        let lower = name.to_lowercase();
-        self.outer_columns.as_ref().and_then(|cols| {
-            if cols.contains_key(lower.as_str()) {
-                Some(CompactArc::from(lower.as_str()))
-            } else {
-                None
-            }
         })
     }
 
@@ -866,7 +815,6 @@ impl<'a> ExprCompiler<'a> {
         match self.ctx.reference(expr) {
             Some(Reference::Column(ColumnSource::Row1(idx))) => builder.emit(Op::LoadColumn(idx)),
             Some(Reference::Column(ColumnSource::Row2(idx))) => builder.emit(Op::LoadColumn2(idx)),
-            Some(Reference::Outer(name)) => builder.emit(Op::LoadOuterColumn(name)),
             Some(Reference::Text) => {
                 let Expression::Identifier(id) = expr else {
                     return Err(CompileError::InvalidExpression(expr.to_string()));

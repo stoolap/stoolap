@@ -23,7 +23,7 @@ use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
 use crate::core::integer::integer_neg;
-use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
@@ -691,7 +691,7 @@ impl Executor {
             || returning().next().is_some())
             && (self.holds_prepared_dml(plan_cache, ctx)
                 || self
-                    .dml_family(None, values().chain(conflict()).chain(returning()), ctx)
+                    .dml_family(None, values().chain(conflict()).chain(returning()))
                     .is_ok())
     }
 
@@ -2291,7 +2291,6 @@ impl Executor {
                                 .into_iter()
                                 .flatten(),
                         ),
-                    ctx,
                 )
                 .is_ok()
         {
@@ -2477,7 +2476,6 @@ impl Executor {
             .dml_family(
                 stmt.where_clause.as_deref(),
                 stmt.updates.values().chain(returning_values),
-                ctx,
             )
             .is_ok();
         let where_prepared = in_family && stmt.where_clause.is_some();
@@ -2529,73 +2527,8 @@ impl Executor {
             None
         };
 
-        // Check if any update expressions contain subqueries
-        let has_update_subqueries = !in_family
-            && stmt
-                .updates
-                .iter()
-                .any(|(_, expr)| Self::has_subqueries(expr));
-
-        // Check if any update expressions have correlated subqueries
-        let has_correlated_updates = !in_family
-            && stmt.updates.iter().any(|(_, expr)| {
-                Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr)
-            });
-
-        // Pre-process update expressions if they contain NON-correlated subqueries
-        // Correlated subqueries must be processed per-row with outer row context
-        let processed_updates: Option<Vec<(String, Expression)>> =
-            if has_update_subqueries && !has_correlated_updates {
-                let processed: Result<Vec<_>> = stmt
-                    .updates
-                    .iter()
-                    .map(|(col_name, expr)| {
-                        let processed_expr = self.process_where_subqueries(expr, ctx)?;
-                        Ok((col_name.to_string(), processed_expr))
-                    })
-                    .collect();
-                Some(processed?)
-            } else {
-                None
-            };
-
-        // Pre-compute column indices for correlated updates path only
-        // For non-correlated path, we compile directly from source expressions
-        // This avoids cloning Expression objects when they're not needed
-        let update_indices: Vec<(usize, crate::core::DataType, u16, Expression, bool)> =
-            if has_correlated_updates {
-                // Only clone expressions when we actually need them (correlated path)
-                {
-                    let col_map = schema.column_index_map();
-                    stmt.updates
-                        .iter()
-                        .filter_map(|(col_name, expr)| {
-                            let is_correlated =
-                                Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr);
-                            let col_lower: String = col_name.to_lowercase().into();
-                            col_map.get(&col_lower).map(|&idx| {
-                                (
-                                    idx,
-                                    schema.columns[idx].data_type,
-                                    schema.columns[idx].vector_dimensions,
-                                    expr.clone(),
-                                    is_correlated,
-                                )
-                            })
-                        })
-                        .collect()
-                }
-            } else {
-                // Non-correlated path: empty vec, we compile directly from source later
-                Vec::new()
-            };
-
         // Build WHERE expression for storage layer
         // Try to convert to storage expression, fall back to in-memory filtering if not possible
-        //
-        // OPTIMIZATION: For correlated EXISTS/IN in WHERE, try semi-join optimization first.
-        // This transforms O(outer × inner) per-row subquery execution to O(inner + outer).
-        let mut where_is_correlated = false;
         let (where_expr, needs_memory_filter, memory_where_clause): (
             Option<Box<dyn StorageExpr>>,
             bool,
@@ -2604,60 +2537,13 @@ impl Executor {
             // The runner reads the rows a prepared WHERE passes
             (None, true, None)
         } else if let Some(ref where_clause) = stmt.where_clause {
-            let has_correlated_where =
-                Self::has_subqueries(where_clause) && Self::has_correlated_subqueries(where_clause);
-
-            let processed_where = if has_correlated_where {
-                // Try semi-join optimization for correlated EXISTS/IN
-                // Avoid cloning upfront - only clone if no optimization succeeds
-                let outer_tables = vec![table_name.to_string()];
-
-                // Try EXISTS semi-join optimization
-                let exists_optimized = self.try_optimize_exists_to_semi_join(
-                    where_clause,
-                    ctx,
-                    &outer_tables,
-                    None,
-                    None,
-                )?;
-
-                // Try IN semi-join optimization (on EXISTS result or original)
-                let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
-                let in_optimized =
-                    self.try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)?;
-
-                // Determine final expression without unnecessary clones
-                let current_expr = in_optimized
-                    .or(exists_optimized)
-                    .unwrap_or_else(|| (**where_clause).clone());
-
-                // What the semi-join rewrite refused is bound to each row as it is met
-                if Self::has_correlated_subqueries(&current_expr) {
-                    where_is_correlated = true;
-                    current_expr
-                } else if Self::has_subqueries(&current_expr) {
-                    self.process_where_subqueries(&current_expr, ctx)?
-                } else {
-                    current_expr
-                }
-            } else if Self::has_subqueries(where_clause) {
-                self.process_where_subqueries(where_clause, ctx)?
+            // Try to push down predicate to storage layer
+            let (storage_expr, needs_mem) = pushdown::try_pushdown(where_clause, schema, Some(ctx));
+            if needs_mem {
+                // Complex expression (like a + b > 100) - use in-memory filtering
+                (storage_expr, true, Some((**where_clause).clone()))
             } else {
-                (**where_clause).clone()
-            };
-
-            if where_is_correlated {
-                (None, true, Some(processed_where))
-            } else {
-                // Try to push down predicate to storage layer
-                let (storage_expr, needs_mem) =
-                    pushdown::try_pushdown(&processed_where, schema, Some(ctx));
-                if needs_mem {
-                    // Complex expression (like a + b > 100) - use in-memory filtering
-                    (storage_expr, true, Some(processed_where))
-                } else {
-                    (storage_expr, false, None)
-                }
+                (storage_expr, false, None)
             }
         } else {
             (None, false, None)
@@ -2728,50 +2614,12 @@ impl Executor {
                     }
                     None => table.collect_all_rows(where_expr.as_deref())?,
                 };
-                // A WHERE the semi-join rewrite refused is bound to each
-                // row here as it is in the update itself, or the check
-                // would look at rows the update does not touch
-                let bound_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = if where_is_correlated {
-                    schema
-                        .column_names_lower_arc()
-                        .iter()
-                        .map(|col_lower| {
-                            let qualified =
-                                CompactArc::from(qualified(table_name, col_lower).as_str());
-                            (CompactArc::from(col_lower.as_str()), qualified)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
                 for (_rid, row) in parent_rows.iter() {
                     // The prepared WHERE chose these rows already
                     if !where_prepared && needs_memory_filter {
                         if let Some(ref mem_where) = memory_where_clause {
                             evaluator.set_row_array(row);
-                            let held = if where_is_correlated {
-                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                                    FxHashMap::with_capacity_and_hasher(
-                                        bound_pairs.len() * 2,
-                                        Default::default(),
-                                    );
-                                for (i, (col_lower, qualified)) in bound_pairs.iter().enumerate() {
-                                    if let Some(value) = row.get(i) {
-                                        outer_row_map.insert(col_lower.clone(), value.clone());
-                                        outer_row_map.insert(qualified.clone(), value.clone());
-                                    }
-                                }
-                                let correlated_ctx = ctx.with_outer_row(
-                                    outer_row_map,
-                                    CompactArc::clone(&column_names),
-                                );
-                                let processed =
-                                    self.process_correlated_where(mem_where, &correlated_ctx)?;
-                                evaluator.evaluate_bool(&processed)
-                            } else {
-                                evaluator.evaluate_bool(mem_where)
-                            };
-                            if !held? {
+                            if !evaluator.evaluate_bool(mem_where)? {
                                 continue;
                             }
                         }
@@ -2795,185 +2643,7 @@ impl Executor {
 
         // Create a setter function that applies updates using pre-computed indices
         // If we need memory filtering, include the WHERE check in the setter
-        // For correlated subqueries, we need special handling
-        let rows_affected = if has_correlated_updates {
-            // Path for correlated subqueries: we need to pre-compute all values
-            // because process_correlated_expression calls self methods and can't be
-            // used inside the closure. Strategy:
-            // 1. Scan table to find all rows (matching WHERE if applicable)
-            // 2. For each row, build outer_row context and evaluate correlated expressions
-            // 3. Store computed values keyed by PK
-            // 4. Call table.update with a setter that looks up pre-computed values
-
-            // Get primary key column index
-            let pk_indices = schema.primary_key_indices();
-            let pk_idx = pk_indices.first().copied().unwrap_or(0);
-
-            // Pre-compute values for all rows
-            // Map: pk_value -> Vec<(col_idx, new_value)>
-            let mut precomputed: ValueMap<Vec<(usize, Value)>> = ValueMap::default();
-
-            // Build column indices for scanning (all columns)
-            let all_col_indices: Vec<usize> = (0..column_names.len()).collect();
-
-            // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
-            // Use CompactArc<str> for zero-cost cloning in the per-row loop
-            let column_names_lower = schema.column_names_lower_arc();
-            let col_name_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = column_names_lower
-                .iter()
-                .map(|col_lower| {
-                    let qualified = CompactArc::from(qualified(table_name, col_lower).as_str());
-                    (CompactArc::from(col_lower.as_str()), qualified)
-                })
-                .collect();
-
-            // Reusable outer_row_map - cleared and reused each iteration
-            // Uses CompactArc<str> keys for zero-cost cloning
-            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
-
-            // Scan all rows (WHERE filtering happens in the setter)
-            let mut scanner = table.scan(&all_col_indices, None)?;
-            while scanner.next() {
-                let row = scanner.row();
-                evaluator.set_row_array(row);
-
-                // Get PK value for this row
-                let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
-
-                // Build outer row context from current row values using pre-computed names
-                outer_row_map.clear();
-                for (i, (col_lower, qualified)) in col_name_pairs.iter().enumerate() {
-                    if let Some(value) = row.get(i) {
-                        outer_row_map.insert(col_lower.clone(), value.clone());
-                        outer_row_map.insert(qualified.clone(), value.clone());
-                    }
-                }
-
-                // Create context with outer row for correlated subquery evaluation
-                // Move map into context, we'll take it back after
-                let mut correlated_ctx = ctx.with_outer_row(
-                    std::mem::take(&mut outer_row_map),
-                    CompactArc::clone(&column_names),
-                );
-
-                // Check WHERE condition if needed
-                if needs_memory_filter {
-                    if let Some(ref where_clause) = memory_where_clause {
-                        let held = if where_is_correlated {
-                            let processed =
-                                self.process_correlated_where(where_clause, &correlated_ctx)?;
-                            evaluator.evaluate_bool(&processed)
-                        } else {
-                            evaluator.evaluate_bool(where_clause)
-                        };
-                        if !held? {
-                            outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
-                            continue;
-                        }
-                    }
-                }
-
-                // Evaluate all update expressions
-                let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
-                for (idx, col_type, vec_dims, expr, is_correlated) in update_indices.iter() {
-                    let evaluated = if *is_correlated {
-                        // Process correlated expression - this executes the subquery
-                        let processed_expr =
-                            self.process_correlated_expression(expr, &correlated_ctx)?;
-                        // Now evaluate the processed expression (subquery replaced with value)
-                        let mut eval =
-                            CompiledEvaluator::new(function_registry).with_context(&correlated_ctx);
-                        eval.init_columns_arc(CompactArc::clone(&column_names));
-                        eval.set_row_array(row);
-                        eval.evaluate(&processed_expr)?
-                    } else {
-                        evaluator.evaluate(expr)?
-                    };
-
-                    let coerced = evaluated.coerce_to_type(*col_type);
-                    validate_coercion(
-                        &evaluated,
-                        &coerced,
-                        &schema.columns[*idx].name,
-                        *col_type,
-                        *vec_dims,
-                    )?;
-                    new_values.push((*idx, coerced));
-                }
-
-                // Take back the map for reuse (zero-copy transfer)
-                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
-
-                if !new_values.is_empty() {
-                    precomputed.insert(pk_value, new_values);
-                }
-            }
-            if let Some(error) = scanner.err() {
-                return Err(error.clone());
-            }
-            drop(scanner);
-
-            let checks = checks_reading(compile_check_programs(schema)?, |c| {
-                update_indices.iter().any(|(idx, _, _, _, _)| *idx == c)
-            });
-            let mut vm = super::expression::ExprVM::new();
-
-            // Now update using precomputed values
-            let mut setter = |mut row: Row| -> Result<(Row, bool)> {
-                let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
-
-                if let Some(updates) = precomputed.get(&pk_value) {
-                    // Capture old values of referenced columns before applying changes
-                    let ref_old: Vec<(usize, Value)> = if !ref_col_indices_for_fk.is_empty() {
-                        ref_col_indices_for_fk
-                            .iter()
-                            .filter_map(|&ci| row.get(ci).map(|v| (ci, v.clone())))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    for (idx, new_value) in updates {
-                        let _ = row.set(*idx, new_value.clone());
-                    }
-                    for check in &checks {
-                        run_check(&mut vm, check, &row)?;
-                    }
-
-                    // Track referenced column changes for FK cascade
-                    for (ci, old_val) in &ref_old {
-                        if let Some(new_val) = row.get(*ci) {
-                            if old_val != new_val {
-                                ref_col_changes.borrow_mut().push((
-                                    *ci,
-                                    old_val.clone(),
-                                    new_val.clone(),
-                                ));
-                            }
-                        }
-                    }
-
-                    // Collect row for child FK parent-existence validation
-                    if has_fk_updates {
-                        fk_new_values.borrow_mut().push(row.clone());
-                    }
-
-                    // Collect row for RETURNING clause
-                    if has_returning {
-                        returning_rows.borrow_mut().push(row.clone());
-                    }
-                    Ok((row, true))
-                } else {
-                    Ok((row, false))
-                }
-            };
-
-            let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
-            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            table.update(access, where_expr.as_deref(), &mut setter)?
-        } else {
-            // Optimized path for non-correlated subqueries
+        let rows_affected = {
             // CRITICAL: Pre-compile update expressions ONCE before the loop
             // Compile directly from source expressions (no intermediate cloning!)
             use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
@@ -2993,24 +2663,6 @@ impl Executor {
                             )
                         })
                         .collect()
-                } else if let Some(ref processed) = processed_updates {
-                    // Use pre-processed expressions (subqueries already evaluated)
-                    processed
-                        .iter()
-                        .filter_map(|(col_name, expr)| {
-                            let col_lower = col_name.to_lowercase();
-                            col_map.get(&col_lower).map(|&idx| {
-                                compile_expression(expr, &column_names).map(|program| {
-                                    (
-                                        idx,
-                                        schema.columns[idx].data_type,
-                                        schema.columns[idx].vector_dimensions,
-                                        program,
-                                    )
-                                })
-                            })
-                        })
-                        .collect::<Result<_>>()?
                 } else {
                     // Compile directly from statement expressions
                     stmt.updates
@@ -3062,28 +2714,12 @@ impl Executor {
                     super::expression::compile_expression_with_params(
                         expr,
                         &column_names,
-                        None,
                         params,
                         &self.function_registry,
                     )
                     .ok()
                 });
             let transaction_id = ctx.transaction_id();
-            // A WHERE the semi-join rewrite refused is bound to each row as it is met
-            let col_name_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = if where_is_correlated {
-                schema
-                    .column_names_lower_arc()
-                    .iter()
-                    .map(|col_lower| {
-                        let qualified = CompactArc::from(qualified(table_name, col_lower).as_str());
-                        (CompactArc::from(col_lower.as_str()), qualified)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
             let candidates = match dml_run.as_ref().filter(|_| where_prepared) {
                 Some(run) => Some(run.candidates(&*table, ctx)?),
                 None => None,
@@ -3141,27 +2777,7 @@ impl Executor {
                         }
                         RowWhere::Clause(where_expr) => {
                             evaluator.set_row_array(&row);
-                            let held = if where_is_correlated {
-                                outer_row_map.clear();
-                                for (i, (col_lower, qualified)) in col_name_pairs.iter().enumerate()
-                                {
-                                    if let Some(value) = row.get(i) {
-                                        outer_row_map.insert(col_lower.clone(), value.clone());
-                                        outer_row_map.insert(qualified.clone(), value.clone());
-                                    }
-                                }
-                                let mut correlated_ctx = ctx.with_outer_row(
-                                    std::mem::take(&mut outer_row_map),
-                                    CompactArc::clone(&column_names),
-                                );
-                                let processed =
-                                    self.process_correlated_where(where_expr, &correlated_ctx);
-                                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
-                                evaluator.evaluate_bool(&processed?)
-                            } else {
-                                evaluator.evaluate_bool(where_expr)
-                            };
-                            if !held? {
+                            if !evaluator.evaluate_bool(where_expr)? {
                                 return Ok((row, false));
                             }
                         }
@@ -3403,7 +3019,7 @@ impl Executor {
             .into_iter()
             .flatten();
         let in_family = self
-            .dml_family(stmt.where_clause.as_deref(), returning_values, ctx)
+            .dml_family(stmt.where_clause.as_deref(), returning_values)
             .is_ok();
         let where_prepared = in_family && stmt.where_clause.is_some();
         // Without a view the prepared subqueries read a snapshot taken before the write
@@ -3494,18 +3110,6 @@ impl Executor {
             None
         };
 
-        // Check if WHERE has correlated subqueries (needs per-row evaluation)
-        // This will be updated after semi-join optimization attempt
-        let mut has_correlated = if let Some(ref where_clause) = stmt.where_clause {
-            !where_prepared
-                && Self::has_subqueries(where_clause)
-                && Self::has_correlated_subqueries(where_clause)
-        } else {
-            false
-        };
-
-        // OPTIMIZATION: For correlated EXISTS/IN in WHERE, try semi-join optimization first.
-        // This transforms O(outer × inner) per-row subquery execution to O(inner + outer).
         let (where_expr, needs_memory_filter, memory_where_clause): (
             Option<Box<dyn StorageExpr>>,
             bool,
@@ -3521,67 +3125,13 @@ impl Executor {
                     },
                     None => (None, true, None),
                 }
-            } else if has_correlated {
-                // Try semi-join optimization for correlated EXISTS/IN
-                // Avoid cloning upfront - only clone if no optimization succeeds
-                let outer_tables = vec![table_name.to_string()];
-
-                // Try EXISTS semi-join optimization
-                let exists_optimized = self.try_optimize_exists_to_semi_join(
-                    where_clause,
-                    ctx,
-                    &outer_tables,
-                    None,
-                    None,
-                )?;
-
-                // Try IN semi-join optimization (on EXISTS result or original)
-                let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
-                let in_optimized =
-                    self.try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)?;
-
-                // Determine final expression without unnecessary clones
-                let (current_expr, any_optimized) = match (&exists_optimized, &in_optimized) {
-                    (_, Some(_)) => (in_optimized.unwrap(), true),
-                    (Some(_), None) => (exists_optimized.unwrap(), true),
-                    (None, None) => ((**where_clause).clone(), false),
-                };
-
-                // Check if there are still correlated subqueries after optimization
-                let still_correlated = Self::has_correlated_subqueries(&current_expr);
-
-                if any_optimized && !still_correlated {
-                    // All correlated subqueries were optimized away - update flag
-                    has_correlated = false;
-                    let processed = if Self::has_subqueries(&current_expr) {
-                        self.process_where_subqueries(&current_expr, ctx)?
-                    } else {
-                        current_expr
-                    };
-                    let (storage_expr, needs_mem) =
-                        pushdown::try_pushdown(&processed, schema, Some(ctx));
-                    if needs_mem {
-                        (storage_expr, true, Some(processed))
-                    } else {
-                        (storage_expr, false, None)
-                    }
-                } else {
-                    // Still have correlated subqueries - use per-row processing with optimized expr
-                    (None, true, Some(current_expr))
-                }
             } else {
-                let processed_where = if Self::has_subqueries(where_clause) {
-                    self.process_where_subqueries(where_clause, ctx)?
-                } else {
-                    (**where_clause).clone()
-                };
-
                 // Try to push down predicate to storage layer
                 let (storage_expr, needs_mem) =
-                    pushdown::try_pushdown(&processed_where, schema, Some(ctx));
+                    pushdown::try_pushdown(where_clause, schema, Some(ctx));
                 if needs_mem {
                     // Complex expression (like a + b > 100) - use in-memory filtering
-                    (storage_expr, true, Some(processed_where))
+                    (storage_expr, true, Some((**where_clause).clone()))
                 } else {
                     (storage_expr, false, None)
                 }
@@ -3635,7 +3185,6 @@ impl Executor {
                     super::expression::compile_expression_with_params(
                         expr,
                         &column_names_with_prefix,
-                        None,
                         params,
                         &self.function_registry,
                     )
@@ -3696,46 +3245,6 @@ impl Executor {
                 Some(table.scan_access(access, &column_indices, None, where_expr.as_deref())?)
             };
 
-            // Pre-compute column name mappings for correlated subqueries
-            let column_names_arc = if has_correlated {
-                Some(CompactArc::new(column_names_owned.clone()))
-            } else {
-                None
-            };
-
-            // OPTIMIZATION: Use schema's cached lowercase column names instead of computing
-            // Each entry: (col_lower, effective_qualified, optional_table_qualified)
-            // Uses CompactArc<str> for zero-cost cloning in the per-row loop
-            let column_names_lower = schema.column_names_lower_arc();
-            #[allow(clippy::type_complexity)]
-            let col_name_triples: Vec<(
-                CompactArc<str>,
-                CompactArc<str>,
-                Option<CompactArc<str>>,
-            )> = column_names_lower
-                .iter()
-                .map(|col_lower| {
-                    let effective_qualified =
-                        CompactArc::from(qualified(effective_name, col_lower).as_str());
-                    let table_qualified = if effective_name != table_name {
-                        Some(CompactArc::from(qualified(table_name, col_lower).as_str()))
-                    } else {
-                        None
-                    };
-                    (
-                        CompactArc::from(col_lower.as_str()),
-                        effective_qualified,
-                        table_qualified,
-                    )
-                })
-                .collect();
-
-            // Reusable outer_row_map for correlated subqueries
-            // Uses CompactArc<str> keys for zero-cost cloning
-            let estimated_entries = col_name_triples.len() * 3; // up to 3 entries per column
-            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
-
             while let Some(scanner) = scanner.as_mut() {
                 if !scanner.next() {
                     break;
@@ -3746,40 +3255,7 @@ impl Executor {
                 let matches = if needs_memory_filter {
                     evaluator.set_row_array(row);
                     if let Some(ref where_expr) = memory_where_clause {
-                        if has_correlated {
-                            // Build outer row context using pre-computed names
-                            outer_row_map.clear();
-                            for (i, (col_lower, effective_qualified, table_qualified)) in
-                                col_name_triples.iter().enumerate()
-                            {
-                                if let Some(value) = row.get(i) {
-                                    outer_row_map.insert(col_lower.clone(), value.clone());
-                                    outer_row_map
-                                        .insert(effective_qualified.clone(), value.clone());
-                                    if let Some(tq) = table_qualified {
-                                        outer_row_map.insert(tq.clone(), value.clone());
-                                    }
-                                }
-                            }
-
-                            // Create context with outer row (move map, take it back later)
-                            let mut correlated_ctx = ctx.with_outer_row(
-                                std::mem::take(&mut outer_row_map),
-                                column_names_arc.clone().unwrap(),
-                            );
-
-                            // Process correlated subquery with outer context
-                            let processed =
-                                self.process_correlated_where(where_expr, &correlated_ctx)?;
-                            // OPTIMIZATION: Take ownership instead of cloning
-                            evaluator.set_outer_row_owned(
-                                correlated_ctx.outer_row.take().unwrap_or_default(),
-                            );
-                            let result = evaluator.evaluate_bool(&processed);
-                            // Take back map for reuse instead of clearing
-                            outer_row_map = evaluator.take_outer_row();
-                            result?
-                        } else if let Some(ref program) = memory_where_program {
+                        if let Some(ref program) = memory_where_program {
                             let mut exec_ctx =
                                 ExecuteContext::new(row).with_transaction_id(transaction_id);
                             if !params.is_empty() {

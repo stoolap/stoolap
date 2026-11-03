@@ -78,7 +78,8 @@ use super::utils::{
     extract_literal_value, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
     order_by_names_an_alias, qualified, split_qualified, strip_table_qualifier,
-    value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
+    value_to_expression, visit_column_refs, visit_column_refs_outside, where_without_aggregates,
+    QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, read_once_argument, statement_draws_per_call};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
@@ -373,13 +374,13 @@ impl<'a> Family<'a> {
             // A modifier on a call to no aggregate was refused before the walk
             Expression::FunctionCall(call) => {
                 if is_aggregate_function(&call.function) {
-                    if !matches!(
-                        site,
-                        Site::Grouped | Site::GroupedOutput | Site::GroupedList
-                    ) {
-                        return Err("an aggregate outside a subquery block");
-                    }
-                    return self.aggregate_call(call, scopes, site, found);
+                    // One where the rows are not grouped is the compiler's error
+                    return match site {
+                        Site::Grouped | Site::GroupedOutput | Site::GroupedList => {
+                            self.aggregate_call(call, scopes, site, found)
+                        }
+                        _ => Ok(()),
+                    };
                 }
                 call.arguments.iter().try_for_each(walk)
             }
@@ -1103,9 +1104,8 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         shape: &QueryClassification,
-        ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
-        self.family(stmt, shape, ctx, true)
+        self.family(stmt, shape, true)
     }
 
     /// Whether the runner reads `stmt`, a statement over one source that
@@ -1114,12 +1114,11 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         shape: &QueryClassification,
-        ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
         if matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_))) {
             return Err("a join");
         }
-        self.family(stmt, shape, ctx, false)
+        self.family(stmt, shape, false)
     }
 
     /// [`Self::prepared_family`], which with `needs_subquery` takes only a
@@ -1128,15 +1127,11 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         shape: &QueryClassification,
-        ctx: Option<&ExecutionContext>,
         needs_subquery: bool,
     ) -> std::result::Result<(), OutOfFamily> {
         #[cfg(feature = "test-failpoints")]
         if crate::test_failpoints::prepared_families_off() {
             return Err("a test refusing the prepared families");
-        }
-        if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
-            return Err("it runs for a row of an enclosing statement");
         }
         // A statement the runner aggregates computes its SELECT list and
         // ORDER BY over its groups, as the aggregation does on any source
@@ -1153,6 +1148,10 @@ impl Executor {
                 .any(|def| def.expressions().any(mentions_subquery))
         {
             return Err("a WINDOW definition holding a subquery");
+        }
+        // One whose groups a subquery reads is the grouped family's
+        if !aggregates && PreparedSelect::aggregates(stmt) {
+            return Err("an aggregate whose output holds a subquery");
         }
         let family = Family {
             executor: self,
@@ -1235,14 +1234,10 @@ impl Executor {
     pub(crate) fn grouped_family(
         &self,
         stmt: &SelectStatement,
-        ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
         #[cfg(feature = "test-failpoints")]
         if crate::test_failpoints::prepared_families_off() {
             return Err("a test refusing the prepared families");
-        }
-        if ctx.is_some_and(|ctx| ctx.outer_row().is_some()) {
-            return Err("it runs for a row of an enclosing statement");
         }
         let grouped = grouped_block(stmt);
         // A grouped statement's DISTINCT ON key runs as an item, its windows
@@ -2799,13 +2794,12 @@ fn existence(
     executor: &Executor,
     stmt: SelectStatement,
     from_names: &[String],
-    ctx: &ExecutionContext,
 ) -> Result<SelectStatement> {
     let grouped = !stmt.group_by.columns.is_empty()
         || stmt.having.is_some()
         || stmt.columns.iter().any(expression_contains_aggregate);
     if grouped {
-        check_grouped_reads(executor, &stmt, from_names, ctx)?;
+        check_grouped_reads(executor, &stmt, from_names)?;
     }
     let where_clause = stmt
         .where_clause
@@ -3682,7 +3676,6 @@ impl RowsRead<'_> {
     ) -> bool {
         // Every value of a VALUES list is evaluated, as the general path does
         self.constant_where
-            && ctx.outer_row().is_none()
             && !matches!(
                 stmt.table_expr.as_deref(),
                 Some(Expression::ValuesSource(_))
@@ -5680,7 +5673,7 @@ impl Builder<'_> {
             true => {
                 self.bind_dropped_order(sq, &own, outer, id, &work)?;
                 self.check_dropped_items(sq, &own, outer)?;
-                existence(executor, statement, &own.lower, ctx)?
+                existence(executor, statement, &own.lower)?
             }
             false => statement,
         };
@@ -6174,6 +6167,7 @@ impl Builder<'_> {
         parent: Option<u16>,
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
+        where_without_aggregates(sq.where_clause.as_deref())?;
         // A value block, and a row compared with the block's one row, count
         // its rows
         let counts_rows = matches!(
@@ -9549,13 +9543,11 @@ impl Executor {
                     p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
-                        && ctx.outer_row().is_none()
                 }
                 CompiledExecution::PreparedJoin(p) => {
                     p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.holds_grouped()
-                        && ctx.outer_row().is_none()
                 }
                 _ => false,
             })
@@ -11631,7 +11623,7 @@ impl Executor {
         let shape = get_classification(stmt);
         if shape.where_has_subqueries
             || shape.output_has_subqueries
-            || self.planned_family(stmt, &shape, Some(ctx)).is_err()
+            || self.planned_family(stmt, &shape).is_err()
             || stmt.distinct
             || !stmt.distinct_on.is_empty()
             || !stmt.set_operations.is_empty()
@@ -12008,7 +12000,6 @@ impl Executor {
                 p.validity.holds(&*self.engine, self.engine.schema_epoch())
                     && p.cte_scope.holds(ctx)
                     && p.blocks.param_count == ctx.params().len()
-                    && ctx.outer_row().is_none()
             })
     }
 
@@ -12026,7 +12017,6 @@ impl Executor {
                     p.validity.holds(&*self.engine, self.engine.schema_epoch())
                         && p.cte_scope.holds(ctx)
                         && p.blocks.param_count == ctx.params().len()
-                        && ctx.outer_row().is_none()
                 }
                 _ => false,
             })
@@ -12038,14 +12028,10 @@ impl Executor {
         &self,
         where_clause: Option<&'e Expression>,
         sets: impl IntoIterator<Item = &'e Expression>,
-        ctx: &'e ExecutionContext,
     ) -> std::result::Result<(), OutOfFamily> {
         #[cfg(feature = "test-failpoints")]
         if crate::test_failpoints::prepared_families_off() {
             return Err("the prepared families are off");
-        }
-        if ctx.outer_row().is_some() {
-            return Err("it runs for a row of an enclosing statement");
         }
         let family = Family {
             executor: self,

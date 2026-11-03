@@ -142,16 +142,10 @@ fn a_refused_probe_reads_one_semi_join_set() {
     let _serial = serial();
     let (_dir, db) = fixture();
     let refusals = READS.cost_scans.load(Ordering::Relaxed);
-    let runs = stoolap::test_failpoints::exists_subquery_runs();
     assert_eq!(ids(&db, &SHAPES[3].replace("{t}", "t")), Vec::<i64>::new());
     assert!(
         READS.cost_scans.load(Ordering::Relaxed) > refusals,
         "the dense key was refused"
-    );
-    assert_eq!(
-        stoolap::test_failpoints::exists_subquery_runs() - runs,
-        0,
-        "no outer row ran the subquery over the volumes"
     );
 }
 

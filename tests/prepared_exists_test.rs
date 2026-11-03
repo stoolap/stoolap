@@ -110,17 +110,10 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-const ALL_GENERAL: [GeneralPath; 10] = [
-    GeneralPath::CorrelatedScan,
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
+const ALL_GENERAL: [GeneralPath; 3] = [
     GeneralPath::PushdownConstant,
     GeneralPath::ProjectionEvaluator,
     GeneralPath::OrderByEvaluator,
-    GeneralPath::AntiJoin,
-    GeneralPath::ExistsSemiJoin,
-    GeneralPath::ExistsSubquery,
 ];
 
 fn general_hits() -> Vec<usize> {

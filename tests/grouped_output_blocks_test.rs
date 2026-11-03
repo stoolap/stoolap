@@ -27,8 +27,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    aggregate_paths_taken, before_grouped_table_opened, general_path_hits, general_path_total,
-    random_draws, reset_aggregate_paths, GeneralPath,
+    aggregate_paths_taken, before_grouped_table_opened, general_path_total, random_draws,
+    reset_aggregate_paths,
 };
 use stoolap::Database;
 
@@ -270,22 +270,6 @@ const INPUT_CASES: &[(&str, &str, Option<&str>)] = &[
     ),
 ];
 
-/// The paths a statement the blocks run never reaches
-const GENERAL: &[GeneralPath] = &[
-    GeneralPath::CorrelatedWhere,
-    GeneralPath::OuterBinding,
-    GeneralPath::OuterSubstitution,
-    GeneralPath::ExistsSubquery,
-    GeneralPath::InSubquery,
-];
-
-fn general_hits() -> Vec<usize> {
-    GENERAL
-        .iter()
-        .map(|path| general_path_hits(*path))
-        .collect()
-}
-
 /// Each row, without the column names
 fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let result = db.query(sql, ()).map_err(|e| e.to_string())?;
@@ -354,17 +338,10 @@ fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
             db
         };
         for (sql, literal) in CASES {
-            let hits = general_hits();
             let first = rows(&db, sql);
             reset_aggregate_paths();
             let again = rows(&db, sql);
             let taken = aggregate_paths_taken();
-            let reached = general_hits();
-            if reached != hits {
-                wrong.push(format!(
-                    "sealed {sealed}: {sql}: reached the general path {hits:?} -> {reached:?}"
-                ));
-            }
             wrong.extend(
                 oracle::check_answer(&RECORDED, sql, &first)
                     .map(|why| format!("sealed {sealed}: {why}")),
@@ -462,17 +439,10 @@ fn a_grouped_statement_reads_its_input_rows_subqueries_through_its_blocks() {
                 wrong.push(format!("sealed {sealed}: {reference}: {want:?}"));
                 continue;
             }
-            let hits = general_hits();
             let first = rows(&db, sql);
             reset_aggregate_paths();
             let again = rows(&db, sql);
             let taken = aggregate_paths_taken();
-            let reached = general_hits();
-            if reached != hits {
-                wrong.push(format!(
-                    "sealed {sealed}: {sql}: reached the general path {hits:?} -> {reached:?}"
-                ));
-            }
             let line = prepared_line(&db, sql);
             if line != "Prepared: yes" {
                 wrong.push(format!("sealed {sealed}: {sql}: {line}"));
@@ -1220,24 +1190,6 @@ fn a_having_name_reads_the_alias_the_grouped_path_reads() {
         "{sql}: k is t.a, the first item named k"
     );
     assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-}
-
-#[test]
-fn a_recorded_answer_s_reference_reads_a_prepared_view_on_the_general_path() {
-    let _guard = serial();
-    let db = Database::open("memory://grouped_output_reference_view").unwrap();
-    fill(&db);
-    db.execute(
-        "CREATE VIEW vm AS SELECT a, (SELECT MAX(u.x) FROM u) AS m FROM t",
-        (),
-    )
-    .unwrap();
-    let sql = "SELECT m, COUNT(*) FROM vm GROUP BY m ORDER BY m";
-    let twin = oracle::general_twin(sql);
-    let want = rows(&db, sql);
-    // The view's statement holds its prepared plan by now
-    assert_eq!(rows(&db, &twin), want, "{twin}");
-    assert_eq!(oracle::on_general_path(sql, || rows(&db, &twin)), want);
 }
 
 /// The same rows hot in memory and sealed into a volume

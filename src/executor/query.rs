@@ -45,14 +45,6 @@ use crate::storage::traits::{Engine, QueryResult, ScanAccess};
 /// code takes more stack per level, so a debug build allows fewer
 pub const MAX_VIEW_DEPTH: usize = if cfg!(debug_assertions) { 16 } else { 32 };
 
-/// Threshold below which streaming NOT EXISTS with early termination outperforms
-/// bulk anti-join materialization. Queries with LIMIT below this value use the
-/// streaming InHashSet path which can terminate early, while queries without LIMIT
-/// (or with larger LIMIT) use bulk anti-join which is faster for full scans.
-/// Based on benchmarking where streaming wins when result set is small enough
-/// to benefit from early termination.
-const ANTI_JOIN_LIMIT_THRESHOLD: i64 = 10000;
-
 /// Deferred projection info: (column_indices, output_column_names)
 /// Used when projection can be deferred until after ORDER BY + LIMIT
 type DeferredProjection = (Vec<usize>, Vec<String>);
@@ -465,9 +457,7 @@ pub(crate) enum EarlySemantic {
     NotTried,
 }
 
-use super::context::{
-    clear_statement_caches, ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutGuard,
-};
+use super::context::{ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutGuard};
 use super::expr_key::ExprKey;
 use super::expression::SubqueryExecutor;
 use super::expression::{
@@ -509,10 +499,10 @@ use super::utils::{
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name, named_as_written,
+    get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name,
     order_by_names_an_alias, qualified, qualified_index, shown_name, split_qualified,
     star_takes_every_column, string_literal_value, strip_table_qualifier, substitute_filter_column,
-    visit_column_refs,
+    visit_column_refs, where_without_aggregates,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
@@ -534,45 +524,6 @@ pub(super) struct OrderByProjection<'e> {
     pub(super) extra_names: Vec<String>,
     /// The source of each appended column, in the order of `extra_names`
     pub(super) extra_sources: Vec<ColumnSource>,
-}
-
-/// Pre-computed column name mappings for correlated subqueries.
-/// Uses CompactArc<str> for zero-cost cloning in the per-row inner loop.
-struct ColumnKeyMapping {
-    /// Column index in the row
-    index: usize,
-    /// Lowercase column name (e.g., "id")
-    col_lower: CompactArc<str>,
-    /// Qualified name with table alias (e.g., "c.id")
-    qualified_name: Option<CompactArc<str>>,
-    /// Unqualified part if original had a dot (e.g., "id" from "table.id")
-    unqualified_part: Option<CompactArc<str>>,
-}
-
-impl ColumnKeyMapping {
-    /// Build column key mappings from column names and optional table alias.
-    /// This pre-computes all the string transformations needed for correlated subquery
-    /// outer row context, avoiding per-row allocations.
-    fn build_mappings(columns: &[String], table_alias: Option<&str>) -> Vec<ColumnKeyMapping> {
-        columns
-            .iter()
-            .enumerate()
-            .map(|(i, col_name)| {
-                let col_lower: CompactArc<str> = CompactArc::from(col_name.to_lowercase().as_str());
-                let unqualified_part = split_qualified(col_name)
-                    .map(|(_, name)| CompactArc::from(name.to_lowercase().as_str()));
-                let qualified_name = table_alias
-                    .filter(|_| unqualified_part.is_none())
-                    .map(|alias| CompactArc::from(qualified(alias, &col_lower).as_str()));
-                ColumnKeyMapping {
-                    index: i,
-                    col_lower,
-                    qualified_name,
-                    unqualified_part,
-                }
-            })
-            .collect()
-    }
 }
 
 /// A later outer chunk continues the first only as a bounded fetch of the
@@ -1137,13 +1088,6 @@ enum JoinProjection {
     Prepared(PreparedProjection),
 }
 
-/// The columns of the row a statement runs for, which its programs read by name
-pub(crate) fn outer_column_names(ctx: &ExecutionContext) -> Option<Vec<String>> {
-    ctx.outer_row()
-        .filter(|outer| !outer.is_empty())
-        .map(|outer| outer.keys().map(|k| k.to_string()).collect())
-}
-
 /// Each lowercase column name, and each qualified one's bare name, to its position
 fn lower_index_map(
     all_columns: &[String],
@@ -1610,7 +1554,7 @@ impl Executor {
                 counts: read,
             }));
         }
-        if let Err(reason) = self.dml_family(None, counts, ctx) {
+        if let Err(reason) = self.dml_family(None, counts) {
             return Err(Error::invalid_argument(format!(
                 "a LIMIT or OFFSET subquery is not supported here: {reason}"
             )));
@@ -1739,11 +1683,6 @@ impl Executor {
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
         let _timeout_guard = if ctx.query_depth == 0 {
-            // Clear query-local caches at top-level.
-            // NOTE: scalar, IN, and semi-join caches are NOT cleared here - they're
-            // invalidated per-table when data changes (INSERT, UPDATE, DELETE, TRUNCATE)
-            // to enable cross-query caching for repeated subqueries.
-            clear_statement_caches();
             TimeoutGuard::new(ctx)
         } else {
             None
@@ -1752,14 +1691,7 @@ impl Executor {
         // Check for cancellation at entry point
         ctx.check_cancelled()?;
 
-        // Validate: aggregate functions are not allowed in WHERE clause
-        if let Some(ref where_clause) = stmt.where_clause {
-            if expression_contains_aggregate(where_clause) {
-                return Err(Error::invalid_argument(
-                    "aggregate functions are not allowed in WHERE clause (use HAVING instead)",
-                ));
-            }
-        }
+        where_without_aggregates(stmt.where_clause.as_deref())?;
 
         // A LIMIT or OFFSET subquery reads the snapshot the statement's CTEs
         // and rows read, so it is taken before the CTEs run
@@ -1788,10 +1720,8 @@ impl Executor {
         if self.has_cte(stmt) {
             let classified = std::cell::OnceCell::new();
             let shape = || classified.get_or_init(|| get_classification(stmt));
-            let grouped = || {
-                Self::grouped_family_reach(stmt, shape())
-                    && self.grouped_family(stmt, Some(ctx)).is_ok()
-            };
+            let grouped =
+                || Self::grouped_family_reach(stmt, shape()) && self.grouped_family(stmt).is_ok();
             let with = stmt
                 .with
                 .as_ref()
@@ -1799,10 +1729,10 @@ impl Executor {
             let slot = compiled.map(NestedPlan::slot);
             if !self.holds_prepared_select(slot, ctx)
                 && !self.holds_prepared_grouped(slot, ctx)
-                && self.prepared_family(stmt, shape(), Some(ctx)).is_err()
+                && self.prepared_family(stmt, shape()).is_err()
                 && !(slot.is_some()
                     && self.reads_source(stmt, ctx)
-                    && self.planned_family(stmt, shape(), Some(ctx)).is_ok())
+                    && self.planned_family(stmt, shape()).is_ok())
                 && !grouped()
                 && !self.run_keeps_join_plan(slot, stmt, with, ctx)
             {
@@ -1863,20 +1793,15 @@ impl Executor {
             });
         let in_family = held
             || ((classification.where_has_subqueries || classification.output_has_subqueries)
-                && self
-                    .prepared_family(stmt, &classification, Some(ctx))
-                    .is_ok())
+                && self.prepared_family(stmt, &classification).is_ok())
             || (slot.is_some()
                 && self.reads_source(stmt, ctx)
-                && self
-                    .planned_family(stmt, &classification, Some(ctx))
-                    .is_ok());
+                && self.planned_family(stmt, &classification).is_ok());
         // A grouped or windowed statement whose clauses hold subqueries runs
         // them as its blocks
         let grouped_family = Self::grouped_family_reach(stmt, &classification)
             && !in_family
-            && (self.holds_prepared_grouped(slot, ctx)
-                || self.grouped_family(stmt, Some(ctx)).is_ok());
+            && (self.holds_prepared_grouped(slot, ctx) || self.grouped_family(stmt).is_ok());
 
         // A SELECT * the runner answers is kept in the semantic cache as the
         // general path keeps it, under a stamp taken before its snapshot
@@ -1913,43 +1838,12 @@ impl Executor {
         // statement's source included
         let RowCounts { limit, offset } = row_counts(stmt, ctx)?;
 
-        // An uncorrelated subquery inside an aggregate's FILTER or argument
-        // folds before the aggregates are parsed, since every aggregation
-        // path reads the statement's own columns; a correlated one is
-        // resolved per input row at the aggregation entry
-        let bound_stmt;
-        // A statement holding this execution's values keeps nothing in its plan
-        let mut folded_select = false;
         // A join prepares its grouped blocks once it has laid out its rows
         let grouped_join =
             grouped_family && matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)));
         let grouped = match grouped_family && !grouped_join {
             true => self.prepared_grouped(compiled, stmt, ctx)?,
             false => None,
-        };
-        let stmt = if grouped.as_ref().is_none_or(|run| run.held.is_none())
-            && !grouped_join
-            && Self::folds_select_subqueries(stmt, &classification)
-        {
-            match self.try_process_select_subqueries(&stmt.columns, ctx)? {
-                Some(columns) => {
-                    // A folded item keeps the name it is written under
-                    let columns = columns
-                        .into_iter()
-                        .zip(&stmt.columns)
-                        .map(|(folded, written)| named_as_written(folded, written))
-                        .collect();
-                    bound_stmt = SelectStatement {
-                        columns,
-                        ..stmt.clone()
-                    };
-                    folded_select = true;
-                    &bound_stmt
-                }
-                None => stmt,
-            }
-        } else {
-            stmt
         };
 
         // Execute the main query
@@ -2089,11 +1983,10 @@ impl Executor {
         } else if let Some(grouped) = grouped {
             self.execute_prepared_grouped(grouped, branch, ctx)?
         } else {
-            let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, branch_classification, compiled)?
         };
         self.finish_select(
-            (stmt, ctx, &classification, compiled),
+            (stmt, ctx, compiled),
             (executed, prepared_visible, distinct_applied),
             (limit, offset, set_limit),
             (written_items, hidden_keys, hidden_windows),
@@ -2106,12 +1999,7 @@ impl Executor {
     /// LIMIT, each unless the executor applied it, and only its own columns
     fn finish_select(
         &self,
-        (stmt, ctx, classification, compiled): (
-            &SelectStatement,
-            &ExecutionContext,
-            &QueryClassification,
-            Option<&NestedPlan>,
-        ),
+        (stmt, ctx, compiled): (&SelectStatement, &ExecutionContext, Option<&NestedPlan>),
         (executed, prepared_visible, distinct_applied): (SelectOutput, Option<usize>, bool),
         (limit, offset, set_limit): (Option<usize>, usize, Option<usize>),
         (written_items, hidden_keys, hidden_windows): (usize, usize, usize),
@@ -2269,140 +2157,12 @@ impl Executor {
                 evaluator.init_columns(&columns);
                 evaluator.add_aggregate_aliases(&sort_slots);
 
-                // Check if any ORDER BY expression contains a correlated subquery
-                // Use cached classification to avoid expensive AST traversal
-                let has_correlated_order_by = classification.order_by_has_correlated_subqueries;
-
                 // OPTIMIZATION: Instead of cloning rows and appending sort keys,
                 // compute sort keys separately and use index-based sorting.
                 // This avoids O(n * row_size) cloning overhead.
                 let num_order_cols = stmt.order_by.len();
 
-                // A subquery that reads nothing of the row is run once here:
-                // its compiled placeholder cannot run on its own
-                let order_exprs: Vec<std::borrow::Cow<Expression>> = stmt
-                    .order_by
-                    .iter()
-                    .map(|ob| {
-                        if Self::has_subqueries(&ob.expression)
-                            && !Self::has_correlated_subqueries(&ob.expression)
-                        {
-                            self.process_where_subqueries(&ob.expression, ctx)
-                                .map(std::borrow::Cow::Owned)
-                        } else {
-                            Ok(std::borrow::Cow::Borrowed(&ob.expression))
-                        }
-                    })
-                    .collect::<Result<_>>()?;
-
-                // Compute sort keys for each row: Vec<Vec<Value>>
-                // Each inner Vec contains the evaluated ORDER BY expressions for that row
-                let sort_keys: Vec<Vec<Value>> = if has_correlated_order_by {
-                    // For correlated subqueries, we need to process per-row with outer context
-                    let columns_arc = CompactArc::clone(&columns);
-                    // Extract table alias for qualified column names
-                    let order_table_alias: Option<SmartString> =
-                        stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
-                            crate::parser::ast::Expression::TableSource(source) => source
-                                .alias
-                                .as_ref()
-                                .map(|a| a.value_lower.clone())
-                                .or_else(|| Some(source.name.value_lower.clone())),
-                            crate::parser::ast::Expression::Aliased(aliased) => {
-                                Some(aliased.alias.value_lower.clone())
-                            }
-                            _ => None,
-                        });
-
-                    // OPTIMIZATION: Pre-compute lowercase column names once before row loop
-                    // This avoids per-row to_lowercase() calls. Use CompactArc<str> for zero-cost clone.
-                    let columns_lower: Vec<CompactArc<str>> = columns
-                        .iter()
-                        .map(|c| CompactArc::from(c.to_lowercase().as_str()))
-                        .collect();
-                    // Each name the outer row answers to, with its position:
-                    // the output names, then each input column's names at
-                    // the position the layout gives it, which win
-                    let mut outer_names: Vec<(CompactArc<str>, usize)> = Vec::new();
-                    let mut name_at = |name: &str, position: usize| {
-                        outer_names.push((CompactArc::from(name), position));
-                        if let Some(alias) = &order_table_alias {
-                            if split_qualified(name).is_none() {
-                                outer_names.push((
-                                    CompactArc::from(qualified(alias, name).as_str()),
-                                    position,
-                                ));
-                            }
-                        }
-                    };
-                    for (position, name) in columns_lower.iter().enumerate() {
-                        name_at(name, position);
-                    }
-                    if let Some(layout) = layout {
-                        for (input, name) in layout.input_columns.iter().enumerate() {
-                            let Some(position) =
-                                layout.sources.iter().position(|s| s.input == Some(input))
-                            else {
-                                continue;
-                            };
-                            let name = name.to_lowercase();
-                            name_at(&name, position);
-                            if let Some((_, bare)) = split_qualified(&name) {
-                                name_at(bare, position);
-                            }
-                        }
-                    }
-
-                    rows.iter()
-                        .map(|(_, row)| {
-                            // Build outer row context from current row
-                            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                                FxHashMap::default();
-                            for (name, position) in &outer_names {
-                                let val =
-                                    row.get(*position).cloned().unwrap_or(Value::null_unknown());
-                                outer_row_map.insert(name.clone(), val);
-                            }
-
-                            // Create context with outer row for correlated subquery evaluation
-                            let correlated_ctx =
-                                ctx.with_outer_row(outer_row_map, columns_arc.clone());
-
-                            evaluator.set_row_array(row);
-                            stmt.order_by
-                                .iter()
-                                .zip(order_exprs.iter())
-                                .zip(mapped_columns.iter())
-                                .map(|((ob, order_expr), mapped)| {
-                                    // A key the projection already put in a
-                                    // column is read from it
-                                    if let Some(idx) = *mapped {
-                                        return Ok(row
-                                            .get(idx)
-                                            .cloned()
-                                            .unwrap_or_else(Value::null_unknown));
-                                    }
-                                    // Try processing correlated subqueries first
-                                    if Self::has_correlated_subqueries(&ob.expression) {
-                                        let processed_expr = self.process_correlated_expression(
-                                            &ob.expression,
-                                            &correlated_ctx,
-                                        )?;
-                                        let mut corr_eval =
-                                            CompiledEvaluator::new(&self.function_registry);
-                                        corr_eval.init_columns(&columns);
-                                        corr_eval.add_aggregate_aliases(&sort_slots);
-                                        corr_eval.set_row_array(row);
-                                        corr_eval = corr_eval.with_context(&correlated_ctx);
-                                        corr_eval.evaluate(&processed_expr)
-                                    } else {
-                                        evaluator.evaluate(order_expr)
-                                    }
-                                })
-                                .collect::<Result<Vec<Value>>>()
-                        })
-                        .collect::<Result<_>>()?
-                } else {
+                let sort_keys: Vec<Vec<Value>> = {
                     // A key the projection already put in a column is read
                     // from it: the row no longer carries what it was
                     // computed from. The rest are compiled once, so per row
@@ -2411,13 +2171,14 @@ impl Executor {
                     let key_sources: Vec<(
                         Option<usize>,
                         Option<super::expression::SharedProgram>,
-                    )> = order_exprs
+                    )> = stmt
+                        .order_by
                         .iter()
                         .zip(mapped_columns.iter())
-                        .map(|(order_expr, mapped)| {
+                        .map(|(ob, mapped)| {
                             Ok(match *mapped {
                                 Some(idx) => (Some(idx), None),
-                                None => (None, Some(evaluator.compile_cached(order_expr)?)),
+                                None => (None, Some(evaluator.compile_cached(&ob.expression)?)),
                             })
                         })
                         .collect::<Result<_>>()?;
@@ -2690,7 +2451,6 @@ impl Executor {
         if let Some(layout) = layout {
             layout.sort_slots(stmt, &mut slots)?;
         }
-        let outer = outer_column_names(ctx);
         // Each key no column holds is computed into a column appended to the
         // row, which the dedup reads and the projection below drops
         let width = columns.len();
@@ -2707,19 +2467,12 @@ impl Executor {
                     "DISTINCT ON key {key} names no column"
                 )));
             }
-            // A subquery that reads nothing of the row is run once here, as
-            // an ORDER BY key's is
-            let key = match Self::has_subqueries(key) && !Self::has_correlated_subqueries(key) {
-                true => std::borrow::Cow::Owned(self.process_where_subqueries(key, ctx)?),
-                false => std::borrow::Cow::Borrowed(key),
-            };
             indices.push(width + programs.len());
             programs.push(super::aggregation::compile_over_slots(
-                &key,
+                key,
                 &columns,
                 &self.function_registry,
                 Some(&slots),
-                outer.as_deref(),
                 false,
                 Some(ctx.params()),
             )?);
@@ -3264,14 +3017,7 @@ impl Executor {
         // The one row without columns, unless the WHERE keeps it out
         let mut passes = true;
         if let Some(where_clause) = &stmt.where_clause {
-            // Pre-process subqueries in WHERE clause (EXISTS, IN, ALL/ANY, scalar subqueries)
-            let processed_where = self.process_where_subqueries(where_clause, ctx)?;
-            // A parent row binds the outer references of a FROM-less subquery
-            let processed_where = match ctx.outer_row() {
-                Some(outer) => super::utils::substitute_outer_references(&processed_where, outer),
-                None => processed_where,
-            };
-            let where_result = super::expression::evaluate_once(&processed_where, Some(ctx))?;
+            let where_result = super::expression::evaluate_once(where_clause, Some(ctx))?;
             passes = ExprVM::passes(&where_result);
         }
 
@@ -3293,24 +3039,12 @@ impl Executor {
             return Ok((Box::new(result), columns, false, shape));
         }
 
-        // Process scalar subqueries in SELECT columns first (single-pass)
-        let processed_columns = self.try_process_select_subqueries(&stmt.columns, ctx)?;
-        let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
-
         let mut columns = Vec::new();
         let mut values = Vec::new();
 
-        for (col_expr, written) in columns_to_use.iter().zip(&stmt.columns) {
-            // Named as written, not as its subqueries were read
-            columns.push(item_name(written));
-
-            // Evaluate expression, with the parent row binding outer references
-            let bound = ctx
-                .outer_row()
-                .map(|outer| super::utils::substitute_outer_references(col_expr, outer));
-            let value =
-                super::expression::evaluate_once(bound.as_ref().unwrap_or(col_expr), Some(ctx))?;
-            values.push(value);
+        for col_expr in &stmt.columns {
+            columns.push(item_name(col_expr));
+            values.push(super::expression::evaluate_once(col_expr, Some(ctx))?);
         }
 
         let row = Row::from_values(values);
@@ -3628,7 +3362,6 @@ impl Executor {
             || classification.has_distinct_on
             || ctx.statement_view().is_some()
             || ctx.statement_snapshot().is_some()
-            || ctx.outer_row().is_some()
             || ctx.timeout_ms() > 0
             || ctx.query_depth > 0
             || expression_contains_aggregate(where_expr)
@@ -3690,7 +3423,6 @@ impl Executor {
     ) -> bool {
         Self::reads_cacheable_rows(ctx)
             && !ctx.has_cte_by_lower(&source.name.value_lower)
-            && ctx.outer_row().is_none()
             && source.as_of.is_none()
             && stmt.where_clause.is_some()
             && classification.semantic_cacheable(ctx.literal_params())
@@ -3865,16 +3597,14 @@ impl Executor {
         let mut output_columns =
             self.get_output_column_names(&stmt.columns, all_columns, table_alias);
         if order_by_extra {
-            let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
+            let (plan, extra_names, layout) = self.ordered_projection(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
                 stmt.table_expr.as_deref(),
-                rows,
                 all_columns,
                 table_alias,
-                ctx,
-            )?;
+            );
             output_columns.extend(extra_names);
             let plan = OutputProjection::Ordered(plan);
             let (projected_rows, applied) =
@@ -3882,22 +3612,10 @@ impl Executor {
             return Ok((projected_rows, output_columns, Some(layout), applied));
         }
         let layout = Self::shared_output_layout(stmt, all_columns, table_alias);
-        if Self::has_correlated_select_subqueries(&stmt.columns) {
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                rows,
-                all_columns,
-                Some(all_columns_lower),
-                ctx,
-                table_alias,
-            )?;
-            return Ok((projected_rows, output_columns, layout, false));
-        }
-        let plan = OutputProjection::Select(self.select_rows_plan(
+        let plan = OutputProjection::Select(self.select_projection(
             &stmt.columns,
             all_columns,
             Some(all_columns_lower),
-            ctx,
             table_alias,
         )?);
         let (projected_rows, applied) =
@@ -4099,12 +3817,10 @@ impl Executor {
 
         // classification is passed from caller to avoid redundant cache lookups
 
-        // A WHERE that keeps no row reads no row; one with a subquery or a
-        // parent row to bind is left to the scan, which prepares both
+        // A WHERE that keeps no row reads no row; one with a subquery is
+        // left to the scan
         if let Some(where_clause) = stmt.where_clause.as_deref().filter(|w| {
-            !classification.where_has_subqueries
-                && ctx.outer_row().is_none()
-                && true_for_no_row(w, ctx, &self.function_registry)
+            !classification.where_has_subqueries && true_for_no_row(w, ctx, &self.function_registry)
         }) {
             Self::bind_empty_where(stmt, where_clause, &all_columns)?;
             return self.finish_without_rows(
@@ -4200,29 +3916,6 @@ impl Executor {
             .or_else(|| early.and_then(|miss| miss.simplified.as_deref()))
             .or(stmt.where_clause.as_deref());
 
-        // Check if this query might reference outer columns (correlated)
-        let has_outer_context = ctx.outer_row().is_some();
-
-        // A parent row's columns are bound into a WHERE holding subqueries,
-        // the subqueries included, so one that reads only the parent row
-        // folds once instead of running for every row of this table
-        let bound_where: Option<Expression> = match (where_to_use, ctx.outer_row()) {
-            (Some(where_expr), Some(outer_row)) if classification.where_has_subqueries => {
-                let inner = [table_alias.as_deref().unwrap_or(table_name)];
-                let scope = super::utils::InnerScope {
-                    tables: &inner,
-                    schema: Some(table.schema()),
-                };
-                Some(super::utils::substitute_outer_references_in_scope(
-                    where_expr, outer_row, &scope,
-                ))
-            }
-            _ => None,
-        };
-        let where_to_use: Option<&Expression> = bound_where.as_ref().or(where_to_use);
-        let where_still_correlated = classification.where_has_correlated_subqueries
-            && where_to_use.is_some_and(Self::has_correlated_subqueries);
-
         // SEMANTIC CACHE: a stamp exists only for an eligible query
         let cache_eligible = cache_stamp.is_some() && where_to_use.is_some();
 
@@ -4245,51 +3938,10 @@ impl Executor {
         }
 
         let (storage_expr, needs_memory_filter) = if let Some(where_expr) = where_to_use {
-            // If there are subqueries, we must filter in memory
-            // Use cached classification to avoid AST traversal
-            if classification.where_has_subqueries {
-                // The conjuncts without a subquery still narrow the scan;
-                // the whole WHERE is evaluated in memory afterwards
-                let (storage_expr, _) =
-                    pushdown::try_pushdown(where_expr, table.schema(), Some(ctx));
-                (storage_expr, true)
-            } else if has_outer_context {
-                // If we have outer row context, this is a correlated subquery
-                // OPTIMIZATION: Substitute outer references with their actual values
-                // to enable predicate pushdown for index usage.
-                // Example: WHERE o.user_id = u.id -> WHERE o.user_id = 42
-                if let Some(outer_row) = ctx.outer_row() {
-                    let schema = table.schema();
-                    let inner = [table_alias.as_deref().unwrap_or(table_name)];
-                    let scope = super::utils::InnerScope {
-                        tables: &inner,
-                        schema: Some(schema),
-                    };
-                    let substituted_expr = super::utils::substitute_outer_references_in_scope(
-                        where_expr, outer_row, &scope,
-                    );
-                    // Try to push down the substituted expression
-                    let (storage_expr, needs_filter) =
-                        pushdown::try_pushdown(&substituted_expr, schema, Some(ctx));
-                    if storage_expr.is_some() {
-                        // Successfully converted - can use index!
-                        // Still need memory filter for any non-pushable parts
-                        (storage_expr, needs_filter)
-                    } else {
-                        // Couldn't push down, fall back to memory filter
-                        (None, true)
-                    }
-                } else {
-                    // No outer row available, force in-memory evaluation
-                    (None, true)
-                }
-            } else {
-                // Try PARTIAL PUSHDOWN: Extract pushable conjuncts from the WHERE clause.
-                // This allows queries like `WHERE indexed_col = 5 AND complex_func(x) > 0`
-                // to use the index for `indexed_col = 5` while filtering `complex_func(x) > 0` in memory.
-                let schema = table.schema();
-                pushdown::try_pushdown(where_expr, schema, Some(ctx))
-            }
+            // Try PARTIAL PUSHDOWN: Extract pushable conjuncts from the WHERE clause.
+            // This allows queries like `WHERE indexed_col = 5 AND complex_func(x) > 0`
+            // to use the index for `indexed_col = 5` while filtering `complex_func(x) > 0` in memory.
+            pushdown::try_pushdown(where_expr, table.schema(), Some(ctx))
         } else {
             (None, false)
         };
@@ -4321,37 +3973,6 @@ impl Executor {
             }
         }
 
-        // FAST PATH: IN subquery index optimization
-        // For queries like `SELECT * FROM table WHERE id IN (SELECT col FROM other_table WHERE ...)`
-        // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
-        // Left to the normal pipeline: aggregation and window functions (this
-        // projection cannot compile them) and an ORDER BY key that is not
-        // projected (the sorter would not find it).
-        if needs_memory_filter
-            && !has_outer_context
-            && !classification.has_group_by
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !order_by_needs_extra_columns
-        {
-            if let Some(where_expr) = where_to_use {
-                if let Some((result, columns, limit_applied)) = self
-                    .try_in_subquery_index_optimization(
-                        stmt,
-                        where_expr,
-                        &*table,
-                        &all_columns,
-                        table_alias.as_deref(),
-                        ctx,
-                        classification,
-                    )?
-                {
-                    let shape = shape_of(&columns);
-                    return Ok((result, columns, limit_applied, shape));
-                }
-            }
-        }
-
         // FAST PATH: IN list literal index optimization
         // For queries like `SELECT * FROM table WHERE id IN (1, 2, 3, 5, 8)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows.
@@ -4362,8 +3983,7 @@ impl Executor {
         // filter is needed anyway. Left to the normal pipeline: aggregation
         // and window functions (this projection cannot compile them) and an
         // ORDER BY key that is not projected (the sorter would not find it).
-        if !has_outer_context
-            && !classification.has_group_by
+        if !classification.has_group_by
             && !classification.has_aggregation
             && !classification.has_window_functions
             && !order_by_needs_extra_columns
@@ -4460,13 +4080,7 @@ impl Executor {
             && !classification.has_aggregation
             && !classification.has_window_functions
             && !order_by_needs_extra_columns
-            && !has_outer_context // Can't stream with outer context (correlated subqueries)
             && !should_disable_streaming_for_cache; // Only disable streaming for small cacheable queries
-
-        // Check for CORRELATED subqueries in WHERE - these require per-row evaluation
-        // Non-correlated scalar subqueries (like SELECT AVG(...)) are OK - they're evaluated once
-        // and the result is used as a literal value for all rows
-        let has_correlated_where_subqueries = classification.where_has_correlated_subqueries;
 
         // CRITICAL OPTIMIZATION: When needs_memory_filter is true AND we have LIMIT,
         // skip the streaming path. The streaming path pre-materializes ALL rows from
@@ -4476,18 +4090,13 @@ impl Executor {
         let skip_streaming_for_memory_filter_with_limit =
             needs_memory_filter && stmt.limit.is_some() && stmt.order_by.is_empty();
 
-        if can_use_streaming
-            && !has_correlated_where_subqueries
-            && !skip_streaming_for_memory_filter_with_limit
-        {
-            // A SELECT list without a block streams; its blocks need processing first
+        if can_use_streaming && !skip_streaming_for_memory_filter_with_limit {
+            // A SELECT list without a block streams
             if !classification.select_has_scalar_subqueries {
                 let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
                 // A table that reads by need materializes only the columns
                 // the statement names
-                let needed = (table.narrows_scans()
-                    && !has_outer_context
-                    && !classification.where_has_subqueries)
+                let needed = (table.narrows_scans() && !classification.where_has_subqueries)
                     .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
                     .flatten();
                 let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
@@ -4505,19 +4114,7 @@ impl Executor {
                 // If we need memory filtering (complex WHERE that couldn't be pushed down)
                 if needs_memory_filter {
                     if let Some(where_expr) = where_to_use {
-                        // Check if there are non-correlated scalar subqueries to process
-                        // These need to be evaluated once before streaming
-                        let has_scalar_subqueries = classification.where_has_subqueries
-                            && !classification.where_has_correlated_subqueries;
-
-                        let filter = if has_scalar_subqueries {
-                            // Process scalar subqueries to resolve them to literal values
-                            let processed = self.process_where_subqueries(where_expr, ctx)?;
-                            RowFilter::new(&processed, &all_columns)?.with_context(ctx)
-                        } else {
-                            // No scalar subqueries - use expression directly
-                            RowFilter::new(where_expr, &all_columns)?.with_context(ctx)
-                        };
+                        let filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
                         result = Box::new(FilteredResult::from_filter(result, filter));
                     }
                 }
@@ -4553,441 +4150,134 @@ impl Executor {
         // PARALLEL EXECUTION: Use parallel filtering for large datasets
         let parallel_config = ParallelConfig::default();
 
-        let rows_result = if needs_memory_filter {
-            // Path 1: Need in-memory filtering (subqueries or complex expressions)
+        let rows_result = if let Some(where_expr) = where_to_use.filter(|_| needs_memory_filter) {
+            // Path 1: Need in-memory filtering (complex expressions)
             // For memory filter, we need all columns to evaluate the WHERE clause
             let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
             let needed = (table.narrows_scans()
-                && !has_outer_context
                 && !classification.has_window_functions
                 && !classification.select_has_scalar_subqueries
                 && !classification.where_has_subqueries)
                 .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
                 .flatten();
 
-            // OPTIMIZATION: Delay scanner creation until we know we need all rows.
-            // For early termination path, we'll collect rows directly with a limit.
-            // This avoids materializing all rows upfront when we only need a few.
-
-            // Check if WHERE contains correlated subqueries
-            // Use cached classification to avoid expensive AST traversal
-            let has_correlated = where_still_correlated;
-
-            // Check if WHERE contains any subqueries (correlated or not)
-            // Use cached classification to avoid redundant traversal of the expression tree
-            let has_subqueries = classification.where_has_subqueries;
-
-            // SEMI-JOIN OPTIMIZATION: Try to optimize correlated EXISTS subqueries
-            // This transforms EXISTS (SELECT ... WHERE outer.col = inner.col AND ...)
-            // into: outer.col IN (SELECT DISTINCT inner_col FROM inner WHERE ...)
-            // This changes O(outer × inner) to O(inner + outer) - massive performance win!
-            let (processed_where, has_correlated) = if has_correlated {
-                if let Some(where_expr) = where_to_use {
-                    // Get outer table names for semi-join detection
-                    let outer_tables = Self::collect_outer_table_names(&stmt.table_expr);
-
-                    // Extract limit value for optimization decision
-                    // With small LIMIT, index-nested-loop with early termination is faster
-                    let outer_limit = row_counts(stmt, ctx)
-                        .ok()
-                        .and_then(|counts| counts.limit)
-                        .and_then(|limit| i64::try_from(limit).ok());
-
-                    // ANTI-JOIN OPTIMIZATION: For pure NOT EXISTS without LIMIT, use HashJoinOperator::Anti
-                    // This is faster than InHashSet because:
-                    // 1. Bulk hash table build and probe (no per-row expression evaluation)
-                    // 2. Better cache efficiency
-                    // 3. Direct row iteration without VM overhead
-                    //
-                    // HOWEVER: For queries with LIMIT, we skip anti-join because it materializes
-                    // ALL outer rows before applying LIMIT. The streaming InHashSet path can stop
-                    // early once LIMIT is reached, making it faster for limited result sets.
-                    if let Some(not_exists_info) =
-                        Self::try_extract_not_exists_info(where_expr, &outer_tables)
-                    {
-                        // Check if NOT EXISTS is the ONLY predicate (pure anti-join case)
-                        let is_pure_not_exists = matches!(where_expr, Expression::Prefix(_));
-
-                        // Only use anti-join for queries without LIMIT (or very large LIMIT)
-                        // For LIMIT queries, the streaming InHashSet path is faster due to early termination
-                        let has_limit = outer_limit.is_some()
-                            && outer_limit.unwrap() < ANTI_JOIN_LIMIT_THRESHOLD;
-
-                        // This path projects the anti-join rows and returns
-                        // them, so it can only answer a plain projection:
-                        // anything that shapes the result afterwards belongs
-                        // to the general path
-                        let is_plain_projection = !classification.has_aggregation
-                            && !classification.has_window_functions
-                            && !classification.has_group_by
-                            && !classification.has_having
-                            && !classification.has_order_by
-                            && !classification.has_distinct
-                            && !classification.has_distinct_on;
-                        // Few outer rows probe the inner index each instead
-                        let use_anti_join = is_pure_not_exists
-                            && !has_limit
-                            && is_plain_projection
-                            && !self.should_use_index_nested_loop(
-                                &not_exists_info,
-                                None,
-                                Some(table.row_count_hint()),
-                                ctx,
-                            );
-                        // Decided before any row is read: an inner WHERE storage
-                        // cannot answer whole leaves NOT EXISTS to the general path
-                        let inner_filter = if use_anti_join {
-                            self.anti_join_inner_filter(&not_exists_info, ctx)
-                        } else {
-                            None
-                        };
-
-                        // The inner rows as this statement sees them, or none
-                        // when the inner name is not a table it can read so
-                        let inner = match inner_filter {
-                            Some(filter) => {
-                                self.anti_join_inner_rows(&not_exists_info, filter.as_deref(), ctx)?
-                            }
-                            None => None,
-                        };
-
-                        if let Some((inner_rows, inner_key)) = inner {
-                            #[cfg(feature = "test-failpoints")]
-                            crate::test_failpoints::general_path_reached(
-                                crate::test_failpoints::GeneralPath::AntiJoin,
-                            );
-                            // Materialize outer table rows
-                            let mut outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
-
-                            // Execute anti-join
-                            let anti_join_result = self.execute_anti_join(
-                                &not_exists_info,
-                                CompactArc::new(outer_rows.drain_rows().collect()),
-                                &all_columns,
-                                inner_rows,
-                                inner_key,
-                            )?;
-
-                            // Project and return result
-                            let projected_rows = self.project_rows_with_alias(
-                                &stmt.columns,
-                                anti_join_result,
-                                &all_columns,
-                                Some(&all_columns_lower),
-                                ctx,
-                                table_alias.as_deref(),
-                            )?;
-                            let output_columns = CompactArc::new(self.get_output_column_names(
-                                &stmt.columns,
-                                &all_columns,
-                                table_alias.as_deref(),
-                            ));
-
-                            // LIMIT and OFFSET, parameters included, are the caller's to apply
-                            let result = ExecutorResult::with_arc_columns(
-                                CompactArc::clone(&output_columns),
-                                projected_rows,
-                            );
-                            let shape = shape_of(&output_columns);
-                            return Ok((Box::new(result), output_columns, false, shape));
-                        }
-                    }
-
-                    // Try semi-join optimizations for both EXISTS and IN subqueries
-                    // These transform O(outer × inner) to O(inner + outer)
-                    // Avoid cloning upfront - only clone if no optimization succeeds
-
-                    // 1. Try EXISTS semi-join optimization
-                    let exists_optimized = self.try_optimize_exists_to_semi_join(
-                        where_expr,
-                        ctx,
-                        &outer_tables,
-                        outer_limit,
-                        Some(table.row_count_hint()),
-                    )?;
-
-                    // 2. Try IN semi-join optimization (on EXISTS result or original)
-                    let expr_for_in = exists_optimized.as_ref().unwrap_or(where_expr);
-                    let in_optimized =
-                        self.try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)?;
-
-                    // Determine final expression without unnecessary clones
-                    let (current_expr, any_optimized) = match (exists_optimized, in_optimized) {
-                        (_, Some(in_opt)) => (in_opt, true),
-                        (Some(exists_opt), None) => (exists_opt, true),
-                        (None, None) => (where_expr.clone(), false), // Clone only when needed
-                    };
-
-                    // Check if there are still correlated subqueries after optimizations
-                    let still_correlated = Self::has_correlated_subqueries(&current_expr);
-
-                    if any_optimized && !still_correlated {
-                        // All correlated subqueries were optimized away; a
-                        // subquery the rewrite refused is read once here
-                        let processed = if Self::has_subqueries(&current_expr) {
-                            self.process_where_subqueries(&current_expr, ctx)?
-                        } else {
-                            current_expr
-                        };
-                        (Some(processed), false)
-                    } else if any_optimized {
-                        // Some optimizations applied but still have correlated parts
-                        (Some(current_expr), true)
-                    } else {
-                        // No optimizations applied - keep original for per-row processing
-                        (Some(current_expr), true)
-                    }
-                } else {
-                    (None, false)
-                }
-            } else if let Some(where_expr) = where_to_use {
-                if has_subqueries {
-                    // Pre-process uncorrelated subqueries once
-                    (Some(self.process_where_subqueries(where_expr, ctx)?), false)
-                } else {
-                    (Some(where_expr.clone()), false)
-                }
-            } else {
-                (None, false)
-            };
-
-            // FAST PATH: InHashSet index optimization (from EXISTS → semi-join transformation)
-            // If EXISTS was transformed to InHashSet and the column is PK/indexed,
-            // probe directly instead of scanning all rows
-            // Skip if there are correlated subqueries in SELECT columns
-            // Skip if query has aggregation: projection cannot compile aggregate functions
-            // Use cached classification to avoid AST traversal
-            if !has_correlated
+            // EARLY TERMINATION: For LIMIT queries without ORDER BY, GROUP BY,
+            // aggregation, or window functions, use streaming filter with early
+            // termination. This is critical for NOT IN performance.
+            let can_early_terminate = !classification.has_order_by
                 && !classification.has_group_by
                 && !classification.has_aggregation
                 && !classification.has_window_functions
-                && !classification.select_has_correlated_subqueries
-                && !self.order_by_needs_extra_columns(stmt, &all_columns)
-            {
-                if let Some(ref where_expr) = processed_where {
-                    if let Some((result, columns, limit_applied)) = self
-                        .try_in_hashset_index_optimization(
-                            stmt,
-                            where_expr,
-                            &*table,
-                            &all_columns,
-                            table_alias.as_deref(),
-                            ctx,
-                        )?
-                    {
-                        let shape = shape_of(&columns);
-                        return Ok((result, columns, limit_applied, shape));
-                    }
-                }
-            }
+                && !stmt.distinct
+                && stmt.distinct_on.is_empty();
 
-            // Check if we can use the PARALLEL PATH:
-            // For simple WHERE without subqueries, collect all rows first
-            // then filter in parallel. This is much faster for large tables.
-            // CRITICAL: Cannot use parallel path when there's outer context because
-            // the WHERE clause may reference outer columns (e.g., products.id in
-            // a correlated subquery like WHERE product_id = products.id)
-            let use_parallel_path =
-                !has_correlated && !has_outer_context && processed_where.is_some();
+            let early_termination_target = if can_early_terminate {
+                let counts = row_counts(stmt, ctx)?;
+                counts.limit.map(|limit| (counts.offset, limit))
+            } else {
+                None
+            };
 
-            if use_parallel_path {
-                let where_expr = processed_where.as_ref().unwrap();
+            // Use early termination path if we have a target
+            if let Some((early_offset, early_limit)) = early_termination_target {
+                let target = early_offset.saturating_add(early_limit);
+                // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
+                // with early termination. We fetch in batches to avoid loading
+                // all rows when only a few are needed.
+                let mut result_rows = RowVec::with_capacity(target.min(1000));
+                let plan = storage_expr
+                    .as_deref()
+                    .and_then(|e| table.limited_index_plan(e));
+                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
 
-                // EARLY TERMINATION: For LIMIT queries without ORDER BY, GROUP BY,
-                // aggregation, or window functions, use streaming filter with early
-                // termination. This is critical for NOT IN performance.
-                let can_early_terminate = !classification.has_order_by
-                    && !classification.has_group_by
-                    && !classification.has_aggregation
-                    && !classification.has_window_functions
-                    && !stmt.distinct
-                    && stmt.distinct_on.is_empty();
+                if needs_memory_filter {
+                    // PARTIAL PUSHDOWN: Storage handles some filtering, memory handles rest.
+                    // Use batched fetching with increasing batch sizes to minimize work.
+                    let mut batch_size = target.max(100); // Start with at least target rows
+                    let mut offset = 0usize;
 
-                let early_termination_target = if can_early_terminate {
-                    let counts = row_counts(stmt, ctx)?;
-                    counts.limit.map(|limit| (counts.offset, limit))
-                } else {
-                    None
-                };
+                    // Pre-compile filter ONCE outside the loop
+                    let mut memory_eval =
+                        ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
 
-                // Use early termination path if we have a target
-                if let Some((early_offset, early_limit)) = early_termination_target {
-                    let target = early_offset.saturating_add(early_limit);
-                    // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
-                    // with early termination. We fetch in batches to avoid loading
-                    // all rows when only a few are needed.
-                    let mut result_rows = RowVec::with_capacity(target.min(1000));
-                    let plan = storage_expr
-                        .as_deref()
-                        .and_then(|e| table.limited_index_plan(e));
-                    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-
-                    if needs_memory_filter {
-                        // PARTIAL PUSHDOWN: Storage handles some filtering, memory handles rest.
-                        // Use batched fetching with increasing batch sizes to minimize work.
-                        let mut batch_size = target.max(100); // Start with at least target rows
-                        let mut offset = 0usize;
-
-                        // Pre-compile filter ONCE outside the loop
-                        let mut memory_eval =
-                            ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
-
-                        loop {
-                            // Fetch batch from storage with storage filter + limit
-                            // Now returns RowVec directly with row IDs preserved
-                            let batch = table.collect_access_rows_with_limit(
-                                access,
-                                storage_expr.as_deref(),
-                                batch_size,
-                                offset,
-                            )?;
-
-                            if batch.is_empty() {
-                                break; // No more rows from storage
-                            }
-
-                            // Apply full WHERE filter (includes both pushed and non-pushed parts)
-                            for (row_id, row) in batch {
-                                if memory_eval.eval_bool_checked(&row)? {
-                                    result_rows.push((row_id, row));
-                                    if result_rows.len() >= target {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if result_rows.len() >= target {
-                                break; // Got enough rows
-                            }
-
-                            // Need more rows - increase batch size and offset
-                            offset += batch_size;
-                            batch_size *= 2; // Exponential backoff
-                        }
-                    } else {
-                        // NO MEMORY FILTER NEEDED: Full filter pushed to storage.
-                        // Use storage-level limit directly. Returns RowVec directly.
-                        result_rows = table.collect_access_rows_with_limit(
+                    loop {
+                        // Fetch batch from storage with storage filter + limit
+                        // Now returns RowVec directly with row IDs preserved
+                        let batch = table.collect_access_rows_with_limit(
                             access,
                             storage_expr.as_deref(),
-                            target,
-                            0,
+                            batch_size,
+                            offset,
                         )?;
-                    }
 
-                    // The rows OFFSET skips were collected too; drop them and cut to
-                    // LIMIT here, since this path reports both as applied
-                    let mut trimmed = result_rows.into_vec();
-                    trimmed.drain(..early_offset.min(trimmed.len()));
-                    trimmed.truncate(early_limit);
-                    let result_rows = RowVec::from_vec(trimmed);
-                    // Project rows and return early - LIMIT/OFFSET already applied
-                    let projected_rows = self.project_rows_with_alias(
-                        &stmt.columns,
-                        result_rows,
-                        &all_columns,
-                        Some(&all_columns_lower),
-                        ctx,
-                        table_alias.as_deref(),
+                        if batch.is_empty() {
+                            break; // No more rows from storage
+                        }
+
+                        // Apply full WHERE filter (includes both pushed and non-pushed parts)
+                        for (row_id, row) in batch {
+                            if memory_eval.eval_bool_checked(&row)? {
+                                result_rows.push((row_id, row));
+                                if result_rows.len() >= target {
+                                    break;
+                                }
+                            }
+                        }
+
+                        if result_rows.len() >= target {
+                            break; // Got enough rows
+                        }
+
+                        // Need more rows - increase batch size and offset
+                        offset += batch_size;
+                        batch_size *= 2; // Exponential backoff
+                    }
+                } else {
+                    // NO MEMORY FILTER NEEDED: Full filter pushed to storage.
+                    // Use storage-level limit directly. Returns RowVec directly.
+                    result_rows = table.collect_access_rows_with_limit(
+                        access,
+                        storage_expr.as_deref(),
+                        target,
+                        0,
                     )?;
-                    let output_columns = CompactArc::new(self.get_output_column_names(
-                        &stmt.columns,
-                        &all_columns,
-                        table_alias.as_deref(),
-                    ));
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&output_columns),
-                        projected_rows,
-                    );
-                    return Ok((Box::new(result), output_columns, true, None)); // true = LIMIT applied
                 }
 
-                // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
-                // Without a storage filter there is no index opportunity,
-                // so the table hands back the materialized RowVec directly
-                // (with real row ids) instead of a per-row scanner drain.
-                // With one, the access rule picks the scan's keys or indexes.
-                let all_rows = if storage_expr.is_none() {
-                    table.collect_all_rows(None)?
-                } else {
-                    let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
-                    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                    let mut scanner = table.scan_access(
-                        access,
-                        &column_idx_vec,
-                        needed.as_deref(),
-                        storage_expr.as_deref(),
-                    )?;
-                    let mut all_rows =
-                        RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
-                    while scanner.next() {
-                        all_rows.push(scanner.take_row_with_id());
-                    }
-                    if let Some(error) = scanner.err() {
-                        return Err(error.clone());
-                    }
-                    all_rows
-                };
-
-                // Apply parallel filtering if we have enough rows
-                // CRITICAL: Propagate errors with ? instead of silently swallowing them
-                let filtered = parallel::parallel_filter(
-                    all_rows,
-                    where_expr,
+                // The rows OFFSET skips were collected too; drop them and cut to
+                // LIMIT here, since this path reports both as applied
+                let mut trimmed = result_rows.into_vec();
+                trimmed.drain(..early_offset.min(trimmed.len()));
+                trimmed.truncate(early_limit);
+                let result_rows = RowVec::from_vec(trimmed);
+                // Project rows and return early - LIMIT/OFFSET already applied
+                let projected_rows = self.project_rows_with_alias(
+                    &stmt.columns,
+                    result_rows,
                     &all_columns,
-                    &self.function_registry,
-                    &parallel_config,
+                    Some(&all_columns_lower),
                     ctx,
+                    table_alias.as_deref(),
                 )?;
-                (filtered, None, None)
+                let output_columns = CompactArc::new(self.get_output_column_names(
+                    &stmt.columns,
+                    &all_columns,
+                    table_alias.as_deref(),
+                ));
+                let result = ExecutorResult::with_arc_columns(
+                    CompactArc::clone(&output_columns),
+                    projected_rows,
+                );
+                return Ok((Box::new(result), output_columns, true, None)); // true = LIMIT applied
+            }
+
+            // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
+            // Without a storage filter there is no index opportunity,
+            // so the table hands back the materialized RowVec directly
+            // (with real row ids) instead of a per-row scanner drain.
+            // With one, the access rule picks the scan's keys or indexes.
+            let all_rows = if storage_expr.is_none() {
+                table.collect_all_rows(None)?
             } else {
-                // SEQUENTIAL PATH: For correlated subqueries or complex cases
-                // Create evaluator once and reuse for all rows
-                let mut eval = if processed_where.is_some() {
-                    let mut e = CompiledEvaluator::new(&self.function_registry);
-                    e = e.with_context(ctx);
-                    e.init_columns(&all_columns);
-                    Some(e)
-                } else {
-                    None
-                };
-
-                // OPTIMIZATION: Pre-compute column name mappings outside the loop
-                // This avoids repeated to_lowercase() and format!() calls per row
-                let column_keys: Option<Vec<ColumnKeyMapping>> = if has_correlated {
-                    Some(ColumnKeyMapping::build_mappings(
-                        &all_columns,
-                        table_alias.as_deref(),
-                    ))
-                } else {
-                    None
-                };
-
-                // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
-                let base_capacity = all_columns.len() * 2 + ctx.outer_row().map_or(0, |m| m.len());
-                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
-                outer_row_map.reserve(base_capacity);
-
-                // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows (only if needed)
-                let all_columns_arc: Option<CompactArc<Vec<String>>> = if has_correlated {
-                    Some(all_columns.clone())
-                } else {
-                    None
-                };
-
-                // LIMIT EARLY TERMINATION: For correlated subqueries without ORDER BY,
-                // we can stop as soon as we have enough matching rows.
-                // This turns O(outer_size) EXISTS evaluations into O(LIMIT) evaluations.
-                let early_termination_target: Option<usize> =
-                    if has_correlated && stmt.order_by.is_empty() {
-                        rows_needed(stmt, ctx)
-                    } else {
-                        None
-                    };
-
-                // Create scanner for the correlated subquery path
-                // For correlated subqueries, we can't push down the WHERE clause to storage
-                // because it depends on outer row values that change per row
                 let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
                 let mut scanner = table.scan_access(
@@ -4996,169 +4286,27 @@ impl Executor {
                     needed.as_deref(),
                     storage_expr.as_deref(),
                 )?;
-
-                // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
-                let mut rows: RowVec = RowVec::with_capacity(64);
-                let mut row_count = 0u64;
+                let mut all_rows = RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
                 while scanner.next() {
-                    // Check for cancellation every 100 rows (more frequent for slow queries)
-                    row_count += 1;
-                    if row_count.is_multiple_of(100) {
-                        ctx.check_cancelled()?;
-                    }
-
-                    let row = scanner.take_row();
-
-                    // Apply in-memory WHERE filter if needed (for complex expressions or subqueries)
-                    if let (Some(ref where_expr), Some(ref mut evaluator)) =
-                        (&processed_where, &mut eval)
-                    {
-                        evaluator.set_row_array(&row);
-
-                        // For correlated subqueries, process per-row with outer context
-                        if has_correlated {
-                            #[cfg(feature = "test-failpoints")]
-                            crate::test_failpoints::general_path_reached(
-                                crate::test_failpoints::GeneralPath::CorrelatedScan,
-                            );
-                            // OPTIMIZATION: Clear and reuse outer_row_map instead of creating new
-                            outer_row_map.clear();
-
-                            // OPTIMIZATION: Copy parent outer context if exists (for nested correlated subqueries)
-                            // Parent context doesn't change per row, but we need to clone since
-                            // std::mem::take moves the map out each iteration
-                            if let Some(parent_outer_row) = ctx.outer_row() {
-                                outer_row_map.extend(
-                                    parent_outer_row.iter().map(|(k, v)| (k.clone(), v.clone())),
-                                );
-                            }
-
-                            // Use pre-computed column mappings
-                            if let Some(ref keys) = column_keys {
-                                for mapping in keys {
-                                    if let Some(value) = row.get(mapping.index) {
-                                        // OPTIMIZATION: Clone value once and reuse for all key insertions
-                                        // Previously we cloned 2-3 times per column
-                                        let cloned_value = value.clone();
-
-                                        // Insert with unqualified part first (if column had a dot)
-                                        if let Some(ref upart) = mapping.unqualified_part {
-                                            outer_row_map
-                                                .insert(upart.clone(), cloned_value.clone());
-                                        }
-
-                                        // Insert with qualified name if available
-                                        if let Some(ref qname) = mapping.qualified_name {
-                                            outer_row_map
-                                                .insert(qname.clone(), cloned_value.clone());
-                                        }
-
-                                        // Insert with lowercase column name (move, no clone)
-                                        outer_row_map
-                                            .insert(mapping.col_lower.clone(), cloned_value);
-                                    }
-                                }
-                            }
-
-                            // Create context with outer row (cheap due to Arc)
-                            // SAFETY: all_columns_arc is always Some when has_correlated is true
-                            let mut correlated_ctx = ctx.with_outer_row(
-                                std::mem::take(&mut outer_row_map),
-                                all_columns_arc.clone().unwrap(), // Arc clone = cheap
-                            );
-
-                            // FAST PATH: If WHERE is just EXISTS or NOT EXISTS, evaluate directly
-                            // without creating AST nodes. This saves ~2-3μs per row.
-                            let (result, used_evaluator) = if let Expression::Exists(exists) =
-                                where_expr
-                            {
-                                let r = self
-                                    .execute_exists_subquery(&exists.subquery, &correlated_ctx)?;
-                                (r, false)
-                            } else if let Expression::Prefix(prefix) = where_expr {
-                                if prefix.operator.eq_ignore_ascii_case("NOT") {
-                                    if let Expression::Exists(exists) = prefix.right.as_ref() {
-                                        let r = !self.execute_exists_subquery(
-                                            &exists.subquery,
-                                            &correlated_ctx,
-                                        )?;
-                                        (r, false)
-                                    } else {
-                                        // Not a simple NOT EXISTS, use standard path
-                                        let processed = self.process_correlated_where(
-                                            where_expr,
-                                            &correlated_ctx,
-                                        )?;
-                                        ctx.check_cancelled()?;
-                                        evaluator.set_outer_row_owned(
-                                            correlated_ctx.outer_row.take().unwrap_or_default(),
-                                        );
-                                        evaluator.set_row_array(&row);
-                                        let r = evaluator.evaluate_bool(&processed)?;
-                                        (r, true)
-                                    }
-                                } else {
-                                    // Not EXISTS/NOT EXISTS, use standard path
-                                    let processed =
-                                        self.process_correlated_where(where_expr, &correlated_ctx)?;
-                                    ctx.check_cancelled()?;
-                                    evaluator.set_outer_row_owned(
-                                        correlated_ctx.outer_row.take().unwrap_or_default(),
-                                    );
-                                    evaluator.set_row_array(&row);
-                                    let r = evaluator.evaluate_bool(&processed)?;
-                                    (r, true)
-                                }
-                            } else {
-                                // Complex WHERE expression, use standard path
-                                let processed =
-                                    self.process_correlated_where(where_expr, &correlated_ctx)?;
-
-                                // Check for cancellation after processing each correlated subquery
-                                // This is critical for slow correlated subqueries
-                                ctx.check_cancelled()?;
-
-                                // OPTIMIZATION: Take ownership instead of cloning - avoids HashMap clone
-                                evaluator.set_outer_row_owned(
-                                    correlated_ctx.outer_row.take().unwrap_or_default(),
-                                );
-                                evaluator.set_row_array(&row);
-
-                                (evaluator.evaluate_bool(&processed)?, true)
-                            };
-
-                            // Take back the map for reuse
-                            if used_evaluator {
-                                outer_row_map = evaluator.take_outer_row();
-                            } else {
-                                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
-                            }
-
-                            if !result {
-                                continue;
-                            }
-                        } else {
-                            // Standard evaluation for non-correlated subqueries
-                            if !evaluator.evaluate_bool(where_expr)? {
-                                continue;
-                            }
-                        }
-                    }
-
-                    rows.push((row_count as i64, row));
-
-                    // LIMIT EARLY TERMINATION: Stop if we have enough rows
-                    if let Some(target) = early_termination_target {
-                        if rows.len() >= target {
-                            break;
-                        }
-                    }
+                    all_rows.push(scanner.take_row_with_id());
                 }
                 if let Some(error) = scanner.err() {
                     return Err(error.clone());
                 }
-                (rows, None, None)
-            }
+                all_rows
+            };
+
+            // Apply parallel filtering if we have enough rows
+            // CRITICAL: Propagate errors with ? instead of silently swallowing them
+            let filtered = parallel::parallel_filter(
+                all_rows,
+                where_expr,
+                &all_columns,
+                &self.function_registry,
+                &parallel_config,
+                ctx,
+            )?;
+            (filtered, None, None)
         } else if storage_expr.is_some() {
             // Path 2: WHERE clause with pushdown - use scanner for index optimization
             // Note: We fetch all columns here because downstream projection uses all_columns indices
@@ -5166,7 +4314,6 @@ impl Executor {
             // A table that reads by need materializes only the columns the
             // statement names; anything a name cannot stand for reads all
             let needed = (table.narrows_scans()
-                && !has_outer_context
                 && !classification.has_window_functions
                 && !classification.select_has_scalar_subqueries
                 && !classification.where_has_subqueries)
@@ -5484,17 +4631,6 @@ impl Executor {
         let held = std::sync::Arc::new(PreparedJoin::new(validity, ctx.cte_scope()));
         *guard = CompiledExecution::PreparedJoin(std::sync::Arc::clone(&held));
         Some(held)
-    }
-
-    /// Whether a grouped or windowed statement reads its SELECT list's
-    /// uncorrelated subqueries before it runs, keeping nothing in its plan
-    pub(crate) fn folds_select_subqueries(
-        stmt: &SelectStatement,
-        classification: &QueryClassification,
-    ) -> bool {
-        (classification.has_aggregation || classification.has_window_functions)
-            && stmt.columns.iter().any(Self::has_subqueries)
-            && !Self::has_correlated_select_subqueries(&stmt.columns)
     }
 
     /// Whether the join's ON is an INNER join's written one, which a WHERE
@@ -5913,39 +5049,6 @@ impl Executor {
         })
     }
 
-    /// `predicate` of `join` with the parent row's values in place of the
-    /// columns it names outside the joined tables; None with no parent row
-    /// or no such column. A conjunct holding a subquery is left for the
-    /// per-row path, which binds it
-    fn bind_to_parent_row(
-        join: &JoinTableSource,
-        predicate: &Expression,
-        ctx: &ExecutionContext,
-    ) -> Option<Expression> {
-        let outer = ctx.outer_row()?;
-        let mut tables = smallvec::SmallVec::new();
-        Self::collect_table_names_from_source(&join.left, &mut tables);
-        Self::collect_table_names_from_source(&join.right, &mut tables);
-        if !Self::references_outer_columns(predicate, &tables) {
-            return None;
-        }
-        let scope = super::utils::InnerScope {
-            tables: &tables,
-            schema: None,
-        };
-        let bound = flatten_and_predicates(predicate)
-            .into_iter()
-            .map(|pred| {
-                if Self::has_subqueries(&pred) {
-                    pred
-                } else {
-                    super::utils::substitute_outer_references_in_scope(&pred, outer, &scope)
-                }
-            })
-            .collect();
-        combine_predicates_with_and(bound)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn execute_join_source_capped(
         &self,
@@ -5959,39 +5062,6 @@ impl Executor {
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
-        // A parent row's column named through the parent's table is bound in
-        // the ON and the WHERE before either is read, or the bare name it
-        // falls back to would read a joined column of that name
-        let bound_source;
-        let join_source = match join_source
-            .condition
-            .as_deref()
-            .filter(|_| ctx.outer_row().is_some())
-        {
-            Some(on) => {
-                // An uncorrelated subquery folds first, as it would below,
-                // so the parent's columns beside it are bound too
-                let folded = match Self::has_subqueries(on) && !Self::has_correlated_subqueries(on)
-                {
-                    true => Some(self.process_where_subqueries(on, ctx)?),
-                    false => None,
-                };
-                let bound =
-                    Self::bind_to_parent_row(join_source, folded.as_ref().unwrap_or(on), ctx);
-                match bound.or(folded) {
-                    Some(condition) => {
-                        bound_source = JoinTableSource {
-                            condition: Some(Box::new(condition)),
-                            ..join_source.clone()
-                        };
-                        &bound_source
-                    }
-                    None => join_source,
-                }
-            }
-            None => join_source,
-        };
-
         // Get table aliases for filter pushdown
         let left_alias = get_table_alias_from_expr(&join_source.left);
         let right_alias = get_table_alias_from_expr(&join_source.right);
@@ -6001,17 +5071,13 @@ impl Executor {
         let left_schema = self.base_table_side_schema(&join_source.left, CteNames::Context(ctx));
         let right_schema = self.base_table_side_schema(&join_source.right, CteNames::Context(ctx));
 
-        // The plan holds what the join compiles, unless this execution read a
-        // value into its clauses: a folded subquery or an outer row. A join
-        // whose ON and WHERE subqueries the blocks run runs them so; any
-        // other reads them per execution
+        // The plan holds what the join compiles. A join whose ON and WHERE
+        // subqueries the blocks run runs them so
         let on_subqueries = join_source
             .condition
             .as_deref()
             .is_some_and(Self::has_subqueries);
-        let plan = compiled
-            .filter(|_| ctx.outer_row().is_none())
-            .and_then(|slot| self.prepared_join(slot, stmt, ctx));
+        let plan = compiled.and_then(|slot| self.prepared_join(slot, stmt, ctx));
         let block_sides = plan.as_ref().and_then(|plan| {
             plan.sides(|| self.join_side_schemas(join_source, ctx, true))
                 .cloned()
@@ -6028,28 +5094,14 @@ impl Executor {
                 .is_ok()
             })
         });
-        // Outside the blocks, an uncorrelated subquery in the ON clause is read
-        // once, the way the WHERE clause reads one, so every path below
-        // compares each pair against a value rather than against something it
-        // never evaluated
-        let processed_on: Option<Expression> = match join_source.condition.as_deref() {
-            Some(cond)
-                if !blocks_where && on_subqueries && !Self::has_correlated_subqueries(cond) =>
-            {
-                Some(self.process_where_subqueries(cond, ctx)?)
-            }
-            _ => None,
-        };
-        let on_condition: Option<&Expression> =
-            processed_on.as_ref().or(join_source.condition.as_deref());
+        let on_condition: Option<&Expression> = join_source.condition.as_deref();
         let grouped_plan = plan
             .as_ref()
             .filter(|_| Self::grouped_family_reach(stmt, classification))
             .cloned();
-        let prepared = plan.as_deref().filter(|_| {
-            processed_on.is_none()
-                && ((!classification.where_has_subqueries && !on_subqueries) || blocks_where)
-        });
+        let prepared = plan
+            .as_deref()
+            .filter(|_| (!classification.where_has_subqueries && !on_subqueries) || blocks_where);
         // The sides and the blocks read one snapshot, as correlated probes do
         let snapshot_ctx;
         let ctx = if blocks_where
@@ -6069,37 +5121,7 @@ impl Executor {
         // - LEFT JOIN: Can push filters to left (preserved), but NOT to right (may have NULLs)
         // - RIGHT JOIN: Can push filters to right (preserved), but NOT to left
         // - FULL OUTER JOIN: Cannot push filters to either side
-        // Unless the plan runs them as blocks, uncorrelated subqueries in the
-        // WHERE fold to their values before the filters are split, so every
-        // join path sees a plain predicate, and a correlated one left after
-        // the join is evaluated per joined row
-        let correlated_where = classification.where_has_correlated_subqueries;
-        let where_folds = classification.where_has_subqueries && !blocks_where;
-        let where_for_join: Option<Expression> = match &stmt.where_clause {
-            Some(where_clause) if where_folds => {
-                // Each conjunct folds on its own, so an uncorrelated one folds
-                // next to a correlated one
-                let mut folded = Vec::new();
-                for pred in flatten_and_predicates(where_clause) {
-                    if Self::has_subqueries(&pred) && !Self::has_correlated_subqueries(&pred) {
-                        folded.push(self.process_where_subqueries(&pred, ctx)?);
-                    } else {
-                        folded.push(pred);
-                    }
-                }
-                combine_predicates_with_and(folded)
-            }
-            Some(where_clause) => Some((**where_clause).clone()),
-            None => None,
-        };
-        // Bound before the predicates are split, or the side a predicate is
-        // pushed to would read the bare name it falls back to as its own
-        let where_for_join = match where_for_join {
-            Some(where_clause) if ctx.outer_row().is_some() => Some(
-                Self::bind_to_parent_row(join_source, &where_clause, ctx).unwrap_or(where_clause),
-            ),
-            where_for_join => where_for_join,
-        };
+        let where_for_join: Option<Expression> = stmt.where_clause.as_deref().cloned();
         // The WHERE splits over the columns each side is read with, a joined
         // side's by its tables'
         let split = SplitSide::both(
@@ -6136,16 +5158,10 @@ impl Executor {
         // blocks ask those of its others that bind as it is read, and the
         // rest of the joined row with the WHERE's conditions on both sides
         let rows_sides = blocks.as_deref().map_or([false; 2], |held| held.rows_sides);
-        // A joined side runs all of its conditions as a join of its own, not
-        // under the plan it holds when the values this run read are in them
         let joined = [&join_source.left, &join_source.right]
             .map(|side| matches!(**side, Expression::JoinSource(_)));
         let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i]);
-        let side_plan = |side: usize| {
-            plan.as_deref()
-                .map(|plan| plan.side_plan(side))
-                .filter(|_| !(joined[side] && where_folds))
-        };
+        let side_plan = |side: usize| plan.as_deref().map(|plan| plan.side_plan(side));
         let plain = |filter: &Option<Expression>, rows: bool| match rows {
             true => filter.as_ref().and_then(|filter| {
                 combine_predicates_with_and(
@@ -6241,8 +5257,6 @@ impl Executor {
             .filter(|_| !classification.where_has_subqueries)
             .is_some_and(|w| true_for_no_row(w, ctx, &self.function_registry));
 
-        // Outside the blocks a correlated WHERE runs per row on the general path
-        let per_row_where = correlated_where && statement_run.is_none();
         let shape = JoinShape {
             stmt,
             classification,
@@ -6253,7 +5267,6 @@ impl Executor {
             filters: [left_filter.as_ref(), right_filter.as_ref()],
             cross_filter: cross_filter.as_ref(),
             rows_sides,
-            per_row_where,
             blocks: statement_run.is_some(),
             ctes: CteNames::Context(ctx),
         };
@@ -7129,12 +6142,8 @@ impl Executor {
                         // Compute sort keys and indices; compile and
                         // evaluation errors both defer to the standard path
                         let compile = || -> Result<BuiltPrograms> {
-                            let outer_columns = outer_column_names(ctx);
-                            let mut compile_ctx =
+                            let compile_ctx =
                                 CompileContext::new(&all_columns, &self.function_registry);
-                            if let Some(outer) = &outer_columns {
-                                compile_ctx = compile_ctx.with_outer_columns(outer);
-                            }
                             stmt.order_by
                                 .iter()
                                 .map(|ob| {
@@ -7261,7 +6270,6 @@ impl Executor {
                             &all_columns,
                             order_limit_applied,
                             output_blocks,
-                            ctx,
                         )?
                     };
                     if let Some(output) = held.as_deref().and_then(Option::as_ref) {
@@ -7572,7 +6580,7 @@ impl Executor {
                 let (all_cols, joined_rows) =
                     merged_side_rows(stmt, merging, all_cols, join_result.rows);
                 let held =
-                    self.held_join_output(prepared, stmt, &all_cols, false, output_blocks, ctx)?;
+                    self.held_join_output(prepared, stmt, &all_cols, false, output_blocks)?;
                 if let Some(output) = held.as_deref().and_then(Option::as_ref) {
                     return output_result(output, joined_rows, false);
                 }
@@ -7752,88 +6760,26 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(where_expr) = effective_where {
-            if per_row_where {
-                let resolved = Self::with_select_aliases(stmt, &where_expr, &all_columns)
-                    .unwrap_or(where_expr);
-                let where_clause = &resolved;
-                // Each joined row is the outer row of the subqueries in the
-                // WHERE, so they are resolved and the predicate compiled per row
-                let keys = ColumnKeyMapping::build_mappings(&all_columns, None);
-                let outer_columns = CompactArc::new(all_columns.clone());
-                let joined_qualifiers: Vec<String> = {
-                    let mut qualifiers: Vec<String> = all_columns
-                        .iter()
-                        .filter_map(|c| split_qualified(c).map(|(q, _)| q.to_lowercase()))
-                        .collect();
-                    qualifiers.sort_unstable();
-                    qualifiers.dedup();
-                    qualifiers
-                };
-                let joined_qualifiers: Vec<&str> =
-                    joined_qualifiers.iter().map(String::as_str).collect();
-                let mut filtered = RowVec::with_capacity(result_rows.len());
-                for (id, row) in result_rows {
-                    // The row of a query around this one stays visible to the subqueries
-                    let mut outer: FxHashMap<CompactArc<str>, Value> =
-                        ctx.outer_row().cloned().unwrap_or_default();
-                    for key in &keys {
-                        if let Some(value) = row.get(key.index) {
-                            if let Some(unqualified) = &key.unqualified_part {
-                                outer.insert(unqualified.clone(), value.clone());
-                            }
-                            outer.insert(key.col_lower.clone(), value.clone());
-                        }
-                    }
-                    let row_ctx = ctx.with_outer_row(outer, outer_columns.clone());
-                    let processed = self.process_correlated_where(where_clause, &row_ctx)?;
-                    ctx.check_cancelled()?;
-                    // A column of the query around this one is not in the joined
-                    // row, so a reference through the parent's table takes its
-                    // value from the context; one through a joined table's name
-                    // is the row's own, whatever bare name it shares
-                    let bound = match row_ctx.outer_row() {
-                        Some(outer) => {
-                            let scope = super::utils::InnerScope {
-                                tables: &joined_qualifiers,
-                                schema: None,
-                            };
-                            super::utils::substitute_outer_references_in_scope(
-                                &processed, outer, &scope,
-                            )
-                        }
-                        None => processed,
-                    };
-                    if RowFilter::new(&bound, &all_columns)?
-                        .with_context(&row_ctx)
-                        .matches_checked(&row)?
-                    {
-                        filtered.push((id, row));
-                    }
-                }
-                filtered
-            } else {
-                // Its subqueries run as the plan's blocks, or were folded
-                // before the filters were split
-                let program = self.join_where(
-                    prepared,
-                    WhereSite::AfterJoin,
-                    stmt,
-                    &where_expr,
-                    &all_columns,
-                    blocks.as_deref(),
-                )?;
-                let mut where_filter = JoinedWhere::new(program, blocks_run.as_ref(), ctx);
-                if let Some(run) = &blocks_run {
-                    run.ask_rows(Some(result_rows.len()));
-                }
-                let mut filtered = RowVec::with_capacity(result_rows.len());
-                for (id, row) in result_rows {
-                    if where_filter.matches(&row, where_blocks)? {
-                        filtered.push((id, row));
-                    }
-                }
-                filtered
+            // Its subqueries run as the plan's blocks
+            let program = self.join_where(
+                prepared,
+                WhereSite::AfterJoin,
+                stmt,
+                &where_expr,
+                &all_columns,
+                blocks.as_deref(),
+            )?;
+            let mut where_filter = JoinedWhere::new(program, blocks_run.as_ref(), ctx);
+            if let Some(run) = &blocks_run {
+                run.ask_rows(Some(result_rows.len()));
             }
+            let mut filtered = RowVec::with_capacity(result_rows.len());
+            for (id, row) in result_rows {
+                if where_filter.matches(&row, where_blocks)? {
+                    filtered.push((id, row));
+                }
+            }
+            filtered
         } else {
             result_rows
         };
@@ -7859,8 +6805,7 @@ impl Executor {
         }
         let (final_columns, final_rows) = merge(all_columns, filtered_rows);
 
-        let held =
-            self.held_join_output(prepared, stmt, &final_columns, false, output_blocks, ctx)?;
+        let held = self.held_join_output(prepared, stmt, &final_columns, false, output_blocks)?;
         if let Some(output) = held.as_deref().and_then(Option::as_ref) {
             return output_result(output, final_rows, false);
         }
@@ -7917,50 +6862,6 @@ impl Executor {
         ))
     }
 
-    /// Keep the rows of an in-memory source that pass a WHERE holding a
-    /// correlated subquery, each row bound as the subquery's outer row
-    pub(crate) fn filter_rows_by_correlated_where(
-        &self,
-        where_expr: &Expression,
-        rows: RowVec,
-        columns: &[String],
-        table_alias: Option<&str>,
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
-        evaluator.init_columns(columns);
-        let column_keys = ColumnKeyMapping::build_mappings(columns, table_alias);
-        let columns_arc = CompactArc::new(columns.to_vec());
-        let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
-        let mut kept = RowVec::with_capacity(rows.len());
-        for (id, row) in rows {
-            outer_row_map.clear();
-            for mapping in &column_keys {
-                if let Some(value) = row.get(mapping.index) {
-                    if let Some(ref upart) = mapping.unqualified_part {
-                        outer_row_map.insert(upart.clone(), value.clone());
-                    }
-                    if let Some(ref qname) = mapping.qualified_name {
-                        outer_row_map.insert(qname.clone(), value.clone());
-                    }
-                    outer_row_map.insert(mapping.col_lower.clone(), value.clone());
-                }
-            }
-            let mut correlated_ctx =
-                ctx.with_outer_row(std::mem::take(&mut outer_row_map), columns_arc.clone());
-            let processed = self.process_correlated_where(where_expr, &correlated_ctx)?;
-            ctx.check_cancelled()?;
-            evaluator.set_outer_row_owned(correlated_ctx.outer_row.take().unwrap_or_default());
-            evaluator.set_row_array(&row);
-            let keep = evaluator.evaluate_bool(&processed)?;
-            outer_row_map = evaluator.take_outer_row();
-            if keep {
-                kept.push((id, row));
-            }
-        }
-        Ok(kept)
-    }
-
     /// Execute a subquery source
     fn execute_subquery_source(
         &self,
@@ -7990,49 +6891,17 @@ impl Executor {
             return Err(err);
         }
 
-        // Apply WHERE clause if present. A parent row's column named through
-        // its own table is bound first, or the bare name it would fall
-        // back to could be this source's own
+        // Apply WHERE clause if present
         let filtered_rows: RowVec = if let Some(ref where_clause) = stmt.where_clause {
-            let bound_where;
-            let where_clause: &Expression = match ctx.outer_row() {
-                Some(outer) => {
-                    let inner: Vec<&str> = subquery_source
-                        .alias
-                        .iter()
-                        .map(|a| a.value_lower.as_str())
-                        .collect();
-                    let scope = super::utils::InnerScope {
-                        tables: &inner,
-                        schema: None,
-                    };
-                    bound_where = super::utils::substitute_outer_references_in_scope(
-                        where_clause,
-                        outer,
-                        &scope,
-                    );
-                    &bound_where
-                }
-                None => where_clause,
-            };
-            if Self::has_correlated_subqueries(where_clause) {
-                let alias = subquery_source
-                    .alias
-                    .as_ref()
-                    .map(|a| a.value_lower.as_str());
-                self.filter_rows_by_correlated_where(where_clause, rows, &columns, alias, ctx)?
-            } else {
-                let where_clause = self.answered_where(where_clause, ctx)?;
-                let where_filter = RowFilter::new(&where_clause, &columns)?.with_context(ctx);
+            let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
 
-                let mut filtered = RowVec::with_capacity(rows.len());
-                for (id, row) in rows {
-                    if where_filter.matches_checked(&row)? {
-                        filtered.push((id, row));
-                    }
+            let mut filtered = RowVec::with_capacity(rows.len());
+            for (id, row) in rows {
+                if where_filter.matches_checked(&row)? {
+                    filtered.push((id, row));
                 }
-                filtered
             }
+            filtered
         } else {
             rows
         };
@@ -8059,38 +6928,30 @@ impl Executor {
             self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
         let (projected_rows, layout, applied) = if self.order_by_needs_extra_columns(stmt, &columns)
         {
-            let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
+            let (plan, extra_names, layout) = self.ordered_projection(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
                 stmt.table_expr.as_deref(),
-                filtered_rows,
                 &CompactArc::new(columns.clone()),
                 subquery_alias,
-                ctx,
-            )?;
+            );
             output_columns.extend(extra_names);
             let plan = OutputProjection::Ordered(plan);
-            let (projected_rows, applied) =
-                self.run_output_projection(stmt, &plan, rows, &output_columns, Some(&layout), ctx)?;
-            (projected_rows, Some(layout), applied)
-        } else if Self::has_correlated_select_subqueries(&stmt.columns) {
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
+            let (projected_rows, applied) = self.run_output_projection(
+                stmt,
+                &plan,
                 filtered_rows,
-                &columns,
-                None,
+                &output_columns,
+                Some(&layout),
                 ctx,
-                subquery_alias,
             )?;
-            let layout = Self::output_layout(stmt, &columns, subquery_alias);
-            (projected_rows, layout, false)
+            (projected_rows, Some(layout), applied)
         } else {
-            let plan = OutputProjection::Select(self.select_rows_plan(
+            let plan = OutputProjection::Select(self.select_projection(
                 &stmt.columns,
                 &columns,
                 None,
-                ctx,
                 subquery_alias,
             )?);
             let layout = Self::output_layout(stmt, &columns, subquery_alias);
@@ -8253,82 +7114,8 @@ impl Executor {
             .and_then(super::utils::get_table_alias_from_expr)
             .map(|name| name.to_lowercase());
         if let Some(ref where_clause) = stmt.where_clause {
-            // A parent row's column named through its own table is bound
-            // first, or the bare name it would fall back to could be the
-            // view's own
-            let bound_where;
-            let where_clause: &Expression = match ctx.outer_row() {
-                Some(outer) => {
-                    let inner: Vec<String> = stmt
-                        .table_expr
-                        .as_deref()
-                        .and_then(super::utils::get_table_alias_from_expr)
-                        .map(|name| name.to_lowercase())
-                        .into_iter()
-                        .collect();
-                    let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
-                    let scope = super::utils::InnerScope {
-                        tables: &inner,
-                        schema: None,
-                    };
-                    bound_where = super::utils::substitute_outer_references_in_scope(
-                        where_clause,
-                        outer,
-                        &scope,
-                    );
-                    &bound_where
-                }
-                None => where_clause,
-            };
-            if Self::has_correlated_subqueries(where_clause) {
-                let rows = Self::materialize_result(result)?;
-                let rows = self.filter_rows_by_correlated_where(
-                    where_clause,
-                    rows,
-                    &view_columns,
-                    view_alias.as_deref(),
-                    ctx,
-                )?;
-                result = Box::new(ExecutorResult::new(view_columns.clone(), rows));
-            } else {
-                let where_clause = self.answered_where(where_clause, ctx)?;
-                let filter = RowFilter::new(&where_clause, &view_columns)?.with_context(ctx);
-                result = Box::new(FilteredResult::from_filter(result, filter));
-            }
-        }
-
-        // A correlated subquery in the select list reads each view row as
-        // its outer row, the way it does over a derived table
-        if Self::has_correlated_select_subqueries(&stmt.columns)
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !self.order_by_needs_extra_columns(stmt, &view_columns)
-        {
-            let rows = Self::materialize_result(result)?;
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                rows,
-                &view_columns,
-                None,
-                ctx,
-                view_alias.as_deref(),
-            )?;
-            let output_columns = CompactArc::new(self.get_output_column_names(
-                &stmt.columns,
-                &view_columns,
-                view_alias.as_deref(),
-            ));
-            let result = ExecutorResult::with_arc_columns(
-                CompactArc::clone(&output_columns),
-                projected_rows,
-            );
-            let layout = Self::output_layout(stmt, &view_columns, None);
-            return Ok((
-                Box::new(result),
-                output_columns,
-                false,
-                SelectShape::laid_out(layout),
-            ));
+            let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
+            result = Box::new(FilteredResult::from_filter(result, filter));
         }
 
         // Aggregation and window functions run over the view's rows, materialized
@@ -8382,16 +7169,14 @@ impl Executor {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-            let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
+            let (plan, extra_names, layout) = self.ordered_projection(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
                 stmt.table_expr.as_deref(),
-                rows,
                 &CompactArc::new(view_columns.clone()),
                 view_alias.as_deref(),
-                ctx,
-            )?;
+            );
             let mut output_columns =
                 self.get_output_column_names(&stmt.columns, &view_columns, None);
             output_columns.extend(extra_names);
@@ -8767,12 +7552,8 @@ impl Executor {
             }
         }
         // A name no column has is compiled once, read as the compiler reads
-        // it: the enclosing row's column, a quoted name's text, or an error
-        let outer_columns = outer_column_names(ctx);
-        let mut unbound_ctx = CompileContext::new(&extended_columns, &self.function_registry);
-        if let Some(outer) = &outer_columns {
-            unbound_ctx = unbound_ctx.with_outer_columns(outer);
-        }
+        // it: a quoted name's text, or an error
+        let unbound_ctx = CompileContext::new(&extended_columns, &self.function_registry);
         let unbound: Vec<Option<SharedProgram>> = stmt
             .columns
             .iter()
@@ -8823,11 +7604,8 @@ impl Executor {
 
             for (col_idx, col_expr) in stmt.columns.iter().enumerate() {
                 if let Some(program) = &unbound[col_idx] {
-                    let mut exec =
+                    let exec =
                         ExecuteContext::with_common_params(row, ctx.params(), ctx.transaction_id());
-                    if let Some(outer) = ctx.outer_row() {
-                        exec = exec.with_outer_row(outer);
-                    }
                     new_values.push(unbound_vm.execute(program, &exec)?);
                     continue;
                 }
@@ -8871,71 +7649,13 @@ impl Executor {
                         // Evaluate the underlying expression
                         let eval = proj_eval.as_mut().unwrap();
                         eval.set_row_array(row);
-
-                        // Check if expression contains EXISTS subqueries
-                        let expr_to_eval = if Self::has_subqueries(&a.expression) {
-                            // Check if it's correlated (references outer columns)
-                            if Self::has_correlated_subqueries(&a.expression) {
-                                // Build outer row context for correlated subquery
-                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                                    FxHashMap::default();
-                                for (i, col_name) in extended_columns.iter().enumerate() {
-                                    if let Some(value) = row.get(i) {
-                                        outer_row_map.insert(
-                                            CompactArc::from(col_name.to_lowercase().as_str()),
-                                            value.clone(),
-                                        );
-                                    }
-                                }
-                                let correlated_ctx = ctx.with_outer_row(
-                                    outer_row_map,
-                                    CompactArc::new(extended_columns.clone()),
-                                );
-                                self.process_correlated_where(&a.expression, &correlated_ctx)?
-                            } else {
-                                self.process_where_subqueries(&a.expression, ctx)?
-                            }
-                        } else {
-                            (*a.expression).clone()
-                        };
-
-                        let val = eval.evaluate(&expr_to_eval)?;
-                        new_values.push(val);
+                        new_values.push(eval.evaluate(&a.expression)?);
                     }
                     other => {
                         // Evaluate the expression
                         let eval = proj_eval.as_mut().unwrap();
                         eval.set_row_array(row);
-
-                        // Check if expression contains EXISTS subqueries
-                        let expr_to_eval = if Self::has_subqueries(other) {
-                            // Check if it's correlated (references outer columns)
-                            if Self::has_correlated_subqueries(other) {
-                                // Build outer row context for correlated subquery
-                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
-                                    FxHashMap::default();
-                                for (i, col_name) in extended_columns.iter().enumerate() {
-                                    if let Some(value) = row.get(i) {
-                                        outer_row_map.insert(
-                                            CompactArc::from(col_name.to_lowercase().as_str()),
-                                            value.clone(),
-                                        );
-                                    }
-                                }
-                                let correlated_ctx = ctx.with_outer_row(
-                                    outer_row_map,
-                                    CompactArc::new(extended_columns.clone()),
-                                );
-                                self.process_correlated_where(other, &correlated_ctx)?
-                            } else {
-                                self.process_where_subqueries(other, ctx)?
-                            }
-                        } else {
-                            other.clone()
-                        };
-
-                        let val = eval.evaluate(&expr_to_eval)?;
-                        new_values.push(val);
+                        new_values.push(eval.evaluate(other)?);
                     }
                 }
             }
@@ -9663,7 +8383,7 @@ impl Executor {
         (left_width, blocks): (usize, Option<&JoinBlocks>),
     ) -> SelectResult {
         let in_family = Self::grouped_family_reach(stmt, classification) && {
-            let decide = || self.grouped_family(stmt, Some(ctx)).is_ok();
+            let decide = || self.grouped_family(stmt).is_ok();
             plan.map_or_else(decide, |plan| plan.grouped(decide))
         };
         let apart = blocks.filter(|_| in_family);
@@ -10179,7 +8899,6 @@ impl Executor {
         }
         let having = match &stmt.having {
             Some(having) => {
-                let processed = self.process_where_subqueries(having, ctx)?;
                 let group_items: Vec<crate::executor::aggregation::GroupByItem> = group_names
                     .iter()
                     .map(|name| crate::executor::aggregation::GroupByItem::Column(name.clone()))
@@ -10189,9 +8908,7 @@ impl Executor {
                     &aggregations,
                     &stmt.columns,
                 );
-                Some(
-                    RowFilter::with_aliases(&processed, &result_columns, &slots)?.with_context(ctx),
-                )
+                Some(RowFilter::with_aliases(having, &result_columns, &slots)?.with_context(ctx))
             }
             None => None,
         };
@@ -10512,7 +9229,7 @@ impl Executor {
         Ok(CompactArc::new(rows))
     }
 
-    /// Project rows with optional table alias for correlated subquery support
+    /// Project rows with optional table alias
     ///
     /// If `all_columns_lower` is provided, it will be used directly instead of
     /// computing lowercase column names per-query. Pass pre-cached values from
@@ -10526,49 +9243,12 @@ impl Executor {
         ctx: &ExecutionContext,
         table_alias: Option<&str>,
     ) -> Result<RowVec> {
-        // Correlated subqueries are evaluated per row
-        if Self::has_correlated_select_subqueries(select_exprs) {
-            return self.project_rows_correlated(
-                select_exprs,
-                rows,
-                all_columns,
-                all_columns_lower,
-                ctx,
-                table_alias,
-            );
-        }
-        let plan = self.select_rows_plan(
-            select_exprs,
-            all_columns,
-            all_columns_lower,
-            ctx,
-            table_alias,
-        )?;
+        let plan =
+            self.select_projection(select_exprs, all_columns, all_columns_lower, table_alias)?;
         Self::run_select_projection(&plan, rows, ctx)
     }
 
-    /// The plan of [`Self::project_rows_with_alias`] for a SELECT list
-    /// without correlated subqueries
-    fn select_rows_plan(
-        &self,
-        select_exprs: &[Expression],
-        all_columns: &[String],
-        all_columns_lower: Option<&[String]>,
-        ctx: &ExecutionContext,
-        table_alias: Option<&str>,
-    ) -> Result<SelectProjection> {
-        // Process scalar subqueries in SELECT columns before evaluation (single-pass)
-        let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
-        self.select_projection(
-            processed.as_deref().unwrap_or(select_exprs),
-            all_columns,
-            all_columns_lower,
-            table_alias,
-        )
-    }
-
-    /// How a SELECT list without correlated subqueries projects rows of
-    /// `all_columns`, found before any row
+    /// How a SELECT list projects rows of `all_columns`, found before any row
     fn select_projection(
         &self,
         select_exprs: &[Expression],
@@ -10800,141 +9480,6 @@ impl Executor {
             }
         }
         Ok(())
-    }
-
-    /// Project rows whose SELECT list holds a correlated subquery, binding
-    /// each row as the subquery's outer row
-    fn project_rows_correlated(
-        &self,
-        select_exprs: &[Expression],
-        rows: RowVec,
-        all_columns: &[String],
-        all_columns_lower: Option<&[String]>,
-        ctx: &ExecutionContext,
-        table_alias: Option<&str>,
-    ) -> Result<RowVec> {
-        let col_index_map_lower = lower_index_map(all_columns, all_columns_lower);
-
-        // Correlated subquery path: expressions change per-row, use CompiledEvaluator
-        let mut projected = RowVec::with_capacity(rows.len());
-
-        // Create evaluator once and reuse for all rows
-        let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-        evaluator = evaluator.with_context(ctx);
-        evaluator.init_columns(all_columns);
-
-        // OPTIMIZATION: Pre-compute column name mappings outside the loop for correlated subqueries
-        let column_keys = ColumnKeyMapping::build_mappings(all_columns, table_alias);
-
-        // OPTIMIZATION: Pre-allocate outer_row_map with capacity and reuse
-        // Uses CompactArc<str> keys for zero-cost cloning in the per-row loop
-        let base_capacity = all_columns.len() * 2;
-        let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
-        outer_row_map.reserve(base_capacity);
-
-        // OPTIMIZATION: Wrap all_columns in CompactArc once, reuse for all rows
-        let all_columns_arc: CompactArc<Vec<String>> = CompactArc::new(all_columns.to_vec());
-
-        // The columns each qualified star takes, found once for every row
-        let qualified_star_cache: FxHashMap<&str, Vec<usize>> = select_exprs
-            .iter()
-            .filter_map(|expr| {
-                let Expression::QualifiedStar(qs) = expr else {
-                    return None;
-                };
-                let mut taken = Vec::new();
-                for_each_qualified_star_column(
-                    all_columns,
-                    &qs.qualifier,
-                    table_alias,
-                    |idx, _| taken.push(idx),
-                );
-                Some((qs.qualifier.as_str(), taken))
-            })
-            .collect();
-
-        for (id, row) in rows.into_iter() {
-            // Use CompactVec directly instead of Vec to avoid Vec->CompactVec conversion
-            let mut values: CompactVec<Value> = CompactVec::with_capacity(select_exprs.len());
-
-            evaluator.set_row_array(&row);
-
-            // OPTIMIZATION: Clear and reuse outer_row_map instead of creating new
-            outer_row_map.clear();
-
-            // Use pre-computed column mappings
-            for mapping in &column_keys {
-                if let Some(value) = row.get(mapping.index) {
-                    // OPTIMIZATION: Clone value once and reuse for all key insertions
-                    let cloned_value = value.clone();
-
-                    // Insert with unqualified part first (if column had a dot)
-                    if let Some(ref upart) = mapping.unqualified_part {
-                        outer_row_map.insert(upart.clone(), cloned_value.clone());
-                    }
-
-                    // Insert with qualified name if available
-                    if let Some(ref qname) = mapping.qualified_name {
-                        outer_row_map.insert(qname.clone(), cloned_value.clone());
-                    }
-
-                    // Insert with lowercase column name (move, no clone)
-                    outer_row_map.insert(mapping.col_lower.clone(), cloned_value);
-                }
-            }
-
-            // Create context with outer row (cheap due to Arc)
-            let correlated_ctx = ctx.with_outer_row(
-                std::mem::take(&mut outer_row_map),
-                all_columns_arc.clone(), // Arc clone = cheap
-            );
-
-            // Process correlated SELECT expressions for this row
-            let processed_exprs: Result<Vec<Expression>> = select_exprs
-                .iter()
-                .map(|expr| self.process_correlated_expression(expr, &correlated_ctx))
-                .collect();
-
-            // Take back the map for reuse
-            outer_row_map = correlated_ctx.outer_row.unwrap_or_default();
-
-            let exprs_to_eval = processed_exprs?;
-
-            for expr in exprs_to_eval.iter() {
-                match expr {
-                    Expression::Star(_) => {
-                        // Expand all columns
-                        for val in row.iter() {
-                            values.push(val.clone());
-                        }
-                    }
-                    Expression::QualifiedStar(qs) => {
-                        for &idx in qualified_star_cache
-                            .get(qs.qualifier.as_str())
-                            .into_iter()
-                            .flatten()
-                        {
-                            if let Some(val) = row.get(idx) {
-                                values.push(val.clone());
-                            }
-                        }
-                    }
-                    _ => {
-                        let value = self.evaluate_select_expr(
-                            &mut evaluator,
-                            expr,
-                            &row,
-                            &col_index_map_lower,
-                        )?;
-                        values.push(value);
-                    }
-                }
-            }
-
-            projected.push((id, Row::from_compact_vec(values)));
-        }
-
-        Ok(projected)
     }
 
     /// How each expression of a non-correlated projection is evaluated:
@@ -11477,82 +10022,6 @@ impl Executor {
         }
     }
 
-    /// Evaluate each select expression holding a correlated subquery per
-    /// row into a column appended to the rows, and name that column where
-    /// the expression stood, so a projection reads a plain column there
-    fn bind_correlated_select_columns(
-        &self,
-        select_exprs: &[Expression],
-        rows: RowVec,
-        all_columns: &[String],
-        table_alias: Option<&str>,
-        ctx: &ExecutionContext,
-    ) -> Result<(Vec<Expression>, RowVec, Vec<String>)> {
-        let correlated: Vec<usize> = select_exprs
-            .iter()
-            .enumerate()
-            .filter(|(_, expr)| Self::has_correlated_subqueries(expr))
-            .map(|(i, _)| i)
-            .collect();
-        let bare: Vec<Expression> = correlated
-            .iter()
-            .map(|&i| match &select_exprs[i] {
-                Expression::Aliased(aliased) => (*aliased.expression).clone(),
-                expr => expr.clone(),
-            })
-            .collect();
-        let values = self.project_rows_with_alias(
-            &bare,
-            RowVec::from_vec((*rows).clone()),
-            all_columns,
-            None,
-            ctx,
-            table_alias,
-        )?;
-        let mut columns = all_columns.to_vec();
-        let mut exprs = select_exprs.to_vec();
-        // A source column may carry any name, so the bound column takes the
-        // first name no source column has, qualified or bare
-        let taken = |name: &str, columns: &[String]| {
-            columns.iter().any(|column| {
-                column.eq_ignore_ascii_case(name) || bare_name(column).eq_ignore_ascii_case(name)
-            })
-        };
-        let mut next = 0usize;
-        for &i in &correlated {
-            let name = loop {
-                let candidate = format!("__correlated_{next}");
-                next += 1;
-                if !taken(&candidate, &columns) {
-                    break candidate;
-                }
-            };
-            let column = Expression::Identifier(Identifier::new(
-                dummy_token(&name, TokenType::Identifier),
-                name.clone(),
-            ));
-            exprs[i] = match &select_exprs[i] {
-                Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
-                    token: aliased.token.clone(),
-                    expression: Box::new(column),
-                    alias: aliased.alias.clone(),
-                }),
-                _ => column,
-            };
-            columns.push(name);
-        }
-        let rows = rows
-            .into_iter()
-            .zip(values)
-            .map(|((id, row), (_, extra))| {
-                let mut values = row.into_values();
-                values.extend(extra.into_values());
-                (id, Row::from_values(values))
-            })
-            .collect();
-        Ok((exprs, rows, columns))
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn project_rows_with_order_by(
         &self,
@@ -11565,70 +10034,16 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<(RowVec, Vec<String>, OutputLayout)> {
-        let (rows, plan, extra_names, layout) = self.ordered_rows_plan(
+        let (plan, extra_names, layout) = self.ordered_projection(
             select_exprs,
             order_by,
             distinct_on,
             from,
-            rows,
             all_columns,
             table_alias,
-            ctx,
-        )?;
+        );
         let projected = Self::run_ordered_projection(&plan, rows, ctx)?;
         Ok((projected, extra_names, layout))
-    }
-
-    /// The plan of [`Self::project_rows_with_order_by`], with the rows it
-    /// projects: a correlated SELECT item is bound into them first
-    #[allow(clippy::too_many_arguments)]
-    fn ordered_rows_plan(
-        &self,
-        select_exprs: &[Expression],
-        order_by: &[crate::parser::ast::OrderByExpression],
-        distinct_on: &[Expression],
-        from: Option<&Expression>,
-        mut rows: RowVec,
-        all_columns: &CompactArc<Vec<String>>,
-        table_alias: Option<&str>,
-        ctx: &ExecutionContext,
-    ) -> Result<(RowVec, OrderedProjection, Vec<String>, OutputLayout)> {
-        // A correlated select expression is evaluated per row first, and
-        // read below as the column it was bound to
-        let mut bound_exprs = None;
-        let mut bound_columns = None;
-        if Self::has_correlated_select_subqueries(select_exprs) {
-            let (exprs, bound_rows, columns) = self.bind_correlated_select_columns(
-                select_exprs,
-                rows,
-                all_columns,
-                table_alias,
-                ctx,
-            )?;
-            bound_exprs = Some(exprs);
-            rows = bound_rows;
-            bound_columns = Some(CompactArc::new(columns));
-        }
-        let select_exprs: &[Expression] = bound_exprs.as_deref().unwrap_or(select_exprs);
-        let shared_columns = bound_columns.as_ref().unwrap_or(all_columns);
-
-        // Process scalar subqueries in SELECT columns before evaluation (single-pass)
-        let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
-        let select_exprs = match &processed {
-            Some(p) => std::borrow::Cow::Borrowed(p.as_slice()),
-            None => std::borrow::Cow::Borrowed(select_exprs),
-        };
-
-        let (plan, extra_names, layout) = self.ordered_projection(
-            &select_exprs,
-            order_by,
-            distinct_on,
-            from,
-            shared_columns,
-            table_alias,
-            ctx,
-        );
-        Ok((rows, plan, extra_names, layout))
     }
 
     /// What a projection keeping the ORDER BY and DISTINCT ON values the
@@ -11643,7 +10058,6 @@ impl Executor {
         from: Option<&Expression>,
         shared_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
-        ctx: &ExecutionContext,
     ) -> (OrderedProjection, Vec<String>, OutputLayout) {
         let all_columns: &[String] = shared_columns;
         let OrderByProjection {
@@ -11684,12 +10098,7 @@ impl Executor {
 
         // Each value's source is found once for the statement; an error
         // is raised by the first row that reads it, as evaluating raised it
-        // A statement run for an outer row reads that row's columns by name
-        let outer_columns = outer_column_names(ctx);
-        let mut compile_ctx = CompileContext::new(all_columns, &self.function_registry);
-        if let Some(outer) = &outer_columns {
-            compile_ctx = compile_ctx.with_outer_columns(outer);
-        }
+        let compile_ctx = CompileContext::new(all_columns, &self.function_registry);
         let compile = |expr: &Expression| -> Result<SharedProgram> {
             ExprCompiler::new(&compile_ctx)
                 .compile(expr)
@@ -11738,7 +10147,6 @@ impl Executor {
         all_columns: &[String],
         sorted: bool,
         blocks: Option<&JoinBlocks>,
-        ctx: &ExecutionContext,
     ) -> Result<Option<JoinOutput>> {
         if let Some(blocks) = blocks.filter(|blocks| blocks.projects_output()) {
             debug_assert_eq!(
@@ -11764,7 +10172,6 @@ impl Executor {
                 stmt.table_expr.as_deref(),
                 &CompactArc::new(all_columns.to_vec()),
                 None,
-                ctx,
             );
             columns.extend(extra_names);
             return Ok(Some(JoinOutput {
@@ -11844,12 +10251,11 @@ impl Executor {
         all_columns: &[String],
         sorted: bool,
         blocks: Option<&JoinBlocks>,
-        ctx: &ExecutionContext,
     ) -> Result<Option<Arc<Option<JoinOutput>>>> {
         prepared
             .map(|prepared| {
                 prepared.output(all_columns, sorted, || {
-                    self.join_output(stmt, all_columns, sorted, blocks, ctx)
+                    self.join_output(stmt, all_columns, sorted, blocks)
                 })
             })
             .transpose()
@@ -11953,12 +10359,9 @@ impl Executor {
         projected: &mut impl RowSink,
     ) -> Result<()> {
         let mut vm = ExprVM::new();
-        let (transaction_id, outer) = (ctx.transaction_id(), ctx.outer_row());
+        let transaction_id = ctx.transaction_id();
         for (row_id, row) in rows.drain_rows().enumerate() {
-            let mut exec = ExecuteContext::with_common_params(&row, params, transaction_id);
-            if let Some(outer) = outer {
-                exec = exec.with_outer_row(outer);
-            }
+            let exec = ExecuteContext::with_common_params(&row, params, transaction_id);
             let mut values = projected.storage(sources.len());
             for source in sources {
                 values.push(match source {
@@ -12193,21 +10596,6 @@ impl Executor {
             computed_distinct_on,
             extra_names,
             extra_sources,
-        }
-    }
-
-    /// Evaluate a single SELECT expression
-    /// OPTIMIZATION: Takes pre-computed column index map for O(1) lookup instead of O(N) linear search
-    fn evaluate_select_expr(
-        &self,
-        evaluator: &mut CompiledEvaluator,
-        expr: &Expression,
-        row: &Row,
-        col_index_map: &StringMap<usize>,
-    ) -> Result<Value> {
-        match select_column(expr, col_index_map) {
-            Some(idx) => Ok(row.get(idx?).cloned().unwrap_or(Value::null_unknown())),
-            None => evaluator.evaluate(unaliased_item(expr)),
         }
     }
 
@@ -12852,9 +11240,6 @@ impl Executor {
                 // Clear all query caches since all data has changed
                 self.semantic_cache.clear();
                 self.query_cache.clear();
-                crate::executor::context::clear_scalar_subquery_cache();
-                crate::executor::context::clear_in_subquery_cache();
-                crate::executor::context::clear_semi_join_cache();
                 crate::executor::context::clear_block_answer_cache();
 
                 let columns = vec!["result".to_string()];
@@ -13919,9 +12304,8 @@ impl Executor {
         if join_type != "INNER" && right_filter_present {
             return Ok(None);
         }
-        // A HAVING that reads the group it is asked about has to be run once
-        // per group with that group as the outer row, which the general
-        // aggregation does and this streaming path does not
+        // A HAVING that reads the group it is asked about runs per group,
+        // which this streaming path does not
         // The ON clause compiles into the residual, where a subquery has no executor
         if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None
             || filters_have_subquery
@@ -14003,7 +12387,6 @@ impl Executor {
             filters: [left.as_ref(), right.as_ref()],
             cross_filter: cross.as_ref(),
             rows_sides: rows,
-            per_row_where: false,
             blocks,
             ctes: CteNames::Listed(&ctes),
         };

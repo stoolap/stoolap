@@ -21,7 +21,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{force_exists_strategy, general_path_hits, GeneralPath};
+use stoolap::test_failpoints::force_exists_strategy;
 use stoolap::Database;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -192,22 +192,6 @@ fn test_a_member_that_settles_the_test_wins_over_an_error() {
             match expected {
                 Some(expected) => assert_eq!(found, Ok(expected), "{sql} under {strategy:?}"),
                 None => assert!(found.is_err(), "{sql} under {strategy:?}: {found:?}"),
-            }
-        }
-    }
-}
-
-#[test]
-fn test_an_in_family_statement_never_reaches_the_general_path() {
-    let _guard = serial();
-    let db = setup("general");
-    for strategy in STRATEGIES {
-        force_exists_strategy(strategy);
-        for (test, _) in CASES {
-            for sql in at_each_depth(test) {
-                let before = general_path_hits(GeneralPath::InSubquery);
-                ids(&db, &sql).unwrap();
-                assert_eq!(general_path_hits(GeneralPath::InSubquery), before, "{sql}");
             }
         }
     }

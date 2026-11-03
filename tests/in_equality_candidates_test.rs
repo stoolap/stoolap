@@ -222,7 +222,6 @@ mod probed {
     use std::sync::Arc;
     use stoolap::test_failpoints::{
         after_equality_key_probed, in_member_probes, in_member_reads, in_subquery_runs,
-        PREPARED_FAMILIES_OFF,
     };
 
     /// The rows of `sql`, with the member reads it made by candidates and
@@ -523,41 +522,6 @@ mod probed {
             found.len(),
             ROWS as usize,
             "a timestamp member lost its rows"
-        );
-    }
-
-    #[test]
-    fn a_conjunct_subquery_runs_once_when_the_list_falls_back() {
-        let _serial = serial();
-        let dir = tempfile::tempdir().unwrap();
-        let db = sealed(&dir);
-        db.execute("CREATE TABLE s (v INTEGER)", ()).unwrap();
-        db.execute("INSERT INTO s VALUES (1), (2), (10)", ())
-            .unwrap();
-        db.execute("BEGIN", ()).unwrap();
-        let (before, asked) = (in_subquery_runs(), in_member_probes());
-        // The general path asks the list's candidates
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                PREPARED_FAMILIES_OFF.store(false, Ordering::SeqCst);
-            }
-        }
-        PREPARED_FAMILIES_OFF.store(true, Ordering::SeqCst);
-        let restore = Restore;
-        let (found, reads) = read(
-            &db,
-            "SELECT id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s)",
-        );
-        drop(restore);
-        let (runs, asked) = (in_subquery_runs() - before, in_member_probes() - asked);
-        db.execute("COMMIT", ()).unwrap();
-        assert_eq!(asked, 1, "the list did not ask the candidates");
-        assert_eq!(reads, (0, 0), "the list did not fall back");
-        assert_eq!(found, vec![1, 2, 10]);
-        assert_eq!(
-            runs, 1,
-            "the conjunct's subquery ran again for the fallback"
         );
     }
 }

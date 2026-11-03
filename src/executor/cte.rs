@@ -667,51 +667,18 @@ impl Executor {
 
         // Apply WHERE clause filter
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            // Process subqueries in WHERE clause (e.g., IN subqueries on CTEs);
-            // a correlated one is evaluated per row below
-            let processed_where = self.answered_where(where_clause, ctx)?.into_owned();
-            // A parent row's column named through its own table is bound
-            // first, or the bare name it would fall back to could be the
-            // CTE's own
-            let processed_where = match ctx.outer_row() {
-                Some(outer) => {
-                    let inner: Vec<&str> = cte_alias.iter().map(String::as_str).collect();
-                    let scope = super::utils::InnerScope {
-                        tables: &inner,
-                        schema: None,
-                    };
-                    super::utils::substitute_outer_references_in_scope(
-                        &processed_where,
-                        outer,
-                        &scope,
-                    )
-                }
-                None => processed_where,
-            };
+            // Compile filter once and reuse for all rows
+            let mut eval = ExpressionEval::compile(where_clause, &cte_columns)?.with_context(ctx);
 
-            if Self::has_correlated_subqueries(&processed_where) {
-                self.filter_rows_by_correlated_where(
-                    &processed_where,
-                    cte_rows,
-                    &cte_columns,
-                    cte_alias.as_deref(),
-                    ctx,
-                )?
-            } else {
-                // Compile filter once and reuse for all rows
-                let mut eval =
-                    ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
-
-                let mut result = RowVec::new();
-                let mut row_id = 0i64;
-                for (_, row) in cte_rows {
-                    if eval.eval_bool_checked(&row)? {
-                        result.push((row_id, row));
-                        row_id += 1;
-                    }
+            let mut result = RowVec::new();
+            let mut row_id = 0i64;
+            for (_, row) in cte_rows {
+                if eval.eval_bool_checked(&row)? {
+                    result.push((row_id, row));
+                    row_id += 1;
                 }
-                result
             }
+            result
         } else {
             cte_rows
         };
@@ -734,14 +701,7 @@ impl Executor {
             return Ok((columns, rows, !skip_order_limit, layout));
         }
 
-        // Process scalar subqueries in SELECT columns before projection; a
-        // correlated one is evaluated per row by the projection
-        let processed_columns = if Self::has_correlated_select_subqueries(&stmt.columns) {
-            None
-        } else {
-            self.try_process_select_subqueries(&stmt.columns, ctx)?
-        };
-        let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
+        let columns_to_use = &stmt.columns;
 
         // Determine output columns
         let output_columns = self.resolve_cte_output_columns_from_exprs(
@@ -893,18 +853,6 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-
-        // A correlated subquery reads each row as its outer row
-        if Self::has_correlated_select_subqueries(columns) {
-            return self.project_rows_with_alias(
-                columns,
-                RowVec::from_vec((**rows).clone()),
-                cte_columns,
-                None,
-                ctx,
-                table_alias,
-            );
-        }
 
         let col_index_map = build_column_index_map(cte_columns);
 

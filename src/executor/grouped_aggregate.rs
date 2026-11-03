@@ -324,7 +324,6 @@ impl Executor {
                     &slot_columns,
                     crate::functions::registry::global_registry(),
                     Some(&slots),
-                    None,
                     false,
                     Some(ctx.params()),
                 )?;

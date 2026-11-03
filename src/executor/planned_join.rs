@@ -45,8 +45,6 @@ pub(crate) struct JoinShape<'a> {
     pub cross_filter: Option<&'a Expression>,
     /// Which sides the statement's blocks read as rows
     pub rows_sides: [bool; 2],
-    /// A correlated WHERE run per joined row, outside the blocks
-    pub per_row_where: bool,
     /// Whether the statement's blocks run its subqueries
     pub blocks: bool,
     pub ctes: CteNames<'a>,
@@ -56,21 +54,15 @@ impl Executor {
     /// The plan of the join `shape` describes
     pub(crate) fn plan_join(&self, shape: &JoinShape<'_>) -> Result<JoinPlan> {
         let condition = shape.join.condition.as_deref();
-        let reduction = match shape.per_row_where {
-            true => None,
-            false => self.reduction_keys(shape),
-        };
-        let probes = match shape.per_row_where {
-            true => [None, None],
-            false => self.join_probes(
-                shape.ctes,
-                [&shape.join.left, &shape.join.right],
-                shape.condition,
-                shape.join_type,
-                shape.aliases,
-                shape.rows_sides,
-            ),
-        };
+        let reduction = self.reduction_keys(shape);
+        let probes = self.join_probes(
+            shape.ctes,
+            [&shape.join.left, &shape.join.right],
+            shape.condition,
+            shape.join_type,
+            shape.aliases,
+            shape.rows_sides,
+        );
         let filters_have_subquery = !shape.blocks
             && [shape.filters[0], shape.filters[1], shape.cross_filter]
                 .into_iter()
