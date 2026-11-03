@@ -10931,29 +10931,41 @@ impl Executor {
     }
 
     /// Side `side` of the join `held` prepared, read from its source as a
-    /// block's FROM is and cut to the rows its conditions pass; None for a
-    /// side the general path reads
+    /// block's FROM is and cut to the rows its conditions pass, a table
+    /// function's from the `offset`-th up to `limit` rows, as the general
+    /// read takes them; with whether those were applied. None for a side
+    /// the general path reads
     pub(crate) fn join_sourced_side_rows(
         &self,
         held: &JoinBlocks,
         run: &PreparedRunner<'_>,
         side: usize,
         (name, ctx): (&str, &ExecutionContext),
-    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
+        (limit, offset): (Option<usize>, usize),
+    ) -> Result<Option<(Box<dyn crate::storage::traits::QueryResult>, bool)>> {
         let Some(SideSource::Rows(source, schema)) = &held.side_sources[side] else {
             return Ok(None);
         };
-        let rows = self
-            .source_rows(source, schema, ctx)?
-            .ok_or_else(|| Error::SchemaChanged {
-                table: name.to_string(),
-            })?;
+        let rows = match (source, limit) {
+            (BlockSource::Function(function, range, _), Some(limit)) => {
+                let first = Some(limit.saturating_add(offset));
+                let (rows, _) = self.tvf_rows(function, None, range.as_deref(), first, ctx)?;
+                let mut rows = rows.into_vec();
+                rows.drain(..offset.min(rows.len()));
+                CompactArc::new(rows)
+            }
+            _ => self
+                .source_rows(source, schema, ctx)?
+                .ok_or_else(|| Error::SchemaChanged {
+                    table: name.to_string(),
+                })?,
+        };
+        let bounded = limit.is_some() && matches!(source, BlockSource::Function(..));
         let columns = schema.column_names_arc();
         let Some(where_) = &held.side_wheres[side] else {
             let rows = RowVec::from_vec((*rows).clone());
-            return Ok(Some(Box::new(ExecutorResult::with_arc_columns(
-                columns, rows,
-            ))));
+            let result = ExecutorResult::with_arc_columns(columns, rows);
+            return Ok(Some((Box::new(result), bounded)));
         };
         let mut kept = RowVec::new();
         let keep = |id: i64, _: u64, row: Row| {
@@ -10962,9 +10974,8 @@ impl Executor {
         };
         let source = rows.iter().map(|(id, row)| Ok((*id, row)));
         run.rows_passing(where_, source, ctx, None, keep)?;
-        Ok(Some(Box::new(ExecutorResult::with_arc_columns(
-            columns, kept,
-        ))))
+        let result = ExecutorResult::with_arc_columns(columns, kept);
+        Ok(Some((Box::new(result), bounded)))
     }
 
     /// `result`, side `expr` as the general path read it with its conditions

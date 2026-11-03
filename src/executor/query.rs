@@ -7973,15 +7973,20 @@ impl Executor {
         // adds conditions of its own to this read
         if let (Some((run, index)), None) = (rows, extra) {
             let alias = get_table_alias_from_expr(expr).unwrap_or_default();
-            let read =
-                self.join_sourced_side_rows(run.blocks, run.run, index, (alias.as_str(), ctx))?;
-            if let Some(result) = read {
+            let read = self.join_sourced_side_rows(
+                run.blocks,
+                run.run,
+                index,
+                (alias.as_str(), ctx),
+                (limit, offset),
+            )?;
+            if let Some((result, bounded)) = read {
                 let columns = result
                     .columns()
                     .iter()
                     .map(|c| qualified(&alias, c))
                     .collect();
-                return Ok((result, columns, false, None));
+                return Ok((result, columns, bounded, None));
             }
         }
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
