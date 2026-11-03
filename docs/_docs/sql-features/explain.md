@@ -283,7 +283,23 @@ Window RANK() OVER (ORDER BY SUM(value) DESC)
       SeqScan products
 ```
 
-A grouped statement with a DISTINCT ON, a named window or a subquery prints the format of the path that runs it.
+A DISTINCT ON keeps the first group of each key, as the sort under it orders them; a key the SELECT list does not compute is computed over each group beside it:
+
+```sql
+EXPLAIN SELECT DISTINCT ON (category) category, name, SUM(value) FROM products GROUP BY category, name ORDER BY category, SUM(value) DESC;
+```
+
+Output:
+```
+plan
+----
+DistinctOn category
+  Sort category ASC, SUM(value) DESC
+    Aggregate category, name, SUM(value) by category, name
+      SeqScan products
+```
+
+A grouped statement with a named window or a subquery prints the format of the path that runs it.
 
 An aggregate over a view, a CTE, a derived table, a VALUES list or a table function groups the rows its source gives, read once, with the source's plan under it:
 

@@ -715,6 +715,49 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT t.g, COUNT(*), RANK() OVER (ORDER BY COUNT(*) * (SELECT 2)) FROM t \
          JOIN t t2 ON t2.id = t.id GROUP BY t.g",
     ),
+    // A DISTINCT ON over the groups, its keys computed over them
+    (
+        "memory",
+        "hash_groups",
+        "SELECT DISTINCT ON (s) s, g, SUM(a) FROM t GROUP BY s, g ORDER BY s, g DESC",
+        "SELECT DISTINCT ON (s) s, g, SUM(a) FROM t WHERE id + 0 = id GROUP BY s, g \
+         ORDER BY s, g DESC",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT DISTINCT ON (SUM(a) > 2) g FROM t GROUP BY g",
+        "SELECT DISTINCT ON (SUM(a) > 2) g FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*), g",
+        "SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g \
+         ORDER BY COUNT(*), g",
+    ),
+    (
+        "memory",
+        "hash_groups",
+        "SELECT DISTINCT ON (s) s, COUNT(*), RANK() OVER (ORDER BY s) FROM (SELECT s, a FROM t) d \
+         GROUP BY s ORDER BY s",
+        "SELECT DISTINCT ON (s) s, COUNT(*), RANK() OVER (ORDER BY s) FROM (SELECT s, a FROM t) d \
+         WHERE s = s GROUP BY s ORDER BY s",
+    ),
+    (
+        "sealed",
+        "hash_groups",
+        "SELECT DISTINCT ON (g % 2) g, MAX(a) FROM tv GROUP BY g HAVING COUNT(*) > 0 \
+         ORDER BY g % 2, g DESC LIMIT 1",
+        "SELECT DISTINCT ON (g % 2) g, MAX(a) FROM tv WHERE g = g GROUP BY g HAVING COUNT(*) > 0 \
+         ORDER BY g % 2, g DESC LIMIT 1",
+    ),
+    (
+        "empty",
+        "storage_grouped",
+        "SELECT DISTINCT ON (s) s, COUNT(*) FROM t GROUP BY s",
+        "SELECT DISTINCT ON (s) s, COUNT(*) FROM t WHERE id + 0 = id GROUP BY s",
+    ),
 ];
 
 fn open(db: Database, seal: bool, rows: bool) -> Database {
