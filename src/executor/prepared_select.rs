@@ -46,8 +46,9 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_extra_args, aggregate_group_key, aggregate_slot_keys,
-    check_grouped_reads, grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs,
-    FeedInput, GroupByItem, HeldFeed, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
+    check_grouped_reads, compile_over_slots, grouped_item, grouping_items, ungrouped_column,
+    AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, Modifiers, RowSource,
+    SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -10879,8 +10880,16 @@ impl Executor {
             .map(
                 |extra| match pushdown::try_pushdown(extra, table.schema(), Some(ctx)) {
                     (Some(expr), false) => Ok(SideFilter::Storage(expr)),
-                    _ => RowFilter::new(extra, &columns)
-                        .map(|f| SideFilter::Row(f.with_context(ctx))),
+                    // A condition the join adds to this read, compiled for it
+                    _ => compile_over_slots(
+                        extra,
+                        &columns,
+                        &self.function_registry,
+                        None,
+                        false,
+                        None,
+                    )
+                    .map(|p| SideFilter::Row(RowFilter::from_program(p).with_context(ctx))),
                 },
             )
             .transpose()?;
