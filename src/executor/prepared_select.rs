@@ -12348,17 +12348,17 @@ impl Executor {
         let prepared = held
             .rows_read()
             .ok_or_else(|| Error::internal("a grouped statement without its table's read"))?;
-        let stmt = &held.stmt;
+        let stmt = &*bounded_branch(&held.stmt, bound);
         if !held.windows_alone() {
-            let stmt = &*bounded_branch(stmt, bound);
             return self.prepared_aggregate(stmt, ctx, (run, prepared), table);
         }
         let names = table.schema().column_names_arc();
-        let plan = held.window.as_ref();
+        let plan = held.window.as_ref().filter(|_| bound.is_none());
         match self.window_table_rows(stmt, ctx, (run, prepared), table, (&names, plan))? {
             WindowRows::Answer(result) => Ok((result, None)),
             WindowRows::Rows(rows, sorted, grouped) => {
-                self.grouped_windows(held, run, (&rows, &names), (sorted, grouped), ctx)
+                let order = (sorted, grouped);
+                self.grouped_windows((held, bound), run, (&rows, &names), order, ctx)
             }
         }
     }
@@ -12366,17 +12366,21 @@ impl Executor {
     /// The windows the grouped statement `held` computes over `rows` of
     /// `columns` without grouping them, read in the order `order` says, the
     /// run `run` answering its blocks: by the plan it holds, else one made now
+    /// over the branch `bound` gives a set operation's first branch
     fn grouped_windows(
         &self,
-        held: &PreparedGrouped,
+        (held, bound): (&PreparedGrouped, BranchBound),
         run: &PreparedRunner<'_>,
         rows: (&[(i64, Row)], &[String]),
         order: (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
         ctx: &ExecutionContext,
     ) -> Result<WindowOutput> {
-        match &held.window {
-            Some(plan) => self.window_by_plan(plan, ctx, rows, order, Some(run)),
-            None => self.window_over(&held.stmt, ctx, rows, order, Some(run)),
+        match (&held.window, bound) {
+            (Some(plan), None) => self.window_by_plan(plan, ctx, rows, order, Some(run)),
+            _ => {
+                let stmt = &*bounded_branch(&held.stmt, bound);
+                self.window_over(stmt, ctx, rows, order, Some(run))
+            }
         }
     }
 
@@ -12403,7 +12407,7 @@ impl Executor {
                 "a grouped statement read its table as rows",
             ));
         }
-        let stmt = &held.stmt;
+        let stmt = &*bounded_branch(&held.stmt, bound);
         // A table function reads its rows once the blocks answer its arguments
         let source = match (source, held.source_values.as_deref()) {
             (StatementSource::Function(names, function), Some([arguments])) => {
@@ -12420,11 +12424,11 @@ impl Executor {
         };
         if held.windows_alone() {
             let (names, rows) = self.window_source_rows(stmt, ctx, (run, prepared), source)?;
-            let output = self.grouped_windows(held, run, (&rows, &names), (None, None), ctx)?;
+            let held_run = (held, bound);
+            let output = self.grouped_windows(held_run, run, (&rows, &names), (None, None), ctx)?;
             return Ok(Some((output, names)));
         }
         let columns = CompactArc::new(source.columns().unwrap_or_default().to_vec());
-        let stmt = &*bounded_branch(stmt, bound);
         let output = self.source_aggregate(stmt, ctx, (run, prepared), source, &columns)?;
         Ok(Some((output, columns)))
     }
@@ -12442,7 +12446,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<WindowOutput> {
         if held.windows_alone() {
-            return self.grouped_windows(held, run, (rows, columns), (None, None), ctx);
+            return self.grouped_windows((held, bound), run, (rows, columns), (None, None), ctx);
         }
         let stmt = &*bounded_branch(&held.stmt, bound);
         let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
@@ -12973,11 +12977,15 @@ impl Executor {
         // follow it
         if prepared.windowed && !prepared.aggregated {
             let computed = prepared.computed.as_ref().unwrap_or(stmt);
+            let bound = (!stmt.set_operations.is_empty()).then_some(limit);
+            let computed = &*bounded_branch(computed, bound);
+            // A set operation's branch reads its bound, not the plan's
+            let window = prepared.window.as_ref().filter(|_| bound.is_none());
             let (names, rows, order) = match source {
                 StatementSource::Table(table) => {
                     let names = table.schema().column_names_arc();
                     let run = (&runner, prepared.rows_read());
-                    let plan = prepared.window.as_ref();
+                    let plan = window;
                     match self.window_table_rows(computed, ctx, run, &*table, (&names, plan))? {
                         WindowRows::Answer(result) => {
                             let output_columns = CompactArc::new(result.columns().to_vec());
@@ -12994,7 +13002,7 @@ impl Executor {
                 }
             };
             // The visible width trims a DISTINCT ON key's hidden item after
-            let (result, layout) = match &prepared.window {
+            let (result, layout) = match window {
                 Some(plan) => self.window_by_plan(plan, ctx, (&rows, &names), order, None)?,
                 None => self.window_over(computed, ctx, (&rows, &names), order, None)?,
             };
