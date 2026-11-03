@@ -1089,17 +1089,6 @@ pub(crate) fn set_operation_key_item(item: &Expression, registry: &FunctionRegis
     }
 }
 
-/// A statement of the family's clauses: its WITH runs before it, as its own
-/// statements, and its DISTINCT, DISTINCT ON and set operation over the rows
-/// it gives, as the general path runs them; no grouping, HAVING or WINDOW
-/// definition a window function reads: one nothing reads is never read
-fn plain_statement(stmt: &SelectStatement) -> bool {
-    matches!(stmt.group_by.modifier, GroupByModifier::None)
-        && !Executor::reads_window_defs(stmt)
-        && stmt.group_by.columns.is_empty()
-        && stmt.having.is_none()
-}
-
 fn unaliased(expr: &Expression) -> &Expression {
     match expr {
         Expression::Aliased(aliased) => &aliased.expression,
@@ -1152,8 +1141,18 @@ impl Executor {
         // A statement the runner aggregates computes its SELECT list and
         // ORDER BY over its groups, as the aggregation does on any source
         let aggregates = PreparedSelect::runs_aggregate(stmt, shape);
-        if !aggregates && !plain_statement(stmt) {
+        if !aggregates && QueryClassification::groups(stmt) {
             return Err("a clause outside the family");
+        }
+        // The window step runs no subquery of a WINDOW definition; the
+        // grouped family's blocks do
+        let definitions = Executor::used_window_defs(stmt);
+        if !aggregates
+            && definitions
+                .iter()
+                .any(|def| def.expressions().any(mentions_subquery))
+        {
+            return Err("a WINDOW definition holding a subquery");
         }
         let family = Family {
             executor: self,
@@ -1164,13 +1163,9 @@ impl Executor {
             family.expression(where_clause, 1, Site::Subqueries, &mut found)?;
         }
         // A statement that does not aggregate computes its windows over the
-        // rows it reads, when no item or key holds a subquery the window
-        // step would run
-        let list = match !aggregates
-            && stmt.set_operations.is_empty()
-            && shape.has_window_functions
-            && !shape.output_has_subqueries
-        {
+        // rows it reads, a set operation's over its first branch's, when no
+        // item or key holds a subquery the window step would run
+        let list = match !aggregates && shape.has_window_functions && !shape.output_has_subqueries {
             true => Site::Rows,
             false => Site::Subqueries,
         };
@@ -12999,6 +12994,19 @@ impl Executor {
                     let run = (&runner, prepared.rows_read());
                     let (names, rows) = self.window_source_rows(computed, ctx, run, source)?;
                     (names, rows, (None, None))
+                }
+            };
+            // The window step lays out a set operation's branch for its
+            // DISTINCT ON, as the general path's does
+            let keyed;
+            let computed = match stmt.set_operations.is_empty() || stmt.distinct_on.is_empty() {
+                true => computed,
+                false => {
+                    keyed = SelectStatement {
+                        distinct_on: stmt.distinct_on.clone(),
+                        ..computed.clone()
+                    };
+                    &keyed
                 }
             };
             // The visible width trims a DISTINCT ON key's hidden item after

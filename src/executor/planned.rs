@@ -112,12 +112,10 @@ impl Executor {
             true => self.aggregate_plan(stmt, ctx),
             false => None,
         };
-        // Windows over the groups run inside the aggregation, under its set
-        // operation as any branch's rows
+        // Windows run over the groups or the rows of a set operation's first
+        // branch as over any statement's
         if aggregating && !aggregates
-            || shape.has_window_functions
-                && !aggregates
-                && (shape.has_set_operations || shape.grouped_has_subqueries)
+            || shape.has_window_functions && !aggregates && shape.grouped_has_subqueries
             || shape.has_cte
             || shape.output_has_subqueries
             || shape.where_has_subqueries
