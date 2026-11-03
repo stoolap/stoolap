@@ -698,9 +698,18 @@ impl QueryClassification {
         }
     }
 
-    /// Check if any column expression contains aggregate functions
+    /// Whether `stmt` aggregates its rows: its SELECT list holds an aggregate
+    /// call, or it groups or judges its rows by a HAVING
     fn check_has_aggregation(stmt: &SelectStatement) -> bool {
-        stmt.columns.iter().any(expression_contains_aggregate) || !stmt.group_by.columns.is_empty()
+        Self::groups(stmt) || stmt.columns.iter().any(expression_contains_aggregate)
+    }
+
+    /// Whether `stmt` groups its rows or judges them by a HAVING: a GROUP
+    /// BY, an empty grouping set included, or a HAVING
+    pub(crate) fn groups(stmt: &SelectStatement) -> bool {
+        !stmt.group_by.columns.is_empty()
+            || !matches!(stmt.group_by.modifier, GroupByModifier::None)
+            || stmt.having.is_some()
     }
 
     /// Check if any column expression contains window functions

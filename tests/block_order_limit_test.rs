@@ -730,7 +730,7 @@ fn alias_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
 fn a_block_s_select_alias_is_read_bare_inside_its_subqueries() {
     for (db, _dir) in alias_tables("block_order_limit_bare_alias") {
         let sql = "SELECT id FROM t WHERE a IN (SELECT SUM(x) OVER (ORDER BY id) AS z FROM u \
-                   WHERE u.id <= t.id HAVING (SELECT z) > 0) ORDER BY id";
+                   WHERE u.id <= t.id ORDER BY (SELECT z) DESC LIMIT 1) ORDER BY id";
         let ids: Vec<i64> = db
             .query(sql, ())
             .unwrap_or_else(|e| panic!("{sql}: {e}"))

@@ -242,7 +242,7 @@ A name in GROUP BY may be a SELECT alias: `SELECT a + 1 AS k, COUNT(*) FROM t GR
 
 A GROUP BY key cannot be or hold an aggregate: `GROUP BY COUNT(*)`, a position naming `COUNT(*)` and an alias of `COUNT(*)` that no column of the source carries all fail with "an aggregate function cannot be a GROUP BY key". A name that is no column of the source, no SELECT alias and no column of an enclosing query's row is an error too: `GROUP BY nosuch` fails as `SELECT nosuch` does. Under GROUPING SETS, the statement groups by each set whether or not the SELECT list names its expressions: `SELECT COUNT(*) FROM t GROUP BY GROUPING SETS ((a), ())` gives a count for each `a` and one for all rows.
 
-A query that aggregates, with GROUP BY or with an aggregate call alone, reads a column of its rows only through a GROUP BY item or inside an aggregate call. Reading one anywhere else is an error, in the SELECT list, HAVING and ORDER BY alike: `SELECT b, COUNT(*) FROM t GROUP BY a` and `SELECT b, COUNT(*) FROM t` both fail with `Column 'b' not found`. A subquery that aggregates follows the same rule, while a column of an enclosing query is one value for it and may be read anywhere. A subquery inside a query that aggregates reads that query's rows the same way: `SELECT a, (SELECT COUNT(*) FROM u WHERE u.id = t.b) FROM t GROUP BY a` fails with `Column 't.b' not found`, at any depth and in the SELECT list of an EXISTS too, though an EXISTS does not compute that list. A subquery that gives `t` another name hides its own name, so `t.b` inside `FROM t AS t2` is still the enclosing row's.
+A query that aggregates, with GROUP BY, with a HAVING or with an aggregate call alone, reads a column of its rows only through a GROUP BY item or inside an aggregate call. Reading one anywhere else is an error, in the SELECT list, HAVING and ORDER BY alike: `SELECT b, COUNT(*) FROM t GROUP BY a` and `SELECT b, COUNT(*) FROM t` both fail with `Column 'b' not found`. A subquery that aggregates follows the same rule, while a column of an enclosing query is one value for it and may be read anywhere. A subquery inside a query that aggregates reads that query's rows the same way: `SELECT a, (SELECT COUNT(*) FROM u WHERE u.id = t.b) FROM t GROUP BY a` fails with `Column 't.b' not found`, at any depth and in the SELECT list of an EXISTS too, though an EXISTS does not compute that list. A subquery that gives `t` another name hides its own name, so `t.b` inside `FROM t AS t2` is still the enclosing row's.
 
 Two rows share a group exactly when their keys are equal the way DISTINCT and UNION compare them, and every row lands in a group:
 
@@ -263,6 +263,8 @@ FROM sales
 GROUP BY category
 HAVING COUNT(*) > 2 AND SUM(amount) > 100;
 ```
+
+A HAVING makes a query aggregate even without a GROUP BY or an aggregate call in its SELECT list: every row the query reads forms one group, which the HAVING keeps or drops. `SELECT 1 FROM sales HAVING COUNT(*) > 2` returns one row when `sales` holds more than two rows and none otherwise, over a table, a view, a derived table, a CTE, a `VALUES` list or a join alike, and whether or not a clause holds a subquery. Such a query reads its columns as any aggregating query does, so a column outside an aggregate call is an error, and a HAVING cannot read a window function's result.
 
 ## Multi-Dimensional Aggregation
 

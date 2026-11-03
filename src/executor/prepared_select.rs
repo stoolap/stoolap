@@ -8423,9 +8423,10 @@ impl PreparedSelect {
             .any(QueryClassification::expression_has_window_function)
     }
 
-    /// Whether `stmt` aggregates its rows: a call, or [`Self::groups`]
+    /// Whether `stmt` aggregates its rows, as its classification says: one
+    /// that groups is known without its lookup
     pub(crate) fn aggregates(stmt: &SelectStatement) -> bool {
-        Self::groups(stmt) || get_classification(stmt).has_aggregation
+        QueryClassification::groups(stmt) || get_classification(stmt).has_aggregation
     }
 
     /// Whether the runner aggregates `stmt`: it aggregates its rows and
@@ -8439,14 +8440,6 @@ impl PreparedSelect {
             && !shape.has_distinct_on
             && Self::aggregates(stmt)
             && !Executor::reads_window_defs(stmt)
-    }
-
-    /// Whether `stmt` groups its rows or judges them by a HAVING: a GROUP
-    /// BY, an empty grouping set included, or a HAVING
-    fn groups(stmt: &SelectStatement) -> bool {
-        !stmt.group_by.columns.is_empty()
-            || !matches!(stmt.group_by.modifier, GroupByModifier::None)
-            || stmt.having.is_some()
     }
 
     /// The steps of `stmt`, which aggregates its rows, over its read,
@@ -12430,7 +12423,7 @@ impl Executor {
         let aggregations = &*self.prepared_calls(prepared.calls, stmt, ctx)?;
         let windows = prepared.windowed;
         let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
-        if PreparedSelect::groups(stmt) || windows {
+        if QueryClassification::groups(stmt) || windows {
             let columns = table.schema().column_names_arc();
             if let Some(read) = prepared.read.and_then(Read::grouped) {
                 let run = (ctx, blocks);
