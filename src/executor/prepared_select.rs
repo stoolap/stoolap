@@ -952,6 +952,25 @@ pub(crate) fn prepared_branch(
     (branch, keyed)
 }
 
+/// `computed`, the statement an aggregation computes for a set operation's
+/// first branch, with `bound`, the rows its whole one needs from it, as its
+/// LIMIT, as the general path's branch takes it; as it is without one
+pub(crate) fn bounded_branch(
+    computed: &SelectStatement,
+    bound: Option<usize>,
+) -> std::borrow::Cow<'_, SelectStatement> {
+    let Some(bound) = bound else {
+        return std::borrow::Cow::Borrowed(computed);
+    };
+    std::borrow::Cow::Owned(SelectStatement {
+        limit: Some(Box::new(Expression::IntegerLiteral(IntegerLiteral {
+            token: computed.token.clone(),
+            value: i64::try_from(bound).unwrap_or(i64::MAX),
+        }))),
+        ..computed.clone()
+    })
+}
+
 /// A set operation whose ORDER BY holds a subquery, as the statement that
 /// orders and limits its rows read as a derived table, whose columns the keys
 /// read; any other statement as it is
@@ -12229,11 +12248,12 @@ impl Executor {
     }
 
     /// The rows of the grouped statement `held` over its `table`, the run
-    /// `run` answering its blocks: its groups and their windows as a
-    /// prepared statement's, or its windows over the rows the WHERE passes
+    /// `run` answering its blocks: its groups, as many as `bound` when it is
+    /// a set operation's branch, and their windows as a prepared statement's,
+    /// or its windows over the rows the WHERE passes
     pub(crate) fn grouped_table(
         &self,
-        held: &PreparedGrouped,
+        (held, bound): (&PreparedGrouped, Option<usize>),
         run: &PreparedRunner<'_>,
         table: &dyn Table,
         ctx: &ExecutionContext,
@@ -12243,6 +12263,7 @@ impl Executor {
             .ok_or_else(|| Error::internal("a grouped statement without its table's read"))?;
         let stmt = &held.stmt;
         if !held.windows_alone() {
+            let stmt = &*bounded_branch(stmt, bound);
             return self.prepared_aggregate(stmt, ctx, (run, prepared), table);
         }
         let names = table.schema().column_names_arc();
@@ -12273,12 +12294,13 @@ impl Executor {
     }
 
     /// The rows of the grouped statement `held` over the rows of the source
-    /// `grouped` read, the run `run` answering its blocks: its groups and
-    /// their windows as a prepared statement's, or its windows over every
-    /// row the WHERE passes; with the source's columns. None over a table
+    /// `grouped` read, the run `run` answering its blocks: its groups, as
+    /// many as `bound` when it is a set operation's branch, and their windows
+    /// as a prepared statement's, or its windows over every row the WHERE
+    /// passes; with the source's columns. None over a table
     pub(crate) fn grouped_over_source(
         &self,
-        held: &PreparedGrouped,
+        (held, bound): (&PreparedGrouped, Option<usize>),
         run: &PreparedRunner<'_>,
         grouped: GroupedRun<'_>,
         ctx: &ExecutionContext,
@@ -12315,25 +12337,27 @@ impl Executor {
             return Ok(Some((output, names)));
         }
         let columns = CompactArc::new(source.columns().unwrap_or_default().to_vec());
+        let stmt = &*bounded_branch(stmt, bound);
         let output = self.source_aggregate(stmt, ctx, (run, prepared), source, &columns)?;
         Ok(Some((output, columns)))
     }
 
     /// The rows of the grouped statement `held` over a join's `rows` of
     /// `columns`, which its WHERE has passed, the run `run` answering its
-    /// blocks: its groups and their windows, or its windows over the rows
+    /// blocks: its groups, as many as `bound` when it is a set operation's
+    /// branch, and their windows, or its windows over the rows
     pub(crate) fn grouped_rows(
         &self,
-        held: &PreparedGrouped,
+        (held, bound): (&PreparedGrouped, Option<usize>),
         run: &PreparedRunner<'_>,
         rows: &[(i64, Row)],
         columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<WindowOutput> {
-        let stmt = &held.stmt;
         if held.windows_alone() {
             return self.grouped_windows(held, run, (rows, columns), (None, None), ctx);
         }
+        let stmt = &*bounded_branch(&held.stmt, bound);
         let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
         let windows = held.classification.has_window_functions;
         let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
@@ -12901,6 +12925,8 @@ impl Executor {
             };
             let run = (&runner, prepared.rows_read());
             let computed = prepared.computed.as_ref().unwrap_or(stmt);
+            let bound = limit.filter(|_| !stmt.set_operations.is_empty());
+            let computed = &*bounded_branch(computed, bound);
             let (result, windows_layout) = match source {
                 StatementSource::Table(table) => {
                     self.prepared_aggregate(computed, ctx, run, &*table)?

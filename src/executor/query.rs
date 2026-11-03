@@ -9681,7 +9681,8 @@ impl Executor {
                 let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
                     Error::internal("a table's columns changed while the statement prepared")
                 })?;
-                let output = self.group_held_rows(held, &run, ctx, rows, columns, |out| {
+                let held_run = (held, Self::branch_bound(stmt, ctx));
+                let output = self.group_held_rows(held_run, &run, ctx, rows, columns, |out| {
                     Self::result_layout(&held.stmt, columns, None, out)
                 })?;
                 return Self::with_late_keys(held, &run, output, ctx);
@@ -9740,10 +9741,11 @@ impl Executor {
     }
 
     /// `rows` of `columns` grouped as `held` prepared them, asking the
-    /// `run`'s blocks
+    /// `run`'s blocks, as many groups as `bound` when it is a set
+    /// operation's branch
     fn group_held_rows(
         &self,
-        held: &super::prepared_select::PreparedGrouped,
+        (held, bound): (&super::prepared_select::PreparedGrouped, Option<usize>),
         run: &super::prepared_select::PreparedRunner<'_>,
         ctx: &ExecutionContext,
         rows: RowVec,
@@ -9759,7 +9761,7 @@ impl Executor {
             }
             false => ctx,
         };
-        let (result, windows) = self.grouped_rows(held, run, &rows, columns, ctx)?;
+        let (result, windows) = self.grouped_rows((held, bound), run, &rows, columns, ctx)?;
         // The windows lay out their own rows
         let layout = match held.classification.has_window_functions {
             true => windows,
@@ -9789,8 +9791,18 @@ impl Executor {
         let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
             Error::internal("a table's columns changed while the statement prepared")
         })?;
-        let output = self.grouped_output(held, &run, grouped, ctx)?;
+        let held_run = (held, Self::branch_bound(branch, ctx));
+        let output = self.grouped_output(held_run, &run, grouped, ctx)?;
         Self::with_late_keys(held, &run, output, ctx)
+    }
+
+    /// The rows a set operation needs from `branch`, its first branch as the
+    /// general path runs it, which carries that bound as its LIMIT; None for
+    /// a statement of its own, whose LIMIT the prepared one holds
+    fn branch_bound(branch: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
+        (!branch.set_operations.is_empty())
+            .then(|| super::row_count::rows_needed(branch, ctx))
+            .flatten()
     }
 
     /// `output`, the rows the run `run` of `held` returned, with each late key
@@ -9811,10 +9823,11 @@ impl Executor {
         Ok((Box::new(result), columns, applied, shape))
     }
 
-    /// The rows the grouped run `run` of `held` returns
+    /// The rows the grouped run `run` of `held` returns, its groups as many
+    /// as `bound` when it is a set operation's branch
     fn grouped_output(
         &self,
-        held: &super::prepared_select::PreparedGrouped,
+        (held, bound): (&super::prepared_select::PreparedGrouped, Option<usize>),
         run: &super::prepared_select::PreparedRunner<'_>,
         grouped: super::prepared_select::GroupedRun<'_>,
         ctx: &ExecutionContext,
@@ -9831,7 +9844,7 @@ impl Executor {
         };
         let alias = grouped.scope_name().map(SmartString::from);
         if let Some(((result, layout), columns)) =
-            self.grouped_over_source(held, run, grouped, ctx)?
+            self.grouped_over_source((held, bound), run, grouped, ctx)?
         {
             let output = CompactArc::new(result.columns().to_vec());
             // The windows lay out their own rows
@@ -9851,7 +9864,7 @@ impl Executor {
         let name = &table_source.name.value_lower;
         let table = self.prepared_table(name, ctx, None)?;
         held.table_fits(&table.schema_arc())?;
-        let (result, layout) = self.grouped_table(held, run, &*table, ctx)?;
+        let (result, layout) = self.grouped_table((held, bound), run, &*table, ctx)?;
         let columns = CompactArc::new(result.columns().to_vec());
         // The windows lay out their own rows
         let layout = match held.classification.has_window_functions {
