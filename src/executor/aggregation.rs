@@ -1223,7 +1223,7 @@ impl CompiledFeed {
             return std::borrow::Cow::Borrowed(self);
         }
         let bind = |program: &super::expression::SharedProgram| {
-            let program = super::expression::bind_params(program.clone(), params);
+            let program = super::expression::Program::bound(program.clone(), params);
             blocks
                 .and_then(|blocks| blocks.bind_members(&program))
                 .unwrap_or(program)

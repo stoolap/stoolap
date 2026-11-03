@@ -21,9 +21,7 @@ use crate::core::{Result, Row, Value, NULL_VALUE};
 use crate::parser::ast::Expression;
 
 use super::expression::SharedProgram;
-use super::expression::{
-    bind_params, compile_expression, concat_values, ExecuteContext, ExprVM, Op,
-};
+use super::expression::{compile_expression, concat_values, ExecuteContext, ExprVM, Op, Program};
 use super::utils::for_each_qualified_star_column;
 
 /// One output item, as its compiled program reads
@@ -223,7 +221,7 @@ impl Projection {
                 },
                 _ => continue,
             };
-            *item = Item::of(bind_params(program.clone(), params));
+            *item = Item::of(Program::bound(program.clone(), params));
         }
         *self = Self::of(std::mem::take(&mut self.items));
     }

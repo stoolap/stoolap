@@ -160,7 +160,7 @@ fn held_program(
             )
         })
         .clone()?;
-    let program = bind_params(program, slot_params(ctx, blocks));
+    let program = Program::bound(program, slot_params(ctx, blocks));
     Ok(blocks
         .and_then(|blocks| blocks.bind_members(&program))
         .unwrap_or(program))
