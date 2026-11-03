@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, a GROUP BY with a DISTINCT ON or a named window, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -299,7 +299,7 @@ DistinctOn category
       SeqScan products
 ```
 
-A grouped statement with a named window or a subquery prints the format of the path that runs it.
+A window that names a `WINDOW` definition shows as the `Window` step any window does, `Window RANK() OVER w`. A grouped statement with a subquery prints the format of the path that runs it.
 
 An aggregate over a view, a CTE, a derived table, a VALUES list or a table function groups the rows its source gives, read once, with the source's plan under it:
 
