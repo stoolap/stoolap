@@ -650,3 +650,36 @@ mod a_failed_read {
         );
     }
 }
+
+#[test]
+fn a_table_function_side_the_join_cuts_generates_what_it_needs() {
+    use stoolap::test_failpoints::tvf_rows;
+    let _guard = serial();
+    let db = Database::open("memory://join_source_sides_cut_series").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1), (2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        (
+            "SELECT s.n FROM generate_series(1, 10000001) AS s(n) JOIN t ON t.id = s.n LIMIT 1",
+            ["1"],
+        ),
+        (
+            "SELECT s.n FROM generate_series(1, 10000001) AS s(n) JOIN t ON t.id = s.n \
+             LIMIT 1 OFFSET 1",
+            ["2"],
+        ),
+    ] {
+        let before = tvf_rows();
+        let got = answer(&db, sql);
+        let generated = tvf_rows() - before;
+        if got != Ok(rows.map(String::from).to_vec()) || generated > 1000 {
+            wrong.push(format!("{sql}: {got:?}, {generated} rows generated"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
