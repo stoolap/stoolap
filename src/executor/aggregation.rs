@@ -209,7 +209,6 @@ pub(crate) fn with_blocks<'a>(
         None => exec,
     }
 }
-
 /// Represents a grouping set for ROLLUP/CUBE operations
 /// Each grouping set specifies which columns are active (included in grouping)
 /// For ROLLUP(a, b), we get: [true, true], [true, false], [false, false]
@@ -792,11 +791,18 @@ pub(crate) type ExtraArgs = (Vec<Value>, Option<crate::core::Error>);
 /// What a parse of aggregate calls does with their extra arguments
 #[derive(Clone, Copy)]
 enum ExtraArgsRead<'a> {
-    /// Reads them, a parameter bound by the context
-    With(Option<&'a ExecutionContext>),
+    /// Reads them, a parameter bound by the context and a block answered by
+    /// the statement's blocks
+    With(
+        Option<&'a ExecutionContext>,
+        Option<&'a dyn SubqueryExecutor>,
+    ),
     /// Reads the literal ones and keeps them as written, for a subquery
     /// block that reads the others for each call
     Block,
+    /// Reads the literal ones and keeps the others as written, for a
+    /// statement that reads them on each run
+    Held,
     /// Leaves them unread, the calls wanted for their identities alone
     Unread,
 }
@@ -805,8 +811,8 @@ impl ExtraArgsRead<'_> {
     /// The extra arguments of a call to `args` as a block keeps them
     fn written(self, args: &[Expression]) -> Option<Box<[Expression]>> {
         match self {
-            ExtraArgsRead::Block => written_extra_args(args),
-            ExtraArgsRead::With(_) | ExtraArgsRead::Unread => None,
+            ExtraArgsRead::Block | ExtraArgsRead::Held => written_extra_args(args),
+            ExtraArgsRead::With(..) | ExtraArgsRead::Unread => None,
         }
     }
 }
@@ -820,12 +826,14 @@ pub(crate) fn extra_args_failure(
 }
 
 /// The extra arguments of an aggregate call (a STRING_AGG separator), each
-/// one value for the statement, read once with the parameters of `ctx`. An
-/// argument that fails to evaluate is NULL here and its error comes second,
-/// for the first group or frame that reads the call to report
+/// one value for the statement, read once with the parameters of `ctx` and
+/// a block in them answered by `blocks`. An argument that fails to evaluate
+/// is NULL here and its error comes second, for the first group or frame
+/// that reads the call to report
 pub(crate) fn aggregate_extra_args(
     args: &[Expression],
     ctx: Option<&ExecutionContext>,
+    blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<ExtraArgs> {
     let mut values = Vec::with_capacity(args.len().saturating_sub(1));
     let mut failed = None;
@@ -833,9 +841,9 @@ pub(crate) fn aggregate_extra_args(
         let value = match literal_extra_arg(arg) {
             Some(value) => value,
             None => {
-                extra_arg_constant(arg)?;
-                let program = super::expression::compile_once(arg)?;
-                super::expression::execute_once(&program, ctx).unwrap_or_else(|error| {
+                extra_arg_constant(arg, blocks)?;
+                let program = super::expression::compile_once(arg, blocks.is_some())?;
+                super::expression::execute_once(&program, ctx, blocks).unwrap_or_else(|error| {
                     failed.get_or_insert(error);
                     Value::null_unknown()
                 })
@@ -884,15 +892,16 @@ fn written_extra_args(args: &[Expression]) -> Option<Box<[Expression]>> {
 }
 
 /// An error unless `arg`, an aggregate argument after the first, is one
-/// value for the call: it reads no row the aggregate reads
-fn extra_arg_constant(arg: &Expression) -> Result<()> {
-    if super::volatility::statement_constant(arg, crate::functions::registry::global_registry()) {
-        return Ok(());
-    }
-    Err(crate::core::Error::invalid_argument(format!(
-        "an aggregate argument after the first must not read the row: {}",
-        arg
-    )))
+/// value for the call: it reads no row the aggregate reads, a block in it
+/// answered by `blocks`
+fn extra_arg_constant(arg: &Expression, blocks: Option<&dyn SubqueryExecutor>) -> Result<()> {
+    let reads_parent = |id| blocks.is_none_or(|blocks| blocks.reads_parent(id));
+    super::volatility::read_once(
+        arg,
+        crate::functions::registry::global_registry(),
+        super::volatility::AGGREGATE_ARGUMENT,
+        (true, &reads_parent),
+    )
 }
 
 /// What one aggregate call reads from each input row, compiled once: the
@@ -2561,7 +2570,20 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: Option<&ExecutionContext>,
     ) -> Result<(Vec<SqlAggregateFunction>, Vec<String>)> {
-        self.parse_calls(stmt, ExtraArgsRead::With(ctx))
+        self.parse_calls(stmt, ExtraArgsRead::With(ctx, None))
+    }
+
+    /// [`Self::parse_aggregations`] of a statement whose subqueries run as
+    /// its `blocks`
+    pub(crate) fn parse_aggregations_in(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        blocks: &dyn SubqueryExecutor,
+    ) -> Result<Vec<SqlAggregateFunction>> {
+        Ok(self
+            .parse_calls(stmt, ExtraArgsRead::With(Some(ctx), Some(blocks)))?
+            .0)
     }
 
     /// [`Self::parse_aggregations`] with the calls' extra arguments unread,
@@ -2589,6 +2611,15 @@ impl Executor {
         stmt: &SelectStatement,
     ) -> Result<Vec<SqlAggregateFunction>> {
         Ok(self.parse_calls(stmt, ExtraArgsRead::Block)?.0)
+    }
+
+    /// The aggregate calls of a statement's `stmt`, each keeping its extra
+    /// arguments as written when one is not a literal, for each run to read
+    pub(crate) fn parse_held_aggregations(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Vec<SqlAggregateFunction>> {
+        Ok(self.parse_calls(stmt, ExtraArgsRead::Held)?.0)
     }
 
     fn parse_calls(
@@ -2938,17 +2969,18 @@ impl Executor {
         };
 
         let extra = match ctx {
-            ExtraArgsRead::With(ctx) => aggregate_extra_args(args, ctx)?,
+            ExtraArgsRead::With(ctx, blocks) => aggregate_extra_args(args, ctx, blocks)?,
             // A call that reads one of them for each run keeps them all written
             ExtraArgsRead::Block if written_extra_args(args).is_some() => {
                 for arg in args.iter().skip(1) {
                     if !is_literal_extra_arg(arg) {
-                        extra_arg_constant(arg)?;
+                        extra_arg_constant(arg, None)?;
                     }
                 }
                 (Vec::new(), None)
             }
-            ExtraArgsRead::Block => aggregate_extra_args(args, None)?,
+            ExtraArgsRead::Held if written_extra_args(args).is_some() => (Vec::new(), None),
+            ExtraArgsRead::Block | ExtraArgsRead::Held => aggregate_extra_args(args, None, None)?,
             ExtraArgsRead::Unread => (Vec::new(), None),
         };
         Ok((column, distinct, extra, expression))

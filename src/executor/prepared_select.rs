@@ -80,7 +80,7 @@ use super::utils::{
     order_by_names_an_alias, qualified, split_qualified, strip_table_qualifier,
     value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
-use super::volatility::{expression_volatility, statement_draws_per_call};
+use super::volatility::{expression_volatility, read_once_argument, statement_draws_per_call};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
@@ -414,12 +414,13 @@ impl<'a> Family<'a> {
                     Site::GroupedList => Site::GroupedOutput,
                     _ => return Err("a window function outside the SELECT list"),
                 };
-                // NTILE's argument, the ones after a call's first and the frame
-                // offsets are read once for the call: a subquery there runs once
+                // An argument the call reads once runs a subquery once
                 let call = &window.function;
-                let inputs = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
                 for (i, arg) in call.arguments.iter().enumerate() {
-                    let at = if i < inputs { inner } else { Site::Subqueries };
+                    let at = match read_once_argument(&call.function, i, true) {
+                        Some(_) => Site::Subqueries,
+                        None => inner,
+                    };
                     if !matches!(arg, Expression::Star(_)) {
                         self.expression(arg, scopes, at, found)?;
                     }
@@ -2469,52 +2470,6 @@ impl Chain<'_> {
     }
 }
 
-/// Whether an argument a call in `expr` reads once rather than for each row
-/// passes `matches`: an aggregate's after its first, a window function's
-/// after its first (each of NTILE's), and a frame offset
-fn constant_args_any(expr: &Expression, matches: &impl Fn(&Expression) -> bool) -> bool {
-    let within = |input: &Expression| constant_args_any(input, matches);
-    match expr {
-        Expression::ScalarSubquery(_) | Expression::Exists(_) => false,
-        Expression::Window(window) => {
-            let call = &window.function;
-            let first = usize::from(!call.function.eq_ignore_ascii_case("NTILE"));
-            call.arguments
-                .iter()
-                .skip(first)
-                .chain(window.frame_offsets())
-                .any(matches)
-                || call
-                    .arguments
-                    .iter()
-                    .take(first)
-                    .chain(call.filter.as_deref())
-                    .chain(call.order_by.iter().map(|o| &o.expression))
-                    .chain(&window.partition_by)
-                    .chain(window.order_by.iter().map(|o| &o.expression))
-                    .any(within)
-        }
-        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
-            call.arguments.iter().skip(1).any(matches)
-                || call
-                    .arguments
-                    .iter()
-                    .take(1)
-                    .chain(call.filter.as_deref())
-                    .chain(call.order_by.iter().map(|o| &o.expression))
-                    .any(within)
-        }
-        other => {
-            let mut found = false;
-            let _ = for_each_child(other, &mut |child| {
-                found |= within(child);
-                Ok(())
-            });
-            found
-        }
-    }
-}
-
 /// Each column of the projected row `expr` reads past the statement's first
 /// `from` columns, by its position on that row
 fn projected_columns(expr: &Expression, from: usize, out: &mut SmallVec<[usize; 2]>) {
@@ -3913,7 +3868,7 @@ impl PreparedSelect {
         executor: &Executor,
         written: &SelectStatement,
     ) -> Result<Option<Vec<SqlAggregateFunction>>> {
-        Ok(Some(executor.parse_block_aggregations(written)?)
+        Ok(Some(executor.parse_held_aggregations(written)?)
             .filter(|calls| calls.iter().all(|call| call.extra_exprs.is_none())))
     }
 
@@ -9289,19 +9244,6 @@ impl PreparedGrouped {
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
         let stmt = first_branch(run_stmt);
-        // An argument read once for its call holds only run slots: one reading
-        // the row is the general path's to refuse
-        // The ORDER BY keys a hidden item computes count with the list
-        let constants = |stmt: &SelectStatement, matches: &dyn Fn(&Expression) -> bool| {
-            stmt.columns
-                .iter()
-                .chain(stmt.having.as_deref())
-                .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-                .any(|e| constant_args_any(e, &matches))
-        };
-        if constants(&stmt, &mentions_subquery) {
-            return Ok(None);
-        }
         let classification = super::query_classification::get_classification(&stmt);
         let (windowed, aggregated) = (
             classification.has_window_functions,
@@ -12394,7 +12336,7 @@ impl Executor {
         if held.windows_alone() {
             return self.grouped_windows(held, run, (rows, columns), (None, None), ctx);
         }
-        let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, ctx)?;
+        let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, (ctx, run))?;
         let windows = held.classification.has_window_functions;
         let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
         let calls = (aggregations, Some(run as &dyn SubqueryExecutor));
@@ -12457,7 +12399,7 @@ impl Executor {
         (runner, prepared): (&PreparedRunner<'_>, RowsRead<'_>),
         table: &dyn Table,
     ) -> Result<WindowOutput> {
-        let aggregations = &*self.prepared_calls(prepared.calls, stmt, ctx)?;
+        let aggregations = &*self.prepared_calls(prepared.calls, stmt, (ctx, runner))?;
         let windows = prepared.windowed;
         let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
         if QueryClassification::groups(stmt) || windows {
@@ -12575,7 +12517,7 @@ impl Executor {
         source: StatementSource<'_>,
         columns: &[String],
     ) -> Result<WindowOutput> {
-        let aggregations = &*self.prepared_calls(prepared.calls, stmt, ctx)?;
+        let aggregations = &*self.prepared_calls(prepared.calls, stmt, (ctx, runner))?;
         let windows = prepared.windowed;
         let calls = (
             aggregations,
@@ -12634,11 +12576,11 @@ impl Executor {
         &self,
         held: Option<&'p [SqlAggregateFunction]>,
         stmt: &SelectStatement,
-        ctx: &ExecutionContext,
+        (ctx, run): (&ExecutionContext, &PreparedRunner<'_>),
     ) -> Result<std::borrow::Cow<'p, [SqlAggregateFunction]>> {
         Ok(match held {
             Some(calls) => std::borrow::Cow::Borrowed(calls),
-            None => std::borrow::Cow::Owned(self.parse_aggregations(stmt, Some(ctx))?.0),
+            None => std::borrow::Cow::Owned(self.parse_aggregations_in(stmt, ctx, run)?),
         })
     }
 
@@ -15490,6 +15432,13 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         }
     }
 
+    fn reads_parent(&self, subquery_index: u16) -> bool {
+        self.prepared
+            .subqueries
+            .get(subquery_index as usize)
+            .is_none_or(|sq| !sq.uncorrelated() || sq.parent.is_some())
+    }
+
     fn params(&self) -> Option<&[Value]> {
         Some(&self.base)
     }
@@ -15566,6 +15515,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
         self.runner.kept_members(subquery_index)
+    }
+
+    fn reads_parent(&self, subquery_index: u16) -> bool {
+        self.runner.reads_parent(subquery_index)
     }
 
     fn params(&self) -> Option<&[Value]> {
