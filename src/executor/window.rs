@@ -162,7 +162,7 @@ impl<'a> RowPrograms<'a> {
 enum ArgSource {
     Literal(Value),
     Parameter,
-    Program(OnceLock<Result<SharedProgram>>),
+    Program(OnceLock<Result<Program>>),
 }
 
 impl ArgSource {
@@ -172,20 +172,6 @@ impl ArgSource {
             None if matches!(expr, Expression::Parameter(_)) => ArgSource::Parameter,
             None => ArgSource::Program(OnceLock::new()),
         }
-    }
-
-    /// The program of `expr` over `columns`, compiled on its first read
-    fn program<'p>(
-        program: &'p OnceLock<Result<SharedProgram>>,
-        expr: &Expression,
-        columns: &[String],
-        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
-    ) -> Result<&'p SharedProgram> {
-        let program = program.get_or_init(|| {
-            let outer = super::query::outer_column_names(ctx);
-            row_program(expr, columns, None, outer.as_deref(), ctx, blocks)
-        });
-        program.as_ref().map_err(Clone::clone)
     }
 }
 
@@ -232,9 +218,7 @@ impl<'w> ConstArg<'w> {
             ArgSource::Literal(value) => Ok(value.clone()),
             ArgSource::Parameter => evaluate_once(self.expr, Some(ctx)),
             ArgSource::Program(program) => {
-                let program = program.get_or_init(|| {
-                    compile_once(self.expr, blocks.is_some()).map(SharedProgram::new)
-                });
+                let program = program.get_or_init(|| compile_once(self.expr, blocks.is_some()));
                 execute_once(program.as_ref().map_err(Clone::clone)?, Some(ctx), blocks)
             }
         }
@@ -281,6 +265,8 @@ struct CallArgs<'w> {
     count: Option<ConstArg<'w>>,
     /// LAG and LEAD's default, which may read the row
     default: Option<(&'w Expression, ArgSource)>,
+    /// The default's program, as the input's is compiled
+    default_program: OnceLock<Result<SharedProgram>>,
     /// A value function's first argument for each row, when it is not a column
     input: Vec<Value>,
 }
@@ -338,6 +324,7 @@ impl<'w> CallArgs<'w> {
                 .get(2)
                 .filter(|_| lead_lag)
                 .map(|expr| (expr, ArgSource::of(expr))),
+            default_program: OnceLock::new(),
             input: Vec::new(),
         }
     }
@@ -347,12 +334,16 @@ impl<'w> CallArgs<'w> {
     fn default_program(
         &self,
         columns: &[String],
-        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Option<&Program>> {
-        let Some((expr, ArgSource::Program(program))) = &self.default else {
+        let Some((expr, ArgSource::Program(_))) = &self.default else {
             return Ok(None);
         };
-        ArgSource::program(program, expr, columns, read).map(|program| Some(&**program))
+        let program = self.default_program.get_or_init(|| {
+            let outer = super::query::outer_column_names(ctx);
+            row_program(expr, columns, None, outer.as_deref(), ctx, blocks)
+        });
+        program.as_deref().map(Some).map_err(Clone::clone)
     }
 
     /// Whether the default or the count read a subquery, which only the
