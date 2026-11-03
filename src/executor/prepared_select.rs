@@ -81,7 +81,7 @@ use super::utils::{
     value_to_expression, visit_column_refs, visit_column_refs_outside, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, statement_draws_per_call};
-use super::window::{WindowOutput, WindowRows};
+use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
 use crate::planner::{
@@ -8540,6 +8540,9 @@ pub struct PreparedGrouped {
     calls: Option<Vec<SqlAggregateFunction>>,
     /// The WHERE holds no subquery and a term that is a statement constant
     constant_where: bool,
+    /// The plan of the windows it computes without grouping, made once when
+    /// no run changes it; None makes it on each run
+    window: Option<super::window::WindowPlan<'static>>,
     /// Its VALUES rows or table function arguments compiled over the blocks
     /// when a value holds a subquery; None evaluates them as written
     source_values: Option<SourcePrograms>,
@@ -9317,6 +9320,14 @@ impl PreparedGrouped {
             false => None,
         };
         let constant_where = PreparedSelect::constant_where(&stmt, &executor.function_registry);
+        let window = (windowed && !aggregated)
+            .then(|| {
+                executor
+                    .prepared_window_plan(&stmt, &schema.column_names_arc(), ctx)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
         Ok(Some(Self {
             validity,
             cte_scope: ctx.cte_scope(),
@@ -9329,6 +9340,7 @@ impl PreparedGrouped {
             read,
             calls,
             constant_where,
+            window,
             source_values,
             late,
             classification,
@@ -12287,11 +12299,29 @@ impl Executor {
             return self.prepared_aggregate(stmt, ctx, (run, prepared), table);
         }
         let names = table.schema().column_names_arc();
-        match self.window_table_rows(stmt, ctx, (run, prepared), table, (&names, None))? {
+        let plan = held.window.as_ref();
+        match self.window_table_rows(stmt, ctx, (run, prepared), table, (&names, plan))? {
             WindowRows::Answer(result) => Ok((result, None)),
             WindowRows::Rows(rows, sorted, grouped) => {
-                self.window_over(stmt, ctx, (&rows, &names), (sorted, grouped), Some(run))
+                self.grouped_windows(held, run, (&rows, &names), (sorted, grouped), ctx)
             }
+        }
+    }
+
+    /// The windows the grouped statement `held` computes over `rows` of
+    /// `columns` without grouping them, read in the order `order` says, the
+    /// run `run` answering its blocks: by the plan it holds, else one made now
+    fn grouped_windows(
+        &self,
+        held: &PreparedGrouped,
+        run: &PreparedRunner<'_>,
+        rows: (&[(i64, Row)], &[String]),
+        order: (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
+        ctx: &ExecutionContext,
+    ) -> Result<WindowOutput> {
+        match &held.window {
+            Some(plan) => self.window_by_plan(plan, ctx, rows, order, Some(run)),
+            None => self.window_over(&held.stmt, ctx, rows, order, Some(run)),
         }
     }
 
@@ -12334,7 +12364,7 @@ impl Executor {
         };
         if held.windows_alone() {
             let (names, rows) = self.window_source_rows(stmt, ctx, (run, prepared), source)?;
-            let output = self.window_over(stmt, ctx, (&rows, &names), (None, None), Some(run))?;
+            let output = self.grouped_windows(held, run, (&rows, &names), (None, None), ctx)?;
             return Ok(Some((output, names)));
         }
         let columns = CompactArc::new(source.columns().unwrap_or_default().to_vec());
@@ -12355,7 +12385,7 @@ impl Executor {
     ) -> Result<WindowOutput> {
         let stmt = &held.stmt;
         if held.windows_alone() {
-            return self.window_over(stmt, ctx, (rows, columns), (None, None), Some(run));
+            return self.grouped_windows(held, run, (rows, columns), (None, None), ctx);
         }
         let aggregations = &*self.prepared_calls(held.calls.as_deref(), stmt, ctx)?;
         let windows = held.classification.has_window_functions;
@@ -12905,7 +12935,7 @@ impl Executor {
                 }
             };
             let (result, layout) = match &prepared.window {
-                Some(plan) => self.window_by_plan(plan, ctx, (&rows, &names), order)?,
+                Some(plan) => self.window_by_plan(plan, ctx, (&rows, &names), order, None)?,
                 None => {
                     // A DISTINCT ON key rides along as a hidden item, as on
                     // the general path, which the visible width trims after

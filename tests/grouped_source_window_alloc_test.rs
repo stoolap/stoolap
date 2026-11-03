@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! A grouped statement computing windows alone over a source's rows copies
-//! the source's column names as the runner's window step does, beyond the
-//! window plan it makes each run
+//! the source's column names as the runner's window step does: once a run,
+//! its window plan made with the statement
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(all(not(feature = "jemalloc"), not(feature = "test-filedb")))]
@@ -83,9 +83,7 @@ fn a_window_over_a_source_copies_its_column_names_once() {
     let runner = format!("SELECT k, ROW_NUMBER() OVER (ORDER BY k), 5 FROM {source}");
     let (blocks, plain) = (names_copied(&db, &family), names_copied(&db, &runner));
     assert_eq!(
-        blocks,
-        plain + 3 * names.len(),
-        "the names a run copies: {blocks} with a subquery, {plain} without; beyond the \
-         runner's, only the window plan made each run copies each name, three times"
+        blocks, plain,
+        "the names a run copies: {blocks} with a subquery, {plain} without"
     );
 }

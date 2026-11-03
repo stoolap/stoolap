@@ -1012,15 +1012,29 @@ impl Executor {
         ctx: &ExecutionContext,
         (rows, columns): (&[(i64, Row)], &[String]),
         order: (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
+        Self::named_window_failure(blocks, rows)?;
         self.run_window(
             plan,
             ctx,
             (rows, columns),
             &FxHashMap::default(),
             order,
-            None,
+            blocks,
         )
+    }
+
+    /// The error a named window the `blocks` read raised, once the windows
+    /// run over a row of `rows`
+    fn named_window_failure(
+        blocks: Option<&dyn SubqueryExecutor>,
+        rows: &[(i64, Row)],
+    ) -> Result<()> {
+        match blocks.and_then(|b| b.window_failure()) {
+            Some(e) if !rows.is_empty() => Err(e.clone()),
+            _ => Ok(()),
+        }
     }
 
     /// Window functions over the rows
@@ -1080,11 +1094,7 @@ impl Executor {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
         // A window over a row reads its named window's parts
-        if let Some(e) = blocks.and_then(|b| b.window_failure()) {
-            if !base_rows.is_empty() {
-                return Err(e.clone());
-            }
-        }
+        Self::named_window_failure(blocks, base_rows)?;
         // A window function in ORDER BY that the select list does not carry
         // is computed into a column of its own, named after it, which the
         // sort reads and the projection then drops. It goes in before the
