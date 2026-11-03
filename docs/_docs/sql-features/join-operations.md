@@ -135,7 +135,7 @@ SELECT t.id, u.id FROM t LEFT JOIN u USING (id) JOIN s ON s.id = t.id;
 
 ### Column names
 
-A bare column name in a join names one column. A name that two sources have, and that no `USING` or `NATURAL` join merges, is an error, `column reference 'id' is ambiguous`, in every clause: the `SELECT` list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `DISTINCT ON`, a window and an aggregate's argument. Qualify it with its source. The bare name of a merged column reads the merged column, unless another source of the join also has a column of that name; then it is ambiguous as well. A `SELECT` alias that a clause reads, such as an `ORDER BY` key, is not ambiguous.
+A bare column name in a join names one column. A name that two sources have, and that no `USING` or `NATURAL` join merges, is an error, `column reference 'id' is ambiguous`, in every clause: the `SELECT` list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `DISTINCT ON`, a window and an aggregate's argument. Qualify it with its source. The bare name of a merged column reads the merged column, unless another source of the join also has a column of that name; then it is ambiguous as well. An `ORDER BY`, `DISTINCT ON` or `GROUP BY` key that is a bare `SELECT` alias reads the alias and is not ambiguous; a name inside a key's expression, in `HAVING` or in a window reads the sources' columns.
 
 ```sql
 SELECT id FROM t JOIN u ON u.id = t.a;                    -- error: ambiguous

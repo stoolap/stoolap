@@ -10176,11 +10176,10 @@ impl JoinBlocks {
     /// An error when a SELECT item, grouping, HAVING, sort key or named
     /// window of `stmt` names `table.column` and two columns of that table
     /// carry the name, or names a bare name two columns carry that no merge
-    /// makes one, other than an alias
+    /// makes one, other than a key that is an alias
     pub(crate) fn check_output_names(&self, stmt: &SelectStatement) -> Result<()> {
-        fn names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str]) -> Result<()> {
+        fn names(chain: &Chain<'_>, expr: &Expression) -> Result<()> {
             match expr {
-                Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str()) => Ok(()),
                 // A table or column the joined row lacks is an enclosing one
                 Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
                     match chain.resolve(expr) {
@@ -10188,44 +10187,36 @@ impl JoinBlocks {
                         _ => Ok(()),
                     }
                 }
-                other => for_each_child(other, &mut |child| names(chain, child, aliases)),
+                other => for_each_child(other, &mut |child| names(chain, child)),
             }
         }
         let scopes = [&self.scope];
         let chain = Chain { scopes: &scopes };
-        // Only a bare name reads an alias
-        let aliases: Vec<&str> = stmt
-            .columns
-            .iter()
-            .filter_map(|c| match c {
-                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-                _ => None,
-            })
-            .collect();
-        let keys = stmt.order_by.iter().map(|ob| &ob.expression);
-        // A named window only as its windows read it, over the row's
-        // columns as an inline one: it reads no alias
-        let windows = Executor::used_window_defs(stmt);
-        let after_items = stmt
+        // An ORDER BY, DISTINCT ON or GROUP BY key that is a bare alias reads
+        // it; a name inside a key, HAVING and a window read the row's columns
+        let alias = |key: &Expression| match key {
+            Expression::Identifier(id) => stmt.columns.iter().any(
+                |c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower),
+            ),
+            _ => false,
+        };
+        let keys = stmt
             .group_by
             .columns
             .iter()
-            .chain(stmt.having.as_deref())
-            .chain(keys)
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .chain(&stmt.distinct_on)
-            .map(|expr| (expr, &aliases[..]));
+            .filter(|key| !alias(key));
+        // A named window only as its windows read it
+        let windows = Executor::used_window_defs(stmt);
         let checked = stmt
             .columns
             .iter()
-            .map(|item| (unaliased(item), &[][..]))
-            .chain(after_items)
-            .chain(
-                windows
-                    .iter()
-                    .flat_map(WindowDefinition::expressions)
-                    .map(|expr| (expr, &[][..])),
-            )
-            .try_for_each(|(expr, aliases)| names(&chain, expr, aliases));
+            .map(unaliased)
+            .chain(keys)
+            .chain(stmt.having.as_deref())
+            .chain(windows.iter().flat_map(WindowDefinition::expressions))
+            .try_for_each(|expr| names(&chain, expr));
         checked
     }
 
