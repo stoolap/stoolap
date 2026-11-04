@@ -46,8 +46,9 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_extra_args, aggregate_group_key, aggregate_slot_keys,
-    check_grouped_reads, grouped_item, grouping_items, ungrouped_column, AggregatePath, CallInputs,
-    FeedInput, GroupByItem, HeldFeed, Modifiers, RowSource, SqlAggregateFunction, COUNT_STAR,
+    check_grouped_reads, compile_over_slots, grouped_item, grouping_items, ungrouped_column,
+    AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, Modifiers, RowSource,
+    SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -10300,7 +10301,7 @@ impl JoinBlocks {
 
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
-    fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
+    pub(crate) fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
         let prepared = &self.side_columns[side];
         // A joined side's rows hold its tables' columns in turn, each named
         // by its table and its own name
@@ -10879,8 +10880,16 @@ impl Executor {
             .map(
                 |extra| match pushdown::try_pushdown(extra, table.schema(), Some(ctx)) {
                     (Some(expr), false) => Ok(SideFilter::Storage(expr)),
-                    _ => RowFilter::new(extra, &columns)
-                        .map(|f| SideFilter::Row(f.with_context(ctx))),
+                    // A condition the join adds to this read, compiled for it
+                    _ => compile_over_slots(
+                        extra,
+                        &columns,
+                        &self.function_registry,
+                        None,
+                        false,
+                        None,
+                    )
+                    .map(|p| SideFilter::Row(RowFilter::from_program(p).with_context(ctx))),
                 },
             )
             .transpose()?;
@@ -10960,10 +10969,55 @@ impl Executor {
         (name, ctx): (&str, &ExecutionContext),
         (limit, offset): (Option<usize>, usize),
     ) -> Result<Option<(Box<dyn crate::storage::traits::QueryResult>, bool)>> {
+        let read = self.join_side_source_rows(held, side, (name, ctx), (limit, offset))?;
+        let Some((rows, columns, bounded)) = read else {
+            return Ok(None);
+        };
+        let Some(where_) = &held.side_wheres[side] else {
+            let rows = match rows {
+                Ok(rows) => RowVec::from_vec(rows),
+                Err(shared) => RowVec::from_vec((*shared).clone()),
+            };
+            let result = ExecutorResult::with_arc_columns(columns, rows);
+            return Ok(Some((Box::new(result), bounded)));
+        };
+        let mut kept = RowVec::new();
+        let keep = |id: i64, _: u64, row: Row| {
+            kept.push((id, row));
+            true
+        };
+        match rows {
+            Ok(rows) => run.rows_passing(where_, rows.into_iter().map(Ok), ctx, None, keep)?,
+            Err(shared) => {
+                let rows = shared.iter().map(|(id, row)| Ok((*id, row)));
+                run.rows_passing(where_, rows, ctx, None, keep)?
+            }
+        };
+        let result = ExecutorResult::with_arc_columns(columns, kept);
+        Ok(Some((Box::new(result), bounded)))
+    }
+
+    /// Side `side` of the join `held` prepared, read from its source before
+    /// any of its conditions, a table function's from the `offset`-th up to
+    /// `limit` rows; with its columns and whether those were applied. Rows
+    /// read for this run move on as they are; a CTE's are shared
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn join_side_source_rows(
+        &self,
+        held: &JoinBlocks,
+        side: usize,
+        (name, ctx): (&str, &ExecutionContext),
+        (limit, offset): (Option<usize>, usize),
+    ) -> Result<
+        Option<(
+            std::result::Result<Vec<(i64, Row)>, SourceRows>,
+            CompactArc<Vec<String>>,
+            bool,
+        )>,
+    > {
         let Some(SideSource::Rows(source, schema)) = &held.side_sources[side] else {
             return Ok(None);
         };
-        // Rows read for this run move on as they are; a CTE's are shared
         let rows = match (source, limit) {
             (BlockSource::Function(function, range, _), Some(limit)) => {
                 let first = Some(limit.saturating_add(offset));
@@ -10987,29 +11041,7 @@ impl Executor {
             }
         };
         let bounded = limit.is_some() && matches!(source, BlockSource::Function(..));
-        let columns = schema.column_names_arc();
-        let Some(where_) = &held.side_wheres[side] else {
-            let rows = match rows {
-                Ok(rows) => RowVec::from_vec(rows),
-                Err(shared) => RowVec::from_vec((*shared).clone()),
-            };
-            let result = ExecutorResult::with_arc_columns(columns, rows);
-            return Ok(Some((Box::new(result), bounded)));
-        };
-        let mut kept = RowVec::new();
-        let keep = |id: i64, _: u64, row: Row| {
-            kept.push((id, row));
-            true
-        };
-        match rows {
-            Ok(rows) => run.rows_passing(where_, rows.into_iter().map(Ok), ctx, None, keep)?,
-            Err(shared) => {
-                let rows = shared.iter().map(|(id, row)| Ok((*id, row)));
-                run.rows_passing(where_, rows, ctx, None, keep)?
-            }
-        };
-        let result = ExecutorResult::with_arc_columns(columns, kept);
-        Ok(Some((Box::new(result), bounded)))
+        Ok(Some((rows, schema.column_names_arc(), bounded)))
     }
 
     /// `result`, side `expr` as the general path read it with its conditions

@@ -5280,12 +5280,66 @@ impl Executor {
                 self.read_join_side(expr, ctx, side, Some(&none), Some(0), 0)
                     .map(|(_, columns, _, _)| columns)
             };
-            let left_cols = columns_of(&join_source.left, left_read)?;
-            let right_cols = columns_of(&join_source.right, right_read)?;
-            if let Some(where_clause) = &where_for_join {
-                let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
-                Self::bind_empty_where(stmt, where_clause, &joined)?;
-            }
+            // The blocks name the sides' columns and bound the WHERE when
+            // they prepared; without them each side is read for its names
+            let (left_cols, right_cols) = match (statement_run, block_sides.as_ref()) {
+                (Some(run), Some(sides)) => {
+                    let reads = [
+                        (&join_source.left, left_read),
+                        (&join_source.right, right_read),
+                    ];
+                    for (i, (entry, side)) in reads.into_iter().enumerate() {
+                        match (rows_sides[i], &**entry) {
+                            // A table side still has the columns they were prepared over
+                            (false, Expression::TableSource(ts)) => {
+                                let schema = self.engine.get_table_schema(&ts.name.value_lower)?;
+                                run.blocks.side_fits(i, &schema)?;
+                            }
+                            // Any other is read as the general path reads it, none of
+                            // its conditions asked: a derived table to its last row
+                            _ => {
+                                let name = get_table_alias_from_expr(entry).unwrap_or_default();
+                                let read = self.join_side_source_rows(
+                                    run.blocks,
+                                    i,
+                                    (name.as_str(), ctx),
+                                    (Some(0), 0),
+                                )?;
+                                if read.is_none() {
+                                    let side = SideRead {
+                                        filter: None,
+                                        run: None,
+                                        apart: side.apart || rows_sides[i],
+                                        ..side
+                                    };
+                                    let (rows, ..) =
+                                        self.read_join_side(entry, ctx, side, None, None, 0)?;
+                                    run.blocks.rows_fit(i, &name, rows.columns())?;
+                                    if let Expression::SubquerySource(_) = &**entry {
+                                        Self::materialize_result(rows)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let names = |side: &JoinSide| -> Vec<String> {
+                        side.columns()
+                            .map(|(table, name)| qualified(table, name))
+                            .collect()
+                    };
+                    (names(&sides[0]), names(&sides[1]))
+                }
+                _ => {
+                    let left_cols = columns_of(&join_source.left, left_read)?;
+                    let right_cols = columns_of(&join_source.right, right_read)?;
+                    if let Some(where_clause) = &where_for_join {
+                        let joined: Vec<String> =
+                            left_cols.iter().chain(&right_cols).cloned().collect();
+                        Self::bind_empty_where(stmt, where_clause, &joined)?;
+                    }
+                    (left_cols, right_cols)
+                }
+            };
             (
                 CompactArc::new(Vec::new()),
                 left_cols,

@@ -319,3 +319,32 @@ fn a_join_compiles_its_output_without_the_bridge() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_join_side_asked_a_condition_storage_cannot_take_compiles_nothing_through_the_bridge() {
+    let db = Database::open("memory://runner_held_side_condition").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO p SELECT value, value % 3 FROM generate_series(1, 50)",
+        "INSERT INTO c SELECT value, value % 4 FROM generate_series(1, 50)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT COUNT(*) FROM p JOIN c ON c.id = p.id WHERE p.k = p.id AND c.k = c.id",
+        "SELECT p.id FROM p JOIN c ON c.id = p.id WHERE c.k = c.id ORDER BY p.id",
+    ] {
+        let first = rows(&db, sql, &[]);
+        let bridge = bridge_compiles();
+        let again = rows(&db, sql, &[]);
+        let compiled = bridge_compiles() - bridge;
+        if again != first || compiled != 0 {
+            wrong.push(format!(
+                "{sql}: {first:?} then {again:?}, {compiled} bridge compiles"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
