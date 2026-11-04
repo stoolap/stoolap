@@ -10301,7 +10301,7 @@ impl JoinBlocks {
 
     /// SchemaChanged when `columns`, the names side `side`, `name`, was read
     /// as rows with, are not the ones the clauses were prepared over
-    fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
+    pub(crate) fn rows_fit(&self, side: usize, name: &str, columns: &[String]) -> Result<()> {
         let prepared = &self.side_columns[side];
         // A joined side's rows hold its tables' columns in turn, each named
         // by its table and its own name

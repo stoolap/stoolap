@@ -18,10 +18,12 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{bridge_compiles, PREPARED_FAMILIES_OFF};
+use stoolap::test_failpoints::{after_select_table_opened, bridge_compiles, PREPARED_FAMILIES_OFF};
 use stoolap::Database;
 
 // The families switch and the bridge counter are process-wide
@@ -167,6 +169,48 @@ fn a_join_that_keeps_no_row_reads_its_other_sides_as_the_general_path() {
         wrong.push(format!("{sql}\n  got  {got:?}\n  want no row"));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_join_that_keeps_no_row_raises_schema_changed_for_a_side_read_over_new_columns() {
+    let _guard = serial();
+    let sql = "SELECT d.* FROM (SELECT * FROM w) AS x JOIN (SELECT * FROM uv) AS d ON TRUE \
+               WHERE FALSE";
+    let mut wrong = Vec::new();
+    for prepared in [false, true] {
+        let db = open(&format!("memory://join_where_false_side_schema_{prepared}"));
+        let statement = db.prepare(sql).unwrap();
+        let run = || -> Result<usize, String> {
+            let rows = match prepared {
+                true => statement.query(()),
+                false => db.query(sql, ()),
+            };
+            rows.map_err(|e| e.to_string())?
+                .map(|row| row.map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|rows| rows.len())
+        };
+        run().unwrap();
+        let writer = db.clone();
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        // The view's columns change once the left side opened w
+        after_select_table_opened(move || {
+            writer.execute("DROP VIEW uv", ()).unwrap();
+            writer
+                .execute("CREATE VIEW uv AS SELECT id, b, b AS c FROM u", ())
+                .unwrap();
+            flag.set(true);
+        });
+        let got = run();
+        if !done.get() || !got.as_ref().is_err_and(|e| e.contains("schema changed")) {
+            wrong.push(format!(
+                "prepared {prepared}: changed {}, {got:?}",
+                done.get()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{sql}\n{}", wrong.join("\n"));
 }
 
 #[test]

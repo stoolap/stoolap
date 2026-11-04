@@ -5314,6 +5314,7 @@ impl Executor {
                                     };
                                     let (rows, ..) =
                                         self.read_join_side(entry, ctx, side, None, None, 0)?;
+                                    run.blocks.rows_fit(i, &name, rows.columns())?;
                                     if let Expression::SubquerySource(_) = &**entry {
                                         Self::materialize_result(rows)?;
                                     }
