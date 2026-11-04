@@ -7436,10 +7436,7 @@ impl Executor {
     pub(super) fn values_row(row_exprs: &[Expression], ctx: &ExecutionContext) -> Result<Row> {
         let mut row_values = Vec::with_capacity(row_exprs.len());
         for expr in row_exprs {
-            let value = ExpressionEval::compile(expr, &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?;
-            row_values.push(value);
+            row_values.push(super::expression::evaluate_once(expr, Some(ctx))?);
         }
         Ok(Row::from_values(row_values))
     }
