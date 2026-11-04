@@ -9727,6 +9727,9 @@ pub struct PreparedDml {
     conflict: Option<PreparedConflict>,
     /// The RETURNING, None without a subquery there
     returning: Option<PreparedReturning>,
+    /// An UPDATE's CHECK constraints reading a column it sets, compiled by
+    /// the first run that compiles them all
+    checks: std::sync::OnceLock<Arc<Vec<super::dml::CompiledCheck>>>,
 }
 
 /// A statement's RETURNING values over the row it returns, one program for
@@ -10077,6 +10080,7 @@ impl PreparedDml {
             values,
             conflict: prepared_conflict,
             returning: prepared_returning,
+            checks: std::sync::OnceLock::new(),
         })
     }
 }
@@ -11330,6 +11334,24 @@ impl<'a> DmlRunner<'a> {
     /// Each SET value's program with the column it writes
     pub(crate) fn sets(&self) -> &'a [(usize, SharedProgram)] {
         &self.prepared.sets
+    }
+
+    /// The CHECK constraints of `schema` reading a column the SET writes,
+    /// compiled by the first run that compiles them all, held for the next
+    pub(crate) fn update_checks(
+        &self,
+        schema: &Schema,
+    ) -> Result<Arc<Vec<super::dml::CompiledCheck>>> {
+        if let Some(checks) = self.prepared.checks.get() {
+            return Ok(Arc::clone(checks));
+        }
+        let sets = &self.prepared.sets;
+        let checks = super::dml::checks_reading(super::dml::compile_check_programs(schema)?, |c| {
+            sets.iter().any(|(at, _)| *at == c)
+        });
+        Ok(Arc::clone(
+            self.prepared.checks.get_or_init(|| Arc::new(checks)),
+        ))
     }
 
     /// The programs of each VALUES row, None for a value without a subquery
