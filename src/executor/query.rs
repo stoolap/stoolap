@@ -2159,17 +2159,14 @@ impl Executor {
                 crate::test_failpoints::general_path_reached(
                     crate::test_failpoints::GeneralPath::OrderByEvaluator,
                 );
-                // What a sort expression reads from the row, for every
-                // evaluator below: an aggregate the column computing it, a
-                // name the input column at the position the layout gives it
+                // What a sort expression reads from the row: an aggregate the
+                // column computing it, a name the input column at the
+                // position the layout gives it
                 let mut sort_slots = aggregate_slots;
                 if let Some(layout) = layout {
                     layout.sort_slots(stmt, &mut sort_slots)?;
                 }
-                let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-                evaluator = evaluator.with_context(ctx);
-                evaluator.init_columns(&columns);
-                evaluator.add_aggregate_aliases(&sort_slots);
+                let mut vm = ExprVM::new();
 
                 // OPTIMIZATION: Instead of cloning rows and appending sort keys,
                 // compute sort keys separately and use index-based sorting.
@@ -2192,7 +2189,17 @@ impl Executor {
                         .map(|(ob, mapped)| {
                             Ok(match *mapped {
                                 Some(idx) => (Some(idx), None),
-                                None => (None, Some(evaluator.compile_cached(&ob.expression)?)),
+                                None => (
+                                    None,
+                                    Some(super::aggregation::compile_over_slots(
+                                        &ob.expression,
+                                        &columns,
+                                        &self.function_registry,
+                                        Some(&sort_slots),
+                                        false,
+                                        Some(ctx.params()),
+                                    )?),
+                                ),
                             })
                         })
                         .collect::<Result<_>>()?;
@@ -2205,7 +2212,9 @@ impl Executor {
                                         .get(*idx)
                                         .cloned()
                                         .unwrap_or_else(Value::null_unknown)),
-                                    (None, Some(p)) => evaluator.evaluate_program(p, row),
+                                    (None, Some(p)) => {
+                                        vm.execute(p, &super::aggregation::slot_context(row, ctx))
+                                    }
                                     (None, None) => Ok(Value::null_unknown()),
                                 })
                                 .collect::<Result<Vec<Value>>>()

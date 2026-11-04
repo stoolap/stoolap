@@ -989,9 +989,6 @@ pub struct CompiledEvaluator<'a> {
     /// Current transaction ID
     transaction_id: Option<u64>,
 
-    /// Expression aliases for HAVING clause
-    expression_aliases: FxHashMap<ExprKey, u16>,
-
     /// VM instance (reusable)
     vm: ExprVM,
 
@@ -1014,7 +1011,6 @@ impl<'a> CompiledEvaluator<'a> {
             columns: CompactArc::new(Vec::new()),
             params: EMPTY_PARAMS.clone(),
             transaction_id: None,
-            expression_aliases: FxHashMap::default(),
             vm: ExprVM::new(),
             local_cache: FxHashMap::default(),
             current_row: None,
@@ -1070,13 +1066,6 @@ impl<'a> CompiledEvaluator<'a> {
 
         self.columns = columns;
         // Clear local cache since compilation context changed
-        self.local_cache.clear();
-    }
-
-    /// Add aggregate expression aliases for HAVING clause evaluation
-    pub(crate) fn add_aggregate_aliases(&mut self, aliases: &FxHashMap<ExprKey, usize>) {
-        self.expression_aliases.extend(alias_slots(aliases));
-        // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }
 
@@ -1390,12 +1379,9 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Compile an expression to a Program
     fn compile_expression(&self, expr: &Expression) -> Result<Program> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::bridge_compiled();
         let mut ctx = CompileContext::new(&self.columns, self.function_registry);
-
-        // Add expression aliases
-        if !self.expression_aliases.is_empty() {
-            ctx = ctx.with_expression_aliases(self.expression_aliases.clone());
-        }
 
         // The parameters are known here: each compiles as its value
         if !self.params.is_empty() {
