@@ -223,6 +223,9 @@ pub struct PreparedJoin {
     /// The plan of each side that runs as a statement of its own: a join or
     /// a derived table
     side_plans: [NestedPlan; 2],
+    /// The plan of each side read as a statement with none of its own
+    /// conditions, a statement apart from the one that has them
+    bare_side_plans: [NestedPlan; 2],
     /// How the join runs, planned on first need
     join_plan: std::sync::OnceLock<JoinPlan>,
     /// Whether the statement's CTEs are named without reading them, which
@@ -246,6 +249,7 @@ impl PreparedJoin {
             grouped_blocks: Shelf::new(),
             feeds: Shelf::new(),
             side_plans: Default::default(),
+            bare_side_plans: Default::default(),
             join_plan: std::sync::OnceLock::new(),
             ctes_named: std::sync::OnceLock::new(),
         }
@@ -263,6 +267,12 @@ impl PreparedJoin {
     /// The plan of side `side` when it runs as a statement of its own
     pub(crate) fn side_plan(&self, side: usize) -> &NestedPlan {
         &self.side_plans[side]
+    }
+
+    /// The plan of side `side` when it runs as a statement with none of its
+    /// own conditions
+    pub(crate) fn bare_side_plan(&self, side: usize) -> &NestedPlan {
+        &self.bare_side_plans[side]
     }
 
     /// Whether the WHERE's subqueries run as the statement's blocks, as

@@ -351,7 +351,16 @@ SELECT * FROM (VALUES ('largest', (SELECT MAX(amount) FROM orders)),
 SELECT value FROM generate_series(1, (SELECT COUNT(*) FROM customers));
 ```
 
-A `VALUES` list or a table function that is one side of a join cannot hold a subquery yet; the statement fails with an error.
+This holds where the `VALUES` list or the table function is one side of a join, too:
+
+```sql
+SELECT o.id, t.target
+FROM orders o
+JOIN (VALUES ((SELECT MAX(amount) FROM orders))) AS t(target) ON o.amount = t.target;
+SELECT c.id, g.value
+FROM customers c
+LEFT JOIN generate_series(1, (SELECT COUNT(*) FROM regions)) AS g ON g.value = c.region_id;
+```
 
 ### Derived Tables (Subqueries in FROM)
 

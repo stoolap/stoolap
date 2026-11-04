@@ -399,6 +399,8 @@ struct SideRead<'a> {
     run: Option<(StatementRun<'a>, usize)>,
     /// The join's plan of the side, when the side runs as a statement
     plan: Option<&'a NestedPlan>,
+    /// The join's plan of the side run as a statement without `filter`
+    bare: Option<&'a NestedPlan>,
     /// A side that is a join keeps both columns of a pair it merges
     apart: bool,
 }
@@ -479,8 +481,8 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    ambiguous_column, joined_aliases, set_operation_key_column, set_operation_key_item, Bound,
-    JoinBlocks, OutOfFamily, PreparedProjection,
+    ambiguous_column, joined_aliases, mentions_subquery, set_operation_key_column,
+    set_operation_key_item, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -5166,6 +5168,7 @@ impl Executor {
             .map_or([false; 2], |held| [0, 1].map(|i| held.side_sourced(i)));
         let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i] && !sourced[i]);
         let side_plan = |side: usize| plan.as_deref().map(|plan| plan.side_plan(side));
+        let bare_plan = |side: usize| plan.as_deref().map(|plan| plan.bare_side_plan(side));
         let plain = |filter: &Option<Expression>, rows: bool| match rows {
             true => filter.as_ref().and_then(|filter| {
                 combine_predicates_with_and(
@@ -5229,6 +5232,7 @@ impl Executor {
             },
             run: statement_run.map(|run| (run, 0)),
             plan: side_plan(0),
+            bare: bare_plan(0),
             apart,
         };
         let right_read = SideRead {
@@ -5239,6 +5243,7 @@ impl Executor {
             },
             run: statement_run.map(|run| (run, 1)),
             plan: side_plan(1),
+            bare: bare_plan(1),
             apart,
         };
         let where_blocks = statement_run.and_then(|run| run.site(false));
@@ -5340,8 +5345,13 @@ impl Executor {
                                         apart: side.apart || rows_sides[i],
                                         ..side
                                     };
+                                    // A table function generates no row, as the
+                                    // source read above takes one
+                                    let limit =
+                                        matches!(&**entry, Expression::FunctionTableSource(_))
+                                            .then_some(0);
                                     let (rows, ..) =
-                                        self.read_join_side(entry, ctx, side, None, None, 0)?;
+                                        self.read_join_side(entry, ctx, side, None, limit, 0)?;
                                     run.blocks.rows_fit(i, &name, rows.columns())?;
                                     if let Expression::SubquerySource(_) = &**entry {
                                         Self::materialize_result(rows)?;
@@ -7436,10 +7446,7 @@ impl Executor {
     pub(super) fn values_row(row_exprs: &[Expression], ctx: &ExecutionContext) -> Result<Row> {
         let mut row_values = Vec::with_capacity(row_exprs.len());
         for expr in row_exprs {
-            let value = ExpressionEval::compile(expr, &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?;
-            row_values.push(value);
+            row_values.push(super::expression::evaluate_once(expr, Some(ctx))?);
         }
         Ok(Row::from_values(row_values))
     }
@@ -7921,26 +7928,7 @@ impl Executor {
             Expression::SubquerySource(ss) => self.derived_side_rows(ss, ctx, filter, None),
             Expression::ValuesSource(vs) => {
                 // A SELECT * of the VALUES, with the filter pushed to this side
-                let select_all = SelectStatement {
-                    param_count: 0,
-                    token: dummy_token("SELECT", TokenType::Keyword),
-                    distinct: false,
-                    distinct_on: vec![],
-                    columns: vec![Expression::Star(StarExpression {
-                        token: dummy_token("*", TokenType::Punctuator),
-                    })],
-                    with: None,
-                    table_expr: Some(Box::new(Expression::ValuesSource(vs.clone()))),
-                    where_clause: filter.map(|f| Box::new(f.clone())),
-                    group_by: GroupByClause::default(),
-                    having: None,
-                    window_defs: vec![],
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    set_operations: vec![],
-                    prepared: None,
-                };
+                let select_all = Self::select_all_of(Expression::ValuesSource(vs.clone()), filter);
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
                 let (result, columns, _, _) =
@@ -8091,9 +8079,27 @@ impl Executor {
                 let (result, columns) = self.derived_side_rows(ss, ctx, filter, plan)?;
                 (result, columns, false, None)
             }
-            (None, None) => self.execute_table_expression_with_filter_limit(
-                expr, ctx, filter, limit, offset, read_out,
-            )?,
+            // A held statement is one statement: the side's with its own
+            // condition, or without one
+            (None, None) => match (
+                Self::side_with_subquery(expr),
+                side.filter.map_or(side.bare, |_| side.plan),
+            ) {
+                (Some(alias), Some(plan)) => {
+                    let conditions = (side.filter, extra);
+                    let (result, columns, bounded) = self.statement_side_rows(
+                        (expr, alias),
+                        ctx,
+                        conditions,
+                        (limit, offset),
+                        plan,
+                    )?;
+                    (result, columns, bounded, None)
+                }
+                _ => self.execute_table_expression_with_filter_limit(
+                    expr, ctx, filter, limit, offset, read_out,
+                )?,
+            },
         };
         if let Some((run, index)) = rows {
             let (result, columns, bounded, _) = fetched;
@@ -8107,6 +8113,130 @@ impl Executor {
             run.blocks.side_fits(index, &schema)?;
         }
         Ok(fetched)
+    }
+
+    /// A SELECT * of `source`, with `filter` as its WHERE
+    fn select_all_of(source: Expression, filter: Option<&Expression>) -> SelectStatement {
+        SelectStatement {
+            param_count: 0,
+            token: dummy_token("SELECT", TokenType::Keyword),
+            distinct: false,
+            distinct_on: vec![],
+            columns: vec![Expression::Star(StarExpression {
+                token: dummy_token("*", TokenType::Punctuator),
+            })],
+            with: None,
+            table_expr: Some(Box::new(source)),
+            where_clause: filter.map(|f| Box::new(f.clone())),
+            group_by: GroupByClause::default(),
+            having: None,
+            window_defs: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            set_operations: vec![],
+            prepared: None,
+        }
+    }
+
+    /// The VALUES list or table function `source` of a join's side when a
+    /// value or an argument of it holds a subquery, with the name its
+    /// columns are qualified by; None for any other side
+    fn side_with_subquery(source: &Expression) -> Option<Option<&str>> {
+        match source {
+            Expression::ValuesSource(vs) if vs.rows.iter().flatten().any(mentions_subquery) => {
+                Some(vs.alias.as_ref().map(|a| a.value.as_str()))
+            }
+            Expression::FunctionTableSource(tvf) if tvf.arguments.iter().any(mentions_subquery) => {
+                Some(Some(
+                    tvf.alias.as_ref().unwrap_or(&tvf.function).value.as_str(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The rows of the join side `source`, a SELECT * of it run under the
+    /// join's `plan` for the side, so a subquery in it runs as that
+    /// statement's block, and its columns qualified by `alias`. The side's
+    /// own `filter`, the same every read, is that statement's WHERE, which
+    /// narrows the source as it is read; `extra`, which the join adds to
+    /// this read, is applied to its rows. A table function's rows are cut as
+    /// its general read cuts them, with whether `limit` and `offset` were
+    /// applied
+    fn statement_side_rows(
+        &self,
+        (source, alias): (&Expression, Option<&str>),
+        ctx: &ExecutionContext,
+        (filter, extra): (Option<&Expression>, Option<&Expression>),
+        (limit, offset): (Option<usize>, usize),
+        plan: &NestedPlan,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        let keeps_none =
+            |c: Option<&Expression>| c.is_some_and(|c| true_for_no_row(c, ctx, global_registry()));
+        // A VALUES list is read whole, as its general read reads it: a read
+        // again would evaluate its values again
+        let first = match (source, filter, extra) {
+            (Expression::FunctionTableSource(_), ..) if keeps_none(filter) || keeps_none(extra) => {
+                Some(0)
+            }
+            (Expression::FunctionTableSource(_), None, None) => {
+                limit.map(|limit| limit.saturating_add(offset))
+            }
+            _ => None,
+        };
+        // The cut is a parameter past the statement's own, so every read of
+        // the plan runs one statement
+        let mut cut = ctx.clone();
+        cut.add_param(Value::Integer(
+            first.map_or(i64::MAX, |first| i64::try_from(first).unwrap_or(i64::MAX)),
+        ));
+        let mut select_all = Self::select_all_of(source.clone(), filter);
+        select_all.limit = Some(Box::new(super::dml::answer_parameter(cut.params().len())));
+        let result = self.execute_source_statement(&select_all, &cut, None, Some(plan))?;
+        let columns: Vec<String> = (result.columns().iter())
+            .map(|c| match alias {
+                Some(alias) => qualified(alias, bare_name(c)),
+                None => bare_name(c).to_string(),
+            })
+            .collect();
+        let bounded = first.is_some();
+        let skip = if bounded { offset } else { 0 };
+        if extra.is_none() && skip == 0 {
+            return Ok((result, columns, bounded));
+        }
+        let program = match extra {
+            Some(extra) => {
+                let program = super::aggregation::compile_over_slots(
+                    extra,
+                    &columns,
+                    global_registry(),
+                    None,
+                    false,
+                    None,
+                )?;
+                Some(super::expression::Program::bound(program, ctx.params()))
+            }
+            None => None,
+        };
+        let mut vm = ExprVM::new();
+        let mut kept = RowVec::new();
+        let mut skipped = 0;
+        for (id, row) in Self::materialize_result(result)? {
+            if let Some(program) = &program {
+                let exec = super::aggregation::slot_context(&row, ctx);
+                if !vm.execute_bool_checked(program, &exec)? {
+                    continue;
+                }
+            }
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+            kept.push((id, row));
+        }
+        let result = ExecutorResult::new(columns.clone(), kept);
+        Ok((Box::new(result), columns, bounded))
     }
 
     /// A derived table's rows and its columns qualified by its alias, those
