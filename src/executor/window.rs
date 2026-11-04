@@ -417,21 +417,23 @@ impl<'w> CallArgs<'w> {
         }
     }
 
-    /// The default's program over the input `columns`, compiled on first
-    /// read; None when there is no default or it is read without one
+    /// The default's program over the input `columns`, a group item or
+    /// aggregate read from its slot in `slots`, compiled on first read;
+    /// None when there is no default or it is read without one
     fn default_program(
         &self,
-        columns: &[String],
+        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Option<&Program>> {
         let Some((expr, ArgSource::Program(_))) = &self.default else {
             return Ok(None);
         };
+        let slots = Some(slots);
         let program = self
             .default_program
             .get_or_init(|| match self.held_default {
-                Some(held) => held_program(expr, held, columns, None, ctx, blocks),
-                None => row_program(expr, columns, None, ctx, blocks),
+                Some(held) => held_program(expr, held, columns, slots, ctx, blocks),
+                None => row_program(expr, columns, slots, ctx, blocks),
             });
         program.as_deref().map(Some).map_err(Clone::clone)
     }
@@ -3114,7 +3116,7 @@ impl Executor {
             // Each partition writes to its own row indices (guaranteed disjoint).
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
-            let lead_lag_default = args.default_program(columns, (ctx, blocks))?;
+            let lead_lag_default = args.default_program((columns, group_slots), (ctx, blocks))?;
 
             // A default holding a REGEXP is copied once per thread, not per job
             #[cfg(feature = "parallel")]
@@ -3252,7 +3254,7 @@ impl Executor {
             wf_info,
             &frame,
             args,
-            args.default_program(columns, (ctx, blocks))?,
+            args.default_program((columns, group_slots), (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3460,7 +3462,7 @@ impl Executor {
             wf_info,
             frame,
             args,
-            args.default_program(columns, (ctx, blocks))?,
+            args.default_program((columns, group_slots), (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,

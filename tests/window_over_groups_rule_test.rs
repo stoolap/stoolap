@@ -13,8 +13,9 @@
 // limitations under the License.
 
 //! A window function over groups reads a GROUP BY expression and the
-//! group's aggregates in every part of its call, hot and sealed, prepared or
-//! not; a column the GROUP BY does not name is an error in each of them
+//! aggregates its SELECT list computes in every part of its call, hot and
+//! sealed, prepared or not; a column the GROUP BY does not name is an error
+//! in each of them
 
 use stoolap::{Database, Value};
 
@@ -40,6 +41,18 @@ const ANSWERED: &[(&str, &[i64], &[&str])] = &[
          GROUP BY id % 2 ORDER BY 1",
         &[],
         &["0|0", "1|100"],
+    ),
+    (
+        "SELECT id % 2, LAG(id % 2, 1, (id % 2) + 100) OVER (ORDER BY id % 2) FROM t \
+         GROUP BY id % 2 ORDER BY 1",
+        &[],
+        &["0|100", "1|0"],
+    ),
+    (
+        "SELECT id % 2, SUM(a), SUM(COUNT(*)) FILTER (WHERE SUM(a) > 30) OVER () FROM t \
+         GROUP BY id % 2 ORDER BY 1",
+        &[],
+        &["0|20|2", "1|40|2"],
     ),
     (
         "SELECT id % 2, SUM(COUNT(*)) FILTER (WHERE id % 2 = 1) OVER () FROM t \
@@ -78,11 +91,20 @@ const REFUSED: &[&str] = &[
     "SELECT id % 2, SUM(a) OVER () FROM t GROUP BY id % 2",
     "SELECT id % 2, SUM(a * 2) OVER () FROM t GROUP BY id % 2",
     "SELECT id % 2, LAG(a) OVER (ORDER BY id % 2) FROM t GROUP BY id % 2",
+    "SELECT id % 2, LAG(id % 2, 1, a) OVER (ORDER BY id % 2) FROM t GROUP BY id % 2",
     "SELECT id % 2, SUM(COUNT(*)) FILTER (WHERE a > 0) OVER () FROM t GROUP BY id % 2",
     "SELECT id % 2, STRING_AGG(CAST(SUM(a) AS TEXT), ',' ORDER BY a) OVER () FROM t \
      GROUP BY id % 2",
     "SELECT id % 2, SUM(COUNT(*)) OVER (PARTITION BY a) FROM t GROUP BY id % 2",
     "SELECT id % 2, ROW_NUMBER() OVER (ORDER BY a) FROM t GROUP BY id % 2",
+];
+
+/// Each statement whose window `FILTER` or own `ORDER BY` reads an aggregate
+/// the SELECT list does not compute
+const UNCOMPUTED: &[&str] = &[
+    "SELECT id % 2, SUM(COUNT(*)) FILTER (WHERE SUM(a) > 30) OVER () FROM t GROUP BY id % 2",
+    "SELECT id % 2, STRING_AGG(CAST(id % 2 AS TEXT), ',' ORDER BY SUM(a)) OVER () FROM t \
+     GROUP BY id % 2",
 ];
 
 fn open(dir: &tempfile::TempDir, sealed: bool) -> Database {
@@ -139,6 +161,12 @@ fn a_window_over_groups_reads_its_groups_in_every_part_of_its_call() {
         for sql in REFUSED {
             let got = answer(db.query(sql, ()));
             if !got.as_ref().is_err_and(|e| e.contains("'a' not found")) {
+                wrong.push(format!("sealed {sealed}: {sql}: {got:?}"));
+            }
+        }
+        for sql in UNCOMPUTED {
+            let got = answer(db.query(sql, ()));
+            if !got.as_ref().is_err_and(|e| e.contains("is not allowed")) {
                 wrong.push(format!("sealed {sealed}: {sql}: {got:?}"));
             }
         }

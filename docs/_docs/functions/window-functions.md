@@ -216,7 +216,7 @@ Diana  | 80000  | 390000
 
 ## Window Functions over Groups
 
-In a query that groups its rows, a window function runs over the groups. Every part of the call reads the group's row: its arguments, its `FILTER`, its own `ORDER BY`, and the `PARTITION BY` and `ORDER BY` of its `OVER` clause read a `GROUP BY` expression and the group's aggregates. `SELECT id % 2, SUM((id % 2) * 10) OVER () FROM t GROUP BY id % 2` and `SUM(COUNT(*)) FILTER (WHERE id % 2 = 1) OVER ()` read each group's `id % 2`. A column the `GROUP BY` does not name, outside an aggregate call, is an error in any of these places, as it is in the SELECT list.
+In a query that groups its rows, a window function runs over the groups. Every part of the call reads the group's row: its arguments, a `LAG` or `LEAD` default included, its `FILTER`, its own `ORDER BY`, and the `PARTITION BY` and `ORDER BY` of its `OVER` clause read a `GROUP BY` expression and the aggregates the SELECT list computes. `SELECT id % 2, SUM((id % 2) * 10) OVER () FROM t GROUP BY id % 2` and `SUM(COUNT(*)) FILTER (WHERE id % 2 = 1) OVER ()` read each group's `id % 2`. A column the `GROUP BY` does not name, outside an aggregate call, is an error in any of these places, as it is in the SELECT list. An aggregate that only a window's `FILTER` or its own `ORDER BY` writes, such as `FILTER (WHERE SUM(a) > 30)` when the SELECT list has no `SUM(a)`, is an error: `aggregate function SUM is not allowed where the rows are not grouped`.
 
 ## Common Use Cases
 
