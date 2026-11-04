@@ -5964,25 +5964,37 @@ impl Executor {
             Some(_) => (None, 0),
             None => (limit, offset),
         };
-        // A side read from the source the blocks prepared, unless the join
-        // adds conditions of its own to this read
-        if let (Some((run, index)), None) = (rows, extra) {
+        // A side read from the source the blocks prepared; the conditions the
+        // join adds to this read are asked of its rows, which no cut reads
+        // before them
+        if let Some((run, index)) = rows {
             let alias = get_table_alias_from_expr(expr);
+            let cut = match extra {
+                Some(_) => (None, 0),
+                None => (limit, offset),
+            };
             let read = self.join_sourced_side_rows(
                 run.blocks,
                 run.run,
                 index,
                 (alias.as_deref().unwrap_or_default(), ctx),
-                (limit, offset),
+                cut,
             )?;
             if let Some((result, bounded)) = read {
-                let columns = (result.columns().iter())
+                let columns: Vec<String> = (result.columns().iter())
                     .map(|c| match &alias {
                         Some(alias) => qualified(alias, c),
                         None => c.clone(),
                     })
                     .collect();
-                return Ok((result, columns, bounded, None));
+                let Some(extra) = extra else {
+                    return Ok((result, columns, bounded, None));
+                };
+                let own = result.columns().to_vec();
+                let mut kept = Self::materialize_result(result)?;
+                Self::side_filter(extra, &columns, ctx)?.retain_checked(&mut kept)?;
+                let result = ExecutorResult::new(own, kept);
+                return Ok((Box::new(result), columns, false, None));
             }
         }
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
