@@ -42,7 +42,7 @@ use super::utils::{
     bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
     qualified_index, qualified_key_index, shown_name, split_qualified,
 };
-use super::window::WindowOutput;
+use super::window::{HeldWindow, WindowOutput};
 use super::Executor;
 
 // Re-export for backward compatibility
@@ -2356,13 +2356,14 @@ impl Executor {
         let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
         let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
         let path = AggregatePath::General;
-        let run = (None, held);
+        let run = (None, held, None);
         self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, run)
     }
 
     /// The window functions of `stmt` over its groups of `aggregations`,
     /// grouped from the rows of `input` as any aggregation groups them, and
-    /// each GROUPING() call read from its group's flag; `path` grouped them
+    /// each GROUPING() call read from its group's flag; `path` grouped them,
+    /// the windows' programs those `windows` keeps for the statement
     #[allow(clippy::too_many_arguments)]
     pub(super) fn windows_over_groups(
         &self,
@@ -2372,7 +2373,11 @@ impl Executor {
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
-        (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
+        (blocks, held, windows): (
+            Option<&dyn SubqueryExecutor>,
+            Option<&HeldFeed>,
+            Option<&HeldWindow>,
+        ),
     ) -> Result<WindowOutput> {
         let run = (blocks, held);
         let (columns, rows, items) =
@@ -2394,7 +2399,11 @@ impl Executor {
         }
         path.taken();
         self.execute_select_with_window_functions_over_groups(
-            stmt, ctx, &rows, &columns, &slots, blocks,
+            stmt,
+            ctx,
+            (&rows, &columns),
+            &slots,
+            (blocks, windows),
         )
     }
 

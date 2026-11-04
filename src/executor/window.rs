@@ -417,21 +417,23 @@ impl<'w> CallArgs<'w> {
         }
     }
 
-    /// The default's program over the input `columns`, compiled on first
-    /// read; None when there is no default or it is read without one
+    /// The default's program over the input `columns`, a group item or
+    /// aggregate read from its slot in `slots`, compiled on first read;
+    /// None when there is no default or it is read without one
     fn default_program(
         &self,
-        columns: &[String],
+        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Option<&Program>> {
         let Some((expr, ArgSource::Program(_))) = &self.default else {
             return Ok(None);
         };
+        let slots = Some(slots);
         let program = self
             .default_program
             .get_or_init(|| match self.held_default {
-                Some(held) => held_program(expr, held, columns, None, ctx, blocks),
-                None => row_program(expr, columns, None, ctx, blocks),
+                Some(held) => held_program(expr, held, columns, slots, ctx, blocks),
+                None => row_program(expr, columns, slots, ctx, blocks),
             });
         program.as_deref().map(Some).map_err(Clone::clone)
     }
@@ -1255,15 +1257,15 @@ impl Executor {
     }
 
     /// Window functions over aggregated rows, whose group items and aggregates
-    /// are found by identity at `group_slots`
+    /// are found by identity at `group_slots`, their programs those `held`
+    /// keeps for the statement
     pub(crate) fn execute_select_with_window_functions_over_groups(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: &[(i64, Row)],
-        base_columns: &[String],
+        (base_rows, base_columns): (&[(i64, Row)], &[String]),
         group_slots: &FxHashMap<ExprKey, usize>,
-        blocks: Option<&dyn SubqueryExecutor>,
+        run: (Option<&dyn SubqueryExecutor>, Option<&HeldWindow>),
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
@@ -1273,7 +1275,7 @@ impl Executor {
             group_slots,
             None,
             None,
-            (blocks, None),
+            run,
         )
     }
 
@@ -3114,7 +3116,7 @@ impl Executor {
             // Each partition writes to its own row indices (guaranteed disjoint).
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
-            let lead_lag_default = args.default_program(columns, (ctx, blocks))?;
+            let lead_lag_default = args.default_program((columns, group_slots), (ctx, blocks))?;
 
             // A default holding a REGEXP is copied once per thread, not per job
             #[cfg(feature = "parallel")]
@@ -3252,7 +3254,7 @@ impl Executor {
             wf_info,
             &frame,
             args,
-            args.default_program(columns, (ctx, blocks))?,
+            args.default_program((columns, group_slots), (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3460,7 +3462,7 @@ impl Executor {
             wf_info,
             frame,
             args,
-            args.default_program(columns, (ctx, blocks))?,
+            args.default_program((columns, group_slots), (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3745,7 +3747,7 @@ impl Executor {
             return Ok(Vec::new());
         };
         let held = wf_info.held.as_ref().map(|held| &held.argument[..]);
-        let mut eval = RowPrograms::compile([arg], columns, None, ctx, blocks, held)?;
+        let mut eval = RowPrograms::compile([arg], columns, Some(group_slots), ctx, blocks, held)?;
         rows.iter().map(|(_, row)| eval.eval(row)).collect()
     }
 
@@ -4260,19 +4262,20 @@ impl Executor {
     }
 
     /// The aggregate's argument per row, NULL where its FILTER rejects the
-    /// row; a held plan's FILTER program in `held`
+    /// row; a held plan's FILTER program in `held`, a group item or
+    /// aggregate read from its slot in `slots`
     #[allow(clippy::too_many_arguments)]
     fn window_filtered_values(
         &self,
         (filter, held): (&Expression, Option<&[HeldProgram]>),
         rows: &[(i64, Row)],
-        columns: &[String],
+        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
         ctx: &ExecutionContext,
         arg_col_idx: Option<usize>,
         expression_values: &[Value],
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
-        let mut eval = RowPrograms::compile([filter], columns, None, ctx, blocks, held)?;
+        let mut eval = RowPrograms::compile([filter], columns, Some(slots), ctx, blocks, held)?;
         let mut values = Vec::with_capacity(rows.len());
         for (idx, (_, row)) in rows.iter().enumerate() {
             values.push(if matches!(eval.eval(row)?, Value::Boolean(true)) {
@@ -4303,12 +4306,13 @@ impl Executor {
     }
 
     /// The keys the call's own ORDER BY gives each row, empty without one or
-    /// for an aggregate that does not order its input
+    /// for an aggregate that does not order its input; a group item or
+    /// aggregate read from its slot in `slots`
     fn window_call_sort_keys(
         &self,
         wf_info: &WindowFunctionInfo,
         rows: &[(i64, Row)],
-        columns: &[String],
+        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Vec<Value>>> {
@@ -4322,7 +4326,7 @@ impl Executor {
         let mut evals = RowPrograms::compile(
             wf_info.call_order_by.iter().map(|order| &order.expression),
             columns,
-            None,
+            Some(slots),
             ctx,
             blocks,
             wf_info.held.as_ref().map(|held| &*held.call_order),
@@ -4374,8 +4378,14 @@ impl Executor {
         // Pre-compute expression values for all rows if needed
         let mut expression_values: Vec<Value> = if has_expression_arg {
             let held = wf_info.held.as_ref().map(|held| &held.argument[..]);
-            let mut eval =
-                RowPrograms::compile(&wf_info.arguments[..1], columns, None, ctx, blocks, held)?;
+            let mut eval = RowPrograms::compile(
+                &wf_info.arguments[..1],
+                columns,
+                Some(group_slots),
+                ctx,
+                blocks,
+                held,
+            )?;
             rows.iter()
                 .map(|(_, row)| eval.eval(row))
                 .collect::<Result<_>>()?
@@ -4389,7 +4399,7 @@ impl Executor {
             expression_values = self.window_filtered_values(
                 (filter, wf_info.held.as_ref().map(|held| &held.filter[..])),
                 rows,
-                columns,
+                (columns, group_slots),
                 ctx,
                 arg_col_idx,
                 &expression_values,
@@ -4399,7 +4409,8 @@ impl Executor {
         }
 
         // The keys the call's own ORDER BY gives each row, empty without one
-        let sort_keys = self.window_call_sort_keys(wf_info, rows, columns, ctx, blocks)?;
+        let sort_keys =
+            self.window_call_sort_keys(wf_info, rows, (columns, group_slots), ctx, blocks)?;
         let keys: Option<&[Vec<Value>]> = (!sort_keys.is_empty()).then_some(&sort_keys);
 
         // Use precomputed ORDER BY values from cache if available
