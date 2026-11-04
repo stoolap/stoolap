@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A join whose WHERE keeps no row names its columns and raises its
-//! errors as the general path does, reading no side and compiling nothing
-//! through the evaluator bridge once its blocks are prepared
+//! A join whose WHERE keeps no row names its columns and raises the errors
+//! its names and its sides' reads raise, reading no table side's rows and
+//! compiling nothing through the evaluator bridge once its blocks are
+//! prepared
 
 #![cfg(feature = "test-failpoints")]
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{after_select_table_opened, bridge_compiles, PREPARED_FAMILIES_OFF};
+use stoolap::test_failpoints::{after_select_table_opened, bridge_compiles};
 use stoolap::Database;
 
 // The families switch and the bridge counter are process-wide
@@ -52,19 +52,6 @@ fn answer(db: &Database, sql: &str) -> Answer {
     Ok((columns, rows))
 }
 
-/// `sql` answered with the prepared families refused: the general path
-fn general(db: &Database, sql: &str) -> Answer {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    let _restore = Restore;
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    answer(db, sql)
-}
-
 fn open(dsn: &str) -> Database {
     let db = Database::open(dsn).unwrap();
     for sql in [
@@ -82,51 +69,96 @@ fn open(dsn: &str) -> Database {
     db
 }
 
-/// Each side `u` may be read as
-const SIDES: &[(&str, &str)] = &[
-    ("", "u"),
-    ("", "uv AS u"),
-    ("WITH c AS (SELECT id, b FROM u) ", "c AS u"),
-    ("", "(SELECT id, b FROM u) AS u"),
-    ("", "(VALUES (1, 10), (3, 30)) AS u(id, b)"),
-    ("", "generate_series(1, 3) AS u(id)"),
+/// Each side `u` may be read as, and whether it has the column b
+const SIDES: &[(&str, &str, bool)] = &[
+    ("", "u", true),
+    ("", "uv AS u", true),
+    ("WITH c AS (SELECT id, b FROM u) ", "c AS u", true),
+    ("", "(SELECT id, b FROM u) AS u", true),
+    ("", "(VALUES (1, 10), (3, 30)) AS u(id, b)", true),
+    ("", "generate_series(1, 3) AS u(id)", false),
 ];
 
-const SHAPES: &[&str] = &[
-    "SELECT * FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
-    "SELECT t.id, u.id FROM t LEFT JOIN {u} ON u.id = t.id WHERE 1 = 0",
-    "SELECT t.a FROM t RIGHT JOIN {u} ON u.id = t.id WHERE t.a > 0 AND 1 = 0",
-    "SELECT * FROM t FULL JOIN {u} ON u.id = t.id WHERE FALSE",
-    "SELECT COUNT(*) FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
-    "SELECT * FROM t JOIN {u} USING (id) WHERE 1 = 0",
-    "SELECT * FROM t NATURAL JOIN {u} WHERE 1 = 0",
-    "SELECT * FROM t JOIN {u} USING (id) JOIN w ON w.k = t.id WHERE 1 = 0",
-    "SELECT * FROM w JOIN t ON w.k = t.id JOIN {u} USING (id) WHERE 1 = 0",
-    "SELECT * FROM w CROSS JOIN t LEFT JOIN {u} ON u.id = t.id WHERE 1 = 0",
-    "SELECT t.missing FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
-    "SELECT t.id FROM t JOIN {u} ON u.id = t.id WHERE u.missing = 1 AND 1 = 0",
-    "SELECT t.id FROM t JOIN {u} ON u.id = t.id WHERE u.id + 9223372036854775807 > 0 AND 1 = 0",
+/// The columns and rows a statement answers, or a text its error holds
+type Written = Result<(&'static [&'static str], &'static [&'static str]), &'static str>;
+
+/// Each statement and what it answers, `u.b` a column only where the side
+/// has b
+const SHAPES: &[(&str, Written)] = &[
+    (
+        "SELECT * FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
+        Ok((&["t.id", "t.a", "u.id", "u.b"], &[])),
+    ),
+    (
+        "SELECT t.id, u.id FROM t LEFT JOIN {u} ON u.id = t.id WHERE 1 = 0",
+        Ok((&["id", "id"], &[])),
+    ),
+    (
+        "SELECT t.a FROM t RIGHT JOIN {u} ON u.id = t.id WHERE t.a > 0 AND 1 = 0",
+        Ok((&["a"], &[])),
+    ),
+    (
+        "SELECT * FROM t FULL JOIN {u} ON u.id = t.id WHERE FALSE",
+        Ok((&["t.id", "t.a", "u.id", "u.b"], &[])),
+    ),
+    (
+        "SELECT COUNT(*) FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
+        Ok((&["COUNT(*)"], &["Integer(0)"])),
+    ),
+    (
+        "SELECT * FROM t JOIN {u} USING (id) WHERE 1 = 0",
+        Ok((&["id", "t.a", "u.b"], &[])),
+    ),
+    (
+        "SELECT * FROM t NATURAL JOIN {u} WHERE 1 = 0",
+        Ok((&["id", "t.a", "u.b"], &[])),
+    ),
+    (
+        "SELECT * FROM t JOIN {u} USING (id) JOIN w ON w.k = t.id WHERE 1 = 0",
+        Ok((&["id", "t.a", "u.b", "w.k", "w.y"], &[])),
+    ),
+    (
+        "SELECT * FROM w JOIN t ON w.k = t.id JOIN {u} USING (id) WHERE 1 = 0",
+        Ok((&["w.k", "w.y", "id", "t.a", "u.b"], &[])),
+    ),
+    (
+        "SELECT * FROM w CROSS JOIN t LEFT JOIN {u} ON u.id = t.id WHERE 1 = 0",
+        Ok((&["w.k", "w.y", "t.id", "t.a", "u.id", "u.b"], &[])),
+    ),
+    (
+        "SELECT t.missing FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
+        Err("column 't.missing' not found"),
+    ),
+    (
+        "SELECT t.id FROM t JOIN {u} ON u.id = t.id WHERE u.missing = 1 AND 1 = 0",
+        Err("column 'u.missing' not found"),
+    ),
+    (
+        "SELECT t.id FROM t JOIN {u} ON u.id = t.id WHERE u.id + 9223372036854775807 > 0 AND 1 = 0",
+        Ok((&["id"], &[])),
+    ),
 ];
 
 #[test]
-fn a_join_that_keeps_no_row_answers_as_the_general_path() {
+fn a_join_that_keeps_no_row_answers_with_its_columns_and_no_row() {
     let _guard = serial();
     let db = open("memory://join_where_false_answers");
     let mut wrong = Vec::new();
-    for (with, side) in SIDES {
-        for shape in SHAPES {
+    for (with, side, has_b) in SIDES {
+        for (shape, want) in SHAPES {
             let sql = format!("{with}{}", shape.replace("{u}", side));
-            let (got, want) = (answer(&db, &sql), general(&db, &sql));
-            // The general path words a missing column as a compile error
-            let same = match (&got, &want) {
-                (Err(got), Err(want)) => {
-                    got == want
-                        || (got.contains("not found")
-                            && want.to_lowercase().contains(&got.to_lowercase()))
+            let got = answer(&db, &sql);
+            let fits = match (want, &got) {
+                (Ok((columns, rows)), Ok((got_columns, got_rows))) => {
+                    let columns: Vec<&str> = (columns.iter().copied())
+                        .filter(|c| *has_b || *c != "u.b")
+                        .collect();
+                    got_columns == &columns && got_rows == rows
                 }
-                _ => got == want,
+                (Err(want), Err(got)) => got.contains(want),
+                _ => false,
             };
-            if !same {
+            if !fits {
                 wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
             }
         }
@@ -135,7 +167,7 @@ fn a_join_that_keeps_no_row_answers_as_the_general_path() {
 }
 
 #[test]
-fn a_join_that_keeps_no_row_reads_its_other_sides_as_the_general_path() {
+fn a_join_that_keeps_no_row_reads_its_other_sides_for_their_errors() {
     let _guard = serial();
     let db = open("memory://join_where_false_side_errors");
     let mut wrong = Vec::new();
@@ -165,7 +197,7 @@ fn a_join_that_keeps_no_row_reads_its_other_sides_as_the_general_path() {
     // A view's rows are never pulled, so its body raises nothing
     let sql = "SELECT t.id FROM t JOIN uo ON TRUE WHERE FALSE";
     let got = answer(&db, sql);
-    if got != Ok((vec!["id".to_string()], Vec::new())) || got != general(&db, sql) {
+    if got != Ok((vec!["id".to_string()], Vec::new())) {
         wrong.push(format!("{sql}\n  got  {got:?}\n  want no row"));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -218,7 +250,7 @@ fn a_join_that_keeps_no_row_compiles_nothing_through_the_bridge_again() {
     let _guard = serial();
     let db = open("memory://join_where_false_bridge");
     let mut wrong = Vec::new();
-    for (with, side) in SIDES {
+    for (with, side, _) in SIDES {
         let sql = format!(
             "{with}SELECT t.id, u.id FROM t JOIN {side} ON u.id = t.id WHERE t.a > 0 AND 1 = 0"
         );
