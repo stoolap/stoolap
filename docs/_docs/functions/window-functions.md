@@ -214,6 +214,10 @@ Frank  | 75000  | 310000
 Diana  | 80000  | 390000
 ```
 
+## Window Functions over Groups
+
+In a query that groups its rows, a window function runs over the groups. Every part of the call reads the group's row: its arguments, its `FILTER`, its own `ORDER BY`, and the `PARTITION BY` and `ORDER BY` of its `OVER` clause read a `GROUP BY` expression and the group's aggregates. `SELECT id % 2, SUM((id % 2) * 10) OVER () FROM t GROUP BY id % 2` and `SUM(COUNT(*)) FILTER (WHERE id % 2 = 1) OVER ()` read each group's `id % 2`. A column the `GROUP BY` does not name, outside an aggregate call, is an error in any of these places, as it is in the SELECT list.
+
 ## Common Use Cases
 
 ### Top N per Group

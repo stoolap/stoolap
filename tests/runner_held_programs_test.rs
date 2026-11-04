@@ -173,6 +173,29 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         ],
     ),
     (
+        "SELECT id % 2, SUM(SUM(a) * $1) OVER () FROM t GROUP BY id % 2 ORDER BY 1",
+        &[2],
+        &["Integer(0)|Integer(120)", "Integer(1)|Integer(120)"],
+    ),
+    (
+        "SELECT id % 2, LAG(SUM(a) + $1, 1, 0) OVER (ORDER BY id % 2) FROM t \
+         GROUP BY id % 2 ORDER BY 1",
+        &[1],
+        &["Integer(0)|Integer(0)", "Integer(1)|Integer(21)"],
+    ),
+    (
+        "SELECT id % 2, SUM(COUNT(*)) FILTER (WHERE id % 2 = $1) OVER () FROM t \
+         GROUP BY id % 2 ORDER BY 1",
+        &[1],
+        &["Integer(0)|Integer(2)", "Integer(1)|Integer(2)"],
+    ),
+    (
+        "SELECT id % 2, STRING_AGG(CAST(SUM(a) + $1 AS TEXT), ',' ORDER BY id % 2 DESC) OVER () \
+         FROM t GROUP BY id % 2 ORDER BY 1",
+        &[0],
+        &["Integer(0)|Text(\"40,20\")", "Integer(1)|Text(\"40,20\")"],
+    ),
+    (
         "SELECT id FROM tv WHERE id < $1 ORDER BY id",
         &[3],
         &["Integer(1)", "Integer(2)"],
@@ -344,6 +367,39 @@ fn a_join_side_asked_a_condition_storage_cannot_take_compiles_nothing_through_th
             wrong.push(format!(
                 "{sql}: {first:?} then {again:?}, {compiled} bridge compiles"
             ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_window_over_groups_reading_an_ungrouped_column_fails_without_the_bridge() {
+    let db = open("runner_held_window_ungrouped");
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT id % 2, SUM(a) OVER () FROM t GROUP BY id % 2",
+        "SELECT id % 2, LAG(a) OVER (ORDER BY id % 2) FROM t GROUP BY id % 2",
+        "SELECT id % 2, SUM(COUNT(*)) FILTER (WHERE a > 0) OVER () FROM t GROUP BY id % 2",
+        "SELECT id % 2, STRING_AGG(CAST(SUM(a) AS TEXT), ',' ORDER BY a) OVER () FROM t \
+         GROUP BY id % 2",
+    ] {
+        for run in 0..2 {
+            let bridge = bridge_compiles();
+            let error = db
+                .query(sql, ())
+                .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+                .err()
+                .map(|e| e.to_string());
+            let compiled = bridge_compiles() - bridge;
+            if !error
+                .as_deref()
+                .is_some_and(|e| e.contains("'a' not found"))
+                || compiled != 0
+            {
+                wrong.push(format!(
+                    "{sql}, run {run}: {error:?}, {compiled} bridge compiles"
+                ));
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

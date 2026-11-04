@@ -12659,6 +12659,7 @@ impl Executor {
             Some(run as &dyn SubqueryExecutor),
             Some(&held.feed),
         );
+        let windows = (windows, Some(&held.windows));
         self.grouped_answer(windows, stmt, calls, ctx, input, columns)
     }
 
@@ -12719,9 +12720,9 @@ impl Executor {
         table: &dyn Table,
     ) -> Result<WindowOutput> {
         let aggregations = &*self.prepared_calls(prepared.calls, (ctx, runner))?;
-        let windows = prepared.windowed;
+        let windows = (prepared.windowed, prepared.windows);
         let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
-        if QueryClassification::groups(stmt) || windows {
+        if QueryClassification::groups(stmt) || windows.0 {
             let columns = table.schema().column_names_arc();
             if let Some(read) = prepared.read.and_then(Read::grouped) {
                 let run = (ctx, blocks);
@@ -12805,10 +12806,11 @@ impl Executor {
 
     /// `stmt`'s groups of `aggregations` from the rows of `input`, of
     /// `columns`: ended as every aggregate path ends them, or the window
-    /// functions over them when `windows`; its `blocks` answer its subqueries
+    /// functions over them when `windows`, their programs those `held`
+    /// keeps; its `blocks` answer its subqueries
     fn grouped_answer(
         &self,
-        windows: bool,
+        (windows, held): (bool, Option<&HeldWindow>),
         stmt: &SelectStatement,
         (aggregations, blocks, feed): HeldCalls<'_>,
         ctx: &ExecutionContext,
@@ -12818,6 +12820,7 @@ impl Executor {
         let path = AggregatePath::HashGroups;
         let run = (blocks, feed);
         if windows {
+            let run = (blocks, feed, held);
             return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, run);
         }
         let stmts = (stmt, stmt);
@@ -12838,7 +12841,7 @@ impl Executor {
         columns: &[String],
     ) -> Result<WindowOutput> {
         let aggregations = &*self.prepared_calls(prepared.calls, (ctx, runner))?;
-        let windows = prepared.windowed;
+        let windows = (prepared.windowed, prepared.windows);
         let calls = (
             aggregations,
             prepared.blocks.then_some(runner as &dyn SubqueryExecutor),
