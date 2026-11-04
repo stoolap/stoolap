@@ -484,11 +484,11 @@ use super::utils::{
     add_table_qualifier, bare_name, build_column_index_map, by_qualifier, collect_table_qualifiers,
     collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
-    extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
-    flatten_and_predicates, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name,
-    order_by_names_an_alias, qualified, qualified_index, shown_name, split_qualified,
-    strip_table_qualifier, substitute_filter_column, visit_column_refs, where_without_aggregates,
+    extract_base_column_name, extract_join_keys_and_residual, flatten_and_predicates,
+    flip_operator, for_each_qualified_star_column, get_table_alias_from_expr, index_join_residual,
+    infix_to_operator, item_name, order_by_names_an_alias, qualified, qualified_index, shown_name,
+    split_qualified, strip_table_qualifier, substitute_filter_column, visit_column_refs,
+    where_without_aggregates,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::WindowOutput;
@@ -4274,9 +4274,21 @@ impl Executor {
                 let outer_extra = if small_outer {
                     None
                 } else if let Some(ref right_f) = transferable {
-                    // Check if right filter references the inner join key column
-                    let references = filter_references_column(right_f, &inner_col);
-                    if references && same_family() {
+                    // Only a filter whose one column is the inner key holds on the outer key
+                    let key = extract_base_column_name(&inner_col);
+                    let (mut refs, mut is_key) = (0, false);
+                    let read = visit_column_refs(right_f, &mut |column| {
+                        refs += 1;
+                        is_key = match column {
+                            Expression::Identifier(id) => id.value_lower == key.as_str(),
+                            Expression::QualifiedIdentifier(q) => {
+                                q.name.value_lower == key.as_str()
+                            }
+                            _ => false,
+                        };
+                    });
+                    let key_alone = read && refs == 1 && is_key;
+                    if key_alone && same_family() {
                         // Create equivalent filter for outer side by substituting the column
                         substitute_filter_column(right_f, &inner_col, &outer_col)
                     } else {
