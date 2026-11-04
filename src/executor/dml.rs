@@ -34,7 +34,6 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 use super::context::ExecutionContext;
-use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::query_cache::{
     CompiledConflictInsert, CompiledExecution, CompiledInsert, NestedPlan, PlanValidity,
@@ -240,7 +239,7 @@ use crate::parser::parse_stored_expression;
 /// DEFAULT (RANDOM()) differs per row. A default that fails to parse or
 /// compile is the error of a row that takes it, as in evaluate_default_expr.
 pub(crate) fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, Vec<DefaultSlot>) {
-    use super::expression::compile_expression;
+    let registry = crate::functions::global_registry();
     let n = schema.columns.len();
     let mut values = Vec::with_capacity(n);
     let mut programs: Vec<DefaultSlot> = vec![None; n];
@@ -266,9 +265,122 @@ pub(crate) fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, 
             values[i] = value;
             continue;
         }
-        programs[i] = Some((compile_expression(&expr, &[]), target));
+        let program =
+            super::aggregation::compile_over_slots(&expr, &[], registry, None, false, None);
+        programs[i] = Some((program, target));
     }
     (values, programs)
+}
+
+/// The defaults and VALUES programs of one INSERT, compiled once per plan
+#[derive(Debug)]
+pub(crate) struct InsertPrograms {
+    pub(crate) default_values: Vec<Value>,
+    pub(crate) default_programs: Vec<DefaultSlot>,
+    /// The VALUES positions (row, value) a program computes, in order, each
+    /// with its program's index; equal expressions share one program
+    values: Vec<((usize, usize), usize)>,
+    programs: Vec<Result<super::expression::SharedProgram>>,
+    /// The RETURNING's programs, when it holds no subquery
+    returning: Option<Vec<Result<super::expression::SharedProgram>>>,
+}
+
+impl InsertPrograms {
+    /// A literal, a parameter and DEFAULT resolve without a program, and a
+    /// subquery's answer is read before the rows
+    pub(crate) fn of(schema: &Schema, stmt: &InsertStatement) -> Self {
+        let (default_values, default_programs) = build_default_slots(schema);
+        let mut values = Vec::new();
+        let mut programs = Vec::new();
+        let mut seen = FxHashMap::default();
+        for (row, value_row) in stmt.values.iter().enumerate() {
+            for (at, expr) in value_row.iter().enumerate() {
+                if matches!(expr, Expression::Default(_) | Expression::Parameter(_))
+                    || try_extract_literal(expr).is_some()
+                    || Executor::has_subqueries(expr)
+                {
+                    continue;
+                }
+                let index = *seen
+                    .entry(super::expr_key::ExprKey::of(expr))
+                    .or_insert_with(|| {
+                        programs.push(compile_value(expr));
+                        programs.len() - 1
+                    });
+                values.push(((row, at), index));
+            }
+        }
+        let returning = (!stmt.returning.is_empty()
+            && !stmt.returning.iter().any(Executor::has_subqueries))
+        .then(|| returning_programs(&stmt.returning, &schema.column_names_arc()));
+        Self {
+            default_values,
+            default_programs,
+            values,
+            programs,
+            returning,
+        }
+    }
+
+    pub(crate) fn returning(&self) -> Option<&[Result<super::expression::SharedProgram>]> {
+        self.returning.as_deref()
+    }
+
+    /// The value at `at` of a VALUES row that neither a literal, a parameter
+    /// nor an answer gives
+    fn value(
+        &self,
+        vm: &mut super::expression::ExprVM,
+        exec: &super::expression::ExecuteContext,
+        at: (usize, usize),
+        expr: &Expression,
+    ) -> Result<Value> {
+        match self.values.binary_search_by_key(&at, |(at, _)| *at) {
+            Ok(found) => match &self.programs[self.values[found].1] {
+                Ok(program) => vm.execute(program, exec),
+                Err(e) => Err(e.clone()),
+            },
+            Err(_) => vm.execute(&*compile_value(expr)?, exec),
+        }
+    }
+}
+
+/// A VALUES expression's program: it reads no column
+fn compile_value(expr: &Expression) -> Result<super::expression::SharedProgram> {
+    super::aggregation::compile_over_slots(
+        expr,
+        &[],
+        crate::functions::global_registry(),
+        None,
+        false,
+        None,
+    )
+}
+
+/// A RETURNING's programs over the target's `columns`, a star expanded
+fn returning_programs(
+    returning: &[Expression],
+    columns: &[String],
+) -> Vec<Result<super::expression::SharedProgram>> {
+    use crate::parser::{Identifier, Position, Token, TokenType};
+    let registry = crate::functions::global_registry();
+    let compile = |expr: &Expression| {
+        super::aggregation::compile_over_slots(expr, columns, registry, None, false, None)
+    };
+    let mut programs = Vec::with_capacity(returning.len());
+    for expr in returning {
+        match expr {
+            Expression::Star(_) => programs.extend(columns.iter().map(|name| {
+                let token = Token::new(TokenType::Identifier, name.clone(), Position::new(0, 0, 0));
+                compile(&Expression::Identifier(Identifier::new(
+                    token,
+                    name.clone(),
+                )))
+            })),
+            _ => programs.push(compile(expr)),
+        }
+    }
+    programs
 }
 
 /// Compiled ON DUPLICATE KEY UPDATE clause, reused for every conflicting row
@@ -304,6 +416,7 @@ static NO_CHECKS: std::sync::LazyLock<Arc<Vec<CompiledCheck>>> =
 /// before the first write and cached
 struct InsertPlan<'a> {
     checks: Arc<Vec<CompiledCheck>>,
+    programs: Arc<InsertPrograms>,
     upsert: Option<Arc<CompiledUpsert>>,
     cache: Option<&'a RwLock<CompiledExecution>>,
     table_name: &'a str,
@@ -329,12 +442,16 @@ impl<'a> InsertPlan<'a> {
                     && plan.token == token
                     && *plan.table_name == *table_name =>
             {
-                Some((Arc::clone(&plan.checks), plan.upsert.clone()))
+                Some((
+                    Arc::clone(&plan.checks),
+                    Arc::clone(&plan.programs),
+                    plan.upsert.clone(),
+                ))
             }
             _ => None,
         });
         let hit = cached.is_some();
-        let (checks, upsert) = match cached {
+        let (checks, programs, upsert) = match cached {
             Some(parts) => parts,
             None => {
                 let checks = compile_check_programs(schema)?;
@@ -352,11 +469,12 @@ impl<'a> InsertPlan<'a> {
                     }
                     None => None,
                 };
-                (checks, upsert)
+                (checks, Arc::new(InsertPrograms::of(schema, stmt)), upsert)
             }
         };
         let plan = Self {
             checks,
+            programs,
             upsert,
             cache,
             table_name,
@@ -386,6 +504,7 @@ impl<'a> InsertPlan<'a> {
         if let Some(Ok(mut slot)) = self.cache.map(|cache| cache.write()) {
             *slot = CompiledExecution::ConflictInsert(CompiledConflictInsert {
                 checks: Arc::clone(&self.checks),
+                programs: Arc::clone(&self.programs),
                 upsert: self.upsert.clone(),
                 table_name: SmartString::new(self.table_name),
                 validity: validity.clone(),
@@ -397,7 +516,7 @@ impl<'a> InsertPlan<'a> {
 
 /// A CHECK constraint compiled once over the table's whole row: a column's,
 /// or the table's own when `column` is None
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct CompiledCheck {
     pub(crate) column: Option<SmartString>,
     pub(crate) table: SmartString,
@@ -450,9 +569,15 @@ fn compile_check(
 ) -> Result<CompiledCheck> {
     let owner = column.unwrap_or(&schema.table_name);
     let expr = parse_stored_expression(text, "CHECK", owner)?;
-    let program = super::expression::compile_expression(&expr, columns)
-        .map_err(|e| Error::internal(format!("the CHECK on {owner} failed to compile: {e}")))?;
     let binding = super::expression::CompileContext::with_global_registry(columns);
+    let program = super::expression::ExprCompiler::new(&binding)
+        .compile(&expr)
+        .map(CompactArc::new)
+        .map_err(|e| {
+            Error::internal(format!(
+                "the CHECK on {owner} failed to compile: Compile error: {e}"
+            ))
+        })?;
     let mut reads = SmallVec::new();
     super::utils::visit_column_refs(&expr, &mut |reference| {
         let read = binding.reference(reference).and_then(|r| r.row_column());
@@ -943,9 +1068,7 @@ impl Executor {
         let column_names: Vec<String>;
         // Pre-compute ALL column types for default values and check constraints
         let all_column_types: Vec<crate::core::DataType>;
-        // Per-statement default slots: constant values plus per-row programs
-        let default_values: Vec<Value>;
-        let default_programs: Vec<DefaultSlot>;
+        let programs: Arc<InsertPrograms>;
         let mut insert_plan: InsertPlan<'_>;
         let check_programs: Arc<Vec<CompiledCheck>>;
         let mut check_vm = super::expression::ExprVM::new();
@@ -953,10 +1076,6 @@ impl Executor {
             let schema = table.schema();
             schema_column_count = schema.columns.len();
 
-            // Build default slots from schema
-            let (dv, dp) = build_default_slots(schema);
-            default_values = dv;
-            default_programs = dp;
             // Only a conflict-handling INSERT keeps its plan here
             insert_plan = InsertPlan::new(
                 plan_cache.filter(|_| stmt.on_duplicate || stmt.do_nothing),
@@ -968,6 +1087,7 @@ impl Executor {
                 conflict.map(|conflict| Arc::clone(&conflict.upsert)),
             )?;
             check_programs = Arc::clone(&insert_plan.checks);
+            programs = Arc::clone(&insert_plan.programs);
             all_column_types = schema.columns.iter().map(|c| c.data_type).collect();
 
             // OPTIMIZATION: When no columns specified, insert into all columns in order
@@ -1009,6 +1129,8 @@ impl Executor {
                     .collect();
             }
         }
+        let (default_values, default_programs) =
+            (&programs.default_values, &programs.default_programs);
         // Columns the INSERT names; only the rest run their defaults. Inline,
         // so a statement allocates nothing for it
         let mut provided: smallvec::SmallVec<[bool; 32]> =
@@ -1025,7 +1147,7 @@ impl Executor {
         };
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
-        use super::expression::{compile_expression, ExecuteContext, ExprVM};
+        use super::expression::{ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
         let mut check_row = None;
         let params = ctx.params();
@@ -1305,6 +1427,7 @@ impl Executor {
                     column_names,
                     ctx,
                     returned,
+                    programs.returning(),
                 )?)
             } else {
                 None
@@ -1360,7 +1483,7 @@ impl Executor {
             // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
             let schema = table.schema_arc();
 
-            for value_row in &stmt.values {
+            for (row_at, value_row) in stmt.values.iter().enumerate() {
                 if value_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values",
@@ -1400,12 +1523,9 @@ impl Executor {
                     }
                     // OPTIMIZATION: Try to extract literal value directly without VM compilation
                     // This avoids ~1-2μs per expression for simple literals (INTEGER, TEXT, etc.)
-                    let value = if let Some(lit_value) = try_extract_literal(expr) {
-                        lit_value
-                    } else {
-                        // Fall back to VM for complex expressions (Parameters, functions, etc.)
-                        let program = compile_expression(expr, &[])?;
-                        vm.execute(&program, &base_exec_ctx)?
+                    let value = match try_extract_simple_value(expr, ctx) {
+                        Some(value) => value,
+                        None => programs.value(&mut vm, &base_exec_ctx, (row_at, i), expr)?,
                     };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
@@ -1567,7 +1687,7 @@ impl Executor {
             }
         } else {
             // Fast path: normal INSERT without clones
-            for value_row in &stmt.values {
+            for (row_at, value_row) in stmt.values.iter().enumerate() {
                 if value_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values",
@@ -1608,12 +1728,9 @@ impl Executor {
                     }
                     // OPTIMIZATION: Try to extract literal value directly without VM compilation
                     // This avoids ~1-2μs per expression for simple literals (INTEGER, TEXT, etc.)
-                    let value = if let Some(lit_value) = try_extract_literal(expr) {
-                        lit_value
-                    } else {
-                        // Fall back to VM for complex expressions (Parameters, functions, etc.)
-                        let program = compile_expression(expr, &[])?;
-                        vm.execute(&program, &base_exec_ctx)?
+                    let value = match try_extract_simple_value(expr, ctx) {
+                        Some(value) => value,
+                        None => programs.value(&mut vm, &base_exec_ctx, (row_at, i), expr)?,
                     };
                     // Coerce to target type
                     let coerced = value.coerce_to_type(column_types[i]);
@@ -1671,6 +1788,7 @@ impl Executor {
                 column_names,
                 ctx,
                 returned,
+                programs.returning(),
             )?)
         } else {
             None
@@ -1832,8 +1950,7 @@ impl Executor {
             column_types,
             column_vector_dims,
             column_names,
-            default_programs,
-            default_row_template,
+            programs,
             compiled_checks,
         ) = if let Some(cached) = cached_insert
             .filter(|cached| cached.token == token && cached.validity.epoch() == opened_epoch)
@@ -1844,8 +1961,7 @@ impl Executor {
                 cached.column_types,
                 cached.column_vector_dims,
                 cached.column_names,
-                cached.default_programs,
-                cached.default_row_template,
+                cached.programs,
                 cached.compiled_checks,
             )
         } else {
@@ -1863,8 +1979,8 @@ impl Executor {
                 schema.columns.iter().map(|c| c.data_type).collect();
 
             // Constant defaults land in the template; non-literal defaults
-            // compile once and execute per row
-            let (default_row_template, default_programs) = build_default_slots(schema);
+            // and VALUES expressions compile once and execute per row
+            let programs = Arc::new(InsertPrograms::of(schema, stmt));
 
             let (column_indices, column_types, column_vector_dims, column_names) =
                 if stmt.columns.is_empty() {
@@ -1914,8 +2030,7 @@ impl Executor {
                 column_types: Arc::new(column_types.clone()),
                 column_vector_dims: Arc::new(column_vector_dims.clone()),
                 column_names: Arc::new(column_names.clone()),
-                default_programs: Arc::new(default_programs.clone()),
-                default_row_template: Arc::new(default_row_template.clone()),
+                programs: Arc::clone(&programs),
                 compiled_checks: Arc::new(compiled_checks.clone()),
                 validity: self.insert_validity(stmt, current_epoch),
                 token,
@@ -1934,11 +2049,12 @@ impl Executor {
                 Arc::new(column_types),
                 Arc::new(column_vector_dims),
                 Arc::new(column_names),
-                Arc::new(default_programs),
-                Arc::new(default_row_template),
+                programs,
                 Arc::new(compiled_checks),
             )
         };
+        let (default_row_template, default_programs) =
+            (&programs.default_values, &programs.default_programs);
 
         // Prepared subqueries are read before the first write, through this
         // statement's transaction
@@ -1989,7 +2105,7 @@ impl Executor {
         };
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
-        use super::expression::{compile_expression, ExecuteContext, ExprVM};
+        use super::expression::{ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
         let mut check_row = None;
         let params = ctx.params();
@@ -2139,9 +2255,7 @@ impl Executor {
                             {
                                 std::mem::replace(&mut answers[at].1, Value::null_unknown())
                             } else {
-                                // Fall back to VM evaluation for complex expressions
-                                let program = compile_expression(expr, &[])?;
-                                vm.execute(&program, &base_exec_ctx)?
+                                programs.value(&mut vm, &base_exec_ctx, (row, value_pos), expr)?
                             };
 
                             let target_type = column_types[value_pos];
@@ -2207,6 +2321,7 @@ impl Executor {
                 ctx,
                 standalone_tx,
                 runner.as_ref(),
+                programs.returning(),
             ));
         }
 
@@ -2467,11 +2582,7 @@ impl Executor {
 
         // A statement of the prepared family runs through one runner, whose
         // subqueries read the tables as the statement found them
-        let returning_has_subqueries = stmt.returning.iter().any(Self::has_subqueries);
-        let returning_values = returning_has_subqueries
-            .then(|| super::prepared_select::returning_values(&stmt.returning))
-            .into_iter()
-            .flatten();
+        let returning_values = super::prepared_select::returning_values(&stmt.returning);
         let in_family = self
             .dml_family(
                 stmt.where_clause.as_deref(),
@@ -2499,7 +2610,7 @@ impl Executor {
                 &sets,
                 &[] as &[Vec<Expression>],
                 None,
-                returning_has_subqueries
+                (!stmt.returning.is_empty())
                     .then_some(super::prepared_select::ReturningSites {
                         table: table_name,
                         schema,
@@ -2529,31 +2640,36 @@ impl Executor {
 
         // Build WHERE expression for storage layer
         // Try to convert to storage expression, fall back to in-memory filtering if not possible
-        let (where_expr, needs_memory_filter, memory_where_clause): (
-            Option<Box<dyn StorageExpr>>,
-            bool,
-            Option<Expression>,
-        ) = if where_prepared {
-            // The runner reads the rows a prepared WHERE passes
-            (None, true, None)
-        } else if let Some(ref where_clause) = stmt.where_clause {
-            // Try to push down predicate to storage layer
-            let (storage_expr, needs_mem) = pushdown::try_pushdown(where_clause, schema, Some(ctx));
-            if needs_mem {
-                // Complex expression (like a + b > 100) - use in-memory filtering
-                (storage_expr, true, Some((**where_clause).clone()))
+        let (where_expr, memory_where_clause): (Option<Box<dyn StorageExpr>>, Option<Expression>) =
+            if where_prepared {
+                // The runner reads the rows a prepared WHERE passes
+                (None, None)
+            } else if let Some(ref where_clause) = stmt.where_clause {
+                // Try to push down predicate to storage layer
+                let (storage_expr, needs_mem) =
+                    pushdown::try_pushdown(where_clause, schema, Some(ctx));
+                if needs_mem {
+                    // Complex expression (like a + b > 100) - use in-memory filtering
+                    (storage_expr, Some((**where_clause).clone()))
+                } else {
+                    (storage_expr, None)
+                }
             } else {
-                (storage_expr, false, None)
-            }
-        } else {
-            (None, false, None)
-        };
+                (None, None)
+            };
 
-        let function_registry = crate::functions::global_registry();
-
-        // Create evaluator once and reuse for all rows (optimization)
-        let mut evaluator = CompiledEvaluator::new(function_registry).with_context(ctx);
-        evaluator.init_columns_arc(CompactArc::clone(&column_names));
+        // The WHERE the prepared family does not ask, compiled once over the
+        // target's row; a failure to compile is the error of a row reaching it
+        let memory_where_program = memory_where_clause.as_ref().map(|expr| {
+            super::aggregation::compile_over_slots(
+                expr,
+                &column_names,
+                crate::functions::global_registry(),
+                None,
+                false,
+                Some(ctx.params()),
+            )
+        });
 
         // Use RefCell to collect updated rows for RETURNING clause and FK validation
         use std::cell::RefCell;
@@ -2614,14 +2730,16 @@ impl Executor {
                     }
                     None => table.collect_all_rows(where_expr.as_deref())?,
                 };
+                let mut vm = super::expression::ExprVM::new();
                 for (_rid, row) in parent_rows.iter() {
                     // The prepared WHERE chose these rows already
-                    if !where_prepared && needs_memory_filter {
-                        if let Some(ref mem_where) = memory_where_clause {
-                            evaluator.set_row_array(row);
-                            if !evaluator.evaluate_bool(mem_where)? {
-                                continue;
-                            }
+                    if let Some(program) = &memory_where_program {
+                        let program = program.as_ref().map_err(Clone::clone)?;
+                        let exec = super::expression::ExecuteContext::new(row)
+                            .with_params(ctx.params())
+                            .with_transaction_id(ctx.transaction_id());
+                        if !vm.execute_bool_checked(program, &exec)? {
+                            continue;
                         }
                     }
                     for (&col_idx, fks_for_col) in &fks_by_ref_col {
@@ -2646,7 +2764,7 @@ impl Executor {
         let rows_affected = {
             // CRITICAL: Pre-compile update expressions ONCE before the loop
             // Compile directly from source expressions (no intermediate cloning!)
-            use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+            use super::expression::{ExecuteContext, ExprVM, SharedProgram};
             use super::prepared_select::Candidates;
 
             let col_map = schema.column_index_map();
@@ -2665,12 +2783,21 @@ impl Executor {
                         .collect()
                 } else {
                     // Compile directly from statement expressions
+                    let registry = crate::functions::global_registry();
                     stmt.updates
                         .iter()
                         .filter_map(|(col_name, expr)| {
                             let col_lower: String = col_name.to_lowercase().into();
                             col_map.get(&col_lower).map(|&idx| {
-                                compile_expression(expr, &column_names).map(|program| {
+                                let program = super::aggregation::compile_over_slots(
+                                    expr,
+                                    &column_names,
+                                    registry,
+                                    None,
+                                    false,
+                                    None,
+                                );
+                                program.map(|program| {
                                     (
                                         idx,
                                         schema.columns[idx].data_type,
@@ -2690,32 +2817,18 @@ impl Executor {
                 .map(|(idx, _, _, _)| schema.columns[*idx].name.to_string())
                 .collect();
 
-            // The CHECK constraints reading an updated column, compiled once
-            let compiled_check_exprs = checks_reading(compile_check_programs(schema)?, |c| {
-                compiled_updates.iter().any(|(idx, _, _, _)| *idx == c)
-            });
+            // The CHECK constraints reading an updated column, held by the plan
+            let compiled_check_exprs = match &dml_run {
+                Some(run) => run.update_checks(schema)?,
+                None => Arc::new(checks_reading(compile_check_programs(schema)?, |c| {
+                    compiled_updates.iter().any(|(idx, _, _, _)| *idx == c)
+                })),
+            };
 
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
             // Extract params before the closure so they can be captured
             let params = ctx.params();
-            // Pre-compile the memory WHERE once: evaluate_bool re-hashes
-            // the AST per row through the program cache. Subquery-bearing
-            // clauses stay on the evaluator (compiled placeholder subquery
-            // ops cannot run standalone), as do clauses that fail to
-            // compile.
-            let memory_where_program = memory_where_clause
-                .as_ref()
-                .filter(|expr| !Self::expr_contains_subquery(expr))
-                .and_then(|expr| {
-                    super::expression::compile_expression_with_params(
-                        expr,
-                        &column_names,
-                        params,
-                        crate::functions::global_registry(),
-                    )
-                    .ok()
-                });
             let transaction_id = ctx.transaction_id();
             let candidates = match dml_run.as_ref().filter(|_| where_prepared) {
                 Some(run) => Some(run.candidates(&*table, ctx)?),
@@ -2726,17 +2839,17 @@ impl Executor {
                 Passed,
                 Runner(&'w super::prepared_select::DmlRunner<'r>),
                 Program(&'w SharedProgram),
-                Clause(&'w Expression),
+                Failed(&'w Error),
             }
             let row_where = match (&dml_run, &candidates) {
                 (Some(run), Some(Candidates::Keyed(_) | Candidates::Scan(_))) => {
                     RowWhere::Runner(run)
                 }
                 (_, Some(_)) => RowWhere::Passed,
-                (_, None) => match (&memory_where_program, &memory_where_clause) {
-                    (Some(program), _) => RowWhere::Program(program),
-                    (None, Some(clause)) => RowWhere::Clause(clause),
-                    (None, None) => RowWhere::Passed,
+                (_, None) => match &memory_where_program {
+                    Some(Ok(program)) => RowWhere::Program(program),
+                    Some(Err(error)) => RowWhere::Failed(error),
+                    None => RowWhere::Passed,
                 },
             };
             // The context each row's programs read, built once over no row
@@ -2772,12 +2885,7 @@ impl Executor {
                                 return Ok((row, false));
                             }
                         }
-                        RowWhere::Clause(where_expr) => {
-                            evaluator.set_row_array(&row);
-                            if !evaluator.evaluate_bool(where_expr)? {
-                                return Ok((row, false));
-                            }
-                        }
+                        RowWhere::Failed(error) => return Err(error.clone()),
                     }
 
                     let mut updates = Vec::with_capacity(compiled_updates.len());
@@ -2828,7 +2936,7 @@ impl Executor {
 
                 // Each CHECK an updated column reads, over the row as it now is
                 if changed {
-                    for check in &compiled_check_exprs {
+                    for check in compiled_check_exprs.iter() {
                         run_check(&mut vm, check, &row)?;
                     }
                 }
@@ -2954,6 +3062,7 @@ impl Executor {
                 ctx,
                 standalone_tx,
                 dml_run.as_ref(),
+                None,
             ));
         }
 
@@ -3011,10 +3120,7 @@ impl Executor {
             .as_deref()
             .is_some_and(Self::has_subqueries);
         let returning_has_subqueries = stmt.returning.iter().any(Self::has_subqueries);
-        let returning_values = returning_has_subqueries
-            .then(|| super::prepared_select::returning_values(&stmt.returning))
-            .into_iter()
-            .flatten();
+        let returning_values = super::prepared_select::returning_values(&stmt.returning);
         let in_family = self
             .dml_family(stmt.where_clause.as_deref(), returning_values)
             .is_ok();
@@ -3079,7 +3185,7 @@ impl Executor {
                 &[],
                 &[] as &[Vec<Expression>],
                 None,
-                returning_has_subqueries
+                (!stmt.returning.is_empty())
                     .then_some(super::prepared_select::ReturningSites {
                         table: table_name,
                         schema,
@@ -3163,31 +3269,22 @@ impl Executor {
                 .map(|c| qualified(effective_name, c))
                 .collect();
 
-            // Create evaluator for WHERE filtering
-            let mut evaluator =
-                CompiledEvaluator::new(crate::functions::global_registry()).with_context(ctx);
-            // Initialize with prefixed column names to support alias.column syntax
-            evaluator.init_columns(&column_names_with_prefix);
-
-            // Pre-compile the memory WHERE once with the same prefixed
-            // columns: evaluate_bool re-hashes the AST per row through the
-            // program cache. Subquery-bearing clauses stay on the evaluator
-            // (compiled placeholder subquery ops cannot run standalone).
+            // The WHERE the prepared family does not ask, compiled once over
+            // the prefixed columns, so it reads alias.column; a failure to
+            // compile is the error of a row reaching it
             use super::expression::{ExecuteContext, ExprVM};
             let mut delete_vm = ExprVM::new();
             let params = ctx.params();
-            let memory_where_program = memory_where_clause
-                .as_ref()
-                .filter(|expr| !Self::expr_contains_subquery(expr))
-                .and_then(|expr| {
-                    super::expression::compile_expression_with_params(
-                        expr,
-                        &column_names_with_prefix,
-                        params,
-                        crate::functions::global_registry(),
-                    )
-                    .ok()
-                });
+            let memory_where_program = memory_where_clause.as_ref().map(|expr| {
+                super::aggregation::compile_over_slots(
+                    expr,
+                    &column_names_with_prefix,
+                    crate::functions::global_registry(),
+                    None,
+                    false,
+                    Some(params),
+                )
+            });
             let transaction_id = ctx.transaction_id();
 
             let mut rows_to_delete: Vec<(Value, Option<Row>)> = Vec::new();
@@ -3250,24 +3347,17 @@ impl Executor {
                 let row = scanner.row();
 
                 // Check memory filter if needed
-                let matches = if needs_memory_filter {
-                    evaluator.set_row_array(row);
-                    if let Some(ref where_expr) = memory_where_clause {
-                        if let Some(ref program) = memory_where_program {
-                            let mut exec_ctx =
-                                ExecuteContext::new(row).with_transaction_id(transaction_id);
-                            if !params.is_empty() {
-                                exec_ctx = exec_ctx.with_params(params);
-                            }
-                            delete_vm.execute_bool_checked(program, &exec_ctx)?
-                        } else {
-                            evaluator.evaluate_bool(where_expr)?
+                let matches = match &memory_where_program {
+                    Some(program) => {
+                        let program = program.as_ref().map_err(Clone::clone)?;
+                        let mut exec_ctx =
+                            ExecuteContext::new(row).with_transaction_id(transaction_id);
+                        if !params.is_empty() {
+                            exec_ctx = exec_ctx.with_params(params);
                         }
-                    } else {
-                        true
+                        delete_vm.execute_bool_checked(program, &exec_ctx)?
                     }
-                } else {
-                    true // Storage layer already filtered
+                    None => true, // Storage layer already filtered
                 };
 
                 if matches {
@@ -3412,6 +3502,7 @@ impl Executor {
                 ctx,
                 standalone_tx,
                 dml_run.as_ref(),
+                None,
             ));
         }
 
@@ -3930,6 +4021,7 @@ impl Executor {
     }
 
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn finish_returning(
         &self,
         returning: &[Expression],
@@ -3938,9 +4030,10 @@ impl Executor {
         ctx: &ExecutionContext,
         standalone_tx: Option<Box<dyn Transaction>>,
         prepared: Option<&super::prepared_select::DmlRunner<'_>>,
+        held: Option<&[Result<super::expression::SharedProgram>]>,
     ) -> Result<Box<dyn QueryResult>> {
         let result =
-            self.build_returning_result(returning, source_rows, column_names, ctx, prepared)?;
+            self.build_returning_result(returning, source_rows, column_names, ctx, prepared, held)?;
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
         if let Some(mut tx) = standalone_tx {
@@ -3953,7 +4046,7 @@ impl Executor {
     ///
     /// Evaluates the RETURNING expressions for each affected row and returns
     /// the results as a QueryResult; a `prepared` RETURNING runs its own
-    /// programs, which read its blocks.
+    /// programs, which read its blocks, else the plan's `held` ones run.
     fn build_returning_result(
         &self,
         returning: &[Expression],
@@ -3961,9 +4054,8 @@ impl Executor {
         column_names: &[String],
         ctx: &ExecutionContext,
         prepared: Option<&super::prepared_select::DmlRunner<'_>>,
+        held: Option<&[Result<super::expression::SharedProgram>]>,
     ) -> Result<Box<dyn QueryResult>> {
-        use crate::parser::{Identifier, Position, Token, TokenType};
-
         let result_columns = match prepared.and_then(|run| run.returning_names()) {
             Some(names) => CompactArc::clone(names),
             None => CompactArc::new(Self::returning_names(returning, column_names)),
@@ -3977,7 +4069,7 @@ impl Executor {
             )));
         }
 
-        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+        use super::expression::{ExecuteContext, ExprVM};
 
         if let Some((run, programs)) = prepared.and_then(|run| Some((run, run.returning()?))) {
             let mut vm = ExprVM::new();
@@ -4002,28 +4094,25 @@ impl Executor {
             )));
         }
 
-        // Pre-compile all RETURNING expressions
-        let mut compiled_exprs: Vec<SharedProgram> = Vec::with_capacity(result_columns.len());
-        for expr in returning {
-            match expr {
-                Expression::Star(_) => {
-                    for col_name in column_names {
-                        let token = Token::new(
-                            TokenType::Identifier,
-                            col_name.clone(),
-                            Position::new(0, 0, 0),
-                        );
-                        let column =
-                            Expression::Identifier(Identifier::new(token, col_name.clone()));
-                        compiled_exprs.push(compile_expression(&column, column_names)?);
-                    }
-                }
-                _ => compiled_exprs.push(super::expression::bind_params(
-                    compile_expression(expr, column_names)?,
-                    ctx.params(),
-                )),
+        let compiled;
+        let programs = match held {
+            Some(held) => held,
+            None => {
+                compiled = returning_programs(returning, column_names);
+                &compiled[..]
             }
+        };
+        if let Some(Err(e)) = programs.iter().find(|program| program.is_err()) {
+            return Err(e.clone());
         }
+        // Bound to this run's parameters once, before the rows
+        let programs: SmallVec<[_; 8]> = programs
+            .iter()
+            .flatten()
+            .map(|program| {
+                super::expression::Program::bound(CompactArc::clone(program), ctx.params())
+            })
+            .collect();
 
         // Create VM for execution (reused for all rows)
         let mut vm = ExprVM::new();
@@ -4034,8 +4123,8 @@ impl Executor {
             // CRITICAL: Include params from context for parameterized queries
             let exec_ctx = ExecuteContext::new(&row).with_params(ctx.params());
 
-            let mut row_values = Vec::with_capacity(compiled_exprs.len());
-            for program in &compiled_exprs {
+            let mut row_values = Vec::with_capacity(programs.len());
+            for program in &programs {
                 // CRITICAL: Propagate errors instead of silently returning NULL
                 let value = vm.execute(program, &exec_ctx)?;
                 row_values.push(value);

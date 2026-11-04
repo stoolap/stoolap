@@ -199,12 +199,8 @@ pub struct CompiledInsert {
     pub column_vector_dims: Arc<Vec<u16>>,
     /// Column names for error messages (Arc for zero-copy sharing)
     pub column_names: Arc<Vec<SmartString>>,
-    /// Per-row default programs: Some for non-literal defaults, which
-    /// must execute per row (DEFAULT (RANDOM()) differs per row)
-    pub default_programs: Arc<Vec<crate::executor::dml::DefaultSlot>>,
-    /// Constant default values for all columns (null_unknown when the
-    /// column has no default or a per-row program)
-    pub default_row_template: Arc<Vec<crate::core::Value>>,
+    /// Its defaults and VALUES programs
+    pub(crate) programs: Arc<crate::executor::dml::InsertPrograms>,
     /// CHECK constraints, pre-compiled once per plan. Re-parsing the
     /// check SQL per row costs a tokenizer plus parser run per inserted
     /// row per constraint.
@@ -232,8 +228,7 @@ impl CompiledInsert {
             column_types: Arc::clone(&self.column_types),
             column_vector_dims: Arc::clone(&self.column_vector_dims),
             column_names: Arc::clone(&self.column_names),
-            default_programs: Arc::clone(&self.default_programs),
-            default_row_template: Arc::clone(&self.default_row_template),
+            programs: Arc::clone(&self.programs),
             compiled_checks: Arc::clone(&self.compiled_checks),
             validity: PlanValidity::new(self.validity.epoch(), None),
             token: self.token,
@@ -250,6 +245,8 @@ impl CompiledInsert {
 pub struct CompiledConflictInsert {
     /// CHECK constraints of the inserted rows
     pub(crate) checks: Arc<Vec<super::dml::CompiledCheck>>,
+    /// Its defaults and VALUES programs
+    pub(crate) programs: Arc<super::dml::InsertPrograms>,
     /// ON DUPLICATE KEY UPDATE clause
     pub(crate) upsert: Option<Arc<super::dml::CompiledUpsert>>,
     /// Table name (already lowercased)
