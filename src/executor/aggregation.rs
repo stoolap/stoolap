@@ -1575,13 +1575,15 @@ impl Executor {
             .collect()
     }
 
-    /// Execute SELECT with aggregation (GROUP BY support)
+    /// Execute SELECT with aggregation (GROUP BY support), the calls fed by
+    /// the `held` feed when a plan holds one
     pub(crate) fn execute_select_with_aggregation(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: RowVec,
         base_columns: &[String],
+        held: Option<&HeldFeed>,
     ) -> Result<Box<dyn QueryResult>> {
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
@@ -1593,7 +1595,7 @@ impl Executor {
             ctx,
             input,
             base_columns,
-            (None, None),
+            (None, held),
         )
     }
 
@@ -2342,18 +2344,20 @@ impl Executor {
         })
     }
 
-    /// Aggregate, then run the window functions over the aggregate's output
+    /// Aggregate, then run the window functions over the aggregate's output,
+    /// the calls fed by the `held` feed when a plan holds one
     pub(crate) fn execute_aggregation_then_windows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        held: Option<&HeldFeed>,
     ) -> Result<WindowOutput> {
         let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
         let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
         let path = AggregatePath::General;
-        let run = (None, None);
+        let run = (None, held);
         self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, run)
     }
 
