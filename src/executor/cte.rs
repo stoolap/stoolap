@@ -351,18 +351,15 @@ impl Executor {
 
     /// The CTE of `registry` the CTE body `stmt` reads when the CTE path can
     /// finish it on its own; None for a body execute_select runs, which
-    /// handles set operations and the rest, and, when it runs under a plan
-    /// (`planned`), the subqueries it holds
+    /// handles set operations and the rest, and for one under a plan
+    /// (`planned`), which the runner reads
     pub(super) fn cte_result_source<'r>(
         &self,
         stmt: &SelectStatement,
         registry: &'r CteRegistry,
         planned: bool,
     ) -> Option<&'r CteData> {
-        // One holding a subquery runs as a statement under the plan it keeps
-        if !Self::cte_result_path_finishes(stmt)
-            || (planned && Self::cte_result_path_reads_subquery(stmt))
-        {
+        if !Self::cte_result_path_finishes(stmt) || planned {
             return None;
         }
         let name = self.extract_cte_name_for_lookup(stmt.table_expr.as_deref()?)?;
@@ -589,7 +586,7 @@ impl Executor {
             // First check for simple CTE reference, when the CTE path can
             // finish the statement on its own
             // Use the base CTE name (not alias) for registry lookup
-            if Self::cte_result_path_finishes(stmt) {
+            if plan.is_none() && Self::cte_result_path_finishes(stmt) {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
@@ -953,23 +950,6 @@ impl Executor {
                 .into_iter()
                 .flatten()
                 .any(Self::has_subqueries)
-    }
-
-    /// Whether a clause the query-on-CTE-result path runs holds a subquery,
-    /// which that path asks through the general path's mechanisms
-    fn cte_result_path_reads_subquery(stmt: &SelectStatement) -> bool {
-        let windows = stmt
-            .window_defs
-            .iter()
-            .flat_map(WindowDefinition::expressions);
-        stmt.columns
-            .iter()
-            .chain(stmt.where_clause.as_deref())
-            .chain(&stmt.group_by.columns)
-            .chain(stmt.having.as_deref())
-            .chain(&stmt.distinct_on)
-            .chain(windows)
-            .any(Self::has_subqueries)
     }
 
     // =========================================================================
