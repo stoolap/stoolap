@@ -62,7 +62,7 @@ impl ScalarFunction for Reenter {
 
 #[test]
 fn a_function_in_a_held_answer_may_rerun_its_statement_after_ddl() {
-    global_registry().register_scalar::<Reenter>();
+    global_registry().register_scalar::<Reenter>().unwrap();
     let (done, finished) = mpsc::channel();
     thread::spawn(move || {
         let db = Database::open("memory://plan_lock_reentry").unwrap();

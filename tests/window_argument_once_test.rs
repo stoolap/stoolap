@@ -54,7 +54,9 @@ impl ScalarFunction for CountedSeparator {
 #[test]
 fn a_window_argument_is_read_once_per_run_and_never_by_explain() {
     let db = Database::open("memory://window_argument_once").unwrap();
-    global_registry().register_scalar::<CountedSeparator>();
+    global_registry()
+        .register_scalar::<CountedSeparator>()
+        .unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", ())

@@ -25,10 +25,12 @@ use stoolap::{Database, Error};
 
 #[test]
 fn a_select_after_a_function_is_registered_is_not_run_again() {
-    global_registry().register_tvf(
-        "MY_SERIES",
-        Arc::new(|| Box::new(stoolap::functions::tvf::GenerateSeriesFunction)),
-    );
+    global_registry()
+        .register_tvf(
+            "MY_SERIES",
+            Arc::new(|| Box::new(stoolap::functions::tvf::GenerateSeriesFunction)),
+        )
+        .unwrap();
     let db = Database::open("memory://registered_function_rerun").unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",

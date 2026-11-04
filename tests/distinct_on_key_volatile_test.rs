@@ -51,7 +51,7 @@ impl ScalarFunction for NextCount {
 
 #[test]
 fn a_key_the_select_list_computes_runs_once_per_row() {
-    global_registry().register_scalar::<NextCount>();
+    global_registry().register_scalar::<NextCount>().unwrap();
     let db = Database::open("memory://distinct_on_key_volatile").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
         .unwrap();

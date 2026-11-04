@@ -163,7 +163,7 @@ fn check_cte_bodies(db: &Database, phase: &str, wrong: &mut Vec<String>) {
 
 #[test]
 fn a_volatile_limit_and_offset_are_read_once_on_every_path() {
-    global_registry().register_scalar::<NextCount>();
+    global_registry().register_scalar::<NextCount>().unwrap();
     let mut wrong = Vec::new();
     let db = open("memory://limit_volatile_once");
     check(&db, "hot", &mut wrong);

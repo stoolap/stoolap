@@ -1057,7 +1057,7 @@ impl ScalarFunction for NativeHaving {
 #[test]
 fn a_having_that_calls_a_native_function_is_not_judged_inside_the_index_walk() {
     let _guard = serial();
-    global_registry().register_scalar::<NativeHaving>();
+    global_registry().register_scalar::<NativeHaving>().unwrap();
     let db = open(
         Database::open("memory://aggregate_path_having_native_call").unwrap(),
         false,

@@ -14,14 +14,63 @@
 
 //! A function registered in the global registry is the one every clause
 //! of every statement calls, hot and sealed, prepared or not: each answers
-//! as its twin without the call does
+//! as its twin without the call does. A name a built-in function holds
+//! takes no registration
 
 use stoolap::core::{Result, Value};
 use stoolap::functions::{
-    global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
-    ScalarFunction,
+    global_registry, AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature,
+    FunctionType, ScalarFunction,
 };
 use stoolap::{Database, Rows};
+
+/// An aggregate under the built-in SUM's name, answering 99
+#[derive(Default)]
+struct NinetyNine;
+
+impl AggregateFunction for NinetyNine {
+    fn name(&self) -> &str {
+        "sum"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "sum",
+            FunctionType::Aggregate,
+            "test override",
+            FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn accumulate(&mut self, _value: &Value) {}
+    fn result(&self) -> Result<Value> {
+        Ok(Value::Integer(99))
+    }
+    fn reset(&mut self) {}
+    fn clone_box(&self) -> Box<dyn AggregateFunction> {
+        Box::new(NinetyNine)
+    }
+}
+
+/// A scalar under the built-in window NTILE's name
+#[derive(Default)]
+struct ScalarNtile;
+
+impl ScalarFunction for ScalarNtile {
+    fn name(&self) -> &str {
+        "NTILE"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo {
+            name: "NTILE".into(),
+            ..RegisteredId.info()
+        }
+    }
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(ScalarNtile)
+    }
+}
 
 /// Answers its argument
 #[derive(Default)]
@@ -124,7 +173,7 @@ fn table(db: &Database) -> Vec<String> {
 
 #[test]
 fn a_registered_function_is_called_in_every_clause_hot_and_sealed() {
-    global_registry().register_scalar::<RegisteredId>();
+    global_registry().register_scalar::<RegisteredId>().unwrap();
     let mut wrong = Vec::new();
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -168,7 +217,7 @@ fn a_registered_function_is_called_in_every_clause_hot_and_sealed() {
 
 #[test]
 fn a_registered_function_is_called_in_a_check_and_a_default() {
-    global_registry().register_scalar::<RegisteredId>();
+    global_registry().register_scalar::<RegisteredId>().unwrap();
     let db = Database::open("memory://registered_function_constraints").unwrap();
     db.execute(
         "CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER CHECK (REGISTERED_ID(a) > 0), \
@@ -188,11 +237,48 @@ fn a_registered_function_is_called_in_a_check_and_a_default() {
     );
 }
 
+#[test]
+fn a_built_in_name_takes_no_registration_and_keeps_its_answer() {
+    let registry = global_registry();
+    let refused = [
+        registry.register_aggregate::<NinetyNine>(),
+        registry.register_scalar::<ScalarNtile>(),
+        registry.register_tvf(
+            "generate_series",
+            std::sync::Arc::new(|| Box::new(stoolap::functions::tvf::GenerateSeriesFunction)),
+        ),
+    ];
+    for outcome in &refused {
+        let message = outcome.as_ref().map_err(|e| e.to_string()).err();
+        assert!(
+            message.as_deref().is_some_and(|m| m.contains("built-in")),
+            "a built-in name took a registration: {message:?}"
+        );
+    }
+    let db = Database::open("memory://registered_function_built_in").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT SUM(a) FROM t", vec!["3"]),
+        ("SELECT SUM(a + 0) FROM t", vec!["3"]),
+        (
+            "SELECT SUM(a + 0) OVER () FROM t ORDER BY id",
+            vec!["3", "3"],
+        ),
+        ("SELECT NTILE(2) OVER (ORDER BY id) FROM t", vec!["1", "2"]),
+    ] {
+        let want: Vec<String> = want.into_iter().map(String::from).collect();
+        assert_eq!(answer(db.query(sql, ())), Ok(want), "{sql}");
+    }
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_planned_statement_calling_a_registered_function_compiles_nothing_through_the_bridge() {
     use stoolap::test_failpoints::bridge_compiles;
-    global_registry().register_scalar::<RegisteredId>();
+    global_registry().register_scalar::<RegisteredId>().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir, false);
     let mut compiled = Vec::new();

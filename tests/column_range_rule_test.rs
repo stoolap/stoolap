@@ -187,7 +187,8 @@ impl stoolap::functions::tvf::TableValuedFunction for PairRange {
 #[test]
 fn test_only_a_series_is_narrowed() {
     stoolap::functions::global_registry()
-        .register_tvf("PAIR_RANGE", std::sync::Arc::new(|| Box::new(PairRange)));
+        .register_tvf("PAIR_RANGE", std::sync::Arc::new(|| Box::new(PairRange)))
+        .unwrap();
     let db = Database::open("memory://range_other_tvf").unwrap();
     assert_eq!(
         ints(&db, "SELECT value FROM pair_range(1, 3) WHERE value >= 0"),

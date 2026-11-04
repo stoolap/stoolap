@@ -159,11 +159,14 @@ struct CommitDuringReturning;
 
 impl ScalarFunction for CommitDuringReturning {
     fn name(&self) -> &str {
-        "SLEEP"
+        "COMMIT_DURING_RETURNING"
     }
 
     fn info(&self) -> FunctionInfo {
-        SleepFunction.info()
+        FunctionInfo {
+            name: "COMMIT_DURING_RETURNING".into(),
+            ..SleepFunction.info()
+        }
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
@@ -191,7 +194,9 @@ impl ReturningHook {
     fn new(transaction: Transaction) -> Self {
         let serial = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *HOOK_STATE.lock().unwrap() = (Some(transaction), 0);
-        global_registry().register_scalar::<CommitDuringReturning>();
+        global_registry()
+            .register_scalar::<CommitDuringReturning>()
+            .unwrap();
         Self { _serial: serial }
     }
 
@@ -202,7 +207,6 @@ impl ReturningHook {
 
 impl Drop for ReturningHook {
     fn drop(&mut self) {
-        global_registry().register_scalar::<SleepFunction>();
         let transaction = HOOK_STATE.lock().unwrap().0.take();
         drop(transaction);
     }
@@ -227,11 +231,14 @@ fn check_commit_conflict(name: &str, source: &str, upsert: bool) {
     };
     let mut rows = db
         .query(
-            &format!("INSERT INTO t {source} ON CONFLICT (u) {action} RETURNING id, v, SLEEP(v)"),
+            &format!(
+                "INSERT INTO t {source} ON CONFLICT (u) {action} \
+                 RETURNING id, v, COMMIT_DURING_RETURNING(v)"
+            ),
             (),
         )
         .unwrap();
-    assert_eq!(rows.columns(), ["id", "v", "SLEEP(v)"]);
+    assert_eq!(rows.columns(), ["id", "v", "COMMIT_DURING_RETURNING(v)"]);
     if upsert {
         let row = rows.next().unwrap().unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 1);

@@ -51,7 +51,7 @@ impl ScalarFunction for NextCount {
 
 #[test]
 fn a_limit_and_an_offset_spelled_alike_keep_their_own_counts() {
-    global_registry().register_scalar::<NextCount>();
+    global_registry().register_scalar::<NextCount>().unwrap();
     let db = Database::open("memory://limit_subquery_volatile").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
         .unwrap();

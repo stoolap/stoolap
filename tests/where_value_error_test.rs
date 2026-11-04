@@ -146,7 +146,9 @@ impl stoolap::functions::ScalarFunction for Tick {
 
 #[test]
 fn a_where_value_is_computed_once_when_another_fails() {
-    stoolap::functions::global_registry().register_scalar::<Tick>();
+    stoolap::functions::global_registry()
+        .register_scalar::<Tick>()
+        .unwrap();
     let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
     let executor = stoolap::executor::Executor::new(Arc::new(engine));

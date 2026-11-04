@@ -1508,47 +1508,14 @@ mod registered_volatile {
         }
     }
 
-    /// TICK under the name of the built-in NOW
-    #[derive(Default)]
-    struct NowTick;
-
-    impl ScalarFunction for NowTick {
-        fn name(&self) -> &str {
-            "NOW"
-        }
-        fn info(&self) -> FunctionInfo {
-            let mut info = Tick.info();
-            info.name = "NOW".to_string();
-            info
-        }
-        fn evaluate(&self, args: &[Value]) -> Result<Value> {
-            Tick.evaluate(args)
-        }
-        fn clone_box(&self) -> Box<dyn ScalarFunction> {
-            Box::new(NowTick)
-        }
-    }
-
     #[test]
     fn test_a_registered_volatile_function_runs_per_inner_row() {
         let _guard = super::serial();
-        global_registry().register_scalar::<Tick>();
+        global_registry().register_scalar::<Tick>().unwrap();
         assert_eq!(
             calls_per_run("TICK"),
             5,
             "TICK runs once per inner row reaching the filter, not once per call"
-        );
-    }
-
-    #[test]
-    fn test_a_registered_function_named_like_a_clock_runs_per_inner_row() {
-        let _guard = super::serial();
-        // No other test of this binary calls NOW
-        global_registry().register_scalar::<NowTick>();
-        assert_eq!(
-            calls_per_run("NOW"),
-            5,
-            "a NOW the registry holds non-deterministic is not the built-in clock"
         );
     }
 
@@ -2607,7 +2574,8 @@ impl stoolap::functions::tvf::TableValuedFunction for NamedRows {
 fn test_a_table_function_generating_nothing_keeps_its_column_names() {
     let _guard = serial();
     stoolap::functions::global_registry()
-        .register_tvf("NAMED_ROWS", std::sync::Arc::new(|| Box::new(NamedRows)));
+        .register_tvf("NAMED_ROWS", std::sync::Arc::new(|| Box::new(NamedRows)))
+        .unwrap();
     let db = setup("prepared_tvf_named_columns");
     for (sql, want) in [
         (

@@ -57,7 +57,7 @@ impl ScalarFunction for Counted {
 }
 
 fn executor() -> Executor {
-    global_registry().register_scalar::<Counted>();
+    global_registry().register_scalar::<Counted>().unwrap();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
     let executor = Executor::new(Arc::new(engine));

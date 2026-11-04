@@ -247,7 +247,7 @@ impl ScalarFunction for Tick {
 fn a_block_error_is_raised_again_without_reading_the_block_again() {
     let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     // No other test here calls TICK
-    global_registry().register_scalar::<Tick>();
+    global_registry().register_scalar::<Tick>().unwrap();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
     let executor = Executor::new(Arc::new(engine));

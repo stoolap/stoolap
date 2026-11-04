@@ -283,7 +283,7 @@ impl ScalarFunction for Counted {
 #[test]
 fn a_table_function_a_false_where_keeps_no_row_of_runs_no_argument_subquery() {
     let _guard = serial();
-    global_registry().register_scalar::<Counted>();
+    global_registry().register_scalar::<Counted>().unwrap();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
     let executor = Executor::new(Arc::new(engine));
