@@ -471,6 +471,51 @@ impl std::fmt::Debug for StatementView {
     }
 }
 
+/// The commits a tombstone counts for: a snapshot's, or those complete when
+/// a read without a view began, before it read the hot store and then the
+/// volumes, so no row is missing from both layers
+#[derive(Clone, Debug)]
+pub struct CommitCut {
+    /// Every commit at or below this was complete at the cut
+    floor: i64,
+    seq: i64,
+    in_flight: SmallVec<[i64; 4]>,
+}
+
+impl CommitCut {
+    /// The cut that counts every commit
+    pub fn every() -> Self {
+        Self::through(i64::MAX)
+    }
+
+    /// The cut that counts the commits at or below `seq`, a snapshot's
+    pub fn through(seq: i64) -> Self {
+        Self {
+            floor: seq,
+            seq,
+            in_flight: SmallVec::new(),
+        }
+    }
+
+    /// Whether the commit with `commit_seq` was complete at the cut
+    #[inline(always)]
+    pub fn sees(&self, commit_seq: i64) -> bool {
+        commit_seq <= self.floor || self.sees_past_floor(commit_seq)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sees_past_floor(&self, commit_seq: i64) -> bool {
+        commit_seq <= self.seq && !self.in_flight.contains(&commit_seq)
+    }
+
+    /// Whether every commit that took its sequence before the cut was
+    /// complete at it
+    pub fn whole(&self) -> bool {
+        self.in_flight.is_empty()
+    }
+}
+
 impl Drop for StatementView {
     fn drop(&mut self) {
         // The last handle unregisters before its Arc goes, so no capture
@@ -540,6 +585,10 @@ pub struct TransactionRegistry {
     /// The number of live statement views; written under the transactions lock
     live_views: AtomicUsize,
 
+    /// Commits holding a sequence that are not complete: raised before the
+    /// sequence is taken, lowered once the status says how it ended
+    commits_in_flight: AtomicUsize,
+
     /// Moves as a truncate or drop begins and again as it ends; written
     /// under the transactions lock, read by a view checking it still holds
     destruction_epoch: AtomicU64,
@@ -581,6 +630,7 @@ impl Drop for HistoryEvent {
         let mut txns = registry.transactions.lock();
         txns.uncommitting(self.seq);
         registry.log_completion(&txns, 0, self.seq);
+        registry.commits_in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -624,6 +674,7 @@ impl TransactionRegistry {
             base: AtomicI64::new(1),
             aborted_floor: AtomicI64::new(0),
             live_views: AtomicUsize::new(0),
+            commits_in_flight: AtomicUsize::new(0),
             destruction_epoch: AtomicU64::new(0),
             destructions_active: AtomicU32::new(0),
             commit_log: CommitLog::new(log_capacity()),
@@ -873,6 +924,7 @@ impl TransactionRegistry {
     #[inline]
     pub fn start_commit(&self, txn_id: i64) -> i64 {
         let mut txns = self.transactions.lock();
+        self.commits_in_flight.fetch_add(1, Ordering::AcqRel);
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::commit_seq_taken();
@@ -882,6 +934,8 @@ impl TransactionRegistry {
             debug_assert!(commit_seq < SLOT_ID_LIMIT);
             self.status.set(txn_id, -commit_seq);
             txns.committing.push(commit_seq);
+        } else {
+            self.commits_in_flight.fetch_sub(1, Ordering::AcqRel);
         }
 
         commit_seq
@@ -913,6 +967,9 @@ impl TransactionRegistry {
             if !self.status.set(txn_id, seq) && seq > 0 {
                 txns.slotless.insert(txn_id, seq);
             }
+            if seq > 0 {
+                self.commits_in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
             self.advance_base(&txns);
         };
         self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
@@ -924,6 +981,7 @@ impl TransactionRegistry {
         let commit_seq;
         {
             let mut txns = self.transactions.lock();
+            self.commits_in_flight.fetch_add(1, Ordering::AcqRel);
             commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
             self.log_completion(&txns, txn_id, commit_seq);
 
@@ -939,6 +997,7 @@ impl TransactionRegistry {
             if !self.status.set(txn_id, commit_seq) {
                 txns.slotless.insert(txn_id, commit_seq);
             }
+            self.commits_in_flight.fetch_sub(1, Ordering::AcqRel);
             self.advance_base(&txns);
         }
         self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
@@ -966,6 +1025,9 @@ impl TransactionRegistry {
                     txns.uncommitting(seq);
                 }
                 self.status.set(txn_id, SLOT_ABORTED);
+                if committing.is_some() {
+                    self.commits_in_flight.fetch_sub(1, Ordering::AcqRel);
+                }
                 self.advance_base(&txns);
                 was_active
             } else {
@@ -1353,11 +1415,40 @@ impl TransactionRegistry {
     /// moves the open point
     pub fn begin_history_event(self: &Arc<Self>) -> HistoryEvent {
         let mut txns = self.transactions.lock();
+        self.commits_in_flight.fetch_add(1, Ordering::AcqRel);
         let seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
         txns.committing.push(seq);
         HistoryEvent {
             registry: Arc::clone(self),
             seq,
+        }
+    }
+
+    /// The commits complete now. With none in flight, every sequence taken
+    /// so far is complete and no lock is taken: a commit raises the count
+    /// before it takes its sequence and lowers it once its status is set
+    #[inline]
+    pub fn commit_cut(&self) -> CommitCut {
+        let seq = self.next_sequence.load(Ordering::Acquire);
+        if self.commits_in_flight.load(Ordering::Acquire) == 0 {
+            return CommitCut {
+                floor: seq,
+                seq,
+                in_flight: SmallVec::new(),
+            };
+        }
+        self.commit_cut_locked()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn commit_cut_locked(&self) -> CommitCut {
+        let txns = self.transactions.lock();
+        let seq = self.next_sequence.load(Ordering::Acquire);
+        CommitCut {
+            floor: Self::completed_through(&txns, seq),
+            seq,
+            in_flight: txns.committing.iter().copied().collect(),
         }
     }
 
@@ -1825,6 +1916,10 @@ impl VisibilityChecker for TransactionRegistry {
 
     fn oldest_time_through(&self, seq: i64) -> Option<i64> {
         self.commit_log.oldest_time_through(seq)
+    }
+
+    fn commit_cut(&self) -> CommitCut {
+        TransactionRegistry::commit_cut(self)
     }
 
     fn commit_of(&self, txn_id: i64) -> CommitOf {
