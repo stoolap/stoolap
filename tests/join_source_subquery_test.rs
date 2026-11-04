@@ -1,0 +1,113 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A VALUES list or a table function holding a subquery answers as one
+//! side of a join, and a VALUES row is evaluated, without the evaluator
+//! bridge
+
+#![cfg(feature = "test-failpoints")]
+
+use std::sync::Mutex;
+
+use stoolap::core::Value;
+use stoolap::test_failpoints::bridge_compiles;
+use stoolap::Database;
+
+// The bridge counter is process-wide
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Each statement, its parameters and the rows it answers, every value
+/// written out
+const CASES: &[(&str, &[i64], &[&str])] = &[
+    (
+        "SELECT t.id FROM t INNER JOIN (VALUES ((SELECT 3))) AS v(n) ON v.n = t.id",
+        &[],
+        &["3"],
+    ),
+    (
+        "SELECT a.id, v.n FROM t AS a LEFT JOIN u AS b ON a.id = b.id \
+         LEFT JOIN (VALUES ((SELECT COUNT(*) FROM t))) AS v(n) ON v.n = 3 ORDER BY a.id",
+        &[],
+        &["1|3", "2|3", "3|3"],
+    ),
+    (
+        "SELECT t.id, v.n FROM t INNER JOIN (VALUES (1 + 1, 'b'), ($1 * 3, 'c')) \
+         AS v(n, s) ON v.n = t.id ORDER BY t.id",
+        &[1],
+        &["2|2", "3|3"],
+    ),
+    (
+        "SELECT n, s FROM (VALUES (1 + 1, UPPER('b')), ($1 * 3, 'c')) AS v(n, s) ORDER BY n",
+        &[2],
+        &["2|B", "6|c"],
+    ),
+    (
+        "SELECT t.id FROM t JOIN generate_series(1, (SELECT 2)) AS g ON g.value = t.id \
+         ORDER BY t.id",
+        &[],
+        &["1", "2"],
+    ),
+    (
+        "SELECT t.id, g.value FROM t LEFT JOIN \
+         generate_series(2, (SELECT MAX(id) FROM t WHERE id < $1)) AS g ON g.value = t.id \
+         ORDER BY t.id",
+        &[3],
+        &["1|NULL", "2|2", "3|NULL"],
+    ),
+];
+
+fn rows(db: &Database, sql: &str, params: &[i64]) -> Vec<String> {
+    let params: Vec<Value> = params.iter().map(|&p| Value::Integer(p)).collect();
+    db.query(sql, params)
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (0..row.len())
+                .map(|at| row.get::<Value>(at).unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+#[test]
+fn a_source_holding_a_subquery_answers_as_written_without_the_bridge() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_source_subquery").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO u VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (sql, params, expected) in CASES {
+        for run in 0..2 {
+            let before = bridge_compiles();
+            let answer = rows(&db, sql, params);
+            let compiled = bridge_compiles() - before;
+            if answer != *expected {
+                wrong.push(format!(
+                    "{sql}, run {run}: {answer:?}, written {expected:?}"
+                ));
+            }
+            if compiled != 0 {
+                wrong.push(format!("{sql}, run {run}: {compiled} bridge compiles"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -13,10 +13,8 @@
 // limitations under the License.
 
 //! The ledger of subquery evaluation sites. Each site states what it does
-//! today: `Right`, the answer its value gives written as a literal, or
-//! `Fails`, an error that changes nothing until the named step prepares it.
-//! A site that answers otherwise fails here, a wrong answer and a site a
-//! step fixed without updating the ledger alike.
+//! today: `Right`, the answer its value gives written as a literal. A site
+//! that answers otherwise fails here.
 
 use stoolap::Database;
 
@@ -25,11 +23,9 @@ use stoolap::Database;
 enum State {
     /// The literal's answer
     Right,
-    /// An error that changes nothing, until the plan step named prepares it
-    Fails(&'static str),
 }
 
-use State::{Fails, Right};
+use State::Right;
 
 /// t: id 1..6, a = id % 3, b = id * 10. u: id 1..3, x = id
 fn setup(name: &str) -> Database {
@@ -83,13 +79,6 @@ fn holds<T: PartialEq + std::fmt::Debug>(
     match (state, got) {
         (Right, Ok(got)) => assert_eq!(&got, want, "{what}"),
         (Right, Err(e)) => panic!("{what} should answer as its literal: {e}"),
-        (Fails(_), Err(_)) => {}
-        (Fails(owner), Ok(got)) if &got == want => {
-            panic!("{what} now answers right: mark it Right, {owner} prepared it")
-        }
-        (Fails(owner), Ok(got)) => {
-            panic!("{what} gave {got:?}, want {want:?}, or an error until {owner}")
-        }
     }
 }
 
@@ -390,7 +379,7 @@ fn test_cte_block_reading_the_grandparent_row() {
 fn test_join_side_values_row() {
     site(
         "site_join_side_values_row",
-        Fails("7b Phase 3: a join reads a VALUES side on the general executor"),
+        Right,
         "SELECT t.id FROM t JOIN (VALUES ((SELECT 3))) v(n) ON v.n = t.id",
         "SELECT t.id FROM t JOIN (VALUES (3)) v(n) ON v.n = t.id",
     );

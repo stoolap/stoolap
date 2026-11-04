@@ -6209,14 +6209,22 @@ impl Builder<'_> {
     ) -> Result<FromEntry> {
         let executor = self.executor;
         Ok(match entry {
-            // Values naming a column read an enclosing scope
+            // Values naming a column read an enclosing scope, and a subquery
+            // in one runs as the statement's block
             Expression::ValuesSource(values)
-                if values.rows.iter().flatten().any(mentions_column) =>
+                if values
+                    .rows
+                    .iter()
+                    .flatten()
+                    .any(|v| mentions_column(v) || mentions_subquery(v)) =>
             {
                 FromEntry::Statement
             }
             Expression::FunctionTableSource(function)
-                if function.arguments.iter().any(mentions_column) =>
+                if function
+                    .arguments
+                    .iter()
+                    .any(|a| mentions_column(a) || mentions_subquery(a)) =>
             {
                 FromEntry::Statement
             }
@@ -11443,7 +11451,8 @@ fn asks_per_row(expr: &Expression, blocks: &[Option<PreparedSubquery>]) -> bool 
     }
 }
 
-fn mentions_subquery(expr: &Expression) -> bool {
+/// Whether `expr` holds a subquery anywhere in it
+pub(crate) fn mentions_subquery(expr: &Expression) -> bool {
     match expr {
         Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => true,
         other => {

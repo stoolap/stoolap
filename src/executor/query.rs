@@ -479,8 +479,8 @@ use super::prepared_join::{
     BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
-    ambiguous_column, joined_aliases, set_operation_key_column, set_operation_key_item, Bound,
-    JoinBlocks, OutOfFamily, PreparedProjection,
+    ambiguous_column, joined_aliases, mentions_subquery, set_operation_key_column,
+    set_operation_key_item, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
 };
 use super::projection::{Concat, Projection};
 use super::pushdown;
@@ -7918,26 +7918,7 @@ impl Executor {
             Expression::SubquerySource(ss) => self.derived_side_rows(ss, ctx, filter, None),
             Expression::ValuesSource(vs) => {
                 // A SELECT * of the VALUES, with the filter pushed to this side
-                let select_all = SelectStatement {
-                    param_count: 0,
-                    token: dummy_token("SELECT", TokenType::Keyword),
-                    distinct: false,
-                    distinct_on: vec![],
-                    columns: vec![Expression::Star(StarExpression {
-                        token: dummy_token("*", TokenType::Punctuator),
-                    })],
-                    with: None,
-                    table_expr: Some(Box::new(Expression::ValuesSource(vs.clone()))),
-                    where_clause: filter.map(|f| Box::new(f.clone())),
-                    group_by: GroupByClause::default(),
-                    having: None,
-                    window_defs: vec![],
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    set_operations: vec![],
-                    prepared: None,
-                };
+                let select_all = Self::select_all_of(Expression::ValuesSource(vs.clone()), filter);
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
                 let (result, columns, _, _) =
@@ -8088,9 +8069,16 @@ impl Executor {
                 let (result, columns) = self.derived_side_rows(ss, ctx, filter, plan)?;
                 (result, columns, false, None)
             }
-            (None, None) => self.execute_table_expression_with_filter_limit(
-                expr, ctx, filter, limit, offset, read_out,
-            )?,
+            (None, None) => match (Self::side_with_subquery(expr), side.plan) {
+                (Some(alias), Some(plan)) => {
+                    let (result, columns) =
+                        self.statement_side_rows((expr, alias), ctx, filter, plan)?;
+                    (result, columns, false, None)
+                }
+                _ => self.execute_table_expression_with_filter_limit(
+                    expr, ctx, filter, limit, offset, read_out,
+                )?,
+            },
         };
         if let Some((run, index)) = rows {
             let (result, columns, bounded, _) = fetched;
@@ -8104,6 +8092,69 @@ impl Executor {
             run.blocks.side_fits(index, &schema)?;
         }
         Ok(fetched)
+    }
+
+    /// A SELECT * of `source`, with `filter` as its WHERE
+    fn select_all_of(source: Expression, filter: Option<&Expression>) -> SelectStatement {
+        SelectStatement {
+            param_count: 0,
+            token: dummy_token("SELECT", TokenType::Keyword),
+            distinct: false,
+            distinct_on: vec![],
+            columns: vec![Expression::Star(StarExpression {
+                token: dummy_token("*", TokenType::Punctuator),
+            })],
+            with: None,
+            table_expr: Some(Box::new(source)),
+            where_clause: filter.map(|f| Box::new(f.clone())),
+            group_by: GroupByClause::default(),
+            having: None,
+            window_defs: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            set_operations: vec![],
+            prepared: None,
+        }
+    }
+
+    /// The VALUES list or table function `source` of a join's side when a
+    /// value or an argument of it holds a subquery, with the name its
+    /// columns are qualified by; None for any other side
+    fn side_with_subquery(source: &Expression) -> Option<Option<&str>> {
+        match source {
+            Expression::ValuesSource(vs) if vs.rows.iter().flatten().any(mentions_subquery) => {
+                Some(vs.alias.as_ref().map(|a| a.value.as_str()))
+            }
+            Expression::FunctionTableSource(tvf) if tvf.arguments.iter().any(mentions_subquery) => {
+                Some(Some(
+                    tvf.alias.as_ref().unwrap_or(&tvf.function).value.as_str(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The rows of the join side `source`, a SELECT * of it run under the
+    /// join's `plan` for the side, so a subquery in it runs as that
+    /// statement's block, and its columns qualified by `alias`; those
+    /// `filter` passes
+    fn statement_side_rows(
+        &self,
+        (source, alias): (&Expression, Option<&str>),
+        ctx: &ExecutionContext,
+        filter: Option<&Expression>,
+        plan: &NestedPlan,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        let select_all = Self::select_all_of(source.clone(), filter);
+        let result = self.execute_source_statement(&select_all, ctx, None, Some(plan))?;
+        let columns = (result.columns().iter())
+            .map(|c| match alias {
+                Some(alias) => qualified(alias, bare_name(c)),
+                None => bare_name(c).to_string(),
+            })
+            .collect();
+        Ok((result, columns))
     }
 
     /// A derived table's rows and its columns qualified by its alias, those
