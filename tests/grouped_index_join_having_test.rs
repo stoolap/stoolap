@@ -20,6 +20,10 @@
 use std::sync::Mutex;
 
 use stoolap::core::Value;
+use stoolap::functions::registry::global_registry;
+use stoolap::functions::{
+    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+};
 use stoolap::test_failpoints::bridge_compiles;
 use stoolap::Database;
 
@@ -72,10 +76,9 @@ fn rows(db: &Database, sql: &str, params: &[i64]) -> Vec<String> {
     rows
 }
 
-#[test]
-fn a_reduced_grouped_join_having_answers_as_written_without_the_bridge() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let db = Database::open("memory://grouped_index_join_having").unwrap();
+/// u and o in a database of `name`'s own, o indexed on its join key
+fn open(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
     for sql in [
         "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)",
         "INSERT INTO u VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
@@ -85,6 +88,13 @@ fn a_reduced_grouped_join_having_answers_as_written_without_the_bridge() {
     ] {
         db.execute(sql, ()).unwrap();
     }
+    db
+}
+
+#[test]
+fn a_reduced_grouped_join_having_answers_as_written_without_the_bridge() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = open("grouped_index_join_having");
     let mut wrong = Vec::new();
     for (sql, params, expected) in CASES {
         for run in 0..2 {
@@ -104,4 +114,75 @@ fn a_reduced_grouped_join_having_answers_as_written_without_the_bridge() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_pattern_parameter_in_a_branch_no_group_reaches_raises_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = open("grouped_index_join_having_pattern");
+    let sql = "SELECT u.id, u.name, COUNT(o.id) FROM u JOIN o ON o.uid = u.id \
+               GROUP BY u.id, u.name HAVING COUNT(o.id) > 0 OR u.name REGEXP $1 LIMIT 5";
+    let params = vec![Value::text("[")];
+    let got: Result<Vec<String>, String> = db
+        .query(sql, params)
+        .and_then(|rows| {
+            rows.map(|row| row.map(|row| row.get::<Value>(0).unwrap().to_string()))
+                .collect()
+        })
+        .map_err(|e| e.to_string());
+    let mut got = got.unwrap_or_else(|e| panic!("{sql} with '[': {e}"));
+    got.sort();
+    assert_eq!(got, ["1", "2", "3"], "{sql}");
+}
+
+/// The database a HAVING's function reads again, through a handle of its own
+static NESTED: Mutex<Option<Database>> = Mutex::new(None);
+
+/// Runs a reduced grouped join with a HAVING before it returns its argument
+#[derive(Default)]
+struct Reenter;
+
+impl ScalarFunction for Reenter {
+    fn name(&self) -> &str {
+        "GROUPED_HAVING_REENTER"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "GROUPED_HAVING_REENTER",
+            FunctionType::Scalar,
+            "runs a grouped join, then returns its argument",
+            FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn evaluate(&self, args: &[Value]) -> stoolap::core::Result<Value> {
+        let nested = NESTED.lock().unwrap_or_else(|e| e.into_inner());
+        let db = nested.as_ref().expect("the nested database is set");
+        let inner = rows(
+            db,
+            "SELECT u.id, COUNT(o.id) FROM u JOIN o ON o.uid = u.id \
+             GROUP BY u.id HAVING COUNT(o.id) > 1 LIMIT 5",
+            &[],
+        );
+        assert_eq!(inner, ["1|3", "3|2"], "the inner join's groups");
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(Reenter)
+    }
+}
+
+#[test]
+fn a_having_whose_function_runs_such_a_join_again_answers() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    global_registry().register_scalar::<Reenter>().unwrap();
+    let db = open("grouped_index_join_having_reenter");
+    *NESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(db.clone());
+    let got = rows(
+        &db,
+        "SELECT u.id, COUNT(o.id) FROM u JOIN o ON o.uid = u.id \
+         GROUP BY u.id HAVING GROUPED_HAVING_REENTER(COUNT(o.id)) > 1 LIMIT 5",
+        &[],
+    );
+    NESTED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    assert_eq!(got, ["1|3", "3|2"]);
 }
