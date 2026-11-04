@@ -820,15 +820,16 @@ impl JumpTargets {
         Self::outside(ops, &[])
     }
 
-    /// The positions the jumps of `ops` outside the `folded` ranges land on
+    /// The positions the jumps of `ops` outside the `folded` ranges, which
+    /// are apart and in position order, land on
     fn outside(ops: &mut [Op], folded: &[(usize, usize, Value)]) -> Self {
+        debug_assert!(folded.windows(2).all(|pair| pair[0].1 <= pair[1].0));
         let mut targets: SmallVec<[bool; 32]> = smallvec::smallvec![false; ops.len() + 1];
+        let mut ranges = folded.iter().peekable();
         for (at, op) in ops.iter_mut().enumerate() {
             let Some(t) = jump_target(op) else { continue };
-            if folded
-                .iter()
-                .any(|(start, end, _)| (*start..*end).contains(&at))
-            {
+            while ranges.next_if(|(_, end, _)| *end <= at).is_some() {}
+            if ranges.peek().is_some_and(|(start, ..)| *start <= at) {
                 continue;
             }
             if let Some(target) = targets.get_mut(usize::from(*t)) {
