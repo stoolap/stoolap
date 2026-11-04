@@ -46,7 +46,7 @@ use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::commit_log::ReadPoint;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
-use crate::storage::mvcc::registry::{HistoryEvent, StatementView};
+use crate::storage::mvcc::registry::{CommitCut, HistoryEvent, StatementView};
 use crate::storage::mvcc::{get_fast_timestamp, next_write_order};
 use crate::storage::traits::PlannedUpdate;
 use crate::storage::volume::side_index::SideIndexDef;
@@ -597,6 +597,11 @@ pub trait VisibilityChecker: Send + Sync {
     /// through `seq`, for an error naming it
     fn oldest_time_through(&self, _seq: i64) -> Option<i64> {
         None
+    }
+
+    /// The commits complete now
+    fn commit_cut(&self) -> CommitCut {
+        CommitCut::every()
     }
 }
 
@@ -3430,6 +3435,51 @@ impl VersionStore {
         }
     }
 
+    /// [`Self::collect_seen_row_ids_into`] for a reader of the newest
+    /// committed state: while no commit publishes here every chain is
+    /// committed, so every id is added without a visibility check
+    pub fn collect_decided_row_ids_into(
+        &self,
+        reader: Reader<'_>,
+        dest: &mut rustc_hash::FxHashSet<i64>,
+    ) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let versions = self.versions.read();
+        if self.publish_epoch_if_quiet().is_some() {
+            for key in versions.keys() {
+                dest.insert(key);
+            }
+            return;
+        }
+        drop(versions);
+        self.collect_seen_row_ids_into(reader, dest);
+    }
+
+    /// [`Self::collect_decided_row_ids_into`] for one row, or, when `seen`,
+    /// [`Self::collect_seen_row_ids_into`]; the reader is built only when
+    /// a version must be checked
+    pub fn has_decided_row<'r>(
+        &self,
+        reader: impl FnOnce() -> Reader<'r>,
+        row_id: i64,
+        seen: bool,
+    ) -> bool {
+        let versions = self.versions.read();
+        let Some(chain) = versions.get(row_id) else {
+            return false;
+        };
+        if !seen && self.publishing.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return false;
+        };
+        let reader = reader();
+        chain_seen(&reader.over(&**checker), reader.txn_id, chain)
+    }
+
     /// Adds the row ids whose chain holds a version `reader` sees, a delete
     /// included: that version, not any sealed copy, decides the row for it
     pub fn collect_seen_row_ids_into(
@@ -3762,6 +3812,14 @@ impl VersionStore {
     /// newest committed state read in between
     pub fn view_sees_newest(&self, view: &StatementView) -> bool {
         self.newest_commit_seq.load(Ordering::SeqCst) <= view.floor()
+    }
+
+    /// The commits complete now
+    #[inline]
+    pub fn commit_cut(&self) -> CommitCut {
+        self.visibility_checker
+            .as_ref()
+            .map_or_else(CommitCut::every, |checker| checker.commit_cut())
     }
 
     /// Notes, before a commit changes an index entry, that it does

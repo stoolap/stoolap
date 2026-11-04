@@ -25,6 +25,7 @@ use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::IndexPlan;
+use crate::storage::mvcc::registry::CommitCut;
 use crate::storage::mvcc::version_store::{AggregateOp, LayoutToken};
 use crate::storage::mvcc::VersionStore;
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
@@ -449,6 +450,13 @@ pub trait Table: Send + Sync {
     /// A committed delete is not counted; tombstones decide sealed copies.
     fn has_visible_row(&self, row_id: i64) -> Result<bool>;
 
+    /// Whether the row's sealed copy is hidden by a version here, as the ids
+    /// `collect_hot_row_ids_into` adds are: a version a commit still
+    /// publishes hides nothing yet
+    fn has_decided_row(&self, row_id: i64) -> Result<bool> {
+        self.has_row_id(row_id)
+    }
+
     /// Claim a row for update to prevent concurrent cold-row modifications.
     /// When two transactions update the same cold row, both write it into hot
     /// under its id. Without claiming, neither detects the other because
@@ -757,6 +765,12 @@ pub trait Table: Send + Sync {
     /// when asked after the first. False when the table cannot tell
     fn sees_newest(&self) -> bool {
         false
+    }
+
+    /// The commits complete now, taken before a read of this table that a
+    /// read of the volumes follows. Every commit when the table cannot tell
+    fn commit_cut(&self) -> CommitCut {
+        CommitCut::every()
     }
 
     /// The publish epoch while the shared indexes hold the committed keys

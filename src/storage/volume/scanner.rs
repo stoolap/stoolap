@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::core::{Error, Result, Row, Value};
 use crate::storage::expression::passes;
-use crate::storage::mvcc::registry::StatementView;
+use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::traits::Scanner;
 
 use super::writer::FrozenVolume;
@@ -165,12 +165,12 @@ pub struct VolumeScanner {
     /// Kept separate from pending_cold_deletes to avoid cloning the tombstone set.
     /// Map: row_id → commit_seq (for snapshot isolation filtering).
     committed_tombstones: Option<Arc<rustc_hash::FxHashMap<i64, u64>>>,
-    /// Snapshot sequence: if Some, only tombstones with commit_seq <= this are visible.
-    /// None means auto-commit (all tombstones visible).
-    pub snapshot_seq: Option<u64>,
     /// The statement view of the read: a tombstone counts only when it sees
     /// the commit
     pub view: Option<StatementView>,
+    /// The commits a tombstone counts for: those complete before the read's
+    /// hot rows were read, or a snapshot's
+    pub cut: CommitCut,
     /// Typed pre-filter predicates extracted from the WHERE clause.
     /// Evaluated directly on column data without Value construction.
     typed_predicates: Vec<ColumnPredicate>,
@@ -461,8 +461,8 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
-            snapshot_seq: None,
             view: None,
+            cut: CommitCut::every(),
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -524,8 +524,8 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
-            snapshot_seq: None,
             view: None,
+            cut: CommitCut::every(),
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -619,8 +619,8 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
-            snapshot_seq: None,
             view: None,
+            cut: CommitCut::every(),
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -1260,7 +1260,7 @@ impl VolumeScanner {
         let rid = self.volume.meta.row_ids[idx];
         if let Some(ref ts) = self.committed_tombstones {
             if let Some(&commit_seq) = ts.get(&rid) {
-                if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss)
+                if self.cut.sees(commit_seq as i64)
                     && self
                         .view
                         .as_ref()

@@ -31,7 +31,7 @@ use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::{self, IndexPlan, Read};
-use crate::storage::mvcc::registry::StatementView;
+use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::LayoutToken;
@@ -3168,17 +3168,26 @@ impl Table for MVCCTable {
     }
 
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
-        // Under a view, only a hot version the view sees hides a sealed copy
+        // Only a hot version the reader sees hides a sealed copy: one a
+        // commit still publishes leaves the copy it replaces shown
         if self.view.is_some() {
             self.version_store
                 .collect_seen_row_ids_into(self.reader(), dest);
         } else {
-            self.version_store.collect_row_ids_into(dest);
+            self.version_store
+                .collect_decided_row_ids_into(self.reader(), dest);
         }
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
         Ok(self.version_store.has_committed_row(row_id))
+    }
+
+    fn has_decided_row(&self, row_id: i64) -> Result<bool> {
+        // As `collect_hot_row_ids_into` decides: under a view, by what it sees
+        Ok(self
+            .version_store
+            .has_decided_row(|| self.reader(), row_id, self.view.is_some()))
     }
 
     fn has_visible_row(&self, row_id: i64) -> Result<bool> {
@@ -3824,6 +3833,10 @@ impl Table for MVCCTable {
                 .view
                 .as_ref()
                 .is_none_or(|view| self.version_store.view_sees_newest(view))
+    }
+
+    fn commit_cut(&self) -> CommitCut {
+        self.version_store.commit_cut()
     }
 
     fn walk_btree_groups(

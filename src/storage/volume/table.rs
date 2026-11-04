@@ -40,7 +40,7 @@ use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::IndexPlan;
-use crate::storage::mvcc::registry::StatementView;
+use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
     aggregate_row, grouped_aggregates, AggregateOp, LayoutToken,
@@ -411,16 +411,23 @@ struct PreparedDeletes<'m> {
     seen: RoundSeen,
 }
 
-/// One round of `cold_rounds`: its snapshot, its number and the volumes
-/// registered at its settled generation
-type ColdRound<'a> = dyn FnMut(&super::manifest::StatementSnapshot, usize, smallvec::SmallVec<[u64; 4]>) -> Result<()>
+/// One round of `cold_rounds`: its snapshot, the commits its tombstones
+/// count by, its number and the volumes registered at its settled generation
+type ColdRound<'a> = dyn FnMut(
+        &super::manifest::StatementSnapshot,
+        &CommitCut,
+        usize,
+        smallvec::SmallVec<[u64; 4]>,
+    ) -> Result<()>
     + 'a;
 
-/// The seal fence of a round that stood and the snapshot it read through;
-/// the loads are published and the snapshot let go after the fence
+/// The seal fence of a round that stood, the snapshot it read through and
+/// whether its cut counted every tombstone the snapshot holds; the loads
+/// are published and the snapshot let go after the fence
 struct HeldRound<'m> {
     guard: Option<super::manifest::SealRead<'m>>,
     snap: Option<super::manifest::StatementSnapshot>,
+    whole: bool,
     mgr: &'m super::manifest::SegmentManager,
 }
 
@@ -477,6 +484,7 @@ impl SegmentedTable {
         // The hot rows are read before the cold view is taken, so a seal
         // landing between them would show its rows twice
         self.settled_across_seals(|| {
+            let cut = self.read_cut();
             // Unordered: hot rows first with early termination.
             // Only scan up to `target` hot rows — avoids O(hot_rows) for small LIMITs.
             let hot_rows = hot_rows(&*self.hot, target, 0)?;
@@ -492,6 +500,13 @@ impl SegmentedTable {
             // For the cold scan, track a skip counter to avoid get_row() for offset rows.
             let hot_count = hot_rows.len();
             let cold_skip = offset.saturating_sub(hot_count);
+            // Short of the target, the hot read returned every hot row it
+            // shows: those, not the hot store's ids, hide their sealed copies
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_count, Default::default());
+            for &(id, _) in &hot_rows {
+                hot_skip.insert(id);
+            }
             let mut result: RowVec = if hot_count > offset {
                 hot_rows.into_iter().skip(offset).collect()
             } else {
@@ -507,9 +522,6 @@ impl SegmentedTable {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::cold_volumes_taken();
             let tombstones_arc = &view.ts;
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
@@ -595,7 +607,7 @@ impl SegmentedTable {
 
                 while let Some(i) = next_position()? {
                     let row_id = row_ids[i];
-                    if !self.shows_cold_row(cs, i, row_id, tombstones_arc, &hot_skip) {
+                    if !self.shows_cold_row(cs, i, row_id, tombstones_arc, &hot_skip, &cut) {
                         continue;
                     }
                     // For rows with a WHERE clause, we must evaluate the filter
@@ -665,6 +677,7 @@ impl SegmentedTable {
             // derived from actual hot results, not a separate B-tree read.
             // This prevents the race where remove_moved_rows runs between
             // building the skip set and scanning hot.
+            let cut = self.read_cut();
             let hot_rows = self.hot_rows(where_expr, access)?;
 
             let mut skip: FxHashSet<i64> =
@@ -675,7 +688,8 @@ impl SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-            let Some(mut all_rows) = self.collect_cold_rows(where_expr, skip, generation, None)?
+            let Some(mut all_rows) =
+                self.collect_cold_rows(where_expr, skip, generation, None, &cut)?
             else {
                 return Ok(None);
             };
@@ -696,6 +710,7 @@ impl SegmentedTable {
         self.across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
             let hot_rows = self.hot_rows(None, ScanAccess::Seq)?;
 
             let mut skip: FxHashSet<i64> =
@@ -706,7 +721,7 @@ impl SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-            let Some(cold) = self.count_cold_rows(&skip, generation)? else {
+            let Some(cold) = self.count_cold_rows(&skip, generation, &cut)? else {
                 return Ok(None);
             };
             Ok(Some(cold + hot_rows.len()))
@@ -715,7 +730,12 @@ impl SegmentedTable {
 
     /// The sealed rows `collect_cold_rows(None, ..)` returns, counted from
     /// the volumes' row ids; None when a seal moved past `generation`
-    fn count_cold_rows(&self, hot_skip: &FxHashSet<i64>, generation: u64) -> Result<Option<usize>> {
+    fn count_cold_rows(
+        &self,
+        hot_skip: &FxHashSet<i64>,
+        generation: u64,
+        cut: &CommitCut,
+    ) -> Result<Option<usize>> {
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
         let view = self.segment_mgr.cold_snapshot();
@@ -734,7 +754,7 @@ impl SegmentedTable {
         let count_volume = |(_, cs): &(u64, &super::manifest::ColdSegment)| -> Result<usize> {
             let row_ids = cs.volume.row_ids()?;
             Ok((0..row_ids.len())
-                .filter(|&i| self.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip))
+                .filter(|&i| self.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut))
                 .count())
         };
         #[cfg(feature = "parallel")]
@@ -1088,14 +1108,32 @@ impl SegmentedTable {
         self.hot.txn_id()
     }
 
-    /// Check if a tombstone is visible to this table's snapshot.
-    /// For auto-commit (snapshot_seq=None), all tombstones are visible.
-    /// For snapshot isolation (snapshot_seq=Some(seq)), only tombstones
-    /// with commit_seq <= seq are visible — newer tombstones are invisible,
-    /// so the original cold row remains visible to the older snapshot.
+    /// The commits a read's tombstones count by, taken before it reads the
+    /// hot store: a commit completing in between shows its rows hot, so the
+    /// read sees the row in one layer. A snapshot counts those at or below
+    /// its sequence; a view decides alone
+    fn read_cut(&self) -> CommitCut {
+        match self.snapshot_seq {
+            Some(seq) => CommitCut::through(seq as i64),
+            None if self.view.is_some() => CommitCut::every(),
+            None => self.hot.commit_cut(),
+        }
+    }
+
+    /// The cut that counts every published tombstone this handle's snapshot
+    /// sees, for a read no hot read pairs with
+    fn published_cut(&self) -> CommitCut {
+        self.snapshot_seq
+            .map_or_else(CommitCut::every, |seq| CommitCut::through(seq as i64))
+    }
+
+    /// Whether a tombstone hides its sealed row from this handle: its
+    /// commit is one `cut` counts, and one the statement view sees.
+    /// Under a snapshot the cut counts the commits at or below it, so the
+    /// original cold row stays visible to an older snapshot.
     #[inline]
-    fn is_tombstone_visible(&self, commit_seq: u64) -> bool {
-        self.snapshot_seq.is_none_or(|ss| commit_seq <= ss)
+    fn is_tombstone_visible(&self, commit_seq: u64, cut: &CommitCut) -> bool {
+        cut.sees(commit_seq as i64)
             && self
                 .view
                 .as_ref()
@@ -1104,16 +1142,21 @@ impl SegmentedTable {
 
     /// Check if a row_id is tombstoned and visible to this snapshot.
     #[inline]
-    fn is_row_tombstoned(&self, tombstones: &FxHashMap<i64, u64>, row_id: i64) -> bool {
+    fn is_row_tombstoned(
+        &self,
+        tombstones: &FxHashMap<i64, u64>,
+        row_id: i64,
+        cut: &CommitCut,
+    ) -> bool {
         tombstones
             .get(&row_id)
-            .is_some_and(|&seq| self.is_tombstone_visible(seq))
+            .is_some_and(|&seq| self.is_tombstone_visible(seq, cut))
     }
 
     /// Whether this handle shows the sealed row at position `i` of `cs`,
-    /// row `row_id`: live in its volume, not tombstoned for its reads, and
-    /// not left to a hot copy or a pending delete in `hot_skip`
-    #[inline]
+    /// row `row_id`: live in its volume, not tombstoned for its reads at
+    /// `cut`, and not left to a hot copy or a pending delete in `hot_skip`
+    #[inline(always)]
     fn shows_cold_row(
         &self,
         cs: &super::manifest::ColdSegment,
@@ -1121,9 +1164,10 @@ impl SegmentedTable {
         row_id: i64,
         tombstones: &FxHashMap<i64, u64>,
         hot_skip: &FxHashSet<i64>,
+        cut: &CommitCut,
     ) -> bool {
         cs.is_visible(i)
-            && !self.is_row_tombstoned(tombstones, row_id)
+            && !self.is_row_tombstoned(tombstones, row_id, cut)
             && !hot_skip.contains(&row_id)
     }
 
@@ -1168,6 +1212,8 @@ impl SegmentedTable {
             return Ok(());
         }
 
+        // An index build leaves out every row a published tombstone names
+        let cut = self.published_cut();
         let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let ts = self.segment_mgr.tombstone_set_arc();
         let mut seen_values: ahash::AHashMap<Vec<Value>, i64> = ahash::AHashMap::new();
@@ -1190,7 +1236,7 @@ impl SegmentedTable {
             let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&ts, row_ids[i])
+                    && !self.is_row_tombstoned(&ts, row_ids[i], &cut)
                     && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
@@ -1203,7 +1249,7 @@ impl SegmentedTable {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                if self.is_row_tombstoned(&ts, rid) {
+                if self.is_row_tombstoned(&ts, rid, &cut) {
                     continue;
                 }
                 // Skip rows shadowed by hot buffer or pending transaction changes
@@ -1281,6 +1327,8 @@ impl SegmentedTable {
         if col_indices.is_empty() {
             return Ok(());
         }
+        // An index build leaves out every row a published tombstone names
+        let cut = self.published_cut();
         let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let ts = self.segment_mgr.tombstone_set_arc();
         for (seg_id, cs) in volumes.iter() {
@@ -1289,7 +1337,7 @@ impl SegmentedTable {
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
             let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count)
-                .find(|&i| cs.is_visible(i) && !self.is_row_tombstoned(&ts, row_ids[i]))
+                .find(|&i| cs.is_visible(i) && !self.is_row_tombstoned(&ts, row_ids[i], &cut))
             else {
                 continue;
             };
@@ -1301,7 +1349,7 @@ impl SegmentedTable {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                if self.is_row_tombstoned(&ts, rid) {
+                if self.is_row_tombstoned(&ts, rid, &cut) {
                     continue;
                 }
                 let values: Vec<Value> = col_indices
@@ -1501,6 +1549,7 @@ impl SegmentedTable {
                     held: HeldRound {
                         guard: Some(guard),
                         snap: None,
+                        whole: true,
                         mgr,
                     },
                     changes: Vec::new(),
@@ -1516,17 +1565,18 @@ impl SegmentedTable {
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
         let mut prep = ColdPrepare::default();
-        let held = self.cold_rounds(mgr, &mut |snap, round, settled| {
+        let held = self.cold_rounds(mgr, &mut |snap, cut, round, settled| {
             prep.hot_ids.clear();
             if round > 0 {
-                self.revalidate_prepared(snap, &mut prep)?;
+                self.revalidate_prepared(snap, cut, &mut prep)?;
             }
             match ids {
                 Some(ids) => {
-                    self.prepare_cold_rows_by_id(snap, ids, where_expr, setter, &mut prep)?
+                    self.prepare_cold_rows_by_id(snap, cut, ids, where_expr, setter, &mut prep)?
                 }
                 None => self.prepare_cold_rows_where(
                     snap,
+                    cut,
                     where_expr,
                     &comparisons,
                     &bloom_hashes,
@@ -1564,10 +1614,13 @@ impl SegmentedTable {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::cold_round_snapshot_starting();
             let snap = mgr.statement_snapshot();
+            // Taken after the snapshot: every tombstone it holds is of a
+            // commit the cut counts as complete or in flight
+            let cut = self.read_cut();
             // The rows are read through these mappings
             self.check_cold()?;
             snap.adopt(std::mem::take(&mut carried));
-            round(&snap, number, settled)?;
+            round(&snap, &cut, number, settled)?;
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::cold_round_prepared();
             // Under the fence only memory is read; a column change comes
@@ -1589,6 +1642,7 @@ impl SegmentedTable {
                 return Ok(HeldRound {
                     guard: Some(guard),
                     snap: Some(snap),
+                    whole: cut.whole(),
                     mgr,
                 });
             }
@@ -1601,9 +1655,9 @@ impl SegmentedTable {
     }
 
     /// The committed tombstones a round that stood read, when this handle
-    /// reads them with no snapshot filter
+    /// reads them with no snapshot filter and its cut counted every one
     fn unfiltered_tombstones(&self, held: &HeldRound<'_>) -> Option<Arc<FxHashMap<i64, u64>>> {
-        if self.snapshot_seq.is_some() {
+        if self.snapshot_seq.is_some() || !held.whole {
             return None;
         }
         held.snap.as_ref().map(|snap| Arc::clone(&snap.tombstones))
@@ -1617,6 +1671,7 @@ impl SegmentedTable {
     fn revalidate_prepared(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
         let checks_unique = self.hot.has_unique_non_pk_indexes();
@@ -1629,7 +1684,7 @@ impl SegmentedTable {
         } = prep;
         for change in changes.iter() {
             let read_from = visited.entry(change.row_id).or_insert(u64::MAX);
-            self.revalidate_row(snap, change.row_id, &change.old_row, read_from)?;
+            self.revalidate_row(snap, cut, change.row_id, &change.old_row, read_from)?;
             // A row a seal registered since the earlier round may hold the key
             if checks_unique {
                 self.check_cold_unique_for_update(
@@ -1649,11 +1704,12 @@ impl SegmentedTable {
     fn revalidate_row(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         row_id: i64,
         old_row: &Row,
         read_from: &mut u64,
     ) -> Result<()> {
-        let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+        let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, cut, row_id)? else {
             return Err(Self::write_conflict(row_id));
         };
         if *read_from != seg_id {
@@ -1671,6 +1727,7 @@ impl SegmentedTable {
     fn prepare_cold_rows_by_id(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         ids: &[i64],
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
@@ -1684,7 +1741,7 @@ impl SegmentedTable {
             if prep.visited.contains_key(&row_id) {
                 continue;
             }
-            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, cut, row_id)? else {
                 prep.hot_ids.push(row_id);
                 continue;
             };
@@ -1717,9 +1774,11 @@ impl SegmentedTable {
 
     /// One round over the rows the filter selects, in the volumes not
     /// walked whole yet
+    #[allow(clippy::too_many_arguments)]
     fn prepare_cold_rows_where(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         where_expr: Option<&dyn Expression>,
         comparisons: &[(&str, crate::core::Operator, &Value)],
         bloom_hashes: &[Option<u64>],
@@ -1749,7 +1808,7 @@ impl SegmentedTable {
             let mapping = cs.mapping.clone();
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !self.shows_cold_row(cs, i, row_id, &tombstones_arc, &hot_skip)
+                if !self.shows_cold_row(cs, i, row_id, &tombstones_arc, &hot_skip, cut)
                     || prep.visited.contains_key(&row_id)
                 {
                     continue;
@@ -3014,6 +3073,7 @@ impl SegmentedTable {
             // The skip set for cold scanners is derived from these actual results,
             // preventing the race where remove_moved_rows runs between building
             // the skip set and hot scanner execution (which would lose rows).
+            let cut = self.read_cut();
             let hot_rows = self.hot_rows(where_expr, access)?;
 
             let mut skip: FxHashSet<i64> =
@@ -3033,6 +3093,7 @@ impl SegmentedTable {
                 where_expr,
                 skip,
                 generation,
+                cut,
             )?
             else {
                 return Ok(None);
@@ -3056,6 +3117,7 @@ impl SegmentedTable {
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
         generation: u64,
+        cut: CommitCut,
     ) -> Result<Option<Vec<Box<dyn Scanner>>>> {
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
@@ -3173,8 +3235,8 @@ impl SegmentedTable {
             // Inter-volume dedup is handled by the per-volume visibility bitmap.
             scanner.set_skip_sets(Arc::clone(tombstones_arc), Arc::clone(&hot_skip_arc));
             scanner.set_visibility_bitmap(cs.visible.clone());
-            scanner.snapshot_seq = self.snapshot_seq;
             scanner.view = self.view.clone();
+            scanner.cut = cut.clone();
             let current_schema = self.hot.schema();
             // From the captured segment: a retired volume's mapping is no
             // longer in the live map, which answers with an identity one
@@ -3223,6 +3285,7 @@ impl SegmentedTable {
         hot_skip: FxHashSet<i64>,
         generation: u64,
         at: Option<&ReadPoint>,
+        cut: &CommitCut,
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.collect_cold_rows");
@@ -3461,7 +3524,9 @@ impl SegmentedTable {
                                     .is_some_and(|&seq| point.sees(seq as i64))
                                 && !hot_skip_ref.contains(&row_id)
                         }
-                        None => self.shows_cold_row(cs, i, row_id, tombstones_ref, hot_skip_ref),
+                        None => {
+                            self.shows_cold_row(cs, i, row_id, tombstones_ref, hot_skip_ref, cut)
+                        }
                     };
                     if !shown {
                         continue;
@@ -3537,14 +3602,15 @@ impl SegmentedTable {
     fn find_segment_row_in(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         row_id: i64,
     ) -> Result<Option<(u64, super::manifest::ColdSegment, usize)>> {
-        if self.hot.has_row_id(row_id)? {
+        if self.hot.has_decided_row(row_id)? {
             return Ok(None);
         }
         // Tombstone view from the SAME snapshot; only the pending set is
         // read live because it is this transaction's own state.
-        if self.is_row_tombstoned(&snap.tombstones, row_id) {
+        if self.is_row_tombstoned(&snap.tombstones, row_id, cut) {
             return Ok(None);
         }
         if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
@@ -3581,6 +3647,7 @@ impl SegmentedTable {
                     _held: HeldRound {
                         guard: Some(guard),
                         snap: None,
+                        whole: true,
                         mgr,
                     },
                     deletes: ColdDeleteRows::new(),
@@ -3598,7 +3665,7 @@ impl SegmentedTable {
             hot_ids: hot_ids.then(Vec::new),
             ..ColdDeletes::default()
         };
-        let held = self.cold_rounds(mgr, &mut |snap, round, settled| {
+        let held = self.cold_rounds(mgr, &mut |snap, cut, round, settled| {
             // Read before the round looks at the hot store; see claim_prepared
             prep.quiet = self.hot.publish_epoch_if_quiet();
             if let Some(hot_ids) = &mut prep.hot_ids {
@@ -3606,15 +3673,16 @@ impl SegmentedTable {
             }
             if round > 0 {
                 for d in prep.deletes.iter_mut() {
-                    self.revalidate_row(snap, d.row_id, &d.old_row, &mut d.seg_id)?;
+                    self.revalidate_row(snap, cut, d.row_id, &d.old_row, &mut d.seg_id)?;
                 }
                 prep.prepared.extend(prep.deletes.iter().map(|d| d.row_id));
             }
             match ids {
-                Some(ids) => self.prepare_cold_deletes_by_id(snap, ids, &mut prep),
+                Some(ids) => self.prepare_cold_deletes_by_id(snap, cut, ids, &mut prep),
                 None => {
                     self.prepare_cold_deletes_where(
                         snap,
+                        cut,
                         where_expr,
                         &comparisons,
                         &bloom_hashes,
@@ -3677,6 +3745,7 @@ impl SegmentedTable {
     fn prepare_cold_deletes_by_id(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         ids: &[i64],
         prep: &mut ColdDeletes,
     ) -> Result<()> {
@@ -3685,7 +3754,7 @@ impl SegmentedTable {
             if prep.prepared.contains(&row_id) {
                 return Ok(());
             }
-            match self.find_segment_row_in(snap, row_id)? {
+            match self.find_segment_row_in(snap, cut, row_id)? {
                 Some((seg_id, cold, idx)) => {
                     let old_row = Self::cold_row_of(&mut None, &cold, idx)?;
                     prep.deletes.push(ColdDelete {
@@ -3708,7 +3777,7 @@ impl SegmentedTable {
             if prep.prepared.contains(&row_id) {
                 continue;
             }
-            match self.find_segment_row_in(snap, row_id)? {
+            match self.find_segment_row_in(snap, cut, row_id)? {
                 Some((seg_id, cold, idx)) => {
                     segments.entry(seg_id).or_insert(cold);
                     located.push((seg_id, idx, row_id));
@@ -3741,6 +3810,7 @@ impl SegmentedTable {
     fn prepare_cold_deletes_where(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        cut: &CommitCut,
         where_expr: Option<&dyn Expression>,
         comparisons: &[(&str, crate::core::Operator, &Value)],
         bloom_hashes: &[Option<u64>],
@@ -3793,7 +3863,7 @@ impl SegmentedTable {
             // groups decoded across the rows
             let mut old_rows: Option<super::writer::RowReader> = None;
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !self.shows_cold_row(cs, i, row_id, &snap.tombstones, &hot_skip)
+                if !self.shows_cold_row(cs, i, row_id, &snap.tombstones, &hot_skip, cut)
                     || (!prep.prepared.is_empty() && prep.prepared.contains(&row_id))
                 {
                     continue;
@@ -3939,6 +4009,7 @@ impl SegmentedTable {
     }
 
     fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
+        let cut = self.read_cut();
         // A hot version this transaction sees decides the row; a newer one it
         // does not see leaves the sealed copy to the tombstones below
         if self.hot.has_visible_row(row_id)? {
@@ -3949,7 +4020,7 @@ impl SegmentedTable {
         // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
         {
             let ts = self.segment_mgr.tombstone_set_arc();
-            if self.is_row_tombstoned(&ts, row_id) {
+            if self.is_row_tombstoned(&ts, row_id, &cut) {
                 return Ok(None);
             }
         }
@@ -4041,6 +4112,7 @@ impl SegmentedTable {
         tombstones: &FxHashMap<i64, u64>,
         hot_skip: &FxHashSet<i64>,
         no_tombstones: bool,
+        cut: &CommitCut,
     ) {
         for (i, &rid) in row_ids.iter().enumerate() {
             if col.is_null(i) || !cs.is_visible(i) {
@@ -4049,7 +4121,7 @@ impl SegmentedTable {
             if hot_skip.contains(&rid) {
                 continue;
             }
-            if !no_tombstones && self.is_row_tombstoned(tombstones, rid) {
+            if !no_tombstones && self.is_row_tombstoned(tombstones, rid, cut) {
                 continue;
             }
             let val = col.get_value(i);
@@ -4075,6 +4147,7 @@ impl SegmentedTable {
         tombstones: &FxHashMap<i64, u64>,
         hot_skip: &FxHashSet<i64>,
         no_tombstones: bool,
+        cut: &CommitCut,
     ) {
         for (i, &rid) in row_ids.iter().enumerate() {
             if col.is_null(i) || !cs.is_visible(i) {
@@ -4083,7 +4156,7 @@ impl SegmentedTable {
             if hot_skip.contains(&rid) {
                 continue;
             }
-            if !no_tombstones && self.is_row_tombstoned(tombstones, rid) {
+            if !no_tombstones && self.is_row_tombstoned(tombstones, rid, cut) {
                 continue;
             }
             let val = col.get_value(i);
@@ -4353,6 +4426,7 @@ impl Table for SegmentedTable {
         self.across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
             let hot_ids = self.hot.get_active_row_ids()?;
 
             if !self.segment_mgr.has_segments() {
@@ -4380,7 +4454,7 @@ impl Table for SegmentedTable {
             for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 for (i, &id) in vol.row_ids()?.iter().enumerate() {
-                    if self.shows_cold_row(cs, i, id, &tombstones_arc, &hot_skip) {
+                    if self.shows_cold_row(cs, i, id, &tombstones_arc, &hot_skip, &cut) {
                         ids.push(id);
                     }
                 }
@@ -4507,6 +4581,7 @@ impl Table for SegmentedTable {
         self.across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
             let hot_rows = self.hot.collect_all_rows_unsorted()?;
 
             let mut skip: FxHashSet<i64> =
@@ -4517,7 +4592,8 @@ impl Table for SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-            let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation, None)? else {
+            let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation, None, &cut)?
+            else {
                 return Ok(None);
             };
             for entry in hot_rows {
@@ -4676,6 +4752,14 @@ impl Table for SegmentedTable {
         // The cold view is taken before the hot rows are read, so a seal
         // landing between them would leave its rows in neither
         self.settled_across_seals(|| {
+            // The volumes are read before the hot rows, so without a view a
+            // commit publishing here in between could show a row in both;
+            // such a read takes the path that reads the hot rows first
+            let quiet = (!self.reads_back_in_time()).then(|| self.hot.publish_epoch_if_quiet());
+            if quiet == Some(None) {
+                return self.limited_cold_and_hot_unordered(where_expr, limit, offset, access);
+            }
+            let cut = self.read_cut();
             // Lazy: no ensure_columns. Phase 1 uses metadata only; Phase 2
             // loads cold volumes on demand after pruning.
             self.segment_mgr
@@ -4715,7 +4799,7 @@ impl Table for SegmentedTable {
                 for (pos, &rid) in cs.volume.row_ids()?.iter().enumerate() {
                     if cs.is_dead(pos)
                         || hot_skip.contains(&rid)
-                        || self.is_row_tombstoned(tombstones_arc, rid)
+                        || self.is_row_tombstoned(tombstones_arc, rid, &cut)
                     {
                         continue;
                     }
@@ -4860,6 +4944,9 @@ impl Table for SegmentedTable {
                     .collect_access_rows_with_limit(access, where_expr, remaining, 0)?;
                 cold_rows.extend(hot_rows);
             }
+            if quiet.is_some_and(|quiet| quiet != self.hot.publish_epoch_if_quiet()) {
+                return self.limited_cold_and_hot_unordered(where_expr, limit, offset, access);
+            }
 
             Ok(cold_rows.into_iter().skip(offset).take(limit).collect())
         })
@@ -4895,7 +4982,7 @@ impl Table for SegmentedTable {
         // but a snapshot txn should still see rows tombstoned after its begin_seq.
         if self.reads_back_in_time() {
             let ts = self.segment_mgr.tombstone_set_arc();
-            if self.is_row_tombstoned(&ts, row_id) {
+            if self.is_row_tombstoned(&ts, row_id, &self.read_cut()) {
                 return Ok(false);
             }
             return self.segment_mgr.is_row_id_in_volume(row_id);
@@ -5007,6 +5094,7 @@ impl Table for SegmentedTable {
         crate::test_failpoints::note_read("seg.sum_column");
         // The volume stats count rows a snapshot or a view may not see
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.sum_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
@@ -5123,7 +5211,7 @@ impl Table for SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
                         && !hot_skip.contains(&row_ids[i])
                 }) else {
                     continue;
@@ -5140,7 +5228,7 @@ impl Table for SegmentedTable {
                 let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
                 for i in start..vol.meta.row_count {
                     let rid = row_ids[i];
-                    if !self.shows_cold_row(cs, i, rid, &tombstones_arc, &hot_skip) {
+                    if !self.shows_cold_row(cs, i, rid, &tombstones_arc, &hot_skip, &cut) {
                         continue;
                     }
                     if let Some(col) = column {
@@ -5176,6 +5264,7 @@ impl Table for SegmentedTable {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.min_column");
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.min_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
@@ -5338,6 +5427,7 @@ impl Table for SegmentedTable {
                                         tombstones_ref,
                                         &hot_skip,
                                         no_tombstones,
+                                        &cut,
                                     );
                                     continue;
                                 }
@@ -5350,7 +5440,9 @@ impl Table for SegmentedTable {
                                 if hot_skip.contains(&rid) {
                                     continue;
                                 }
-                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                if !no_tombstones
+                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                {
                                     continue;
                                 }
                                 let v = values[i];
@@ -5375,6 +5467,7 @@ impl Table for SegmentedTable {
                                         tombstones_ref,
                                         &hot_skip,
                                         no_tombstones,
+                                        &cut,
                                     );
                                     continue;
                                 }
@@ -5387,7 +5480,9 @@ impl Table for SegmentedTable {
                                 if hot_skip.contains(&rid) {
                                     continue;
                                 }
-                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                if !no_tombstones
+                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                {
                                     continue;
                                 }
                                 let v = values[i];
@@ -5417,6 +5512,7 @@ impl Table for SegmentedTable {
                                         tombstones_ref,
                                         &hot_skip,
                                         no_tombstones,
+                                        &cut,
                                     );
                                     continue;
                                 }
@@ -5429,7 +5525,9 @@ impl Table for SegmentedTable {
                                 if hot_skip.contains(&rid) {
                                     continue;
                                 }
-                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                if !no_tombstones
+                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                {
                                     continue;
                                 }
                                 let v = values[i];
@@ -5457,6 +5555,7 @@ impl Table for SegmentedTable {
                                 tombstones_ref,
                                 &hot_skip,
                                 no_tombstones,
+                                &cut,
                             );
                         }
                     }
@@ -5471,7 +5570,7 @@ impl Table for SegmentedTable {
                         if hot_skip.contains(&rid) {
                             return false;
                         }
-                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid, &cut) {
                             return false;
                         }
                         true
@@ -5497,6 +5596,7 @@ impl Table for SegmentedTable {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.max_column");
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.max_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
@@ -5652,6 +5752,7 @@ impl Table for SegmentedTable {
                                         tombstones_ref,
                                         &hot_skip,
                                         no_tombstones,
+                                        &cut,
                                     );
                                     continue;
                                 }
@@ -5664,7 +5765,9 @@ impl Table for SegmentedTable {
                                 if hot_skip.contains(&rid) {
                                     continue;
                                 }
-                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                if !no_tombstones
+                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                {
                                     continue;
                                 }
                                 let v = values[i];
@@ -5689,6 +5792,7 @@ impl Table for SegmentedTable {
                                         tombstones_ref,
                                         &hot_skip,
                                         no_tombstones,
+                                        &cut,
                                     );
                                     continue;
                                 }
@@ -5701,7 +5805,9 @@ impl Table for SegmentedTable {
                                 if hot_skip.contains(&rid) {
                                     continue;
                                 }
-                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                if !no_tombstones
+                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                {
                                     continue;
                                 }
                                 let v = values[i];
@@ -5731,6 +5837,7 @@ impl Table for SegmentedTable {
                                         tombstones_ref,
                                         &hot_skip,
                                         no_tombstones,
+                                        &cut,
                                     );
                                     continue;
                                 }
@@ -5743,7 +5850,9 @@ impl Table for SegmentedTable {
                                 if hot_skip.contains(&rid) {
                                     continue;
                                 }
-                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                if !no_tombstones
+                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                {
                                     continue;
                                 }
                                 let v = values[i];
@@ -5771,6 +5880,7 @@ impl Table for SegmentedTable {
                                 tombstones_ref,
                                 &hot_skip,
                                 no_tombstones,
+                                &cut,
                             );
                         }
                     }
@@ -5783,7 +5893,7 @@ impl Table for SegmentedTable {
                         if hot_skip.contains(&rid) {
                             return false;
                         }
-                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid, &cut) {
                             return false;
                         }
                         true
@@ -5813,6 +5923,7 @@ impl Table for SegmentedTable {
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self.hot.get_partition_count(column_name);
@@ -5860,7 +5971,7 @@ impl Table for SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
                         && !hot_skip.contains(&row_ids[i])
                 }) else {
                     continue;
@@ -5879,7 +5990,8 @@ impl Table for SegmentedTable {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
+                    {
                         continue;
                     }
                     if let Some(col) = column {
@@ -5911,6 +6023,7 @@ impl Table for SegmentedTable {
         self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
 
             let schema = self.hot.schema();
             let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
@@ -5947,7 +6060,7 @@ impl Table for SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
                         && !hot_skip.contains(&row_ids[i])
                 }) else {
                     continue;
@@ -5966,7 +6079,8 @@ impl Table for SegmentedTable {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
+                    {
                         continue;
                     }
                     if let Some(col) = column {
@@ -5991,6 +6105,7 @@ impl Table for SegmentedTable {
         self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
 
             let schema = self.hot.schema();
             if col_idx >= schema.columns.len() {
@@ -6075,7 +6190,7 @@ impl Table for SegmentedTable {
                         cs.is_visible(i)
                             && !hot_skip.contains(&row_ids[i])
                             && (no_tombstones
-                                || !self.is_row_tombstoned(&tombstones_arc, row_ids[i]))
+                                || !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut))
                     }) else {
                         continue;
                     };
@@ -6087,7 +6202,7 @@ impl Table for SegmentedTable {
                         if hot_skip.contains(&rid) {
                             continue;
                         }
-                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
+                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid, &cut) {
                             continue;
                         }
                         distinct.insert(col.get_value(i));
@@ -6103,7 +6218,7 @@ impl Table for SegmentedTable {
                         if hot_skip.contains(&rid) {
                             return false;
                         }
-                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
+                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid, &cut) {
                             return false;
                         }
                         true
@@ -6124,6 +6239,7 @@ impl Table for SegmentedTable {
         column_name: &str,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self.hot.collect_rows_grouped_by_partition(column_name);
@@ -6164,7 +6280,7 @@ impl Table for SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
                         && !hot_skip.contains(&row_ids[i])
                 }) else {
                     continue;
@@ -6185,7 +6301,8 @@ impl Table for SegmentedTable {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
+                    {
                         continue;
                     }
                     let val = if let Some(col) = column {
@@ -6209,6 +6326,7 @@ impl Table for SegmentedTable {
         partition_value: &Value,
     ) -> Result<Option<RowVec>> {
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self
@@ -6280,7 +6398,7 @@ impl Table for SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
                         && !hot_skip.contains(&row_ids[i])
                 }) else {
                     continue;
@@ -6304,7 +6422,8 @@ impl Table for SegmentedTable {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
+                    {
                         continue;
                     }
                     let matches = if let Some(col) = column {
@@ -6368,6 +6487,7 @@ impl Table for SegmentedTable {
         self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
             // 1. Collect hot rows in PK order. Only materialize `needed` rows
             //    (not all hot rows). The skip set uses row IDs only (no materialization).
             let hot_rows = match self.hot.collect_rows_ordered_by_index(
@@ -6544,7 +6664,7 @@ impl Table for SegmentedTable {
                     if skip.contains(&rid) {
                         continue;
                     }
-                    if self.is_row_tombstoned(&tombstones_arc, rid) {
+                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) {
                         continue;
                     }
 
@@ -6741,6 +6861,7 @@ impl Table for SegmentedTable {
             // The hot store answers from an index when it can; then only its
             // best rows are read, and a sealed copy of a hot row is recognised
             // per candidate instead of through a set of every matching hot row
+            let cut = self.read_cut();
             let hot_top =
                 self.hot
                     .scan_top_k(walk, where_expr, column_name, ascending, needed, 0)?;
@@ -6886,8 +7007,8 @@ impl Table for SegmentedTable {
                     )?;
                     scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
                     scanner.set_visibility_bitmap(cs.visible.clone());
-                    scanner.snapshot_seq = self.snapshot_seq;
                     scanner.view = self.view.clone();
+                    scanner.cut = cut.clone();
                     scanner.set_column_mapping(
                         self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
                     );
@@ -7476,7 +7597,13 @@ impl Table for SegmentedTable {
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::as_of_hot_read();
-            let Some(cold_rows) = self.collect_cold_rows(None, decided, generation, Some(point))?
+            let Some(cold_rows) = self.collect_cold_rows(
+                None,
+                decided,
+                generation,
+                Some(point),
+                &CommitCut::every(),
+            )?
             else {
                 return Ok(None);
             };
@@ -7524,6 +7651,7 @@ impl Table for SegmentedTable {
         crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
         // The volume stats count rows a snapshot or a view may not see
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             // Bail out: during seal, hot+cold overlap makes aggregation unreliable
             if self.segment_mgr.seal_overlap() > 0 {
@@ -7902,7 +8030,7 @@ impl Table for SegmentedTable {
                                 continue;
                             }
                             let row_id = row_ids[i];
-                            if self.is_row_tombstoned(tombstones_ref, row_id)
+                            if self.is_row_tombstoned(tombstones_ref, row_id, &cut)
                                 || hot_skip_ref.contains(&row_id)
                             {
                                 continue;
@@ -8012,6 +8140,7 @@ impl Table for SegmentedTable {
             return Ok(None);
         }
         self.newest_clear_of_destruction(|| {
+            let cut = self.read_cut();
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self
@@ -8084,7 +8213,7 @@ impl Table for SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let visible = |i: usize| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(tombstones_ref, row_ids[i])
+                        && !self.is_row_tombstoned(tombstones_ref, row_ids[i], &cut)
                         && !hot_skip_ref.contains(&row_ids[i])
                 };
                 let Some(start) = (0..vol.meta.row_count).find(|&i| visible(i)) else {
