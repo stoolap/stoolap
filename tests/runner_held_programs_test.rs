@@ -172,6 +172,21 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
             "Integer(3)|Integer(50)",
         ],
     ),
+    (
+        "SELECT id FROM tv WHERE id < $1 ORDER BY id",
+        &[3],
+        &["Integer(1)", "Integer(2)"],
+    ),
+    (
+        "SELECT a FROM tv WHERE id > 1 ORDER BY a DESC",
+        &[],
+        &["Integer(30)", "Integer(20)"],
+    ),
+    (
+        "SELECT COUNT(*), SUM(a + $1) FROM tv",
+        &[1],
+        &["Integer(3)|Integer(63)"],
+    ),
 ];
 
 fn open(name: &str) -> Database {

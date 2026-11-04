@@ -897,10 +897,11 @@ impl ExecutionContext {
     /// Create a new context with incremented view depth.
     /// Used when executing nested views to track recursion depth.
     /// Also increments query_depth since views are nested queries.
-    /// A view's query reads none of the CTEs of the statement reading it.
+    /// A view's query reads none of the CTEs of the statement reading it,
+    /// and none of its parameters, which a view cannot take.
     pub fn with_incremented_view_depth(&self) -> Self {
         Self {
-            params: self.params.clone(),
+            params: EMPTY_PARAMS.clone(),
             auto_commit: self.auto_commit,
             cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
