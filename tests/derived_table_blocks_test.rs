@@ -650,6 +650,24 @@ fn an_exists_over_a_correlated_derived_table_binds_the_order_by_it_drops() {
 }
 
 #[test]
+fn an_exists_binds_a_subquery_in_its_order_by_over_a_table_as_over_a_derived_table() {
+    let _turn = turn();
+    let db = hot("exists_order_subquery");
+    for from in ["u", "(SELECT id, x FROM u) AS u"] {
+        for key in ["(SELECT nosuch(1))", "(SELECT nosuch(u.x))"] {
+            let sql =
+                format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM {from} WHERE u.id = t.id ORDER BY {key})");
+            let got = answer(&db, &sql);
+            assert!(
+                got.as_ref()
+                    .is_err_and(|e| e.contains("Function not found: NOSUCH")),
+                "{sql}: {got:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_slot_spelled_as_a_name_shares_no_cached_subquery_with_that_name() {
     let _turn = turn();
     // The inner `a` is t's, a slot holding 'z'; the quoted "a" no table has
