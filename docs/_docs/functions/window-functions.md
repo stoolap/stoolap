@@ -392,5 +392,6 @@ A named window holds anything the same window written in `OVER (...)` holds, sub
 
 - When ORDER BY is omitted, the entire partition is treated as a single group
 - NULL values are handled according to SQL standards
-- Window functions can only appear in SELECT and ORDER BY clauses
+- Window functions can only appear in a SELECT list, a DISTINCT ON key or an ORDER BY key, of the query or of any subquery. Anywhere else (WHERE, HAVING, GROUP BY, JOIN ON, LIMIT, OFFSET, a WINDOW definition, a table function argument, or any part of INSERT, UPDATE, DELETE and RETURNING) the statement fails before it runs: `the window function ROW_NUMBER is allowed only in a SELECT list, DISTINCT ON or ORDER BY`
+- A window function cannot be read inside an aggregate call or another window function, in its arguments, FILTER, PARTITION BY, ORDER BY or frame: `SUM(ROW_NUMBER() OVER ())` fails with `the window function ROW_NUMBER cannot be read inside a call of SUM`. An aggregate inside a window function, such as `SUM(SUM(a)) OVER ()`, is allowed
 - Multiple window functions can be used in the same query

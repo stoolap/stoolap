@@ -8740,13 +8740,7 @@ impl Executor {
         branch: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> SelectResult {
-        let Some(held) = grouped.held.clone() else {
-            // The general path groups the rows the source gave, as `branch`
-            let Some((columns, rows)) = grouped.source_rows(ctx)? else {
-                return Err(Error::internal("a grouped statement without its rows"));
-            };
-            return self.execute_query_on_memory_result(branch, ctx, columns.to_vec(), rows);
-        };
+        let held = Arc::clone(&grouped.held);
         let held = &*held;
         let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
             Error::internal("a table's columns changed while the statement prepared")

@@ -8704,9 +8704,7 @@ enum GroupedSource {
 /// One execution of a grouped statement of the family: its plan, and the
 /// rows of a source that is not a base table with the name its scope bears
 pub(crate) struct GroupedRun<'s> {
-    /// None when the blocks cannot run the statement, whose source's rows,
-    /// read already, the general path takes
-    pub(crate) held: Option<Arc<PreparedGrouped>>,
+    pub(crate) held: Arc<PreparedGrouped>,
     source: Option<(StatementSource<'s>, SmartString)>,
 }
 
@@ -8715,51 +8713,11 @@ impl GroupedRun<'_> {
     pub(crate) fn scope_name(&self) -> Option<&str> {
         self.source.as_ref().map(|(_, name)| name.as_str())
     }
-
-    /// The columns of the source's rows and every row, for the general path
-    /// when the blocks cannot run the statement. None over a base table
-    pub(crate) fn source_rows(
-        self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<(CompactArc<Vec<String>>, RowVec)>> {
-        let Some((source, _)) = self.source else {
-            return Ok(None);
-        };
-        let Some(columns) = source.columns() else {
-            return Err(Error::internal(
-                "a grouped statement read its table as rows",
-            ));
-        };
-        let columns = CompactArc::new(columns.to_vec());
-        let rows = match source {
-            StatementSource::Rows(_, rows) => rows,
-            StatementSource::Stream(_, mut result) => {
-                result_rows(&mut *result).collect::<Result<_>>()?
-            }
-            StatementSource::Values(_, values) => (0i64..)
-                .zip(&values.rows)
-                .map(|(id, exprs)| Executor::values_row(exprs, ctx).map(|row| (id, row)))
-                .collect::<Result<_>>()?,
-            StatementSource::Cte((_, rows)) => rows.iter().cloned().collect(),
-            StatementSource::Function(..) => {
-                return Err(Error::internal(
-                    "a table function read before its blocks answered its arguments",
-                ))
-            }
-            StatementSource::Table(_) => {
-                return Err(Error::internal(
-                    "a grouped statement read its table as rows",
-                ))
-            }
-        };
-        Ok(Some((columns, rows)))
-    }
 }
 
 impl PreparedGrouped {
     /// Prepare `stmt` over the `scope` of its `source`'s rows, whose columns
-    /// `schema` holds; None when a block reads a column of the row that is
-    /// not a GROUP BY item
+    /// `schema` holds
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
@@ -8770,7 +8728,7 @@ impl PreparedGrouped {
         source: GroupedSource,
         param_count: usize,
         epoch: u64,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Self> {
         let validity = executor.select_validity(stmt, epoch);
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
@@ -9332,30 +9290,20 @@ impl PreparedGrouped {
                     }
                     over_items(item, &chain, &item_of, slots.as_ref())
                 };
-                let Ok(opened) = open_items(written, &key_chain, width, &mut item) else {
-                    return Ok(None);
-                };
+                let opened = open_items(written, &key_chain, width, &mut item)?;
                 let read = match (opened, chain.resolve(written)) {
-                    (Some(opened), _) => {
-                        match compile_with(
-                            &slots_ctx,
-                            &over_items(&opened, &chain, &item_of, None)?,
-                        ) {
-                            Ok(program) => Hole::Program(program),
-                            Err(_) => return Ok(None),
-                        }
-                    }
+                    (Some(opened), _) => Hole::Program(compile_with(
+                        &slots_ctx,
+                        &over_items(&opened, &chain, &item_of, None)?,
+                    )?),
                     (None, Ok(Some((_, column)))) => match item_of(column, written) {
                         Some(item) => Hole::Column(item),
                         None => return Err(ungrouped_column(&reference_name(written))),
                     },
-                    _ => match compile_with(
+                    _ => Hole::Program(compile_with(
                         &slots_ctx,
                         &over_items(written, &chain, &item_of, None)?,
-                    ) {
-                        Ok(program) => Hole::Program(program),
-                        Err(_) => return Ok(None),
-                    },
+                    )?),
                 };
                 grouped.push((*slot, read));
             }
@@ -9420,7 +9368,7 @@ impl PreparedGrouped {
                     .flatten()
             })
             .flatten();
-        Ok(Some(Self {
+        Ok(Self {
             validity,
             cte_scope: ctx.cte_scope(),
             schema,
@@ -9440,7 +9388,7 @@ impl PreparedGrouped {
             star_items: None,
             classification,
             stmt,
-        }))
+        })
     }
 
     /// The keys computed over the rows the run returns, when there are any
@@ -9537,7 +9485,7 @@ impl Executor {
             .filter(|p| p.source == GroupedSource::Table && base_table.is_some())
         {
             return Ok(Some(GroupedRun {
-                held: Some(Arc::clone(held)),
+                held: Arc::clone(held),
                 source: None,
             }));
         }
@@ -9551,7 +9499,7 @@ impl Executor {
                 && columns.is_some_and(|columns| *p.schema.column_names_arc() == columns)
         }) {
             return Ok(Some(GroupedRun {
-                held: Some(held),
+                held,
                 source: source.map(|source| (source, scope_name)),
             }));
         }
@@ -9568,7 +9516,7 @@ impl Executor {
             (None, None) => return Err(Error::internal("a grouped statement without one table")),
         };
         let scope = ScopeTable::of(scope_name.clone(), &schema);
-        let Some(prepared) = PreparedGrouped::prepare(
+        let prepared = Arc::new(PreparedGrouped::prepare(
             self,
             ctx,
             stmt,
@@ -9577,15 +9525,7 @@ impl Executor {
             kind,
             ctx.params().len(),
             epoch,
-        )?
-        else {
-            // Rows read already go to the general path, which reads no source again
-            return Ok(source.map(|source| GroupedRun {
-                held: None,
-                source: Some((source, scope_name)),
-            }));
-        };
-        let prepared = Arc::new(prepared);
+        )?);
         if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
             if matches!(
                 &*guard,
@@ -9597,7 +9537,7 @@ impl Executor {
             }
         }
         Ok(Some(GroupedRun {
-            held: Some(prepared),
+            held: prepared,
             source: source.map(|source| (source, scope_name)),
         }))
     }
@@ -9605,7 +9545,7 @@ impl Executor {
     /// A grouped join statement prepared over the joined `columns` its join
     /// path laid out: over the scope its `blocks` hold, else from its
     /// `leaves` and `sides`, as `of_join_columns` takes them; None when they
-    /// do not line up or a block reads a column outside its groups
+    /// do not line up
     pub(crate) fn prepare_grouped_join(
         &self,
         stmt: &SelectStatement,
@@ -9640,7 +9580,7 @@ impl Executor {
             ctx.params().len(),
             self.engine.schema_epoch(),
         )?;
-        Ok(prepared.map(|prepared| PreparedGrouped {
+        Ok(Some(PreparedGrouped {
             star_items: stars.map(|(_, items)| items),
             ..prepared
         }))

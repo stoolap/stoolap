@@ -213,6 +213,8 @@ WHERE value > ANY (SELECT ...)
 WHERE value > ALL (SELECT ...)
 ```
 
+ANY, SOME and ALL take only a comparison operator: `=`, `<>` (or `!=`), `<`, `<=`, `>` and `>=`. Any other operator before them fails the statement before it runs, wherever it stands: `a + ANY (SELECT 1)` raises `ANY takes a comparison operator (=, <>, <, <=, >, >=), not +`.
+
 The value on the left of `IN`, `ANY` or `ALL` may be a `SELECT` alias in a `WHERE` or a `HAVING`, and an aggregate in a statement with a `GROUP BY`, such as `HAVING COUNT(*) IN (SELECT n FROM limits)`.
 
 #### Error Handling
