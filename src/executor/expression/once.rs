@@ -34,7 +34,20 @@ pub(crate) fn compile_once(expr: &Expression, blocks: bool) -> Result<Program> {
 }
 
 /// A one-shot program a prepared statement holds, compiled by its first run
-pub(crate) type HeldOnce = std::sync::OnceLock<Result<Program>>;
+pub(crate) type HeldOnce = std::sync::OnceLock<Program>;
+
+/// What `held` holds, else what `compile` makes, held once it compiles: a
+/// compile that fails is tried again by the next run
+pub(crate) fn held_or_compile<T>(
+    held: &std::sync::OnceLock<T>,
+    compile: impl FnOnce() -> Result<T>,
+) -> Result<&T> {
+    if let Some(held) = held.get() {
+        return Ok(held);
+    }
+    let compiled = compile()?;
+    Ok(held.get_or_init(|| compiled))
+}
 
 /// `expr`'s program in `held`, compiled as [`compile_once`] compiles it on
 /// the first read
@@ -43,9 +56,7 @@ pub(crate) fn held_once<'h>(
     expr: &Expression,
     blocks: bool,
 ) -> Result<&'h Program> {
-    held.get_or_init(|| compile_once(expr, blocks))
-        .as_ref()
-        .map_err(Clone::clone)
+    held_or_compile(held, || compile_once(expr, blocks))
 }
 
 /// [`compile_once`] with the functions of `registry`

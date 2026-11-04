@@ -84,6 +84,9 @@ fn allocations(test: &str, rows: i64, sql: &str) -> usize {
         .collect();
     db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
         .unwrap();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO r SELECT id FROM t", ()).unwrap();
     let stmt = db.prepare(sql).unwrap();
     let count = || -> i64 {
         match sql.contains("$1") {
@@ -107,6 +110,49 @@ fn a_known_text_vector_is_read_once_per_execution() {
         if long >= short + 200 {
             wrong.push(format!(
                 "{sql}: {long} allocations over 2000 rows, {short} over 200"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Each with the argument folded over the parameter, then written as the
+/// parameter alone
+const CAST_TWINS: &[(&str, &str)] = &[
+    (
+        "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, CAST($1 AS TEXT)) < 1e9",
+        "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, $1) < 1e9",
+    ),
+    (
+        "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_L2(e, CAST($1 AS TEXT))) > 0",
+        "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_L2(e, $1)) > 0",
+    ),
+    (
+        "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id \
+         HAVING SUM(VEC_DISTANCE_L2(t.e, CAST($1 AS TEXT))) > 0",
+        "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id HAVING SUM(VEC_DISTANCE_L2(t.e, $1)) > 0",
+    ),
+    (
+        "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, COALESCE($1, '[0, 0, 0]')) < 1e9",
+        "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, $1) < 1e9",
+    ),
+    (
+        "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id \
+         HAVING SUM(VEC_DISTANCE_L2(t.e, COALESCE($1, '[0, 0, 0]'))) > 0",
+        "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id HAVING SUM(VEC_DISTANCE_L2(t.e, $1)) > 0",
+    ),
+];
+
+#[test]
+fn a_parameter_folded_into_a_vector_argument_is_read_once_per_execution() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wrong = Vec::new();
+    for (cast, plain) in CAST_TWINS {
+        let cast_cost = allocations("cast", 2_000, cast);
+        let plain_cost = allocations("plain", 2_000, plain);
+        if cast_cost >= plain_cost + 200 {
+            wrong.push(format!(
+                "{cast}: {cast_cost} allocations over 2000 rows, {plain_cost} with the parameter alone"
             ));
         }
     }

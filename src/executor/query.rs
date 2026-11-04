@@ -3042,7 +3042,7 @@ impl Executor {
             if passes {
                 rows.push((0, Row::from_values(vec![])));
             }
-            return self.grouped_select(stmt, ctx, classification, rows, &[], None);
+            return self.grouped_select(stmt, ctx, classification, rows, &[], None, None);
         }
         if !passes {
             // Still need to determine column names for the schema
@@ -3713,6 +3713,7 @@ impl Executor {
                 RowVec::new(),
                 all_columns,
                 |out| Self::shared_result_layout(stmt, all_columns, table_alias, out),
+                None,
             )?,
         };
         let columns = CompactArc::new(result.columns().to_vec());
@@ -4424,10 +4425,18 @@ impl Executor {
         let has_agg = classification.has_aggregation;
 
         if has_agg {
-            let (result, layout) =
-                self.group_and_window_rows(stmt, ctx, classification, rows, &all_columns, |out| {
-                    Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out)
-                })?;
+            let layout = |out: &[String]| {
+                Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out)
+            };
+            let (result, layout) = self.group_and_window_rows(
+                stmt,
+                ctx,
+                classification,
+                rows,
+                &all_columns,
+                layout,
+                None,
+            )?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
@@ -5081,10 +5090,6 @@ impl Executor {
             })
         });
         let on_condition: Option<&Expression> = join_source.condition.as_deref();
-        let grouped_plan = plan
-            .as_ref()
-            .filter(|_| Self::grouped_family_reach(stmt, classification))
-            .cloned();
         let prepared = plan
             .as_deref()
             .filter(|_| (!classification.where_has_subqueries && !on_subqueries) || blocks_where);
@@ -6296,7 +6301,7 @@ impl Executor {
                     if has_agg || has_window {
                         let laid_out = blocks.as_deref().filter(|_| projection_pushdown.is_none());
                         return self.grouped_join_select(
-                            grouped_plan.as_deref(),
+                            plan.as_deref(),
                             stmt,
                             ctx,
                             classification,
@@ -6840,7 +6845,7 @@ impl Executor {
         };
         if classification.has_aggregation || classification.has_window_functions {
             return self.grouped_join_select(
-                grouped_plan.as_deref(),
+                plan.as_deref(),
                 stmt,
                 ctx,
                 classification,
@@ -6965,6 +6970,7 @@ impl Executor {
                 filtered_rows,
                 &columns,
                 subquery_alias,
+                None,
             );
         }
 
@@ -7182,6 +7188,7 @@ impl Executor {
                 rows,
                 &view_columns,
                 view_alias.as_deref(),
+                None,
             );
         }
 
@@ -7511,6 +7518,7 @@ impl Executor {
                 result_rows,
                 &column_names,
                 values_alias,
+                None,
             );
         }
 
@@ -8389,7 +8397,9 @@ impl Executor {
     /// The aggregation and window functions of `stmt` over a source's rows,
     /// the one dispatch every source hands its rows to: GROUP BY and then
     /// the windows over the groups, the windows alone, or the aggregation
-    /// alone, whose layout `aggregate_layout` builds from its columns
+    /// alone, whose layout `aggregate_layout` builds from its columns; the
+    /// calls fed by the `held` feed when a plan holds one
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn group_and_window_rows(
         &self,
         stmt: &SelectStatement,
@@ -8398,15 +8408,17 @@ impl Executor {
         rows: RowVec,
         columns: &[String],
         aggregate_layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
+        held: Option<&super::aggregation::HeldFeed>,
     ) -> Result<WindowOutput> {
         match (
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
-            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns),
+            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns, held),
             (false, true) => self.execute_select_with_window_functions(stmt, ctx, &rows, columns),
             _ => {
-                let result = self.execute_select_with_aggregation(stmt, ctx, rows, columns)?;
+                let result =
+                    self.execute_select_with_aggregation(stmt, ctx, rows, columns, held)?;
                 let layout = aggregate_layout(result.columns());
                 Ok((result, layout))
             }
@@ -8414,7 +8426,8 @@ impl Executor {
     }
 
     /// `group_and_window_rows` as the SELECT's output, its layout over the
-    /// input `columns` named under `table_alias`
+    /// input `columns` named under `table_alias`, fed by the `held` feed
+    #[allow(clippy::too_many_arguments)]
     fn grouped_select(
         &self,
         stmt: &SelectStatement,
@@ -8423,11 +8436,11 @@ impl Executor {
         rows: RowVec,
         columns: &[String],
         table_alias: Option<&str>,
+        held: Option<&super::aggregation::HeldFeed>,
     ) -> SelectResult {
+        let layout = |out: &[String]| Self::result_layout(stmt, columns, table_alias, out);
         let (result, layout) =
-            self.group_and_window_rows(stmt, ctx, classification, rows, columns, |out| {
-                Self::result_layout(stmt, columns, table_alias, out)
-            })?;
+            self.group_and_window_rows(stmt, ctx, classification, rows, columns, layout, held)?;
         let columns = CompactArc::new(result.columns().to_vec());
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
@@ -8436,7 +8449,8 @@ impl Executor {
     /// merged pair apart, the first `left_width` its left side's as read:
     /// through the grouped blocks when the statement belongs to their family,
     /// held with the `plan`, over the scope its `blocks` laid out when it has
-    /// them; else over the rows `merge` shows, as any grouped statement
+    /// them; else over the rows `merge` shows, as any grouped statement, its
+    /// calls fed by programs the `plan` holds
     #[allow(clippy::too_many_arguments)]
     fn grouped_join_select(
         &self,
@@ -8500,7 +8514,9 @@ impl Executor {
             Some(merge) => merge(columns, rows),
             None => (columns, rows),
         };
-        self.grouped_select(stmt, ctx, classification, rows, &columns, None)
+        let feed = plan.map(|plan| plan.feed(&columns));
+        let held = feed.as_deref();
+        self.grouped_select(stmt, ctx, classification, rows, &columns, None, held)
     }
 
     /// Each source the join `expr` reads, left to right, with its column

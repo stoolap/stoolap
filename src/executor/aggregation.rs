@@ -1080,7 +1080,7 @@ pub(crate) struct CompiledFeed {
 }
 
 /// A plan's feed, compiled on its first run over the columns it reads
-pub(crate) type HeldFeed = std::sync::OnceLock<Result<CompiledFeed>>;
+pub(crate) type HeldFeed = std::sync::OnceLock<CompiledFeed>;
 
 /// The feed of one execution's aggregation
 struct RowFeed<'a> {
@@ -1116,12 +1116,11 @@ impl<'a> RowFeed<'a> {
         let registry = crate::functions::registry::global_registry();
         let feed = match held {
             Some(held) => {
-                let compiled = held.get_or_init(|| {
+                let compiled = super::expression::held_or_compile(held, || {
                     CompiledFeed::compile(aggregations, at, |expr| {
                         compile_over_slots(expr, columns, registry, None, blocks.is_some(), None)
                     })
-                });
-                let compiled = compiled.as_ref().map_err(Clone::clone)?;
+                })?;
                 compiled.bound(slot_params(ctx, blocks), blocks)
             }
             None => std::borrow::Cow::Owned(CompiledFeed::compile(aggregations, at, |expr| {
@@ -1575,13 +1574,15 @@ impl Executor {
             .collect()
     }
 
-    /// Execute SELECT with aggregation (GROUP BY support)
+    /// Execute SELECT with aggregation (GROUP BY support), the calls fed by
+    /// the `held` feed when a plan holds one
     pub(crate) fn execute_select_with_aggregation(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: RowVec,
         base_columns: &[String],
+        held: Option<&HeldFeed>,
     ) -> Result<Box<dyn QueryResult>> {
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
@@ -1593,7 +1594,7 @@ impl Executor {
             ctx,
             input,
             base_columns,
-            (None, None),
+            (None, held),
         )
     }
 
@@ -2342,18 +2343,20 @@ impl Executor {
         })
     }
 
-    /// Aggregate, then run the window functions over the aggregate's output
+    /// Aggregate, then run the window functions over the aggregate's output,
+    /// the calls fed by the `held` feed when a plan holds one
     pub(crate) fn execute_aggregation_then_windows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        held: Option<&HeldFeed>,
     ) -> Result<WindowOutput> {
         let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
         let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
         let path = AggregatePath::General;
-        let run = (None, None);
+        let run = (None, held);
         self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, run)
     }
 

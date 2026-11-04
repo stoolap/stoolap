@@ -691,6 +691,7 @@ impl Executor {
                 filtered_rows,
                 &cte_columns,
                 |out| Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), out),
+                None,
             )?;
             let columns = result.columns().to_vec();
             let mut rows = Self::materialize_result(result)?;

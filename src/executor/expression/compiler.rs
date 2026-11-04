@@ -1915,7 +1915,8 @@ impl<'a> ExprCompiler<'a> {
     }
 
     /// Compile an argument a vector function reads: a constant is read as a
-    /// vector here, a parameter when its program is bound
+    /// vector here, a parameter or what folds over parameters when its
+    /// program is bound
     fn compile_vector_operand(
         &self,
         arg: &Expression,
@@ -1925,7 +1926,9 @@ impl<'a> ExprCompiler<'a> {
         self.compile_expr(arg, builder)?;
         match builder.take_constant_since(start) {
             Some(value) => builder.emit(Op::LoadConst(read_as_vector(value))),
-            None if matches!(arg, Expression::Parameter(_)) => builder.emit(Op::ReadAsVector),
+            None if matches!(arg, Expression::Parameter(_)) || builder.folds_since(start) => {
+                builder.emit(Op::ReadAsVector)
+            }
             None => {}
         }
         Ok(())

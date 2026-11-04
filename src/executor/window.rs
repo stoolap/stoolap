@@ -112,7 +112,7 @@ fn row_program(
 
 /// One expression's program in a held plan, compiled over its columns by
 /// the first run and bound to each run
-type HeldProgram = OnceLock<Result<SharedProgram>>;
+type HeldProgram = OnceLock<SharedProgram>;
 
 /// The programs of a held plan's window function, one per expression
 #[derive(Debug, Default)]
@@ -167,18 +167,17 @@ fn held_program(
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
-    let program = held
-        .get_or_init(|| {
-            compile_over_slots(
-                expr,
-                columns,
-                global_registry(),
-                slots,
-                blocks.is_some(),
-                None,
-            )
-        })
-        .clone()?;
+    let program = held_or_compile(held, || {
+        compile_over_slots(
+            expr,
+            columns,
+            global_registry(),
+            slots,
+            blocks.is_some(),
+            None,
+        )
+    })?
+    .clone();
     let program = Program::bound(program, slot_params(ctx, blocks));
     Ok(blocks
         .and_then(|blocks| blocks.bind_members(&program))
@@ -241,7 +240,7 @@ impl<'a> RowPrograms<'a> {
 enum ArgSource {
     Literal(Value),
     Parameter,
-    Program(OnceLock<Result<Program>>),
+    Program(HeldOnce),
 }
 
 impl ArgSource {
@@ -709,7 +708,8 @@ use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
     bind_params, compile_expression, compute_expression_hash, evaluate_once, execute_once,
-    held_once, literal_value, ExprVM, HeldOnce, Program, SharedProgram, SubqueryExecutor,
+    held_once, held_or_compile, literal_value, ExprVM, HeldOnce, Program, SharedProgram,
+    SubqueryExecutor,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};

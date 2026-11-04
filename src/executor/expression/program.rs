@@ -233,12 +233,13 @@ impl Program {
             return None;
         }
         let mut source = self.ops.clone();
-        let targets = JumpTargets::of(&mut source);
         let replaced_at: SmallVec<[usize; 4]> = replaced.iter().map(|(at, _)| *at).collect();
         for (at, op) in replaced {
             source[at] = op;
         }
         let folded = self.folded(&mut source, &replaced_at);
+        // A jump inside a folded range is gone with it
+        let targets = JumpTargets::outside(&mut source, &folded);
         let mut ops: Vec<Op> = Vec::with_capacity(source.len());
         // Of each op emitted: whether it loads a value known only now, and
         // the first position it stands for
@@ -816,8 +817,21 @@ struct JumpTargets(SmallVec<[bool; 32]>);
 
 impl JumpTargets {
     fn of(ops: &mut [Op]) -> Self {
+        Self::outside(ops, &[])
+    }
+
+    /// The positions the jumps of `ops` outside the `folded` ranges, which
+    /// are apart and in position order, land on
+    fn outside(ops: &mut [Op], folded: &[(usize, usize, Value)]) -> Self {
+        debug_assert!(folded.windows(2).all(|pair| pair[0].1 <= pair[1].0));
         let mut targets: SmallVec<[bool; 32]> = smallvec::smallvec![false; ops.len() + 1];
-        for t in ops.iter_mut().filter_map(jump_target) {
+        let mut ranges = folded.iter().peekable();
+        for (at, op) in ops.iter_mut().enumerate() {
+            let Some(t) = jump_target(op) else { continue };
+            while ranges.next_if(|(_, end, _)| *end <= at).is_some() {}
+            if ranges.peek().is_some_and(|(start, ..)| *start <= at) {
+                continue;
+            }
             if let Some(target) = targets.get_mut(usize::from(*t)) {
                 *target = true;
             }
@@ -906,6 +920,11 @@ impl ProgramBuilder {
     /// execution's parameters are known
     pub fn mark_fold(&mut self, start: u16) {
         self.folds.push((start, self.position()));
+    }
+
+    /// Whether the ops emitted since `start` were marked to fold as one
+    pub fn folds_since(&self, start: u16) -> bool {
+        self.folds.last() == Some(&(start, self.position()))
     }
 
     /// Emit an operation

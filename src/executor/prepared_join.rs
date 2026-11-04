@@ -24,6 +24,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Schema};
 use crate::planner::join::JoinPlan;
 
+use super::aggregation::HeldFeed;
 use super::context::CteScope;
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
@@ -216,6 +217,9 @@ pub struct PreparedJoin {
     grouped: std::sync::OnceLock<bool>,
     /// None stands for blocks that read a column outside the groups
     grouped_blocks: Shelf<GroupedKey, Option<PreparedGrouped>>,
+    /// The programs feeding the calls of a grouped statement its grouped
+    /// blocks do not run, by the joined rows' columns
+    feeds: Shelf<Vec<String>, HeldFeed>,
     /// The plan of each side that runs as a statement of its own: a join or
     /// a derived table
     side_plans: [NestedPlan; 2],
@@ -240,6 +244,7 @@ impl PreparedJoin {
             join_blocks: RwLock::new(None),
             grouped: std::sync::OnceLock::new(),
             grouped_blocks: Shelf::new(),
+            feeds: Shelf::new(),
             side_plans: Default::default(),
             join_plan: std::sync::OnceLock::new(),
             ctes_named: std::sync::OnceLock::new(),
@@ -311,6 +316,19 @@ impl PreparedJoin {
             || Arc::clone(&built),
         );
         Ok(built)
+    }
+
+    /// The feed held for a grouped statement's calls over joined rows of
+    /// `columns`; one for this run alone when no more are held
+    pub(crate) fn feed(&self, columns: &[String]) -> Arc<HeldFeed> {
+        let wanted = |held: &Vec<String>| held == columns;
+        if let Some(held) = self.feeds.find(wanted) {
+            return held;
+        }
+        let feed = Arc::new(HeldFeed::new());
+        self.feeds
+            .hold(wanted, || columns.to_vec(), || Arc::clone(&feed));
+        feed
     }
 
     /// The output held for joined rows of `columns`, or the one `build`
