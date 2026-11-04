@@ -539,6 +539,9 @@ pub struct SqlAggregateFunction {
     pub column: String,
     /// Pre-computed lowercase column name for index lookups
     pub column_lower: String,
+    /// Whether the column is a name written double-quoted, which reads as
+    /// its text when no column carries it
+    pub(crate) quoted: bool,
     /// Alias for the result column
     pub alias: Option<String>,
     /// Whether DISTINCT is specified
@@ -819,6 +822,11 @@ fn literal_extra_arg(arg: &Expression) -> Option<Value> {
         Expression::Identifier(id) => Some(Value::text(id.value.as_str())),
         arg => super::utils::extract_literal_value(arg),
     }
+}
+
+/// Whether a call's first argument is a name written double-quoted
+fn quoted_argument(args: &[Expression]) -> bool {
+    matches!(args.first(), Some(Expression::Identifier(id)) if id.quoted)
 }
 
 /// Whether every argument of a call to `args` after the first is a literal,
@@ -1193,28 +1201,39 @@ impl CompiledFeed {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>();
-        let programs = key_columns.is_none()
+        let mut programs = key_columns.is_none()
             || !aggregations
                 .iter()
                 .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
+        let mut inputs = CallInputs::compile_with(aggregations, &compile)?;
+        let columns = aggregations
+            .iter()
+            .zip(&mut inputs)
+            .map(|(agg, input)| {
+                if agg.column == "*" || agg.expression.is_some() {
+                    return Ok(None);
+                }
+                match Executor::lookup_column_index(&agg.column_lower, col_index_map) {
+                    Some(idx) => Ok(Some(idx)),
+                    // A qualified name its source lacks
+                    None if split_qualified(&agg.column).is_some() => {
+                        Err(ungrouped_column(&shown_name(&agg.column)))
+                    }
+                    // A quoted name no column carries is its text, as the
+                    // compiler reads it
+                    None if agg.quoted => {
+                        let text = super::utils::value_to_expression(&Value::text(&agg.column));
+                        input.argument = Some(compile(&text)?);
+                        programs = true;
+                        Ok(None)
+                    }
+                    None => Err(crate::core::Error::ColumnNotFound(agg.column.clone())),
+                }
+            })
+            .collect::<Result<_>>()?;
         Ok(Self {
-            inputs: CallInputs::compile_with(aggregations, compile)?,
-            columns: aggregations
-                .iter()
-                .map(|agg| {
-                    if agg.column == "*" || agg.expression.is_some() {
-                        return Ok(None);
-                    }
-                    match Executor::lookup_column_index(&agg.column_lower, col_index_map) {
-                        Some(idx) => Ok(Some(idx)),
-                        // A qualified name its source lacks
-                        None if split_qualified(&agg.column).is_some() => {
-                            Err(ungrouped_column(&shown_name(&agg.column)))
-                        }
-                        None => Ok(None),
-                    }
-                })
-                .collect::<Result<_>>()?,
+            inputs,
+            columns,
             items,
             key_columns,
             programs,
@@ -2538,6 +2557,7 @@ impl Executor {
                         name: func.function.to_string(),
                         column,
                         column_lower,
+                        quoted: quoted_argument(&func.arguments),
                         alias: None,
                         distinct: distinct || func.is_distinct,
                         extra_args,
@@ -2704,6 +2724,7 @@ impl Executor {
                         name: func.function.to_string(),
                         column,
                         column_lower,
+                        quoted: quoted_argument(&func.arguments),
                         alias: Some(aliased.alias.value.to_string()),
                         distinct: distinct || func.is_distinct,
                         extra_args,

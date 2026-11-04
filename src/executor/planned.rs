@@ -51,6 +51,20 @@ impl Executor {
         ctx: Option<&ExecutionContext>,
         run: impl FnOnce(&PreparedSelect) -> R,
     ) -> Option<R> {
+        self.with_planned_or_error(stmt, compiled, classification, ctx, run, &mut None)
+    }
+
+    /// [`Self::with_planned`], keeping in `error` the error planning gives
+    /// a statement that names what its table does not have
+    pub(crate) fn with_planned_or_error<R>(
+        &self,
+        stmt: &SelectStatement,
+        compiled: &RwLock<CompiledExecution>,
+        classification: Option<&OnceLock<Arc<QueryClassification>>>,
+        ctx: Option<&ExecutionContext>,
+        run: impl FnOnce(&PreparedSelect) -> R,
+        error: &mut Option<Error>,
+    ) -> Option<R> {
         let epoch = self.engine.schema_epoch();
         let held = match &*compiled.read().ok()? {
             CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
@@ -77,7 +91,13 @@ impl Executor {
             crate::test_failpoints::compiled_epoch_checked();
             return Some(run(&p));
         }
-        let planned = self.plan_into(stmt, compiled, classification, ctx?, epoch)?;
+        let planned = match self.plan_into(stmt, compiled, classification, ctx?, epoch) {
+            Ok(planned) => planned?,
+            Err(e) => {
+                *error = Some(e);
+                return None;
+            }
+        };
         // The run that plans reads through its view; a count or bound the
         // table keeps answers the runs after it
         planned.key_read()?;
@@ -85,7 +105,9 @@ impl Executor {
     }
 
     /// The plan of `stmt`, kept in `compiled`; a statement prepared but not
-    /// planned is kept as one the planner declines while its tables hold
+    /// planned is kept as one the planner declines while its tables hold;
+    /// a name no table or view has, or a column the schema it reads does
+    /// not have, is the statement's error
     fn plan_into(
         &self,
         stmt: &SelectStatement,
@@ -93,7 +115,7 @@ impl Executor {
         classification: Option<&OnceLock<Arc<QueryClassification>>>,
         ctx: &ExecutionContext,
         epoch: u64,
-    ) -> Option<Arc<PreparedSelect>> {
+    ) -> Result<Option<Arc<PreparedSelect>>> {
         let shape = match classification {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
@@ -105,7 +127,7 @@ impl Executor {
         if aggregates {
             #[cfg(feature = "test-failpoints")]
             if crate::test_failpoints::prepared_families_off() {
-                return None;
+                return Ok(None);
             }
         }
         let quiet = match aggregates {
@@ -121,14 +143,14 @@ impl Executor {
             || shape.where_has_subqueries
             || shape.has_joins
         {
-            return None;
+            return Ok(None);
         }
-        let Expression::TableSource(ts) = stmt.table_expr.as_deref()? else {
-            return None;
+        let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
+            return Ok(None);
         };
         let table = &ts.name.value_lower;
         if ts.as_of.is_some() || ctx.get_cte_by_lower(table).is_some() {
-            return None;
+            return Ok(None);
         }
         // DISTINCT, DISTINCT ON and set operations as the runner's family
         // takes them; over a window step they finish the window's rows, and
@@ -137,19 +159,26 @@ impl Executor {
             && (shape.has_distinct && !aggregates
                 || shape.has_distinct_on
                 || shape.has_set_operations)
+            && self.planned_family(stmt, &shape).is_err()
         {
-            self.planned_family(stmt, &shape).ok()?;
+            return Ok(None);
         }
         // Read before the schema: a change in between leaves this behind
         let validity = self.select_validity(stmt, epoch);
-        let store = self.engine.get_version_store(table).ok()?;
+        let store = match self.engine.get_version_store(table) {
+            Ok(store) => store,
+            Err(Error::TableNotFound(_)) if self.engine.get_view_lowercase(table)?.is_none() => {
+                return Err(Error::TableOrViewNotFound(table.to_string()));
+            }
+            Err(_) => return Ok(None),
+        };
         let (schema, token) = store.schema_and_token();
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::compile_schema_read();
         let scope = ts.alias.as_ref().map_or(table, |alias| &alias.value_lower);
         let param_count = ctx.params().len();
         let (branch, keyed_branch) = prepared_branch(stmt);
-        let prepared = PreparedSelect::prepare(
+        let prepared = match PreparedSelect::prepare(
             self,
             ctx,
             &branch,
@@ -158,9 +187,12 @@ impl Executor {
             param_count,
             epoch,
             keyed_branch,
-        )
-        .ok()
-        .map(|mut prepared| {
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(e @ Error::ColumnNotFound(_)) => return Err(e),
+            Err(_) => None,
+        };
+        let prepared = prepared.map(|mut prepared| {
             // A LIMIT or OFFSET read per run leaves the statement to a
             // scan, and so do a DISTINCT, which the key read does not
             // take, a set operation, whose rows are its branches' too, and
@@ -181,7 +213,9 @@ impl Executor {
             prepared.quiet = quiet;
             Arc::new(prepared)
         });
-        let mut slot = compiled.write().ok()?;
+        let Ok(mut slot) = compiled.write() else {
+            return Ok(None);
+        };
         if matches!(
             &*slot,
             CompiledExecution::Unknown
@@ -193,7 +227,7 @@ impl Executor {
                 None => CompiledExecution::NotOptimizable(validity),
             };
         }
-        prepared
+        Ok(prepared)
     }
 
     /// The plan the planner makes of `stmt` in `ctx`, as EXPLAIN shows it;
@@ -328,6 +362,8 @@ impl Executor {
         params: &[Value],
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        // A name the plan does not find is the error of the statement's own
+        // run, planned again after it takes its view
         self.with_planned(stmt, compiled, classification, ctx, |planned| {
             // The table's count or bound sees no open transaction's writes
             // and no statement's view: those read the plan's rows
