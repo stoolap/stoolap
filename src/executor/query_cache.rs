@@ -288,7 +288,7 @@ pub struct NestedPlan {
     nested: std::sync::OnceLock<Box<[NestedPlan]>>,
     /// A SELECT's LIMIT and OFFSET subqueries; made when one is first read
     counts: std::sync::OnceLock<Box<CountsSlot>>,
-    /// Set once the statement passed `statement_modifier_error`; a failure
+    /// Set once the statement passed `statement_form_error`; a failure
     /// is checked again, as the registry may gain an aggregate
     checked: std::sync::OnceLock<()>,
 }

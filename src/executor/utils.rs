@@ -1335,54 +1335,69 @@ pub(crate) fn modifier_outside_aggregate(
     })
 }
 
-/// The error of the first call in `statement` that [`modifier_outside_aggregate`]
-/// refuses, at any depth: checked before any path runs, since a path may
-/// answer without compiling a call. A table's CHECK and DEFAULT take the
-/// rule where they compile
-pub(crate) fn statement_modifier_error(
+/// The first form in `statement`, at any depth, that no path answers: a call
+/// [`modifier_outside_aggregate`] refuses, a window function outside a SELECT
+/// list, DISTINCT ON and ORDER BY or inside another call's input, ANY or ALL
+/// with an operator that does not compare. Checked before any path runs; a
+/// table's CHECK and DEFAULT take the modifier rule where they compile
+pub(crate) fn statement_form_error(
     statement: &crate::parser::ast::Statement,
     registry: &crate::functions::FunctionRegistry,
 ) -> crate::core::Result<()> {
-    ModifierWalk { registry }
+    FormWalk { registry }
         .statement(statement)
         .map_err(crate::core::Error::invalid_argument)
 }
 
-struct ModifierWalk<'a> {
+/// Where an expression stands, for the window functions it may hold
+#[derive(Clone, Copy)]
+enum At<'e> {
+    /// A SELECT list, DISTINCT ON or ORDER BY item
+    Output,
+    /// Any other place a statement reads
+    Elsewhere,
+    /// The input of the aggregate or window call named
+    Inside(&'e str),
+}
+
+struct FormWalk<'a> {
     registry: &'a crate::functions::FunctionRegistry,
 }
 
-impl ModifierWalk<'_> {
+impl FormWalk<'_> {
     fn statement(&self, statement: &crate::parser::ast::Statement) -> Result<(), String> {
         use crate::parser::ast::Statement;
+        let at = At::Elsewhere;
         match statement {
             Statement::Select(stmt) => self.select(stmt),
             Statement::Insert(stmt) => {
-                stmt.values.iter().try_for_each(|row| self.all(row))?;
+                stmt.values.iter().try_for_each(|row| self.all(row, at))?;
                 stmt.select.as_deref().map_or(Ok(()), |s| self.select(s))?;
-                self.all(&stmt.update_expressions)?;
-                self.optional(stmt.update_where.as_deref())?;
-                self.all(&stmt.returning)
+                self.all(&stmt.update_expressions, at)?;
+                self.optional(stmt.update_where.as_deref(), at)?;
+                self.all(&stmt.returning, at)
             }
             Statement::Update(stmt) => {
                 self.with(stmt.with.as_ref())?;
-                stmt.updates.values().try_for_each(|e| self.expression(e))?;
-                self.optional(stmt.where_clause.as_deref())?;
-                self.all(&stmt.returning)
+                stmt.updates
+                    .values()
+                    .try_for_each(|e| self.expression(e, at))?;
+                self.optional(stmt.where_clause.as_deref(), at)?;
+                self.all(&stmt.returning, at)
             }
             Statement::Delete(stmt) => {
                 self.with(stmt.with.as_ref())?;
-                self.optional(stmt.where_clause.as_deref())?;
-                self.all(&stmt.returning)
+                self.optional(stmt.where_clause.as_deref(), at)?;
+                self.all(&stmt.returning, at)
             }
             Statement::CreateView(stmt) => self.select(&stmt.query),
             Statement::CreateTable(stmt) => {
                 stmt.as_select.as_deref().map_or(Ok(()), |s| self.select(s))
             }
             Statement::Explain(stmt) => self.statement(&stmt.statement),
-            Statement::Expression(stmt) => self.expression(&stmt.expression),
-            Statement::Set(stmt) => self.expression(&stmt.value),
-            Statement::Pragma(stmt) => self.optional(stmt.value.as_ref()),
+            Statement::Expression(stmt) => self.expression(&stmt.expression, at),
+            Statement::Set(stmt) => self.expression(&stmt.value, at),
+            Statement::Pragma(stmt) => self.optional(stmt.value.as_ref(), at),
             Statement::Truncate(_)
             | Statement::DropTable(_)
             | Statement::AlterTable(_)
@@ -1418,29 +1433,29 @@ impl ModifierWalk<'_> {
             where_clause,
             group_by,
             having,
-            window_defs,
+            window_defs: _,
             order_by,
             limit,
             offset,
             set_operations,
             prepared: _,
         } = stmt;
-        self.all(distinct_on)?;
-        self.all(columns)?;
+        let at = At::Elsewhere;
+        self.all(distinct_on, At::Output)?;
+        self.all(columns, At::Output)?;
         self.with(with.as_ref())?;
-        self.optional(table_expr.as_deref())?;
-        self.optional(where_clause.as_deref())?;
-        self.all(&group_by.columns)?;
+        self.optional(table_expr.as_deref(), at)?;
+        self.optional(where_clause.as_deref(), at)?;
+        self.all(&group_by.columns, at)?;
         if let GroupByModifier::GroupingSets(sets) = &group_by.modifier {
-            sets.iter().try_for_each(|set| self.all(set))?;
+            sets.iter().try_for_each(|set| self.all(set, at))?;
         }
-        self.optional(having.as_deref())?;
-        for window in window_defs {
-            window.expressions().try_for_each(|e| self.expression(e))?;
-        }
-        self.ordered(order_by)?;
-        self.optional(limit.as_deref())?;
-        self.optional(offset.as_deref())?;
+        self.optional(having.as_deref(), at)?;
+        // Only the parts of a named window that a window function reads are read
+        super::Executor::try_for_each_used_window_value(stmt, &mut |e| self.expression(e, at))?;
+        self.ordered(order_by, At::Output)?;
+        self.optional(limit.as_deref(), at)?;
+        self.optional(offset.as_deref(), at)?;
         set_operations
             .iter()
             .try_for_each(|op| self.select(&op.right))
@@ -1452,7 +1467,7 @@ impl ModifierWalk<'_> {
         })
     }
 
-    fn expression(&self, expr: &Expression) -> Result<(), String> {
+    fn expression<'e>(&self, expr: &'e Expression, at: At<'e>) -> Result<(), String> {
         match expr {
             Expression::Identifier(_)
             | Expression::QualifiedIdentifier(_)
@@ -1468,90 +1483,126 @@ impl ModifierWalk<'_> {
             | Expression::IntervalLiteral(_)
             | Expression::Parameter(_)
             | Expression::CteReference(_) => Ok(()),
-            Expression::Prefix(prefix) => self.expression(&prefix.right),
+            Expression::Prefix(prefix) => self.expression(&prefix.right, at),
             Expression::Infix(infix) => {
-                self.expression(&infix.left)?;
-                self.expression(&infix.right)
+                self.expression(&infix.left, at)?;
+                self.expression(&infix.right, at)
             }
-            Expression::List(list) => self.all(&list.elements),
-            Expression::ExpressionList(list) => self.all(&list.expressions),
-            Expression::Distinct(distinct) => self.expression(&distinct.expr),
+            Expression::List(list) => self.all(&list.elements, at),
+            Expression::ExpressionList(list) => self.all(&list.expressions, at),
+            Expression::Distinct(distinct) => self.expression(&distinct.expr, at),
             Expression::Exists(exists) => self.select(&exists.subquery),
             Expression::AllAny(all_any) => {
-                self.expression(&all_any.left)?;
+                if super::expression::QuantifiedMembers::operator(&all_any.operator).is_none() {
+                    return Err(format!(
+                        "{} takes a comparison operator (=, <>, <, <=, >, >=), not {}",
+                        all_any.all_any_type, all_any.operator
+                    ));
+                }
+                self.expression(&all_any.left, at)?;
                 self.select(&all_any.subquery)
             }
             Expression::In(in_expr) => {
-                self.expression(&in_expr.left)?;
-                self.expression(&in_expr.right)
+                self.expression(&in_expr.left, at)?;
+                self.expression(&in_expr.right, at)
             }
-            Expression::InHashSet(in_set) => self.expression(&in_set.column),
-            Expression::QuantifiedSet(set) => self.expression(&set.left),
+            Expression::InHashSet(in_set) => self.expression(&in_set.column, at),
+            Expression::QuantifiedSet(set) => self.expression(&set.left, at),
             Expression::Between(between) => {
-                self.expression(&between.expr)?;
-                self.expression(&between.lower)?;
-                self.expression(&between.upper)
+                self.expression(&between.expr, at)?;
+                self.expression(&between.lower, at)?;
+                self.expression(&between.upper, at)
             }
             Expression::Like(like) => {
-                self.expression(&like.left)?;
-                self.expression(&like.pattern)?;
-                self.optional(like.escape.as_deref())
+                self.expression(&like.left, at)?;
+                self.expression(&like.pattern, at)?;
+                self.optional(like.escape.as_deref(), at)
             }
             Expression::ScalarSubquery(subquery) => self.select(&subquery.subquery),
             Expression::Case(case) => {
-                self.optional(case.value.as_deref())?;
+                self.optional(case.value.as_deref(), at)?;
                 for when in &case.when_clauses {
-                    self.expression(&when.condition)?;
-                    self.expression(&when.then_result)?;
+                    self.expression(&when.condition, at)?;
+                    self.expression(&when.then_result, at)?;
                 }
-                self.optional(case.else_value.as_deref())
+                self.optional(case.else_value.as_deref(), at)
             }
-            Expression::Cast(cast) => self.expression(&cast.expr),
-            Expression::FunctionCall(call) => self.call(call),
-            Expression::Aliased(aliased) => self.expression(&aliased.expression),
+            Expression::Cast(cast) => self.expression(&cast.expr, at),
+            // Which calls aggregate matters only to a window function under one
+            Expression::FunctionCall(call)
+                if !matches!(at, At::Inside(_))
+                    && expr.holds_window()
+                    && self.registry.is_aggregate(&call.function) =>
+            {
+                self.call(call, At::Inside(&call.function))
+            }
+            Expression::FunctionCall(call) => self.call(call, at),
+            Expression::Aliased(aliased) => self.expression(&aliased.expression, at),
             Expression::Window(window) => {
-                self.call(&window.function)?;
-                self.all(&window.partition_by)?;
-                self.ordered(&window.order_by)?;
-                window.frame_offsets().try_for_each(|e| self.expression(e))
+                let name = || window.function.function.to_uppercase();
+                match at {
+                    At::Output => {}
+                    At::Elsewhere => return Err(format!(
+                        "the window function {} is allowed only in a SELECT list, DISTINCT ON or ORDER BY",
+                        name()
+                    )),
+                    At::Inside(outer) => {
+                        return Err(format!(
+                            "the window function {} cannot be read inside a call of {}",
+                            name(),
+                            outer.to_uppercase()
+                        ))
+                    }
+                }
+                let inner = At::Inside(&window.function.function);
+                self.call(&window.function, inner)?;
+                self.all(&window.partition_by, inner)?;
+                self.ordered(&window.order_by, inner)?;
+                window
+                    .frame_offsets()
+                    .try_for_each(|e| self.expression(e, inner))
             }
             Expression::TableSource(table) => {
-                self.optional(table.as_of.as_ref().map(|as_of| &*as_of.value))
+                self.optional(table.as_of.as_ref().map(|as_of| &*as_of.value), at)
             }
             Expression::JoinSource(join) => {
-                self.expression(&join.left)?;
-                self.expression(&join.right)?;
-                self.optional(join.condition.as_deref())
+                self.expression(&join.left, at)?;
+                self.expression(&join.right, at)?;
+                self.optional(join.condition.as_deref(), at)
             }
             Expression::SubquerySource(source) => self.select(&source.subquery),
             Expression::ValuesSource(values) => {
-                values.rows.iter().try_for_each(|row| self.all(row))
+                values.rows.iter().try_for_each(|row| self.all(row, at))
             }
-            Expression::FunctionTableSource(source) => self.all(&source.arguments),
+            Expression::FunctionTableSource(source) => self.all(&source.arguments, at),
         }
     }
 
-    fn call(&self, call: &FunctionCall) -> Result<(), String> {
+    fn call<'e>(&self, call: &'e FunctionCall, at: At<'e>) -> Result<(), String> {
         if let Some(error) = modifier_outside_aggregate(call, self.registry) {
             return Err(error);
         }
-        self.all(&call.arguments)?;
-        self.ordered(&call.order_by)?;
-        self.optional(call.filter.as_deref())
+        self.all(&call.arguments, at)?;
+        self.ordered(&call.order_by, at)?;
+        self.optional(call.filter.as_deref(), at)
     }
 
-    fn all(&self, exprs: &[Expression]) -> Result<(), String> {
-        exprs.iter().try_for_each(|e| self.expression(e))
+    fn all<'e>(&self, exprs: &'e [Expression], at: At<'e>) -> Result<(), String> {
+        exprs.iter().try_for_each(|e| self.expression(e, at))
     }
 
-    fn optional(&self, expr: Option<&Expression>) -> Result<(), String> {
-        expr.map_or(Ok(()), |e| self.expression(e))
+    fn optional<'e>(&self, expr: Option<&'e Expression>, at: At<'e>) -> Result<(), String> {
+        expr.map_or(Ok(()), |e| self.expression(e, at))
     }
 
-    fn ordered(&self, order: &[crate::parser::ast::OrderByExpression]) -> Result<(), String> {
+    fn ordered<'e>(
+        &self,
+        order: &'e [crate::parser::ast::OrderByExpression],
+        at: At<'e>,
+    ) -> Result<(), String> {
         order
             .iter()
-            .try_for_each(|o| self.expression(&o.expression))
+            .try_for_each(|o| self.expression(&o.expression, at))
     }
 }
 
