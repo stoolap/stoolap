@@ -2672,17 +2672,50 @@ impl Executor {
             .collect()
     }
 
+    /// `f` over each value of a named window of `stmt` that one of its
+    /// windows reads, the parts [`Self::used_window_defs`] keeps, once for
+    /// each window naming it
+    pub(crate) fn try_for_each_used_window_value<'a, E>(
+        stmt: &'a SelectStatement,
+        f: &mut impl FnMut(&'a Expression) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if stmt.window_defs.is_empty() {
+            return Ok(());
+        }
+        let defs = &stmt.window_defs;
+        for expr in Self::window_sites(stmt) {
+            expr.try_for_each_window(&mut |window| {
+                let Some((at, order_by, frame)) = definition_read(window, defs) else {
+                    return Ok(());
+                };
+                let def = &defs[at];
+                def.partition_by.iter().try_for_each(&mut *f)?;
+                if order_by {
+                    def.order_by.iter().try_for_each(|o| f(&o.expression))?;
+                }
+                match def.frame.as_ref().filter(|_| frame) {
+                    Some(frame) => frame.offsets().try_for_each(&mut *f),
+                    None => Ok(()),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     /// Every window `stmt` reads, in its SELECT list, ORDER BY and DISTINCT
     /// ON, into `out`
     fn windows_read<'a>(stmt: &'a SelectStatement, out: &mut impl Extend<&'a WindowExpression>) {
-        let read = stmt
-            .columns
-            .iter()
-            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
-            .chain(&stmt.distinct_on);
-        for expr in read {
+        for expr in Self::window_sites(stmt) {
             Self::collect_all_windows_in_expression(expr, out);
         }
+    }
+
+    /// The expressions of `stmt` a window may stand in
+    fn window_sites(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
+        stmt.columns
+            .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
+            .chain(&stmt.distinct_on)
     }
 
     /// Each window expression of `expr` outside its subqueries, in the order

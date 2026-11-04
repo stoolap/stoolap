@@ -1452,11 +1452,7 @@ impl FormWalk<'_> {
         }
         self.optional(having.as_deref(), at)?;
         // Only the parts of a named window that a window function reads are read
-        for window in super::Executor::used_window_defs(stmt) {
-            window
-                .expressions()
-                .try_for_each(|e| self.expression(e, at))?;
-        }
+        super::Executor::try_for_each_used_window_value(stmt, &mut |e| self.expression(e, at))?;
         self.ordered(order_by, At::Output)?;
         self.optional(limit.as_deref(), at)?;
         self.optional(offset.as_deref(), at)?;
