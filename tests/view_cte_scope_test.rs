@@ -373,3 +373,37 @@ fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
         "the same CTE names keep the plan"
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_table_read_after_a_cte_of_its_name_is_planned_again_for_its_context() {
+    let _serial = serial();
+    use stoolap::test_failpoints::bridge_compiles;
+    let mut wrong = Vec::new();
+    for text in ["SELECT id FROM u", "SELECT id FROM u WHERE id >= 1"] {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let executor = Executor::new(Arc::new(engine));
+        for sql in &SETUP[..4] {
+            executor.execute(sql).unwrap();
+        }
+        for (ctes, want) in [
+            (&[("u", 2)][..], vec![2]),
+            (&[("w", 3)][..], vec![1]),
+            (&[("u", 2), ("w", 3)][..], vec![2]),
+            (&[][..], vec![1]),
+            (&[("u", 2)][..], vec![2]),
+            (&[("w", 3)][..], vec![1]),
+        ] {
+            let before = bridge_compiles();
+            let got = executor_ids(executor.execute_with_context(text, &id_ctes_context(ctes)));
+            let compiled = bridge_compiles() - before;
+            if got != Ok(want.clone()) || compiled != 0 {
+                wrong.push(format!(
+                    "{text} under {ctes:?}: {got:?}, {compiled} bridge compiles"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

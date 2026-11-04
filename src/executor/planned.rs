@@ -68,14 +68,17 @@ impl Executor {
     ) -> Option<R> {
         let epoch = self.engine.schema_epoch();
         let held = match &*compiled.read().ok()? {
-            CompiledExecution::PreparedSelect(p) if p.validity.holds(&*self.engine, epoch) => {
+            // A context of other CTEs than it was planned in may hide its
+            // table, or show one: the statement is planned again for it
+            CompiledExecution::PreparedSelect(p)
+                if p.validity.holds(&*self.engine, epoch)
+                    && ctx.is_none_or(|ctx| p.cte_scope.holds(ctx)) =>
+            {
                 // The runner reads a statement prepared for the tables as they are
                 if !p.answers_first() {
                     return None;
                 }
-                // A context of other CTEs than it was planned in may hide its table
-                ctx.is_none_or(|ctx| p.cte_scope.holds(ctx))
-                    .then(|| Arc::clone(p))
+                Some(Arc::clone(p))
             }
             CompiledExecution::NotOptimizable(validity) if validity.holds(&*self.engine, epoch) => {
                 return None
