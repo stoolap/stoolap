@@ -56,7 +56,7 @@ pub use evaluator_bridge::{
 };
 pub(crate) use once::{
     compile_once, evaluate_once, evaluate_once_in, execute_context, execute_once, held_once,
-    try_eval_constant_expr_with_context, HeldOnce,
+    held_or_compile, try_eval_constant_expr_with_context, HeldOnce,
 };
 pub(crate) use ops::more_than_one_row;
 pub use ops::{CompareOp, Op, QuantifiedMembers, RowComparison, RowMembers, RowTest};

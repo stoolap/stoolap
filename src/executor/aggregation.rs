@@ -1080,7 +1080,7 @@ pub(crate) struct CompiledFeed {
 }
 
 /// A plan's feed, compiled on its first run over the columns it reads
-pub(crate) type HeldFeed = std::sync::OnceLock<Result<CompiledFeed>>;
+pub(crate) type HeldFeed = std::sync::OnceLock<CompiledFeed>;
 
 /// The feed of one execution's aggregation
 struct RowFeed<'a> {
@@ -1116,12 +1116,11 @@ impl<'a> RowFeed<'a> {
         let registry = crate::functions::registry::global_registry();
         let feed = match held {
             Some(held) => {
-                let compiled = held.get_or_init(|| {
+                let compiled = super::expression::held_or_compile(held, || {
                     CompiledFeed::compile(aggregations, at, |expr| {
                         compile_over_slots(expr, columns, registry, None, blocks.is_some(), None)
                     })
-                });
-                let compiled = compiled.as_ref().map_err(Clone::clone)?;
+                })?;
                 compiled.bound(slot_params(ctx, blocks), blocks)
             }
             None => std::borrow::Cow::Owned(CompiledFeed::compile(aggregations, at, |expr| {
