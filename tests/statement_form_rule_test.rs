@@ -94,6 +94,17 @@ const ANSWERED: &[(&str, &[i64], &[&str])] = &[
         &["Integer(3)"],
     ),
     (
+        "SELECT id FROM t WHERE id < 3 WINDOW w AS (ORDER BY ROW_NUMBER() OVER ()) ORDER BY id",
+        &[],
+        &["Integer(1)", "Integer(2)"],
+    ),
+    (
+        "SELECT id, ROW_NUMBER() OVER (w ORDER BY id DESC) FROM t WHERE id < 3 \
+         WINDOW w AS (ORDER BY ROW_NUMBER() OVER ()) ORDER BY id",
+        &[],
+        &["Integer(1)|Integer(2)", "Integer(2)|Integer(1)"],
+    ),
+    (
         "SELECT a FROM t WHERE a != ALL (SELECT tid FROM u) ORDER BY a",
         &[],
         &["Integer(4)", "Integer(5)"],

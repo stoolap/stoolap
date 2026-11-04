@@ -1433,7 +1433,7 @@ impl FormWalk<'_> {
             where_clause,
             group_by,
             having,
-            window_defs,
+            window_defs: _,
             order_by,
             limit,
             offset,
@@ -1451,7 +1451,8 @@ impl FormWalk<'_> {
             sets.iter().try_for_each(|set| self.all(set, at))?;
         }
         self.optional(having.as_deref(), at)?;
-        for window in window_defs {
+        // Only the parts of a named window that a window function reads are read
+        for window in super::Executor::used_window_defs(stmt) {
             window
                 .expressions()
                 .try_for_each(|e| self.expression(e, at))?;
@@ -1542,15 +1543,17 @@ impl FormWalk<'_> {
             Expression::FunctionCall(call) => self.call(call, at),
             Expression::Aliased(aliased) => self.expression(&aliased.expression, at),
             Expression::Window(window) => {
-                let name = window.function.function.to_uppercase();
+                let name = || window.function.function.to_uppercase();
                 match at {
                     At::Output => {}
                     At::Elsewhere => return Err(format!(
-                        "the window function {name} is allowed only in a SELECT list, DISTINCT ON or ORDER BY"
+                        "the window function {} is allowed only in a SELECT list, DISTINCT ON or ORDER BY",
+                        name()
                     )),
                     At::Inside(outer) => {
                         return Err(format!(
-                            "the window function {name} cannot be read inside a call of {}",
+                            "the window function {} cannot be read inside a call of {}",
+                            name(),
                             outer.to_uppercase()
                         ))
                     }
