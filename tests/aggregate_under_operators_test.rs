@@ -138,36 +138,11 @@ fn check(db: &Database, context: &str) {
     }
 }
 
-// The families' switch is process-wide
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn an_aggregate_under_an_operator_is_computed_hot_and_sealed() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = open(&dir, sealed, "aggregate_under_operators_runner");
         check(&db, &format!("sealed {sealed}"));
-    }
-}
-
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn an_aggregate_under_an_operator_is_computed_on_the_general_path() {
-    use std::sync::atomic::Ordering::SeqCst;
-    use stoolap::test_failpoints::PREPARED_FAMILIES_OFF;
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    let _restore = Restore;
-    for sealed in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open(&dir, sealed, "aggregate_under_operators_general");
-        check(&db, &format!("general, sealed {sealed}"));
     }
 }

@@ -21,7 +21,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use stoolap::core::{Row, Value};
-use stoolap::executor::expression::{compile_expression, ExecuteContext, ExprVM};
+use stoolap::executor::expression::{CompileContext, ExecuteContext, ExprCompiler, ExprVM};
 use stoolap::parser::ast::Statement;
 
 struct ThreadCounting;
@@ -58,7 +58,10 @@ fn runs(predicate: &str) -> usize {
     let Statement::Select(select) = stoolap::parser::parse_sql(&sql).unwrap().remove(0) else {
         panic!("not a SELECT: {sql}");
     };
-    let program = compile_expression(select.where_clause.as_deref().unwrap(), &columns).unwrap();
+    let compile = CompileContext::with_global_registry(&columns);
+    let program = ExprCompiler::new(&compile)
+        .compile(select.where_clause.as_deref().unwrap())
+        .unwrap();
     let mut vm = ExprVM::new();
     let ctx = ExecuteContext::new(&row);
     vm.execute(&program, &ctx).unwrap();

@@ -14,23 +14,18 @@
 
 //! A statement with window functions over one table runs on the planner's
 //! plan, its rows read through the index the window rule chooses, and
-//! answers as the general path does
-
-#![cfg(feature = "test-failpoints")]
-
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Mutex, MutexGuard};
+//! answers as recorded
 
 use stoolap::core::Value;
-use stoolap::test_failpoints::PREPARED_FAMILIES_OFF;
 use stoolap::Database;
 
-// The families switch is process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
+mod oracle;
 
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Each statement's answer, recorded when the general path gave the same
+const RECORDED: oracle::Answers = answers!("planned_window");
+
+/// The statements over another source than a table, recorded likewise
+const RECORDED_SOURCES: oracle::Answers = answers!("planned_window_sources");
 
 /// t: a indexed, b indexed, NOT NULL and distinct, so an ORDER BY b orders
 /// the rows one way, c with NULLs
@@ -132,22 +127,8 @@ fn answer(db: &Database, sql: &str, params: &[i64]) -> Result<Vec<String>, Strin
     Ok(out)
 }
 
-/// `run` on the general path, the prepared families off
-fn general<T>(run: impl FnOnce() -> T) -> T {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, Relaxed);
-        }
-    }
-    PREPARED_FAMILIES_OFF.store(true, Relaxed);
-    let _restore = Restore;
-    run()
-}
-
 #[test]
-fn a_windowed_statement_answers_as_the_general_path() {
-    let _guard = serial();
+fn a_windowed_statement_answers_as_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let mut wrong = Vec::new();
     let mut count = 0;
@@ -157,24 +138,28 @@ fn a_windowed_statement_answers_as_the_general_path() {
                 let sql = shape.replace("{w}", window);
                 count += 1;
                 let planned = answer(&db, &sql, params);
-                let reference = general(|| answer(&db, &sql, params));
                 // Rows a LIMIT keeps without an ORDER BY are any of the
-                // statement's, each carrying its own window value
+                // statement's, each carrying its own window value: the
+                // whole statement's rows are recorded in sorted order
                 let unordered = !shape.contains("ORDER BY") && shape.contains("LIMIT");
-                let fits = match (&planned, unordered) {
+                let failure = match (&planned, unordered) {
                     (Ok(rows), true) => {
-                        let whole = sql.split(" LIMIT").next().unwrap_or_default();
-                        let all = general(|| answer(&db, whole, params)).unwrap_or_default();
-                        rows.len() == reference.as_ref().map_or(0, Vec::len)
-                            && rows.iter().all(|row| all.contains(row))
+                        let (whole, limit) = sql.split_once(" LIMIT ").unwrap();
+                        let mut all = answer(&db, whole, params);
+                        if let Ok(all) = &mut all {
+                            all.sort();
+                        }
+                        let fits = all.as_ref().is_ok_and(|all| {
+                            rows.len() == all.len().min(limit.parse().unwrap())
+                                && rows.iter().all(|row| all.contains(row))
+                        });
+                        let key = format!("{context}: {whole}");
+                        oracle::check_answer(&RECORDED, &key, &all)
+                            .or_else(|| (!fits).then(|| format!("{sql}: gave {rows:?}")))
                     }
-                    _ => planned == reference,
+                    _ => oracle::check_answer(&RECORDED, &format!("{context}: {sql}"), &planned),
                 };
-                if !fits {
-                    wrong.push(format!(
-                        "{context}: {sql}\n  planned  {planned:?}\n  general  {reference:?}"
-                    ));
-                }
+                wrong.extend(failure);
             }
         }
     }
@@ -201,8 +186,7 @@ const SOURCE_SHAPES: &[&str] = &[
 ];
 
 #[test]
-fn a_windowed_statement_over_a_source_answers_as_the_general_path() {
-    let _guard = serial();
+fn a_windowed_statement_over_a_source_answers_as_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let mut wrong = Vec::new();
     let mut count = 0;
@@ -212,12 +196,11 @@ fn a_windowed_statement_over_a_source_answers_as_the_general_path() {
                 let sql = shape.replace("{w}", window);
                 count += 1;
                 let planned = answer(&db, &sql, &[]);
-                let reference = general(|| answer(&db, &sql, &[]));
-                if planned.is_err() || planned != reference {
-                    wrong.push(format!(
-                        "{context}: {sql}\n  planned  {planned:?}\n  general  {reference:?}"
-                    ));
+                if let Err(e) = &planned {
+                    wrong.push(format!("{context}: {sql}: {e}"));
                 }
+                let key = format!("{context}: {sql}");
+                wrong.extend(oracle::check_answer(&RECORDED_SOURCES, &key, &planned));
             }
         }
     }
@@ -232,7 +215,6 @@ fn a_windowed_statement_over_a_source_answers_as_the_general_path() {
 
 #[test]
 fn a_window_over_a_source_under_a_limit_without_order_reads_every_row() {
-    let _guard = serial();
     let db = hot("source_limit");
     let tv_rows = answer(&db, "SELECT COUNT(*) FROM tv", &[]).unwrap();
     for (sql, want) in [
@@ -254,15 +236,12 @@ fn a_window_over_a_source_under_a_limit_without_order_reads_every_row() {
             vec!["3".to_string(), "3".to_string()],
         ),
     ] {
-        let got = answer(&db, sql, &[]);
-        assert_eq!(got.as_ref(), Ok(&want), "{sql}");
-        assert_eq!(got, general(|| answer(&db, sql, &[])), "{sql}");
+        assert_eq!(answer(&db, sql, &[]), Ok(want), "{sql}");
     }
 }
 
 #[test]
 fn explain_shows_the_window_step_over_a_source() {
-    let _guard = serial();
     let db = hot("explain_sources");
     for (sql, window, source) in [
         (
@@ -296,7 +275,6 @@ fn explain_shows_the_window_step_over_a_source() {
 
 #[test]
 fn explain_shows_the_window_step_and_the_index_read_it_takes() {
-    let _guard = serial();
     let db = hot("explain");
     let lines = |sql: &str| -> Vec<String> {
         db.query(&format!("EXPLAIN {sql}"), ())
@@ -352,7 +330,6 @@ fn explain_shows_the_window_step_and_the_index_read_it_takes() {
 
 #[test]
 fn a_prepared_window_reads_the_parameters_of_each_run() {
-    let _serial = serial();
     let db = hot("parameter_runs");
     let stmt = db
         .prepare("SELECT id, STRING_AGG(CAST(a AS TEXT), $1) OVER () FROM t WHERE id <= 3")

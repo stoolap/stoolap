@@ -94,9 +94,6 @@ fn row_program(
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
-    if blocks.is_none() && slots.is_none() {
-        return compile_expression(expr, columns).map(|program| bind_params(program, ctx.params()));
-    }
     let program = compile_over_slots(
         expr,
         columns,
@@ -687,16 +684,13 @@ type PartitionKey = SmallVec<[Value; 4]>;
 /// shared across window functions with the same OVER clause
 type SharedSortedPartitions = std::sync::Arc<Vec<Vec<usize>>>;
 
-/// Identity of one ORDER BY item: expression hash, rendered expression,
-/// direction and NULLS placement. The hash alone is not identity (two
-/// expressions can collide), and rendered SQL alone is not either
-/// (Display drops positional parameter indices), so a cache hit
-/// requires both to match.
-type OrderByItemKey = (u64, String, bool, Option<bool>);
+/// Identity of one ORDER BY item: the expression as written, direction and
+/// NULLS placement
+type OrderByItemKey = (ExprKey, bool, Option<bool>);
 type OrderByKey = SmallVec<[OrderByItemKey; 2]>;
 
 /// Identity of a whole OVER clause: partition items then ORDER BY items
-type OverClauseKey = (SmallVec<[(u64, String); 2]>, OrderByKey);
+type OverClauseKey = (SmallVec<[ExprKey; 2]>, OrderByKey);
 
 use crate::functions::registry::{global_registry, FunctionRegistry};
 use crate::functions::{Volatility, WindowFunction};
@@ -709,9 +703,8 @@ use super::aggregation::{
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
-    bind_params, compile_expression, compute_expression_hash, evaluate_once, execute_once,
-    held_once, held_or_compile, literal_value, ExprVM, HeldOnce, Program, SharedProgram,
-    SubqueryExecutor,
+    evaluate_once, execute_once, held_once, held_or_compile, literal_value, ExprVM, HeldOnce,
+    Program, SharedProgram, SubqueryExecutor,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
@@ -2895,10 +2888,7 @@ impl Executor {
     /// Structural cache key for a (PARTITION BY, ORDER BY) pair; window
     /// functions sharing both reuse one partition map and one sort
     fn over_clause_cache_key(partition_by: &[Expression], order_key: OrderByKey) -> OverClauseKey {
-        let partition = partition_by
-            .iter()
-            .map(|e| (compute_expression_hash(e), e.to_string()))
-            .collect();
+        let partition = partition_by.iter().map(ExprKey::exact).collect();
         (partition, order_key)
     }
 
@@ -2923,14 +2913,7 @@ impl Executor {
     fn order_by_cache_key(order_by: &[OrderByExpression]) -> OrderByKey {
         order_by
             .iter()
-            .map(|ob| {
-                (
-                    compute_expression_hash(&ob.expression),
-                    ob.expression.to_string(),
-                    ob.ascending,
-                    ob.nulls_first,
-                )
-            })
+            .map(|ob| (ExprKey::exact(&ob.expression), ob.ascending, ob.nulls_first))
             .collect()
     }
 
@@ -2939,20 +2922,16 @@ impl Executor {
     /// different partition scheme, because the streaming path builds only one
     /// partition map and computes per-partition subsets.
     fn all_partitions_match(window_functions: &[WindowFunctionInfo]) -> bool {
-        let mut canonical: Option<SmallVec<[(u64, String); 2]>> = None;
+        let mut canonical: Option<SmallVec<[ExprKey; 2]>> = None;
         for wf in window_functions {
             // A global (unpartitioned) window must see all rows, so
             // per-partition streaming is unsafe.
             if wf.partition_by_exprs.is_empty() {
                 return false;
             }
-            // Same identity the partition cache uses: hash plus rendered
-            // form, per item, so parameters and separators cannot merge
-            let key: SmallVec<[(u64, String); 2]> = wf
-                .partition_by_exprs
-                .iter()
-                .map(|e| (compute_expression_hash(e), e.to_string()))
-                .collect();
+            // Same identity the partition cache uses, per item
+            let key: SmallVec<[ExprKey; 2]> =
+                wf.partition_by_exprs.iter().map(ExprKey::exact).collect();
             match &canonical {
                 None => canonical = Some(key),
                 Some(c) if c != &key => return false,
@@ -4820,57 +4799,6 @@ mod tests {
             assert!(
                 pct_ranks[i] >= pct_ranks[i - 1],
                 "pct_ranks should be non-decreasing"
-            );
-        }
-    }
-
-    /// The SELECT expression of `SELECT {text}`
-    fn select_expression(text: &str) -> Expression {
-        match &crate::parser::parse_sql(&format!("SELECT {text}")).unwrap()[0] {
-            Statement::Select(select) => select.columns[0].clone(),
-            other => panic!("not a SELECT: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_window_argument_is_compiled_for_its_call_outside_the_program_cache() {
-        let executor = create_test_executor();
-        setup_test_data(&executor);
-        for (sql, argument) in [
-            (
-                "SELECT NTILE(1 + 700201) OVER (PARTITION BY dept ORDER BY id) FROM employees",
-                "1 + 700201",
-            ),
-            (
-                "SELECT LAG(salary, 700203 - 700202) OVER (PARTITION BY dept ORDER BY id) \
-                 FROM employees",
-                "700203 - 700202",
-            ),
-            (
-                "SELECT NTH_VALUE(salary, 700205 - 700204) OVER (PARTITION BY dept ORDER BY id) \
-                 FROM employees",
-                "700205 - 700204",
-            ),
-            (
-                "SELECT FIRST_VALUE(salary) OVER (PARTITION BY dept ORDER BY id \
-                 ROWS BETWEEN 700207 - 700206 PRECEDING AND CURRENT ROW) FROM employees",
-                "700207 - 700206",
-            ),
-            (
-                "SELECT SUM(salary) OVER (PARTITION BY dept ORDER BY id \
-                 ROWS BETWEEN 700209 - 700208 PRECEDING AND CURRENT ROW) FROM employees",
-                "700209 - 700208",
-            ),
-            (
-                "SELECT NTILE(1 + 700210) OVER (PARTITION BY dept ORDER BY id) FROM employees \
-                 LIMIT 3",
-                "1 + 700210",
-            ),
-        ] {
-            let _ = executor.execute(sql).unwrap();
-            assert!(
-                !crate::executor::expression::program_cached(&select_expression(argument), &[]),
-                "{sql}: `{argument}` entered the program cache"
             );
         }
     }

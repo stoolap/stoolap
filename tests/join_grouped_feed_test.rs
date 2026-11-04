@@ -13,23 +13,11 @@
 // limitations under the License.
 
 //! A grouped join whose clauses hold no subquery feeds its calls through
-//! programs its plan holds: it answers as its rows, summed here, say, and
-//! run again compiles nothing through the evaluator bridge
-
-#![cfg(feature = "test-failpoints")]
+//! programs its plan holds: it answers as its rows, summed here, say
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::bridge_compiles;
 use stoolap::{Database, Value};
-
-// The bridge counter is process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// The column names and each row, or the error
 type Answer = Result<(Vec<String>, Vec<Vec<Option<i64>>>), String>;
@@ -244,7 +232,6 @@ fn values(params: &[i64]) -> Vec<Value> {
 
 #[test]
 fn a_grouped_join_answers_as_its_rows_say_run_after_run() {
-    let _guard = serial();
     let db = open("memory://join_grouped_feed_answers");
     let mut wrong = Vec::new();
     for (sql, columns, first, second, rows) in SHAPES {
@@ -257,23 +244,6 @@ fn a_grouped_join_answers_as_its_rows_say_run_after_run() {
             if got != want {
                 wrong.push(format!("{sql} {params:?}\n  got  {got:?}\n  want {want:?}"));
             }
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-#[test]
-fn a_grouped_join_run_again_compiles_nothing_through_the_bridge() {
-    let _guard = serial();
-    let db = open("memory://join_grouped_feed_bridge");
-    let mut wrong = Vec::new();
-    for (sql, _, first, second, _) in SHAPES {
-        answer(&db, sql, &values(first)).unwrap();
-        let before = bridge_compiles();
-        answer(&db, sql, &values(second)).unwrap();
-        let compiled = bridge_compiles() - before;
-        if compiled != 0 {
-            wrong.push(format!("{sql}: run again, {compiled} bridge compiles"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

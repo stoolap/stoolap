@@ -1,0 +1,188 @@
+6	45cf370406c285d5	hot: SELECT 1 UNION ALL SELECT g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY 1
+6	45cf370406c285d5	hot: SELECT 1 UNION ALL SELECT g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY 1
+6	45cf370406c285d5	hot: SELECT 1 UNION ALL SELECT g FROM t GROUP BY g ORDER BY 1
+6	45cf370406c285d5	hot: SELECT 1 UNION ALL SELECT g FROM v t GROUP BY g ORDER BY 1
+3	08f8b3e66c06783c	hot: SELECT COUNT(*) FROM (SELECT id, g, s, a FROM t) t UNION ALL SELECT COUNT(*) FROM (SELECT id, g, s, a FROM t) t WHERE g > 1 ORDER BY 1
+3	08f8b3e66c06783c	hot: SELECT COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) UNION ALL SELECT COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) WHERE g > 1 ORDER BY 1
+3	08f8b3e66c06783c	hot: SELECT COUNT(*) FROM t UNION ALL SELECT COUNT(*) FROM t WHERE g > 1 ORDER BY 1
+3	08f8b3e66c06783c	hot: SELECT COUNT(*) FROM v t UNION ALL SELECT COUNT(*) FROM v t WHERE g > 1 ORDER BY 1
+2	e2c1fbbc0501487d	hot: SELECT COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t WINDOW w AS (ORDER BY COUNT(*))
+2	e2c1fbbc0501487d	hot: SELECT COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) WINDOW w AS (ORDER BY COUNT(*))
+2	e2c1fbbc0501487d	hot: SELECT COUNT(*), RANK() OVER w FROM t WINDOW w AS (ORDER BY COUNT(*))
+2	e2c1fbbc0501487d	hot: SELECT COUNT(*), RANK() OVER w FROM v t WINDOW w AS (ORDER BY COUNT(*))
+3	0743de527092e9d8	hot: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+3	0743de527092e9d8	hot: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+3	0743de527092e9d8	hot: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+3	0743de527092e9d8	hot: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+5	e96cf220302f631b	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+5	e96cf220302f631b	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+5	e96cf220302f631b	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM t GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+5	e96cf220302f631b	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM v t GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+2	912dd98ff060cab0	hot: SELECT g FROM (SELECT id, g, s, a FROM t) t GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	hot: SELECT g FROM (SELECT id, g, s, a FROM t) t GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	912dd98ff060cab0	hot: SELECT g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	hot: SELECT g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	912dd98ff060cab0	hot: SELECT g FROM t GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	hot: SELECT g FROM t GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	912dd98ff060cab0	hot: SELECT g FROM v t GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	hot: SELECT g FROM v t GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	c1b073e5e4a46b57	hot: SELECT g, COUNT(*) AS c FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	c1b073e5e4a46b57	hot: SELECT g, COUNT(*) AS c FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	c1b073e5e4a46b57	hot: SELECT g, COUNT(*) AS c FROM t GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	c1b073e5e4a46b57	hot: SELECT g, COUNT(*) AS c FROM v t GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	522a9756d5ea5690	hot: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	hot: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION ALL SELECT g, 1 FROM (SELECT id, g, s, a FROM t) t ORDER BY 1, 2
+6	e9d7bde36eca33df	hot: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	hot: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+2	7c2ad01d1d0dfc4c	hot: SELECT g, COUNT(*) FROM (VALUES (1), (2)) t(g) GROUP BY g EXCEPT SELECT 1, 1 LIMIT 1
+2	522a9756d5ea5690	hot: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	hot: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION ALL SELECT g, 1 FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) ORDER BY 1, 2
+6	e9d7bde36eca33df	hot: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	hot: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+2	522a9756d5ea5690	hot: SELECT g, COUNT(*) FROM t GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	hot: SELECT g, COUNT(*) FROM t GROUP BY g UNION ALL SELECT g, 1 FROM t ORDER BY 1, 2
+6	e9d7bde36eca33df	hot: SELECT g, COUNT(*) FROM t GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	hot: SELECT g, COUNT(*) FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+2	522a9756d5ea5690	hot: SELECT g, COUNT(*) FROM v t GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	hot: SELECT g, COUNT(*) FROM v t GROUP BY g UNION ALL SELECT g, 1 FROM v t ORDER BY 1, 2
+6	e9d7bde36eca33df	hot: SELECT g, COUNT(*) FROM v t GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	hot: SELECT g, COUNT(*) FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+6	0a23678c77a6f7df	hot: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+6	0a23678c77a6f7df	hot: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+6	0a23678c77a6f7df	hot: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM t GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+6	0a23678c77a6f7df	hot: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM v t GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	259dd871fb11a4df	hot: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	259dd871fb11a4df	hot: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	259dd871fb11a4df	hot: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	259dd871fb11a4df	hot: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+1	ff3821881a02344b	hot: SELECT g, COUNT(*), RANK() OVER nosuch FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	ff3821881a02344b	hot: SELECT g, COUNT(*), RANK() OVER nosuch FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	ff3821881a02344b	hot: SELECT g, COUNT(*), RANK() OVER nosuch FROM t GROUP BY g
+1	ff3821881a02344b	hot: SELECT g, COUNT(*), RANK() OVER nosuch FROM v t GROUP BY g
+5	0a0a469ece935037	hot: SELECT g, COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	hot: SELECT g, COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	hot: SELECT g, COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	0a0a469ece935037	hot: SELECT g, COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	hot: SELECT g, COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	hot: SELECT g, COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	0a0a469ece935037	hot: SELECT g, COUNT(*), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	hot: SELECT g, COUNT(*), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	hot: SELECT g, COUNT(*), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	0a0a469ece935037	hot: SELECT g, COUNT(*), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	hot: SELECT g, COUNT(*), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	hot: SELECT g, COUNT(*), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	cefc3b03e68394d1	hot: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	cefc3b03e68394d1	hot: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	cefc3b03e68394d1	hot: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM t GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	cefc3b03e68394d1	hot: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM v t GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	70aaffb7f283a7e2	hot: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	70aaffb7f283a7e2	hot: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	70aaffb7f283a7e2	hot: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	70aaffb7f283a7e2	hot: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+3	39ec9d87fc865258	hot: SELECT g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g
+2	9a27b4dd2d9fc795	hot: SELECT g, SUM(a) FROM (VALUES (1, 0), (2, 9223372036854775807), (2, 1)) t(g, a) GROUP BY g UNION ALL SELECT 0, 0 LIMIT 1
+3	39ec9d87fc865258	hot: SELECT g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g
+3	39ec9d87fc865258	hot: SELECT g, SUM(a) FROM t GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM t GROUP BY g ORDER BY g
+3	39ec9d87fc865258	hot: SELECT g, SUM(a) FROM v t GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM v t GROUP BY g ORDER BY g
+5	5f2b4e32a6933759	hot: SELECT g, SUM(a), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+5	5f2b4e32a6933759	hot: SELECT g, SUM(a), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+5	5f2b4e32a6933759	hot: SELECT g, SUM(a), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+5	5f2b4e32a6933759	hot: SELECT g, SUM(a), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+7	120d27167582249a	hot: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+7	120d27167582249a	hot: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+7	120d27167582249a	hot: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM t GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+7	120d27167582249a	hot: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM v t GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+6	45cf370406c285d5	sealed: SELECT 1 UNION ALL SELECT g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY 1
+6	45cf370406c285d5	sealed: SELECT 1 UNION ALL SELECT g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY 1
+6	45cf370406c285d5	sealed: SELECT 1 UNION ALL SELECT g FROM t GROUP BY g ORDER BY 1
+6	45cf370406c285d5	sealed: SELECT 1 UNION ALL SELECT g FROM v t GROUP BY g ORDER BY 1
+3	08f8b3e66c06783c	sealed: SELECT COUNT(*) FROM (SELECT id, g, s, a FROM t) t UNION ALL SELECT COUNT(*) FROM (SELECT id, g, s, a FROM t) t WHERE g > 1 ORDER BY 1
+3	08f8b3e66c06783c	sealed: SELECT COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) UNION ALL SELECT COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) WHERE g > 1 ORDER BY 1
+3	08f8b3e66c06783c	sealed: SELECT COUNT(*) FROM t UNION ALL SELECT COUNT(*) FROM t WHERE g > 1 ORDER BY 1
+3	08f8b3e66c06783c	sealed: SELECT COUNT(*) FROM v t UNION ALL SELECT COUNT(*) FROM v t WHERE g > 1 ORDER BY 1
+2	e2c1fbbc0501487d	sealed: SELECT COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t WINDOW w AS (ORDER BY COUNT(*))
+2	e2c1fbbc0501487d	sealed: SELECT COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) WINDOW w AS (ORDER BY COUNT(*))
+2	e2c1fbbc0501487d	sealed: SELECT COUNT(*), RANK() OVER w FROM t WINDOW w AS (ORDER BY COUNT(*))
+2	e2c1fbbc0501487d	sealed: SELECT COUNT(*), RANK() OVER w FROM v t WINDOW w AS (ORDER BY COUNT(*))
+3	0743de527092e9d8	sealed: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+3	0743de527092e9d8	sealed: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+3	0743de527092e9d8	sealed: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+3	0743de527092e9d8	sealed: SELECT DISTINCT ON (g % 2) g, SUM(a), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g % 2, g
+5	e96cf220302f631b	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+5	e96cf220302f631b	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+5	e96cf220302f631b	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM t GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+5	e96cf220302f631b	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM v t GROUP BY s UNION ALL SELECT 'q', 0 ORDER BY 1
+2	912dd98ff060cab0	sealed: SELECT g FROM (SELECT id, g, s, a FROM t) t GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	sealed: SELECT g FROM (SELECT id, g, s, a FROM t) t GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	912dd98ff060cab0	sealed: SELECT g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	sealed: SELECT g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	912dd98ff060cab0	sealed: SELECT g FROM t GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	sealed: SELECT g FROM t GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	912dd98ff060cab0	sealed: SELECT g FROM v t GROUP BY g EXCEPT SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3 LIMIT 1
+3	c0be96189ae20a48	sealed: SELECT g FROM v t GROUP BY g EXCEPT SELECT 2 ORDER BY g DESC LIMIT 2
+2	c1b073e5e4a46b57	sealed: SELECT g, COUNT(*) AS c FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	c1b073e5e4a46b57	sealed: SELECT g, COUNT(*) AS c FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	c1b073e5e4a46b57	sealed: SELECT g, COUNT(*) AS c FROM t GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	c1b073e5e4a46b57	sealed: SELECT g, COUNT(*) AS c FROM v t GROUP BY g UNION SELECT 1, 99 ORDER BY c DESC LIMIT 1 OFFSET 1
+2	522a9756d5ea5690	sealed: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	sealed: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION ALL SELECT g, 1 FROM (SELECT id, g, s, a FROM t) t ORDER BY 1, 2
+6	e9d7bde36eca33df	sealed: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	sealed: SELECT g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+2	7c2ad01d1d0dfc4c	sealed: SELECT g, COUNT(*) FROM (VALUES (1), (2)) t(g) GROUP BY g EXCEPT SELECT 1, 1 LIMIT 1
+2	522a9756d5ea5690	sealed: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	sealed: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION ALL SELECT g, 1 FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) ORDER BY 1, 2
+6	e9d7bde36eca33df	sealed: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	sealed: SELECT g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+2	522a9756d5ea5690	sealed: SELECT g, COUNT(*) FROM t GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	sealed: SELECT g, COUNT(*) FROM t GROUP BY g UNION ALL SELECT g, 1 FROM t ORDER BY 1, 2
+6	e9d7bde36eca33df	sealed: SELECT g, COUNT(*) FROM t GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	sealed: SELECT g, COUNT(*) FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+2	522a9756d5ea5690	sealed: SELECT g, COUNT(*) FROM v t GROUP BY g INTERSECT SELECT 3, 2 LIMIT 1
+11	a55561d07d05843b	sealed: SELECT g, COUNT(*) FROM v t GROUP BY g UNION ALL SELECT g, 1 FROM v t ORDER BY 1, 2
+6	e9d7bde36eca33df	sealed: SELECT g, COUNT(*) FROM v t GROUP BY g UNION SELECT 9, 9 ORDER BY 1
+5	6632c20871383dcd	sealed: SELECT g, COUNT(*) FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+6	0a23678c77a6f7df	sealed: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM (SELECT id, g, s, a FROM t) t GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+6	0a23678c77a6f7df	sealed: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+6	0a23678c77a6f7df	sealed: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM t GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+6	0a23678c77a6f7df	sealed: SELECT g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM v t GROUP BY g UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	259dd871fb11a4df	sealed: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	259dd871fb11a4df	sealed: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	259dd871fb11a4df	sealed: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	259dd871fb11a4df	sealed: SELECT g, COUNT(*), RANK() OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+1	ff3821881a02344b	sealed: SELECT g, COUNT(*), RANK() OVER nosuch FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	ff3821881a02344b	sealed: SELECT g, COUNT(*), RANK() OVER nosuch FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	ff3821881a02344b	sealed: SELECT g, COUNT(*), RANK() OVER nosuch FROM t GROUP BY g
+1	ff3821881a02344b	sealed: SELECT g, COUNT(*), RANK() OVER nosuch FROM v t GROUP BY g
+5	0a0a469ece935037	sealed: SELECT g, COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	sealed: SELECT g, COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	sealed: SELECT g, COUNT(*), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	0a0a469ece935037	sealed: SELECT g, COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	sealed: SELECT g, COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	sealed: SELECT g, COUNT(*), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	0a0a469ece935037	sealed: SELECT g, COUNT(*), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	sealed: SELECT g, COUNT(*), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	sealed: SELECT g, COUNT(*), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	0a0a469ece935037	sealed: SELECT g, COUNT(*), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY MAX(s), g)
+1	1a189814f0aae4c8	sealed: SELECT g, COUNT(*), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY a)
+6	7216cce7c7be9a38	sealed: SELECT g, COUNT(*), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY g) UNION ALL SELECT 0, 0, 0 ORDER BY 1
+5	cefc3b03e68394d1	sealed: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	cefc3b03e68394d1	sealed: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	cefc3b03e68394d1	sealed: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM t GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	cefc3b03e68394d1	sealed: SELECT g, COUNT(*), ROW_NUMBER() OVER w FROM v t GROUP BY g WINDOW w AS (PARTITION BY g % 2 ORDER BY MIN(a))
+5	70aaffb7f283a7e2	sealed: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	70aaffb7f283a7e2	sealed: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	70aaffb7f283a7e2	sealed: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+5	70aaffb7f283a7e2	sealed: SELECT g, COUNT(*), SUM(COUNT(*)) OVER w, ROW_NUMBER() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+3	39ec9d87fc865258	sealed: SELECT g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g
+2	9a27b4dd2d9fc795	sealed: SELECT g, SUM(a) FROM (VALUES (1, 0), (2, 9223372036854775807), (2, 1)) t(g, a) GROUP BY g UNION ALL SELECT 0, 0 LIMIT 1
+3	39ec9d87fc865258	sealed: SELECT g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g
+3	39ec9d87fc865258	sealed: SELECT g, SUM(a) FROM t GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM t GROUP BY g ORDER BY g
+3	39ec9d87fc865258	sealed: SELECT g, SUM(a) FROM v t GROUP BY g HAVING COUNT(*) > 1 INTERSECT SELECT g, SUM(a) FROM v t GROUP BY g ORDER BY g
+5	5f2b4e32a6933759	sealed: SELECT g, SUM(a), RANK() OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+5	5f2b4e32a6933759	sealed: SELECT g, SUM(a), RANK() OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+5	5f2b4e32a6933759	sealed: SELECT g, SUM(a), RANK() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+5	5f2b4e32a6933759	sealed: SELECT g, SUM(a), RANK() OVER w FROM v t GROUP BY g WINDOW w AS (ORDER BY SUM(a) DESC) ORDER BY g
+7	120d27167582249a	sealed: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+7	120d27167582249a	sealed: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+7	120d27167582249a	sealed: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM t GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g
+7	120d27167582249a	sealed: SELECT s, g, MAX(a), LAG(MAX(a)) OVER w FROM v t GROUP BY s, g WINDOW w AS (PARTITION BY s ORDER BY g) ORDER BY s, g

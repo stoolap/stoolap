@@ -80,10 +80,9 @@
 use crate::common::CompactArc;
 use crate::core::predicate::{kind, KeySide};
 use crate::core::{Result, Row, RowVec, Schema};
+use crate::executor::aggregation::{compile_over_pair, compile_over_slots};
 use crate::executor::context::ExecutionContext;
-use crate::executor::expression::{
-    compile_expression, JoinFilter, RowFilter, SharedProgram, SubqueryExecutor,
-};
+use crate::executor::expression::{JoinFilter, RowFilter, SharedProgram, SubqueryExecutor};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
@@ -283,7 +282,7 @@ fn residual_filters(
 ) -> Result<Vec<RowFilter>> {
     let compile_one = |cond: &Expression| match blocks {
         Some(blocks) => blocks.blocks.compile(cond, false, global_registry()),
-        None => compile_expression(cond, all_columns),
+        None => compile_over_slots(cond, all_columns, global_registry(), None, false, None),
     };
     let compile = || {
         analysis
@@ -925,10 +924,7 @@ impl JoinExecutor {
             let compile = || -> Result<BuiltPrograms> {
                 let program = match blocks.and_then(|b| Some((b, b.blocks.on.as_ref()?))) {
                     Some((blocks, on)) => blocks.blocks.compile(on, true, global_registry())?,
-                    None => CompactArc::clone(
-                        JoinFilter::new(cond, left_columns, right_columns, global_registry())?
-                            .program(),
-                    ),
+                    None => compile_over_pair(cond, left_columns, right_columns)?,
                 };
                 Ok(std::iter::once(program).collect())
             };

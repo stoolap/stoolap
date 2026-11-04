@@ -1133,10 +1133,6 @@ impl Executor {
         shape: &QueryClassification,
         needs_subquery: bool,
     ) -> std::result::Result<(), OutOfFamily> {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return Err("a test refusing the prepared families");
-        }
         // A statement the runner aggregates computes its SELECT list and
         // ORDER BY over its groups, as the aggregation does on any source
         let aggregates = PreparedSelect::runs_aggregate(stmt, shape);
@@ -1239,10 +1235,6 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
     ) -> std::result::Result<(), OutOfFamily> {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return Err("a test refusing the prepared families");
-        }
         let grouped = grouped_block(stmt);
         // A grouped statement's DISTINCT ON key runs as an item, its windows
         // too, and an ORDER BY window as a hidden item the window path adds
@@ -9619,10 +9611,6 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return false;
-        }
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| match &*guard {
@@ -10649,10 +10637,6 @@ impl Executor {
         &self,
         clause: &Expression,
     ) -> std::result::Result<(), OutOfFamily> {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return Err("a test refusing the prepared families");
-        }
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),
@@ -11874,10 +11858,7 @@ impl Executor {
                     .map(|c| c.value.to_string())
                     .collect();
             }
-            let body = match self.cte_result_source(&cte.query, &registry, true) {
-                Some(_) => self.general_explain(&cte.query),
-                None => self.explain_lines(&cte.query, &ctes),
-            };
+            let body = self.explain_lines(&cte.query, &ctes);
             bodies.push((cte.name.value_lower.clone(), body));
             registry.store(&cte.name.value, names, RowVec::new());
         }
@@ -12106,24 +12087,25 @@ impl Executor {
     ) -> Result<Box<dyn Table>> {
         use crate::storage::traits::transaction::StatementTable;
         let table = match through {
-            Some(tx) => tx.get_read_table_at(name, ctx.scan_view(name), ctx.table_use()),
+            Some(tx) => tx.get_read_table_at(name, ctx.statement_view(), ctx.table_use()),
             None => {
                 let active = self
                     .active_transaction
                     .lock()
                     .map_err(|_| Error::internal("active transaction lock poisoned"))?;
                 match active.as_ref() {
-                    Some(tx) => {
-                        tx.transaction
-                            .get_read_table_at(name, ctx.scan_view(name), ctx.table_use())
-                    }
+                    Some(tx) => tx.transaction.get_read_table_at(
+                        name,
+                        ctx.statement_view(),
+                        ctx.table_use(),
+                    ),
                     None => {
                         drop(active);
                         ctx.statement_snapshot()
                             .ok_or_else(|| {
                                 Error::internal("a prepared statement reads without a snapshot")
                             })?
-                            .statement_table_at(name, ctx.scan_view(name))
+                            .statement_table_at(name, ctx.statement_view())
                     }
                 }
             }
@@ -12206,10 +12188,6 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return false;
-        }
         compiled
             .and_then(|slot| slot.read().ok())
             .is_some_and(|guard| {
@@ -12248,10 +12226,6 @@ impl Executor {
         where_clause: Option<&'e Expression>,
         sets: impl IntoIterator<Item = &'e Expression>,
     ) -> std::result::Result<(), OutOfFamily> {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return Err("the prepared families are off");
-        }
         let family = Family {
             executor: self,
             blocks: RefCell::new(SmallVec::new()),

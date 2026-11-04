@@ -1066,10 +1066,6 @@ pub(crate) enum OrderLimitPath {
     TopN,
     /// The statement's sort over keys an evaluator computes per row
     ComputedKeys,
-    /// `TopNResult` over source rows, projected after
-    DeferredProjection,
-    /// A projection offering each row it builds to a `TopN`
-    ProjectedTop,
     /// Nearest vectors by distance, through HNSW or by brute force
     VectorSearch,
     /// An index nested loop join sorting its joined rows itself
@@ -1100,11 +1096,9 @@ impl OrderLimitPath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl OrderLimitPath {
-    pub(crate) const ALL: [OrderLimitPath; 13] = [
+    pub(crate) const ALL: [OrderLimitPath; 11] = [
         OrderLimitPath::TopN,
         OrderLimitPath::ComputedKeys,
-        OrderLimitPath::DeferredProjection,
-        OrderLimitPath::ProjectedTop,
         OrderLimitPath::VectorSearch,
         OrderLimitPath::JoinIndexSort,
         OrderLimitPath::CteOrderLimitPushdown,
@@ -1120,8 +1114,6 @@ impl OrderLimitPath {
         match self {
             OrderLimitPath::TopN => "top_n",
             OrderLimitPath::ComputedKeys => "computed_keys",
-            OrderLimitPath::DeferredProjection => "deferred_projection",
-            OrderLimitPath::ProjectedTop => "projected_top",
             OrderLimitPath::VectorSearch => "vector_search",
             OrderLimitPath::JoinIndexSort => "join_index_sort",
             OrderLimitPath::CteOrderLimitPushdown => "cte_order_limit_pushdown",
@@ -2238,7 +2230,15 @@ mod tests {
             })),
         });
 
-        let filter = RowFilter::new(&filter_expr, inner.columns()).unwrap();
+        let program = crate::executor::aggregation::compile_over_slots(
+            &filter_expr,
+            inner.columns(),
+            crate::functions::registry::global_registry(),
+            None,
+            false,
+            None,
+        );
+        let filter = RowFilter::from_program(program.unwrap());
         let mut result = FilteredResult::from_filter(inner, filter);
 
         // Should get rows with value 20 and 30

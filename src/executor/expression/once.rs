@@ -218,12 +218,7 @@ fn contains_context_dependent_function(expr: &Expression) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::executor::expression::evaluator_bridge::program_cached;
-    use crate::executor::Executor;
     use crate::parser::ast::Statement;
-    use crate::storage::mvcc::engine::MVCCEngine;
 
     #[test]
     fn a_one_shot_evaluation_keeps_no_value_it_read() {
@@ -251,55 +246,6 @@ mod tests {
         match &crate::parser::parse_sql(&format!("SELECT {text}")).unwrap()[0] {
             Statement::Select(select) => select.columns[0].clone(),
             other => panic!("not a SELECT: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_value_a_statement_reads_once_is_not_cached() {
-        let engine = MVCCEngine::in_memory();
-        engine.open_engine().unwrap();
-        let executor = Executor::new(Arc::new(engine));
-        executor
-            .execute("CREATE TABLE once_t (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        executor
-            .execute("INSERT INTO once_t VALUES (1), (2), (3)")
-            .unwrap();
-        for (sql, value) in [
-            ("SELECT id FROM once_t LIMIT 1 + 700001", "1 + 700001"),
-            (
-                "SELECT id FROM once_t LIMIT 1 OFFSET 0 * 700002",
-                "0 * 700002",
-            ),
-            ("SELECT * FROM generate_series(1, 2 + 700003)", "2 + 700003"),
-            ("SELECT 3 + 700004", "3 + 700004"),
-            ("SELECT 1 WHERE 4 + 700005 > 0", "4 + 700005 > 0"),
-            (
-                "SELECT id FROM once_t WHERE id > 0 * 700006 ORDER BY id LIMIT 2",
-                "0 * 700006",
-            ),
-            (
-                "SELECT id FROM once_t WHERE id IN (0 * 700007, 1)",
-                "0 * 700007",
-            ),
-            (
-                "SELECT id FROM once_t WHERE 8 + 700008 < 0",
-                "8 + 700008 < 0",
-            ),
-            (
-                "SELECT STRING_AGG(CAST(id AS TEXT), '-' || '700009') FROM once_t",
-                "'-' || '700009'",
-            ),
-            (
-                "ALTER TABLE once_t ADD COLUMN c INTEGER DEFAULT 10 + 700010",
-                "10 + 700010",
-            ),
-        ] {
-            let _ = executor.execute(sql).unwrap();
-            assert!(
-                !program_cached(&expression(value), &[]),
-                "{sql}: `{value}` is read once, yet it entered the program cache"
-            );
         }
     }
 }

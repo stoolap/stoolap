@@ -163,6 +163,21 @@ pub(crate) fn compile_over_slots(
         .map_err(|e| crate::core::Error::internal(format!("Compile error: {}", e)))
 }
 
+/// A program over the pair of rows a join reads, `left`'s columns then
+/// `right`'s
+pub(crate) fn compile_over_pair(
+    expr: &Expression,
+    left: &[String],
+    right: &[String],
+) -> Result<super::expression::SharedProgram> {
+    let registry = crate::functions::registry::global_registry();
+    let compile = super::expression::CompileContext::new(left, registry).with_second_row(right);
+    super::expression::ExprCompiler::new(&compile)
+        .compile(expr)
+        .map(CompactArc::new)
+        .map_err(|e| crate::core::Error::internal(format!("Compile error: {}", e)))
+}
+
 /// The VM context for one slot row of `ctx`'s statement
 pub(crate) fn slot_context<'a>(
     row: &'a Row,
@@ -1124,9 +1139,6 @@ impl<'a> RowFeed<'a> {
                 compiled.bound(slot_params(ctx, blocks), blocks)
             }
             None => std::borrow::Cow::Owned(CompiledFeed::compile(aggregations, at, |expr| {
-                if blocks.is_none() && !super::utils::expression_has_parameters(expr) {
-                    return super::expression::compile_expression(expr, columns);
-                }
                 let program = compile_over_slots(
                     expr,
                     columns,
@@ -3281,21 +3293,6 @@ impl Executor {
             columns.to_vec(),
             filtered_rows,
         )))
-    }
-
-    /// The one group of `aggregations`, every row of `table` fed to it
-    pub(super) fn global_scan_rows(
-        &self,
-        table: &dyn crate::storage::traits::Table,
-        aggregations: &[SqlAggregateFunction],
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        let columns = table.schema().column_names_lower_arc();
-        let mut scanner = table.scan(&[], None)?;
-        let input = FeedInput::Each(ScannedRows(&mut *scanner), table.row_count_hint());
-        let rows = self.global_row(aggregations, &columns, ctx, (None, None), input)?;
-        scanner.close()?;
-        Ok(rows)
     }
 
     /// The one group of `aggregations` over the rows of `input`, whose

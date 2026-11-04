@@ -21,9 +21,7 @@
 
 mod oracle;
 
-use stoolap::test_failpoints::{
-    bridge_compiles, join_paths_taken, program_compiles, reset_join_paths,
-};
+use stoolap::test_failpoints::{join_paths_taken, program_compiles, reset_join_paths};
 use stoolap::Database;
 
 fn fill(db: &Database) {
@@ -147,20 +145,19 @@ fn a_join_where_runs_its_subqueries_as_blocks() {
         for &(shape, path, twin) in CASES {
             let sql = shape.replace("{l}", "l").replace("{r}", "r");
             let first = rows(&db, &sql);
-            let bridge = bridge_compiles();
             let programs = program_compiles();
             reset_join_paths();
             let again = rows(&db, &sql);
             let taken = join_paths_taken();
-            let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+            let compiled = program_compiles() - programs;
             if taken != [path] {
                 wrong.push(format!(
                     "sealed {sealed}: {sql}: took {taken:?}, expected {path}"
                 ));
             }
-            if compiled != (0, 0) {
+            if compiled != 0 {
                 wrong.push(format!(
-                    "sealed {sealed}: {sql}: run again, compiled {compiled:?}"
+                    "sealed {sealed}: {sql}: run again, compiled {compiled}"
                 ));
             }
             if again != first {

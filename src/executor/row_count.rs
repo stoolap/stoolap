@@ -15,7 +15,7 @@
 //! The row counts a LIMIT and an OFFSET ask for: every path that applies
 //! them, or decides a shortcut by them, reads them here.
 
-use crate::core::{Error, Result, RowVec, Value};
+use crate::core::{Error, Result, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 
 use super::context::ExecutionContext;
@@ -29,16 +29,7 @@ pub(crate) struct RowCounts {
     pub offset: usize,
 }
 
-impl RowCounts {
-    /// Keep the rows the counts ask for, of rows already in order
-    pub fn apply(self, rows: &mut RowVec) {
-        let skipped = self.offset.min(rows.len());
-        rows.drain(..skipped);
-        if let Some(limit) = self.limit {
-            rows.truncate(limit);
-        }
-    }
-}
+impl RowCounts {}
 
 /// The LIMIT and OFFSET of `stmt`. A count is an INTEGER of zero or more,
 /// or a FLOAT holding one; NULL, any other value and an evaluation error

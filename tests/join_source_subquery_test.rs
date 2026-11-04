@@ -13,8 +13,7 @@
 // limitations under the License.
 
 //! A VALUES list or a table function holding a subquery answers as one
-//! side of a join, and a VALUES row is evaluated, without the evaluator
-//! bridge
+//! side of a join, and a VALUES row is evaluated
 
 #![cfg(feature = "test-failpoints")]
 
@@ -26,10 +25,10 @@ use stoolap::functions::registry::global_registry;
 use stoolap::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
-use stoolap::test_failpoints::{bridge_compiles, tvf_rows};
+use stoolap::test_failpoints::tvf_rows;
 use stoolap::Database;
 
-// The bridge counter is process-wide
+// One test runs at a time
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Each statement, its parameters and the rows it answers, every value
@@ -101,7 +100,7 @@ fn rows(db: &Database, sql: &str, params: &[i64]) -> Vec<String> {
 }
 
 #[test]
-fn a_source_holding_a_subquery_answers_as_written_without_the_bridge() {
+fn a_source_holding_a_subquery_answers_as_written() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open("memory://join_source_subquery").unwrap();
     for sql in [
@@ -115,16 +114,11 @@ fn a_source_holding_a_subquery_answers_as_written_without_the_bridge() {
     let mut wrong = Vec::new();
     for (sql, params, expected) in CASES {
         for run in 0..2 {
-            let before = bridge_compiles();
             let answer = rows(&db, sql, params);
-            let compiled = bridge_compiles() - before;
             if answer != *expected {
                 wrong.push(format!(
                     "{sql}, run {run}: {answer:?}, written {expected:?}"
                 ));
-            }
-            if compiled != 0 {
-                wrong.push(format!("{sql}, run {run}: {compiled} bridge compiles"));
             }
         }
     }

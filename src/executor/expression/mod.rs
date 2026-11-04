@@ -37,23 +37,17 @@
 //   └─────────────┘     └──────────────┘     └─────────────┘
 
 mod compiler;
-mod evaluator_bridge;
-#[cfg(test)]
-pub(crate) use evaluator_bridge::program_cached;
+mod join_filter;
 mod once;
 mod ops;
 mod program;
+mod row_filter;
 mod vm;
 
 pub(crate) use compiler::literal_value;
 pub(crate) use compiler::parameter_slot;
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
-pub(crate) use evaluator_bridge::bind_params;
-pub use evaluator_bridge::{
-    clear_program_cache, compile_expression, compile_expression_with_context,
-    compute_expression_hash, CompiledEvaluator, ExpressionEval, JoinFilter, RowFilter,
-    SharedProgram,
-};
+pub use join_filter::JoinFilter;
 pub(crate) use once::{
     compile_once, evaluate_once, evaluate_once_in, execute_context, execute_once, held_once,
     held_or_compile, try_eval_constant_expr_with_context, HeldOnce,
@@ -61,7 +55,8 @@ pub(crate) use once::{
 pub(crate) use ops::more_than_one_row;
 pub use ops::{CompareOp, Op, QuantifiedMembers, RowComparison, RowMembers, RowTest};
 pub(crate) use program::known_params;
-pub use program::Program;
+pub use program::{Program, SharedProgram};
+pub use row_filter::RowFilter;
 pub(crate) use vm::concat_values;
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 

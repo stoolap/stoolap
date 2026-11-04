@@ -14,17 +14,22 @@
 
 //! A statement that does not aggregate and computes windows by a WINDOW
 //! definition, or is a set operation's branch, runs on the runner over a
-//! table or another source, and answers as the general path does
+//! table or another source, and answers as recorded
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{prepared_selects_built, PREPARED_FAMILIES_OFF};
+use stoolap::test_failpoints::prepared_selects_built;
 use stoolap::Database;
 
-// The families switch and the build counter are process-wide
+mod oracle;
+
+/// Each statement's column names and rows, recorded when the general path
+/// gave the same
+const RECORDED: oracle::Answers = answers!("window_named_set_operation");
+
+// The build counter is process-wide
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -50,17 +55,14 @@ fn rows(db: &Database, sql: &str) -> Answer {
     Ok((columns, out))
 }
 
-/// `sql` answered with the prepared families refused: the general path
-fn general(db: &Database, sql: &str) -> Answer {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    let _restore = Restore;
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    rows(db, sql)
+/// What is wrong with `answer` as `key`'s recorded answer, its column
+/// names on the first line
+fn check(key: &str, answer: Answer) -> Option<String> {
+    let lines = answer.map(|(columns, rows)| {
+        let names = format!("columns: {}", columns.join("|"));
+        std::iter::once(names).chain(rows).collect()
+    });
+    oracle::check_answer(&RECORDED, key, &lines)
 }
 
 fn open(dsn: &str, seal: bool) -> Database {
@@ -121,7 +123,7 @@ const SHAPES: &[&str] = &[
 ];
 
 #[test]
-fn a_windowed_statement_answers_as_the_general_path() {
+fn a_windowed_statement_answers_as_recorded() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let sealed = format!("file://{}?checkpoint_interval=0", dir.path().display());
@@ -136,10 +138,7 @@ fn a_windowed_statement_answers_as_the_general_path() {
         for source in SOURCES {
             for shape in SHAPES {
                 let sql = shape.replace("{s}", source);
-                let (got, want) = (rows(&db, &sql), general(&db, &sql));
-                if got != want {
-                    wrong.push(format!("{name}: {sql}\n  got {got:?}\n  want {want:?}"));
-                }
+                wrong.extend(check(&format!("{name}: {sql}"), rows(&db, &sql)));
             }
         }
     }

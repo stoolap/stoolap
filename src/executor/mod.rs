@@ -107,8 +107,7 @@ use planned_dml::DmlStatement;
 pub(crate) use aggregation::AggregatePath;
 pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
 pub use expression::{
-    CompileContext, CompileError, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,
-    Program as ExprProgram,
+    CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, Program as ExprProgram,
 };
 pub use parallel::{
     hash_row_by_keys,

@@ -12,18 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A statement the runner prepares fails with the error preparing it gives,
-//! without the evaluator bridge compiling it again
+//! A statement the runner prepares fails with the error preparing it gives
 
-#![cfg(feature = "test-failpoints")]
-
-use std::sync::Mutex;
-
-use stoolap::test_failpoints::bridge_compiles;
 use stoolap::Database;
-
-// The bridge counter is process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Each statement over t and a text its error holds
 const ERRORS: &[(&str, &str)] = &[
@@ -47,8 +38,7 @@ const ERRORS: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn a_statement_fails_as_preparing_it_fails_without_the_bridge() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+fn a_statement_fails_as_preparing_it_fails() {
     let db = Database::open("memory://prepare_error").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", ())
         .unwrap();
@@ -56,7 +46,6 @@ fn a_statement_fails_as_preparing_it_fails_without_the_bridge() {
     let mut wrong = Vec::new();
     for (sql, want) in ERRORS {
         for run in 0..2 {
-            let before = bridge_compiles();
             let got = match db.query(sql, ()) {
                 Ok(rows) => rows
                     .map(|row| row.map(|_| ()))
@@ -65,12 +54,8 @@ fn a_statement_fails_as_preparing_it_fails_without_the_bridge() {
                     .map(|e| e.to_string()),
                 Err(e) => Some(e.to_string()),
             };
-            let compiled = bridge_compiles() - before;
             if !got.as_deref().is_some_and(|got| got.contains(want)) {
                 wrong.push(format!("{sql}, run {run}: {got:?}, want {want:?}"));
-            }
-            if compiled != 0 {
-                wrong.push(format!("{sql}, run {run}: {compiled} bridge compiles"));
             }
         }
     }

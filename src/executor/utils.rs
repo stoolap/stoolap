@@ -23,7 +23,6 @@
 
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
-use std::sync::LazyLock;
 
 use crate::common::SmartString;
 
@@ -61,19 +60,7 @@ pub(crate) fn probes_by_equality(table: &dyn crate::storage::traits::Table, colu
 // Token Creation Utilities
 // ============================================================================
 
-/// Static dummy token for internal AST construction - avoids allocation.
-/// Token literal is not used during execution, only for display/errors.
-static DUMMY_TOKEN: LazyLock<Token> =
-    LazyLock::new(|| Token::new(TokenType::Identifier, String::new(), Position::default()));
-
-/// Clone the static dummy token (single String allocation for empty string).
-#[inline]
-pub fn dummy_token_clone() -> Token {
-    DUMMY_TOKEN.clone()
-}
-
 /// Helper to create a dummy token for internal AST construction.
-/// Use `dummy_token_clone()` when literal doesn't matter to avoid allocation.
 #[inline]
 pub fn dummy_token(literal: &str, token_type: TokenType) -> Token {
     Token::new(token_type, literal, Position::default())
@@ -2633,8 +2620,7 @@ pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item =
 /// What separates a column's qualifier from its own name in the column
 /// text the executor binds by. No identifier holds it, so a dot inside a
 /// quoted qualifier or name never splits them otherwise. A caller handing
-/// column names to `compile_expression`, `RowFilter` or `JoinFilter` names a
-/// qualified column with `qualified`
+/// column names to the compiler names a qualified column with `qualified`
 pub const QUALIFIER_SEP: char = '\u{1F}';
 
 /// The column text of `name` read through the FROM entry `qualifier`
@@ -2705,28 +2691,6 @@ pub(crate) fn for_each_qualified_star_column(
     }
     if !found && table_alias.is_some_and(|alias| eq_names(alias, qualifier)) {
         (0..columns.len()).for_each(|idx| take(idx, 0));
-    }
-}
-
-/// Whether `expr` is a star that takes every column of `columns` in order,
-/// so a projection of it alone hands the rows on as they are
-pub(crate) fn star_takes_every_column(
-    expr: &Expression,
-    columns: &[String],
-    table_alias: Option<&str>,
-) -> bool {
-    match expr {
-        Expression::Star(_) => true,
-        Expression::QualifiedStar(qs) => {
-            let mut next = 0;
-            let mut in_order = true;
-            for_each_qualified_star_column(columns, &qs.qualifier, table_alias, |idx, _| {
-                in_order &= idx == next;
-                next += 1;
-            });
-            in_order && next == columns.len()
-        }
-        _ => false,
     }
 }
 

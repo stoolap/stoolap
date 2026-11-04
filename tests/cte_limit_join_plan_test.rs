@@ -20,7 +20,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{bridge_compiles, general_path_hits, random_draws, GeneralPath};
+use stoolap::test_failpoints::{general_path_hits, program_compiles, random_draws, GeneralPath};
 use stoolap::Database;
 
 // The counters are process-wide
@@ -208,9 +208,9 @@ fn a_join_whose_limit_cuts_a_cte_side_keeps_its_plan_and_the_cut() {
 }
 
 #[test]
-fn a_cut_cte_body_run_again_compiles_nothing_through_the_bridge() {
+fn a_cut_cte_body_run_again_compiles_nothing() {
     let _guard = serial();
-    let db = hot("bridge");
+    let db = hot("again");
     let mut wrong = Vec::new();
     for from in FROMS {
         for (select, on) in PLACES {
@@ -221,11 +221,11 @@ fn a_cut_cte_body_run_again_compiles_nothing_through_the_bridge() {
                         let sql = format!("{WITH}SELECT {select} FROM {from}{order}{limit}")
                             .replace("{v}", v);
                         answer(&db, &sql).unwrap();
-                        let before = bridge_compiles();
+                        let before = program_compiles();
                         answer(&db, &sql).unwrap();
-                        let compiled = bridge_compiles() - before;
+                        let compiled = program_compiles() - before;
                         if compiled != 0 {
-                            wrong.push(format!("{sql}: run again, {compiled} bridge compiles"));
+                            wrong.push(format!("{sql}: run again, {compiled} compiles"));
                         }
                     }
                 }

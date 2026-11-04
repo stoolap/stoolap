@@ -287,29 +287,3 @@ fn a_built_in_name_takes_no_registration_and_keeps_its_answer() {
         assert_eq!(answer(db.query(sql, ())), Ok(want), "{sql}");
     }
 }
-
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn a_planned_statement_calling_a_registered_function_compiles_nothing_through_the_bridge() {
-    use stoolap::test_failpoints::bridge_compiles;
-    global_registry().register_scalar::<RegisteredId>().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(&dir, false);
-    let mut compiled = Vec::new();
-    for sql in [
-        "SELECT REGISTERED_ID(a) FROM t ORDER BY id",
-        "SELECT id FROM t WHERE REGISTERED_ID(a) = 20",
-        "SELECT id FROM t ORDER BY REGISTERED_ID(a) DESC LIMIT 2",
-        "SELECT g, SUM(REGISTERED_ID(a)) FROM t GROUP BY g ORDER BY g",
-    ] {
-        let before = bridge_compiles();
-        answer(db.query(sql, ())).unwrap();
-        if bridge_compiles() != before {
-            compiled.push(sql);
-        }
-    }
-    assert!(
-        compiled.is_empty(),
-        "compiled through the bridge: {compiled:#?}"
-    );
-}

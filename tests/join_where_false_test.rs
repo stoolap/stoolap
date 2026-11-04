@@ -13,9 +13,7 @@
 // limitations under the License.
 
 //! A join whose WHERE keeps no row names its columns and raises the errors
-//! its names and its sides' reads raise, reading no table side's rows and
-//! compiling nothing through the evaluator bridge once its blocks are
-//! prepared
+//! its names and its sides' reads raise, reading no table side's rows
 
 #![cfg(feature = "test-failpoints")]
 
@@ -23,10 +21,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{after_select_table_opened, bridge_compiles};
+use stoolap::test_failpoints::after_select_table_opened;
 use stoolap::Database;
 
-// The families switch and the bridge counter are process-wide
+// The table hook is process-wide
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -243,25 +241,4 @@ fn a_join_that_keeps_no_row_raises_schema_changed_for_a_side_read_over_new_colum
         }
     }
     assert!(wrong.is_empty(), "{sql}\n{}", wrong.join("\n"));
-}
-
-#[test]
-fn a_join_that_keeps_no_row_compiles_nothing_through_the_bridge_again() {
-    let _guard = serial();
-    let db = open("memory://join_where_false_bridge");
-    let mut wrong = Vec::new();
-    for (with, side, _) in SIDES {
-        let sql = format!(
-            "{with}SELECT t.id, u.id FROM t JOIN {side} ON u.id = t.id WHERE t.a > 0 AND 1 = 0"
-        );
-        let statement = db.prepare(&sql).unwrap();
-        statement.query(()).unwrap().count();
-        let before = bridge_compiles();
-        statement.query(()).unwrap().count();
-        let compiled = bridge_compiles() - before;
-        if compiled != 0 {
-            wrong.push(format!("{sql}: run again, {compiled} bridge compiles"));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

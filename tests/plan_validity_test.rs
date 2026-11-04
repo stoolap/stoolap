@@ -284,13 +284,11 @@ mod held {
     use std::cell::Cell;
     use std::rc::Rc;
     use stoolap::test_failpoints::{
-        after_compiled_epoch_checked, bridge_compiles, prepared_dml_built, prepared_selects_built,
-        program_compiles,
+        after_compiled_epoch_checked, prepared_dml_built, prepared_selects_built, program_compiles,
     };
 
-    fn compiles() -> [usize; 4] {
+    fn compiles() -> [usize; 3] {
         [
-            bridge_compiles(),
             program_compiles(),
             prepared_selects_built(),
             prepared_dml_built(),

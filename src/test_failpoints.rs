@@ -999,7 +999,6 @@ thread_local! {
     static JOIN_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static ORDER_LIMIT_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static DISTINCT_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static BRIDGE_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROGRAM_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1041,16 +1040,6 @@ pub fn program_compiles() -> usize {
 
 pub(crate) fn program_compiled() {
     PROGRAM_COMPILES.with(|n| n.set(n.get() + 1));
-}
-
-/// Expressions this thread handed the evaluation bridge to compile or look
-/// up in its program cache, so far
-pub fn bridge_compiles() -> usize {
-    BRIDGE_COMPILES.with(std::cell::Cell::get)
-}
-
-pub(crate) fn bridge_compiled() {
-    BRIDGE_COMPILES.with(|n| n.set(n.get() + 1));
 }
 
 /// Programs compiled for a one-shot evaluation on this thread, so far
@@ -1980,9 +1969,9 @@ pub(crate) fn tvf_rows_generated(rows: usize) {
 pub enum GeneralPath {
     /// A constant the pushdown evaluates itself
     PushdownConstant,
-    /// The projection's `CompiledEvaluator` for computed columns
+    /// The projection's programs for computed columns
     ProjectionEvaluator,
-    /// The sort's `CompiledEvaluator` for ORDER BY keys no column holds
+    /// The sort's programs for ORDER BY keys no column holds
     OrderByEvaluator,
 }
 
@@ -2005,15 +1994,6 @@ pub fn general_path_total() -> usize {
         .iter()
         .map(|hits| hits.load(std::sync::atomic::Ordering::Relaxed))
         .sum()
-}
-
-/// Refuse every prepared SELECT family, the prepared UPDATE and DELETE and
-/// the plans they hold, so that a statement and the statements inside it
-/// run on the general path: a recorded answer's reference reads them there
-pub static PREPARED_FAMILIES_OFF: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn prepared_families_off() -> bool {
-    PREPARED_FAMILIES_OFF.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 type HookSlot = RefCell<Option<Box<dyn FnOnce()>>>;

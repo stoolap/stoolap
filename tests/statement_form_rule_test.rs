@@ -187,21 +187,3 @@ fn a_form_no_path_answers_is_the_statements_error_everywhere() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
-
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn a_refused_form_reaches_no_evaluator_bridge() {
-    use stoolap::test_failpoints::bridge_compiles;
-    let dir = tempfile::tempdir().unwrap();
-    let db = tables("statement_form_rule_bridge", false, &dir);
-    let mut wrong = Vec::new();
-    for &(sql, _, params) in REFUSED {
-        let before = bridge_compiles();
-        let _ = rows(&db, sql, params, false);
-        let compiled = bridge_compiles() - before;
-        if compiled != 0 {
-            wrong.push(format!("{sql}: {compiled} bridge compiles"));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}

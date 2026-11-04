@@ -74,18 +74,13 @@ impl GlobalSource {
 /// groups come from, as the rules decide them
 pub(crate) struct AggregatePlan {
     pub(crate) aggregations: Vec<SqlAggregateFunction>,
-    /// Whether the SELECT list reads nothing but the calls
-    pub(super) plain: bool,
     pub(crate) read: AggregateRead,
 }
 
 /// Where an aggregate over one table reads from
 pub(crate) enum AggregateRead {
-    /// Its one row from `source`, `pushed` the WHERE the table runs whole
-    Global {
-        source: GlobalSource,
-        pushed: Option<Box<dyn StorageExpr>>,
-    },
+    /// Its one row from `source`
+    Global { source: GlobalSource },
     /// Its groups by one column, named and placed as `group`, from `source`;
     /// `walks` whether the index walk reads them when the table declines
     Grouped {
@@ -155,8 +150,7 @@ impl Executor {
         let source = Self::global_source(stmt, &aggregations, plain, pushed.is_some(), indexed);
         Ok(Some(AggregatePlan {
             aggregations,
-            plain,
-            read: AggregateRead::Global { source, pushed },
+            read: AggregateRead::Global { source },
         }))
     }
 
@@ -210,24 +204,6 @@ impl Executor {
             true => GlobalSource::StorageFiltered,
             false => GlobalSource::Scan,
         }
-    }
-
-    /// Whether every row of the table feeds the calls one by one, faster
-    /// than the scan that collects them: plain counts, sums, averages and
-    /// bounds, under no ORDER BY or LIMIT
-    fn streams_calls(
-        classification: &QueryClassification,
-        aggregations: &[SqlAggregateFunction],
-        plain: bool,
-    ) -> bool {
-        plain
-            && !classification.has_order_by
-            && !classification.has_limit
-            && aggregations.iter().all(|agg| match agg.name.as_str() {
-                "COUNT" => agg.counts_rows() || agg.answered_with(Modifiers::DISTINCT),
-                "SUM" | "MIN" | "MAX" | "AVG" => agg.answered_with(Modifiers::NONE),
-                _ => false,
-            })
     }
 
     /// The one row of `aggregations` over `table` from `source`, each call
@@ -405,34 +381,6 @@ impl Executor {
             alone,
         };
         self.finish_aggregation(path, slots, ctx, names, rows)
-    }
-
-    /// `stmt`'s one row over `table` when it aggregates the table without
-    /// grouping, from the source the rule picks; None when its rows are read
-    /// past a WHERE, which the scan does. Inlined into the table scan, it
-    /// costs that scan's loop more per row
-    #[inline(never)]
-    pub(crate) fn global_aggregate(
-        &self,
-        table: &dyn Table,
-        stmt: &SelectStatement,
-        (classification, plan): (&QueryClassification, &AggregatePlan),
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Box<dyn QueryResult>>> {
-        let AggregateRead::Global { source, pushed } = &plan.read else {
-            return Ok(None);
-        };
-        let aggregations = &plan.aggregations;
-        // A WHERE the table declined is the scan's to read, and so are calls
-        // the feed does not stream
-        let scan = || match stmt.where_clause.is_none()
-            && Self::streams_calls(classification, aggregations, plan.plain)
-        {
-            true => self.global_scan_rows(table, aggregations, ctx).map(Some),
-            false => Ok(None),
-        };
-        let source = (*source, pushed.as_deref());
-        self.global_answer(table, stmt, (aggregations, source), ctx, None, scan)
     }
 
     /// `stmt`'s one row of `aggregations` over `table`, from `source` with

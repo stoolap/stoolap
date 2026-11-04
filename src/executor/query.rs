@@ -32,22 +32,18 @@ use crate::storage::traits::transaction::{StatementTable, TableUse};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
-use crate::core::predicate::{kind, sql_compare, sql_eq, KeySide};
+use crate::core::predicate::{kind, KeySide};
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::mvcc::version_store::LayoutToken;
-use crate::storage::traits::{Engine, QueryResult, ScanAccess};
+use crate::storage::traits::{Engine, QueryResult};
 
 /// Maximum depth for nested views to prevent stack overflow. Unoptimized
 /// code takes more stack per level, so a debug build allows fewer
 pub const MAX_VIEW_DEPTH: usize = if cfg!(debug_assertions) { 16 } else { 32 };
-
-/// Deferred projection info: (column_indices, output_column_names)
-/// Used when projection can be deferred until after ORDER BY + LIMIT
-type DeferredProjection = (Vec<usize>, Vec<String>);
 
 /// What one output column of a SELECT holds
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,11 +306,9 @@ fn folded(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// What a SELECT's rows carry to its ORDER BY: the projection deferred past
-/// ORDER BY and LIMIT, when it is, and the layout of the columns
+/// What a SELECT's rows carry to its ORDER BY: the layout of the columns
 #[derive(Default)]
 pub(crate) struct SelectShape {
-    deferred: Option<DeferredProjection>,
     layout: Option<LaidOut>,
     /// How many columns the statement shows, when a star leaves that unknown
     /// and the ORDER BY keys follow them
@@ -342,11 +336,10 @@ impl std::ops::Deref for LaidOut {
 }
 
 impl SelectShape {
-    /// The shape of columns laid out as `layout`, with no deferred
-    /// projection; none without a layout, as a statement with no ORDER BY
+    /// The shape of columns laid out as `layout`; none without a layout, as
+    /// a statement with no ORDER BY
     fn laid_out(layout: Option<OutputLayout>) -> Option<Self> {
         layout.map(|layout| Self {
-            deferred: None,
             layout: Some(LaidOut::Built(layout)),
             visible: None,
         })
@@ -386,9 +379,6 @@ type SelectResult = Result<SelectOutput>;
 /// An outer side fetched for a join: the result, its qualified columns,
 /// whether the limit and offset were applied, and the layout of a table
 type OuterFetch = (Box<dyn QueryResult>, Vec<String>, bool, Option<LayoutToken>);
-
-/// The layout a table's rows were read in and the schema they were read with
-type ReadSchema = (LayoutToken, CompactArc<Schema>);
 
 /// How a join reads one of its sides: its conditions as the WHERE gives
 /// them, and the statement's run with the side's number when the blocks
@@ -463,8 +453,7 @@ use super::context::{ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutG
 use super::expr_key::ExprKey;
 use super::expression::SubqueryExecutor;
 use super::expression::{
-    compile_expression, CompileContext, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,
-    ExpressionEval, JoinFilter, RowFilter, SharedProgram,
+    CompileContext, ExecuteContext, ExprCompiler, ExprVM, JoinFilter, RowFilter, SharedProgram,
 };
 use super::hash_table::JoinHashTable;
 use super::join_executor::{JoinExecutor, JoinPath, StatementRun, StreamingJoinRequest};
@@ -474,8 +463,6 @@ use super::operators::index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
 };
 use super::operators::BloomFilterOperator;
-use super::parallel::{self, ParallelConfig};
-use super::planned_aggregate::{bounds, AggregatePlan, AggregateRead};
 use super::planned_join::{pick_index_join_side, JoinShape};
 use super::prepared_join::{
     BuiltPrograms, JoinFilters, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
@@ -484,14 +471,12 @@ use super::prepared_select::{
     ambiguous_column, joined_aliases, mentions_subquery, set_operation_key_column,
     set_operation_key_item, Bound, JoinBlocks, OutOfFamily, PreparedProjection,
 };
-use super::projection::{Concat, Projection};
 use super::pushdown;
 use super::query_cache::{CachedPlanRef, CompiledExecution, NestedPlan};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     AliasedResult, DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, FilteredResult,
-    LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, ProjectionResult,
-    RadixOrderSpec, ScannerResult, TopN, TopNResult,
+    LimitedResult, OrderLimitPath, OrderedResult, ProjectedResult, RadixOrderSpec, TopNResult,
 };
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
@@ -503,15 +488,13 @@ use super::utils::{
     flatten_and_predicates, flip_operator, for_each_qualified_star_column,
     get_table_alias_from_expr, index_join_residual, infix_to_operator, item_name,
     order_by_names_an_alias, qualified, qualified_index, shown_name, split_qualified,
-    star_takes_every_column, string_literal_value, strip_table_qualifier, substitute_filter_column,
-    visit_column_refs, where_without_aggregates,
+    strip_table_qualifier, substitute_filter_column, visit_column_refs, where_without_aggregates,
 };
 use super::volatility::{expression_volatility, statement_constant};
-use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows};
+use super::window::WindowOutput;
 use super::Executor;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
-use crate::planner::distinct_values_column;
 use crate::planner::join::IndexProbe;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
@@ -987,62 +970,6 @@ fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<
     }
 }
 
-// Argument source for inline function evaluation
-#[derive(Debug, Clone)]
-enum ArgSource {
-    Column(usize),
-    Const(Value),
-}
-
-// Simple condition for inline CASE: column comparisons
-#[derive(Debug, Clone)]
-enum CaseCondition {
-    Equals { col_idx: usize, value: Value },
-    NotEquals { col_idx: usize, value: Value },
-    GreaterThan { col_idx: usize, value: Value },
-    GreaterOrEqual { col_idx: usize, value: Value },
-    LessThan { col_idx: usize, value: Value },
-    LessOrEqual { col_idx: usize, value: Value },
-    IsNull { col_idx: usize },
-}
-
-// A single WHEN branch for inline CASE
-#[derive(Debug, Clone)]
-struct CaseBranch {
-    condition: CaseCondition,
-    result: ArgSource,
-}
-
-/// How one SELECT expression of an uncorrelated projection is evaluated
-#[derive(Debug, Clone)]
-enum ExprAction {
-    SimpleColumn(usize),
-    StarExpand,
-    /// The columns a qualified star takes, found once
-    QualifiedStarExpand(Vec<usize>),
-    /// Inline COALESCE - bypasses VM for 7x speedup
-    Coalesce(smallvec::SmallVec<[ArgSource; 4]>),
-    /// Inline CASE - bypasses VM for simple equality/null checks
-    Case {
-        branches: smallvec::SmallVec<[CaseBranch; 4]>,
-        else_result: Option<ArgSource>,
-    },
-    /// Columns, constants and parameters joined by `||`
-    Concat(Concat),
-    Compiled(SharedProgram),
-}
-
-impl ExprAction {
-    /// The action running `program`: a concatenation runs without the VM,
-    /// see [`Concat`]
-    fn of_program(program: SharedProgram) -> Self {
-        match Concat::of(&program) {
-            Some(concat) => ExprAction::Concat(concat),
-            None => ExprAction::Compiled(program),
-        }
-    }
-}
-
 /// How a SELECT list without correlated subqueries projects its input rows
 #[derive(Debug)]
 enum SelectProjection {
@@ -1052,7 +979,6 @@ enum SelectProjection {
     Subset(Vec<usize>),
     /// The columns at these positions, moved; none appears twice
     Take(Vec<usize>),
-    Actions(Vec<ExprAction>),
 }
 
 /// What a projection keeping ORDER BY and DISTINCT ON values reads per row
@@ -1090,34 +1016,6 @@ enum JoinProjection {
     General(OutputProjection),
     /// A SELECT list or ORDER BY holding subqueries the statement's blocks run
     Prepared(PreparedProjection),
-}
-
-/// Each lowercase column name, and each qualified one's bare name, to its position
-fn lower_index_map(
-    all_columns: &[String],
-    all_columns_lower: Option<&[String]>,
-) -> StringMap<usize> {
-    let computed_lower: Vec<String>;
-    let columns_lower: &[String] = match all_columns_lower {
-        Some(lower) => lower,
-        None => {
-            computed_lower = all_columns.iter().map(|c| c.to_lowercase()).collect();
-            &computed_lower
-        }
-    };
-    // Pre-size HashMap to avoid rehashing (estimate 1.5x for qualified names)
-    let mut col_index_map_lower: StringMap<usize> =
-        StringMap::with_capacity(all_columns.len() * 3 / 2);
-    for (i, lower) in columns_lower.iter().enumerate() {
-        col_index_map_lower.insert(lower.clone(), i);
-        // Also add unqualified column names for qualified columns
-        if let Some((_, column_part)) = split_qualified(lower) {
-            col_index_map_lower
-                .entry(column_part.to_string())
-                .or_insert(i);
-        }
-    }
-    col_index_map_lower
 }
 
 /// Where one projected value comes from: a column of the input row, or a
@@ -1164,32 +1062,6 @@ impl RowSink for RowVec {
     #[inline]
     fn put(&mut self, id: i64, row: Row) {
         self.push((id, row));
-    }
-}
-
-/// The rows an ORDER BY LIMIT keeps of a projection; a row it does not
-/// keep lends its storage to the next
-struct TopSink<'t, F: Fn(&Row, &Row) -> Ordering> {
-    top: &'t mut TopN<F>,
-    spare: Option<Row>,
-}
-
-impl<F: Fn(&Row, &Row) -> Ordering> RowSink for TopSink<'_, F> {
-    #[inline]
-    fn storage(&mut self, width: usize) -> CompactVec<Value> {
-        match self.spare.take() {
-            Some(row) => {
-                let mut values = CompactVec::from_vec(row.into_values());
-                values.clear();
-                values
-            }
-            None => CompactVec::with_capacity(width),
-        }
-    }
-
-    #[inline]
-    fn put(&mut self, _id: i64, row: Row) {
-        self.spare = self.top.push(row);
     }
 }
 
@@ -1472,15 +1344,6 @@ impl Executor {
             }
         }
         Ordering::Equal
-    }
-
-    /// Execute a SELECT statement
-    pub(crate) fn execute_select(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.execute_select_with_plan(stmt, ctx, None, None)
     }
 
     /// `ctx` with the snapshot a statement reading its LIMIT or OFFSET
@@ -1866,7 +1729,6 @@ impl Executor {
 
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
-        // The fourth return value contains deferred projection info if applicable
         // A pure UNION ALL without ORDER BY or DISTINCT needs LIMIT + OFFSET
         // rows at most from each branch, so that many bound the first
         // branch and the set operation; the whole is cut below
@@ -1993,7 +1855,6 @@ impl Executor {
             prepared_visible = Some(visible);
             distinct_applied = distinct;
             let shape = SelectShape {
-                deferred: None,
                 layout: layout.map(LaidOut::Shared),
                 visible: None,
             };
@@ -2023,11 +1884,7 @@ impl Executor {
         (written_items, hidden_keys, hidden_windows): (usize, usize, usize),
     ) -> Result<Box<dyn QueryResult>> {
         let (mut result, columns, limit_offset_applied, shape) = executed;
-        let SelectShape {
-            deferred: deferred_projection,
-            layout,
-            visible,
-        } = shape.unwrap_or_default();
+        let SelectShape { layout, visible } = shape.unwrap_or_default();
         let prepared_visible = prepared_visible.or(visible);
 
         // Count expected SELECT columns (before any extra ORDER BY columns).
@@ -2053,10 +1910,9 @@ impl Executor {
         // Beside a star only the rows know the width an ORDER BY position
         // counts in: the columns before those appended for the sort
         if stmt.columns.iter().any(is_star_item) {
-            let width = match (&deferred_projection, expected_columns) {
-                (Some((_, names)), _) => names.len(),
-                (None, 0) => columns.len(),
-                (None, shown) => shown,
+            let width = match expected_columns {
+                0 => columns.len(),
+                shown => shown,
             };
             if let Some(position) = crate::parser::scope::order_position_outside(stmt, Some(width))
             {
@@ -2366,20 +2222,9 @@ impl Executor {
                         offset,
                     )?);
 
-                    // Apply deferred projection if applicable
-                    // This reduces allocations from O(matched_rows) to O(limit)
-                    match deferred_projection {
-                        Some(_) => OrderLimitPath::DeferredProjection.taken(),
-                        None => OrderLimitPath::TopN.taken(),
-                    }
-                    if let Some((col_indices, output_names)) = deferred_projection {
-                        result = Box::new(ProjectionResult::new(
-                            result,
-                            Projection::columns(col_indices),
-                            output_names,
-                        ));
-                    } else if columns.len() > expected_columns && expected_columns > 0 {
-                        // Remove extra ORDER BY columns if needed (no deferred projection)
+                    OrderLimitPath::TopN.taken();
+                    if columns.len() > expected_columns && expected_columns > 0 {
+                        // Remove extra ORDER BY columns if needed
                         result = Box::new(ProjectedResult::new(result, expected_columns));
                     }
 
@@ -2707,115 +2552,16 @@ impl Executor {
             }
         };
 
-        // Execute based on table source type
+        // A statement over one source runs on its plan
         match table_expr {
-            Expression::TableSource(table_source) => {
-                // Check if this is a CTE from context (for subqueries referencing outer CTEs)
-                let table_name = &table_source.name.value_lower;
-                if let Some((columns, rows)) = ctx.get_cte_by_lower(table_name) {
-                    if table_source.as_of.is_some() {
-                        return Err(Self::as_of_not_a_table(table_name));
-                    }
-                    // Execute query against CTE data
-                    // Dereference Arc to get &Vec<(i64, Row)>, then wrap in RowVec
-                    return self.execute_query_on_memory_result(
-                        stmt,
-                        ctx,
-                        columns.to_vec(),
-                        RowVec::from_vec((**rows).clone()),
-                    );
-                }
-
-                // Check if this is actually a view (single lookup, no double RwLock acquisition)
-                if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
-                    if table_source.as_of.is_some() {
-                        return Err(Self::as_of_not_a_table(table_name));
-                    }
-                    return self.execute_view_query(&view_def, stmt, ctx, classification);
-                }
-                self.execute_simple_table_scan(table_source, stmt, ctx, classification, None)
-            }
             Expression::JoinSource(join_source) => {
                 let slot = compiled.map(NestedPlan::slot);
                 self.execute_join_source(join_source, stmt, ctx, classification, slot, false)
             }
-            Expression::SubquerySource(subquery_source) => {
-                let plan = compiled.and_then(|plan| plan.from(stmt));
-                self.execute_subquery_source(subquery_source, stmt, ctx, classification, plan)
-            }
-            Expression::ValuesSource(values_source) => {
-                self.execute_values_source(values_source, stmt, ctx, classification)
-            }
-            Expression::FunctionTableSource(tvf_source) => {
-                self.execute_tvf_source(tvf_source, stmt, ctx, classification)
-            }
-            _ => Err(Error::NotSupported(
-                "Unsupported FROM clause type".to_string(),
+            _ => Err(Error::internal(
+                "a statement over one source ran without its plan",
             )),
         }
-    }
-
-    /// Evaluate a TVF source: look up function, evaluate args, generate rows, determine columns.
-    /// Execute a TVF for use in a join context: generate rows, build qualified columns,
-    /// and apply an optional filter. Shared by execute_table_expression_with_filter
-    /// and execute_table_expression_with_filter_limit.
-    fn execute_tvf_for_join(
-        &self,
-        tvf_source: &FunctionTableSource,
-        ctx: &ExecutionContext,
-        filter: Option<&Expression>,
-        limit: Option<usize>,
-        offset: usize,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
-        // Only push limit to TVF generation when no filter will discard rows afterwards.
-        // With a filter, we must generate all rows first, then filter, then let
-        // downstream processing handle the limit. The flag says whether the
-        // limit and offset were applied here. A filter that keeps no row
-        // generates none.
-        let tvf_limit = match filter {
-            Some(filter) if true_for_no_row(filter, ctx, global_registry()) => Some(0),
-            Some(_) => None,
-            None => limit.map(|l| l.saturating_add(offset)),
-        };
-
-        // Extract range bounds from the filter to narrow TVF generation range.
-        // This avoids materializing millions of rows when a selective predicate exists.
-        let range_hint = filter.and_then(|filter_expr| {
-            let col_name: SmartString = if !tvf_source.column_aliases.is_empty() {
-                tvf_source.column_aliases[0].value_lower.clone()
-            } else {
-                SmartString::from("value")
-            };
-            Self::tvf_range_hint(filter_expr, &col_name, ctx)
-        });
-
-        let (mut result_rows, column_names) =
-            Self::evaluate_tvf_with_range(tvf_source, None, ctx, tvf_limit, range_hint)?;
-
-        let table_alias = tvf_source
-            .alias
-            .as_ref()
-            .map(|a| a.value.to_string())
-            .unwrap_or_else(|| tvf_source.function.value.to_string());
-
-        let qualified_columns: Vec<String> = column_names
-            .iter()
-            .map(|col| qualified(&table_alias, col))
-            .collect();
-
-        if let Some(filter_expr) = filter {
-            let row_filter = RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
-            row_filter.retain_checked(&mut result_rows)?;
-        }
-        let bounded = tvf_limit.is_some();
-        if bounded && offset > 0 {
-            let mut rows = result_rows.into_vec();
-            rows.drain(..offset.min(rows.len()));
-            result_rows = RowVec::from_vec(rows);
-        }
-
-        let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(column_names, result_rows));
-        Ok((result, qualified_columns, bounded))
     }
 
     /// LIMIT + OFFSET of a positive LIMIT, for fetch paths that stop early and
@@ -2825,43 +2571,6 @@ impl Executor {
         let counts = row_counts(stmt, ctx).ok()?;
         let limit = counts.limit.filter(|limit| *limit > 0)?;
         Some(limit.saturating_add(counts.offset))
-    }
-
-    /// Execute a table-valued function source (e.g., generate_series(1, 10))
-    fn execute_tvf_source(
-        &self,
-        tvf_source: &FunctionTableSource,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        classification: &Arc<QueryClassification>,
-    ) -> SelectResult {
-        // Push LIMIT down to TVF generation only when nothing can filter/reshape/reorder:
-        // WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT, aggregation, window functions, set operations
-        let limit_hint = if stmt.where_clause.is_none()
-            && stmt.group_by.columns.is_empty()
-            && stmt.having.is_none()
-            && stmt.order_by.is_empty()
-            && !stmt.distinct
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !classification.has_set_operations
-        {
-            rows_needed(stmt, ctx)
-        } else {
-            None
-        };
-
-        let (result_rows, columns) = self.tvf_rows(
-            tvf_source,
-            None,
-            stmt.where_clause.as_deref(),
-            limit_hint,
-            ctx,
-        )?;
-
-        // Delegate to execute_query_on_memory_result which handles
-        // WHERE, ORDER BY, LIMIT, GROUP BY, aggregation, window functions
-        self.execute_query_on_memory_result(stmt, ctx, columns, result_rows)
     }
 
     /// The rows and columns a TVF source gives a statement whose WHERE is
@@ -3084,33 +2793,6 @@ impl Executor {
         Ok((Box::new(result), columns, false, shape))
     }
 
-    /// Execute a query against in-memory data (for CTEs referenced from context)
-    fn execute_query_on_memory_result(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        columns: Vec<String>,
-        rows: RowVec,
-    ) -> SelectResult {
-        // ORDER BY is the caller's, which binds it by the layout, and so is
-        // LIMIT after it; DISTINCT reads every row before a LIMIT counts them
-        let skip_order_limit = !stmt.order_by.is_empty() || stmt.distinct;
-
-        let (result_cols, result_rows, order_limit_applied, layout) =
-            self.execute_query_on_cte_result_inner(stmt, ctx, columns, rows, skip_order_limit)?;
-        let shape = SelectShape::laid_out(layout);
-        let result_cols = CompactArc::new(result_cols);
-        Ok((
-            Box::new(ExecutorResult::with_arc_columns(
-                CompactArc::clone(&result_cols),
-                result_rows,
-            )),
-            result_cols,
-            order_limit_applied,
-            shape,
-        ))
-    }
-
     /// Check if ORDER BY or DISTINCT ON references columns not in SELECT
     /// OPTIMIZATION: Use HashSet for O(1) lookup and eq_ignore_ascii_case to avoid allocations
     fn order_by_needs_extra_columns(&self, stmt: &SelectStatement, all_columns: &[String]) -> bool {
@@ -3256,96 +2938,6 @@ impl Executor {
         }
     }
 
-    /// Check if deferred projection optimization is applicable.
-    ///
-    /// For ORDER BY + LIMIT queries where SELECT columns are simple column references,
-    /// we can defer projection until after sorting and limiting. This reduces allocations
-    /// from O(matched_rows) to O(limit).
-    ///
-    /// Returns (column_indices, output_column_names) if optimization applies, None otherwise.
-    fn get_deferred_projection_info(
-        &self,
-        stmt: &SelectStatement,
-        source_columns_lower: &[String],
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> Option<(Vec<usize>, Vec<String>)> {
-        // Must have ORDER BY + LIMIT
-        if stmt.order_by.is_empty() || stmt.limit.is_none() {
-            return None;
-        }
-
-        // No aggregation or window functions (these are handled separately)
-        if classification.has_aggregation || classification.has_window_functions {
-            return None;
-        }
-
-        // No DISTINCT — it reads the columns the SELECT asked for, and
-        // deferring the projection would leave it reading the whole source
-        // row, where rows that project alike are still telling apart
-        if classification.has_distinct_on || classification.has_distinct {
-            return None;
-        }
-
-        // ORDER BY columns must exist in source columns (so sorting can happen before projection)
-        for ob in &stmt.order_by {
-            if order_by_names_an_alias(&ob.expression, stmt) {
-                return None;
-            }
-            let col_exists = match &ob.expression {
-                Expression::Identifier(id) => source_columns_lower
-                    .iter()
-                    .any(|c| c == id.value_lower.as_str()),
-                Expression::QualifiedIdentifier(qid) => source_columns_lower
-                    .iter()
-                    .any(|c| c == qid.name.value_lower.as_str()),
-                _ => false, // Complex expression - can't evaluate on source columns
-            };
-            if !col_exists {
-                return None;
-            }
-        }
-
-        // Calculate projection indices - all SELECT columns must be simple column references
-        let mut indices = Vec::with_capacity(stmt.columns.len());
-        let mut output_names = Vec::with_capacity(stmt.columns.len());
-
-        for expr in &stmt.columns {
-            // A star does not benefit; a computed item needs the evaluator
-            let column = match unaliased_item(expr) {
-                Expression::Identifier(id) => id.value_lower.as_str(),
-                Expression::QualifiedIdentifier(qid) => qid.name.value_lower.as_str(),
-                _ => return None,
-            };
-            indices.push(source_columns_lower.iter().position(|c| c == column)?);
-            output_names.push(item_name(expr));
-        }
-
-        Some((indices, output_names))
-    }
-
-    /// The answer of a DISTINCT statement the plan's rule reads the distinct
-    /// values of, for one run without a plan; None when the rule does not
-    /// take it or the table keeps no values to read
-    fn distinct_values_answer(
-        table: &dyn crate::storage::traits::Table,
-        stmt: &SelectStatement,
-        classification: &QueryClassification,
-    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
-        let Some(column) = distinct_values_column(stmt, classification, table.schema()) else {
-            return Ok(None);
-        };
-        let Some(values) = Self::distinct_column_values(table, &column)? else {
-            return Ok(None);
-        };
-        let rows: RowVec = values
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (i as i64, Row::from_values(vec![v])))
-            .collect();
-        let name = item_name(&stmt.columns[0]);
-        Ok(Some(Box::new(ExecutorResult::new(vec![name], rows))))
-    }
-
     /// The distinct values of `column`, lowercase, the table keeps in its
     /// index or volumes; None when it keeps none
     pub(crate) fn distinct_column_values(
@@ -3470,7 +3062,7 @@ impl Executor {
         table_name: &str,
         ctx: &ExecutionContext,
     ) -> Option<super::semantic_cache::CacheStamp> {
-        self.semantic_cache_stamp(table_name, ctx.scan_view(table_name), |_| ())
+        self.semantic_cache_stamp(table_name, ctx.statement_view(), |_| ())
             .map(|(stamp, ())| stamp)
     }
 
@@ -3606,932 +3198,6 @@ impl Executor {
         }
     }
 
-    /// A table scan's rows projected by the SELECT list, the names of the
-    /// output columns and, for an ORDER BY, their layout; with `order_by_extra`, the ORDER BY
-    /// columns the list lacks follow, for execute_select to sort by and drop.
-    /// True when only the rows an ORDER BY LIMIT keeps were kept, in order
-    #[allow(clippy::too_many_arguments)]
-    fn project_scanned_rows(
-        &self,
-        stmt: &SelectStatement,
-        rows: RowVec,
-        all_columns: &CompactArc<Vec<String>>,
-        all_columns_lower: &[String],
-        table_alias: Option<&str>,
-        order_by_extra: bool,
-        ctx: &ExecutionContext,
-    ) -> Result<(RowVec, Vec<String>, Option<OutputLayout>, bool)> {
-        let mut output_columns =
-            self.get_output_column_names(&stmt.columns, all_columns, table_alias);
-        if order_by_extra {
-            let (plan, extra_names, layout) = self.ordered_projection(
-                &stmt.columns,
-                &stmt.order_by,
-                &stmt.distinct_on,
-                stmt.table_expr.as_deref(),
-                all_columns,
-                table_alias,
-            );
-            output_columns.extend(extra_names);
-            let plan = OutputProjection::Ordered(plan);
-            let (projected_rows, applied) =
-                self.run_output_projection(stmt, &plan, rows, &output_columns, Some(&layout), ctx)?;
-            return Ok((projected_rows, output_columns, Some(layout), applied));
-        }
-        let layout = Self::shared_output_layout(stmt, all_columns, table_alias);
-        let plan = OutputProjection::Select(self.select_projection(
-            &stmt.columns,
-            all_columns,
-            Some(all_columns_lower),
-            table_alias,
-        )?);
-        let (projected_rows, applied) =
-            self.run_output_projection(stmt, &plan, rows, &output_columns, layout.as_ref(), ctx)?;
-        Ok((projected_rows, output_columns, layout, applied))
-    }
-
-    /// The rows `plan` projects of `columns`, or only those the statement's
-    /// ORDER BY LIMIT keeps, in order, when its sort reads them alone; true then
-    fn run_output_projection(
-        &self,
-        stmt: &SelectStatement,
-        plan: &OutputProjection,
-        rows: RowVec,
-        columns: &[String],
-        layout: Option<&OutputLayout>,
-        ctx: &ExecutionContext,
-    ) -> Result<(RowVec, bool)> {
-        let Some(mut top) = self.projected_top(stmt, columns, layout, ctx)? else {
-            let rows = match plan {
-                OutputProjection::Select(plan) => Self::run_select_projection(plan, rows, ctx)?,
-                OutputProjection::Ordered(plan) => Self::run_ordered_projection(plan, rows, ctx)?,
-            };
-            return Ok((rows, false));
-        };
-        OrderLimitPath::ProjectedTop.taken();
-        let mut kept = TopSink {
-            top: &mut top,
-            spare: None,
-        };
-        match plan {
-            OutputProjection::Select(plan) => {
-                Self::project_select_into(plan, rows, ctx, &mut kept)?
-            }
-            OutputProjection::Ordered(plan) => {
-                Self::project_ordered_into(plan, rows, ctx, &mut kept)?
-            }
-        }
-        Ok((top.into_row_vec(), true))
-    }
-
-    /// A table scan's answer when no row can match: no rows, taking the
-    /// aggregate, window or projection path scanned rows would take
-    #[allow(clippy::too_many_arguments)]
-    fn finish_without_rows(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        all_columns: &CompactArc<Vec<String>>,
-        all_columns_lower: &[String],
-        table_alias: Option<&str>,
-        classification: &QueryClassification,
-    ) -> SelectResult {
-        let (result, layout) = match (
-            classification.has_aggregation,
-            classification.has_window_functions,
-        ) {
-            (false, false) => {
-                let (rows, columns, layout, applied) = self.project_scanned_rows(
-                    stmt,
-                    RowVec::new(),
-                    all_columns,
-                    all_columns_lower,
-                    table_alias,
-                    self.order_by_needs_extra_columns(stmt, all_columns),
-                    ctx,
-                )?;
-                let columns = CompactArc::new(columns);
-                let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
-                return Ok((
-                    Box::new(result),
-                    columns,
-                    applied,
-                    SelectShape::laid_out(layout),
-                ));
-            }
-            _ => self.group_and_window_rows(
-                stmt,
-                ctx,
-                classification,
-                RowVec::new(),
-                all_columns,
-                |out| Self::shared_result_layout(stmt, all_columns, table_alias, out),
-                None,
-            )?,
-        };
-        let columns = CompactArc::new(result.columns().to_vec());
-        Ok((result, columns, false, SelectShape::laid_out(layout)))
-    }
-
-    /// Execute a simple table scan
-    fn execute_simple_table_scan(
-        &self,
-        table_source: &SimpleTableSource,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-        read_out: Option<&mut Option<ReadSchema>>,
-    ) -> SelectResult {
-        // A table read AS OF is a row source, read once for the statement
-        if let Some(as_of) = &table_source.as_of {
-            let (columns, rows) = self.as_of_rows(&table_source.name.value_lower, as_of, ctx)?;
-            return self.execute_query_on_memory_result(stmt, ctx, columns, rows);
-        }
-        // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
-        let table_name = &table_source.name.value_lower;
-
-        // Check if there's an active explicit transaction
-        let active_tx = self.active_transaction.lock().unwrap();
-        let in_explicit_transaction = active_tx.is_some();
-
-        // Only a cacheable SELECT * takes a stamp: no transaction, parameters
-        // or row-shaping clauses, and a view that sees the stamped state.
-        // Taken before the transaction or snapshot the scan reads under, so
-        // a cached result is never older than its stamp
-        let cacheable = !in_explicit_transaction
-            && Self::semantic_writable(stmt, ctx, classification, table_source);
-        let cache_stamp = match cacheable {
-            true => self.semantic_write_stamp(table_name, ctx),
-            false => None,
-        };
-        // The statement's start looked the cache up and simplified the WHERE
-        let early_miss = ctx.semantic_miss(stmt).filter(|_| cacheable);
-
-        // Get table from active transaction or create a new one
-        let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
-            // Use the active transaction - this allows seeing uncommitted changes
-            let table = tx_state
-                .transaction
-                .get_read_table_at(table_name, ctx.scan_view(table_name), ctx.table_use())
-                .map_err(|e| {
-                    if matches!(e, Error::TableNotFound(_)) {
-                        Error::TableOrViewNotFound(table_name.to_string())
-                    } else {
-                        e
-                    }
-                })?;
-            drop(active_tx); // Release lock before doing work
-            (table, None)
-        } else {
-            drop(active_tx); // Release lock before creating new transaction
-                             // No active transaction: a statement-scoped snapshot, when the
-                             // statement carries one, keeps every fetch on one transaction;
-                             // otherwise a standalone transaction
-            if let Some(snapshot) = ctx.statement_snapshot() {
-                let table = snapshot
-                    .statement_table_at(table_name, ctx.scan_view(table_name))
-                    .map_err(|e| {
-                        if matches!(e, Error::TableNotFound(_)) {
-                            Error::TableOrViewNotFound(table_name.to_string())
-                        } else {
-                            e
-                        }
-                    })?;
-                (table, None)
-            } else {
-                let tx = self.begin_transaction()?;
-
-                // The transaction is this read's own
-                let table = tx
-                    .get_read_table_at(table_name, ctx.scan_view(table_name), TableUse::Read)
-                    .map_err(|e| {
-                        if matches!(e, Error::TableNotFound(_)) {
-                            Error::TableOrViewNotFound(table_name.to_string())
-                        } else {
-                            e
-                        }
-                    })?;
-                (table, Some(tx))
-            }
-        };
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::select_table_opened();
-        // The layout this handle's reads are checked against, and its schema
-        if let Some(out) = read_out {
-            *out = Some((table.layout_token(), table.schema_arc()));
-        }
-
-        // Build column list from schema: refcount bump, not a per-statement
-        // deep clone of every column name
-        let all_columns = table.schema().column_names_arc();
-        // Get pre-cached lowercase column names to avoid per-query to_lowercase() calls
-        let all_columns_lower = table.schema().column_names_lower_arc();
-
-        // Get table alias for correlated subquery support
-        let table_alias: Option<String> = table_source
-            .alias
-            .as_ref()
-            .map(|a| a.value_lower.to_string())
-            .or_else(|| Some(table_name.to_string()));
-        // The shape of a result this scan answers whole, for its ORDER BY
-        let shape_of = |columns: &[String]| {
-            SelectShape::laid_out(Self::shared_result_layout(
-                stmt,
-                &all_columns,
-                table_alias.as_deref(),
-                columns,
-            ))
-        };
-
-        // classification is passed from caller to avoid redundant cache lookups
-
-        // A WHERE that keeps no row reads no row; one with a subquery is
-        // left to the scan
-        if let Some(where_clause) = stmt.where_clause.as_deref().filter(|w| {
-            !classification.where_has_subqueries && true_for_no_row(w, ctx, global_registry())
-        }) {
-            Self::bind_empty_where(stmt, where_clause, &all_columns)?;
-            return self.finish_without_rows(
-                stmt,
-                ctx,
-                &all_columns,
-                &all_columns_lower,
-                table_alias.as_deref(),
-                classification,
-            );
-        }
-
-        // AGGREGATION PUSHDOWN: Try to compute simple aggregates directly on storage
-        // This avoids all row materialization for queries like:
-        // - SELECT COUNT(*) FROM table
-        // - SELECT SUM(col), MIN(col), MAX(col) FROM table
-        // Must check before any row collection happens
-        if classification.has_aggregation && !classification.has_window_functions {
-            // One row or the groups, from the source the rules pick
-            let indexed = |column: &str| bounds(table.get_index_on_column(column));
-            let run = (ctx, true);
-            let plan =
-                self.aggregate_read_plan(stmt, classification, run, table.schema(), indexed)?;
-            let result = match &plan {
-                Some(
-                    plan @ AggregatePlan {
-                        read: AggregateRead::Global { .. },
-                        ..
-                    },
-                ) => {
-                    let run = (classification.as_ref(), plan);
-                    self.global_aggregate(table.as_ref(), stmt, run, ctx)?
-                }
-                Some(AggregatePlan {
-                    aggregations,
-                    read:
-                        AggregateRead::Grouped {
-                            source,
-                            group: (group, at),
-                            walks,
-                        },
-                    ..
-                }) => {
-                    let read = (*source, (group.as_str(), *at), *walks);
-                    let calls = aggregations.as_slice();
-                    let run = (ctx, None);
-                    self.grouped_aggregate(table.as_ref(), stmt, calls, read, run, &all_columns)?
-                }
-                None => None,
-            };
-            if let Some(result) = result {
-                let columns = CompactArc::new(result.columns().to_vec());
-                let shape = shape_of(&columns);
-                return Ok((result, columns, false, shape));
-            }
-        }
-
-        // A DISTINCT the plan's rule takes reads its column's distinct values
-        if classification.has_distinct {
-            if let Some(result) =
-                Self::distinct_values_answer(table.as_ref(), stmt, classification)?
-            {
-                let columns = CompactArc::new(result.columns().to_vec());
-                let shape = shape_of(&columns);
-                return Ok((result, columns, false, shape));
-            }
-        }
-
-        // Check if we need aggregation/window functions (need all columns)
-        let needs_all_columns =
-            classification.has_aggregation || classification.has_window_functions;
-
-        // Check if ORDER BY references columns not in SELECT
-        let order_by_needs_extra_columns = self.order_by_needs_extra_columns(stmt, &all_columns);
-
-        // Build alias map from SELECT columns for alias substitution in WHERE clause.
-        // Exclude aliases that shadow real table columns (WHERE references columns, not aliases).
-        let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(&all_columns));
-
-        // Note: Projection pushdown was found to be SLOWER due to extra allocations
-        // We now always fetch all columns and project in the executor
-        let _ = needs_all_columns; // Silence unused warning - kept for documentation
-
-        // The WHERE the scan pushes down, which the statement's start may have
-        // simplified already
-        let early = early_miss.filter(|_| alias_map.is_empty() && stmt.where_clause.is_some());
-        let rewritten_where = match early {
-            Some(_) => None,
-            None => Self::scan_where(stmt, &alias_map),
-        };
-        let where_to_use: Option<&Expression> = rewritten_where
-            .as_deref()
-            .or_else(|| early.and_then(|miss| miss.simplified.as_deref()))
-            .or(stmt.where_clause.as_deref());
-
-        // SEMANTIC CACHE: a stamp exists only for an eligible query
-        let cache_eligible = cache_stamp.is_some() && where_to_use.is_some();
-
-        // Try cache lookup for eligible queries the statement's start did not
-        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && early_miss.is_none()) {
-            if let Some(where_expr) = where_to_use {
-                if let Some((result, output_columns)) = self.semantic_cache_answer(
-                    table_name,
-                    stmt,
-                    &all_columns,
-                    table_alias.as_deref(),
-                    where_expr,
-                    classification.where_has_parameters.then(|| ctx.params()),
-                    stamp,
-                )? {
-                    let shape = shape_of(&output_columns);
-                    return Ok((result, output_columns, false, shape));
-                }
-            }
-        }
-
-        let (storage_expr, needs_memory_filter) = if let Some(where_expr) = where_to_use {
-            // Try PARTIAL PUSHDOWN: Extract pushable conjuncts from the WHERE clause.
-            // This allows queries like `WHERE indexed_col = 5 AND complex_func(x) > 0`
-            // to use the index for `indexed_col = 5` while filtering `complex_func(x) > 0` in memory.
-            pushdown::try_pushdown(where_expr, table.schema(), Some(ctx))
-        } else {
-            (None, false)
-        };
-
-        // ZONE MAP PRUNING: Short-circuit if zone maps indicate no rows can match
-        // This checks min/max statistics per segment to skip entire scan when
-        // the WHERE clause predicates are outside all segment ranges
-        // IMPORTANT: Don't short-circuit if we have aggregation, window functions, or GROUP BY
-        // because aggregation on empty results needs to produce output (e.g., COUNT=0)
-        let has_aggregation_or_grouping = classification.has_aggregation
-            || classification.has_window_functions
-            || classification.has_group_by;
-
-        if !has_aggregation_or_grouping {
-            if let Some(ref expr) = storage_expr {
-                if self
-                    .get_query_planner()
-                    .can_prune_entire_scan(&*table, expr.as_ref())
-                {
-                    return self.finish_without_rows(
-                        stmt,
-                        ctx,
-                        &all_columns,
-                        &all_columns_lower,
-                        table_alias.as_deref(),
-                        classification,
-                    );
-                }
-            }
-        }
-
-        // FAST PATH: IN list literal index optimization
-        // For queries like `SELECT * FROM table WHERE id IN (1, 2, 3, 5, 8)`
-        // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows.
-        // Tried even when the IN list pushed down: pushdown turns it into a
-        // min..max range, which on spread-out values scans the whole table.
-        // Tried for every primary-key IN list, since pushdown would turn it
-        // into a min..max range; for other indexed columns only when a memory
-        // filter is needed anyway. Left to the normal pipeline: aggregation
-        // and window functions (this projection cannot compile them) and an
-        // ORDER BY key that is not projected (the sorter would not find it).
-        if !classification.has_group_by
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !order_by_needs_extra_columns
-        {
-            if let Some(where_expr) = where_to_use {
-                if let Some((result, columns, limit_applied)) = self
-                    .try_in_list_index_optimization(
-                        stmt,
-                        where_expr,
-                        &*table,
-                        &all_columns,
-                        table_alias.as_deref(),
-                        ctx,
-                        classification,
-                        needs_memory_filter,
-                    )?
-                {
-                    let shape = shape_of(&columns);
-                    return Ok((result, columns, limit_applied, shape));
-                }
-            }
-        }
-
-        // FAST PATH: LIMIT pushdown optimization
-        // For simple queries like `SELECT * FROM table LIMIT 10` or
-        // `SELECT * FROM table WHERE indexed_col = value LIMIT 10` without ORDER BY,
-        // we can stop scanning early at the storage layer
-        let can_pushdown_limit = classification.has_limit
-            && !classification.has_order_by
-            && !classification.has_group_by
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !classification.has_distinct
-            && !needs_memory_filter; // Allow with storage_expr (WHERE on indexed columns)
-
-        if can_pushdown_limit {
-            let counts = row_counts(stmt, ctx)?;
-            let (limit, offset) = (counts.limit.unwrap_or(usize::MAX), counts.offset);
-
-            // Pass storage_expr to filter while scanning with limit
-            // Use unordered version since ORDER BY is already confirmed empty by can_pushdown_limit
-            // This enables true early termination without sorting overhead
-            // Now returns RowVec directly with row IDs preserved
-            let plan = storage_expr
-                .as_deref()
-                .and_then(|e| table.limited_index_plan(e));
-            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            let rows = table.collect_access_rows_with_limit_unordered(
-                access,
-                storage_expr.as_deref(),
-                limit,
-                offset,
-            )?;
-
-            // Project rows according to SELECT expressions
-            // Note: collect_rows_with_limit always returns full rows (all columns),
-            // so we must always project here regardless of scanner_handled_projection
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                rows,
-                &all_columns,
-                Some(&all_columns_lower),
-                ctx,
-                table_alias.as_deref(),
-            )?;
-            let output_columns = CompactArc::new(self.get_output_column_names(
-                &stmt.columns,
-                &all_columns,
-                table_alias.as_deref(),
-            ));
-
-            let result = ExecutorResult::with_arc_columns(
-                CompactArc::clone(&output_columns),
-                projected_rows,
-            );
-            // LIMIT/OFFSET already applied at storage level
-            return Ok((Box::new(result), output_columns, true, None));
-        }
-
-        // STREAMING PATH: For simple queries without aggregation/window/ORDER BY
-        // Use streaming result to avoid materializing all rows into Vec
-        //
-        // For cache-eligible queries, we disable streaming ONLY if the table is small
-        // enough to potentially benefit from caching. Large tables (>100K rows) would
-        // exceed the cache limit anyway, so we allow streaming for them.
-        //
-        // OPTIMIZATION: Use row_count_hint() which is O(1) instead of row_count() which
-        // is O(n) with visibility checks. The hint returns an upper bound (versions.len())
-        // which is safe for this decision - if hint > threshold, actual count is also large.
-        let should_disable_streaming_for_cache = cache_eligible && Self::semantic_rows_fit(&*table);
-
-        let can_use_streaming = !classification.has_order_by
-            && !classification.has_group_by
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !order_by_needs_extra_columns
-            && !should_disable_streaming_for_cache; // Only disable streaming for small cacheable queries
-
-        // CRITICAL OPTIMIZATION: When needs_memory_filter is true AND we have LIMIT,
-        // skip the streaming path. The streaming path pre-materializes ALL rows from
-        // storage (via collect_visible_rows) before FilteredResult applies the filter.
-        // This defeats early termination for LIMIT queries.
-        // Fall through to the parallel/sequential path which has proper early termination.
-        let skip_streaming_for_memory_filter_with_limit =
-            needs_memory_filter && stmt.limit.is_some() && stmt.order_by.is_empty();
-
-        if can_use_streaming && !skip_streaming_for_memory_filter_with_limit {
-            // A SELECT list without a block streams
-            if !classification.select_has_scalar_subqueries {
-                let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-                // A table that reads by need materializes only the columns
-                // the statement names
-                let needed = (table.narrows_scans() && !classification.where_has_subqueries)
-                    .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
-                    .flatten();
-                let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
-                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                let scanner = table.scan_access(
-                    access,
-                    &column_idx_vec,
-                    needed.as_deref(),
-                    storage_expr.as_deref(),
-                )?;
-
-                let mut result: Box<dyn QueryResult> =
-                    Box::new(ScannerResult::new(scanner, all_columns.clone()));
-
-                // If we need memory filtering (complex WHERE that couldn't be pushed down)
-                if needs_memory_filter {
-                    if let Some(where_expr) = where_to_use {
-                        let filter = RowFilter::new(where_expr, &all_columns)?.with_context(ctx);
-                        result = Box::new(FilteredResult::from_filter(result, filter));
-                    }
-                }
-
-                // A lone star is the scan's own rows, under the schema's names
-                if matches!(stmt.columns.as_slice(), [Expression::Star(_)]) {
-                    let shape = shape_of(&all_columns);
-                    return Ok((result, all_columns, false, shape));
-                }
-                let projection =
-                    Projection::compile(&stmt.columns, &all_columns, table_alias.as_deref())?;
-                let output_columns = CompactArc::new(self.get_output_column_names(
-                    &stmt.columns,
-                    &all_columns,
-                    table_alias.as_deref(),
-                ));
-                // The scan's own rows, under their own names, need no projection
-                if !(projection.is_columns_in_order(all_columns.len())
-                    && *output_columns == all_columns[..])
-                {
-                    result = Box::new(
-                        ProjectionResult::new(result, projection, (*output_columns).clone())
-                            .with_context(ctx),
-                    );
-                }
-                // LIMIT/OFFSET NOT applied yet - streaming path
-                let shape = shape_of(&output_columns);
-                return Ok((result, output_columns, false, shape));
-            }
-        }
-
-        // Collect rows - choose optimal path based on query type
-        // PARALLEL EXECUTION: Use parallel filtering for large datasets
-        let parallel_config = ParallelConfig::default();
-
-        let rows_result = if let Some(where_expr) = where_to_use.filter(|_| needs_memory_filter) {
-            // Path 1: Need in-memory filtering (complex expressions)
-            // For memory filter, we need all columns to evaluate the WHERE clause
-            let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-            let needed = (table.narrows_scans()
-                && !classification.has_window_functions
-                && !classification.select_has_scalar_subqueries
-                && !classification.where_has_subqueries)
-                .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
-                .flatten();
-
-            // EARLY TERMINATION: For LIMIT queries without ORDER BY, GROUP BY,
-            // aggregation, or window functions, use streaming filter with early
-            // termination. This is critical for NOT IN performance.
-            let can_early_terminate = !classification.has_order_by
-                && !classification.has_group_by
-                && !classification.has_aggregation
-                && !classification.has_window_functions
-                && !stmt.distinct
-                && stmt.distinct_on.is_empty();
-
-            let early_termination_target = if can_early_terminate {
-                let counts = row_counts(stmt, ctx)?;
-                counts.limit.map(|limit| (counts.offset, limit))
-            } else {
-                None
-            };
-
-            // Use early termination path if we have a target
-            if let Some((early_offset, early_limit)) = early_termination_target {
-                let target = early_offset.saturating_add(early_limit);
-                // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
-                // with early termination. We fetch in batches to avoid loading
-                // all rows when only a few are needed.
-                let mut result_rows = RowVec::with_capacity(target.min(1000));
-                let plan = storage_expr
-                    .as_deref()
-                    .and_then(|e| table.limited_index_plan(e));
-                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-
-                if needs_memory_filter {
-                    // PARTIAL PUSHDOWN: Storage handles some filtering, memory handles rest.
-                    // Use batched fetching with increasing batch sizes to minimize work.
-                    let mut batch_size = target.max(100); // Start with at least target rows
-                    let mut offset = 0usize;
-
-                    // Pre-compile filter ONCE outside the loop
-                    let mut memory_eval =
-                        ExpressionEval::compile(where_expr, &all_columns)?.with_context(ctx);
-
-                    loop {
-                        // Fetch batch from storage with storage filter + limit
-                        // Now returns RowVec directly with row IDs preserved
-                        let batch = table.collect_access_rows_with_limit(
-                            access,
-                            storage_expr.as_deref(),
-                            batch_size,
-                            offset,
-                        )?;
-
-                        if batch.is_empty() {
-                            break; // No more rows from storage
-                        }
-
-                        // Apply full WHERE filter (includes both pushed and non-pushed parts)
-                        for (row_id, row) in batch {
-                            if memory_eval.eval_bool_checked(&row)? {
-                                result_rows.push((row_id, row));
-                                if result_rows.len() >= target {
-                                    break;
-                                }
-                            }
-                        }
-
-                        if result_rows.len() >= target {
-                            break; // Got enough rows
-                        }
-
-                        // Need more rows - increase batch size and offset
-                        offset += batch_size;
-                        batch_size *= 2; // Exponential backoff
-                    }
-                } else {
-                    // NO MEMORY FILTER NEEDED: Full filter pushed to storage.
-                    // Use storage-level limit directly. Returns RowVec directly.
-                    result_rows = table.collect_access_rows_with_limit(
-                        access,
-                        storage_expr.as_deref(),
-                        target,
-                        0,
-                    )?;
-                }
-
-                // The rows OFFSET skips were collected too; drop them and cut to
-                // LIMIT here, since this path reports both as applied
-                let mut trimmed = result_rows.into_vec();
-                trimmed.drain(..early_offset.min(trimmed.len()));
-                trimmed.truncate(early_limit);
-                let result_rows = RowVec::from_vec(trimmed);
-                // Project rows and return early - LIMIT/OFFSET already applied
-                let projected_rows = self.project_rows_with_alias(
-                    &stmt.columns,
-                    result_rows,
-                    &all_columns,
-                    Some(&all_columns_lower),
-                    ctx,
-                    table_alias.as_deref(),
-                )?;
-                let output_columns = CompactArc::new(self.get_output_column_names(
-                    &stmt.columns,
-                    &all_columns,
-                    table_alias.as_deref(),
-                ));
-                let result = ExecutorResult::with_arc_columns(
-                    CompactArc::clone(&output_columns),
-                    projected_rows,
-                );
-                return Ok((Box::new(result), output_columns, true, None)); // true = LIMIT applied
-            }
-
-            // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
-            // Without a storage filter there is no index opportunity,
-            // so the table hands back the materialized RowVec directly
-            // (with real row ids) instead of a per-row scanner drain.
-            // With one, the access rule picks the scan's keys or indexes.
-            let all_rows = if storage_expr.is_none() {
-                table.collect_all_rows(None)?
-            } else {
-                let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
-                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                let mut scanner = table.scan_access(
-                    access,
-                    &column_idx_vec,
-                    needed.as_deref(),
-                    storage_expr.as_deref(),
-                )?;
-                let mut all_rows = RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
-                while scanner.next() {
-                    all_rows.push(scanner.take_row_with_id());
-                }
-                if let Some(error) = scanner.err() {
-                    return Err(error.clone());
-                }
-                all_rows
-            };
-
-            // Apply parallel filtering if we have enough rows
-            // CRITICAL: Propagate errors with ? instead of silently swallowing them
-            let filtered = parallel::parallel_filter(
-                all_rows,
-                where_expr,
-                &all_columns,
-                global_registry(),
-                &parallel_config,
-                ctx,
-            )?;
-            (filtered, None, None)
-        } else if storage_expr.is_some() {
-            // Path 2: WHERE clause with pushdown - use scanner for index optimization
-            // Note: We fetch all columns here because downstream projection uses all_columns indices
-            let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-            // A table that reads by need materializes only the columns the
-            // statement names; anything a name cannot stand for reads all
-            let needed = (table.narrows_scans()
-                && !classification.has_window_functions
-                && !classification.select_has_scalar_subqueries
-                && !classification.where_has_subqueries)
-                .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
-                .flatten();
-            let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
-            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            let mut scanner = table.scan_access(
-                access,
-                &column_idx_vec,
-                needed.as_deref(),
-                storage_expr.as_deref(),
-            )?;
-
-            // OPTIMIZATION: Use take_row() to avoid cloning each row
-            // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
-            let mut rows = RowVec::with_capacity(64);
-            let mut row_count = 0u64;
-            while scanner.next() {
-                row_count += 1;
-                if row_count.is_multiple_of(100) {
-                    ctx.check_cancelled()?;
-                }
-                rows.push((row_count as i64, scanner.take_row()));
-            }
-            if let Some(e) = scanner.err() {
-                return Err(e.clone());
-            }
-            (rows, None, None)
-        } else {
-            // Path 3: Full scan without WHERE - use collect_all_rows
-            // Projection is handled later by the executor which is more efficient
-            //
-            // Window functions read through an index as the plan's rule
-            // chooses, else every row
-            let read = (classification.has_window_functions && !classification.has_aggregation)
-                .then(|| {
-                    Self::window_read(
-                        stmt,
-                        table.schema(),
-                        |column| table.get_index_on_column(column).is_some(),
-                        false,
-                    )
-                })
-                .flatten();
-            let rows = match read {
-                Some(read) => {
-                    let plan = (stmt, None, None);
-                    self.read_window_rows(&read, plan, ctx, table.as_ref(), &all_columns)?
-                }
-                None => None,
-            };
-            match rows {
-                Some(WindowRows::Answer(result)) => {
-                    let columns = CompactArc::new(result.columns().to_vec());
-                    return Ok((result, columns, false, None));
-                }
-                Some(WindowRows::Rows(rows, sorted, grouped)) => (rows, sorted, grouped),
-                None => (table.collect_all_rows(None)?, None, None),
-            }
-        };
-
-        // Destructure: rows and optional window optimization states
-        let (rows, window_presorted_state, window_pregrouped_state): (
-            RowVec,
-            Option<WindowPreSortedState>,
-            Option<WindowPreGroupedState>,
-        ) = rows_result;
-
-        // Record cardinality feedback for future estimate improvements
-        // This helps the optimizer learn from actual query execution
-        if let Some(where_expr) = where_to_use {
-            let actual_rows = rows.len() as u64;
-            // Only record feedback if we have a meaningful predicate and enough rows
-            if actual_rows >= 10 || rows.is_empty() {
-                if let Some(estimated_rows) = self
-                    .get_query_planner()
-                    .estimate_scan_rows(table_name, Some(where_expr))
-                {
-                    self.get_query_planner().record_feedback(
-                        table_name,
-                        where_expr,
-                        None, // Column-specific feedback not yet implemented
-                        estimated_rows,
-                        actual_rows,
-                    );
-                }
-            }
-        }
-
-        // Handle the combination of window functions and aggregation
-        // Order: Aggregation first (GROUP BY), then window functions
-        let has_window = classification.has_window_functions;
-        let has_agg = classification.has_aggregation;
-
-        if has_agg {
-            let layout = |out: &[String]| {
-                Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out)
-            };
-            let (result, layout) = self.group_and_window_rows(
-                stmt,
-                ctx,
-                classification,
-                rows,
-                &all_columns,
-                layout,
-                None,
-            )?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Check if we need window functions only (no aggregation)
-        if has_window {
-            let (result, layout) = self.window_over(
-                stmt,
-                ctx,
-                (&rows, &all_columns),
-                (window_presorted_state, window_pregrouped_state),
-                (None, None),
-            )?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Project rows according to SELECT expressions
-        // Check if deferred projection is applicable (ORDER BY + LIMIT with simple columns)
-        // This reduces allocations from O(matched_rows) to O(limit)
-        let deferred_projection_info =
-            self.get_deferred_projection_info(stmt, &all_columns_lower, classification);
-
-        let (projected_rows, output_columns, shape, applied) = match deferred_projection_info {
-            Some((col_indices, output_names)) if !order_by_needs_extra_columns => {
-                // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
-                // Return all source columns; projection will be applied after TopNResult
-                (
-                    rows,
-                    all_columns.to_vec(),
-                    SelectShape {
-                        deferred: Some((col_indices, output_names)),
-                        layout: Some(LaidOut::Built(OutputLayout::of_shared_input(&all_columns))),
-                        visible: None,
-                    },
-                    false,
-                )
-            }
-            _ => {
-                let (projected_rows, output_columns, layout, applied) = self.project_scanned_rows(
-                    stmt,
-                    rows,
-                    &all_columns,
-                    &all_columns_lower,
-                    table_alias.as_deref(),
-                    order_by_needs_extra_columns,
-                    ctx,
-                )?;
-                (
-                    projected_rows,
-                    output_columns,
-                    SelectShape::laid_out(layout).unwrap_or_default(),
-                    applied,
-                )
-            }
-        };
-
-        // SEMANTIC CACHE: Insert result for eligible queries
-        // For SELECT * queries, cache the raw rows before returning
-        //
-        // Note: The cache stores Vec<Row>, so we extract rows from RowVec for caching.
-        // The result keeps the original RowVec.
-        // Skip caching when deferred projection is used (rows are not projected yet)
-        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && shape.deferred.is_none()) {
-            if let Some(where_expr) = where_to_use {
-                self.semantic_write(
-                    table_name,
-                    &all_columns,
-                    projected_rows.rows(),
-                    where_expr,
-                    classification.where_has_parameters.then(|| ctx.params()),
-                    stamp,
-                );
-            }
-        }
-
-        let output_columns = CompactArc::new(output_columns);
-        let result =
-            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, applied, Some(shape)))
-    }
-
     /// Execute a JOIN source. A GROUP BY + LIMIT join reads its left side in
     /// chunks, each group from one left row: while the groups fall short of
     /// the ones the statement wants and a chunk came full, the next chunk is
@@ -4644,10 +3310,6 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<std::sync::Arc<PreparedJoin>> {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return None;
-        }
         let epoch = self.engine.schema_epoch();
         let current = |guard: &CompiledExecution| match guard {
             CompiledExecution::PreparedJoin(held)
@@ -4866,10 +3528,6 @@ impl Executor {
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         sides: Option<&JoinSides>,
     ) -> std::result::Result<(), OutOfFamily> {
-        #[cfg(feature = "test-failpoints")]
-        if crate::test_failpoints::prepared_families_off() {
-            return Err("a test refusing the prepared families");
-        }
         let Some(sides @ [left, right]) = sides else {
             return Err("a side not named before it is read");
         };
@@ -4993,7 +3651,15 @@ impl Executor {
             Some((blocks, cross)) => blocks.compile(cross, false, global_registry()),
             None => {
                 let resolved = Self::with_select_aliases(stmt, cross, all_columns);
-                compile_expression(resolved.as_ref().unwrap_or(cross), all_columns)
+                let cross = resolved.as_ref().unwrap_or(cross);
+                super::aggregation::compile_over_slots(
+                    cross,
+                    all_columns,
+                    global_registry(),
+                    None,
+                    false,
+                    None,
+                )
             }
         };
         match prepared {
@@ -5914,10 +4580,9 @@ impl Executor {
                         combined
                             .map(|expr| match blocks.as_deref() {
                                 Some(blocks) => blocks.compile(&expr, true, global_registry()),
-                                None => {
-                                    JoinFilter::new(&expr, left_cols, right_cols, global_registry())
-                                        .map(|f| CompactArc::clone(f.program()))
-                                }
+                                None => super::aggregation::compile_over_pair(
+                                    &expr, left_cols, right_cols,
+                                ),
                             })
                             .into_iter()
                             .collect()
@@ -6418,8 +5083,6 @@ impl Executor {
                             final_rows,
                             &all_columns,
                             None,
-                            ctx,
-                            None,
                         )?;
                         let output_columns = CompactArc::new(self.get_output_column_names(
                             &stmt.columns,
@@ -6677,14 +5340,8 @@ impl Executor {
                 }
 
                 // Project and return results
-                let projected_rows = self.project_rows_with_alias(
-                    &stmt.columns,
-                    joined_rows,
-                    &all_cols,
-                    None,
-                    ctx,
-                    None,
-                )?;
+                let projected_rows =
+                    self.project_rows_with_alias(&stmt.columns, joined_rows, &all_cols, None)?;
                 let output_columns =
                     CompactArc::new(self.get_output_column_names(&stmt.columns, &all_cols, None));
 
@@ -6926,14 +5583,8 @@ impl Executor {
                 Some(layout),
             )
         } else {
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                final_rows,
-                &final_columns,
-                None,
-                ctx,
-                None,
-            )?;
+            let projected_rows =
+                self.project_rows_with_alias(&stmt.columns, final_rows, &final_columns, None)?;
             // Determine output column names
             // Note: For JOIN results, columns are already qualified (e.g., "a.id", "b.id"),
             // so we pass None for table_alias - the prefix matching will work
@@ -6949,122 +5600,6 @@ impl Executor {
             Box::new(result),
             output_columns,
             false,
-            SelectShape::laid_out(layout),
-        ))
-    }
-
-    /// Execute a subquery source
-    fn execute_subquery_source(
-        &self,
-        subquery_source: &SubqueryTableSource,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-        plan: Option<&NestedPlan>,
-    ) -> SelectResult {
-        // classification is passed from caller for the outer stmt
-        // Note: The inner subquery will get its own classification via execute_select
-
-        // Execute subquery with incremented depth to avoid creating new TimeoutGuard
-        let subquery_ctx = ctx.with_incremented_query_depth();
-        let result = self.execute_derived(subquery_source, &subquery_ctx, plan)?;
-        let columns = result.columns().to_vec();
-
-        // Materialize the subquery result directly with synthetic row IDs
-        let mut rows = RowVec::new();
-        let mut result = result;
-        let mut row_id = 0i64;
-        while result.next() {
-            rows.push((row_id, result.take_row()));
-            row_id += 1;
-        }
-        if let Some(err) = result.last_error() {
-            return Err(err);
-        }
-
-        // Apply WHERE clause if present
-        let filtered_rows: RowVec = if let Some(ref where_clause) = stmt.where_clause {
-            let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
-
-            let mut filtered = RowVec::with_capacity(rows.len());
-            for (id, row) in rows {
-                if where_filter.matches_checked(&row)? {
-                    filtered.push((id, row));
-                }
-            }
-            filtered
-        } else {
-            rows
-        };
-
-        let subquery_alias = subquery_source
-            .alias
-            .as_ref()
-            .map(|a| a.value_lower.as_str());
-
-        if classification.has_aggregation || classification.has_window_functions {
-            return self.grouped_select(
-                stmt,
-                ctx,
-                classification,
-                filtered_rows,
-                &columns,
-                subquery_alias,
-                None,
-            );
-        }
-
-        // Project rows according to SELECT expressions; a column ORDER BY
-        // or DISTINCT ON reads that the select list leaves out rides along
-        let mut output_columns =
-            self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
-        let (projected_rows, layout, applied) = if self.order_by_needs_extra_columns(stmt, &columns)
-        {
-            let (plan, extra_names, layout) = self.ordered_projection(
-                &stmt.columns,
-                &stmt.order_by,
-                &stmt.distinct_on,
-                stmt.table_expr.as_deref(),
-                &CompactArc::new(columns.clone()),
-                subquery_alias,
-            );
-            output_columns.extend(extra_names);
-            let plan = OutputProjection::Ordered(plan);
-            let (projected_rows, applied) = self.run_output_projection(
-                stmt,
-                &plan,
-                filtered_rows,
-                &output_columns,
-                Some(&layout),
-                ctx,
-            )?;
-            (projected_rows, Some(layout), applied)
-        } else {
-            let plan = OutputProjection::Select(self.select_projection(
-                &stmt.columns,
-                &columns,
-                None,
-                subquery_alias,
-            )?);
-            let layout = Self::output_layout(stmt, &columns, subquery_alias);
-            let (projected_rows, applied) = self.run_output_projection(
-                stmt,
-                &plan,
-                filtered_rows,
-                &output_columns,
-                layout.as_ref(),
-                ctx,
-            )?;
-            (projected_rows, layout, applied)
-        };
-
-        let output_columns = CompactArc::new(output_columns);
-        let result =
-            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok((
-            Box::new(result),
-            output_columns,
-            applied,
             SelectShape::laid_out(layout),
         ))
     }
@@ -7182,271 +5717,6 @@ impl Executor {
         Ok(Box::new(AliasedResult::renamed(result, columns.to_vec())))
     }
 
-    /// Execute a view as a subquery
-    fn execute_view_query(
-        &self,
-        view_def: &ViewDefinition,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> SelectResult {
-        // classification is passed from caller for the outer stmt
-        // Note: The view's inner query will get its own classification via execute_select
-        let result = self.execute_view_body(view_def, ctx)?;
-        let view_columns = result.columns().to_vec();
-
-        // Apply outer query's WHERE clause if present
-        // OPTIMIZATION: FilteredResult owns a pre-compiled RowFilter and reuses it for each row,
-        // avoiding repeated expression compilation per row.
-        // CRITICAL: Must pass ctx for parameter resolution ($1, named params, etc.)
-        let mut result: Box<dyn QueryResult> = result;
-        let view_alias = stmt
-            .table_expr
-            .as_deref()
-            .and_then(super::utils::get_table_alias_from_expr)
-            .map(|name| name.to_lowercase());
-        if let Some(ref where_clause) = stmt.where_clause {
-            let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
-            result = Box::new(FilteredResult::from_filter(result, filter));
-        }
-
-        // Aggregation and window functions run over the view's rows, materialized
-        if classification.has_aggregation || classification.has_window_functions {
-            let mut rows = RowVec::with_capacity(64);
-            let mut idx = 0i64;
-            while result.next() {
-                rows.push((idx, result.take_row()));
-                idx += 1;
-            }
-            if let Some(err) = result.last_error() {
-                return Err(err);
-            }
-            return self.grouped_select(
-                stmt,
-                ctx,
-                classification,
-                rows,
-                &view_columns,
-                view_alias.as_deref(),
-                None,
-            );
-        }
-
-        // Handle projection: apply outer query's column selection
-        // Check if SELECT * or t.* - if so, return all view columns
-        let is_select_star = stmt.columns.len() == 1
-            && star_takes_every_column(&stmt.columns[0], &view_columns, view_alias.as_deref());
-
-        if is_select_star {
-            // For SELECT *, just return the view result with WHERE applied
-            // DISTINCT, ORDER BY, LIMIT/OFFSET are handled by execute_select
-            let layout = Self::output_layout(stmt, &view_columns, view_alias.as_deref());
-            return Ok((
-                result,
-                CompactArc::new(view_columns),
-                false,
-                SelectShape::laid_out(layout),
-            ));
-        }
-
-        // A column ORDER BY or DISTINCT ON reads that the select list leaves
-        // out rides along, the way it does for a derived table
-        if self.order_by_needs_extra_columns(stmt, &view_columns) {
-            let mut result = result;
-            let mut rows = RowVec::new();
-            let mut row_id = 0i64;
-            while result.next() {
-                rows.push((row_id, result.take_row()));
-                row_id += 1;
-            }
-            if let Some(err) = result.last_error() {
-                return Err(err);
-            }
-            let (plan, extra_names, layout) = self.ordered_projection(
-                &stmt.columns,
-                &stmt.order_by,
-                &stmt.distinct_on,
-                stmt.table_expr.as_deref(),
-                &CompactArc::new(view_columns.clone()),
-                view_alias.as_deref(),
-            );
-            let mut output_columns =
-                self.get_output_column_names(&stmt.columns, &view_columns, None);
-            output_columns.extend(extra_names);
-            let plan = OutputProjection::Ordered(plan);
-            let (projected_rows, applied) =
-                self.run_output_projection(stmt, &plan, rows, &output_columns, Some(&layout), ctx)?;
-            let output_columns = CompactArc::new(output_columns);
-            let result = ExecutorResult::with_arc_columns(
-                CompactArc::clone(&output_columns),
-                projected_rows,
-            );
-            return Ok((
-                Box::new(result),
-                output_columns,
-                applied,
-                SelectShape::laid_out(Some(layout)),
-            ));
-        }
-
-        // Determine if we have any complex expressions (not just column references)
-        // Column references are checked against the view here; any other item
-        // compiles into the projection
-        let mut has_complex_expressions = false;
-        let mut column_indices = Vec::with_capacity(stmt.columns.len());
-        let mut output_columns = Vec::with_capacity(stmt.columns.len());
-        let view_alias = view_alias.as_deref();
-
-        // First pass: check if all are simple column references and build indices
-        for col in &stmt.columns {
-            match col {
-                Expression::Star(_) => {
-                    // Expand all columns
-                    for (idx, name) in view_columns.iter().enumerate() {
-                        column_indices.push(idx);
-                        output_columns.push(name.clone());
-                    }
-                }
-                Expression::QualifiedStar(qs) => {
-                    for_each_qualified_star_column(
-                        &view_columns,
-                        &qs.qualifier,
-                        view_alias,
-                        |idx, start| {
-                            column_indices.push(idx);
-                            output_columns.push(view_columns[idx][start..].to_string());
-                        },
-                    );
-                }
-                Expression::Identifier(id) => {
-                    // Simple column reference
-                    output_columns.push(id.value.to_string());
-                    let name_lower = &id.value_lower;
-                    if let Some(idx) = view_columns
-                        .iter()
-                        .position(|c| c.eq_ignore_ascii_case(name_lower))
-                    {
-                        column_indices.push(idx);
-                    } else if id.quoted {
-                        // A quoted name no column has is its text, which
-                        // the compiled projection reads as such
-                        has_complex_expressions = true;
-                    } else {
-                        return Err(Error::ColumnNotFound(id.value.to_string()));
-                    }
-                }
-                Expression::Aliased(aliased) => {
-                    output_columns.push(aliased.alias.value.to_string());
-                    // Check if inner is a simple identifier
-                    if let Expression::Identifier(id) = aliased.expression.as_ref() {
-                        let name_lower = &id.value_lower;
-                        if let Some(idx) = view_columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(name_lower))
-                        {
-                            column_indices.push(idx);
-                        } else if id.quoted {
-                            has_complex_expressions = true;
-                        } else {
-                            return Err(Error::ColumnNotFound(id.value.to_string()));
-                        }
-                    } else {
-                        // Complex expression in alias - compiled into the projection
-                        has_complex_expressions = true;
-                    }
-                }
-                _ => {
-                    // Any other expression type requires evaluation
-                    has_complex_expressions = true;
-                    // We'll compute the output column name later
-                    output_columns.push(item_name(col));
-                }
-            }
-        }
-
-        // Apply projection based on complexity
-        let result: Box<dyn QueryResult> = if has_complex_expressions {
-            // Rebuild output columns to handle Star expansion
-            let mut final_output_columns = Vec::with_capacity(stmt.columns.len());
-            for col in &stmt.columns {
-                match col {
-                    Expression::Star(_) => {
-                        for name in &view_columns {
-                            final_output_columns.push(name.clone());
-                        }
-                    }
-                    Expression::QualifiedStar(qs) => {
-                        for_each_qualified_star_column(
-                            &view_columns,
-                            &qs.qualifier,
-                            view_alias,
-                            |idx, start| {
-                                final_output_columns.push(view_columns[idx][start..].to_string())
-                            },
-                        );
-                    }
-                    Expression::Aliased(aliased) => {
-                        final_output_columns.push(aliased.alias.value.to_string());
-                    }
-                    _ => {
-                        final_output_columns.push(item_name(col));
-                    }
-                }
-            }
-
-            let projection = Projection::compile(&stmt.columns, result.columns(), view_alias)?;
-            Box::new(
-                ProjectionResult::new(result, projection, final_output_columns.clone())
-                    .with_context(ctx),
-            )
-        } else {
-            Box::new(ProjectionResult::new(
-                result,
-                Projection::columns(column_indices),
-                output_columns.clone(),
-            ))
-        };
-
-        // Rebuild output_columns if we used complex expressions
-        let final_columns = if has_complex_expressions {
-            let mut cols = Vec::with_capacity(stmt.columns.len());
-            for col in &stmt.columns {
-                match col {
-                    Expression::Star(_) => {
-                        for name in &view_columns {
-                            cols.push(name.clone());
-                        }
-                    }
-                    Expression::QualifiedStar(qs) => {
-                        for_each_qualified_star_column(
-                            &view_columns,
-                            &qs.qualifier,
-                            view_alias,
-                            |idx, start| cols.push(view_columns[idx][start..].to_string()),
-                        );
-                    }
-                    Expression::Aliased(aliased) => {
-                        cols.push(aliased.alias.value.to_string());
-                    }
-                    _ => {
-                        cols.push(item_name(col));
-                    }
-                }
-            }
-            cols
-        } else {
-            output_columns
-        };
-
-        let layout = Self::output_layout(stmt, &view_columns, view_alias);
-        Ok((
-            result,
-            CompactArc::new(final_columns),
-            false,
-            SelectShape::laid_out(layout),
-        ))
-    }
-
     /// The column names of a VALUES source
     pub(super) fn values_columns(values_source: &ValuesTableSource) -> Vec<String> {
         // Determine column names
@@ -7467,305 +5737,6 @@ impl Executor {
             // Generate default column names: column1, column2, ...
             (1..=num_columns).map(|i| format!("column{}", i)).collect()
         }
-    }
-
-    /// One row of a VALUES source, each value evaluated
-    pub(super) fn values_row(row_exprs: &[Expression], ctx: &ExecutionContext) -> Result<Row> {
-        let mut row_values = Vec::with_capacity(row_exprs.len());
-        for expr in row_exprs {
-            row_values.push(super::expression::evaluate_once(expr, Some(ctx))?);
-        }
-        Ok(Row::from_values(row_values))
-    }
-
-    /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
-    fn execute_values_source(
-        &self,
-        values_source: &ValuesTableSource,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        classification: &std::sync::Arc<QueryClassification>,
-    ) -> SelectResult {
-        // classification is passed from caller to avoid redundant cache lookups
-
-        // Get the table alias for qualified name resolution
-        let table_alias = values_source
-            .alias
-            .as_ref()
-            .map(|a| a.value.to_string())
-            .unwrap_or_default();
-
-        let column_names = Self::values_columns(values_source);
-
-        // Build a map of both simple and qualified column names to indices
-        let mut col_index_map = build_column_index_map(&column_names);
-
-        // Also add qualified names (e.g., "v.id" for table alias "v")
-        // OPTIMIZATION: Pre-compute lowercase table alias once outside the loop
-        if !table_alias.is_empty() {
-            let alias_lower = table_alias.to_lowercase();
-            for (i, name) in column_names.iter().enumerate() {
-                col_index_map.insert(qualified(&alias_lower, &name.to_lowercase()), i);
-            }
-        }
-
-        // OPTIMIZATION: Pre-create RowFilters outside the loop if WHERE clause exists
-        let (where_filter, qualified_filter) = if let Some(ref where_clause) = stmt.where_clause {
-            // Pre-compute qualified column names once
-            let qualified_cols: Vec<String> = column_names
-                .iter()
-                .map(|c| qualified(&table_alias, c))
-                .collect();
-
-            // Create filters for simple and qualified column names
-            let filter = RowFilter::new(where_clause, &column_names)?.with_context(ctx);
-            let qual_filter = RowFilter::new(where_clause, &qualified_cols)?.with_context(ctx);
-
-            (Some(filter), Some(qual_filter))
-        } else {
-            (None, None)
-        };
-
-        // Evaluate all rows
-        let mut result_rows = RowVec::with_capacity(values_source.rows.len());
-        let mut row_id = 0i64;
-        for row_exprs in &values_source.rows {
-            let row = Self::values_row(row_exprs, ctx)?;
-
-            // Apply WHERE clause filtering
-            if let (Some(wf), Some(qf)) = (&where_filter, &qualified_filter) {
-                // Try with simple column names first, then qualified
-                if wf.matches_checked(&row)? || qf.matches_checked(&row)? {
-                    result_rows.push((row_id, row));
-                    row_id += 1;
-                }
-            } else {
-                result_rows.push((row_id, row));
-                row_id += 1;
-            }
-        }
-
-        let values_alias = values_source.alias.as_ref().map(|a| a.value_lower.as_str());
-
-        if classification.has_aggregation || classification.has_window_functions {
-            return self.grouped_select(
-                stmt,
-                ctx,
-                classification,
-                result_rows,
-                &column_names,
-                values_alias,
-                None,
-            );
-        }
-
-        let layout = Self::output_layout(stmt, &column_names, values_alias);
-
-        // Create the result - use CompactArc for column names
-        let column_names_arc = CompactArc::new(column_names);
-        let values_result =
-            ExecutorResult::with_arc_columns(CompactArc::clone(&column_names_arc), result_rows);
-
-        // If the SELECT has projections, apply them
-        if stmt.columns.len() == 1
-            && star_takes_every_column(&stmt.columns[0], &column_names_arc, values_alias)
-        {
-            // SELECT * or t.* - return all columns
-            return Ok((
-                Box::new(values_result),
-                column_names_arc,
-                false,
-                SelectShape::laid_out(layout),
-            ));
-        }
-
-        // Apply column projection
-        let mut projected_columns = Vec::new();
-        let mut projected_rows = RowVec::new();
-        let mut proj_row_id = 0i64;
-
-        // Determine output columns
-        for col_expr in &stmt.columns {
-            match col_expr {
-                Expression::Star(_) => {
-                    projected_columns.extend(column_names_arc.iter().cloned());
-                }
-                Expression::QualifiedStar(qs) => {
-                    for_each_qualified_star_column(
-                        &column_names_arc,
-                        &qs.qualifier,
-                        values_alias,
-                        |idx, start| {
-                            projected_columns.push(column_names_arc[idx][start..].to_string())
-                        },
-                    );
-                }
-                other => projected_columns.push(item_name(other)),
-            }
-        }
-
-        // Build extended columns for evaluator - just use simple column names
-        // The evaluator handles qualified references by stripping the qualifier
-        let extended_columns = column_names_arc.to_vec();
-
-        // OPTIMIZATION: Check if we need an evaluator for complex expressions
-        let needs_evaluator = stmt.columns.iter().any(|c| {
-            matches!(c, Expression::Aliased(_))
-                || !matches!(
-                    c,
-                    Expression::Star(_)
-                        | Expression::QualifiedStar(_)
-                        | Expression::Identifier(_)
-                        | Expression::QualifiedIdentifier(_)
-                )
-        });
-
-        let mut proj_eval = if needs_evaluator {
-            let mut eval = CompiledEvaluator::new(global_registry());
-            eval = eval.with_context(ctx);
-            eval.init_columns(&extended_columns);
-            Some(eval)
-        } else {
-            None
-        };
-
-        // OPTIMIZATION: Pre-compute qualified column lookups to avoid format! per row
-        let mut qualified_col_indices: Vec<Option<usize>> = Vec::new();
-        for col_expr in &stmt.columns {
-            if let Expression::QualifiedIdentifier(qi) = col_expr {
-                qualified_col_indices.push(qualified_index(
-                    &col_index_map,
-                    &qi.qualifier.value_lower,
-                    &qi.name.value_lower,
-                ));
-            } else {
-                qualified_col_indices.push(None);
-            }
-        }
-        // A name no column has is compiled once, read as the compiler reads
-        // it: a quoted name's text, or an error
-        let unbound_ctx = CompileContext::new(&extended_columns, global_registry());
-        let unbound: Vec<Option<SharedProgram>> = stmt
-            .columns
-            .iter()
-            .zip(&qualified_col_indices)
-            .map(|(col_expr, qualified_idx)| {
-                let bound = match col_expr {
-                    Expression::Identifier(id) => {
-                        col_index_map.contains_key(id.value_lower.as_str())
-                    }
-                    Expression::QualifiedIdentifier(_) => qualified_idx.is_some(),
-                    _ => return Ok(None),
-                };
-                if bound {
-                    return Ok(None);
-                }
-                ExprCompiler::new(&unbound_ctx)
-                    .compile(col_expr)
-                    .map(|program| Some(CompactArc::new(program)))
-                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
-            })
-            .collect::<Result<_>>()?;
-        let mut unbound_vm = ExprVM::new();
-
-        // Materialize and project
-        // OPTIMIZATION: Pre-compute output size to avoid reallocation per row
-        let output_cols = projected_columns.len();
-        // The columns each qualified star takes, found once for every row
-        let star_columns: Vec<Vec<usize>> = stmt
-            .columns
-            .iter()
-            .map(|col_expr| {
-                let mut taken = Vec::new();
-                if let Expression::QualifiedStar(qs) = col_expr {
-                    for_each_qualified_star_column(
-                        &column_names_arc,
-                        &qs.qualifier,
-                        values_alias,
-                        |idx, _| taken.push(idx),
-                    );
-                }
-                taken
-            })
-            .collect();
-        let mut result_box: Box<dyn QueryResult> = Box::new(values_result);
-        while result_box.next() {
-            let row = result_box.row();
-            let mut new_values = Vec::with_capacity(output_cols);
-
-            for (col_idx, col_expr) in stmt.columns.iter().enumerate() {
-                if let Some(program) = &unbound[col_idx] {
-                    let exec =
-                        ExecuteContext::with_common_params(row, ctx.params(), ctx.transaction_id());
-                    new_values.push(unbound_vm.execute(program, &exec)?);
-                    continue;
-                }
-                match col_expr {
-                    Expression::Star(_) => {
-                        // Extend with all values from the row
-                        new_values.extend(row.iter().cloned());
-                    }
-                    Expression::QualifiedStar(_) => {
-                        new_values.extend(
-                            star_columns[col_idx].iter().map(|&idx| {
-                                row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                            }),
-                        );
-                    }
-                    Expression::Identifier(id) => {
-                        // Use pre-computed lowercase
-                        if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
-                            if let Some(val) = row.get(idx) {
-                                new_values.push(val.clone());
-                            } else {
-                                new_values.push(Value::null_unknown());
-                            }
-                        } else {
-                            new_values.push(Value::null_unknown());
-                        }
-                    }
-                    Expression::QualifiedIdentifier(_) => {
-                        // Use pre-computed index
-                        if let Some(idx) = qualified_col_indices[col_idx] {
-                            if let Some(val) = row.get(idx) {
-                                new_values.push(val.clone());
-                            } else {
-                                new_values.push(Value::null_unknown());
-                            }
-                        } else {
-                            new_values.push(Value::null_unknown());
-                        }
-                    }
-                    Expression::Aliased(a) => {
-                        // Evaluate the underlying expression
-                        let eval = proj_eval.as_mut().unwrap();
-                        eval.set_row_array(row);
-                        new_values.push(eval.evaluate(&a.expression)?);
-                    }
-                    other => {
-                        // Evaluate the expression
-                        let eval = proj_eval.as_mut().unwrap();
-                        eval.set_row_array(row);
-                        new_values.push(eval.evaluate(other)?);
-                    }
-                }
-            }
-
-            projected_rows.push((proj_row_id, Row::from_values(new_values)));
-            proj_row_id += 1;
-        }
-
-        let projected_columns_arc = CompactArc::new(projected_columns);
-        let final_result = ExecutorResult::with_arc_columns(
-            CompactArc::clone(&projected_columns_arc),
-            projected_rows,
-        );
-        Ok((
-            Box::new(final_result),
-            projected_columns_arc,
-            false,
-            SelectShape::laid_out(layout),
-        ))
     }
 
     /// The statement a joined side runs as: a SELECT * of its join, with
@@ -7822,7 +5793,6 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
-        read_out: Option<&mut Option<ReadSchema>>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         match expr {
             Expression::TableSource(ts) => {
@@ -7849,8 +5819,7 @@ impl Executor {
                         // Must apply execution context for parameter support
                         // Use qualified_columns for filter column resolution since WHERE clause
                         // has qualified names like "ds.avg_salary" not just "avg_salary"
-                        let row_filter =
-                            RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+                        let row_filter = Self::side_filter(filter_expr, &qualified_columns, ctx)?;
                         // CTE stores CompactArc<Vec<(i64, Row)>>, filter on the Row part
                         let mut filtered_rows = RowVec::with_capacity(rows.len());
                         for (id, row) in rows.iter() {
@@ -7897,83 +5866,43 @@ impl Executor {
                     let result: Box<dyn QueryResult> = match filter {
                         Some(filter_expr) => {
                             let row_filter =
-                                RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+                                Self::side_filter(filter_expr, &qualified_columns, ctx)?;
                             Box::new(FilteredResult::from_filter(result, row_filter))
                         }
                         None => result,
                     };
                     return Ok((result, qualified_columns));
                 }
-
-                // Create a SELECT * statement with optional WHERE clause
-                let select_all = SelectStatement {
-                    param_count: 0,
-                    token: dummy_token("SELECT", TokenType::Keyword),
-                    distinct: false,
-                    distinct_on: vec![],
-                    columns: vec![Expression::Star(StarExpression {
-                        token: dummy_token("*", TokenType::Punctuator),
-                    })],
-                    with: None,
-                    table_expr: Some(Box::new(Expression::TableSource(ts.clone()))),
-                    where_clause: filter.map(|f| Box::new(f.clone())),
-                    group_by: GroupByClause::default(),
-                    having: None,
-                    window_defs: vec![],
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    set_operations: vec![],
-                    prepared: None,
-                };
-                // Get classification for the synthetic SELECT statement
-                let classification = get_classification(&select_all);
-                let (result, columns, _, _) = self.execute_simple_table_scan(
-                    ts,
-                    &select_all,
-                    ctx,
-                    &classification,
-                    read_out,
-                )?;
-
-                // Prefix column names with table alias (or table name if no alias)
-                // This is needed for proper qualified identifier resolution in JOINs
-                let table_alias = ts
-                    .alias
-                    .as_ref()
-                    .map(|a| a.value.clone())
-                    .unwrap_or_else(|| ts.name.value.clone());
-
-                let qualified_columns: Vec<String> = columns
-                    .iter()
-                    .map(|col| qualified(&table_alias, col))
-                    .collect();
-
-                Ok((result, qualified_columns))
+                Err(Self::side_without_blocks())
             }
             Expression::JoinSource(js) => self.joined_side_rows(js, ctx, filter, None, false),
             Expression::SubquerySource(ss) => self.derived_side_rows(ss, ctx, filter, None),
-            Expression::ValuesSource(vs) => {
-                // A SELECT * of the VALUES, with the filter pushed to this side
-                let select_all = Self::select_all_of(Expression::ValuesSource(vs.clone()), filter);
-                // Get classification for the synthetic SELECT statement
-                let classification = get_classification(&select_all);
-                let (result, columns, _, _) =
-                    self.execute_values_source(vs, &select_all, ctx, &classification)?;
-                // Its columns by its alias, as a table's are
-                let columns = match &vs.alias {
-                    Some(alias) => columns.iter().map(|c| qualified(&alias.value, c)).collect(),
-                    None => columns.to_vec(),
-                };
-                Ok((result, columns))
-            }
-            Expression::FunctionTableSource(tvf_source) => self
-                .execute_tvf_for_join(tvf_source, ctx, filter, None, 0)
-                .map(|(result, columns, _)| (result, columns)),
-            _ => Err(Error::NotSupported(
-                "Unsupported table expression type".to_string(),
-            )),
+            _ => Err(Self::side_without_blocks()),
         }
+    }
+
+    /// A join side over a table, VALUES list or table function is read
+    /// through the join's blocks
+    #[cold]
+    fn side_without_blocks() -> Error {
+        Error::internal("a join side over a source was read without its blocks")
+    }
+
+    /// A filter over a join side's `columns`, compiled from `filter`
+    fn side_filter(
+        filter: &Expression,
+        columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<RowFilter> {
+        let program = super::aggregation::compile_over_slots(
+            filter,
+            columns,
+            global_registry(),
+            None,
+            false,
+            None,
+        )?;
+        Ok(RowFilter::from_program(program).with_context(ctx))
     }
 
     /// The `window` of a GROUP BY + LIMIT join's left side `expr`. Unless
@@ -8035,25 +5964,35 @@ impl Executor {
             Some(_) => (None, 0),
             None => (limit, offset),
         };
-        // A side read from the source the blocks prepared, unless the join
-        // adds conditions of its own to this read
-        if let (Some((run, index)), None) = (rows, extra) {
+        // A side read from the source the blocks prepared; the conditions the
+        // join adds to this read are asked of its rows, which no cut reads
+        // before them
+        if let Some((run, index)) = rows {
             let alias = get_table_alias_from_expr(expr);
+            let cut = match extra {
+                Some(_) => (None, 0),
+                None => (limit, offset),
+            };
             let read = self.join_sourced_side_rows(
                 run.blocks,
                 run.run,
                 index,
                 (alias.as_deref().unwrap_or_default(), ctx),
-                (limit, offset),
+                cut,
             )?;
             if let Some((result, bounded)) = read {
-                let columns = (result.columns().iter())
+                let columns: Vec<String> = (result.columns().iter())
                     .map(|c| match &alias {
                         Some(alias) => qualified(alias, c),
                         None => c.clone(),
                     })
                     .collect();
-                return Ok((result, columns, bounded, None));
+                let Some(extra) = extra else {
+                    return Ok((result, columns, bounded, None));
+                };
+                let filter = Self::side_filter(extra, &columns, ctx)?;
+                let result = Box::new(FilteredResult::from_filter(result, filter));
+                return Ok((result, columns, false, None));
             }
         }
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
@@ -8082,8 +6021,6 @@ impl Executor {
         if side.run.is_some() {
             crate::test_failpoints::join_side_opening();
         }
-        let mut read = None;
-        let read_out = side.run.is_some().then_some(&mut read);
         // A joined side runs as a join of its own, under the plan it holds,
         // both columns of a pair it merges kept as the blocks read them
         let nested = match (rows, expr) {
@@ -8124,9 +6061,11 @@ impl Executor {
                     )?;
                     (result, columns, bounded, None)
                 }
-                _ => self.execute_table_expression_with_filter_limit(
-                    expr, ctx, filter, limit, offset, read_out,
-                )?,
+                _ => {
+                    let (result, columns) =
+                        self.execute_table_expression_with_filter(expr, ctx, filter)?;
+                    (result, columns, false, None)
+                }
             },
         };
         if let Some((run, index)) = rows {
@@ -8135,10 +6074,8 @@ impl Executor {
                 self.join_source_side_rows(run.blocks, run.run, index, (expr, result), ctx)?;
             return Ok((result, columns, bounded, None));
         }
-        if let Some((run, index)) = side.run {
-            let (_, schema) =
-                read.ok_or_else(|| Error::internal("a join side read without its schema"))?;
-            run.blocks.side_fits(index, &schema)?;
+        if side.run.is_some() {
+            return Err(Error::internal("a join side read without its schema"));
         }
         Ok(fetched)
     }
@@ -8297,7 +6234,7 @@ impl Executor {
         if let Some(filter_expr) = filter {
             // Use qualified_columns for filter column resolution since WHERE clause
             // has qualified names like "ds.avg_salary" not just "avg_salary"
-            let row_filter = RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+            let row_filter = Self::side_filter(filter_expr, &qualified_columns, ctx)?;
             // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
             let mut materialized = Self::materialize_result(result)?;
             row_filter.retain_checked(&mut materialized)?;
@@ -8307,153 +6244,6 @@ impl Executor {
         }
 
         Ok((result, qualified_columns))
-    }
-
-    /// `read_out` takes the layout and schema a plain table's rows were read
-    /// with
-    pub(crate) fn execute_table_expression_with_filter_limit(
-        &self,
-        expr: &Expression,
-        ctx: &ExecutionContext,
-        filter: Option<&Expression>,
-        row_limit: Option<usize>,
-        row_offset: usize,
-        read_out: Option<&mut Option<ReadSchema>>,
-    ) -> Result<OuterFetch> {
-        // Handle FunctionTableSource with limit passthrough
-        let tvf_source = match expr {
-            Expression::FunctionTableSource(fts) => Some(fts.as_ref()),
-            Expression::Aliased(aliased) => {
-                if let Expression::FunctionTableSource(fts) = aliased.expression.as_ref() {
-                    Some(fts.as_ref())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(tvf_source) = tvf_source {
-            return self
-                .execute_tvf_for_join(tvf_source, ctx, filter, row_limit, row_offset)
-                .map(|(result, columns, bounded)| (result, columns, bounded, None));
-        }
-
-        // Extract TableSource from the expression (handles both direct and aliased)
-        let (ts, custom_alias) = match expr {
-            Expression::TableSource(ts) => (ts, None),
-            Expression::Aliased(aliased) => {
-                if let Expression::TableSource(ts) = aliased.expression.as_ref() {
-                    (ts, Some(aliased.alias.value.clone()))
-                } else {
-                    // Not a table source, fall back to standard execution
-                    return self
-                        .execute_table_expression_with_filter(expr, ctx, filter, None)
-                        .map(|(result, columns)| (result, columns, false, None));
-                }
-            }
-            _ => {
-                // Not a table source, fall back to standard execution
-                return self
-                    .execute_table_expression_with_filter(expr, ctx, filter, None)
-                    .map(|(result, columns)| (result, columns, false, None));
-            }
-        };
-
-        // Only optimize if we have a limit
-        if let Some(limit) = row_limit {
-            let table_name = ts.name.value_lower.as_str();
-
-            // Skip if this is a CTE reference - CTEs are already materialized
-            if ctx.get_cte_by_lower(table_name).is_some() {
-                return self
-                    .execute_table_expression_with_filter(expr, ctx, filter, None)
-                    .map(|(result, columns)| (result, columns, false, None));
-            }
-
-            // Skip if this is a view
-            if self.engine.get_view_lowercase(table_name)?.is_some() {
-                return self
-                    .execute_table_expression_with_filter(expr, ctx, filter, None)
-                    .map(|(result, columns)| (result, columns, false, None));
-            }
-
-            // Create a SELECT * statement with WHERE clause AND LIMIT
-            // This triggers the LIMIT pushdown optimization in execute_simple_table_scan
-            let select_all = SelectStatement {
-                param_count: 0,
-                token: dummy_token("SELECT", TokenType::Keyword),
-                distinct: false,
-                distinct_on: vec![],
-                columns: vec![Expression::Star(StarExpression {
-                    token: dummy_token("*", TokenType::Punctuator),
-                })],
-                with: None,
-                table_expr: Some(Box::new(Expression::TableSource(ts.clone()))),
-                where_clause: filter.map(|f| Box::new(f.clone())),
-                group_by: GroupByClause::default(),
-                having: None,
-                window_defs: vec![],
-                order_by: vec![],
-                limit: Some(Box::new(Expression::IntegerLiteral(
-                    crate::parser::ast::IntegerLiteral {
-                        token: dummy_token(&limit.to_string(), TokenType::Integer),
-                        value: limit as i64,
-                    },
-                ))),
-                offset: (row_offset > 0).then(|| {
-                    Box::new(Expression::IntegerLiteral(
-                        crate::parser::ast::IntegerLiteral {
-                            token: dummy_token(&row_offset.to_string(), TokenType::Integer),
-                            value: row_offset as i64,
-                        },
-                    ))
-                }),
-                set_operations: vec![],
-                prepared: None,
-            };
-            // Get classification for the synthetic SELECT statement
-            let classification = get_classification(&select_all);
-            // The scan says whether it applied the synthetic LIMIT and OFFSET. A
-            // path that did not may still have stopped early at their sum, so
-            // the pair is applied here, as the select layer would
-            let mut opened = None;
-            let (result, columns, applied, _) = self.execute_simple_table_scan(
-                ts,
-                &select_all,
-                ctx,
-                &classification,
-                Some(&mut opened),
-            )?;
-            let token = opened.as_ref().map(|(token, _)| *token);
-            if let Some(out) = read_out {
-                *out = opened;
-            }
-            let result: Box<dyn QueryResult> = if applied {
-                result
-            } else {
-                Box::new(LimitedResult::new(result, Some(limit), row_offset))
-            };
-
-            // Prefix column names with table alias (or table name if no alias)
-            // Use custom_alias from Aliased expression if provided
-            let table_alias = custom_alias.unwrap_or_else(|| {
-                ts.alias
-                    .as_ref()
-                    .map(|a| a.value.clone())
-                    .unwrap_or_else(|| ts.name.value.clone())
-            });
-
-            let qualified_columns: Vec<String> = columns
-                .iter()
-                .map(|col| qualified(&table_alias, col))
-                .collect();
-
-            return Ok((result, qualified_columns, true, token));
-        }
-
-        // Fall back to standard execution for other cases
-        self.execute_table_expression_with_filter(expr, ctx, filter, read_out)
-            .map(|(result, columns)| (result, columns, false, None))
     }
 
     /// Materialize a result into a RowVec
@@ -9229,8 +7019,8 @@ impl Executor {
                         .blocks
                         .compile(expr, true, global_registry())
                         .map(|p| JoinFilter::from_program(p).with_context(ctx)),
-                    None => JoinFilter::new(expr, &outer_cols, &inner_cols, global_registry())
-                        .map(|f| f.with_context(ctx)),
+                    None => super::aggregation::compile_over_pair(expr, &outer_cols, &inner_cols)
+                        .map(|p| JoinFilter::from_program(p).with_context(ctx)),
                 })
                 .transpose()
         };
@@ -9482,22 +7272,15 @@ impl Executor {
     }
 
     /// Project rows with optional table alias
-    ///
-    /// If `all_columns_lower` is provided, it will be used directly instead of
-    /// computing lowercase column names per-query. Pass pre-cached values from
-    /// `schema.column_names_lower_arc()` for optimal performance.
     pub(crate) fn project_rows_with_alias(
         &self,
         select_exprs: &[Expression],
         rows: RowVec,
         all_columns: &[String],
-        all_columns_lower: Option<&[String]>,
-        ctx: &ExecutionContext,
         table_alias: Option<&str>,
     ) -> Result<RowVec> {
-        let plan =
-            self.select_projection(select_exprs, all_columns, all_columns_lower, table_alias)?;
-        Self::run_select_projection(&plan, rows, ctx)
+        let plan = self.select_projection(select_exprs, all_columns, table_alias)?;
+        Ok(Self::run_select_projection(&plan, rows))
     }
 
     /// How a SELECT list projects rows of `all_columns`, found before any row
@@ -9505,7 +7288,6 @@ impl Executor {
         &self,
         select_exprs: &[Expression],
         all_columns: &[String],
-        all_columns_lower: Option<&[String]>,
         table_alias: Option<&str>,
     ) -> Result<SelectProjection> {
         // Check if this is SELECT * (no projection needed)
@@ -9661,40 +7443,24 @@ impl Executor {
             // Fall through to slow path if there are duplicates
         }
 
-        // OPTIMIZATION: Pre-compute table alias lowercase
-        let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
-        let col_index_map_lower = lower_index_map(all_columns, all_columns_lower);
-
-        // Use the optimized path with pre-compiled expressions
-        Ok(SelectProjection::Actions(self.projection_actions(
-            select_exprs,
-            all_columns,
-            &col_index_map_lower,
-            table_alias_lower.as_deref(),
-        )?))
+        // A computed item is projected by the statement's plan
+        Err(Error::internal(
+            "a SELECT list computing its items was projected without its plan",
+        ))
     }
 
     /// The rows `plan` projects
-    fn run_select_projection(
-        plan: &SelectProjection,
-        rows: RowVec,
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
+    fn run_select_projection(plan: &SelectProjection, rows: RowVec) -> RowVec {
         if let SelectProjection::Whole = plan {
-            return Ok(rows);
+            return rows;
         }
         let mut projected = RowVec::with_capacity(rows.len());
-        Self::project_select_into(plan, rows, ctx, &mut projected)?;
-        Ok(projected)
+        Self::project_select_into(plan, rows, &mut projected);
+        projected
     }
 
     /// The rows `plan` projects, put into `out`
-    fn project_select_into(
-        plan: &SelectProjection,
-        rows: RowVec,
-        ctx: &ExecutionContext,
-        out: &mut impl RowSink,
-    ) -> Result<()> {
+    fn project_select_into(plan: &SelectProjection, rows: RowVec, out: &mut impl RowSink) {
         match plan {
             SelectProjection::Whole => {
                 for (id, row) in rows.into_iter() {
@@ -9712,513 +7478,7 @@ impl Executor {
                     out.put(id, row.take_columns(indices));
                 }
             }
-            SelectProjection::Actions(actions) => {
-                let bound = bound_items(
-                    actions,
-                    ctx.params(),
-                    |action| match action {
-                        ExprAction::Compiled(program) => Some(program),
-                        ExprAction::Concat(concat) => concat.source(),
-                        _ => None,
-                    },
-                    ExprAction::of_program,
-                );
-                return Self::run_projection_actions(
-                    bound.as_deref().unwrap_or(actions),
-                    rows,
-                    ctx,
-                    out,
-                );
-            }
         }
-        Ok(())
-    }
-
-    /// How each expression of a non-correlated projection is evaluated:
-    /// complex ones are compiled once, before any row
-    fn projection_actions(
-        &self,
-        select_exprs: &[Expression],
-        all_columns: &[String],
-        col_index_map_lower: &StringMap<usize>,
-        table_alias_lower: Option<&str>,
-    ) -> Result<Vec<ExprAction>> {
-        // Helper to try building inline COALESCE action (bypasses VM for 7x speedup)
-        fn try_build_coalesce_action(
-            func: &crate::parser::ast::FunctionCall,
-            col_index_map_lower: &StringMap<usize>,
-        ) -> Option<ExprAction> {
-            if !func.function.eq_ignore_ascii_case("COALESCE") {
-                return None;
-            }
-            if func.arguments.is_empty() {
-                return None;
-            }
-
-            let mut args: smallvec::SmallVec<[ArgSource; 4]> = smallvec::SmallVec::new();
-            for arg in &func.arguments {
-                match arg {
-                    Expression::Identifier(id) => {
-                        let idx = *col_index_map_lower.get(id.value_lower.as_str())?;
-                        args.push(ArgSource::Column(idx));
-                    }
-                    Expression::QualifiedIdentifier(qid) => {
-                        let idx = qualified_index(
-                            col_index_map_lower,
-                            &qid.qualifier.value_lower,
-                            &qid.name.value_lower,
-                        )?;
-                        args.push(ArgSource::Column(idx));
-                    }
-                    // Handle all literal types
-                    Expression::IntegerLiteral(lit) => {
-                        args.push(ArgSource::Const(Value::Integer(lit.value)));
-                    }
-                    Expression::FloatLiteral(lit) => {
-                        args.push(ArgSource::Const(Value::Float(lit.value)));
-                    }
-                    Expression::StringLiteral(lit) => {
-                        args.push(ArgSource::Const(string_literal_value(lit)));
-                    }
-                    Expression::BooleanLiteral(lit) => {
-                        args.push(ArgSource::Const(Value::Boolean(lit.value)));
-                    }
-                    Expression::NullLiteral(_) => {
-                        args.push(ArgSource::Const(Value::null_unknown()));
-                    }
-                    _ => return None, // Complex arg - fall back to VM
-                }
-            }
-            Some(ExprAction::Coalesce(args))
-        }
-
-        // Helper to extract column index from identifier expressions
-        fn get_col_idx(expr: &Expression, col_index_map_lower: &StringMap<usize>) -> Option<usize> {
-            match expr {
-                Expression::Identifier(id) => {
-                    col_index_map_lower.get(id.value_lower.as_str()).copied()
-                }
-                Expression::QualifiedIdentifier(qid) => qualified_index(
-                    col_index_map_lower,
-                    &qid.qualifier.value_lower,
-                    &qid.name.value_lower,
-                ),
-                _ => None,
-            }
-        }
-
-        // Helper to convert expression to ArgSource (column or literal)
-        fn expr_to_arg_source(
-            expr: &Expression,
-            col_index_map_lower: &StringMap<usize>,
-        ) -> Option<ArgSource> {
-            match expr {
-                Expression::Identifier(id) => {
-                    let idx = *col_index_map_lower.get(id.value_lower.as_str())?;
-                    Some(ArgSource::Column(idx))
-                }
-                Expression::QualifiedIdentifier(qid) => {
-                    let idx = qualified_index(
-                        col_index_map_lower,
-                        &qid.qualifier.value_lower,
-                        &qid.name.value_lower,
-                    )?;
-                    Some(ArgSource::Column(idx))
-                }
-                Expression::IntegerLiteral(lit) => {
-                    Some(ArgSource::Const(Value::Integer(lit.value)))
-                }
-                Expression::FloatLiteral(lit) => Some(ArgSource::Const(Value::Float(lit.value))),
-                Expression::StringLiteral(lit) => Some(ArgSource::Const(string_literal_value(lit))),
-                Expression::BooleanLiteral(lit) => {
-                    Some(ArgSource::Const(Value::Boolean(lit.value)))
-                }
-                Expression::NullLiteral(_) => Some(ArgSource::Const(Value::null_unknown())),
-                _ => None,
-            }
-        }
-
-        // Helper to convert expression to Value (for condition comparison)
-        fn expr_to_value(expr: &Expression) -> Option<Value> {
-            match expr {
-                Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
-                Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-                Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
-                Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
-                Expression::NullLiteral(_) => Some(Value::null_unknown()),
-                _ => None,
-            }
-        }
-
-        // Helper to try building inline CASE action (bypasses VM)
-        fn try_build_case_action(
-            case: &crate::parser::ast::CaseExpression,
-            col_index_map_lower: &StringMap<usize>,
-        ) -> Option<ExprAction> {
-            // Only handle searched CASE (no value expression)
-            if case.value.is_some() {
-                return None;
-            }
-
-            let mut branches: smallvec::SmallVec<[CaseBranch; 4]> = smallvec::SmallVec::new();
-
-            for when_clause in &case.when_clauses {
-                // Parse condition: support comparisons and IS NULL
-                let condition = match &when_clause.condition {
-                    Expression::Infix(infix) => {
-                        // Handle column op literal (e.g., balance > 50000)
-                        if let Some(col_idx) = get_col_idx(&infix.left, col_index_map_lower) {
-                            if let Some(value) = expr_to_value(&infix.right) {
-                                match infix.operator.as_str() {
-                                    "=" => CaseCondition::Equals { col_idx, value },
-                                    "!=" | "<>" => CaseCondition::NotEquals { col_idx, value },
-                                    ">" => CaseCondition::GreaterThan { col_idx, value },
-                                    ">=" => CaseCondition::GreaterOrEqual { col_idx, value },
-                                    "<" => CaseCondition::LessThan { col_idx, value },
-                                    "<=" => CaseCondition::LessOrEqual { col_idx, value },
-                                    _ if infix.operator.eq_ignore_ascii_case("IS") => {
-                                        if matches!(&*infix.right, Expression::NullLiteral(_)) {
-                                            CaseCondition::IsNull { col_idx }
-                                        } else {
-                                            return None;
-                                        }
-                                    }
-                                    _ => return None,
-                                }
-                            } else if infix.operator.eq_ignore_ascii_case("IS") {
-                                if matches!(&*infix.right, Expression::NullLiteral(_)) {
-                                    CaseCondition::IsNull { col_idx }
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        // Handle literal op column (reversed: 50000 < balance)
-                        } else {
-                            let col_idx = get_col_idx(&infix.right, col_index_map_lower)?;
-                            let value = expr_to_value(&infix.left)?;
-                            // Reverse the operator since column is on right
-                            match infix.operator.as_str() {
-                                "=" => CaseCondition::Equals { col_idx, value },
-                                "!=" | "<>" => CaseCondition::NotEquals { col_idx, value },
-                                ">" => CaseCondition::LessThan { col_idx, value }, // 5 > col means col < 5
-                                ">=" => CaseCondition::LessOrEqual { col_idx, value }, // 5 >= col means col <= 5
-                                "<" => CaseCondition::GreaterThan { col_idx, value }, // 5 < col means col > 5
-                                "<=" => CaseCondition::GreaterOrEqual { col_idx, value }, // 5 <= col means col >= 5
-                                _ => return None,
-                            }
-                        }
-                    }
-                    _ => return None, // Complex condition - fall back to VM
-                };
-
-                // Parse result
-                let result = expr_to_arg_source(&when_clause.then_result, col_index_map_lower)?;
-
-                branches.push(CaseBranch { condition, result });
-            }
-
-            // Parse ELSE
-            let else_result = match &case.else_value {
-                Some(expr) => Some(expr_to_arg_source(expr, col_index_map_lower)?),
-                None => None,
-            };
-
-            Some(ExprAction::Case {
-                branches,
-                else_result,
-            })
-        }
-
-        // Analyze and pre-compile all expressions ONCE before the row loop
-        let mut actions: Vec<ExprAction> = Vec::with_capacity(select_exprs.len());
-
-        for expr in select_exprs.iter() {
-            let action = match expr {
-                Expression::Star(_) => ExprAction::StarExpand,
-                Expression::QualifiedStar(qs) => {
-                    let mut taken = Vec::new();
-                    for_each_qualified_star_column(
-                        all_columns,
-                        &qs.qualifier,
-                        table_alias_lower,
-                        |idx, _| taken.push(idx),
-                    );
-                    ExprAction::QualifiedStarExpand(taken)
-                }
-                Expression::Identifier(id) => {
-                    if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
-                        ExprAction::SimpleColumn(idx)
-                    } else {
-                        // Unknown identifier - compile as expression (might be alias)
-                        let program = compile_expression(expr, all_columns)?;
-                        ExprAction::Compiled(program)
-                    }
-                }
-                Expression::QualifiedIdentifier(qid) => match qualified_index(
-                    col_index_map_lower,
-                    &qid.qualifier.value_lower,
-                    &qid.name.value_lower,
-                ) {
-                    Some(idx) => ExprAction::SimpleColumn(idx),
-                    None => ExprAction::Compiled(compile_expression(expr, all_columns)?),
-                },
-                Expression::Aliased(aliased) => {
-                    // Recurse into the inner expression
-                    match &*aliased.expression {
-                        Expression::Identifier(id) => {
-                            if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
-                                ExprAction::SimpleColumn(idx)
-                            } else {
-                                let program = compile_expression(&aliased.expression, all_columns)?;
-                                ExprAction::Compiled(program)
-                            }
-                        }
-                        Expression::QualifiedIdentifier(qid) => match qualified_index(
-                            col_index_map_lower,
-                            &qid.qualifier.value_lower,
-                            &qid.name.value_lower,
-                        ) {
-                            Some(idx) => ExprAction::SimpleColumn(idx),
-                            None => ExprAction::Compiled(compile_expression(
-                                &aliased.expression,
-                                all_columns,
-                            )?),
-                        },
-                        Expression::FunctionCall(func) => {
-                            // Try inline COALESCE optimization
-                            if let Some(action) =
-                                try_build_coalesce_action(func, col_index_map_lower)
-                            {
-                                action
-                            } else {
-                                let program = compile_expression(&aliased.expression, all_columns)?;
-                                ExprAction::Compiled(program)
-                            }
-                        }
-                        Expression::Case(case) => {
-                            // Try inline CASE optimization
-                            if let Some(action) = try_build_case_action(case, col_index_map_lower) {
-                                action
-                            } else {
-                                let program = compile_expression(&aliased.expression, all_columns)?;
-                                ExprAction::Compiled(program)
-                            }
-                        }
-                        _ => {
-                            // Compile the inner expression (not the Aliased wrapper)
-                            let program = compile_expression(&aliased.expression, all_columns)?;
-                            ExprAction::Compiled(program)
-                        }
-                    }
-                }
-                Expression::FunctionCall(func) => {
-                    // Try inline COALESCE optimization
-                    if let Some(action) = try_build_coalesce_action(func, col_index_map_lower) {
-                        action
-                    } else {
-                        let program = compile_expression(expr, all_columns)?;
-                        ExprAction::Compiled(program)
-                    }
-                }
-                Expression::Case(case) => {
-                    // Try inline CASE optimization
-                    if let Some(action) = try_build_case_action(case, col_index_map_lower) {
-                        action
-                    } else {
-                        let program = compile_expression(expr, all_columns)?;
-                        ExprAction::Compiled(program)
-                    }
-                }
-                _ => {
-                    // Complex expression - compile it
-                    let program = compile_expression(expr, all_columns)?;
-                    ExprAction::Compiled(program)
-                }
-            };
-            let action = match action {
-                ExprAction::Compiled(program) => ExprAction::of_program(program),
-                action => action,
-            };
-            actions.push(action);
-        }
-        Ok(actions)
-    }
-
-    /// The rows `actions` project, run directly on the VM. Out of line: its
-    /// row loop keeps its own registers in any caller
-    #[inline(never)]
-    fn run_projection_actions(
-        actions: &[ExprAction],
-        rows: RowVec,
-        ctx: &ExecutionContext,
-        projected: &mut impl RowSink,
-    ) -> Result<()> {
-        // Pre-fetch parameters for VM context
-        let params = ctx.params();
-        let transaction_id = ctx.transaction_id();
-
-        // Create reusable VM
-        let mut vm = ExprVM::new();
-
-        // Check if all actions are SimpleColumn (common fast path)
-        let all_simple_columns = actions
-            .iter()
-            .all(|a| matches!(a, ExprAction::SimpleColumn(_)));
-
-        // Project rows using pre-analyzed actions
-        if all_simple_columns {
-            // Super fast path: just extract column indices and use take_columns
-            let indices: Vec<usize> = actions
-                .iter()
-                .filter_map(|a| {
-                    if let ExprAction::SimpleColumn(idx) = a {
-                        Some(*idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            for (id, row) in rows.into_iter() {
-                projected.put(id, row.take_columns(&indices));
-            }
-        } else {
-            // General path: mixed actions
-            // Pre-compute capacity outside loop to avoid repeated len() calls
-            let values_capacity = actions.len();
-
-            for (id, row) in rows.into_iter() {
-                // Use CompactVec directly instead of Vec to avoid Vec->CompactVec conversion
-                let mut values = projected.storage(values_capacity);
-
-                // Build VM context with all params in one call (faster than builder chain)
-                let vm_ctx = ExecuteContext::with_common_params(&row, params, transaction_id);
-
-                for action in actions {
-                    match action {
-                        ExprAction::SimpleColumn(idx) => {
-                            // Direct index access with bounds check
-                            if let Some(v) = row.get(*idx) {
-                                values.push(v.clone());
-                            } else {
-                                values.push(Value::null_unknown());
-                            }
-                        }
-                        ExprAction::StarExpand => {
-                            for val in row.iter() {
-                                values.push(val.clone());
-                            }
-                        }
-                        ExprAction::QualifiedStarExpand(taken) => {
-                            for &idx in taken {
-                                if let Some(val) = row.get(idx) {
-                                    values.push(val.clone());
-                                }
-                            }
-                        }
-                        ExprAction::Coalesce(args) => {
-                            // Inline COALESCE: direct loop avoids iterator overhead
-                            let mut found = false;
-                            for arg in args.iter() {
-                                let val: Option<&Value> = match arg {
-                                    ArgSource::Column(idx) => row.get(*idx),
-                                    ArgSource::Const(v) => Some(v),
-                                };
-                                if let Some(v) = val {
-                                    if !v.is_null() {
-                                        values.push(v.clone());
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !found {
-                                values.push(Value::null_unknown());
-                            }
-                        }
-                        ExprAction::Case {
-                            branches,
-                            else_result,
-                        } => {
-                            // Inline CASE: direct loop avoids iterator overhead
-                            let mut matched = false;
-                            for branch in branches.iter() {
-                                let col_val: Option<&Value> = match &branch.condition {
-                                    CaseCondition::Equals { col_idx, .. }
-                                    | CaseCondition::NotEquals { col_idx, .. }
-                                    | CaseCondition::GreaterThan { col_idx, .. }
-                                    | CaseCondition::GreaterOrEqual { col_idx, .. }
-                                    | CaseCondition::LessThan { col_idx, .. }
-                                    | CaseCondition::LessOrEqual { col_idx, .. }
-                                    | CaseCondition::IsNull { col_idx } => row.get(*col_idx),
-                                };
-                                let cond_matches = match (&branch.condition, col_val) {
-                                    (CaseCondition::Equals { value, .. }, Some(v)) => {
-                                        sql_eq(v, value) == Some(true)
-                                    }
-                                    (CaseCondition::NotEquals { value, .. }, Some(v)) => {
-                                        sql_eq(v, value) == Some(false)
-                                    }
-                                    (CaseCondition::GreaterThan { value, .. }, Some(v)) => {
-                                        sql_compare(v, value).is_some_and(|o| o.is_gt())
-                                    }
-                                    (CaseCondition::GreaterOrEqual { value, .. }, Some(v)) => {
-                                        sql_compare(v, value).is_some_and(|o| o.is_ge())
-                                    }
-                                    (CaseCondition::LessThan { value, .. }, Some(v)) => {
-                                        sql_compare(v, value).is_some_and(|o| o.is_lt())
-                                    }
-                                    (CaseCondition::LessOrEqual { value, .. }, Some(v)) => {
-                                        sql_compare(v, value).is_some_and(|o| o.is_le())
-                                    }
-                                    (CaseCondition::IsNull { .. }, Some(v)) => v.is_null(),
-                                    (_, None) => false,
-                                };
-                                if cond_matches {
-                                    match &branch.result {
-                                        ArgSource::Column(idx) => {
-                                            if let Some(v) = row.get(*idx) {
-                                                values.push(v.clone());
-                                            } else {
-                                                values.push(Value::null_unknown());
-                                            }
-                                        }
-                                        ArgSource::Const(v) => values.push(v.clone()),
-                                    }
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            if !matched {
-                                // No branch matched - use ELSE or NULL
-                                match else_result {
-                                    Some(ArgSource::Column(idx)) => {
-                                        if let Some(v) = row.get(*idx) {
-                                            values.push(v.clone());
-                                        } else {
-                                            values.push(Value::null_unknown());
-                                        }
-                                    }
-                                    Some(ArgSource::Const(v)) => values.push(v.clone()),
-                                    None => values.push(Value::null_unknown()),
-                                }
-                            }
-                        }
-                        ExprAction::Concat(concat) => values.push(concat.value(&vm_ctx)?),
-                        ExprAction::Compiled(program) => {
-                            let value = vm.execute(program, &vm_ctx)?;
-                            values.push(value);
-                        }
-                    }
-                }
-
-                projected.put(id, Row::from_compact_vec(values));
-            }
-        }
-
-        Ok(())
     }
 
     /// Project rows including ORDER BY columns not in SELECT
@@ -10433,7 +7693,7 @@ impl Executor {
                 visible: None,
             }));
         }
-        let plan = self.select_projection(&stmt.columns, all_columns, None, None)?;
+        let plan = self.select_projection(&stmt.columns, all_columns, None)?;
         Ok(Some(JoinOutput {
             projection: JoinProjection::General(OutputProjection::Select(plan)),
             columns: CompactArc::new(columns),
@@ -10525,7 +7785,7 @@ impl Executor {
     ) -> SelectResult {
         let rows = match &output.projection {
             JoinProjection::General(OutputProjection::Select(plan)) => {
-                Self::run_select_projection(plan, rows, ctx)?
+                Self::run_select_projection(plan, rows)
             }
             JoinProjection::General(OutputProjection::Ordered(plan)) => {
                 Self::run_ordered_projection(plan, rows, ctx)?
@@ -10538,7 +7798,6 @@ impl Executor {
         };
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output.columns), rows);
         let shape = output.layout.as_ref().map(|layout| SelectShape {
-            deferred: None,
             layout: Some(LaidOut::Shared(CompactArc::clone(layout))),
             visible: output.visible,
         });
@@ -11181,49 +8440,6 @@ impl Executor {
         };
         let mapped = keys.map(try_map_to_column).collect();
         (mapped, aggregate_slots)
-    }
-
-    /// The top-N the statement's ORDER BY LIMIT keeps of projected rows of
-    /// `columns`, when its sort would read them by these columns alone, as
-    /// execute_select sorts them; None when the sort comes later or reads more
-    fn projected_top(
-        &self,
-        stmt: &SelectStatement,
-        columns: &[String],
-        layout: Option<&OutputLayout>,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<TopN<impl Fn(&Row, &Row) -> Ordering>>> {
-        if stmt.order_by.is_empty()
-            || stmt.distinct
-            || !stmt.distinct_on.is_empty()
-            || !stmt.set_operations.is_empty()
-        {
-            return Ok(None);
-        }
-        let (
-            Some(layout),
-            RowCounts {
-                limit: Some(limit),
-                offset,
-            },
-        ) = (layout, row_counts(stmt, ctx)?)
-        else {
-            return Ok(None);
-        };
-        let (mapped, _) = self.order_by_columns(stmt, columns, Some(layout), false);
-        let order_specs = stmt
-            .order_by
-            .iter()
-            .zip(mapped)
-            .map(|(ob, mapped)| mapped.map(|c| (Some(c), ob.ascending, ob.nulls_first)))
-            .collect::<Option<Vec<_>>>();
-        Ok(order_specs.map(|order_specs| {
-            TopN::new(
-                move |a: &Row, b: &Row| Self::compare_rows_with_indices(a, b, &order_specs),
-                limit,
-                offset,
-            )
-        }))
     }
 
     /// Compare two rows for ORDER BY using pre-computed column indices
@@ -12238,25 +9454,6 @@ impl Executor {
         }
     }
 
-    /// The WHERE a table scan reads `stmt`'s rows by when resolving the
-    /// SELECT aliases of `aliases` it names, then simplifying, changes it;
-    /// None when the scan reads the WHERE as written. Inlined into the table
-    /// scan, it costs that scan's loop more per row
-    #[inline(never)]
-    pub(crate) fn scan_where(
-        stmt: &SelectStatement,
-        aliases: &FxHashMap<String, &Expression>,
-    ) -> Option<Box<Expression>> {
-        let where_clause = stmt.where_clause.as_deref()?;
-        let resolved =
-            (!aliases.is_empty()).then(|| Self::substitute_aliases(where_clause, aliases));
-        let read = resolved.as_ref().unwrap_or(where_clause);
-        ExpressionSimplifier::new()
-            .try_simplify(read)
-            .or(resolved)
-            .map(Box::new)
-    }
-
     /// Build a map of column aliases to their underlying expressions from SELECT columns
     /// Build alias map, optionally excluding aliases that shadow real table columns.
     ///
@@ -12327,7 +9524,16 @@ impl Executor {
         columns: &[String],
     ) -> Result<()> {
         let resolved = Self::with_select_aliases(stmt, where_clause, columns);
-        RowFilter::new(resolved.as_ref().unwrap_or(where_clause), columns).map(|_| ())
+        let predicate = resolved.as_ref().unwrap_or(where_clause);
+        super::aggregation::compile_over_slots(
+            predicate,
+            columns,
+            global_registry(),
+            None,
+            false,
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Substitute column aliases in an expression with their underlying expressions

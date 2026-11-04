@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Every path that builds an aggregate result answers as recorded, each
-//! answer confirmed by the general path when it was recorded, and every
+//! answer confirmed by another path when it was recorded, and every
 //! path is exercised: a path added without a case here fails the coverage
 //! check
 
@@ -24,38 +24,14 @@ use stoolap::functions::{
     global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, NativeFn1,
     ScalarFunction,
 };
-use stoolap::test_failpoints::{
-    aggregate_paths, aggregate_paths_taken, reset_aggregate_paths, PREPARED_FAMILIES_OFF,
-};
+use stoolap::test_failpoints::{aggregate_paths, aggregate_paths_taken, reset_aggregate_paths};
 use stoolap::Database;
 
 mod oracle;
 
-// The families' switch is process-wide
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// What `run` gives with the prepared families refused, so a subquery block
-/// aggregates on the general path
-fn families_off<T>(run: impl FnOnce() -> T) -> T {
-    use std::sync::atomic::Ordering::SeqCst;
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    let _restore = Restore;
-    run()
-}
-
 /// The uncorrelated subqueries the references hold, each written in as its
-/// answer before a reference runs, an `IN` list when marked, so the general
-/// path reads no subquery
+/// answer before a reference runs, an `IN` list when marked, so the
+/// reference reads no subquery
 const WRITTEN_IN: &[(&str, bool)] = &[
     ("SELECT a FROM t WHERE id = 3", false),
     ("SELECT a FROM t WHERE id = 1", false),
@@ -79,10 +55,53 @@ fn written_in(db: &Database, reference: &str) -> String {
         })
 }
 
-/// (context, path the query takes there, query, the same query forced
-/// onto the general path, run with the prepared families refused to
-/// confirm an answer as it is recorded; a correlated subquery written as a
-/// join)
+/// Where the first space outside every parenthesis stands in `text`
+fn word_end(text: &str) -> usize {
+    let mut depth = 0i32;
+    text.char_indices()
+        .find(|&(_, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            c == ' ' && depth == 0
+        })
+        .map_or(text.len(), |(at, _)| at)
+}
+
+/// `sql` with its first source, at the top level, joined to one row of a
+/// column no statement names, which leaves its rows as they are
+fn joined(sql: &str) -> String {
+    let (mut depth, mut from) = (0i32, None);
+    for (at, c) in sql.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 && sql[at..].starts_with(" FROM ") => {
+                from = Some(at + " FROM ".len());
+                break;
+            }
+            _ => {}
+        }
+    }
+    let from = from.unwrap_or_else(|| panic!("{sql}: no FROM"));
+    // The source ends at the first space outside its parentheses, and after
+    // its name, the lowercase word after it, when it has one
+    let end = from + word_end(&sql[from..]);
+    let rest = sql[end..].strip_prefix(" AS ").unwrap_or(&sql[end..]);
+    let rest = rest.trim_start();
+    let end = match rest.starts_with(|c: char| c.is_ascii_lowercase()) {
+        true => sql.len() - rest.len() + word_end(rest),
+        false => end,
+    };
+    let (head, tail) = sql.split_at(end);
+    format!("{head} CROSS JOIN (VALUES (0)) AS oracle_one(oracle_x){tail}")
+}
+
+/// (context, path the query takes there, query, the same query written so
+/// that another path answers it, run to confirm an answer as it is
+/// recorded; a correlated subquery written as a join)
 const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
@@ -859,7 +878,6 @@ const RECORDED: oracle::Answers = answers!("aggregate_path_equivalence");
 
 #[test]
 fn every_aggregate_path_answers_as_recorded() {
-    let _guard = serial();
     let memory = open(
         Database::open("memory://aggregate_path_equivalence").unwrap(),
         false,
@@ -903,12 +921,19 @@ fn every_aggregate_path_answers_as_recorded() {
             wrong.push(format!("{ctx}: {sql}: took {taken:?}, expected [{path}]"));
         }
         let key = format!("{ctx}: {sql}");
-        // Recorded only as the reference, on the general path, answers it
+        // Recorded only as the reference, aggregated on another path,
+        // answers it; a reference on the same path alone is read over a
+        // join with one row
         let confirm = || {
-            let written = written_in(db, reference);
-            let (want, reference_taken) = families_off(|| run(db, &written));
+            let other = |taken: &[&str]| taken.iter().any(|p| *p != path);
+            let mut written = written_in(db, reference);
+            let (mut want, mut reference_taken) = run(db, &written);
+            if !other(&reference_taken) {
+                written = joined(&written);
+                (want, reference_taken) = run(db, &written);
+            }
             assert!(
-                !reference_taken.is_empty() && reference_taken.iter().all(|p| *p == "general"),
+                other(&reference_taken),
                 "{ctx}: {written}: took {reference_taken:?}"
             );
             lines(want)
@@ -934,7 +959,6 @@ fn every_aggregate_path_answers_as_recorded() {
 
 #[test]
 fn a_filtered_aggregate_keeps_every_conjunct_with_literals_and_parameters() {
-    let _guard = serial();
     let int = Value::Integer;
     // Each WHERE with its parameters; the literal form writes them in
     let cases: &[(&str, Vec<Value>, &str)] = &[
@@ -1024,7 +1048,6 @@ fn a_filtered_aggregate_keeps_every_conjunct_with_literals_and_parameters() {
 
 #[test]
 fn a_having_that_calls_a_scalar_function_is_not_judged_inside_the_index_walk() {
-    let _guard = serial();
     let db = open(
         Database::open("memory://aggregate_path_having_scalar_call").unwrap(),
         false,
@@ -1069,7 +1092,6 @@ impl ScalarFunction for NativeHaving {
 
 #[test]
 fn a_having_that_calls_a_native_function_is_not_judged_inside_the_index_walk() {
-    let _guard = serial();
     global_registry().register_scalar::<NativeHaving>().unwrap();
     let db = open(
         Database::open("memory://aggregate_path_having_native_call").unwrap(),

@@ -39,7 +39,7 @@ use super::query_cache::{
     CompiledConflictInsert, CompiledExecution, CompiledInsert, NestedPlan, PlanValidity,
 };
 use super::result::{ExecResult, ExecutorResult};
-use super::utils::{dummy_token_clone, qualified};
+use super::utils::qualified;
 use super::Executor;
 use std::sync::RwLock;
 
@@ -647,142 +647,6 @@ pub(crate) fn run_check_on_values(
 }
 
 impl Executor {
-    /// Select row_ids for DML operations using the full SELECT executor.
-    /// This reuses all SELECT optimizations (indexes, semi-joins, parallel execution, etc.)
-    /// for UPDATE and DELETE operations.
-    ///
-    /// Returns Some(row_ids) if:
-    /// - Table has a single-column INTEGER PRIMARY KEY
-    /// - WHERE clause exists
-    ///
-    /// Returns None to fall back to storage layer's scan-based approach.
-    fn select_row_ids_for_dml(
-        &self,
-        table_name: &str,
-        where_clause: &Expression,
-        schema: &Schema,
-        table: &dyn Table,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Vec<i64>>> {
-        // Check if this is a single-column INTEGER PRIMARY KEY
-        let pk_indices = schema.primary_key_indices();
-        if pk_indices.len() != 1 {
-            return Ok(None);
-        }
-
-        let pk_idx = pk_indices[0];
-        let pk_col = &schema.columns[pk_idx];
-
-        // Must be INTEGER type (where value = row_id)
-        if pk_col.data_type != DataType::Integer {
-            return Ok(None);
-        }
-
-        let pk_column_name = &pk_col.name;
-        let pk_column_lower = pk_column_name.to_lowercase();
-
-        // FAST PATH: If WHERE is InHashSet on the PK column, extract row_ids directly
-        // This avoids building and executing a full SELECT statement
-        if let Expression::InHashSet(in_expr) = where_clause {
-            if let Expression::Identifier(id) = in_expr.column.as_ref() {
-                if id.value_lower == pk_column_lower {
-                    // A member is the key it equals, read as the comparison
-                    // reads it: an integral float names a row, another names
-                    // none
-                    let member_key = |v: &Value| match v {
-                        Value::Integer(i) => Some(*i),
-                        Value::Float(f) => Self::lossless_float_key(*f),
-                        _ => None,
-                    };
-                    if in_expr.not {
-                        // NOT IN: get all active row_ids and exclude the ones in the set
-                        let excluded: I64Set = in_expr
-                            .values
-                            .members()
-                            .iter()
-                            .filter_map(member_key)
-                            .collect();
-
-                        let mut row_ids: Vec<i64> = table
-                            .get_active_row_ids()?
-                            .into_iter()
-                            .filter(|id| !excluded.contains(*id))
-                            .collect();
-                        row_ids.sort_unstable();
-                        return Ok(Some(row_ids));
-                    } else {
-                        // IN: the keys the members name
-                        let mut row_ids: Vec<i64> = in_expr
-                            .values
-                            .members()
-                            .iter()
-                            .filter_map(member_key)
-                            .collect();
-                        row_ids.sort_unstable();
-                        return Ok(Some(row_ids));
-                    }
-                }
-            }
-        }
-
-        // GENERAL PATH: Build SELECT query and use full executor
-        let select_stmt = SelectStatement {
-            param_count: 0,
-            token: dummy_token_clone(),
-            distinct: false,
-            distinct_on: vec![],
-            columns: vec![Expression::Identifier(Identifier::new(
-                dummy_token_clone(),
-                pk_column_name.clone(),
-            ))],
-            with: None,
-            table_expr: Some(Box::new(Expression::TableSource(Box::new(
-                SimpleTableSource {
-                    token: dummy_token_clone(),
-                    name: Identifier::new(dummy_token_clone(), table_name.to_string()),
-                    alias: None,
-                    as_of: None,
-                },
-            )))),
-            where_clause: Some(Box::new(where_clause.clone())),
-            group_by: GroupByClause::default(),
-            having: None,
-            window_defs: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            set_operations: Vec::new(),
-            prepared: None,
-        };
-
-        // Execute using full SELECT executor (gets all optimizations)
-        let target_ctx;
-        let ctx = if ctx.statement_view().is_some() {
-            target_ctx = ctx.with_newest_target(table_name);
-            &target_ctx
-        } else {
-            ctx
-        };
-        let mut result = self.execute_select(&select_stmt, ctx)?;
-
-        // Collect row_ids from result
-        let mut row_ids = Vec::new();
-        while result.next() {
-            let row = result.row();
-            if let Some(Value::Integer(id)) = row.get(0) {
-                row_ids.push(*id);
-            }
-        }
-        if let Some(err) = result.last_error() {
-            return Err(err);
-        }
-
-        // Sort for cache locality
-        row_ids.sort_unstable();
-
-        Ok(Some(row_ids))
-    }
-
     /// Whether the INSERT's VALUES, ON CONFLICT DO UPDATE or RETURNING hold
     /// a subquery of the prepared family
     #[inline(never)]
@@ -2992,25 +2856,11 @@ impl Executor {
                     }
                 }
             } else {
-                let row_ids = match memory_where_clause {
-                    Some(ref where_clause) => self.select_row_ids_for_dml(
-                        table_name,
-                        where_clause,
-                        schema,
-                        table.as_ref(),
-                        ctx,
-                    )?,
-                    None => None,
-                };
-                match row_ids {
-                    Some(row_ids) => table.update_by_row_ids(&row_ids, &mut setter)?,
-                    // The storage layer reads the rows the WHERE names
-                    None => {
-                        let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
-                        let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                        table.update(access, where_expr.as_deref(), &mut setter)?
-                    }
-                }
+                // The storage layer reads the rows the WHERE names; the setter
+                // asks each the part it does not take
+                let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+                let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+                table.update(access, where_expr.as_deref(), &mut setter)?
             };
             rows
         };
@@ -3453,39 +3303,21 @@ impl Executor {
             }
             delete_count
         } else {
-            // Simple WHERE expression without RETURNING - use storage layer directly
-            // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch delete.
-            // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
-            let row_ids = match memory_where_clause {
-                Some(ref where_clause) => self.select_row_ids_for_dml(
-                    table_name,
-                    where_clause,
-                    schema,
-                    table.as_ref(),
-                    ctx,
-                )?,
-                None => None,
-            };
-            match row_ids {
-                Some(row_ids) => table.delete_by_row_ids(&row_ids)?,
-                // The storage layer reads the rows the WHERE names
+            // A WHERE the storage layer takes whole: it reads the rows the
+            // WHERE names. The access the plan decided, else the rule's answer now
+            let decided = dml_run
+                .as_ref()
+                .filter(|_| where_prepared)
+                .and_then(|run| run.access(&*table));
+            let plan;
+            let access = match decided {
+                Some(access) => access,
                 None => {
-                    // The access the plan decided, else the rule's answer now
-                    let decided = dml_run
-                        .as_ref()
-                        .filter(|_| where_prepared)
-                        .and_then(|run| run.access(&*table));
-                    let plan;
-                    let access = match decided {
-                        Some(access) => access,
-                        None => {
-                            plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
-                            plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
-                        }
-                    };
-                    table.delete(access, where_expr.as_deref())?
+                    plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
+                    plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                 }
-            }
+            };
+            table.delete(access, where_expr.as_deref())?
         };
 
         // Invalidate semantic cache for this table BEFORE commit

@@ -127,12 +127,6 @@ impl Executor {
         // keeps whole is answered from there before its run
         let aggregating = PreparedSelect::aggregates(stmt);
         let aggregates = PreparedSelect::runs_aggregate(stmt, &shape);
-        if aggregates {
-            #[cfg(feature = "test-failpoints")]
-            if crate::test_failpoints::prepared_families_off() {
-                return Ok(None);
-            }
-        }
         let quiet = match aggregates {
             true => self.aggregate_plan(stmt, ctx),
             false => None,

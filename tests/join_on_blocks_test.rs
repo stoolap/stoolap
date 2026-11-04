@@ -25,8 +25,7 @@ mod oracle;
 use std::collections::BTreeSet;
 
 use stoolap::test_failpoints::{
-    bridge_compiles, join_paths_taken, prepared_strategy_runs, program_compiles, reset_join_paths,
-    PreparedStrategy,
+    join_paths_taken, prepared_strategy_runs, program_compiles, reset_join_paths, PreparedStrategy,
 };
 use stoolap::Database;
 
@@ -292,12 +291,11 @@ fn a_join_on_runs_its_subqueries_as_blocks() {
         };
         for case in CASES {
             let first = rows(&db, case.sql);
-            let bridge = bridge_compiles();
             let programs = program_compiles();
             reset_join_paths();
             let again = rows(&db, case.sql);
             let taken = join_paths_taken();
-            let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+            let compiled = program_compiles() - programs;
             let want = match &case.reference {
                 Reference::Moved(sql) => {
                     let want = rows(&db, sql);
@@ -316,9 +314,9 @@ fn a_join_on_runs_its_subqueries_as_blocks() {
                     case.sql, case.path
                 ));
             }
-            if compiled != (0, 0) {
+            if compiled != 0 {
                 wrong.push(format!(
-                    "sealed {sealed}: {}: run again, compiled {compiled:?}",
+                    "sealed {sealed}: {}: run again, compiled {compiled}",
                     case.sql
                 ));
             }
@@ -658,9 +656,9 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
             wrong.push(format!("{sql}: {got}, expected {want}"));
         }
         let ran = rows(&db, sql).and_then(|_| {
-            let compiles = (bridge_compiles(), program_compiles());
+            let compiles = program_compiles();
             rows(&db, sql)?;
-            Ok((bridge_compiles(), program_compiles()) == compiles)
+            Ok(program_compiles() == compiles)
         });
         if got == "Prepared: yes" && ran != Ok(true) {
             wrong.push(format!("{sql}: says yes, run again it compiled ({ran:?})"));
@@ -740,9 +738,9 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
             wrong.push(format!("{sql}: {got:?}, expected {want:?}"));
         }
         let ran = rows(&db, sql).and_then(|_| {
-            let compiles = (bridge_compiles(), program_compiles());
+            let compiles = program_compiles();
             rows(&db, sql)?;
-            Ok((bridge_compiles(), program_compiles()) == compiles)
+            Ok(program_compiles() == compiles)
         });
         if ran != Ok(want.iter().all(|line| *line == yes)) {
             wrong.push(format!(
@@ -755,9 +753,9 @@ fn explain_says_no_for_a_join_in_a_select_that_holds_no_plan() {
         wrong.push(format!("{insert}: {:?}", lines(&insert)));
     }
     let ran = db.execute(&insert, ()).and_then(|_| {
-        let compiles = (bridge_compiles(), program_compiles());
+        let compiles = program_compiles();
         db.execute(&insert, ())?;
-        Ok((bridge_compiles(), program_compiles()) == compiles)
+        Ok(program_compiles() == compiles)
     });
     if ran.as_ref().map_err(|e| e.to_string()) != Ok(&true) {
         wrong.push(format!(

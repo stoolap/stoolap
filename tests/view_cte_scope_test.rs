@@ -355,7 +355,7 @@ fn ctes_are_told_apart_by_their_names_not_a_number_made_of_them() {
 #[test]
 fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
     let _serial = serial();
-    use stoolap::test_failpoints::{bridge_compiles, program_compiles};
+    use stoolap::test_failpoints::program_compiles;
     let engine = MVCCEngine::in_memory();
     engine.open_engine().unwrap();
     let executor = Executor::new(Arc::new(engine));
@@ -364,11 +364,11 @@ fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
     }
     let sql = "SELECT t.id FROM t JOIN u ON EXISTS (SELECT 1 FROM u w WHERE w.id = t.id)";
     executor_ids(executor.execute_with_context(sql, &cte_context("u"))).unwrap();
-    let compiles = (bridge_compiles(), program_compiles());
+    let compiles = program_compiles();
     let again = executor_ids(executor.execute_with_context(sql, &cte_context("u")));
     assert_eq!(again, Ok(vec![2]));
     assert_eq!(
-        (bridge_compiles(), program_compiles()),
+        program_compiles(),
         compiles,
         "the same CTE names keep the plan"
     );
@@ -378,7 +378,6 @@ fn a_plan_made_in_a_context_bringing_ctes_is_kept_for_the_same_names() {
 #[test]
 fn a_table_read_after_a_cte_of_its_name_is_planned_again_for_its_context() {
     let _serial = serial();
-    use stoolap::test_failpoints::bridge_compiles;
     let mut wrong = Vec::new();
     for text in ["SELECT id FROM u", "SELECT id FROM u WHERE id >= 1"] {
         let engine = MVCCEngine::in_memory();
@@ -395,13 +394,9 @@ fn a_table_read_after_a_cte_of_its_name_is_planned_again_for_its_context() {
             (&[("u", 2)][..], vec![2]),
             (&[("w", 3)][..], vec![1]),
         ] {
-            let before = bridge_compiles();
             let got = executor_ids(executor.execute_with_context(text, &id_ctes_context(ctes)));
-            let compiled = bridge_compiles() - before;
-            if got != Ok(want.clone()) || compiled != 0 {
-                wrong.push(format!(
-                    "{text} under {ctes:?}: {got:?}, {compiled} bridge compiles"
-                ));
+            if got != Ok(want.clone()) {
+                wrong.push(format!("{text} under {ctes:?}: {got:?}"));
             }
         }
     }
