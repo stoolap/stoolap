@@ -3115,6 +3115,10 @@ struct PreparedBlocks {
     subqueries: Vec<PreparedSubquery>,
 }
 
+/// The scan's filter for a WHERE's pushed conjuncts, and whether a row it
+/// passes is still asked the rest
+type ScanFilter = (Option<Box<dyn StorageExpr>>, bool);
+
 /// A statement's WHERE over its table's row: its program, what of it a scan
 /// takes, and the rows a set test's keys may narrow it to
 #[derive(Debug)]
@@ -3133,6 +3137,10 @@ struct PreparedWhere {
     pushdown: Option<Expression>,
     /// `pushdown` prepared, for a run to give its values
     push: Option<PreparedPush>,
+    /// `pushdown` as the scan's filter, built by the first run that asks it
+    /// alone, when every run builds the same: it reads no parameter and no
+    /// value a run draws
+    converted: Option<std::sync::OnceLock<ScanFilter>>,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
     /// set's keys name the rows the WHERE may pass
     narrowing: Option<Narrowing>,
@@ -3551,6 +3559,13 @@ impl WhereParts {
             equalities: self.equalities,
             needed: None,
             push: pushdown.as_ref().and_then(|p| PreparedPush::of(p, schema)),
+            converted: pushdown
+                .as_ref()
+                .filter(|p| {
+                    !super::utils::expression_has_parameters(p)
+                        && expression_volatility(p, global_registry()) == Volatility::Fixed
+                })
+                .map(|_| std::sync::OnceLock::new()),
             whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
             scanned: programs
                 .scanned
@@ -14630,7 +14645,15 @@ impl<'a> PreparedRunner<'a> {
             _ if self.failed_slots.is_some() => (None, true),
             (Some(expr), _) => (Some(expr), false),
             (None, Some(pushdown)) if self.prepared.run_slots.is_empty() => {
-                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
+                match where_.converted.as_ref().filter(|_| extra.is_none()) {
+                    Some(converted) => {
+                        let (expr, residual) = converted.get_or_init(|| {
+                            pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
+                        });
+                        (expr.as_ref().map(|expr| expr.clone_box()), *residual)
+                    }
+                    None => pushdown::try_pushdown(pushdown, table.schema(), Some(ctx)),
+                }
             }
             (None, Some(pushdown)) => {
                 let mut run_ctx = ctx.clone();
