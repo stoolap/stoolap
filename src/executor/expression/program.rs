@@ -908,6 +908,11 @@ impl ProgramBuilder {
         self.folds.push((start, self.position()));
     }
 
+    /// Whether the ops emitted since `start` were marked to fold as one
+    pub fn folds_since(&self, start: u16) -> bool {
+        self.folds.last() == Some(&(start, self.position()))
+    }
+
     /// Emit an operation
     #[inline]
     pub fn emit(&mut self, op: Op) {
