@@ -116,7 +116,8 @@ fn a_known_text_vector_is_read_once_per_execution() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Each with the argument cast first, then written as the parameter alone
+/// Each with the argument folded over the parameter, then written as the
+/// parameter alone
 const CAST_TWINS: &[(&str, &str)] = &[
     (
         "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, CAST($1 AS TEXT)) < 1e9",
@@ -129,6 +130,15 @@ const CAST_TWINS: &[(&str, &str)] = &[
     (
         "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id \
          HAVING SUM(VEC_DISTANCE_L2(t.e, CAST($1 AS TEXT))) > 0",
+        "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id HAVING SUM(VEC_DISTANCE_L2(t.e, $1)) > 0",
+    ),
+    (
+        "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, COALESCE($1, '[0, 0, 0]')) < 1e9",
+        "SELECT COUNT(*) FROM t WHERE VEC_DISTANCE_L2(e, $1) < 1e9",
+    ),
+    (
+        "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id \
+         HAVING SUM(VEC_DISTANCE_L2(t.e, COALESCE($1, '[0, 0, 0]'))) > 0",
         "SELECT COUNT(*) FROM t JOIN r ON t.id = r.id HAVING SUM(VEC_DISTANCE_L2(t.e, $1)) > 0",
     ),
 ];

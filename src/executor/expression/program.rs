@@ -233,12 +233,13 @@ impl Program {
             return None;
         }
         let mut source = self.ops.clone();
-        let targets = JumpTargets::of(&mut source);
         let replaced_at: SmallVec<[usize; 4]> = replaced.iter().map(|(at, _)| *at).collect();
         for (at, op) in replaced {
             source[at] = op;
         }
         let folded = self.folded(&mut source, &replaced_at);
+        // A jump inside a folded range is gone with it
+        let targets = JumpTargets::outside(&mut source, &folded);
         let mut ops: Vec<Op> = Vec::with_capacity(source.len());
         // Of each op emitted: whether it loads a value known only now, and
         // the first position it stands for
@@ -816,8 +817,20 @@ struct JumpTargets(SmallVec<[bool; 32]>);
 
 impl JumpTargets {
     fn of(ops: &mut [Op]) -> Self {
+        Self::outside(ops, &[])
+    }
+
+    /// The positions the jumps of `ops` outside the `folded` ranges land on
+    fn outside(ops: &mut [Op], folded: &[(usize, usize, Value)]) -> Self {
         let mut targets: SmallVec<[bool; 32]> = smallvec::smallvec![false; ops.len() + 1];
-        for t in ops.iter_mut().filter_map(jump_target) {
+        for (at, op) in ops.iter_mut().enumerate() {
+            let Some(t) = jump_target(op) else { continue };
+            if folded
+                .iter()
+                .any(|(start, end, _)| (*start..*end).contains(&at))
+            {
+                continue;
+            }
             if let Some(target) = targets.get_mut(usize::from(*t)) {
                 *target = true;
             }
