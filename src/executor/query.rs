@@ -8072,7 +8072,7 @@ impl Executor {
             (None, None) => match (Self::side_with_subquery(expr), side.plan) {
                 (Some(alias), Some(plan)) => {
                     let (result, columns) =
-                        self.statement_side_rows((expr, alias), ctx, filter, plan)?;
+                        self.statement_side_rows((expr, alias), ctx, (side.filter, extra), plan)?;
                     (result, columns, false, None)
                 }
                 _ => self.execute_table_expression_with_filter_limit(
@@ -8137,16 +8137,18 @@ impl Executor {
 
     /// The rows of the join side `source`, a SELECT * of it run under the
     /// join's `plan` for the side, so a subquery in it runs as that
-    /// statement's block, and its columns qualified by `alias`; those
-    /// `filter` passes, applied to each read, as it may differ between them
+    /// statement's block, and its columns qualified by `alias`. The side's
+    /// own `filter`, the same every read, is that statement's WHERE, which
+    /// narrows the source as it is read; `extra`, which the join adds to
+    /// this read, is applied to its rows
     fn statement_side_rows(
         &self,
         (source, alias): (&Expression, Option<&str>),
         ctx: &ExecutionContext,
-        filter: Option<&Expression>,
+        (filter, extra): (Option<&Expression>, Option<&Expression>),
         plan: &NestedPlan,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        let select_all = Self::select_all_of(source.clone(), None);
+        let select_all = Self::select_all_of(source.clone(), filter);
         let result = self.execute_source_statement(&select_all, ctx, None, Some(plan))?;
         let columns: Vec<String> = (result.columns().iter())
             .map(|c| match alias {
@@ -8154,11 +8156,11 @@ impl Executor {
                 None => bare_name(c).to_string(),
             })
             .collect();
-        let Some(filter) = filter else {
+        let Some(extra) = extra else {
             return Ok((result, columns));
         };
         let program = super::aggregation::compile_over_slots(
-            filter,
+            extra,
             &columns,
             global_registry(),
             None,

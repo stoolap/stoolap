@@ -21,7 +21,7 @@
 use std::sync::Mutex;
 
 use stoolap::core::Value;
-use stoolap::test_failpoints::bridge_compiles;
+use stoolap::test_failpoints::{bridge_compiles, tvf_rows};
 use stoolap::Database;
 
 // The bridge counter is process-wide
@@ -124,4 +124,21 @@ fn a_source_holding_a_subquery_answers_as_written_without_the_bridge() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_table_function_side_is_narrowed_by_its_own_condition_as_it_generates() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_source_subquery_narrowed").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    // Unnarrowed, the series would pass the rows a series may generate
+    let sql = "SELECT t.id FROM t JOIN generate_series(1, (SELECT 10000001)) AS g \
+               ON g.value = t.id WHERE g.value = 1";
+    for run in 0..2 {
+        let before = tvf_rows();
+        assert_eq!(rows(&db, sql, &[]), ["1"], "{sql}, run {run}");
+        assert_eq!(tvf_rows() - before, 1, "{sql}, run {run}: rows generated");
+    }
 }
