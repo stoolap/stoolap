@@ -10969,10 +10969,55 @@ impl Executor {
         (name, ctx): (&str, &ExecutionContext),
         (limit, offset): (Option<usize>, usize),
     ) -> Result<Option<(Box<dyn crate::storage::traits::QueryResult>, bool)>> {
+        let read = self.join_side_source_rows(held, side, (name, ctx), (limit, offset))?;
+        let Some((rows, columns, bounded)) = read else {
+            return Ok(None);
+        };
+        let Some(where_) = &held.side_wheres[side] else {
+            let rows = match rows {
+                Ok(rows) => RowVec::from_vec(rows),
+                Err(shared) => RowVec::from_vec((*shared).clone()),
+            };
+            let result = ExecutorResult::with_arc_columns(columns, rows);
+            return Ok(Some((Box::new(result), bounded)));
+        };
+        let mut kept = RowVec::new();
+        let keep = |id: i64, _: u64, row: Row| {
+            kept.push((id, row));
+            true
+        };
+        match rows {
+            Ok(rows) => run.rows_passing(where_, rows.into_iter().map(Ok), ctx, None, keep)?,
+            Err(shared) => {
+                let rows = shared.iter().map(|(id, row)| Ok((*id, row)));
+                run.rows_passing(where_, rows, ctx, None, keep)?
+            }
+        };
+        let result = ExecutorResult::with_arc_columns(columns, kept);
+        Ok(Some((Box::new(result), bounded)))
+    }
+
+    /// Side `side` of the join `held` prepared, read from its source before
+    /// any of its conditions, a table function's from the `offset`-th up to
+    /// `limit` rows; with its columns and whether those were applied. Rows
+    /// read for this run move on as they are; a CTE's are shared
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn join_side_source_rows(
+        &self,
+        held: &JoinBlocks,
+        side: usize,
+        (name, ctx): (&str, &ExecutionContext),
+        (limit, offset): (Option<usize>, usize),
+    ) -> Result<
+        Option<(
+            std::result::Result<Vec<(i64, Row)>, SourceRows>,
+            CompactArc<Vec<String>>,
+            bool,
+        )>,
+    > {
         let Some(SideSource::Rows(source, schema)) = &held.side_sources[side] else {
             return Ok(None);
         };
-        // Rows read for this run move on as they are; a CTE's are shared
         let rows = match (source, limit) {
             (BlockSource::Function(function, range, _), Some(limit)) => {
                 let first = Some(limit.saturating_add(offset));
@@ -10996,29 +11041,7 @@ impl Executor {
             }
         };
         let bounded = limit.is_some() && matches!(source, BlockSource::Function(..));
-        let columns = schema.column_names_arc();
-        let Some(where_) = &held.side_wheres[side] else {
-            let rows = match rows {
-                Ok(rows) => RowVec::from_vec(rows),
-                Err(shared) => RowVec::from_vec((*shared).clone()),
-            };
-            let result = ExecutorResult::with_arc_columns(columns, rows);
-            return Ok(Some((Box::new(result), bounded)));
-        };
-        let mut kept = RowVec::new();
-        let keep = |id: i64, _: u64, row: Row| {
-            kept.push((id, row));
-            true
-        };
-        match rows {
-            Ok(rows) => run.rows_passing(where_, rows.into_iter().map(Ok), ctx, None, keep)?,
-            Err(shared) => {
-                let rows = shared.iter().map(|(id, row)| Ok((*id, row)));
-                run.rows_passing(where_, rows, ctx, None, keep)?
-            }
-        };
-        let result = ExecutorResult::with_arc_columns(columns, kept);
-        Ok(Some((Box::new(result), bounded)))
+        Ok(Some((rows, schema.column_names_arc(), bounded)))
     }
 
     /// `result`, side `expr` as the general path read it with its conditions

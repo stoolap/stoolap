@@ -5284,12 +5284,41 @@ impl Executor {
             // they prepared; without them each side is read for its names
             let (left_cols, right_cols) = match (statement_run, block_sides.as_ref()) {
                 (Some(run), Some(sides)) => {
-                    // A table side still has the columns they were prepared over
-                    let entries = [&join_source.left, &join_source.right];
-                    for (i, entry) in entries.into_iter().enumerate() {
-                        if let (false, Expression::TableSource(ts)) = (rows_sides[i], &**entry) {
-                            let schema = self.engine.get_table_schema(&ts.name.value_lower)?;
-                            run.blocks.side_fits(i, &schema)?;
+                    let reads = [
+                        (&join_source.left, left_read),
+                        (&join_source.right, right_read),
+                    ];
+                    for (i, (entry, side)) in reads.into_iter().enumerate() {
+                        match (rows_sides[i], &**entry) {
+                            // A table side still has the columns they were prepared over
+                            (false, Expression::TableSource(ts)) => {
+                                let schema = self.engine.get_table_schema(&ts.name.value_lower)?;
+                                run.blocks.side_fits(i, &schema)?;
+                            }
+                            // Any other is read as the general path reads it, none of
+                            // its conditions asked: a derived table to its last row
+                            _ => {
+                                let name = get_table_alias_from_expr(entry).unwrap_or_default();
+                                let read = self.join_side_source_rows(
+                                    run.blocks,
+                                    i,
+                                    (name.as_str(), ctx),
+                                    (Some(0), 0),
+                                )?;
+                                if read.is_none() {
+                                    let side = SideRead {
+                                        filter: None,
+                                        run: None,
+                                        apart: side.apart || rows_sides[i],
+                                        ..side
+                                    };
+                                    let (rows, ..) =
+                                        self.read_join_side(entry, ctx, side, None, None, 0)?;
+                                    if let Expression::SubquerySource(_) = &**entry {
+                                        Self::materialize_result(rows)?;
+                                    }
+                                }
+                            }
                         }
                     }
                     let names = |side: &JoinSide| -> Vec<String> {

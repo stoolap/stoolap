@@ -73,6 +73,7 @@ fn open(dsn: &str) -> Database {
         "CREATE TABLE w (k INTEGER PRIMARY KEY, y INTEGER)",
         "INSERT INTO w VALUES (1, 5)",
         "CREATE VIEW uv AS SELECT id, b FROM u",
+        "CREATE VIEW uo AS SELECT id + 9223372036854775807 AS x FROM u",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -102,6 +103,7 @@ const SHAPES: &[&str] = &[
     "SELECT * FROM w CROSS JOIN t LEFT JOIN {u} ON u.id = t.id WHERE 1 = 0",
     "SELECT t.missing FROM t JOIN {u} ON u.id = t.id WHERE 1 = 0",
     "SELECT t.id FROM t JOIN {u} ON u.id = t.id WHERE u.missing = 1 AND 1 = 0",
+    "SELECT t.id FROM t JOIN {u} ON u.id = t.id WHERE u.id + 9223372036854775807 > 0 AND 1 = 0",
 ];
 
 #[test]
@@ -126,6 +128,43 @@ fn a_join_that_keeps_no_row_answers_as_the_general_path() {
                 wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
             }
         }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_join_that_keeps_no_row_reads_its_other_sides_as_the_general_path() {
+    let _guard = serial();
+    let db = open("memory://join_where_false_side_errors");
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT t.id FROM t JOIN (VALUES (9223372036854775807 + 1)) AS v(x) ON TRUE WHERE FALSE",
+            "overflow",
+        ),
+        (
+            "SELECT t.id FROM t JOIN u ON t.missing = u.id JOIN w ON w.k = t.id WHERE FALSE",
+            "missing",
+        ),
+        (
+            "SELECT t.id FROM t JOIN (SELECT missing FROM u) AS d ON TRUE WHERE FALSE",
+            "missing",
+        ),
+        (
+            "SELECT t.id FROM t JOIN (SELECT id + 9223372036854775807 AS x FROM u) AS d ON TRUE WHERE FALSE",
+            "overflow",
+        ),
+    ] {
+        match answer(&db, sql) {
+            Err(e) if e.to_lowercase().contains(want) => {}
+            got => wrong.push(format!("{sql}\n  got  {got:?}\n  want an error naming {want}")),
+        }
+    }
+    // A view's rows are never pulled, so its body raises nothing
+    let sql = "SELECT t.id FROM t JOIN uo ON TRUE WHERE FALSE";
+    let got = answer(&db, sql);
+    if got != Ok((vec!["id".to_string()], Vec::new())) || got != general(&db, sql) {
+        wrong.push(format!("{sql}\n  got  {got:?}\n  want no row"));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
