@@ -18,9 +18,14 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use stoolap::core::Value;
+use stoolap::functions::registry::global_registry;
+use stoolap::functions::{
+    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+};
 use stoolap::test_failpoints::{bridge_compiles, tvf_rows};
 use stoolap::Database;
 
@@ -184,5 +189,55 @@ fn a_table_function_side_read_for_its_columns_generates_no_row() {
         assert_eq!(result.columns(), ["value"], "{sql}, run {run}");
         assert_eq!(result.count(), 0, "{sql}, run {run}");
         assert_eq!(tvf_rows() - before, 0, "{sql}, run {run}: rows generated");
+    }
+}
+
+static NEXT: AtomicI64 = AtomicI64::new(0);
+
+/// 1, 2, 3 and on, one value for each call
+#[derive(Default)]
+struct NextValue;
+
+impl ScalarFunction for NextValue {
+    fn name(&self) -> &str {
+        "JOIN_SOURCE_NEXT_VALUE"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "JOIN_SOURCE_NEXT_VALUE",
+            FunctionType::Scalar,
+            "the next of 1, 2, 3 and on",
+            FunctionSignature::new(FunctionDataType::Integer, vec![], 0, 0),
+        )
+        .non_deterministic()
+    }
+    fn evaluate(&self, _args: &[Value]) -> stoolap::core::Result<Value> {
+        Ok(Value::Integer(NEXT.fetch_add(1, Ordering::Relaxed) + 1))
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(NextValue)
+    }
+}
+
+#[test]
+fn a_values_side_is_evaluated_once_for_its_read() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    global_registry().register_scalar::<NextValue>().unwrap();
+    let db = Database::open("memory://join_source_subquery_values_once").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (101)", ()).unwrap();
+    // The 101st value matches; a read cut short and read again would
+    // evaluate the values again and draw other numbers
+    let values = vec!["(JOIN_SOURCE_NEXT_VALUE() + (SELECT 0))"; 101].join(", ");
+    let sql = format!("SELECT u.id FROM (VALUES {values}) AS v(n) JOIN u ON u.id = v.n LIMIT 1");
+    for run in 0..2 {
+        NEXT.store(0, Ordering::Relaxed);
+        assert_eq!(rows(&db, &sql, &[]), ["101"], "run {run}");
+        assert_eq!(
+            NEXT.load(Ordering::Relaxed),
+            101,
+            "run {run}: values evaluated"
+        );
     }
 }

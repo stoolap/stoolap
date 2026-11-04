@@ -8161,9 +8161,9 @@ impl Executor {
     /// statement's block, and its columns qualified by `alias`. The side's
     /// own `filter`, the same every read, is that statement's WHERE, which
     /// narrows the source as it is read; `extra`, which the join adds to
-    /// this read, is applied to its rows. The rows are cut as a table
-    /// function's general read cuts them, with whether `limit` and `offset`
-    /// were applied
+    /// this read, is applied to its rows. A table function's rows are cut as
+    /// its general read cuts them, with whether `limit` and `offset` were
+    /// applied
     fn statement_side_rows(
         &self,
         (source, alias): (&Expression, Option<&str>),
@@ -8174,9 +8174,15 @@ impl Executor {
     ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
         let keeps_none =
             |c: Option<&Expression>| c.is_some_and(|c| true_for_no_row(c, ctx, global_registry()));
-        let first = match (filter, extra) {
-            _ if keeps_none(filter) || keeps_none(extra) => Some(0),
-            (None, None) => limit.map(|limit| limit.saturating_add(offset)),
+        // A VALUES list is read whole, as its general read reads it: a read
+        // again would evaluate its values again
+        let first = match (source, filter, extra) {
+            (Expression::FunctionTableSource(_), ..) if keeps_none(filter) || keeps_none(extra) => {
+                Some(0)
+            }
+            (Expression::FunctionTableSource(_), None, None) => {
+                limit.map(|limit| limit.saturating_add(offset))
+            }
             _ => None,
         };
         // The cut is a parameter past the statement's own, so every read of
