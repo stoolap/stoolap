@@ -15,45 +15,36 @@
 //! A join condition over a compiled program, run per pair of rows with the
 //! statement's parameters and transaction
 
-use crate::api::params::ParamVec;
-use crate::common::CompactArc;
+use std::cell::RefCell;
+
 use crate::core::Row;
 use crate::executor::context::ExecutionContext;
 
-use super::program::{Program, SharedProgram};
-use super::row_filter::EMPTY_PARAMS;
+use super::bound_program::BoundProgram;
+use super::program::SharedProgram;
 use super::vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 
 /// A filter for join condition evaluation between two rows.
 #[derive(Clone)]
 pub struct JoinFilter {
-    /// Pre-compiled program
-    program: SharedProgram,
-    /// Query parameters (shared Arc to avoid cloning)
-    params: CompactArc<ParamVec>,
-    /// Transaction ID for CURRENT_TRANSACTION_ID()
-    transaction_id: Option<u64>,
+    bound: BoundProgram,
 }
 
 impl JoinFilter {
     /// A filter over a program compiled earlier for the same column lists
     pub fn from_program(program: SharedProgram) -> Self {
         Self {
-            program,
-            params: EMPTY_PARAMS.clone(),
-            transaction_id: None,
+            bound: BoundProgram::new(program),
         }
     }
 
-    /// Set parameters and the transaction from the execution context.
-    /// Required when the join condition holds parameter placeholders
-    /// ($1, $2, ...) or reads CURRENT_TRANSACTION_ID().
+    /// This filter bound to the parameters and transaction of `ctx`, which
+    /// a condition reading a parameter or CURRENT_TRANSACTION_ID() needs
     #[inline]
-    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        self.params = CompactArc::clone(ctx.params_arc());
-        self.program = Program::bound(self.program, &self.params);
-        self.transaction_id = ctx.transaction_id();
-        self
+    pub fn with_context(self, ctx: &ExecutionContext) -> Self {
+        Self {
+            bound: self.bound.with_context(ctx),
+        }
     }
 
     /// Check if a pair of rows satisfies the join condition. An error in it
@@ -75,31 +66,20 @@ impl JoinFilter {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> bool {
         JOIN_VM.with(|vm| {
-            let mut ctx = ExecuteContext::for_join(left_row, right_row);
-
-            // Apply params if present (required for parameter placeholders like $1, $2)
-            let params = blocks.and_then(|b| b.params()).unwrap_or(&self.params);
-            if !params.is_empty() {
-                ctx = ctx.with_params(params);
-            }
-            ctx = ctx.with_transaction_id(self.transaction_id);
-            if let Some(blocks) = blocks {
-                ctx = ctx.with_subquery_executor(blocks);
-            }
-
-            // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
-            // If the VM is already borrowed, create a temporary one for this call.
-            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
-                let matched = borrowed_vm.execute_bool(&self.program, &ctx);
-                if borrowed_vm.has_bool_error() {
+            let pair = ExecuteContext::for_join(left_row, right_row);
+            let ctx = self.bound.context(pair, blocks);
+            // A condition calling a function that runs a join again on this
+            // thread gets a fresh VM, whose error goes to the fallback slot
+            if let Ok(mut vm) = vm.try_borrow_mut() {
+                let matched = vm.execute_bool(&self.bound.program, &ctx);
+                if vm.has_bool_error() {
                     *failed = true;
                 }
                 matched
             } else {
-                // Fallback: create a fresh VM for recursive calls
-                let mut temp_vm = ExprVM::new();
-                let matched = temp_vm.execute_bool(&self.program, &ctx);
-                if let Some(e) = temp_vm.take_bool_error() {
+                let mut vm = ExprVM::new();
+                let matched = vm.execute_bool(&self.bound.program, &ctx);
+                if let Some(e) = vm.take_bool_error() {
                     JOIN_FALLBACK_ERROR.with(|slot| {
                         slot.borrow_mut().get_or_insert(e);
                     });
@@ -128,16 +108,16 @@ impl JoinFilter {
 
     /// Get the underlying program.
     pub fn program(&self) -> &SharedProgram {
-        &self.program
+        &self.bound.program
     }
 }
 
 thread_local! {
     /// The VM join conditions run in on this thread
-    static JOIN_VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+    static JOIN_VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
     /// An error from a join condition run on a temporary VM, for `take_error`
-    static JOIN_FALLBACK_ERROR: std::cell::RefCell<Option<crate::core::Error>> =
-        const { std::cell::RefCell::new(None) };
+    static JOIN_FALLBACK_ERROR: RefCell<Option<crate::core::Error>> =
+        const { RefCell::new(None) };
 }
 
 // Static assertions to verify JoinFilter implements Send + Sync.
@@ -151,6 +131,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::params::ParamVec;
+    use crate::common::CompactArc;
     use crate::core::Value;
     use crate::executor::expression::{CompileContext, ExprCompiler};
     use crate::functions::global_registry;

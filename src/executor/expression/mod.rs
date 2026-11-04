@@ -36,6 +36,7 @@
 //   │   (Value)   │     │              │     │             │
 //   └─────────────┘     └──────────────┘     └─────────────┘
 
+mod bound_program;
 mod compiler;
 mod join_filter;
 mod once;
