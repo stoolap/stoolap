@@ -4105,6 +4105,14 @@ impl Executor {
         if let Some(Err(e)) = programs.iter().find(|program| program.is_err()) {
             return Err(e.clone());
         }
+        // Bound to this run's parameters once, before the rows
+        let programs: SmallVec<[_; 8]> = programs
+            .iter()
+            .flatten()
+            .map(|program| {
+                super::expression::Program::bound(CompactArc::clone(program), ctx.params())
+            })
+            .collect();
 
         // Create VM for execution (reused for all rows)
         let mut vm = ExprVM::new();
@@ -4116,7 +4124,7 @@ impl Executor {
             let exec_ctx = ExecuteContext::new(&row).with_params(ctx.params());
 
             let mut row_values = Vec::with_capacity(programs.len());
-            for program in programs.iter().flatten() {
+            for program in &programs {
                 // CRITICAL: Propagate errors instead of silently returning NULL
                 let value = vm.execute(program, &exec_ctx)?;
                 row_values.push(value);

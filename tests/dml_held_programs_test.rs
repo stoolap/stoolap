@@ -18,8 +18,11 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{bridge_compiles, program_compiles};
+use stoolap::test_failpoints::{bridge_compiles, program_compiles, programs_ran};
 use stoolap::{Database, Value};
+
+/// Held by each test: the programs one records are those of every thread
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Each statement with the parameters of its first and its second run
 const CASES: &[(&str, [&[i64]; 2])] = &[
@@ -109,6 +112,7 @@ fn run(db: &Database, sql: &str, params: &[i64], in_transaction: bool) -> Result
 
 #[test]
 fn a_dml_run_after_the_first_compiles_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
     for (cold, in_transaction) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
@@ -131,6 +135,46 @@ fn a_dml_run_after_the_first_compiles_nothing() {
                      {again:?}, run again, compiled {compiled:?}"
                 ));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Each RETURNING reading a parameter, over the rows it returns
+const RETURNING_PARAMETERS: &[&str] = &[
+    "INSERT INTO dst SELECT id, v FROM src RETURNING id, VEC_DISTANCE_L2(v, $1)",
+    "UPDATE src SET n = n + 1 RETURNING VEC_DISTANCE_L2(v, $1)",
+    "DELETE FROM dst RETURNING id, VEC_DISTANCE_L2(v, $1)",
+];
+
+#[test]
+fn a_returning_binds_its_parameters_once_per_run() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://dml_held_returning_parameters").unwrap();
+    for sql in [
+        "CREATE TABLE src (id INTEGER PRIMARY KEY, v VECTOR(3), n INTEGER)",
+        "CREATE TABLE dst (id INTEGER PRIMARY KEY, v VECTOR(3))",
+        "INSERT INTO src SELECT value, '[1,2,3]', 0 FROM generate_series(1, 5)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for sql in RETURNING_PARAMETERS {
+        let mut returned = 0;
+        let ran = programs_ran(|| {
+            returned = db
+                .query(sql, vec![Value::text("[1,2,4]")])
+                .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .len();
+        });
+        let per_row: Vec<String> = ran
+            .into_iter()
+            .filter(|(listing, times)| *times > 1 && listing.contains("LoadParam"))
+            .map(|(listing, times)| format!("{times} runs of {listing}"))
+            .collect();
+        if returned != 5 || !per_row.is_empty() {
+            wrong.push(format!("{sql}: {returned} rows, {per_row:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
