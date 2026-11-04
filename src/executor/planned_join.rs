@@ -262,15 +262,25 @@ impl Executor {
         if qualified_by(&outer_col, &inner_alias_lower) {
             return None;
         }
-        if outer_alias.is_some_and(|alias| !qualified_by(&outer_col, &alias.to_lowercase())) {
-            return None;
-        }
         let inner_col = bare_name(&inner_col).to_string();
         let txn = self.begin_transaction().ok()?;
         let table = txn
             .get_read_table_at(&table_name, None, TableUse::Read)
             .ok()?;
         let schema = table.schema();
+        // The outer column is the outer side's: qualified by its name, or a
+        // bare name the inner table has no column of
+        let outer_named_by_inner =
+            || (schema.columns.iter()).any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
+        let outer_side = match split_qualified(&outer_col) {
+            Some(_) => {
+                outer_alias.is_none_or(|alias| qualified_by(&outer_col, &alias.to_lowercase()))
+            }
+            None => !outer_named_by_inner(),
+        };
+        if !outer_side {
+            return None;
+        }
         let is_pk = schema
             .pk_column_index()
             .is_some_and(|pk| schema.columns[pk].name_lower == inner_col.to_lowercase());
@@ -279,15 +289,7 @@ impl Executor {
         } else if let Some(index) = table.lookup_index_on_column(&inner_col) {
             ProbeIndex::Secondary(index)
         } else {
-            // A narrowing key must be the outer side's; an inner column's
-            // name is unsure
-            let outer_is_sure = outer_alias.is_some()
-                || split_qualified(&outer_col).is_some()
-                || !schema
-                    .columns
-                    .iter()
-                    .any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
-            ProbeIndex::Equality { outer_is_sure }
+            ProbeIndex::Equality
         };
         Some(IndexProbe {
             table: table_name,
@@ -313,7 +315,7 @@ impl Executor {
         let strategy = match &probe.index {
             ProbeIndex::PrimaryKey => IndexLookupStrategy::PrimaryKey,
             ProbeIndex::Secondary(index) => IndexLookupStrategy::SecondaryIndex(Arc::clone(index)),
-            ProbeIndex::Equality { outer_is_sure } => {
+            ProbeIndex::Equality => {
                 let txn = self.begin_transaction().ok()?;
                 let table = txn
                     .get_read_table_at(&probe.table, None, TableUse::Read)
@@ -323,7 +325,7 @@ impl Executor {
                 let probes = probes_by_equality(&*table, &probe.inner_col);
                 let narrows =
                     large || (probes && table.has_sealed_rows()) || (outer_materialized && !probes);
-                if !((bounded && probes) || (small_outer && *outer_is_sure && narrows)) {
+                if !((bounded && probes) || (small_outer && narrows)) {
                     return None;
                 }
                 return Some((

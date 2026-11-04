@@ -56,9 +56,7 @@ pub(crate) enum ProbeIndex {
     Secondary(Arc<dyn Index>),
     /// The table's candidates for one key, which a run takes only when the
     /// table's size and the join's limit say a probe pays
-    Equality {
-        outer_is_sure: bool,
-    },
+    Equality,
 }
 
 impl std::fmt::Debug for ProbeIndex {
@@ -66,9 +64,7 @@ impl std::fmt::Debug for ProbeIndex {
         match self {
             ProbeIndex::PrimaryKey => f.write_str("PrimaryKey"),
             ProbeIndex::Secondary(index) => write!(f, "Secondary({})", index.name()),
-            ProbeIndex::Equality { outer_is_sure } => {
-                write!(f, "Equality {{ outer_is_sure: {outer_is_sure} }}")
-            }
+            ProbeIndex::Equality => f.write_str("Equality"),
         }
     }
 }
