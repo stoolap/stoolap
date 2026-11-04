@@ -170,3 +170,19 @@ fn a_side_read_without_its_condition_keeps_its_plan_apart() {
         assert_eq!(ids(true), [1], "{sql} with true again");
     }
 }
+
+#[test]
+fn a_table_function_side_read_for_its_columns_generates_no_row() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_source_subquery_no_row").unwrap();
+    // Read in full, the series would pass the rows a series may generate
+    let sql = "SELECT g.value FROM generate_series(1, (SELECT 20000000)) AS g(value) \
+               JOIN (VALUES (1)) AS v(x) ON 1 = 1 WHERE 1 = 0 LIMIT 1";
+    for run in 0..2 {
+        let before = tvf_rows();
+        let result = db.query(sql, ()).unwrap();
+        assert_eq!(result.columns(), ["value"], "{sql}, run {run}");
+        assert_eq!(result.count(), 0, "{sql}, run {run}");
+        assert_eq!(tvf_rows() - before, 0, "{sql}, run {run}: rows generated");
+    }
+}

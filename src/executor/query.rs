@@ -5345,8 +5345,13 @@ impl Executor {
                                         apart: side.apart || rows_sides[i],
                                         ..side
                                     };
+                                    // A table function generates no row, as the
+                                    // source read above takes one
+                                    let limit =
+                                        matches!(&**entry, Expression::FunctionTableSource(_))
+                                            .then_some(0);
                                     let (rows, ..) =
-                                        self.read_join_side(entry, ctx, side, None, None, 0)?;
+                                        self.read_join_side(entry, ctx, side, None, limit, 0)?;
                                     run.blocks.rows_fit(i, &name, rows.columns())?;
                                     if let Expression::SubquerySource(_) = &**entry {
                                         Self::materialize_result(rows)?;
@@ -8081,9 +8086,15 @@ impl Executor {
                 side.filter.map_or(side.bare, |_| side.plan),
             ) {
                 (Some(alias), Some(plan)) => {
-                    let (result, columns) =
-                        self.statement_side_rows((expr, alias), ctx, (side.filter, extra), plan)?;
-                    (result, columns, false, None)
+                    let conditions = (side.filter, extra);
+                    let (result, columns, bounded) = self.statement_side_rows(
+                        (expr, alias),
+                        ctx,
+                        conditions,
+                        (limit, offset),
+                        plan,
+                    )?;
+                    (result, columns, bounded, None)
                 }
                 _ => self.execute_table_expression_with_filter_limit(
                     expr, ctx, filter, limit, offset, read_out,
@@ -8150,44 +8161,76 @@ impl Executor {
     /// statement's block, and its columns qualified by `alias`. The side's
     /// own `filter`, the same every read, is that statement's WHERE, which
     /// narrows the source as it is read; `extra`, which the join adds to
-    /// this read, is applied to its rows
+    /// this read, is applied to its rows. The rows are cut as a table
+    /// function's general read cuts them, with whether `limit` and `offset`
+    /// were applied
     fn statement_side_rows(
         &self,
         (source, alias): (&Expression, Option<&str>),
         ctx: &ExecutionContext,
         (filter, extra): (Option<&Expression>, Option<&Expression>),
+        (limit, offset): (Option<usize>, usize),
         plan: &NestedPlan,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        let select_all = Self::select_all_of(source.clone(), filter);
-        let result = self.execute_source_statement(&select_all, ctx, None, Some(plan))?;
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+        let keeps_none =
+            |c: Option<&Expression>| c.is_some_and(|c| true_for_no_row(c, ctx, global_registry()));
+        let first = match (filter, extra) {
+            _ if keeps_none(filter) || keeps_none(extra) => Some(0),
+            (None, None) => limit.map(|limit| limit.saturating_add(offset)),
+            _ => None,
+        };
+        // The cut is a parameter past the statement's own, so every read of
+        // the plan runs one statement
+        let mut cut = ctx.clone();
+        cut.add_param(Value::Integer(
+            first.map_or(i64::MAX, |first| i64::try_from(first).unwrap_or(i64::MAX)),
+        ));
+        let mut select_all = Self::select_all_of(source.clone(), filter);
+        select_all.limit = Some(Box::new(super::dml::answer_parameter(cut.params().len())));
+        let result = self.execute_source_statement(&select_all, &cut, None, Some(plan))?;
         let columns: Vec<String> = (result.columns().iter())
             .map(|c| match alias {
                 Some(alias) => qualified(alias, bare_name(c)),
                 None => bare_name(c).to_string(),
             })
             .collect();
-        let Some(extra) = extra else {
-            return Ok((result, columns));
+        let bounded = first.is_some();
+        let skip = if bounded { offset } else { 0 };
+        if extra.is_none() && skip == 0 {
+            return Ok((result, columns, bounded));
+        }
+        let program = match extra {
+            Some(extra) => {
+                let program = super::aggregation::compile_over_slots(
+                    extra,
+                    &columns,
+                    global_registry(),
+                    None,
+                    false,
+                    None,
+                )?;
+                Some(super::expression::Program::bound(program, ctx.params()))
+            }
+            None => None,
         };
-        let program = super::aggregation::compile_over_slots(
-            extra,
-            &columns,
-            global_registry(),
-            None,
-            false,
-            None,
-        )?;
-        let program = super::expression::Program::bound(program, ctx.params());
         let mut vm = ExprVM::new();
         let mut kept = RowVec::new();
+        let mut skipped = 0;
         for (id, row) in Self::materialize_result(result)? {
-            let exec = super::aggregation::slot_context(&row, ctx);
-            if vm.execute_bool_checked(&program, &exec)? {
-                kept.push((id, row));
+            if let Some(program) = &program {
+                let exec = super::aggregation::slot_context(&row, ctx);
+                if !vm.execute_bool_checked(program, &exec)? {
+                    continue;
+                }
             }
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+            kept.push((id, row));
         }
         let result = ExecutorResult::new(columns.clone(), kept);
-        Ok((Box::new(result), columns))
+        Ok((Box::new(result), columns, bounded))
     }
 
     /// A derived table's rows and its columns qualified by its alias, those
