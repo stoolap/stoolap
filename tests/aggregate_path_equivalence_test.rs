@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Every path that builds an aggregate result answers as the general path
-//! does, and every path is exercised: a path added without a case here
-//! fails the coverage check
+//! Every path that builds an aggregate result answers as recorded, each
+//! answer confirmed by the general path when it was recorded, and every
+//! path is exercised: a path added without a case here fails the coverage
+//! check
 
 #![cfg(feature = "test-failpoints")]
 
@@ -79,8 +80,9 @@ fn written_in(db: &Database, reference: &str) -> String {
 }
 
 /// (context, path the query takes there, query, the same query forced
-/// onto the general path, run with the prepared families refused; a
-/// correlated subquery written as a join)
+/// onto the general path, run with the prepared families refused to
+/// confirm an answer as it is recorded; a correlated subquery written as a
+/// join)
 const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
@@ -853,8 +855,10 @@ fn run(db: &Database, sql: &str) -> (Answer, Vec<&'static str>) {
     (answer, aggregate_paths_taken())
 }
 
+const RECORDED: oracle::Answers = answers!("aggregate_path_equivalence");
+
 #[test]
-fn every_aggregate_path_answers_as_the_general_path() {
+fn every_aggregate_path_answers_as_recorded() {
     let _guard = serial();
     let memory = open(
         Database::open("memory://aggregate_path_equivalence").unwrap(),
@@ -885,28 +889,37 @@ fn every_aggregate_path_answers_as_the_general_path() {
             _ => &memory,
         };
         let (got, taken) = run(db, sql);
-        let written = written_in(db, reference);
-        let (want, reference_taken) = families_off(|| run(db, &written));
         // A value written in names its column by the value: the rows compare
-        let rows_only = |answer: Answer| answer.map(|(_, rows)| (Vec::new(), rows));
-        let (got, want) = match written == reference {
-            true => (got, want),
-            false => (rows_only(got), rows_only(want)),
+        let named = !WRITTEN_IN
+            .iter()
+            .any(|(subquery, _)| reference.contains(&format!("({subquery})")));
+        let lines = |answer: Answer| {
+            answer.map(|(columns, rows)| {
+                let names = named.then(|| format!("columns: {}", columns.join("|")));
+                names.into_iter().chain(rows).collect::<Vec<_>>()
+            })
         };
-        let reference = written;
         if taken != [path] {
             wrong.push(format!("{ctx}: {sql}: took {taken:?}, expected [{path}]"));
         }
-        if reference_taken.is_empty() || reference_taken.iter().any(|p| *p != "general") {
-            wrong.push(format!("{ctx}: {reference}: took {reference_taken:?}"));
-        }
-        if got != want {
-            wrong.push(format!("{ctx}: {sql}: got {got:?}, general path {want:?}"));
+        let key = format!("{ctx}: {sql}");
+        // Recorded only as the reference, on the general path, answers it
+        let confirm = || {
+            let written = written_in(db, reference);
+            let (want, reference_taken) = families_off(|| run(db, &written));
+            assert!(
+                !reference_taken.is_empty() && reference_taken.iter().all(|p| *p == "general"),
+                "{ctx}: {written}: took {reference_taken:?}"
+            );
+            lines(want)
+        };
+        if let Some(error) = oracle::check_confirmed(&RECORDED, &key, &lines(got), confirm) {
+            wrong.push(error);
         }
         covered.extend(taken);
-        covered.extend(reference_taken);
     }
-    for path in aggregate_paths() {
+    // The general path answers the references, and only when recording
+    for path in aggregate_paths().into_iter().filter(|p| *p != "general") {
         if !covered.contains(&path) {
             wrong.push(format!("no case takes the {path} path"));
         }
