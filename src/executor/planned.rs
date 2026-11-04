@@ -35,6 +35,7 @@ use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::row_count::static_row_counts;
+use super::utils::where_without_aggregates;
 use super::Executor;
 
 impl Executor {
@@ -104,10 +105,9 @@ impl Executor {
         Some(run(&planned))
     }
 
-    /// The plan of `stmt`, kept in `compiled`; a statement prepared but not
-    /// planned is kept as one the planner declines while its tables hold;
-    /// a name no table or view has, or a column the schema it reads does
-    /// not have, is the statement's error
+    /// The plan of `stmt`, kept in `compiled`; a name no table or view has,
+    /// and any error preparing it, such as a column its table does not
+    /// have, is the statement's error
     fn plan_into(
         &self,
         stmt: &SelectStatement,
@@ -163,8 +163,6 @@ impl Executor {
         {
             return Ok(None);
         }
-        // Read before the schema: a change in between leaves this behind
-        let validity = self.select_validity(stmt, epoch);
         let store = match self.engine.get_version_store(table) {
             Ok(store) => store,
             Err(Error::TableNotFound(_)) if self.engine.get_view_lowercase(table)?.is_none() => {
@@ -177,8 +175,14 @@ impl Executor {
         crate::test_failpoints::compile_schema_read();
         let scope = ts.alias.as_ref().map_or(table, |alias| &alias.value_lower);
         let param_count = ctx.params().len();
+        // A statement whose values are not all given, as EXPLAIN shows one,
+        // is not planned; what else prepare refuses is the statement's error
+        if stmt.param_count > param_count {
+            return Ok(None);
+        }
+        where_without_aggregates(stmt.where_clause.as_deref())?;
         let (branch, keyed_branch) = prepared_branch(stmt);
-        let prepared = match PreparedSelect::prepare(
+        let mut prepared = PreparedSelect::prepare(
             self,
             ctx,
             &branch,
@@ -187,32 +191,26 @@ impl Executor {
             param_count,
             epoch,
             keyed_branch,
-        ) {
-            Ok(prepared) => Some(prepared),
-            Err(e @ Error::ColumnNotFound(_)) => return Err(e),
-            Err(_) => None,
-        };
-        let prepared = prepared.map(|mut prepared| {
-            // A LIMIT or OFFSET read per run leaves the statement to a
-            // scan, and so do a DISTINCT, which the key read does not
-            // take, a set operation, whose rows are its branches' too, and
-            // an aggregate, whose row its calls compute
-            let counts = static_row_counts(stmt).filter(|_| {
-                stmt.set_operations.is_empty()
-                    && !stmt.distinct
-                    && !shape.has_window_functions
-                    && !aggregates
-            });
-            if let Some(counts) = counts {
-                prepared.read_by_key(
-                    (table.clone(), &store),
-                    (schema, token),
-                    (counts.offset, counts.limit),
-                );
-            }
-            prepared.quiet = quiet;
-            Arc::new(prepared)
+        )?;
+        // A LIMIT or OFFSET read per run leaves the statement to a scan, and
+        // so do a DISTINCT, which the key read does not take, a set
+        // operation, whose rows are its branches' too, and an aggregate,
+        // whose row its calls compute
+        let counts = static_row_counts(stmt).filter(|_| {
+            stmt.set_operations.is_empty()
+                && !stmt.distinct
+                && !shape.has_window_functions
+                && !aggregates
         });
+        if let Some(counts) = counts {
+            prepared.read_by_key(
+                (table.clone(), &store),
+                (schema, token),
+                (counts.offset, counts.limit),
+            );
+        }
+        prepared.quiet = quiet;
+        let prepared = Arc::new(prepared);
         let Ok(mut slot) = compiled.write() else {
             return Ok(None);
         };
@@ -222,12 +220,9 @@ impl Executor {
                 | CompiledExecution::NotOptimizable(_)
                 | CompiledExecution::PreparedSelect(_)
         ) {
-            *slot = match &prepared {
-                Some(prepared) => CompiledExecution::PreparedSelect(Arc::clone(prepared)),
-                None => CompiledExecution::NotOptimizable(validity),
-            };
+            *slot = CompiledExecution::PreparedSelect(Arc::clone(&prepared));
         }
-        Ok(prepared)
+        Ok(Some(prepared))
     }
 
     /// The plan the planner makes of `stmt` in `ctx`, as EXPLAIN shows it;
