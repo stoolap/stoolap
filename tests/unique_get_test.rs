@@ -247,61 +247,6 @@ fn a_false_constant_term_keeps_every_row_out_before_a_key_read() {
     }
 }
 
-/// ABS answering -1 for every argument, on a registry of its own
-#[derive(Default)]
-struct MinusOne;
-
-impl stoolap::functions::ScalarFunction for MinusOne {
-    fn name(&self) -> &str {
-        "ABS"
-    }
-    fn info(&self) -> stoolap::functions::FunctionInfo {
-        use stoolap::functions::{FunctionDataType, FunctionInfo, FunctionSignature, FunctionType};
-        FunctionInfo::new(
-            "ABS",
-            FunctionType::Scalar,
-            "test override",
-            FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
-        )
-    }
-    fn evaluate(&self, _args: &[stoolap::Value]) -> stoolap::core::Result<stoolap::Value> {
-        Ok(stoolap::Value::Integer(-1))
-    }
-    fn clone_box(&self) -> Box<dyn stoolap::functions::ScalarFunction> {
-        Box::new(MinusOne)
-    }
-}
-
-#[test]
-fn a_constant_term_is_asked_with_the_statements_own_functions() {
-    let registry = stoolap::functions::registry::FunctionRegistry::new();
-    registry.register_scalar::<MinusOne>();
-    let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor = stoolap::executor::Executor::with_function_registry(
-        std::sync::Arc::new(engine),
-        std::sync::Arc::new(registry),
-    );
-    for sql in [CREATE, "INSERT INTO u VALUES (1, 7, 'n1', 1.0)"] {
-        executor.execute(sql).unwrap();
-    }
-    let count = |sql: &str| {
-        let mut rows = executor.execute(sql).unwrap();
-        let mut n = 0;
-        while rows.next() {
-            n += 1;
-        }
-        n
-    };
-    for sql in [
-        "SELECT id FROM u WHERE id = 1 AND ABS(1) < 0",
-        "SELECT id FROM u WHERE code = 7 AND ABS(1) < 0",
-        "SELECT id FROM u WHERE name = 'n1' AND ABS(1) < 0",
-    ] {
-        assert_eq!(count(sql), 1, "{sql}: the override holds for the row");
-    }
-}
-
 #[cfg(feature = "test-failpoints")]
 mod windows {
     use super::*;

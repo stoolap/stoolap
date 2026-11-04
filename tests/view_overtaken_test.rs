@@ -282,22 +282,6 @@ fn the_runs_of_an_overtaken_select_share_its_first_deadline() {
 }
 
 #[test]
-fn a_select_calling_a_registered_function_is_not_run_again() {
-    let db = memory("registered");
-    let registry = stoolap::FunctionRegistry::new();
-    registry.register_tvf(
-        "MY_SERIES",
-        Arc::new(|| Box::new(stoolap::functions::tvf::GenerateSeriesFunction)),
-    );
-    let executor = Executor::with_function_registry(Arc::clone(db.engine()), Arc::new(registry));
-    after_the_view(&db, TRUNCATE_OTHER);
-    assert!(matches!(
-        executor.execute("SELECT v FROM t ORDER BY v"),
-        Err(Error::ViewOvertaken)
-    ));
-}
-
-#[test]
 fn a_view_the_caller_gave_is_not_taken_again() {
     let db = memory("given");
     let executor = Executor::new(Arc::clone(db.engine()));

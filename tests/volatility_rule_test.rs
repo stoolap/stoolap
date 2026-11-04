@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use stoolap::core::{Result, Value};
 use stoolap::executor::Executor;
-use stoolap::functions::registry::FunctionRegistry;
 use stoolap::functions::{
-    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
+    ScalarFunction,
 };
 use stoolap::storage::mvcc::engine::MVCCEngine;
 
@@ -57,15 +57,10 @@ impl ScalarFunction for Counted {
 }
 
 fn executor() -> Executor {
-    let registry = FunctionRegistry::new();
-    registry.register_scalar::<Counted>();
-    executor_with(registry)
-}
-
-fn executor_with(registry: FunctionRegistry) -> Executor {
+    global_registry().register_scalar::<Counted>();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    let executor = Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
         "INSERT INTO t VALUES (1, 10)",
@@ -119,55 +114,5 @@ fn test_a_fixed_registered_function_folds_by_the_registry_that_runs_it() {
         calls < 5,
         "COUNTED is fixed in the registry that compiles it, so a call of constants \
          folds into the program instead of running per inner row: {calls} calls"
-    );
-}
-
-/// A fixed aggregate under the name of the built-in RANDOM
-#[cfg(feature = "test-failpoints")]
-#[derive(Default)]
-struct FixedRandom;
-
-#[cfg(feature = "test-failpoints")]
-impl stoolap::functions::AggregateFunction for FixedRandom {
-    fn name(&self) -> &str {
-        "RANDOM"
-    }
-    fn info(&self) -> FunctionInfo {
-        FunctionInfo::new(
-            "RANDOM",
-            FunctionType::Aggregate,
-            "test fixed aggregate",
-            FunctionSignature::new(FunctionDataType::Integer, vec![], 0, 0),
-        )
-    }
-    fn accumulate(&mut self, _value: &Value) {}
-    fn result(&self) -> Result<Value> {
-        Ok(Value::Integer(0))
-    }
-    fn reset(&mut self) {}
-    fn clone_box(&self) -> Box<dyn stoolap::functions::AggregateFunction> {
-        Box::new(FixedRandom)
-    }
-}
-
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn test_a_name_is_as_volatile_as_any_function_it_can_run() {
-    let _guard = serial();
-    let registry = FunctionRegistry::new();
-    registry.register_aggregate::<FixedRandom>();
-    let executor = executor_with(registry);
-    let draws = stoolap::test_failpoints::random_draws();
-    let (found, _) = run(
-        &executor,
-        "SELECT id FROM t WHERE id = 1 AND a > (SELECT v FROM m WHERE m.k = t.id \
-         AND m.v = RANDOM() * 0 + m.k)",
-    );
-    assert_eq!(found, vec![Some(Value::Integer(1))]);
-    assert_eq!(
-        stoolap::test_failpoints::random_draws() - draws,
-        5,
-        "the scalar RANDOM the program calls draws per inner row, though the name \
-         also holds a fixed aggregate"
     );
 }

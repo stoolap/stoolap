@@ -1510,7 +1510,7 @@ impl Executor {
             !matches!(
                 count,
                 Expression::IntegerLiteral(_) | Expression::Parameter(_)
-            ) && expression_volatility(count, &self.function_registry) == Volatility::PerCall
+            ) && expression_volatility(count, global_registry()) == Volatility::PerCall
         });
         if !volatile || counts.into_iter().flatten().any(Self::has_subqueries) {
             return Ok(None);
@@ -2108,7 +2108,7 @@ impl Executor {
                     || split_qualified(c).is_some_and(|(_, last)| eq_folded(last, name))
             };
             let mut twice = None;
-            let registry = &self.function_registry;
+            let registry = global_registry();
             for ob in &stmt.order_by {
                 if set_operation_key_column(&ob.expression, stmt, registry).is_some() {
                     continue;
@@ -2194,7 +2194,7 @@ impl Executor {
                                     Some(super::aggregation::compile_over_slots(
                                         &ob.expression,
                                         &columns,
-                                        &self.function_registry,
+                                        global_registry(),
                                         Some(&sort_slots),
                                         false,
                                         Some(ctx.params()),
@@ -2494,7 +2494,7 @@ impl Executor {
             programs.push(super::aggregation::compile_over_slots(
                 key,
                 &columns,
-                &self.function_registry,
+                global_registry(),
                 Some(&slots),
                 false,
                 Some(ctx.params()),
@@ -2625,7 +2625,7 @@ impl Executor {
         {
             return None;
         }
-        let registry = &self.function_registry;
+        let registry = global_registry();
         let alias = |name: &str| {
             stmt.columns.iter().any(
                 |column| matches!(column, Expression::Aliased(item) if item.alias.value_lower == name),
@@ -2769,7 +2769,7 @@ impl Executor {
         // limit and offset were applied here. A filter that keeps no row
         // generates none.
         let tvf_limit = match filter {
-            Some(filter) if true_for_no_row(filter, ctx, &self.function_registry) => Some(0),
+            Some(filter) if true_for_no_row(filter, ctx, global_registry()) => Some(0),
             Some(_) => None,
             None => limit.map(|l| l.saturating_add(offset)),
         };
@@ -2874,7 +2874,7 @@ impl Executor {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
         if let Some(where_clause) = where_clause {
-            if true_for_no_row(where_clause, ctx, &self.function_registry) {
+            if true_for_no_row(where_clause, ctx, global_registry()) {
                 return Ok((RowVec::new(), Self::tvf_columns(tvf_source)?));
             }
         }
@@ -3587,7 +3587,7 @@ impl Executor {
                     (*rows).clone(),
                     &filter,
                     &columns,
-                    &self.function_registry,
+                    global_registry(),
                 )?
                 .into_iter()
                 .enumerate()
@@ -3844,7 +3844,7 @@ impl Executor {
         // A WHERE that keeps no row reads no row; one with a subquery is
         // left to the scan
         if let Some(where_clause) = stmt.where_clause.as_deref().filter(|w| {
-            !classification.where_has_subqueries && true_for_no_row(w, ctx, &self.function_registry)
+            !classification.where_has_subqueries && true_for_no_row(w, ctx, global_registry())
         }) {
             Self::bind_empty_where(stmt, where_clause, &all_columns)?;
             return self.finish_without_rows(
@@ -4326,7 +4326,7 @@ impl Executor {
                 all_rows,
                 where_expr,
                 &all_columns,
-                &self.function_registry,
+                global_registry(),
                 &parallel_config,
                 ctx,
             )?;
@@ -4943,7 +4943,7 @@ impl Executor {
         blocks: Option<&JoinBlocks>,
     ) -> Result<SharedProgram> {
         let compile = || match blocks.and_then(|blocks| Some((blocks, blocks.cross.as_ref()?))) {
-            Some((blocks, cross)) => blocks.compile(cross, false, &self.function_registry),
+            Some((blocks, cross)) => blocks.compile(cross, false, global_registry()),
             None => {
                 let resolved = Self::with_select_aliases(stmt, cross, all_columns);
                 compile_expression(resolved.as_ref().unwrap_or(cross), all_columns)
@@ -5261,7 +5261,7 @@ impl Executor {
         let never = where_for_join
             .as_ref()
             .filter(|_| !classification.where_has_subqueries)
-            .is_some_and(|w| true_for_no_row(w, ctx, &self.function_registry));
+            .is_some_and(|w| true_for_no_row(w, ctx, global_registry()));
 
         let shape = JoinShape {
             stmt,
@@ -5876,16 +5876,11 @@ impl Executor {
                         };
                         combined
                             .map(|expr| match blocks.as_deref() {
-                                Some(blocks) => {
-                                    blocks.compile(&expr, true, &self.function_registry)
+                                Some(blocks) => blocks.compile(&expr, true, global_registry()),
+                                None => {
+                                    JoinFilter::new(&expr, left_cols, right_cols, global_registry())
+                                        .map(|f| CompactArc::clone(f.program()))
                                 }
-                                None => JoinFilter::new(
-                                    &expr,
-                                    left_cols,
-                                    right_cols,
-                                    &self.function_registry,
-                                )
-                                .map(|f| CompactArc::clone(f.program())),
                             })
                             .into_iter()
                             .collect()
@@ -6202,8 +6197,7 @@ impl Executor {
                         // Compute sort keys and indices; compile and
                         // evaluation errors both defer to the standard path
                         let compile = || -> Result<BuiltPrograms> {
-                            let compile_ctx =
-                                CompileContext::new(&all_columns, &self.function_registry);
+                            let compile_ctx = CompileContext::new(&all_columns, global_registry());
                             stmt.order_by
                                 .iter()
                                 .map(|ob| {
@@ -7593,7 +7587,7 @@ impl Executor {
         });
 
         let mut proj_eval = if needs_evaluator {
-            let mut eval = CompiledEvaluator::new(&self.function_registry);
+            let mut eval = CompiledEvaluator::new(global_registry());
             eval = eval.with_context(ctx);
             eval.init_columns(&extended_columns);
             Some(eval)
@@ -7616,7 +7610,7 @@ impl Executor {
         }
         // A name no column has is compiled once, read as the compiler reads
         // it: a quoted name's text, or an error
-        let unbound_ctx = CompileContext::new(&extended_columns, &self.function_registry);
+        let unbound_ctx = CompileContext::new(&extended_columns, global_registry());
         let unbound: Vec<Option<SharedProgram>> = stmt
             .columns
             .iter()
@@ -9073,12 +9067,10 @@ impl Executor {
                 .map(|expr| match run {
                     Some(run) => run
                         .blocks
-                        .compile(expr, true, &self.function_registry)
+                        .compile(expr, true, global_registry())
                         .map(|p| JoinFilter::from_program(p).with_context(ctx)),
-                    None => {
-                        JoinFilter::new(expr, &outer_cols, &inner_cols, &self.function_registry)
-                            .map(|f| f.with_context(ctx))
-                    }
+                    None => JoinFilter::new(expr, &outer_cols, &inner_cols, global_registry())
+                        .map(|f| f.with_context(ctx)),
                 })
                 .transpose()
         };
@@ -9086,7 +9078,7 @@ impl Executor {
             Vec::with_capacity(aggregations.len());
         for agg in &aggregations {
             funcs.push(
-                agg.state(&self.function_registry)
+                agg.state(global_registry())
                     .ok_or_else(|| Error::internal(format!("aggregate {} vanished", agg.name)))?,
             );
         }
@@ -10189,7 +10181,7 @@ impl Executor {
 
         // Each value's source is found once for the statement; an error
         // is raised by the first row that reads it, as evaluating raised it
-        let compile_ctx = CompileContext::new(all_columns, &self.function_registry);
+        let compile_ctx = CompileContext::new(all_columns, global_registry());
         let compile = |expr: &Expression| -> Result<SharedProgram> {
             ExprCompiler::new(&compile_ctx)
                 .compile(expr)
@@ -10957,7 +10949,7 @@ impl Executor {
             if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
                 continue;
             }
-            if set_operation && !any_item && !set_operation_key_item(col, &self.function_registry) {
+            if set_operation && !any_item && !set_operation_key_item(col, global_registry()) {
                 continue;
             }
             // An item's column by the layout; without one, by its index
@@ -10976,7 +10968,7 @@ impl Executor {
                 other => other,
             };
             if !set_operation
-                && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+                && matches!(inner, Expression::FunctionCall(f) if global_registry().is_aggregate(&f.function))
             {
                 aggregate_slots.entry(key).or_insert(position);
             }
@@ -12416,7 +12408,7 @@ impl Executor {
         if aggregations.iter().any(|agg| {
             !agg.answered_with(supported)
                 || agg.hidden
-                || self.function_registry.get_aggregate(&agg.name).is_none()
+                || global_registry().get_aggregate(&agg.name).is_none()
         }) {
             return Ok(None);
         }

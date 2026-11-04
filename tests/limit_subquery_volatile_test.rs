@@ -53,9 +53,6 @@ impl ScalarFunction for NextCount {
 fn a_limit_and_an_offset_spelled_alike_keep_their_own_counts() {
     global_registry().register_scalar::<NextCount>();
     let db = Database::open("memory://limit_subquery_volatile").unwrap();
-    stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
-        .function_registry()
-        .register_scalar::<NextCount>();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
         .unwrap();
     db.execute("INSERT INTO t VALUES (1), (2), (3), (4)", ())

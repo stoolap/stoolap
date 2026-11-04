@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use stoolap::core::{Result, Value};
 use stoolap::executor::Executor;
-use stoolap::functions::registry::{global_registry, FunctionRegistry};
+use stoolap::functions::registry::global_registry;
 use stoolap::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
@@ -86,11 +86,11 @@ const TABLE: [&str; 2] = [
 
 #[test]
 fn a_scalar_function_named_as_a_window_function_reads_its_argument_for_each_row() {
-    let registry = FunctionRegistry::new();
-    registry.register_scalar::<ScalarNtile>();
+    // No other test of this binary calls NTILE
+    global_registry().register_scalar::<ScalarNtile>();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    let executor = Executor::new(Arc::new(engine));
     for sql in TABLE {
         executor.execute(sql).unwrap();
     }

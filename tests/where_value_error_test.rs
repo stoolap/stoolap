@@ -146,12 +146,10 @@ impl stoolap::functions::ScalarFunction for Tick {
 
 #[test]
 fn a_where_value_is_computed_once_when_another_fails() {
-    let registry = stoolap::functions::registry::FunctionRegistry::new();
-    registry.register_scalar::<Tick>();
+    stoolap::functions::global_registry().register_scalar::<Tick>();
     let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor =
-        stoolap::executor::Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    let executor = stoolap::executor::Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
         "INSERT INTO t VALUES (1, 1)",

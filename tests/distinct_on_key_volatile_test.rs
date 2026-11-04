@@ -53,9 +53,6 @@ impl ScalarFunction for NextCount {
 fn a_key_the_select_list_computes_runs_once_per_row() {
     global_registry().register_scalar::<NextCount>();
     let db = Database::open("memory://distinct_on_key_volatile").unwrap();
-    stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
-        .function_registry()
-        .register_scalar::<NextCount>();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", ())

@@ -49,12 +49,9 @@ impl ScalarFunction for NextCount {
     }
 }
 
-/// A database holding `t`, its view and an index, with NEXT_COUNT known
+/// A database holding `t`, its view and an index
 fn open(dsn: &str) -> Database {
     let db = Database::open(dsn).unwrap();
-    stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
-        .function_registry()
-        .register_scalar::<NextCount>();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
         "INSERT INTO t SELECT value, value % 9, 'b' || value FROM generate_series(1, 1000)",

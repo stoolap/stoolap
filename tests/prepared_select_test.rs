@@ -1469,9 +1469,9 @@ mod registered_volatile {
     use std::sync::Arc;
     use stoolap::core::{Result, Value};
     use stoolap::executor::Executor;
-    use stoolap::functions::registry::FunctionRegistry;
     use stoolap::functions::{
-        FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+        global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
+        ScalarFunction,
     };
     use stoolap::storage::mvcc::engine::MVCCEngine;
 
@@ -1532,10 +1532,9 @@ mod registered_volatile {
     #[test]
     fn test_a_registered_volatile_function_runs_per_inner_row() {
         let _guard = super::serial();
-        let registry = FunctionRegistry::new();
-        registry.register_scalar::<Tick>();
+        global_registry().register_scalar::<Tick>();
         assert_eq!(
-            calls_per_run(registry, "TICK"),
+            calls_per_run("TICK"),
             5,
             "TICK runs once per inner row reaching the filter, not once per call"
         );
@@ -1544,20 +1543,20 @@ mod registered_volatile {
     #[test]
     fn test_a_registered_function_named_like_a_clock_runs_per_inner_row() {
         let _guard = super::serial();
-        let registry = FunctionRegistry::new();
-        registry.register_scalar::<NowTick>();
+        // No other test of this binary calls NOW
+        global_registry().register_scalar::<NowTick>();
         assert_eq!(
-            calls_per_run(registry, "NOW"),
+            calls_per_run("NOW"),
             5,
             "a NOW the registry holds non-deterministic is not the built-in clock"
         );
     }
 
     /// Calls of `function` in one run that finds the third of five inner rows
-    fn calls_per_run(registry: FunctionRegistry, function: &str) -> usize {
+    fn calls_per_run(function: &str) -> usize {
         let mut engine = MVCCEngine::in_memory();
         stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-        let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+        let executor = Executor::new(Arc::new(engine));
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
             "INSERT INTO t VALUES (1, 10)",
