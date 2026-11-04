@@ -857,12 +857,13 @@ fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Exp
     if !items.iter().any(star) {
         return Ok(None);
     }
-    let name = scope.tables.first().map_or("", |(name, _)| name.as_str());
+    let name = scope.tables.first().and_then(|(name, _)| name.as_deref());
     let mut written = Vec::with_capacity(items.len() + scope.lower.len());
     for item in items {
         match item {
             Expression::Star(_) => {}
-            Expression::QualifiedStar(star) if star.qualifier.to_lowercase() == name => {}
+            Expression::QualifiedStar(star)
+                if name.is_some_and(|name| star.qualifier.to_lowercase() == name) => {}
             Expression::QualifiedStar(star) => {
                 return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)))
             }
@@ -884,7 +885,7 @@ fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Exp
 /// `stmt`, its stars expanded by `star_items`, with each star column read
 /// by its name, quoted, as a statement run of the block binds it
 fn named_star_columns(stmt: &SelectStatement, scope: &ScopeTable) -> SelectStatement {
-    let source = scope.tables.first().map_or("", |(name, _)| name.as_str());
+    let source = scope.tables.first().and_then(|(name, _)| name.as_deref());
     let named = |value: &str, lower: &str| Identifier {
         quoted: true,
         ..ident(value, lower)
@@ -897,8 +898,8 @@ fn named_star_columns(stmt: &SelectStatement, scope: &ScopeTable) -> SelectState
                 let at = column.index as usize;
                 let name = named(&scope.columns[at], &scope.lower[at]);
                 match source {
-                    "" => Expression::Identifier(name),
-                    source => Expression::QualifiedIdentifier(QualifiedIdentifier {
+                    None => Expression::Identifier(name),
+                    Some(source) => Expression::QualifiedIdentifier(QualifiedIdentifier {
                         qualifier: ident(source, source),
                         name,
                     }),
@@ -1337,7 +1338,8 @@ impl Executor {
 /// in that order; a join's statement scope holds its two sides
 #[derive(Debug)]
 struct ScopeTable {
-    tables: SmallVec<[(SmartString, usize); 2]>,
+    /// None for a source without a name, which no qualifier names
+    tables: SmallVec<[(Option<SmartString>, usize); 2]>,
     /// The names its programs compile against
     columns: CompactArc<Vec<String>>,
     /// Each column's own name, lowercase, as a bare reference names it
@@ -1352,7 +1354,7 @@ struct ScopeTable {
 }
 
 impl ScopeTable {
-    fn of(name: SmartString, schema: &Schema) -> Self {
+    fn of(name: impl Into<Option<SmartString>>, schema: &Schema) -> Self {
         // A column a join's run names under its table is read by its own name
         let lower = schema.column_names_lower_arc();
         let lower = match lower.iter().any(|c| c.contains(QUALIFIER_SEP)) {
@@ -1360,7 +1362,7 @@ impl ScopeTable {
             false => lower,
         };
         Self {
-            tables: smallvec::smallvec![(name, 0)],
+            tables: smallvec::smallvec![(name.into(), 0)],
             columns: schema.column_names_arc(),
             lower,
             types: schema.columns.iter().map(|c| c.data_type).collect(),
@@ -1466,7 +1468,7 @@ impl ScopeTable {
             })
         };
         let mut tables = self.tables.clone();
-        tables.push((SmartString::new(""), self.lower.len()));
+        tables.push((None, self.lower.len()));
         Self {
             tables,
             columns: CompactArc::new(self.columns.iter().cloned().chain(names()).collect()),
@@ -1496,7 +1498,9 @@ impl ScopeTable {
     fn spelled(&self, at: usize) -> String {
         let table = self.tables.iter().rev().find(|(_, start)| *start <= at);
         match table {
-            Some((table, _)) if self.tables.len() > 1 => format!("{table}.{}", self.lower[at]),
+            Some((Some(table), _)) if self.tables.len() > 1 => {
+                format!("{table}.{}", self.lower[at])
+            }
             _ => self.lower[at].clone(),
         }
     }
@@ -1531,9 +1535,12 @@ impl ScopeTable {
         let spelled: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
         // The own name column `at` spells as the `offset`-th of `leaf`
         let own = |leaf: &JoinLeaf, offset: usize, at: usize| -> Option<&str> {
-            let name = spelled[at]
-                .strip_prefix(leaf.name.as_str())?
-                .strip_prefix(QUALIFIER_SEP)?;
+            let name = match &leaf.name {
+                Some(table) => spelled[at]
+                    .strip_prefix(table.as_str())?
+                    .strip_prefix(QUALIFIER_SEP)?,
+                None => Some(spelled[at].as_str()).filter(|c| !c.contains(QUALIFIER_SEP))?,
+            };
             match &leaf.columns {
                 Some(names) => names.get(offset).filter(|n| n.to_lowercase() == name)?,
                 None => &spelled[at],
@@ -1580,10 +1587,10 @@ impl ScopeTable {
         for i in (0..m).rev() {
             bounds[i] = starts[i + 1][bounds[i + 1]];
         }
-        let mut tables: SmallVec<[(SmartString, usize); 2]> = SmallVec::new();
+        let mut tables: SmallVec<[(Option<SmartString>, usize); 2]> = SmallVec::new();
         let mut lower = Vec::with_capacity(n);
         for (i, leaf) in leaves.iter().enumerate() {
-            tables.push((SmartString::from(leaf.name.as_str()), bounds[i]));
+            tables.push((leaf.name.as_deref().map(SmartString::from), bounds[i]));
             for at in bounds[i]..bounds[i + 1] {
                 lower.push(own(leaf, at - bounds[i], at)?.to_string());
             }
@@ -1604,7 +1611,7 @@ impl ScopeTable {
 
     /// The name qualifying the table whose columns include `index`, and the
     /// columns of that table
-    fn table(&self, index: usize) -> (&SmartString, std::ops::Range<usize>) {
+    fn table(&self, index: usize) -> (Option<&SmartString>, std::ops::Range<usize>) {
         let at = self
             .tables
             .iter()
@@ -1614,7 +1621,7 @@ impl ScopeTable {
             .tables
             .get(at + 1)
             .map_or(self.lower.len(), |(_, start)| *start);
-        (&self.tables[at].0, self.tables[at].1..end)
+        (self.tables[at].0.as_ref(), self.tables[at].1..end)
     }
 
     /// An error when a column in `rest` is also named `name`: a reference to
@@ -1635,8 +1642,9 @@ impl ScopeTable {
 /// The scope of each side of `join` over `sides`, its tables side by side,
 /// read by position in the joined row
 fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable; 2]> {
-    let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
-        ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
+    let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
+        let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
+        ScopeTable::of(name, schema)
     };
     let side_scope = |expr: &Expression, side: &JoinSide| {
         ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
@@ -1654,9 +1662,9 @@ fn merged_once(scope: &ScopeTable, merges: &[(usize, usize)]) -> Result<()> {
         for at in [left, right] {
             let (table, range) = scope.table(at);
             let name = scope.lower[at].as_str();
-            let spelled = match table.is_empty() {
-                true => name.to_string(),
-                false => format!("{table}.{name}"),
+            let spelled = match table {
+                None => name.to_string(),
+                Some(table) => format!("{table}.{name}"),
             };
             scope.unique(range.filter(|&i| i != at), name, &spelled)?;
         }
@@ -1980,8 +1988,9 @@ impl StatementWalk<'_> {
             aliases: Vec::new(),
             check: check == Check::All,
         };
-        let untyped = |name: &SmartString, columns: &[String]| {
-            ScopeTable::of(name.clone(), &untyped_schema(name, columns))
+        let untyped = |name: Option<&SmartString>, columns: &[String]| {
+            let schema = untyped_schema(name.map_or("", |n| n.as_str()), columns);
+            ScopeTable::of(name.cloned(), &schema)
         };
         let Some(table_expr) = table_expr else {
             return Ok((None, ScopeTable::unnamed()));
@@ -1992,13 +2001,13 @@ impl StatementWalk<'_> {
                 let lower = &ts.name.value_lower;
                 let walked_cte = self.ctes.iter().rev().find(|(cte, _)| cte == lower);
                 if let Some((_, columns)) = walked_cte {
-                    let scope = untyped(&name, columns);
+                    let scope = untyped(Some(&name), columns);
                     return Ok((Some(table_expr.clone()), scope));
                 }
                 match self.executor.named(self.ctx, lower)? {
-                    Named::Cte((columns, _)) => untyped(&name, columns),
+                    Named::Cte((columns, _)) => untyped(Some(&name), columns),
                     Named::View(view) => untyped(
-                        &name,
+                        Some(&name),
                         &view_names(self.executor, &view, self.ctx, self.runs)?,
                     ),
                     Named::Table => {
@@ -2023,7 +2032,7 @@ impl StatementWalk<'_> {
                     .map(|row| row.iter().map(|e| self.expr(e, &beside)).collect())
                     .collect::<Result<_>>()?;
                 let name = values.alias.as_ref().map(|a| a.value_lower.clone());
-                let scope = untyped(&name.unwrap_or_default(), &Executor::values_columns(values));
+                let scope = untyped(name.as_ref(), &Executor::values_columns(values));
                 let walked = ValuesTableSource {
                     rows,
                     ..(**values).clone()
@@ -2041,7 +2050,7 @@ impl StatementWalk<'_> {
                     .as_ref()
                     .unwrap_or(&function.function)
                     .value_lower;
-                let scope = untyped(name, &Executor::tvf_columns(function)?);
+                let scope = untyped(Some(name), &Executor::tvf_columns(function)?);
                 let walked = FunctionTableSource {
                     arguments,
                     ..(**function).clone()
@@ -2055,10 +2064,9 @@ impl StatementWalk<'_> {
                 let (subquery, names, own) =
                     self.statement(&derived.subquery, enclosing, inside, check)?;
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
-                let name = name.unwrap_or_default();
                 let scope = match derived.keeps_names {
-                    true => untyped(&name, &output_names(&derived.subquery, &own, true)?),
-                    false => untyped(&name, &names),
+                    true => untyped(name.as_ref(), &output_names(&derived.subquery, &own, true)?),
+                    false => untyped(name.as_ref(), &names),
                 };
                 let walked = SubqueryTableSource {
                     subquery: Box::new(subquery),
@@ -2148,10 +2156,9 @@ impl StatementWalk<'_> {
             }
             Expression::QualifiedIdentifier(q) => {
                 let qualifier = &q.qualifier.value_lower;
-                let named = level
-                    .scopes
-                    .iter()
-                    .position(|scope| scope.tables.iter().any(|(name, _)| name == qualifier));
+                let named = level.scopes.iter().position(|scope| {
+                    (scope.tables.iter()).any(|(name, _)| name.as_ref() == Some(qualifier))
+                });
                 match named.and_then(beyond) {
                     Some(_) => {
                         let (depth, index) = chain.qualified(qualifier, &q.name.value_lower, q)?;
@@ -2280,9 +2287,9 @@ fn output_names(stmt: &SelectStatement, own: &ScopeTable, shown: bool) -> Result
 /// table without one
 fn run_name(own: &ScopeTable, at: usize) -> String {
     let (table, _) = own.table(at);
-    match own.tables.len() < 2 || table.is_empty() || own.merged.iter().any(|m| m.0 == at) {
-        true => own.columns[at].clone(),
-        false => qualified(table, &own.columns[at]),
+    match table.filter(|_| own.tables.len() > 1 && !own.merged.iter().any(|m| m.0 == at)) {
+        None => own.columns[at].clone(),
+        Some(table) => qualified(table, &own.columns[at]),
     }
 }
 
@@ -2310,7 +2317,7 @@ fn qualified_star_columns(
     let (_, start) = own
         .tables
         .iter()
-        .find(|(name, _)| **name == *qualifier)
+        .find(|(name, _)| name.as_deref() == Some(qualifier.as_str()))
         .ok_or_else(|| Error::invalid_argument(unknown_qualifier(&star.qualifier)))?;
     Ok(own.table(*start).1)
 }
@@ -2404,7 +2411,7 @@ impl Chain<'_> {
                 scope
                     .tables
                     .iter()
-                    .find(|(name, _)| name == qualifier)
+                    .find(|(name, _)| name.as_deref() == Some(qualifier))
                     .map(|(_, start)| (depth, *start))
             })
             .ok_or_else(|| Error::invalid_argument(unknown_qualifier(qualifier)))?;
@@ -2898,7 +2905,10 @@ fn scope_signature(signature: String, outer: &[&ScopeTable]) -> Arc<str> {
     let mut scopes = signature;
     for scope in outer {
         for (name, _) in &scope.tables {
-            scopes.push_str(name);
+            match name {
+                Some(name) => scopes.push_str(name),
+                None => scopes.push('\u{3}'),
+            }
             scopes.push('\u{2}');
         }
         for (column, data_type) in scope.lower.iter().zip(&scope.types) {
@@ -3115,6 +3125,10 @@ struct PreparedBlocks {
     subqueries: Vec<PreparedSubquery>,
 }
 
+/// The scan's filter for a WHERE's pushed conjuncts, and whether a row it
+/// passes is still asked the rest
+type ScanFilter = (Option<Box<dyn StorageExpr>>, bool);
+
 /// A statement's WHERE over its table's row: its program, what of it a scan
 /// takes, and the rows a set test's keys may narrow it to
 #[derive(Debug)]
@@ -3133,6 +3147,10 @@ struct PreparedWhere {
     pushdown: Option<Expression>,
     /// `pushdown` prepared, for a run to give its values
     push: Option<PreparedPush>,
+    /// `pushdown` as the scan's filter, built by the first run that asks it
+    /// alone, when every run builds the same: it reads no parameter and no
+    /// value a run draws
+    converted: Option<std::sync::OnceLock<ScanFilter>>,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
     /// set's keys name the rows the WHERE may pass
     narrowing: Option<Narrowing>,
@@ -3551,6 +3569,13 @@ impl WhereParts {
             equalities: self.equalities,
             needed: None,
             push: pushdown.as_ref().and_then(|p| PreparedPush::of(p, schema)),
+            converted: pushdown
+                .as_ref()
+                .filter(|p| {
+                    !super::utils::expression_has_parameters(p)
+                        && expression_volatility(p, global_registry()) == Volatility::Fixed
+                })
+                .map(|_| std::sync::OnceLock::new()),
             whole: WhereProgram::of(programs.whole, WhereRest::Whole, blocks),
             scanned: programs
                 .scanned
@@ -4396,8 +4421,9 @@ enum SideSource {
 enum FromEntry {
     /// A table, by its name, the name its scope bears and its schema
     Table(SmartString, SmartString, CompactArc<Schema>),
-    /// A source read once per run, under its name, with its columns
-    Source(SmartString, BlockSource, Vec<String>),
+    /// A source read once per run, under its name when it has one, with its
+    /// columns
+    Source(Option<SmartString>, BlockSource, Vec<String>),
     /// One whose values read an enclosing scope, which runs as a statement
     Statement,
 }
@@ -6235,7 +6261,9 @@ impl Builder<'_> {
                     (Some(_), Some(_)) => {
                         return Err(Executor::as_of_not_a_table(&ts.name.value_lower))
                     }
-                    (Some((source, columns)), None) => FromEntry::Source(name, source, columns),
+                    (Some((source, columns)), None) => {
+                        FromEntry::Source(Some(name), source, columns)
+                    }
                     (None, as_of) => {
                         let schema = executor
                             .engine
@@ -6249,7 +6277,7 @@ impl Builder<'_> {
                         match as_of {
                             // A table read AS OF is a source read once per run
                             Some(as_of) => FromEntry::Source(
-                                name,
+                                Some(name),
                                 BlockSource::AsOf(
                                     ts.name.value_lower.clone(),
                                     Box::new(as_of.clone()),
@@ -6270,11 +6298,7 @@ impl Builder<'_> {
                 let own = CompileContext::bound(global_registry());
                 let rows = source_programs(&values.rows, |v| compile_with(&own, v));
                 FromEntry::Source(
-                    values
-                        .alias
-                        .as_ref()
-                        .map(|a| a.value_lower.clone())
-                        .unwrap_or_default(),
+                    values.alias.as_ref().map(|a| a.value_lower.clone()),
                     BlockSource::Values(values.clone(), rows),
                     Executor::values_columns(values),
                 )
@@ -6287,7 +6311,7 @@ impl Builder<'_> {
                     .value_lower;
                 let range = function_range(where_clause, name);
                 FromEntry::Source(
-                    name.clone(),
+                    Some(name.clone()),
                     BlockSource::Function(function.clone(), range, counts()),
                     Executor::tvf_columns(function)?,
                 )
@@ -6306,11 +6330,7 @@ impl Builder<'_> {
                 };
                 let tables = executor.read_tables(&derived.subquery);
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
-                FromEntry::Source(
-                    name.unwrap_or_default(),
-                    BlockSource::Derived(Box::new(run), tables),
-                    columns,
-                )
+                FromEntry::Source(name, BlockSource::Derived(Box::new(run), tables), columns)
             }
             _ => return Err(Error::internal("a prepared subquery without one table")),
         })
@@ -6345,8 +6365,11 @@ impl Builder<'_> {
         let picks = grouped_block(sq) || !matches!(form, Form::Scalar);
         let registry = global_registry();
         // A source's columns have no type, as a statement's own source's
-        let over_source = |name: SmartString, source: BlockSource, columns: Vec<String>| {
-            let schema = CompactArc::new(untyped_schema(&name, &columns));
+        let over_source = |name: Option<SmartString>, source: BlockSource, columns: Vec<String>| {
+            let schema = CompactArc::new(untyped_schema(
+                name.as_deref().unwrap_or_default(),
+                &columns,
+            ));
             let scope = ScopeTable::of(name, &schema);
             (None, Some(source), schema, scope)
         };
@@ -7516,7 +7539,8 @@ impl PreparedProjection {
                     item_rewritten.extend((0..columns.len()).map(|_| None));
                 }
                 Expression::QualifiedStar(star) => {
-                    if star.qualifier.to_lowercase() != scope.tables[0].0.as_str() {
+                    if scope.tables[0].0.as_deref() != Some(star.qualifier.to_lowercase().as_str())
+                    {
                         return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)));
                     }
                     select_exprs.extend((0..columns.len()).map(star_item));
@@ -8879,7 +8903,9 @@ impl PreparedGrouped {
             Expression::QualifiedStar(q) => scope
                 .tables
                 .iter()
-                .find(|(name, _)| super::utils::eq_folded(&q.qualifier, name))
+                .find(|(name, _)| {
+                    (name.as_ref()).is_some_and(|n| super::utils::eq_folded(&q.qualifier, n))
+                })
                 .map_or(0, |(_, start)| scope.table(*start).1.len()),
             Expression::Star(_) => width,
             _ => 1,
@@ -10284,8 +10310,9 @@ impl JoinBlocks {
         param_count: usize,
     ) -> Result<Option<Self>> {
         let rows_sides = [sides[0].rows, sides[1].rows];
-        let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
-            ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
+        let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
+            let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
+            ScopeTable::of(name, schema)
         };
         let Some([left_scope, right_scope]) = side_scopes(join, sides) else {
             return Ok(None);
@@ -10658,7 +10685,7 @@ impl Executor {
             ctes: Vec::new(),
         };
         let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
-        let name = scope.tables.first().map(|(name, _)| name.as_str());
+        let name = scope.tables.first().and_then(|(name, _)| name.as_deref());
         Ok(CompactArc::new(untyped_schema(
             name.unwrap_or_default(),
             &scope.columns,
@@ -13959,10 +13986,10 @@ fn held_columns(stmt: &SelectStatement, chain: &Chain<'_>) -> Vec<Option<usize>>
 }
 
 /// One source a join reads: the name qualifying its columns, lowercase,
-/// their names when known before the join reads it, and how many there are
-/// when that is known
+/// None for a source without one, their names when known before the join
+/// reads it, and how many there are when that is known
 pub(crate) struct JoinLeaf {
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
     pub(crate) columns: Option<Vec<String>>,
     pub(crate) width: Option<usize>,
 }
@@ -14630,7 +14657,15 @@ impl<'a> PreparedRunner<'a> {
             _ if self.failed_slots.is_some() => (None, true),
             (Some(expr), _) => (Some(expr), false),
             (None, Some(pushdown)) if self.prepared.run_slots.is_empty() => {
-                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
+                match where_.converted.as_ref().filter(|_| extra.is_none()) {
+                    Some(converted) => {
+                        let (expr, residual) = converted.get_or_init(|| {
+                            pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
+                        });
+                        (expr.as_ref().map(|expr| expr.clone_box()), *residual)
+                    }
+                    None => pushdown::try_pushdown(pushdown, table.schema(), Some(ctx)),
+                }
             }
             (None, Some(pushdown)) => {
                 let mut run_ctx = ctx.clone();

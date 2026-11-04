@@ -22,6 +22,7 @@ use smallvec::SmallVec;
 
 use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Schema};
+use crate::parser::ast::Expression;
 use crate::planner::join::JoinPlan;
 
 use super::aggregation::HeldFeed;
@@ -166,7 +167,8 @@ impl<K, T: ?Sized> Shelf<K, T> {
 /// is itself a join; and whether the side is read as rows
 #[derive(Debug, Clone)]
 pub(crate) struct JoinSide {
-    pub(crate) leaves: SmallVec<[(SmartString, CompactArc<Schema>); 1]>,
+    /// Each table's name, None for a source without one, and its columns
+    pub(crate) leaves: SmallVec<[(Option<SmartString>, CompactArc<Schema>); 1]>,
     pub(crate) rows: bool,
 }
 
@@ -179,19 +181,45 @@ impl JoinSide {
         }
     }
 
-    /// Each column as a reference spells it: its table's name and its own
-    pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, &str)> {
+    /// Each column as a reference spells it: its table's name, None for a
+    /// source without one, and its own
+    pub(crate) fn columns(&self) -> impl Iterator<Item = (Option<&str>, &str)> {
         self.leaves.iter().flat_map(|(name, schema)| {
             schema
                 .columns
                 .iter()
-                .map(move |c| (name.as_str(), c.name.as_str()))
+                .map(move |c| (name.as_deref(), c.name.as_str()))
+        })
+    }
+
+    /// Each column's text, read through its table's name, bare for a source
+    /// without one
+    pub(crate) fn column_texts(&self) -> impl Iterator<Item = String> + '_ {
+        self.columns().map(|(table, name)| match table {
+            Some(table) => super::utils::qualified(table, name),
+            None => name.to_string(),
         })
     }
 }
 
 /// Each side's columns as a join's blocks read them
 pub(crate) type JoinSides = [JoinSide; 2];
+
+/// Where a join's runs ask its WHERE's and ON's conditions, the same for
+/// every run of its plan
+#[derive(Debug)]
+pub(crate) struct JoinFilters {
+    /// The WHERE split over the sides: each side's, then the joined row's
+    pub split: [Option<Expression>; 3],
+    /// Each side's conditions, as the blocks wrote them when they hold them
+    pub sides: [Option<Expression>; 2],
+    /// Each side's conditions without a subquery, for a side read as rows
+    pub plain: [Option<Expression>; 2],
+    /// The ON with the conditions the blocks moved into it, when they did
+    pub on: Option<Option<Expression>>,
+    /// The joined row's conditions, with those the blocks moved there
+    pub cross: Option<Expression>,
+}
 
 /// The programs one join statement compiled, valid while its validity holds
 #[derive(Debug)]
@@ -226,6 +254,9 @@ pub struct PreparedJoin {
     /// The plan of each side read as a statement with none of its own
     /// conditions, a statement apart from the one that has them
     bare_side_plans: [NestedPlan; 2],
+    /// Where its runs ask the WHERE's and the ON's conditions, built by the
+    /// first
+    filters: std::sync::OnceLock<JoinFilters>,
     /// How the join runs, planned on first need
     join_plan: std::sync::OnceLock<JoinPlan>,
     /// Whether the statement's CTEs are named without reading them, which
@@ -250,9 +281,20 @@ impl PreparedJoin {
             feeds: Shelf::new(),
             side_plans: Default::default(),
             bare_side_plans: Default::default(),
+            filters: std::sync::OnceLock::new(),
             join_plan: std::sync::OnceLock::new(),
             ctes_named: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The filters its first run built, when one did
+    pub(crate) fn held_filters(&self) -> Option<&JoinFilters> {
+        self.filters.get()
+    }
+
+    /// `filters` held for the runs after this one
+    pub(crate) fn hold_filters(&self, filters: JoinFilters) -> &JoinFilters {
+        self.filters.get_or_init(|| filters)
     }
 
     /// How the join runs, as `plan` decides once
