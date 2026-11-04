@@ -40,11 +40,13 @@ fn answer(db: &Database, sql: &str, params: &[Value]) -> Answer {
     let mut rows = Vec::new();
     for row in result {
         let row = row.map_err(|e| e.to_string())?;
-        rows.push(
-            (0..row.len())
-                .map(|i| row.get::<Option<i64>>(i).unwrap())
-                .collect(),
-        );
+        // Every value is an INTEGER or NULL: another type is a wrong answer
+        let values = (0..row.len()).map(|i| match row.get_value(i).unwrap() {
+            Value::Integer(n) => Ok(Some(*n)),
+            value if value.is_null() => Ok(None),
+            value => Err(format!("{value:?} where an INTEGER or NULL is written")),
+        });
+        rows.push(values.collect::<Result<_, _>>()?);
     }
     Ok((columns, rows))
 }
