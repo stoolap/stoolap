@@ -38,6 +38,18 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &["1|10", "3|30"],
     ),
     (
+        "SELECT t.id, COUNT(*) FROM t JOIN generate_series(5, 9) AS s(n) ON t.id = s.n \
+         GROUP BY t.id LIMIT 1",
+        &[],
+        &["5|1"],
+    ),
+    (
+        "SELECT t.id, SUM(s.n) FROM t JOIN generate_series(5, $1) AS s(n) ON t.id = s.n \
+         GROUP BY t.id LIMIT $2",
+        &[7, 1],
+        &["5|5"],
+    ),
+    (
         "SELECT t.id, COUNT(*) FROM t JOIN generate_series(1, 3) AS s(n) ON t.id = s.n \
          GROUP BY t.id ORDER BY t.id LIMIT 2",
         &[],

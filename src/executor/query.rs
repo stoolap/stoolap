@@ -5990,11 +5990,9 @@ impl Executor {
                 let Some(extra) = extra else {
                     return Ok((result, columns, bounded, None));
                 };
-                let own = result.columns().to_vec();
-                let mut kept = Self::materialize_result(result)?;
-                Self::side_filter(extra, &columns, ctx)?.retain_checked(&mut kept)?;
-                let result = ExecutorResult::new(own, kept);
-                return Ok((Box::new(result), columns, false, None));
+                let filter = Self::side_filter(extra, &columns, ctx)?;
+                let result = Box::new(FilteredResult::from_filter(result, filter));
+                return Ok((result, columns, false, None));
             }
         }
         if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
