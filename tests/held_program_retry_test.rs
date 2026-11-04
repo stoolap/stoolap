@@ -72,7 +72,7 @@ macro_rules! registered_late {
             };
             let missing = run().expect_err("the function is not registered yet");
             assert!(missing.to_string().contains($name), "{missing}");
-            global_registry().register_scalar::<$function>();
+            global_registry().register_scalar::<$function>().unwrap();
             assert_eq!(run().unwrap(), $expected, "{}", $sql);
             let queried: Vec<String> = db
                 .query($sql, ())
