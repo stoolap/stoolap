@@ -478,7 +478,7 @@ use super::parallel::{self, ParallelConfig};
 use super::planned_aggregate::{bounds, AggregatePlan, AggregateRead};
 use super::planned_join::{pick_index_join_side, JoinShape};
 use super::prepared_join::{
-    BuiltPrograms, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
+    BuiltPrograms, JoinFilters, JoinProgramKey, JoinSide, JoinSides, PreparedJoin, WhereSite,
 };
 use super::prepared_select::{
     ambiguous_column, joined_aliases, mentions_subquery, set_operation_key_column,
@@ -4678,6 +4678,57 @@ impl Executor {
                 .any(|kind| join_type.contains(kind))
     }
 
+    /// Where a join's runs ask its conditions: the WHERE's `split`, each
+    /// side's as the `blocks` wrote it when they hold them, a side read as
+    /// rows asking its own without a subquery, and the conditions the blocks
+    /// moved, in an INNER join's ON, else on the joined row
+    fn join_filters(
+        [left, right, cross]: [Option<Expression>; 3],
+        blocks: Option<&JoinBlocks>,
+        join_source: &JoinTableSource,
+        join_type: &str,
+    ) -> JoinFilters {
+        let sides = match blocks.and_then(|held| held.written.as_ref()) {
+            Some([left, right]) => [left.clone(), right.clone()],
+            None => [left.clone(), right.clone()],
+        };
+        // One the blocks read from its source asks them all
+        let rows_sides = blocks.map_or([false; 2], |held| held.rows_sides);
+        let sourced = blocks.map_or([false; 2], |held| [0, 1].map(|i| held.side_sourced(i)));
+        let joined = [&join_source.left, &join_source.right]
+            .map(|side| matches!(**side, Expression::JoinSource(_)));
+        let plain = [0, 1].map(|i| match !joined[i] && rows_sides[i] && !sourced[i] {
+            true => sides[i].as_ref().and_then(|filter| {
+                combine_predicates_with_and(
+                    flatten_and_predicates(filter)
+                        .into_iter()
+                        .filter(|part| !Self::has_subqueries(part))
+                        .collect(),
+                )
+            }),
+            false => None,
+        });
+        let (on, moved_cross) = match blocks.and_then(|held| held.moved.clone()) {
+            Some(moved) if Self::inner_on(join_source, join_type) => {
+                let on = join_source.condition.as_deref().cloned();
+                let on = combine_predicates_with_and(on.into_iter().chain([moved]).collect());
+                (Some(on), cross.clone())
+            }
+            Some(moved) => (
+                None,
+                combine_predicates_with_and(cross.clone().into_iter().chain([moved]).collect()),
+            ),
+            None => (None, cross.clone()),
+        };
+        JoinFilters {
+            split: [left, right, cross],
+            sides,
+            plain,
+            on,
+            cross: moved_cross,
+        }
+    }
+
     /// Whether a join keeps its plan, its CTEs bound or inlined, so its
     /// blocks may run; a join with a CTE not named before it runs stays
     /// there; a view only its run names runs when the caller `runs`
@@ -5114,22 +5165,26 @@ impl Executor {
             ctx
         };
 
-        // Partition WHERE clause predicates for pushdown
-        // Note: For OUTER JOINs, we must be careful:
-        // - LEFT JOIN: Can push filters to left (preserved), but NOT to right (may have NULLs)
-        // - RIGHT JOIN: Can push filters to right (preserved), but NOT to left
-        // - FULL OUTER JOIN: Cannot push filters to either side
-        let where_for_join: Option<Expression> = stmt.where_clause.as_deref().cloned();
-        // The WHERE splits over the columns each side is read with, a joined
-        // side's by its tables'
-        let split = SplitSide::both(
-            block_sides.as_ref(),
-            [left_alias.as_deref(), right_alias.as_deref()],
-            [left_schema.as_deref(), right_schema.as_deref()],
-        );
-        let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
-            Some(where_clause) => split_join_where(where_clause, split, &join_type),
-            None => (None, None, None),
+        let where_for_join = stmt.where_clause.as_deref();
+        // The WHERE split over the columns each side is read with, a joined
+        // side's by its tables', as the plan holds it after its first run
+        let held = plan.as_deref().and_then(PreparedJoin::held_filters);
+        let fresh_split = held.is_none().then(|| {
+            let sides = SplitSide::both(
+                block_sides.as_ref(),
+                [left_alias.as_deref(), right_alias.as_deref()],
+                [left_schema.as_deref(), right_schema.as_deref()],
+            );
+            let (left, right, cross) = match where_for_join {
+                Some(where_clause) => split_join_where(where_clause, sides, &join_type),
+                None => (None, None, None),
+            };
+            [left, right, cross]
+        });
+        let unsplit = [None, None, None];
+        let split = match held {
+            Some(held) => &held.split,
+            None => fresh_split.as_ref().unwrap_or(&unsplit),
         };
         // The statement's blocks, and the one run of them every site calls
         let blocks = match blocks_where {
@@ -5137,20 +5192,36 @@ impl Executor {
                 prepared,
                 stmt,
                 (join_source, join_type.as_str()),
-                cross_filter.as_ref(),
-                [left_filter.as_ref(), right_filter.as_ref()],
+                split[2].as_ref(),
+                [split[0].as_ref(), split[1].as_ref()],
                 (left_alias.as_deref(), right_alias.as_deref()),
                 block_sides.as_ref(),
                 ctx,
             )?,
             false => None,
         };
-        // Each side reads the conditions the blocks left it; the joined row
-        // asks the rest, the ones the blocks moved among them
-        let where_split = left_filter.is_some() || right_filter.is_some();
-        let (left_filter, right_filter) = match blocks.as_deref().and_then(|b| b.written.as_ref()) {
-            Some([left, right]) => (left.clone(), right.clone()),
-            None => (left_filter, right_filter),
+        let where_split = split[0].is_some() || split[1].is_some();
+        let built;
+        let filters = match held {
+            Some(held) => held,
+            None => {
+                let split = fresh_split.unwrap_or_default();
+                let filters = Self::join_filters(split, blocks.as_deref(), join_source, &join_type);
+                match plan.as_deref() {
+                    Some(plan) => plan.hold_filters(filters),
+                    None => {
+                        built = filters;
+                        &built
+                    }
+                }
+            }
+        };
+        let [left_filter, right_filter] = &filters.sides;
+        let [left_plain, right_plain] = &filters.plain;
+        let cross_filter = &filters.cross;
+        let on_condition = match &filters.on {
+            Some(moved_on) => moved_on.as_ref(),
+            None => on_condition,
         };
         // A side read as rows reads its conditions without a block; the
         // blocks ask those of its others that bind as it is read, and the
@@ -5165,38 +5236,6 @@ impl Executor {
         let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i] && !sourced[i]);
         let side_plan = |side: usize| plan.as_deref().map(|plan| plan.side_plan(side));
         let bare_plan = |side: usize| plan.as_deref().map(|plan| plan.bare_side_plan(side));
-        let plain = |filter: &Option<Expression>, rows: bool| match rows {
-            true => filter.as_ref().and_then(|filter| {
-                combine_predicates_with_and(
-                    flatten_and_predicates(filter)
-                        .into_iter()
-                        .filter(|part| !Self::has_subqueries(part))
-                        .collect(),
-                )
-            }),
-            false => None,
-        };
-        let (left_plain, right_plain) = (
-            plain(&left_filter, reads_plain[0]),
-            plain(&right_filter, reads_plain[1]),
-        );
-        // As the blocks prepared them: an INNER join's ON with them, else its
-        // WHERE on the joined row
-        let moved_on;
-        let (on_condition, cross_filter) =
-            match blocks.as_deref().and_then(|held| held.moved.clone()) {
-                Some(moved) if Self::inner_on(join_source, &join_type) => {
-                    moved_on = combine_predicates_with_and(
-                        on_condition.cloned().into_iter().chain([moved]).collect(),
-                    );
-                    (moved_on.as_ref(), cross_filter)
-                }
-                Some(moved) => (
-                    on_condition,
-                    combine_predicates_with_and(cross_filter.into_iter().chain([moved]).collect()),
-                ),
-                None => (on_condition, cross_filter),
-            };
         let blocks_run = match blocks.as_deref() {
             Some(blocks) => Some(self.join_runner(blocks, ctx)?.ok_or_else(|| {
                 Error::internal("a table's columns changed while the statement prepared")
@@ -6812,10 +6851,10 @@ impl Executor {
         let did_any_pushdown = where_split;
         let effective_where = if did_any_pushdown {
             // Pushdown happened - only apply cross predicates (if any)
-            cross_filter.clone()
+            cross_filter.as_ref()
         } else {
             // No pushdown - apply full WHERE clause
-            where_for_join.clone()
+            where_for_join
         };
 
         // Apply WHERE clause if present
@@ -6825,7 +6864,7 @@ impl Executor {
                 prepared,
                 WhereSite::AfterJoin,
                 stmt,
-                &where_expr,
+                where_expr,
                 &all_columns,
                 blocks.as_deref(),
             )?;
