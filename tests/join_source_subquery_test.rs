@@ -65,6 +65,20 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &[3],
         &["1|NULL", "2|2", "3|NULL"],
     ),
+    // A GROUP BY join under a LIMIT reads its sides in chunks of the left
+    // keys; the first chunk matches nothing
+    (
+        "SELECT t.id, COUNT(*) FROM t JOIN (VALUES ((SELECT 3))) AS v(n) ON t.id = v.n \
+         GROUP BY t.id LIMIT 1",
+        &[],
+        &["3|1"],
+    ),
+    (
+        "SELECT t.id, COUNT(*) FROM t JOIN generate_series(3, (SELECT 3)) AS g \
+         ON t.id = g.value GROUP BY t.id LIMIT 1",
+        &[],
+        &["3|1"],
+    ),
 ];
 
 fn rows(db: &Database, sql: &str, params: &[i64]) -> Vec<String> {

@@ -8138,7 +8138,7 @@ impl Executor {
     /// The rows of the join side `source`, a SELECT * of it run under the
     /// join's `plan` for the side, so a subquery in it runs as that
     /// statement's block, and its columns qualified by `alias`; those
-    /// `filter` passes
+    /// `filter` passes, applied to each read, as it may differ between them
     fn statement_side_rows(
         &self,
         (source, alias): (&Expression, Option<&str>),
@@ -8146,15 +8146,36 @@ impl Executor {
         filter: Option<&Expression>,
         plan: &NestedPlan,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        let select_all = Self::select_all_of(source.clone(), filter);
+        let select_all = Self::select_all_of(source.clone(), None);
         let result = self.execute_source_statement(&select_all, ctx, None, Some(plan))?;
-        let columns = (result.columns().iter())
+        let columns: Vec<String> = (result.columns().iter())
             .map(|c| match alias {
                 Some(alias) => qualified(alias, bare_name(c)),
                 None => bare_name(c).to_string(),
             })
             .collect();
-        Ok((result, columns))
+        let Some(filter) = filter else {
+            return Ok((result, columns));
+        };
+        let program = super::aggregation::compile_over_slots(
+            filter,
+            &columns,
+            global_registry(),
+            None,
+            false,
+            None,
+        )?;
+        let program = super::expression::Program::bound(program, ctx.params());
+        let mut vm = ExprVM::new();
+        let mut kept = RowVec::new();
+        for (id, row) in Self::materialize_result(result)? {
+            let exec = super::aggregation::slot_context(&row, ctx);
+            if vm.execute_bool_checked(&program, &exec)? {
+                kept.push((id, row));
+            }
+        }
+        let result = ExecutorResult::new(columns.clone(), kept);
+        Ok((Box::new(result), columns))
     }
 
     /// A derived table's rows and its columns qualified by its alias, those
