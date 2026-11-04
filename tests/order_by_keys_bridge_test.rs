@@ -13,18 +13,10 @@
 // limitations under the License.
 
 //! A sort key the rows of a finished SELECT carry in no column is compiled
-//! over the rows' columns without the evaluator bridge
-
-#![cfg(feature = "test-failpoints")]
-
-use std::sync::Mutex;
+//! over the rows' columns
 
 use stoolap::core::Value;
-use stoolap::test_failpoints::bridge_compiles;
 use stoolap::Database;
-
-// The bridge counter is process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Each statement, its parameters and the rows it answers, every value
 /// written out
@@ -95,21 +87,15 @@ fn rows(db: &Database, sql: &str, params: &[i64]) -> Vec<String> {
 }
 
 #[test]
-fn a_computed_sort_key_answers_as_written_without_the_bridge() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+fn a_computed_sort_key_answers_as_written() {
     let db = open();
     let mut wrong = Vec::new();
     for (sql, params, expected) in CASES {
-        let before = bridge_compiles();
         let answer = rows(&db, sql, params);
-        let compiled = bridge_compiles() - before;
         if answer != *expected {
             wrong.push(format!(
                 "{sql} {params:?}: {answer:?}, written {expected:?}"
             ));
-        }
-        if compiled != 0 {
-            wrong.push(format!("{sql} {params:?}: {compiled} bridge compiles"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

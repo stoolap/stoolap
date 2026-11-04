@@ -44,27 +44,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::common::CompactVec;
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, RowVec, Value};
-use crate::functions::FunctionRegistry;
-use crate::parser::ast::Expression;
+use crate::core::{Row, RowVec, Value};
 
-use super::context::ExecutionContext;
-use super::expression::ExpressionEval;
 #[cfg(feature = "parallel")]
 use super::expression::RowFilter;
 use super::utils::{hash_composite_key, verify_composite_key_equality};
+#[cfg(feature = "parallel")]
+use crate::core::Result;
 
-/// Get number of parallel threads (1 when parallel feature is disabled)
+/// Get number of parallel threads
+#[cfg(feature = "parallel")]
 #[inline]
 fn num_threads() -> usize {
-    #[cfg(feature = "parallel")]
-    {
-        rayon::current_num_threads()
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        1
-    }
+    rayon::current_num_threads()
 }
 
 // Re-export JoinType from operators::hash_join - single source of truth
@@ -153,49 +145,6 @@ impl ParallelConfig {
     }
 }
 
-/// Parallel filter execution for WHERE clause evaluation
-///
-/// This function filters rows in parallel by:
-/// 1. Splitting rows into chunks
-/// 2. Evaluating the WHERE predicate on each chunk in parallel
-/// 3. Collecting matching rows from all chunks
-///
-/// Works with `(i64, Row)` tuples, preserving the row ID throughout filtering.
-///
-/// # Performance
-///
-/// For a table with 1M rows and 50% selectivity:
-/// - Sequential: ~500ms
-/// - Parallel (8 cores): ~80ms (6x speedup)
-///
-/// The speedup depends on:
-/// - Number of CPU cores
-/// - Complexity of the WHERE predicate
-/// - Selectivity (how many rows pass the filter)
-pub fn parallel_filter(
-    rows: RowVec,
-    filter_expr: &Expression,
-    columns: &[String],
-    _function_registry: &FunctionRegistry,
-    config: &ParallelConfig,
-    ctx: &ExecutionContext,
-) -> Result<RowVec> {
-    #[cfg(feature = "parallel")]
-    {
-        let row_count = rows.len();
-        if config.should_parallel_filter(row_count) {
-            // Pre-compile the filter expression once (RowFilter is Send+Sync)
-            let columns_vec: Vec<String> = columns.to_vec();
-            let filter = RowFilter::new(filter_expr, &columns_vec)?.with_context(ctx);
-            return filter_in_parallel(rows, &filter);
-        }
-    }
-
-    // Sequential fallback (always compiled)
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    sequential_filter(rows, filter_expr, columns, ctx)
-}
-
 /// The rows `filter` keeps, in their order, each judged on the thread pool
 #[cfg(feature = "parallel")]
 pub(crate) fn filter_in_parallel(rows: RowVec, filter: &RowFilter) -> Result<RowVec> {
@@ -263,27 +212,6 @@ fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool
         Some(error) => Err(error),
         None => Ok(keep),
     }
-}
-
-/// Sequential filter for small datasets or when parallel is disabled; out
-/// of line so the parallel branch does not shape its row loop
-#[inline(never)]
-fn sequential_filter(
-    rows: RowVec,
-    filter_expr: &Expression,
-    columns: &[String],
-    ctx: &ExecutionContext,
-) -> Result<RowVec> {
-    let columns_vec: Vec<String> = columns.to_vec();
-    let mut eval = ExpressionEval::compile(filter_expr, &columns_vec)?.with_context(ctx);
-
-    let mut result = RowVec::with_capacity(rows.len());
-    for (id, row) in rows {
-        if eval.eval_bool_checked(&row)? {
-            result.push((id, row));
-        }
-    }
-    Ok(result)
 }
 
 /// Parallel filter with ownership transfer (more efficient for large results)
@@ -1135,42 +1063,6 @@ where
     }
     let _ = config; // suppress unused warning when parallel feature is disabled
     rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-}
-
-/// Parallel filter with statistics collection
-///
-/// CRITICAL: This function now returns Result to properly propagate compilation errors.
-pub fn parallel_filter_with_stats(
-    rows: RowVec,
-    filter_expr: &Expression,
-    columns: &[String],
-    function_registry: &FunctionRegistry,
-    config: &ParallelConfig,
-    ctx: &ExecutionContext,
-) -> Result<(RowVec, ParallelStats)> {
-    let row_count = rows.len();
-    let parallel_used = config.should_parallel_filter(row_count);
-
-    let n_threads = num_threads();
-    let chunk_size = if parallel_used {
-        config.chunk_size.max(row_count / (n_threads * 4)).max(512)
-    } else {
-        row_count // Single chunk for sequential
-    };
-
-    let chunks_used = row_count.div_ceil(chunk_size);
-
-    // CRITICAL: Propagate errors with ? instead of silently swallowing them
-    let result = parallel_filter(rows, filter_expr, columns, function_registry, config, ctx)?;
-
-    let stats = ParallelStats {
-        rows_processed: row_count,
-        rows_passed: result.len(),
-        chunks_used,
-        parallel_used,
-    };
-
-    Ok((result, stats))
 }
 
 /// Distance metric for vector search

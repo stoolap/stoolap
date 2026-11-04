@@ -84,15 +84,45 @@ fn insert(db: &Database, from: i64, to: i64) {
     }
 }
 
-/// What `run` gives with the prepared families off: the general path's
-/// scan reads in batches and through the ordered collector, a plan streams
+/// The ids of t's rows with `k` in `low..=high` that `keep` passes, up to
+/// `target`, sorted: read through the ordered collector in batches, each
+/// twice the last and at the offset the last ended, as a residual filter
+/// under a LIMIT reads them
 #[cfg(feature = "test-failpoints")]
-fn on_general_path<T>(run: impl FnOnce() -> T) -> T {
-    use stoolap::test_failpoints::PREPARED_FAMILIES_OFF;
-    PREPARED_FAMILIES_OFF.store(true, Ordering::SeqCst);
-    let given = run();
-    PREPARED_FAMILIES_OFF.store(false, Ordering::SeqCst);
-    given
+fn batched(
+    db: &Database,
+    (low, high): (i64, i64),
+    keep: fn(i64) -> bool,
+    target: usize,
+) -> Vec<i64> {
+    use stoolap::core::Value;
+    use stoolap::storage::expression::{AndExpr, ComparisonExpr, Expression};
+    use stoolap::storage::traits::{Engine, ScanAccess};
+    let tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+    let mut range = AndExpr::new(vec![
+        Box::new(ComparisonExpr::gte("k", Value::Integer(low))),
+        Box::new(ComparisonExpr::lte("k", Value::Integer(high))),
+    ]);
+    range.prepare_for_schema(table.schema());
+    let plan = table.limited_index_plan(&range);
+    let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+    let (mut ids, mut size, mut offset) = (Vec::new(), target.max(100), 0);
+    while ids.len() < target {
+        let batch = table
+            .collect_access_rows_with_limit(access, Some(&range), size, offset)
+            .unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        let read = batch.into_iter().map(|(id, _)| id).filter(|id| keep(*id));
+        ids.extend(read);
+        offset += size;
+        size *= 2;
+    }
+    ids.truncate(target);
+    ids.sort_unstable();
+    ids
 }
 
 fn ids_db(db: &Database, sql: &str, params: &[i64]) -> Vec<i64> {
@@ -892,8 +922,8 @@ fn a_timestamp_bound_outside_the_range_compares_as_a_timestamp() {
     }
 }
 
-/// The executor fetches a residual LIMIT in batches, calling the ordered
-/// collector again with a larger offset; when the budget is refused
+/// A read in batches calls the ordered collector again with a larger
+/// offset; when the budget is refused
 /// between two batches, the second batch's scan must follow the same
 /// order as the first batch's walk, or a row comes twice.
 #[cfg(feature = "test-failpoints")]
@@ -940,9 +970,7 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
             INDEX_PAGES.set_budget_bytes(0);
         });
     });
-    let sql =
-        "SELECT id FROM (SELECT id FROM t WHERE k >= 0 AND k <= 1 AND ABS(id - 904) = 0 LIMIT 2) s";
-    let rows = on_general_path(|| ids_db(&db, sql, &[]));
+    let rows = batched(&db, (0, 1), |id| id == 904, 2);
     stoolap::test_failpoints::after_cold_volumes_taken(|| {});
     db.execute("PRAGMA INDEX_CACHE_MB = 16", ()).unwrap();
     assert!(calls.load(Ordering::SeqCst) > 1, "more than one batch");
@@ -965,8 +993,7 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     insert(&db, 1, ROWS);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     // A hundred keys, eight hundred candidates: 3,200 bytes of positions
-    let sql =
-        "SELECT id FROM (SELECT id FROM t WHERE k >= 100 AND k <= 199 AND ABS(id + 1) > 0 LIMIT 5) s";
+    let read = || batched(&db, (100, 199), |_| true, 5);
     let want = expected_range(100, 199);
     let positions = 800 * std::mem::size_of::<u32>();
     INDEX_PAGES.clear();
@@ -974,7 +1001,7 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     // Room for the walk's reader, not for its positions
     INDEX_PAGES.set_budget_bytes((idle + reader_bytes(SIDE_WINDOW) + positions / 2) as u64);
     let before = reads(&db);
-    let rows = on_general_path(|| ids_db(&db, sql, &[]));
+    let rows = read();
     let after = reads(&db);
     INDEX_PAGES.set_budget_bytes(16 * 1024 * 1024);
     assert_eq!(rows.len(), 5);
@@ -989,7 +1016,7 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
     INDEX_PAGES.reset_peak();
     let idle = INDEX_PAGES.stats().charged_bytes;
     let before = reads(&db);
-    let rows = on_general_path(|| ids_db(&db, sql, &[]));
+    let rows = read();
     let after = reads(&db);
     assert_eq!(rows.len(), 5);
     assert_eq!(delta(&after, &before, "refused"), 0);

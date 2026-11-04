@@ -17,9 +17,7 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{
-    bridge_compiles, join_paths_taken, program_compiles, reset_join_paths,
-};
+use stoolap::test_failpoints::{join_paths_taken, program_compiles, reset_join_paths};
 use stoolap::Database;
 
 fn open(name: &str) -> Database {
@@ -124,18 +122,13 @@ fn a_join_run_again_compiles_nothing() {
     let mut wrong = Vec::new();
     for &(sql, path) in CASES {
         let first = rows(&db, sql);
-        let before = bridge_compiles();
         let programs_before = program_compiles();
         reset_join_paths();
         let again = rows(&db, sql);
-        let handed = bridge_compiles() - before;
         let compiled = program_compiles() - programs_before;
         let taken = join_paths_taken();
         if taken != [path] {
             wrong.push(format!("{sql}: took {taken:?}, expected {path}"));
-        }
-        if handed != 0 {
-            wrong.push(format!("{sql}: run again, handed the bridge {handed}"));
         }
         if compiled != 0 {
             wrong.push(format!("{sql}: run again, compiled {compiled} programs"));

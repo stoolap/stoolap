@@ -13,25 +13,19 @@
 // limitations under the License.
 
 //! A statement that aggregates its rows and keeps the first group of each
-//! DISTINCT ON key answers on the runner as on the general path, rows in
-//! order, over every source, hot and sealed
+//! DISTINCT ON key answers on the runner as recorded, rows in order, over
+//! every source, hot and sealed
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::{Mutex, MutexGuard};
-
-use stoolap::test_failpoints::{
-    aggregate_paths_taken, reset_aggregate_paths, PREPARED_FAMILIES_OFF,
-};
+use stoolap::test_failpoints::{aggregate_paths_taken, reset_aggregate_paths};
 use stoolap::Database;
 
-// The families switch and the path counters are process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
+mod oracle;
 
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Each statement's column names and rows, recorded when the general path
+/// gave the same
+const RECORDED: oracle::Answers = answers!("aggregate_distinct_on");
 
 /// The column names and each row in order, or the error
 type Answer = Result<(Vec<String>, Vec<String>), String>;
@@ -52,17 +46,14 @@ fn rows(db: &Database, sql: &str) -> Answer {
     Ok((columns, out))
 }
 
-/// `sql` answered with the prepared families refused: the general path
-fn general(db: &Database, sql: &str) -> Answer {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    let _restore = Restore;
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    rows(db, sql)
+/// What is wrong with `answer` as `key`'s recorded answer, its column
+/// names on the first line
+fn check(key: &str, answer: Answer) -> Option<String> {
+    let lines = answer.map(|(columns, rows)| {
+        let names = format!("columns: {}", columns.join("|"));
+        std::iter::once(names).chain(rows).collect()
+    });
+    oracle::check_answer(&RECORDED, key, &lines)
 }
 
 fn open(dsn: &str, seal: bool) -> Database {
@@ -123,8 +114,7 @@ const SHAPES: &[&str] = &[
 ];
 
 #[test]
-fn an_aggregate_with_distinct_on_answers_as_the_general_path() {
-    let _guard = serial();
+fn an_aggregate_with_distinct_on_answers_as_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let sealed = format!("file://{}?checkpoint_interval=0", dir.path().display());
     let mut wrong = Vec::new();
@@ -138,12 +128,10 @@ fn an_aggregate_with_distinct_on_answers_as_the_general_path() {
                 reset_aggregate_paths();
                 let got = rows(&db, &sql);
                 let taken = aggregate_paths_taken();
-                let want = general(&db, &sql);
-                if got != want || taken.contains(&"general") {
-                    wrong.push(format!(
-                        "{name}: {sql}\n  took {taken:?}\n  got {got:?}\n  want {want:?}"
-                    ));
+                if taken.contains(&"general") {
+                    wrong.push(format!("{name}: {sql}: took {taken:?}"));
                 }
+                wrong.extend(check(&format!("{name}: {sql}"), got));
             }
         }
     }
@@ -152,7 +140,6 @@ fn an_aggregate_with_distinct_on_answers_as_the_general_path() {
 
 #[test]
 fn a_prepared_aggregate_with_distinct_on_reads_each_run_s_parameter() {
-    let _guard = serial();
     let db = open("memory://aggregate_distinct_on_prepared", false);
     let sql = "SELECT DISTINCT ON (g > $1) g, COUNT(*) FROM t GROUP BY g ORDER BY g > $1, g DESC";
     let statement = db.prepare(sql).unwrap();

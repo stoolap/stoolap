@@ -18,10 +18,8 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::atomic::Ordering::Relaxed;
-
 use stoolap::test_failpoints::{
-    order_limit_paths, order_limit_paths_taken, reset_order_limit_paths, PREPARED_FAMILIES_OFF,
+    order_limit_paths, order_limit_paths_taken, reset_order_limit_paths,
 };
 use stoolap::Database;
 
@@ -73,20 +71,24 @@ const CASES: &[Case] = &[
          ORDER BY a DESC NULLS FIRST, id",
         Some((5, 0)),
     ),
-    // With the prepared families off, a statement runs on the general path
+    // A set operation sorted by a computed key computes it over its rows
     case(
-        "memory, families off",
-        "projected_top",
-        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id LIMIT 3 OFFSET 1",
-        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id",
-        Some((3, 1)),
+        "memory",
+        "computed_keys",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a + 0, id LIMIT 5 OFFSET 2",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a + 0, id",
+        Some((5, 2)),
     ),
     case(
-        "sealed, families off",
-        "projected_top",
-        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id LIMIT 3",
-        "SELECT id, a + 0 AS b FROM (SELECT id, a FROM t) s ORDER BY id",
-        Some((3, 0)),
+        "sealed",
+        "computed_keys",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a + 0 DESC, id LIMIT 4",
+        "SELECT id, a FROM t WHERE id <= 150 UNION ALL SELECT id, a FROM t WHERE id > 150 \
+         ORDER BY a + 0 DESC, id",
+        Some((4, 0)),
     ),
     // A statement over a derived table or a view runs on the runner
     case(
@@ -131,29 +133,6 @@ const CASES: &[Case] = &[
         "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id LIMIT 4) s",
         "SELECT * FROM (SELECT * FROM t ORDER BY a + 0 DESC, id) s",
         Some((4, 0)),
-    ),
-    // A join without its blocks, as with the prepared families off, runs on
-    // the general path
-    case(
-        "memory, families off",
-        "computed_keys",
-        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0, t.id LIMIT 4 OFFSET 1",
-        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0, t.id",
-        Some((4, 1)),
-    ),
-    case(
-        "sealed, families off",
-        "computed_keys",
-        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0 DESC, t.id LIMIT 4",
-        "SELECT * FROM t CROSS JOIN (SELECT 1 AS one) o ORDER BY t.a + 0 DESC, t.id",
-        Some((4, 0)),
-    ),
-    case(
-        "memory, families off",
-        "deferred_projection",
-        "SELECT id, a FROM t ORDER BY id LIMIT 3 OFFSET 1",
-        "SELECT id, a FROM t ORDER BY id",
-        Some((3, 1)),
     ),
     // The same statements over the table run on the plan
     case(
@@ -397,11 +376,8 @@ fn every_order_limit_path_answers_as_the_whole_sort() {
             true => &sealed,
             false => &memory,
         };
-        let off = case.ctx.ends_with("families off");
-        PREPARED_FAMILIES_OFF.store(off, Relaxed);
         let (got, taken) = run(db, case.sql);
         let (whole, reference_taken) = run(db, case.reference);
-        PREPARED_FAMILIES_OFF.store(false, Relaxed);
         let want: Vec<String> = match case.cut {
             Some((limit, offset)) => {
                 let mut whole = whole.into_iter();

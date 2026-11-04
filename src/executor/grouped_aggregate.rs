@@ -168,7 +168,6 @@ impl Executor {
             || Self::sorts_groups(stmt, classification, &aggregations, grouped_names);
         Ok(Some(AggregatePlan {
             aggregations,
-            plain,
             read: AggregateRead::Grouped {
                 source,
                 group: (group, group_index),

@@ -26,8 +26,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    after_select_table_opened, before_join_side_opened, bridge_compiles, general_path_hits,
-    join_paths_taken, program_compiles, reset_join_paths, GeneralPath,
+    after_select_table_opened, before_join_side_opened, general_path_hits, join_paths_taken,
+    program_compiles, reset_join_paths, GeneralPath,
 };
 use stoolap::Database;
 
@@ -199,14 +199,11 @@ fn a_join_reads_its_output_s_subqueries_through_its_blocks() {
                         wrong.push(format!("sealed {sealed}: {sql}: answers {first:?}"));
                         continue;
                     }
-                    let compiles = (bridge_compiles(), program_compiles());
+                    let compiles = program_compiles();
                     reset_join_paths();
                     let again = rows(&db, &sql);
                     let taken = join_paths_taken();
-                    let compiled = (
-                        bridge_compiles() - compiles.0,
-                        program_compiles() - compiles.1,
-                    );
+                    let compiled = program_compiles() - compiles;
                     let reached = general_hits();
                     if reached != hits {
                         wrong.push(format!(
@@ -220,9 +217,9 @@ fn a_join_reads_its_output_s_subqueries_through_its_blocks() {
                     if line != "Prepared: yes" {
                         wrong.push(format!("sealed {sealed}: {sql}: {line}"));
                     }
-                    if compiled != (0, 0) {
+                    if compiled != 0 {
                         wrong.push(format!(
-                            "sealed {sealed}: {sql}: run again compiled {compiled:?}"
+                            "sealed {sealed}: {sql}: run again compiled {compiled}"
                         ));
                     }
                     if again != first {

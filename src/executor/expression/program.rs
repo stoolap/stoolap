@@ -29,6 +29,9 @@ use crate::common::CompactArc;
 use crate::core::DataType;
 use crate::core::Value;
 
+/// Shared program reference for zero-copy caching
+pub type SharedProgram = CompactArc<Program>;
+
 /// Compiled expression program
 ///
 /// This is the executable form of an expression. It's designed to be:

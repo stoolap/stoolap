@@ -25,8 +25,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use stoolap::test_failpoints::{
-    before_join_side_opened, bound_side_reads, bridge_compiles, join_paths_taken, program_compiles,
-    reset_join_paths,
+    before_join_side_opened, bound_side_reads, join_paths_taken, program_compiles, reset_join_paths,
 };
 use stoolap::Database;
 
@@ -255,14 +254,11 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
                     _ => plain.clone(),
                 };
                 let first = rows(&db, &plain);
-                let compiles = (bridge_compiles(), program_compiles());
+                let compiles = program_compiles();
                 reset_join_paths();
                 let again = rows(&db, &plain);
                 let taken = join_paths_taken();
-                let compiled = (
-                    bridge_compiles() - compiles.0,
-                    program_compiles() - compiles.1,
-                );
+                let compiled = program_compiles() - compiles;
                 let mut why = Vec::new();
                 let want = anchored(&db, &RECORDED, &reference, &mut why);
                 wrong.extend(why.into_iter().map(|why| format!("sealed {sealed}: {why}")));
@@ -280,7 +276,7 @@ fn a_join_reads_a_side_s_subqueries_through_its_blocks() {
                 if line != "Prepared: yes" {
                     wrong.push(format!("sealed {sealed}: {plain}: {line}"));
                 }
-                if compiled != (0, 0) && !shape.keys_from_rows {
+                if compiled != 0 && !shape.keys_from_rows {
                     wrong.push(format!(
                         "sealed {sealed}: {plain}: run again compiled {compiled:?}"
                     ));

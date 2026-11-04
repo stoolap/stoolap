@@ -457,7 +457,10 @@ fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
                     }
                 };
             }
-            let program = super::compile_expression(&where_of(&predicate), &columns).unwrap();
+            let compile = CompileContext::with_global_registry(&columns);
+            let program = ExprCompiler::new(&compile)
+                .compile(&where_of(&predicate))
+                .unwrap();
             assert!(
                 program.is_predicate_chain() || !columns_only,
                 "{predicate} is not a chain"

@@ -21,7 +21,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{bridge_compiles, general_path_hits, program_compiles, GeneralPath};
+use stoolap::test_failpoints::{general_path_hits, program_compiles, GeneralPath};
 use stoolap::Database;
 
 // The general path counters are process-wide
@@ -152,8 +152,8 @@ fn rows(db: &Database, sql: &str) -> Vec<String> {
     out
 }
 
-fn compiles() -> (usize, usize) {
-    (bridge_compiles(), program_compiles())
+fn compiles() -> usize {
+    program_compiles()
 }
 
 #[test]

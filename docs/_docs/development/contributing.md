@@ -189,13 +189,15 @@ src/
 
 ## Expression Compilation Pattern
 
-When working on the executor, always pre-compile expressions:
+When working on the executor, always pre-compile expressions, once with the statement's plan:
 
 ```rust
 // Correct: Pre-compile once, reuse for all rows
-let filter = RowFilter::new(&where_expr, &columns)?;
+let compile = CompileContext::with_global_registry(&columns);
+let program = CompactArc::new(ExprCompiler::new(&compile).compile(&where_expr)?);
+let filter = RowFilter::from_program(program).with_context(ctx);
 for row in rows {
-    if filter.matches(&row) { ... }
+    if filter.matches_checked(&row)? { ... }
 }
 
 // Wrong: Evaluating expression AST directly per row (slow)

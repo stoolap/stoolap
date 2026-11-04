@@ -1,0 +1,200 @@
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (2) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY 2, g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (2) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY 2, g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (2) g, COUNT(*) FROM t GROUP BY g ORDER BY 2, g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (2) g, COUNT(*) FROM v t GROUP BY g ORDER BY 2, g
+1	116f5b51de7ba2f7	hot: SELECT DISTINCT ON (5) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	116f5b51de7ba2f7	hot: SELECT DISTINCT ON (5) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	116f5b51de7ba2f7	hot: SELECT DISTINCT ON (5) g, COUNT(*) FROM t GROUP BY g
+1	116f5b51de7ba2f7	hot: SELECT DISTINCT ON (5) g, COUNT(*) FROM v t GROUP BY g
+2	6e592f0e34a06333	hot: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM (SELECT id, g, s, a FROM t) t
+2	6e592f0e34a06333	hot: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a)
+2	6e592f0e34a06333	hot: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM t
+2	6e592f0e34a06333	hot: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM v t
+3	8446b0928267b246	hot: SELECT DISTINCT ON (COUNT(*)) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY COUNT(*) DESC, g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (COUNT(*)) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY COUNT(*) DESC, g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (COUNT(*)) g FROM t GROUP BY g ORDER BY COUNT(*) DESC, g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (COUNT(*)) g FROM v t GROUP BY g ORDER BY COUNT(*) DESC, g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY COUNT(*), g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY COUNT(*), g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*), g
+3	32528ab6f79f051b	hot: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM v t GROUP BY g ORDER BY COUNT(*), g
+5	7401460a65ea2756	hot: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY MAX(a) DESC, g
+5	7401460a65ea2756	hot: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY MAX(a) DESC, g
+5	7401460a65ea2756	hot: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM t GROUP BY g ORDER BY MAX(a) DESC, g
+5	7401460a65ea2756	hot: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM v t GROUP BY g ORDER BY MAX(a) DESC, g
+3	94c022928b7ede90	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+3	d16e7018a42776ba	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY SUM(a) > 2, g
+3	94c022928b7ede90	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+3	d16e7018a42776ba	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY SUM(a) > 2, g
+3	94c022928b7ede90	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM t GROUP BY g
+3	d16e7018a42776ba	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM t GROUP BY g ORDER BY SUM(a) > 2, g
+3	94c022928b7ede90	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM v t GROUP BY g
+3	d16e7018a42776ba	hot: SELECT DISTINCT ON (SUM(a) > 2) g FROM v t GROUP BY g ORDER BY SUM(a) > 2, g
+2	d3086e1feafadd21	hot: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM (SELECT id, g, s, a FROM t) t
+2	d3086e1feafadd21	hot: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a)
+2	d3086e1feafadd21	hot: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM t
+2	d3086e1feafadd21	hot: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM v t
+4	3f34611701ff0312	hot: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY UPPER(s) ORDER BY UPPER(s)
+4	3f34611701ff0312	hot: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY UPPER(s) ORDER BY UPPER(s)
+4	3f34611701ff0312	hot: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM t GROUP BY UPPER(s) ORDER BY UPPER(s)
+4	3f34611701ff0312	hot: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM v t GROUP BY UPPER(s) ORDER BY UPPER(s)
+1	1a189814f0aae4c8	hot: SELECT DISTINCT ON (a) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	1a189814f0aae4c8	hot: SELECT DISTINCT ON (a) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	1a189814f0aae4c8	hot: SELECT DISTINCT ON (a) g, COUNT(*) FROM t GROUP BY g
+1	1a189814f0aae4c8	hot: SELECT DISTINCT ON (a) g, COUNT(*) FROM v t GROUP BY g
+3	d7f95ea02caf8a02	hot: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY c, g
+3	d7f95ea02caf8a02	hot: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY c, g
+3	d7f95ea02caf8a02	hot: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c, g
+3	d7f95ea02caf8a02	hot: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM v t GROUP BY g ORDER BY c, g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (g % 2) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (g % 2) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (g % 2) g FROM t GROUP BY g ORDER BY g
+3	8446b0928267b246	hot: SELECT DISTINCT ON (g % 2) g FROM v t GROUP BY g ORDER BY g
+3	cf3c62b738abfb47	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	cf3c62b738abfb47	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	cf3c62b738abfb47	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	cf3c62b738abfb47	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM v t GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	1deed6be47d75c6c	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g % 2, g
+3	1deed6be47d75c6c	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g % 2, g
+3	1deed6be47d75c6c	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g % 2, g
+3	1deed6be47d75c6c	hot: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM v t GROUP BY g ORDER BY g % 2, g
+5	6632c20871383dcd	hot: SELECT DISTINCT ON (g) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g
+5	6632c20871383dcd	hot: SELECT DISTINCT ON (g) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g
+5	6632c20871383dcd	hot: SELECT DISTINCT ON (g) g, COUNT(*) FROM t GROUP BY g ORDER BY g
+5	6632c20871383dcd	hot: SELECT DISTINCT ON (g) g, COUNT(*) FROM v t GROUP BY g ORDER BY g
+12	c681318d3554a8ed	hot: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY ROLLUP (g, s) ORDER BY g, s
+12	c681318d3554a8ed	hot: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY ROLLUP (g, s) ORDER BY g, s
+12	c681318d3554a8ed	hot: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM t GROUP BY ROLLUP (g, s) ORDER BY g, s
+12	c681318d3554a8ed	hot: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM v t GROUP BY ROLLUP (g, s) ORDER BY g, s
+1	41dcbf36446f25d9	hot: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	41dcbf36446f25d9	hot: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	41dcbf36446f25d9	hot: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM t GROUP BY g
+1	41dcbf36446f25d9	hot: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM v t GROUP BY g
+4	504beb4801cee212	hot: SELECT DISTINCT ON (s) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g, s ORDER BY s, g
+4	504beb4801cee212	hot: SELECT DISTINCT ON (s) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g, s ORDER BY s, g
+4	504beb4801cee212	hot: SELECT DISTINCT ON (s) g, COUNT(*) FROM t GROUP BY g, s ORDER BY s, g
+4	504beb4801cee212	hot: SELECT DISTINCT ON (s) g, COUNT(*) FROM v t GROUP BY g, s ORDER BY s, g
+4	53e20a96f42b0ba4	hot: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	53e20a96f42b0ba4	hot: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	53e20a96f42b0ba4	hot: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM t GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	53e20a96f42b0ba4	hot: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM v t GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	a43773ef34268f56	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t WHERE a < 9 GROUP BY s ORDER BY s
+4	a43773ef34268f56	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) WHERE a < 9 GROUP BY s ORDER BY s
+4	a43773ef34268f56	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM t WHERE a < 9 GROUP BY s ORDER BY s
+4	a43773ef34268f56	hot: SELECT DISTINCT ON (s) s, COUNT(*) FROM v t WHERE a < 9 GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	hot: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM (SELECT id, g, s, a FROM t) t GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	hot: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	hot: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM t GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	hot: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM v t GROUP BY s ORDER BY s
+2	19ae7982a482febb	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+2	19ae7982a482febb	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+2	19ae7982a482febb	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM t GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM t GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+2	19ae7982a482febb	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM v t GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	hot: SELECT DISTINCT ON (s) s, g, SUM(a) FROM v t GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+4	afbafd3058708fd4	hot: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g ORDER BY s, COUNT(*), g
+4	afbafd3058708fd4	hot: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g ORDER BY s, COUNT(*), g
+4	afbafd3058708fd4	hot: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM t GROUP BY s, g ORDER BY s, COUNT(*), g
+4	afbafd3058708fd4	hot: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM v t GROUP BY s, g ORDER BY s, COUNT(*), g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (2) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY 2, g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (2) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY 2, g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (2) g, COUNT(*) FROM t GROUP BY g ORDER BY 2, g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (2) g, COUNT(*) FROM v t GROUP BY g ORDER BY 2, g
+1	116f5b51de7ba2f7	sealed: SELECT DISTINCT ON (5) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	116f5b51de7ba2f7	sealed: SELECT DISTINCT ON (5) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	116f5b51de7ba2f7	sealed: SELECT DISTINCT ON (5) g, COUNT(*) FROM t GROUP BY g
+1	116f5b51de7ba2f7	sealed: SELECT DISTINCT ON (5) g, COUNT(*) FROM v t GROUP BY g
+2	6e592f0e34a06333	sealed: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM (SELECT id, g, s, a FROM t) t
+2	6e592f0e34a06333	sealed: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a)
+2	6e592f0e34a06333	sealed: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM t
+2	6e592f0e34a06333	sealed: SELECT DISTINCT ON (COUNT(*)) COUNT(*) FROM v t
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (COUNT(*)) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY COUNT(*) DESC, g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (COUNT(*)) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY COUNT(*) DESC, g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (COUNT(*)) g FROM t GROUP BY g ORDER BY COUNT(*) DESC, g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (COUNT(*)) g FROM v t GROUP BY g ORDER BY COUNT(*) DESC, g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY COUNT(*), g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY COUNT(*), g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*), g
+3	32528ab6f79f051b	sealed: SELECT DISTINCT ON (COUNT(*)) g, COUNT(*) FROM v t GROUP BY g ORDER BY COUNT(*), g
+5	7401460a65ea2756	sealed: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY MAX(a) DESC, g
+5	7401460a65ea2756	sealed: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY MAX(a) DESC, g
+5	7401460a65ea2756	sealed: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM t GROUP BY g ORDER BY MAX(a) DESC, g
+5	7401460a65ea2756	sealed: SELECT DISTINCT ON (MAX(a)) MAX(a), g FROM v t GROUP BY g ORDER BY MAX(a) DESC, g
+3	94c022928b7ede90	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+3	d16e7018a42776ba	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY SUM(a) > 2, g
+3	94c022928b7ede90	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+3	d16e7018a42776ba	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY SUM(a) > 2, g
+3	94c022928b7ede90	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM t GROUP BY g
+3	d16e7018a42776ba	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM t GROUP BY g ORDER BY SUM(a) > 2, g
+3	94c022928b7ede90	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM v t GROUP BY g
+3	d16e7018a42776ba	sealed: SELECT DISTINCT ON (SUM(a) > 2) g FROM v t GROUP BY g ORDER BY SUM(a) > 2, g
+2	d3086e1feafadd21	sealed: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM (SELECT id, g, s, a FROM t) t
+2	d3086e1feafadd21	sealed: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a)
+2	d3086e1feafadd21	sealed: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM t
+2	d3086e1feafadd21	sealed: SELECT DISTINCT ON (SUM(a)) SUM(a) AS total, COUNT(*) FROM v t
+4	3f34611701ff0312	sealed: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY UPPER(s) ORDER BY UPPER(s)
+4	3f34611701ff0312	sealed: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY UPPER(s) ORDER BY UPPER(s)
+4	3f34611701ff0312	sealed: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM t GROUP BY UPPER(s) ORDER BY UPPER(s)
+4	3f34611701ff0312	sealed: SELECT DISTINCT ON (UPPER(s)) UPPER(s), COUNT(*) FROM v t GROUP BY UPPER(s) ORDER BY UPPER(s)
+1	1a189814f0aae4c8	sealed: SELECT DISTINCT ON (a) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	1a189814f0aae4c8	sealed: SELECT DISTINCT ON (a) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	1a189814f0aae4c8	sealed: SELECT DISTINCT ON (a) g, COUNT(*) FROM t GROUP BY g
+1	1a189814f0aae4c8	sealed: SELECT DISTINCT ON (a) g, COUNT(*) FROM v t GROUP BY g
+3	d7f95ea02caf8a02	sealed: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY c, g
+3	d7f95ea02caf8a02	sealed: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY c, g
+3	d7f95ea02caf8a02	sealed: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c, g
+3	d7f95ea02caf8a02	sealed: SELECT DISTINCT ON (c) g, COUNT(*) AS c FROM v t GROUP BY g ORDER BY c, g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (g % 2) g FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (g % 2) g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (g % 2) g FROM t GROUP BY g ORDER BY g
+3	8446b0928267b246	sealed: SELECT DISTINCT ON (g % 2) g FROM v t GROUP BY g ORDER BY g
+3	cf3c62b738abfb47	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	cf3c62b738abfb47	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	cf3c62b738abfb47	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	cf3c62b738abfb47	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*) FROM v t GROUP BY g HAVING COUNT(*) > 0 ORDER BY g % 2, g DESC
+3	1deed6be47d75c6c	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g % 2, g
+3	1deed6be47d75c6c	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g % 2, g
+3	1deed6be47d75c6c	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g % 2, g
+3	1deed6be47d75c6c	sealed: SELECT DISTINCT ON (g % 2) g, COUNT(*), RANK() OVER (ORDER BY g) FROM v t GROUP BY g ORDER BY g % 2, g
+5	6632c20871383dcd	sealed: SELECT DISTINCT ON (g) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g ORDER BY g
+5	6632c20871383dcd	sealed: SELECT DISTINCT ON (g) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g ORDER BY g
+5	6632c20871383dcd	sealed: SELECT DISTINCT ON (g) g, COUNT(*) FROM t GROUP BY g ORDER BY g
+5	6632c20871383dcd	sealed: SELECT DISTINCT ON (g) g, COUNT(*) FROM v t GROUP BY g ORDER BY g
+12	c681318d3554a8ed	sealed: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY ROLLUP (g, s) ORDER BY g, s
+12	c681318d3554a8ed	sealed: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY ROLLUP (g, s) ORDER BY g, s
+12	c681318d3554a8ed	sealed: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM t GROUP BY ROLLUP (g, s) ORDER BY g, s
+12	c681318d3554a8ed	sealed: SELECT DISTINCT ON (g, s) g, s, COUNT(*) FROM v t GROUP BY ROLLUP (g, s) ORDER BY g, s
+1	41dcbf36446f25d9	sealed: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g
+1	41dcbf36446f25d9	sealed: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g
+1	41dcbf36446f25d9	sealed: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM t GROUP BY g
+1	41dcbf36446f25d9	sealed: SELECT DISTINCT ON (nosuch) g, COUNT(*) FROM v t GROUP BY g
+4	504beb4801cee212	sealed: SELECT DISTINCT ON (s) g, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g, s ORDER BY s, g
+4	504beb4801cee212	sealed: SELECT DISTINCT ON (s) g, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g, s ORDER BY s, g
+4	504beb4801cee212	sealed: SELECT DISTINCT ON (s) g, COUNT(*) FROM t GROUP BY g, s ORDER BY s, g
+4	504beb4801cee212	sealed: SELECT DISTINCT ON (s) g, COUNT(*) FROM v t GROUP BY g, s ORDER BY s, g
+4	53e20a96f42b0ba4	sealed: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	53e20a96f42b0ba4	sealed: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	53e20a96f42b0ba4	sealed: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM t GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	53e20a96f42b0ba4	sealed: SELECT DISTINCT ON (s) g, s, COUNT(*) FROM v t GROUP BY g, s ORDER BY s, COUNT(*) DESC, g
+4	a43773ef34268f56	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM (SELECT id, g, s, a FROM t) t WHERE a < 9 GROUP BY s ORDER BY s
+4	a43773ef34268f56	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) WHERE a < 9 GROUP BY s ORDER BY s
+4	a43773ef34268f56	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM t WHERE a < 9 GROUP BY s ORDER BY s
+4	a43773ef34268f56	sealed: SELECT DISTINCT ON (s) s, COUNT(*) FROM v t WHERE a < 9 GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	sealed: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM (SELECT id, g, s, a FROM t) t GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	sealed: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	sealed: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM t GROUP BY s ORDER BY s
+4	9fde3ba075330d1a	sealed: SELECT DISTINCT ON (s) s, STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a) FROM v t GROUP BY s ORDER BY s
+2	19ae7982a482febb	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+2	19ae7982a482febb	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+2	19ae7982a482febb	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM t GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM t GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+2	19ae7982a482febb	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM v t GROUP BY s, g ORDER BY s, g DESC LIMIT 1
+3	345151ae658a6476	sealed: SELECT DISTINCT ON (s) s, g, SUM(a) FROM v t GROUP BY s, g ORDER BY s, g DESC LIMIT 2 OFFSET 1
+4	afbafd3058708fd4	sealed: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM (SELECT id, g, s, a FROM t) t GROUP BY s, g ORDER BY s, COUNT(*), g
+4	afbafd3058708fd4	sealed: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM (VALUES (1, 1, 'x', 1), (2, 1, 'y', 2), (3, 2, 'x', 3), (4, 3, 'y', NULL), (5, 3, 'x', 5), (6, 4, 'z', 1)) t(id, g, s, a) GROUP BY s, g ORDER BY s, COUNT(*), g
+4	afbafd3058708fd4	sealed: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM t GROUP BY s, g ORDER BY s, COUNT(*), g
+4	afbafd3058708fd4	sealed: SELECT DISTINCT ON (s, COUNT(*)) s, g FROM v t GROUP BY s, g ORDER BY s, COUNT(*), g

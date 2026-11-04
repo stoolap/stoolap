@@ -1,0 +1,4 @@
+68	52d1a08fc2e81135	sealed false, in a transaction false
+70	11d498157cea0ed6	sealed false, in a transaction true
+68	52d1a08fc2e81135	sealed true, in a transaction false
+70	11d498157cea0ed6	sealed true, in a transaction true

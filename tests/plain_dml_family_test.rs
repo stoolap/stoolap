@@ -13,19 +13,22 @@
 // limitations under the License.
 
 //! An UPDATE or DELETE without a subquery runs in the prepared family and
-//! changes the rows, reports the count and fails as the general path does,
-//! hot and sealed, in a transaction or not
+//! changes the rows, reports the count and fails as recorded, hot and
+//! sealed, in a transaction or not
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Mutex;
-
-use stoolap::test_failpoints::{prepared_dml_site_runs, PreparedDmlSite, PREPARED_FAMILIES_OFF};
+use stoolap::test_failpoints::{prepared_dml_site_runs, PreparedDmlSite};
 use stoolap::{Database, Value};
 
-/// The switch is process-wide: one test runs with it at a time
-static SWITCH: Mutex<()> = Mutex::new(());
+mod oracle;
+
+/// The counts, errors and rows of each run, recorded when the general path
+/// gave the same
+const RECORDED: oracle::Answers = answers!("plain_dml_family");
+
+/// The site counters are process-wide: one test reads them at a time
+static SITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Each statement with its parameters
 const RUN: &[(&str, &[i64])] = &[
@@ -116,10 +119,9 @@ fn table(name: &str, cold: bool, dir: &tempfile::TempDir) -> Database {
 }
 
 /// Each statement's count or error, then the table it leaves
-fn answers(name: &str, family: bool, cold: bool, in_transaction: bool) -> Vec<String> {
+fn answers(name: &str, cold: bool, in_transaction: bool) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let db = table(name, cold, &dir);
-    PREPARED_FAMILIES_OFF.store(!family, Relaxed);
     let mut answers = Vec::new();
     for (sql, params) in RUN {
         if in_transaction {
@@ -137,7 +139,6 @@ fn answers(name: &str, family: bool, cold: bool, in_transaction: bool) -> Vec<St
             }
         }
     }
-    PREPARED_FAMILIES_OFF.store(false, Relaxed);
     let rows = db.query("SELECT * FROM t ORDER BY id", ()).unwrap();
     for row in rows {
         answers.push(format!("{:?}", row.unwrap().as_row()));
@@ -146,38 +147,17 @@ fn answers(name: &str, family: bool, cold: bool, in_transaction: bool) -> Vec<St
 }
 
 #[test]
-fn a_plain_update_or_delete_answers_in_the_family_as_on_the_general_path() {
-    let _serial = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
-    let sites = [
-        PreparedDmlSite::UpdateSet,
-        PreparedDmlSite::InsertValues,
-        PreparedDmlSite::ConflictUpdate,
-    ];
-    let first = sites.map(prepared_dml_site_runs);
+fn a_plain_update_or_delete_answers_in_the_family_as_recorded() {
+    let _serial = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    let first = prepared_dml_site_runs(PreparedDmlSite::UpdateSet);
     for (cold, in_transaction) in [(false, false), (true, false), (false, true), (true, true)] {
         let name = format!("plain_dml_family_{cold}_{in_transaction}");
-        let general_before = sites.map(prepared_dml_site_runs);
-        let general = answers(&format!("{name}_general"), false, cold, in_transaction);
-        assert_eq!(
-            sites.map(prepared_dml_site_runs),
-            general_before,
-            "the general path runs no prepared site"
-        );
-        let family = answers(&format!("{name}_family"), true, cold, in_transaction);
-        let differ: Vec<String> = general
-            .iter()
-            .zip(&family)
-            .filter(|(g, f)| g != f)
-            .map(|(g, f)| format!("  general {g}\n  family  {f}"))
-            .collect();
-        assert!(
-            differ.is_empty() && general.len() == family.len(),
-            "hot/sealed {cold}, in a transaction {in_transaction}:\n{}",
-            differ.join("\n")
-        );
+        let family = answers(&name, cold, in_transaction);
+        let key = format!("sealed {cold}, in a transaction {in_transaction}");
+        assert_eq!(oracle::check(&RECORDED, &key, &family), None, "{family:#?}");
     }
     assert!(
-        prepared_dml_site_runs(PreparedDmlSite::UpdateSet) > first[0],
+        prepared_dml_site_runs(PreparedDmlSite::UpdateSet) > first,
         "a plain UPDATE ran its SET in the family"
     );
 }
@@ -197,7 +177,7 @@ fn upsert_answers(name: &str, statements: &[&str]) -> Vec<String> {
 
 #[test]
 fn a_prepared_upsert_raises_its_update_value_error_only_at_a_conflict() {
-    let _serial = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SITES.lock().unwrap_or_else(|e| e.into_inner());
     let upsert = |id: i64, one: &str| {
         format!(
             "INSERT INTO t VALUES ({id}, 1, 1, 1.0, 'n', 1, {}, 1) \

@@ -13,12 +13,12 @@
 // limitations under the License.
 
 //! An UPDATE, DELETE or INSERT compiles its programs once, with its plan: a
-//! run after the first compiles nothing, through the evaluator bridge or
-//! otherwise, hot and sealed, in a transaction or not
+//! run after the first compiles nothing, hot and sealed, in a transaction or
+//! not
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{bridge_compiles, program_compiles, programs_ran};
+use stoolap::test_failpoints::{program_compiles, programs_ran};
 use stoolap::{Database, Value};
 
 /// Held by each test: the programs one records are those of every thread
@@ -126,10 +126,10 @@ fn a_dml_run_after_the_first_compiles_nothing() {
                 wrong.push(e);
                 continue;
             }
-            let (bridge, programs) = (bridge_compiles(), program_compiles());
+            let programs = program_compiles();
             let again = run(&db, sql, second, in_transaction);
-            let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
-            if again.is_err() || compiled != (0, 0) {
+            let compiled = program_compiles() - programs;
+            if again.is_err() || compiled != 0 {
                 wrong.push(format!(
                     "{sql} (sealed {cold}, in a transaction {in_transaction}): \
                      {again:?}, run again, compiled {compiled:?}"

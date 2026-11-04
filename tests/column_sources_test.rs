@@ -452,12 +452,15 @@ fn a_separator_inside_a_value_names_no_qualified_column() {
 
 #[test]
 fn a_caller_of_the_compiler_names_a_qualified_column_with_qualified() {
-    use stoolap::executor::expression::compile_expression;
+    use stoolap::executor::expression::{CompileContext, ExprCompiler};
     use stoolap::executor::utils::qualified;
-    use stoolap::parser::ast::Statement;
+    use stoolap::parser::ast::{Expression, Statement};
     let item = |sql: &str| match &stoolap::parser::parse_sql(sql).unwrap()[0] {
         Statement::Select(select) => select.columns[0].clone(),
         _ => unreachable!(),
+    };
+    let compile_expression = |expr: &Expression, columns: &[String]| {
+        ExprCompiler::new(&CompileContext::with_global_registry(columns)).compile(expr)
     };
     let reference = item("SELECT t.id FROM t");
     assert!(compile_expression(&reference, &[qualified("t", "id")]).is_ok());

@@ -13,25 +13,22 @@
 // limitations under the License.
 
 //! A statement that aggregates its rows and is a set operation's branch or
-//! computes a window by a WINDOW definition answers on the runner as on the
-//! general path, rows in order, over every source, hot and sealed
+//! computes a window by a WINDOW definition answers on the runner as
+//! recorded, rows in order, over every source, hot and sealed
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::{Mutex, MutexGuard};
-
-use stoolap::test_failpoints::{
-    aggregate_paths_taken, reset_aggregate_paths, PREPARED_FAMILIES_OFF,
-};
+use stoolap::test_failpoints::{aggregate_paths_taken, reset_aggregate_paths};
 use stoolap::Database;
 
-// The families switch and the path counters are process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
+mod oracle;
 
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Each statement's column names and rows, recorded when the general path
+/// gave the same
+const RECORDED: oracle::Answers = answers!("aggregate_set_operation_window");
+
+/// The bounded UNION ALL branches' answers, recorded likewise
+const RECORDED_BOUND: oracle::Answers = answers!("aggregate_set_operation_window_bound");
 
 /// The column names and each row in order, or the error
 type Answer = Result<(Vec<String>, Vec<String>), String>;
@@ -52,17 +49,14 @@ fn rows(db: &Database, sql: &str) -> Answer {
     Ok((columns, out))
 }
 
-/// `sql` answered with the prepared families refused: the general path
-fn general(db: &Database, sql: &str) -> Answer {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    let _restore = Restore;
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    rows(db, sql)
+/// What is wrong with `answer` as `key`'s answer `recorded`, its column
+/// names on the first line
+fn check(recorded: &oracle::Answers, key: &str, answer: Answer) -> Option<String> {
+    let lines = answer.map(|(columns, rows)| {
+        let names = format!("columns: {}", columns.join("|"));
+        std::iter::once(names).chain(rows).collect()
+    });
+    oracle::check_answer(recorded, key, &lines)
 }
 
 fn open(dsn: &str, seal: bool) -> Database {
@@ -130,8 +124,7 @@ const SHAPES: &[&str] = &[
 ];
 
 #[test]
-fn an_aggregate_in_a_set_operation_or_with_a_named_window_answers_as_the_general_path() {
-    let _guard = serial();
+fn an_aggregate_in_a_set_operation_or_with_a_named_window_answers_as_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let sealed = format!("file://{}?checkpoint_interval=0", dir.path().display());
     let mut wrong = Vec::new();
@@ -148,12 +141,10 @@ fn an_aggregate_in_a_set_operation_or_with_a_named_window_answers_as_the_general
                 reset_aggregate_paths();
                 let got = rows(&db, &sql);
                 let taken = aggregate_paths_taken();
-                let want = general(&db, &sql);
-                if got != want || taken.contains(&"general") {
-                    wrong.push(format!(
-                        "{name}: {sql}\n  took {taken:?}\n  got {got:?}\n  want {want:?}"
-                    ));
+                if taken.contains(&"general") {
+                    wrong.push(format!("{name}: {sql}: took {taken:?}"));
                 }
+                wrong.extend(check(&RECORDED, &format!("{name}: {sql}"), got));
             }
         }
     }
@@ -162,7 +153,6 @@ fn an_aggregate_in_a_set_operation_or_with_a_named_window_answers_as_the_general
 
 #[test]
 fn a_grouped_family_branch_groups_no_more_than_its_union_all_needs() {
-    let _guard = serial();
     let db = open("memory://aggregate_set_operation_window_family", false);
     let values = "(VALUES (1, 0), (2, 9223372036854775807), (2, 1)) t(g, a)";
     for sql in [
@@ -183,7 +173,6 @@ fn a_grouped_family_branch_groups_no_more_than_its_union_all_needs() {
 
 #[test]
 fn a_union_all_branch_reads_only_the_groups_its_limit_needs() {
-    let _guard = serial();
     let db = Database::open("memory://aggregate_set_operation_window_bound").unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, a INTEGER)",
@@ -199,6 +188,6 @@ fn a_union_all_branch_reads_only_the_groups_its_limit_needs() {
     ] {
         let want = vec!["Integer(1)|Integer(0)".to_string()];
         assert_eq!(rows(&db, sql).map(|(_, rows)| rows), Ok(want), "{sql}");
-        assert_eq!(rows(&db, sql), general(&db, sql), "{sql}");
+        assert_eq!(check(&RECORDED_BOUND, sql, rows(&db, sql)), None);
     }
 }

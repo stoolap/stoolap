@@ -14,10 +14,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use stoolap::core::{DataType, Result, Row, RowVec, SchemaBuilder, Value};
-use stoolap::executor::expression::clear_program_cache;
 use stoolap::functions::scalar::SleepFunction;
 use stoolap::functions::{global_registry, FunctionInfo, ScalarFunction};
 use stoolap::storage::expression::ComparisonExpr;
@@ -355,16 +354,6 @@ impl ScalarFunction for InvalidFirstPattern {
     }
 }
 
-struct WindowHook {
-    _serial: MutexGuard<'static, ()>,
-}
-
-impl Drop for WindowHook {
-    fn drop(&mut self) {
-        clear_program_cache();
-    }
-}
-
 #[test]
 fn lazy_window_propagates_first_error_without_retrying() {
     let db =
@@ -373,14 +362,11 @@ fn lazy_window_propagates_first_error_without_retrying() {
         .unwrap();
     db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
-    let _hook = WindowHook {
-        _serial: WINDOW_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
-    };
+    let _serial = WINDOW_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     WINDOW_HOOK_CALLS.store(0, Ordering::SeqCst);
     global_registry()
         .register_scalar::<InvalidFirstPattern>()
         .unwrap();
-    clear_program_cache();
     let result = db.query_one::<bool, _>(
         "SELECT 'x' REGEXP CASE WHEN INVALID_FIRST_PATTERN(v) = 0 THEN '[' ELSE 'x' END, \
          ROW_NUMBER() OVER (PARTITION BY v) FROM t LIMIT 1",

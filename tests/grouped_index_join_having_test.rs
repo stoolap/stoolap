@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The HAVING of a grouped join a LIMIT reduces is compiled over the
-//! group rows without the evaluator bridge
+//! group rows
 
 #![cfg(feature = "test-failpoints")]
 
@@ -24,10 +24,9 @@ use stoolap::functions::registry::global_registry;
 use stoolap::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
-use stoolap::test_failpoints::bridge_compiles;
 use stoolap::Database;
 
-// The bridge counter is process-wide
+// One test runs at a time
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Each statement, its parameters and the rows it answers in some order,
@@ -92,23 +91,16 @@ fn open(name: &str) -> Database {
 }
 
 #[test]
-fn a_reduced_grouped_join_having_answers_as_written_without_the_bridge() {
+fn a_reduced_grouped_join_having_answers_as_written() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = open("grouped_index_join_having");
     let mut wrong = Vec::new();
     for (sql, params, expected) in CASES {
         for run in 0..2 {
-            let before = bridge_compiles();
             let answer = rows(&db, sql, params);
-            let compiled = bridge_compiles() - before;
             if answer != *expected {
                 wrong.push(format!(
                     "{sql} {params:?}, run {run}: {answer:?}, written {expected:?}"
-                ));
-            }
-            if compiled != 0 {
-                wrong.push(format!(
-                    "{sql} {params:?}, run {run}: {compiled} bridge compiles"
                 ));
             }
         }

@@ -164,24 +164,3 @@ fn an_aggregate_of_a_quoted_name_no_column_has_reads_its_text() {
         }
     }
 }
-
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn a_name_the_table_does_not_have_compiles_nothing_through_the_bridge() {
-    use stoolap::test_failpoints::bridge_compiles;
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(&dir, false);
-    let mut compiled = Vec::new();
-    for (sql, params, _) in CASES {
-        let before = bridge_compiles();
-        error(db.query(sql, values(params)));
-        prepared_error(&db, sql, params);
-        if bridge_compiles() != before {
-            compiled.push(*sql);
-        }
-    }
-    assert!(
-        compiled.is_empty(),
-        "compiled through the bridge: {compiled:#?}"
-    );
-}

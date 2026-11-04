@@ -14,11 +14,11 @@
 
 //! A recursive CTE's members, and a statement over a CTE, run on the runner
 //! under the statement's plan: hot and sealed, prepared or not, each answers
-//! its rows and compiles nothing through the bridge when it runs again
+//! its rows and compiles nothing when it runs again
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{bridge_compiles, general_path_total};
+use stoolap::test_failpoints::{general_path_total, program_compiles};
 use stoolap::{Database, Value};
 
 /// Each statement, its parameters and its rows
@@ -123,12 +123,12 @@ fn a_recursive_cte_runs_on_the_runner_hot_and_sealed() {
         for (sql, params, want) in CASES {
             let stmt = db.prepare(sql).unwrap();
             for run in 0..2 {
-                let (bridge, general) = (bridge_compiles(), general_path_total());
+                let (programs, general) = (program_compiles(), general_path_total());
                 let got = [
                     ("ad hoc", answer(db.query(sql, values(params)))),
                     ("prepared", answer(stmt.query(values(params)))),
                 ];
-                let compiled = bridge_compiles() - bridge;
+                let compiled = program_compiles() - programs;
                 let reached = general_path_total() - general;
                 for (how, got) in got {
                     if got != *want {
@@ -137,7 +137,7 @@ fn a_recursive_cte_runs_on_the_runner_hot_and_sealed() {
                 }
                 if run > 0 && (compiled != 0 || reached != 0) {
                     wrong.push(format!(
-                        "sealed {sealed}: {sql}: run again, {compiled} bridge compiles, \
+                        "sealed {sealed}: {sql}: run again, {compiled} compiles, \
                          {reached} general path runs"
                     ));
                 }

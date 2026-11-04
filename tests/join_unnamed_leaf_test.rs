@@ -13,18 +13,18 @@
 // limitations under the License.
 
 //! A join of more than two sources, one of them a derived table or VALUES
-//! list without a name, runs on its prepared blocks: it compiles nothing
-//! through the evaluator bridge, names that source's columns bare, and
+//! list without a name, runs on its prepared blocks: run again it compiles
+//! nothing past a one-shot value, names that source's columns bare, and
 //! reads a bare name two of its sources have as ambiguous
 
 #![cfg(feature = "test-failpoints")]
 
 use std::sync::Mutex;
 
-use stoolap::test_failpoints::bridge_compiles;
+use stoolap::test_failpoints::{one_shot_compiles, program_compiles};
 use stoolap::Database;
 
-// The bridge counter is process-wide
+// One test runs at a time
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// The columns and rows, sorted, a statement answers, or a text its error
@@ -173,15 +173,15 @@ fn open() -> Database {
 }
 
 #[test]
-fn a_join_with_an_unnamed_source_answers_as_written_without_the_bridge() {
+fn a_join_with_an_unnamed_source_answers_as_written_and_compiles_once() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = open();
     let mut wrong = Vec::new();
     for (sql, want) in CASES {
         for run in 0..2 {
-            let before = bridge_compiles();
+            let before = (program_compiles(), one_shot_compiles());
             let got = answer(&db, sql);
-            let compiled = bridge_compiles() - before;
+            let compiled = (program_compiles() - before.0) - (one_shot_compiles() - before.1);
             let fits = match (want, &got) {
                 (Ok((columns, rows)), Ok((got_columns, got_rows))) => {
                     got_columns == columns && got_rows == rows
@@ -192,8 +192,8 @@ fn a_join_with_an_unnamed_source_answers_as_written_without_the_bridge() {
             if !fits {
                 wrong.push(format!("{sql}, run {run}\n  got  {got:?}\n  want {want:?}"));
             }
-            if compiled != 0 {
-                wrong.push(format!("{sql}, run {run}: {compiled} bridge compiles"));
+            if run > 0 && want.is_ok() && compiled != 0 {
+                wrong.push(format!("{sql}, run again: {compiled} compiles"));
             }
         }
     }

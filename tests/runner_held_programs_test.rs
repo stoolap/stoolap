@@ -13,12 +13,11 @@
 // limitations under the License.
 
 //! A statement the runner reads compiles its programs once, with its plan:
-//! a run after the first compiles nothing, through the evaluator bridge or
-//! otherwise, and answers as the first did
+//! a run after the first compiles nothing and answers as the first did
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{bridge_compiles, program_compiles};
+use stoolap::test_failpoints::program_compiles;
 use stoolap::Database;
 
 fn rows(db: &Database, sql: &str, params: &[i64]) -> Vec<String> {
@@ -224,17 +223,17 @@ fn open(name: &str) -> Database {
     db
 }
 
-/// What a second run of `sql` compiled, through the bridge and in all; a
-/// wrong answer of either run goes to `wrong`
+/// What a second run of `sql` compiled; a wrong answer of either run goes
+/// to `wrong`
 fn compiled_again(
     db: &Database,
     (sql, params, answer): (&str, &[i64], &[&str]),
     wrong: &mut Vec<String>,
-) -> (usize, usize) {
+) -> usize {
     let first = rows(db, sql, params);
-    let (bridge, programs) = (bridge_compiles(), program_compiles());
+    let programs = program_compiles();
     let again = rows(db, sql, params);
-    let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+    let compiled = program_compiles() - programs;
     if first != answer || again != answer {
         wrong.push(format!(
             "{sql}: {first:?} then {again:?}, expected {answer:?}"
@@ -249,8 +248,8 @@ fn a_run_after_the_first_compiles_nothing() {
     let mut wrong = Vec::new();
     for &(sql, params, answer) in CASES {
         let compiled = compiled_again(&db, (sql, params, answer), &mut wrong);
-        if compiled != (0, 0) {
-            wrong.push(format!("{sql}: run again, compiled {compiled:?}"));
+        if compiled != 0 {
+            wrong.push(format!("{sql}: run again, compiled {compiled}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -321,7 +320,7 @@ const JOINS: &[(&str, &[i64], &[&str])] = &[
 ];
 
 #[test]
-fn a_join_compiles_its_output_without_the_bridge() {
+fn a_join_answers_its_computed_output() {
     let db = Database::open("memory://runner_held_programs_joins").unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
@@ -331,49 +330,16 @@ fn a_join_compiles_its_output_without_the_bridge() {
     }
     let mut wrong = Vec::new();
     for &(sql, params, answer) in JOINS {
-        let bridge = bridge_compiles();
         let first = rows(&db, sql, params);
-        let compiled = bridge_compiles() - bridge;
-        if compiled != 0 || first != answer {
-            wrong.push(format!(
-                "{sql}: {first:?}, expected {answer:?}, {compiled} bridge compiles"
-            ));
+        if first != answer {
+            wrong.push(format!("{sql}: {first:?}, expected {answer:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[test]
-fn a_join_side_asked_a_condition_storage_cannot_take_compiles_nothing_through_the_bridge() {
-    let db = Database::open("memory://runner_held_side_condition").unwrap();
-    for sql in [
-        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER)",
-        "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO p SELECT value, value % 3 FROM generate_series(1, 50)",
-        "INSERT INTO c SELECT value, value % 4 FROM generate_series(1, 50)",
-    ] {
-        db.execute(sql, ()).unwrap();
-    }
-    let mut wrong = Vec::new();
-    for sql in [
-        "SELECT COUNT(*) FROM p JOIN c ON c.id = p.id WHERE p.k = p.id AND c.k = c.id",
-        "SELECT p.id FROM p JOIN c ON c.id = p.id WHERE c.k = c.id ORDER BY p.id",
-    ] {
-        let first = rows(&db, sql, &[]);
-        let bridge = bridge_compiles();
-        let again = rows(&db, sql, &[]);
-        let compiled = bridge_compiles() - bridge;
-        if again != first || compiled != 0 {
-            wrong.push(format!(
-                "{sql}: {first:?} then {again:?}, {compiled} bridge compiles"
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-#[test]
-fn a_window_over_groups_reading_an_ungrouped_column_fails_without_the_bridge() {
+fn a_window_over_groups_reading_an_ungrouped_column_fails() {
     let db = open("runner_held_window_ungrouped");
     let mut wrong = Vec::new();
     for sql in [
@@ -384,21 +350,16 @@ fn a_window_over_groups_reading_an_ungrouped_column_fails_without_the_bridge() {
          GROUP BY id % 2",
     ] {
         for run in 0..2 {
-            let bridge = bridge_compiles();
             let error = db
                 .query(sql, ())
                 .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
                 .err()
                 .map(|e| e.to_string());
-            let compiled = bridge_compiles() - bridge;
             if !error
                 .as_deref()
                 .is_some_and(|e| e.contains("'a' not found"))
-                || compiled != 0
             {
-                wrong.push(format!(
-                    "{sql}, run {run}: {error:?}, {compiled} bridge compiles"
-                ));
+                wrong.push(format!("{sql}, run {run}: {error:?}"));
             }
         }
     }

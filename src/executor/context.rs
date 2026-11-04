@@ -31,7 +31,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 use crate::api::params::ParamVec;
-use crate::common::{CompactArc, SmartString, StringMap};
+use crate::common::{CompactArc, StringMap};
 use crate::core::predicate::PredicateSet;
 use crate::core::{Result, Row, Value};
 
@@ -504,7 +504,6 @@ pub fn clear_all_thread_local_caches() {
     crate::storage::mvcc::clear_version_map_pools();
 
     // Clear global LRU caches
-    super::expression::clear_program_cache();
     super::query_classification::clear_classification_cache();
 }
 
@@ -649,10 +648,6 @@ pub struct ExecutionContext {
     /// The commits a read committed statement's reads see, taken once for
     /// the statement; None reads the newest committed state
     statement_view: Option<StatementView>,
-    /// A DML target selected through a query: the scan of this table at
-    /// this query depth reads the newest state, the query's subqueries the
-    /// view. Behind an Arc, as few statements set it and every one carries it
-    newest_target: Option<Arc<(SmartString, usize)>>,
     /// What the statement writes beside the tables its reads open: reads
     /// open a handle that registers nothing where it cannot write
     table_use: TableUse,
@@ -756,7 +751,6 @@ impl ExecutionContext {
             transaction_id: None,
             statement_snapshot: None,
             statement_view: None,
-            newest_target: None,
             table_use: TableUse::Write,
             semantic_miss: None,
             literal_params: false,
@@ -913,7 +907,6 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
-            newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
             literal_params: false,
@@ -938,7 +931,6 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
-            newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
             literal_params: false,
@@ -1014,7 +1006,6 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
-            newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: None,
             literal_params: false,
@@ -1093,15 +1084,6 @@ impl ExecutionContext {
         self.statement_view = Some(view);
     }
 
-    /// A copy of this context in which the query run at this depth selects
-    /// the rows of `table` a DML writes: its scan of the table reads the
-    /// newest state, as the write does
-    pub(crate) fn with_newest_target(&self, table: &str) -> Self {
-        let mut ctx = self.clone();
-        ctx.newest_target = Some(Arc::new((SmartString::from(table), self.query_depth)));
-        ctx
-    }
-
     /// What the statement writes beside the tables its reads open
     pub(crate) fn table_use(&self) -> TableUse {
         self.table_use
@@ -1112,19 +1094,6 @@ impl ExecutionContext {
     pub(crate) fn with_table_use(mut self, table_use: TableUse) -> Self {
         self.table_use = table_use;
         self
-    }
-
-    /// The view a scan of `table` at this depth reads through: none for the
-    /// DML target a query selects, else the statement's
-    pub(crate) fn scan_view(&self, table: &str) -> Option<&StatementView> {
-        let target = self.newest_target.as_deref().is_some_and(|(name, depth)| {
-            *depth == self.query_depth && name.eq_ignore_ascii_case(table)
-        });
-        if target {
-            None
-        } else {
-            self.statement_view()
-        }
     }
 
     /// The semantic cache miss the start of `statement` left, if it is the
@@ -1203,7 +1172,6 @@ impl ExecutionContext {
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
-            newest_target: self.newest_target.clone(),
             table_use: self.table_use,
             semantic_miss: self.semantic_miss.clone(),
             literal_params: self.literal_params,

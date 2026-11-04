@@ -18,11 +18,9 @@
 
 use crate::common::CompactArc;
 use crate::core::{Result, Row, Value, NULL_VALUE};
-use crate::parser::ast::Expression;
 
 use super::expression::SharedProgram;
-use super::expression::{compile_expression, concat_values, ExecuteContext, ExprVM, Op, Program};
-use super::utils::for_each_qualified_star_column;
+use super::expression::{concat_values, ExecuteContext, ExprVM, Op, Program};
 
 /// One output item, as its compiled program reads
 #[derive(Debug, Clone)]
@@ -177,28 +175,6 @@ impl Projection {
     /// The input column of each item, when every item is one
     pub(crate) fn column_indices(&self) -> Option<&[usize]> {
         self.columns.as_deref()
-    }
-
-    /// The items of `expressions` over the input `columns`, a qualified star
-    /// naming `table_alias`'s columns
-    pub(crate) fn compile(
-        expressions: &[Expression],
-        columns: &[String],
-        table_alias: Option<&str>,
-    ) -> Result<Self> {
-        let mut items = Vec::with_capacity(expressions.len());
-        for expression in expressions {
-            match expression {
-                Expression::Star(_) => items.extend((0..columns.len()).map(Item::Column)),
-                Expression::QualifiedStar(star) => {
-                    for_each_qualified_star_column(columns, &star.qualifier, table_alias, |i, _| {
-                        items.push(Item::Column(i))
-                    })
-                }
-                expression => items.push(Item::of(compile_expression(expression, columns)?)),
-            }
-        }
-        Ok(Self::of(items))
     }
 
     /// The input columns at `indices`, in that order

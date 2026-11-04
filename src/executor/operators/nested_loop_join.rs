@@ -364,7 +364,6 @@ mod tests {
     use super::*;
     use crate::core::Value;
     use crate::executor::operator::MaterializedOperator;
-    use crate::functions::registry::global_registry;
     use crate::parser::ast::{Expression, Identifier, InfixExpression};
     use crate::parser::token::{Position, Token, TokenType};
 
@@ -385,7 +384,8 @@ mod tests {
         let left = ["left_id".to_string(), "value".to_string()];
         let right = ["right_id".to_string(), "data".to_string()];
         let condition = make_eq_condition("left_id", "right_id");
-        JoinFilter::new(&condition, &left, &right, global_registry()).unwrap()
+        let program = crate::executor::aggregation::compile_over_pair(&condition, &left, &right);
+        JoinFilter::from_program(program.unwrap())
     }
 
     fn collect_results(op: &mut dyn Operator) -> Result<Vec<Row>> {

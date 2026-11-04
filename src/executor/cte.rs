@@ -32,22 +32,18 @@ use crate::common::SmartString;
 use ahash::AHashSet;
 use std::sync::Arc;
 
-use crate::common::{CompactArc, CompactVec, StringMap};
+use crate::common::{CompactArc, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
-use super::expression::ExpressionEval;
-use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::query_cache::NestedPlan;
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
-use super::row_count::{row_counts, static_row_counts};
-use super::utils::{
-    build_column_index_map, for_each_qualified_star_column, item_name, order_by_names_an_alias,
-};
+use super::row_count::static_row_counts;
+use super::utils::order_by_names_an_alias;
 use super::Executor;
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -349,23 +345,6 @@ impl Executor {
         Ok(cte_registry)
     }
 
-    /// The CTE of `registry` the CTE body `stmt` reads when the CTE path can
-    /// finish it on its own; None for a body execute_select runs, which
-    /// handles set operations and the rest, and for one under a plan
-    /// (`planned`), which the runner reads
-    pub(super) fn cte_result_source<'r>(
-        &self,
-        stmt: &SelectStatement,
-        registry: &'r CteRegistry,
-        planned: bool,
-    ) -> Option<&'r CteData> {
-        if !Self::cte_result_path_finishes(stmt) || planned {
-            return None;
-        }
-        let name = self.extract_cte_name_for_lookup(stmt.table_expr.as_deref()?)?;
-        registry.get(&name)
-    }
-
     /// Execute a single CTE query, under `plan` when it holds one
     fn execute_cte_query(
         &self,
@@ -374,21 +353,6 @@ impl Executor {
         ctx: &ExecutionContext,
         cte_registry: &mut CteRegistry,
     ) -> Result<(Vec<String>, RowVec)> {
-        if let Some((columns, rows)) = self.cte_result_source(stmt, cte_registry, plan.is_some()) {
-            // Execute query against CTE result
-            // Clone Arc data into RowVec for processing
-            // A subquery in the statement reads the earlier
-            // CTEs through the context
-            let counted = self.read_volatile_counts(stmt, ctx)?;
-            let ctx = counted.as_ref().unwrap_or(ctx);
-            return self.execute_query_on_cte_result(
-                stmt,
-                &ctx.with_cte_data(cte_registry.data()),
-                columns.to_vec(),
-                RowVec::from_vec((**rows).clone()),
-            );
-        }
-
         // Execute as a normal SELECT and materialize
         // Create context with CTE data so tables can resolve CTE references
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
@@ -581,28 +545,6 @@ impl Executor {
         // Create a context with CTE data so subqueries can access CTEs
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
 
-        // Check if the main query references a CTE
-        if let Some(ref table_expr) = stmt.table_expr {
-            // First check for simple CTE reference, when the CTE path can
-            // finish the statement on its own
-            // Use the base CTE name (not alias) for registry lookup
-            if plan.is_none() && Self::cte_result_path_finishes(stmt) {
-                if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
-                    if let Some((columns, rows)) = cte_registry.get(&cte_name) {
-                        // Execute query against CTE result
-                        // Clone Arc data into RowVec for processing
-                        let (result_cols, result_rows) = self.execute_query_on_cte_result(
-                            stmt,
-                            &ctx_with_ctes,
-                            columns.to_vec(),
-                            RowVec::from_vec((**rows).clone()),
-                        )?;
-                        return Ok(Box::new(ExecutorResult::new(result_cols, result_rows)));
-                    }
-                }
-            }
-        }
-
         // Execute as a normal SELECT (strip the WITH clause)
         let stmt_without_with = SelectStatement {
             param_count: 0,
@@ -626,160 +568,6 @@ impl Executor {
         self.select_with_plan(&stmt_without_with, &ctx_with_ctes, None, plan)
     }
 
-    /// Execute a query on CTE result data
-    pub(crate) fn execute_query_on_cte_result(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        cte_columns: Vec<String>,
-        cte_rows: RowVec,
-    ) -> Result<(Vec<String>, RowVec)> {
-        let (cols, rows, _applied, _layout) =
-            self.execute_query_on_cte_result_inner(stmt, ctx, cte_columns, cte_rows, false)?;
-        Ok((cols, rows))
-    }
-
-    /// Inner implementation that optionally skips ORDER BY/LIMIT processing.
-    /// Returns (columns, rows, order_limit_applied, layout of the columns
-    /// for the ORDER BY the caller applies).
-    /// When `skip_order_limit` is true, ORDER BY and LIMIT/OFFSET are NOT applied,
-    /// allowing the caller to delegate to a more capable ORDER BY handler.
-    pub(crate) fn execute_query_on_cte_result_inner(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-        cte_columns: Vec<String>,
-        cte_rows: RowVec,
-        skip_order_limit: bool,
-    ) -> Result<(Vec<String>, RowVec, bool, Option<OutputLayout>)> {
-        debug_assert!(skip_order_limit || stmt.order_by.is_empty());
-        // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
-        let classification = get_classification(stmt);
-
-        let cte_alias = stmt
-            .table_expr
-            .as_deref()
-            .and_then(super::utils::get_table_alias_from_expr)
-            .map(|name| name.to_lowercase());
-
-        // Apply WHERE clause filter
-        let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
-            // Compile filter once and reuse for all rows
-            let mut eval = ExpressionEval::compile(where_clause, &cte_columns)?.with_context(ctx);
-
-            let mut result = RowVec::new();
-            let mut row_id = 0i64;
-            for (_, row) in cte_rows {
-                if eval.eval_bool_checked(&row)? {
-                    result.push((row_id, row));
-                    row_id += 1;
-                }
-            }
-            result
-        } else {
-            cte_rows
-        };
-
-        if classification.has_aggregation || classification.has_window_functions {
-            let (result, layout) = self.group_and_window_rows(
-                stmt,
-                ctx,
-                &classification,
-                filtered_rows,
-                &cte_columns,
-                |out| Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), out),
-                None,
-            )?;
-            let columns = result.columns().to_vec();
-            let mut rows = Self::materialize_result(result)?;
-
-            if !skip_order_limit {
-                row_counts(stmt, ctx)?.apply(&mut rows);
-            }
-            return Ok((columns, rows, !skip_order_limit, layout));
-        }
-
-        let columns_to_use = &stmt.columns;
-
-        // Determine output columns
-        let output_columns = self.resolve_cte_output_columns_from_exprs(
-            &stmt.columns,
-            &cte_columns,
-            cte_alias.as_deref(),
-        )?;
-
-        let needs_projection = self.needs_projection_for_columns(columns_to_use);
-
-        if skip_order_limit {
-            // The caller sorts by the layout and trims after: every input
-            // column ORDER BY reads that no output column copies rides along
-            let mut layout = Self::output_layout(stmt, &cte_columns, cte_alias.as_deref());
-            let extra: Vec<usize> = match &layout {
-                Some(layout) if needs_projection => order_by_inputs(stmt, &cte_columns)
-                    .into_iter()
-                    .filter(|&idx| !layout.sources.iter().any(|s| s.input == Some(idx)))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let result_rows = if needs_projection {
-                let projected = self.project_cte_rows_from_columns(
-                    columns_to_use,
-                    &filtered_rows,
-                    &cte_columns,
-                    cte_alias.as_deref(),
-                    ctx,
-                )?;
-                if extra.is_empty() {
-                    projected
-                } else {
-                    projected
-                        .into_iter()
-                        .zip(filtered_rows.iter())
-                        .map(|((id, proj_row), (_, src_row))| {
-                            let mut vals = proj_row.into_values();
-                            vals.extend(extra.iter().map(|&idx| {
-                                src_row
-                                    .get(idx)
-                                    .cloned()
-                                    .unwrap_or_else(Value::null_unknown)
-                            }));
-                            (id, Row::from_values(vals))
-                        })
-                        .collect()
-                }
-            } else {
-                filtered_rows
-            };
-            let mut columns = output_columns;
-            if let Some(layout) = layout.as_mut() {
-                for &idx in &extra {
-                    columns.push(cte_columns[idx].clone());
-                    layout.sources.push(ColumnSource {
-                        item: None,
-                        input: Some(idx),
-                    });
-                }
-            }
-            return Ok((columns, result_rows, false, layout));
-        }
-
-        let mut result_rows = if needs_projection {
-            self.project_cte_rows_from_columns(
-                columns_to_use,
-                &filtered_rows,
-                &cte_columns,
-                cte_alias.as_deref(),
-                ctx,
-            )?
-        } else {
-            filtered_rows
-        };
-
-        row_counts(stmt, ctx)?.apply(&mut result_rows);
-
-        Ok((output_columns, result_rows, true, None))
-    }
-
     /// Extract the base CTE/table name for registry lookup (ignores aliases)
     fn extract_cte_name_for_lookup(&self, expr: &Expression) -> Option<String> {
         match expr {
@@ -792,164 +580,9 @@ impl Executor {
         }
     }
 
-    /// The output column names of the SELECT items `columns` as written
-    fn resolve_cte_output_columns_from_exprs(
-        &self,
-        columns: &[Expression],
-        cte_columns: &[String],
-        table_alias: Option<&str>,
-    ) -> Result<Vec<String>> {
-        let mut output_columns = Vec::new();
-
-        for col_expr in columns {
-            match col_expr {
-                Expression::Star(_) => {
-                    output_columns.extend(cte_columns.iter().cloned());
-                }
-                Expression::QualifiedStar(qs) => {
-                    for_each_qualified_star_column(
-                        cte_columns,
-                        &qs.qualifier,
-                        table_alias,
-                        |idx, start| output_columns.push(cte_columns[idx][start..].to_string()),
-                    );
-                }
-                other => output_columns.push(item_name(other)),
-            }
-        }
-
-        if output_columns.is_empty() {
-            output_columns = cte_columns.to_vec();
-        }
-
-        Ok(output_columns)
-    }
-
-    /// Check if columns need projection
-    fn needs_projection_for_columns(&self, columns: &[Expression]) -> bool {
-        if columns.is_empty() {
-            return false;
-        }
-
-        // Check if it's just SELECT *
-        if columns.len() == 1 {
-            if let Expression::Star(_) = &columns[0] {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Project rows based on provided column expressions (for processed subqueries)
-    fn project_cte_rows_from_columns(
-        &self,
-        columns: &[Expression],
-        rows: &RowVec,
-        cte_columns: &[String],
-        table_alias: Option<&str>,
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-
-        let col_index_map = build_column_index_map(cte_columns);
-
-        // Pre-compile expressions that need evaluation
-        // Store: Star -> None, Identifier -> column index, Complex -> compiled program
-        enum CompiledColumn {
-            Star,
-            Columns(Vec<usize>),
-            Identifier(usize),
-            Compiled(SharedProgram),
-        }
-
-        let compiled_columns: Vec<CompiledColumn> = columns
-            .iter()
-            .map(|col_expr| match col_expr {
-                Expression::Star(_) => Ok(CompiledColumn::Star),
-                Expression::QualifiedStar(qs) => {
-                    let mut taken = Vec::new();
-                    for_each_qualified_star_column(
-                        cte_columns,
-                        &qs.qualifier,
-                        table_alias,
-                        |idx, _| taken.push(idx),
-                    );
-                    Ok(CompiledColumn::Columns(taken))
-                }
-                // A name no column has reads as the compiler says: the enclosing
-                // row's column, a quoted name's text, or an error
-                Expression::Identifier(id) => match col_index_map.get(id.value_lower.as_str()) {
-                    Some(&idx) => Ok(CompiledColumn::Identifier(idx)),
-                    None => compile_expression(col_expr, cte_columns).map(CompiledColumn::Compiled),
-                },
-                Expression::Aliased(aliased) => {
-                    let program = compile_expression(&aliased.expression, cte_columns)?;
-                    Ok(CompiledColumn::Compiled(program))
-                }
-                _ => {
-                    let program = compile_expression(col_expr, cte_columns)?;
-                    Ok(CompiledColumn::Compiled(program))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Create VM for expression execution (reused for all rows)
-        let mut vm = ExprVM::new();
-        let mut result_rows = RowVec::with_capacity(rows.len());
-
-        for (row_id, (_, row)) in rows.iter().enumerate() {
-            // OPTIMIZATION: Pre-allocate CompactVec with estimated capacity
-            let mut values: CompactVec<Value> =
-                CompactVec::with_capacity(columns.len().max(row.len()));
-            // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(row).with_params(ctx.params());
-
-            for compiled in &compiled_columns {
-                match compiled {
-                    CompiledColumn::Star => {
-                        // OPTIMIZATION: Extend with row values
-                        values.extend(row.iter().cloned());
-                    }
-                    CompiledColumn::Columns(taken) => {
-                        values.extend(
-                            taken.iter().map(|&idx| {
-                                row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                            }),
-                        );
-                    }
-                    CompiledColumn::Identifier(idx) => {
-                        values.push(row.get(*idx).cloned().unwrap_or_else(Value::null_unknown));
-                    }
-                    CompiledColumn::Compiled(program) => {
-                        values.push(vm.execute(program, &exec_ctx)?);
-                    }
-                }
-            }
-
-            result_rows.push((row_id as i64, Row::from_compact_vec(values)));
-        }
-
-        Ok(result_rows)
-    }
-
     /// Check if a SELECT statement has a WITH clause
     pub(crate) fn has_cte(&self, stmt: &SelectStatement) -> bool {
         stmt.with.is_some()
-    }
-
-    /// Whether the query-on-CTE-result path can finish a statement by
-    /// itself: it leaves set operations, DISTINCT and ORDER BY, which the
-    /// standard sort binds by the output's layout, and a LIMIT or OFFSET
-    /// subquery, which execute_select reads first, to execute_select
-    fn cte_result_path_finishes(stmt: &SelectStatement) -> bool {
-        stmt.set_operations.is_empty()
-            && !stmt.distinct
-            && stmt.order_by.is_empty()
-            && ![stmt.limit.as_deref(), stmt.offset.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(Self::has_subqueries)
     }
 
     // =========================================================================
