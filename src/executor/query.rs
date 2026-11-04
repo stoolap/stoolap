@@ -8717,9 +8717,7 @@ impl Executor {
             _ => None,
         };
         leaves.push(super::prepared_select::JoinLeaf {
-            name: get_table_alias_from_expr(expr)
-                .map(|name| name.to_lowercase())
-                .unwrap_or_default(),
+            name: get_table_alias_from_expr(expr).map(|name| name.to_lowercase()),
             columns,
             width,
         });

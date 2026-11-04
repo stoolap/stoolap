@@ -117,6 +117,19 @@ const CASES: &[(&str, Written)] = &[
         "SELECT * FROM t AS \"\" JOIN u ON u.tid = \"\".id JOIN b ON b.id = u.id",
         Ok((&[".id", ".a", ".v", "u.id", "u.tid", "u.name", "b.id"], &["Integer(1)|Integer(1)|Integer(10)|Integer(1)|Integer(1)|Text(\"alpha\")|Integer(1)", "Integer(1)|Integer(1)|Integer(10)|Integer(2)|Integer(1)|Text(\"bo\")|Integer(2)"])),
     ),
+    // A source without a name is not the one an empty alias names
+    (
+        "SELECT \"\".v + 0 FROM (SELECT 99 AS v) CROSS JOIN b CROSS JOIN t AS \"\"",
+        Ok((&["\"\".v + 0"], &["Integer(10)", "Integer(10)", "Integer(20)", "Integer(20)"])),
+    ),
+    (
+        "SELECT \"\".v + 0 FROM (SELECT 99 AS k) CROSS JOIN b CROSS JOIN t AS \"\"",
+        Ok((&["\"\".v + 0"], &["Integer(10)", "Integer(10)", "Integer(20)", "Integer(20)"])),
+    ),
+    (
+        "SELECT * FROM (SELECT 99 AS v) CROSS JOIN t AS \"\" WHERE \"\".v = 10",
+        Ok((&["v", ".id", ".a", ".v"], &["Integer(99)|Integer(1)|Integer(1)|Integer(10)"])),
+    ),
 ];
 
 /// The column names and the rows sorted, or the error
