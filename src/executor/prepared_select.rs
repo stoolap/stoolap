@@ -4194,6 +4194,7 @@ fn held_blocks(
                 list(&grouped.blocks, lines);
             }
             sides.extend([p.side_plan(0), p.side_plan(1)]);
+            sides.extend([p.bare_side_plan(0), p.bare_side_plan(1)]);
         }
         _ => {}
     }

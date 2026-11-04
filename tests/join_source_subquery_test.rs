@@ -142,3 +142,31 @@ fn a_table_function_side_is_narrowed_by_its_own_condition_as_it_generates() {
         assert_eq!(tvf_rows() - before, 1, "{sql}, run {run}: rows generated");
     }
 }
+
+#[test]
+fn a_side_read_without_its_condition_keeps_its_plan_apart() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_source_subquery_apart").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2)", ()).unwrap();
+    // A WHERE false reads each side without its condition, for its columns
+    for sql in [
+        "SELECT t.id FROM t JOIN (VALUES ((SELECT 1)), ((SELECT 2))) AS v(n) \
+         ON t.id = v.n WHERE $1 AND v.n = 1 ORDER BY t.id",
+        "SELECT t.id FROM t JOIN generate_series(1, (SELECT 2)) AS g \
+         ON t.id = g.value WHERE $1 AND g.value = 1 ORDER BY t.id",
+    ] {
+        let stmt = db.prepare(sql).unwrap();
+        let ids = |keep: bool| -> Vec<i64> {
+            stmt.query((keep,))
+                .unwrap()
+                .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                .collect()
+        };
+        assert_eq!(ids(false), Vec::<i64>::new(), "{sql} with false");
+        assert_eq!(ids(true), [1], "{sql} with true after false");
+        assert_eq!(ids(false), Vec::<i64>::new(), "{sql} with false again");
+        assert_eq!(ids(true), [1], "{sql} with true again");
+    }
+}

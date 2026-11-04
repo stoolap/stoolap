@@ -399,6 +399,8 @@ struct SideRead<'a> {
     run: Option<(StatementRun<'a>, usize)>,
     /// The join's plan of the side, when the side runs as a statement
     plan: Option<&'a NestedPlan>,
+    /// The join's plan of the side run as a statement without `filter`
+    bare: Option<&'a NestedPlan>,
     /// A side that is a join keeps both columns of a pair it merges
     apart: bool,
 }
@@ -5166,6 +5168,7 @@ impl Executor {
             .map_or([false; 2], |held| [0, 1].map(|i| held.side_sourced(i)));
         let reads_plain = [0, 1].map(|i| !joined[i] && rows_sides[i] && !sourced[i]);
         let side_plan = |side: usize| plan.as_deref().map(|plan| plan.side_plan(side));
+        let bare_plan = |side: usize| plan.as_deref().map(|plan| plan.bare_side_plan(side));
         let plain = |filter: &Option<Expression>, rows: bool| match rows {
             true => filter.as_ref().and_then(|filter| {
                 combine_predicates_with_and(
@@ -5229,6 +5232,7 @@ impl Executor {
             },
             run: statement_run.map(|run| (run, 0)),
             plan: side_plan(0),
+            bare: bare_plan(0),
             apart,
         };
         let right_read = SideRead {
@@ -5239,6 +5243,7 @@ impl Executor {
             },
             run: statement_run.map(|run| (run, 1)),
             plan: side_plan(1),
+            bare: bare_plan(1),
             apart,
         };
         let where_blocks = statement_run.and_then(|run| run.site(false));
@@ -8069,7 +8074,12 @@ impl Executor {
                 let (result, columns) = self.derived_side_rows(ss, ctx, filter, plan)?;
                 (result, columns, false, None)
             }
-            (None, None) => match (Self::side_with_subquery(expr), side.plan) {
+            // A held statement is one statement: the side's with its own
+            // condition, or without one
+            (None, None) => match (
+                Self::side_with_subquery(expr),
+                side.filter.map_or(side.bare, |_| side.plan),
+            ) {
                 (Some(alias), Some(plan)) => {
                     let (result, columns) =
                         self.statement_side_rows((expr, alias), ctx, (side.filter, extra), plan)?;
