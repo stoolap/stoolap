@@ -37,7 +37,6 @@ use crate::api::params::ParamVec;
 static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
     std::sync::LazyLock::new(|| CompactArc::new(ParamVec::new()));
 use crate::common::CompactArc;
-use crate::executor::expr_key::ExprKey;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -111,14 +110,6 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
 /// [`Program::bound`]
 pub(crate) fn bind_params(program: SharedProgram, params: &[Value]) -> SharedProgram {
     Program::bound(program, params)
-}
-
-/// Each aliased slot at the width the program loads it with
-fn alias_slots(aliases: &FxHashMap<ExprKey, usize>) -> FxHashMap<ExprKey, u16> {
-    aliases
-        .iter()
-        .map(|(&key, &slot)| (key, slot as u16))
-        .collect()
 }
 
 /// Compute a u64 hash of an expression without string allocation.
@@ -521,28 +512,6 @@ impl RowFilter {
             params: EMPTY_PARAMS.clone(),
             transaction_id: None,
         }
-    }
-
-    /// Create a row filter whose group items and aggregates are read from
-    /// the row's slot for each expression's identity (for HAVING)
-    pub(crate) fn with_aliases(
-        expr: &Expression,
-        columns: &[String],
-        aliases: &FxHashMap<ExprKey, usize>,
-    ) -> Result<Self> {
-        let ctx = CompileContext::with_global_registry(columns)
-            .with_expression_aliases(alias_slots(aliases));
-        let compiler = ExprCompiler::new(&ctx);
-        let program = compiler
-            .compile(expr)
-            .map(CompactArc::new)
-            .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
-
-        Ok(Self {
-            program,
-            params: EMPTY_PARAMS.clone(),
-            transaction_id: None,
-        })
     }
 
     /// Create a filter from execution context.

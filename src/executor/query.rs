@@ -8993,7 +8993,14 @@ impl Executor {
                     &aggregations,
                     &stmt.columns,
                 );
-                Some(RowFilter::with_aliases(having, &result_columns, &slots)?.with_context(ctx))
+                Some(super::aggregation::compile_over_slots(
+                    having,
+                    &result_columns,
+                    global_registry(),
+                    Some(&slots),
+                    false,
+                    Some(ctx.params()),
+                )?)
             }
             None => None,
         };
@@ -9104,7 +9111,11 @@ impl Executor {
             }
             let row = Row::from_values(values);
             if let Some(having) = &having {
-                if !having.matches_checked(&row)? {
+                thread_local! {
+                    static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+                }
+                let exec = super::aggregation::slot_context(&row, ctx);
+                if !VM.with(|vm| vm.borrow_mut().execute_bool_checked(having, &exec))? {
                     return Ok(false);
                 }
             }
