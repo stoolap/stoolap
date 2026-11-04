@@ -1787,10 +1787,24 @@ impl Executor {
         // A nested statement is planned into its slot as the router plans
         // the statement it runs
         let held = self.holds_prepared_select(slot, ctx)
-            || slot.is_some_and(|slot| {
-                self.with_planned(stmt, slot, plan_classification, Some(ctx), |_| ());
-                self.holds_prepared_select(Some(slot), ctx)
-            });
+            || match slot {
+                Some(slot) => {
+                    let mut error = None;
+                    self.with_planned_or_error(
+                        stmt,
+                        slot,
+                        plan_classification,
+                        Some(ctx),
+                        |_| (),
+                        &mut error,
+                    );
+                    if let Some(e) = error {
+                        return Err(e);
+                    }
+                    self.holds_prepared_select(Some(slot), ctx)
+                }
+                None => false,
+            };
         let in_family = held
             || ((classification.where_has_subqueries || classification.output_has_subqueries)
                 && self.prepared_family(stmt, &classification).is_ok())
