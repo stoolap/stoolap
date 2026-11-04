@@ -13,19 +13,16 @@
 // limitations under the License.
 
 //! A call's arguments are read as the function it names reads them: a
-//! scalar function's for each row whatever its name, a window function's
-//! default only for the rows of the partitions the statement computes
+//! window function's default only for the rows of the partitions the
+//! statement computes
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
 
 use stoolap::core::{Result, Value};
-use stoolap::executor::Executor;
-use stoolap::functions::registry::{global_registry, FunctionRegistry};
+use stoolap::functions::registry::global_registry;
 use stoolap::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
 };
-use stoolap::storage::mvcc::engine::MVCCEngine;
 use stoolap::Database;
 
 static TICKS: AtomicI64 = AtomicI64::new(0);
@@ -55,60 +52,14 @@ impl ScalarFunction for Tick {
     }
 }
 
-/// A scalar function named as a window function, returning its argument
-#[derive(Default)]
-struct ScalarNtile;
-
-impl ScalarFunction for ScalarNtile {
-    fn name(&self) -> &str {
-        "NTILE"
-    }
-    fn info(&self) -> FunctionInfo {
-        FunctionInfo::new(
-            "NTILE",
-            FunctionType::Scalar,
-            "test identity",
-            FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
-        )
-    }
-    fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        Ok(args[0].clone())
-    }
-    fn clone_box(&self) -> Box<dyn ScalarFunction> {
-        Box::new(ScalarNtile)
-    }
-}
-
 const TABLE: [&str; 2] = [
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, g INTEGER)",
     "INSERT INTO t VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3)",
 ];
 
 #[test]
-fn a_scalar_function_named_as_a_window_function_reads_its_argument_for_each_row() {
-    let registry = FunctionRegistry::new();
-    registry.register_scalar::<ScalarNtile>();
-    let mut engine = MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
-    for sql in TABLE {
-        executor.execute(sql).unwrap();
-    }
-    let sql = "SELECT NTILE((SELECT t.a)) FROM t ORDER BY t.id";
-    let mut rows = executor
-        .execute(sql)
-        .unwrap_or_else(|e| panic!("{sql}: {e}"));
-    let mut got = Vec::new();
-    while rows.next() {
-        got.push(rows.row().get(0).cloned());
-    }
-    let want: Vec<_> = [10, 20, 30].map(|a| Some(Value::Integer(a))).into();
-    assert_eq!(got, want, "{sql}");
-}
-
-#[test]
 fn a_default_is_read_only_for_the_partitions_a_limit_keeps() {
-    global_registry().register_scalar::<Tick>();
+    global_registry().register_scalar::<Tick>().unwrap();
     let db = Database::open("memory://window_default_limit").unwrap();
     for sql in TABLE {
         db.execute(sql, ()).unwrap();

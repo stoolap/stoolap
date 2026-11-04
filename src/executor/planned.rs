@@ -259,7 +259,7 @@ impl Executor {
             let table = &source.name.value_lower;
             let first = prepared.explain(
                 &first_branch_of(stmt),
-                (table, &self.function_registry),
+                (table, crate::functions::global_registry()),
                 Vec::new(),
                 keyed,
             )?;
@@ -393,7 +393,7 @@ impl Executor {
                         &held
                     }
                 };
-                if planned.keeps_no_row(stmt, terms_ctx, &self.function_registry) {
+                if planned.keeps_no_row(stmt, terms_ctx, crate::functions::global_registry()) {
                     let (plan, _) = planned.key_read()?;
                     let empty = ExecutorResult::with_arc_columns(plan.names.clone(), RowVec::new());
                     return Some(Ok(Box::new(empty) as Box<dyn QueryResult>));

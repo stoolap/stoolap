@@ -75,7 +75,7 @@ const STATEMENTS: &[(&str, &str)] = &[
 
 #[test]
 fn an_aggregate_over_a_derived_table_runs_its_statement_once() {
-    global_registry().register_scalar::<Tick>();
+    global_registry().register_scalar::<Tick>().unwrap();
     let db = Database::open("memory://derived_aggregate_once").unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",

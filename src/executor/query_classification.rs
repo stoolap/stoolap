@@ -781,8 +781,7 @@ impl QueryClassification {
 
     /// Whether an expression may answer differently in another statement
     /// (NOW, RANDOM): such a query is never served from the semantic cache.
-    /// The classification is shared by every executor, so the built-in
-    /// registry decides, which takes a function it does not hold as volatile
+    /// A function the registry does not hold counts as volatile
     fn expression_has_nondeterministic_functions(expr: &Expression) -> bool {
         expression_volatility(expr, crate::functions::global_registry()) != Volatility::Fixed
     }

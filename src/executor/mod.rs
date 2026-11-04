@@ -89,24 +89,13 @@ mod window;
 
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::api::params::ParamVec;
 use crate::common::CompactArc;
 use crate::core::{Error, Result, Value};
-use crate::functions::FunctionRegistry;
 use query_cache::CachedText;
 
-/// Default function registry - shared across all executors to avoid per-database allocation
-static DEFAULT_FUNCTION_REGISTRY: OnceLock<Arc<FunctionRegistry>> = OnceLock::new();
-
-/// Get the default function registry (lazily initialized, shared across all executors)
-#[inline]
-fn default_function_registry() -> Arc<FunctionRegistry> {
-    DEFAULT_FUNCTION_REGISTRY
-        .get_or_init(|| Arc::new(FunctionRegistry::new()))
-        .clone()
-}
 use crate::parser::ast::{ParamSlots, Program, Statement};
 use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -395,12 +384,11 @@ pub(crate) fn insert_reads_through_a_view(stmt: &crate::parser::ast::InsertState
 /// SQL Query Executor
 ///
 /// The executor is the main entry point for executing SQL statements.
-/// It coordinates between the parser, storage engine, and function registry.
+/// It coordinates between the parser, storage engine, and the global
+/// function registry.
 pub struct Executor {
     /// Storage engine
     engine: Arc<MVCCEngine>,
-    /// Function registry for scalar, aggregate, and window functions
-    function_registry: Arc<FunctionRegistry>,
     /// This session's isolation level as its `u8` value, `LEVEL_UNSET`
     /// until the session sets one
     default_isolation_level: AtomicU8,
@@ -438,25 +426,6 @@ impl Executor {
     pub fn new(engine: Arc<MVCCEngine>) -> Self {
         Self {
             engine,
-            function_registry: default_function_registry(),
-            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
-            query_cache: Arc::new(QueryCache::default()),
-            semantic_cache: Arc::new(SemanticCache::default()),
-            statement_gate: RwLock::new(()),
-            active_transaction: TransactionSlot::new(None),
-            query_planner: std::sync::OnceLock::new(),
-            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
-        }
-    }
-
-    /// Create a new executor with a custom function registry
-    pub fn with_function_registry(
-        engine: Arc<MVCCEngine>,
-        function_registry: Arc<FunctionRegistry>,
-    ) -> Self {
-        Self {
-            engine,
-            function_registry,
             default_isolation_level: AtomicU8::new(LEVEL_UNSET),
             query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
@@ -472,7 +441,6 @@ impl Executor {
     pub(crate) fn for_transaction(&self, tx: Box<dyn Transaction>) -> Self {
         Self {
             engine: Arc::clone(&self.engine),
-            function_registry: Arc::clone(&self.function_registry),
             default_isolation_level: AtomicU8::new(
                 self.default_isolation_level.load(Ordering::Relaxed),
             ),
@@ -552,11 +520,6 @@ impl Executor {
     /// Get the storage engine
     pub fn engine(&self) -> &Arc<MVCCEngine> {
         &self.engine
-    }
-
-    /// Get the function registry
-    pub fn function_registry(&self) -> &Arc<FunctionRegistry> {
-        &self.function_registry
     }
 
     /// Execute a SQL query string
@@ -870,7 +833,7 @@ impl Executor {
                 && runs < STATEMENT_RUNS
                 && matches!(statement, Statement::Select(_))
                 && ctx.is_none_or(|ctx| ctx.statement_view().is_none())
-                && !self.function_registry.has_registered_functions();
+                && !crate::functions::global_registry().has_registered_functions();
             if !again {
                 return result;
             }
@@ -1081,7 +1044,7 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        utils::statement_modifier_error(statement, &self.function_registry)?;
+        utils::statement_modifier_error(statement, crate::functions::global_registry())?;
         let holds = statement_holds_as_of(statement);
         let ctx = self.with_statement_cut(statement, std::borrow::Cow::Borrowed(ctx), holds)?;
         self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None)
@@ -1215,7 +1178,7 @@ impl Executor {
             drop(result);
             if !took_view
                 || attempt == STATEMENT_RUNS
-                || self.function_registry.has_registered_functions()
+                || crate::functions::global_registry().has_registered_functions()
             {
                 return Err(Error::ViewOvertaken);
             }
@@ -1453,7 +1416,7 @@ impl Executor {
         check_param_count(&plan.params, ctx.params().len())?;
         // The compiled fast paths run only a plan a run here has filled
         if plan.compiled.checked().get().is_none() {
-            utils::statement_modifier_error(&plan.statement, &self.function_registry)?;
+            utils::statement_modifier_error(&plan.statement, crate::functions::global_registry())?;
             let _ = plan.compiled.checked().set(());
         }
         let gate = self.enter(changes_session(&plan.statement));
@@ -1625,13 +1588,6 @@ mod tests {
             first_memory,
             "a capture took new memory though the first view's was free"
         );
-    }
-
-    #[test]
-    fn test_executor_creation() {
-        let executor = create_test_executor();
-        assert!(executor.function_registry().exists("COUNT"));
-        assert!(executor.function_registry().exists("UPPER"));
     }
 
     #[test]

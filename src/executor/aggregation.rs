@@ -1570,7 +1570,7 @@ impl Executor {
     fn call_templates(&self, aggregations: &[SqlAggregateFunction]) -> Result<Vec<CallTemplate>> {
         aggregations
             .iter()
-            .map(|agg| agg.template(&self.function_registry))
+            .map(|agg| agg.template(crate::functions::global_registry()))
             .collect()
     }
 

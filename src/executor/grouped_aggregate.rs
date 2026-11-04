@@ -356,7 +356,11 @@ impl Executor {
         // runs, reset for each group
         let mut runs = aggregations
             .iter()
-            .map(|agg| Ok(agg.template(&self.function_registry)?.instance()))
+            .map(|agg| {
+                Ok(agg
+                    .template(crate::functions::global_registry())?
+                    .instance())
+            })
             .collect::<Result<Vec<_>>>()?;
         let count_star = Value::Integer(1);
 

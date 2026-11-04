@@ -28,7 +28,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::predicate::{kind, KeySide, PredicateSet};
 use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value};
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
-use crate::functions::{FunctionRegistry, Volatility};
+use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::scope::unknown_qualifier;
 use crate::parser::token::{Position, Token, TokenType};
@@ -484,7 +484,7 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         if statement_form_block(sq, counts_rows, registry) {
             return self.derived(sq);
         }
@@ -598,7 +598,7 @@ impl<'a> Family<'a> {
         if scopes > MAX_SCOPES {
             return Err("more than 32 scopes in a chain");
         }
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         if statement_form_block(sq, false, registry) {
             return self.derived(sq);
         }
@@ -5329,7 +5329,7 @@ impl Builder<'_> {
         let holes = if work.holes.is_empty() {
             Vec::new()
         } else {
-            let registry = &self.executor.function_registry;
+            let registry = global_registry();
             let parent = match projected {
                 Some(from) => CompileContext::bound_pair(registry, from as u32),
                 None => CompileContext::bound(registry),
@@ -5421,7 +5421,7 @@ impl Builder<'_> {
             let keys = keys.iter().map(|key| &**key);
             return self.bind_grouping(&chain, id, sq, keys, true, work);
         }
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         let compile = CompileContext::bound(registry).with_prepared_subqueries();
         for ob in &sq.order_by {
             let key = with_aliases(&ob.expression, &sq.columns, &own.columns);
@@ -5444,7 +5444,7 @@ impl Builder<'_> {
         if !grouped_block(sq) || !sq.columns.iter().map(unaliased).any(mentions_subquery) {
             return Ok(());
         }
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         let group_keys: SmallVec<[ExprKey; 2]> = grouping_items(sq)
             .into_iter()
             .map(|key| {
@@ -5531,7 +5531,7 @@ impl Builder<'_> {
         scopes.push(&scope);
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         let compile = CompileContext::bound(registry).with_prepared_subqueries();
         let windowed = windowed_block(sq);
         let grouped = grouped_block(sq) && !windowed;
@@ -6129,7 +6129,7 @@ impl Builder<'_> {
                     reads & 1 == 0
                         && reads.count_ones() <= 1
                         && !is_leaf(value)
-                        && !volatile(value, &self.executor.function_registry)
+                        && !volatile(value, global_registry())
                 };
                 let sides = [(&infix.left, left), (&infix.right, right)];
                 if let Some(index) = sides.iter().position(|(value, reads)| hoist(value, *reads)) {
@@ -6258,7 +6258,7 @@ impl Builder<'_> {
                     .iter()
                     .flatten()
                     .for_each(|v| self.note_params(v));
-                let own = CompileContext::bound(&executor.function_registry);
+                let own = CompileContext::bound(global_registry());
                 let rows = source_programs(&values.rows, |v| compile_with(&own, v));
                 FromEntry::Source(
                     values
@@ -6328,14 +6328,13 @@ impl Builder<'_> {
                     ..
                 }
         );
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         if statement_form_block(sq, counts_rows, registry) {
             return self.statement_block(sq, outer, parent, form);
         }
         // EXISTS, value and grouped blocks pick candidates by their correlation equalities
         let picks = grouped_block(sq) || !matches!(form, Form::Scalar);
-        let executor = self.executor;
-        let registry = &executor.function_registry;
+        let registry = global_registry();
         // A source's columns have no type, as a statement's own source's
         let over_source = |name: SmartString, source: BlockSource, columns: Vec<String>| {
             let schema = CompactArc::new(untyped_schema(&name, &columns));
@@ -6783,7 +6782,7 @@ impl Builder<'_> {
         work: &mut Rewritten,
     ) -> Result<Grouped> {
         let executor = self.executor;
-        let registry = &executor.function_registry;
+        let registry = global_registry();
         let scope = chain.scopes[0];
         let bound = group_by_expressions(executor, sq, &scope.columns)?;
         let mut items = Vec::with_capacity(bound.len());
@@ -6969,7 +6968,7 @@ impl Builder<'_> {
                 .holes
                 .iter()
                 .all(|(slot, hole)| key_slot(*slot) || !reads_row_column(hole))
-            && !statement_draws_per_call(block, &self.executor.function_registry)
+            && !statement_draws_per_call(block, global_registry())
     }
 }
 
@@ -7621,7 +7620,7 @@ impl PreparedProjection {
             columns,
             true,
         );
-        let registry = &executor.function_registry;
+        let registry = global_registry();
         let bound = CompileContext::bound(registry).with_prepared_subqueries();
         // An expression bound here, or as the blocks rewrote it
         let compile = |expr: &Expression, rewritten: Option<&Expression>| match rewritten {
@@ -8158,7 +8157,7 @@ impl PreparedSelect {
         epoch: u64,
         keyed_branch: bool,
     ) -> Result<Self> {
-        let registry = &executor.function_registry;
+        let registry = global_registry();
         // A statement with window functions reads its rows as a SELECT * of
         // them would, and its window step computes the SELECT list over them
         let windowed = Self::computes_windows(stmt);
@@ -8494,7 +8493,7 @@ impl PreparedSelect {
             layout,
             order_keys,
             plan,
-            constant_where: Self::constant_where(stmt, &executor.function_registry),
+            constant_where: Self::constant_where(stmt, global_registry()),
             windowed,
             aggregated,
             calls,
@@ -8769,7 +8768,7 @@ impl PreparedGrouped {
         let stmt = keyed.as_ref().unwrap_or(stmt);
         // A window function in an ORDER BY key holding a subquery runs as a
         // hidden item, an unrepeatable alias the key reads after the windows
-        let key_windows = with_key_windows(stmt, &executor.function_registry)?;
+        let key_windows = with_key_windows(stmt, global_registry())?;
         let (stmt, window_keys) = match &key_windows {
             Some((stmt, keys)) => (stmt, keys.as_slice()),
             None => (stmt, &[][..]),
@@ -8935,7 +8934,7 @@ impl PreparedGrouped {
         // An alias of an item holding a subquery, a volatile one or a window
         // needs the value the row returns, which computing it again over the
         // group's row would not give: a key reading one reads that row
-        let registry = &executor.function_registry;
+        let registry = global_registry();
         // Over rows that do not group, the row a key is asked of is the one
         // the run returns, so every alias reads its value there
         let unrepeatable = |position: usize| {
@@ -9082,7 +9081,7 @@ impl PreparedGrouped {
         }
         let blocks_read = builder.subqueries.len();
         let source_rows = builder.prepare_source_values(stmt, Builder::rewrite_blocks)?;
-        let values = CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
+        let values = CompileContext::bound(global_registry()).with_prepared_subqueries();
         let source_values = source_rows
             .map(|rows| source_programs(&rows, |expr| compile_with(&values, expr)))
             .transpose()?;
@@ -9094,7 +9093,7 @@ impl PreparedGrouped {
         if let Some(parts) = &where_parts {
             parts.read_as(&schema, &mut read_as);
         }
-        let own = CompileContext::bound(&executor.function_registry)
+        let own = CompileContext::bound(global_registry())
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let where_program = where_parts
@@ -9253,7 +9252,7 @@ impl PreparedGrouped {
             &build_column_index_map(&names),
         );
         let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
-        let item_ctx = CompileContext::new(&item_names, &executor.function_registry);
+        let item_ctx = CompileContext::new(&item_names, global_registry());
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {
             let holding: SmallVec<[usize; 2]> = (0..held.len())
                 .filter(|&item| held[item] == Some(column))
@@ -9268,7 +9267,7 @@ impl PreparedGrouped {
                 .filter(|item| holding.contains(item))
                 .or(holding.first().copied())
         };
-        let slots_ctx = CompileContext::bound(&executor.function_registry);
+        let slots_ctx = CompileContext::bound(global_registry());
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
         let mut late_holes = Vec::new();
         for (id, sq) in blocks.subqueries.iter().enumerate() {
@@ -9358,7 +9357,7 @@ impl PreparedGrouped {
         let late = match late.is_empty() {
             true => None,
             false => {
-                let over_row = CompileContext::new(&[], &executor.function_registry)
+                let over_row = CompileContext::new(&[], global_registry())
                     .with_prepared_subqueries()
                     .with_expression_aliases(group_reads);
                 let keys = late
@@ -9402,7 +9401,7 @@ impl PreparedGrouped {
             true => Some(PreparedSelect::held_calls(executor, &stmt)?),
             false => None,
         };
-        let constant_where = PreparedSelect::constant_where(&stmt, &executor.function_registry);
+        let constant_where = PreparedSelect::constant_where(&stmt, global_registry());
         let windows = HeldWindow::default();
         let window = (windowed && !aggregated)
             .then(|| {
@@ -9840,7 +9839,7 @@ impl PreparedDml {
             let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
             let value = if !value_work.reads_row
                 && !is_leaf(value)
-                && !volatile(value, &executor.function_registry)
+                && !volatile(value, global_registry())
             {
                 let slot = builder.slot();
                 run_slots.push((slot, rewritten_value));
@@ -9870,7 +9869,7 @@ impl PreparedDml {
                 programs.push(Some(
                     if !value_work.reads_row
                         && !is_leaf(value)
-                        && !volatile(value, &executor.function_registry)
+                        && !volatile(value, global_registry())
                     {
                         let slot = builder.slot();
                         run_slots.push((slot, rewritten_value));
@@ -9910,10 +9909,7 @@ impl PreparedDml {
                 let first = builder.subqueries.len();
                 let mut value_work = Rewritten::default();
                 let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
-                if !value_work.reads_row
-                    && !is_leaf(value)
-                    && !volatile(value, &executor.function_registry)
-                {
+                if !value_work.reads_row && !is_leaf(value) && !volatile(value, global_registry()) {
                     let slot = builder.slot();
                     run_slots.push((slot, rewritten_value));
                     return Ok(slot_parameter(slot));
@@ -9955,10 +9951,7 @@ impl PreparedDml {
                 let first = builder.subqueries.len();
                 let mut value_work = Rewritten::default();
                 let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
-                if !value_work.reads_row
-                    && !is_leaf(value)
-                    && !volatile(value, &executor.function_registry)
-                {
+                if !value_work.reads_row && !is_leaf(value) && !volatile(value, global_registry()) {
                     let slot = builder.slot();
                     run_slots.push((slot, rewritten_value));
                     values.push(slot_parameter(slot));
@@ -9977,7 +9970,7 @@ impl PreparedDml {
         if let Some(parts) = &where_parts {
             parts.read_as(schema, &mut read_as);
         }
-        let own = CompileContext::bound(&executor.function_registry)
+        let own = CompileContext::bound(global_registry())
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let where_program = where_parts
@@ -9999,7 +9992,7 @@ impl PreparedDml {
         let prepared_conflict = match (conflict, &joined, conflict_parts) {
             (Some(sites), Some(_), Some((sets, where_, reads_target))) => {
                 let over_joined =
-                    CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
+                    CompileContext::bound(global_registry()).with_prepared_subqueries();
                 let updates = sets
                     .iter()
                     .map(|(index, value)| {
@@ -10023,7 +10016,7 @@ impl PreparedDml {
         let prepared_returning = match (returning, &returning_scope, returning_parts) {
             (Some(sites), Some(_), Some((values, reads_target))) => {
                 let over_returned =
-                    CompileContext::bound(&executor.function_registry).with_prepared_subqueries();
+                    CompileContext::bound(global_registry()).with_prepared_subqueries();
                 let columns = sites.schema.column_names_arc();
                 Some(PreparedReturning {
                     names: CompactArc::new(Executor::returning_names(sites.values, &columns)),
@@ -10504,7 +10497,7 @@ impl JoinBlocks {
         let output_blocks = first_output_block..builder.subqueries.len();
         // Each side's conditions as its own scan reads them, a value a column
         // is compared with a run slot; the joined row reads the same blocks
-        let registry = &executor.function_registry;
+        let registry = global_registry();
         let mut side_parts = [None, None];
         // A table side without conditions is read by its scan all the same
         let none = Expression::BooleanLiteral(BooleanLiteral {
@@ -10881,15 +10874,8 @@ impl Executor {
                 |extra| match pushdown::try_pushdown(extra, table.schema(), Some(ctx)) {
                     (Some(expr), false) => Ok(SideFilter::Storage(expr)),
                     // A condition the join adds to this read, compiled for it
-                    _ => compile_over_slots(
-                        extra,
-                        &columns,
-                        &self.function_registry,
-                        None,
-                        false,
-                        None,
-                    )
-                    .map(|p| SideFilter::Row(RowFilter::from_program(p).with_context(ctx))),
+                    _ => compile_over_slots(extra, &columns, global_registry(), None, false, None)
+                        .map(|p| SideFilter::Row(RowFilter::from_program(p).with_context(ctx))),
                 },
             )
             .transpose()?;
@@ -11766,7 +11752,7 @@ impl Builder<'_> {
         let rewritten = self.rewrite(chain, None, value, &mut value_work)?;
         if !value_work.reads_row
             && !is_leaf(value)
-            && !volatile(value, &self.executor.function_registry)
+            && !volatile(value, global_registry())
             && !(nested && mentions_subquery(value))
         {
             let slot = self.slot();
@@ -11964,7 +11950,7 @@ impl Executor {
         let params = ctx.params().len();
         let prepared =
             PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch, false).ok()?;
-        prepared.explain(stmt, (&scope, &self.function_registry), body, false)
+        prepared.explain(stmt, (&scope, global_registry()), body, false)
     }
 
     /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
@@ -12697,7 +12683,7 @@ impl Executor {
             source => {
                 let names = CompactArc::new(source.columns().unwrap_or_default().to_vec());
                 let mut rows = RowVec::new();
-                if !prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
+                if !prepared.keeps_no_row(stmt, ctx, global_registry()) {
                     let keep = |id: i64, _: u64, row: Row| {
                         rows.push((id, row));
                         true
@@ -12786,7 +12772,7 @@ impl Executor {
         table: &dyn Table,
         (names, plan): (&[String], Option<&super::window::WindowPlan<'_>>),
     ) -> Result<WindowRows> {
-        let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
+        let keeps_none = prepared.keeps_no_row(stmt, ctx, global_registry());
         let indexed = match prepared.read.and_then(Read::window) {
             Some(read) if !keeps_none => {
                 self.read_window_rows(read, (stmt, plan, prepared.windows), ctx, table, names)?
@@ -12966,7 +12952,7 @@ impl Executor {
         let take = if hold { Take::Collected } else { Take::Stream };
         // Made on the first row: the scan's own answers need none
         let mut kept: Option<RowVec> = None;
-        let passing = match prepared.keeps_no_row(stmt, ctx, &self.function_registry) {
+        let passing = match prepared.keeps_no_row(stmt, ctx, global_registry()) {
             true => Passing::Pruned,
             false => {
                 let mut keep = |id: i64, _: u64, row: Row| {
@@ -13296,7 +13282,7 @@ impl Executor {
             target.is_none_or(|target| rows.len() < target)
         };
         // A WHERE that keeps no row reads no row
-        let keeps_none = prepared.keeps_no_row(stmt, ctx, &self.function_registry);
+        let keeps_none = prepared.keeps_no_row(stmt, ctx, global_registry());
         // A DISTINCT of one column answers with the values the table keeps
         let column = stmt
             .distinct
@@ -17593,9 +17579,9 @@ impl PreparedRunner<'_> {
         let decided = pushed && sq.pushed_whole;
         let no_row = Row::new();
         let call = (!grouping.extra.is_empty()).then(|| self.exec_over(&no_row, &params));
-        let registry = &self.executor.function_registry;
+        let registry = global_registry();
         let mut groups =
-            grouping.groups(0, call.as_ref().map(|exec| (&mut *vm, exec, &**registry)))?;
+            grouping.groups(0, call.as_ref().map(|exec| (&mut *vm, exec, registry)))?;
         let mut key = KeyReader::new(grouping, Vec::new());
         let mut scanned = 0u64;
         'rows: while scanner.next() {

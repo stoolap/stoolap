@@ -53,7 +53,9 @@ impl TableValuedFunction for MyRows {
 
 #[test]
 fn a_table_function_side_registered_again_reads_no_column_by_its_old_place() {
-    global_registry().register_tvf("MY_ROWS", Arc::new(|| Box::new(MyRows(false))));
+    global_registry()
+        .register_tvf("MY_ROWS", Arc::new(|| Box::new(MyRows(false))))
+        .unwrap();
     let db = Database::open("memory://join_side_function_columns").unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY)",
@@ -73,7 +75,9 @@ fn a_table_function_side_registered_again_reads_no_column_by_its_old_place() {
         .collect()
     };
     let first = run();
-    global_registry().register_tvf("MY_ROWS", Arc::new(|| Box::new(MyRows(true))));
+    global_registry()
+        .register_tvf("MY_ROWS", Arc::new(|| Box::new(MyRows(true))))
+        .unwrap();
     let again = run();
     let changed = again.as_ref().is_err_and(|e| e.contains("schema changed"));
     assert!(

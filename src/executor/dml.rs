@@ -2549,7 +2549,7 @@ impl Executor {
             (None, false, None)
         };
 
-        let function_registry = &self.function_registry;
+        let function_registry = crate::functions::global_registry();
 
         // Create evaluator once and reuse for all rows (optimization)
         let mut evaluator = CompiledEvaluator::new(function_registry).with_context(ctx);
@@ -2708,14 +2708,11 @@ impl Executor {
                 .as_ref()
                 .filter(|expr| !Self::expr_contains_subquery(expr))
                 .and_then(|expr| {
-                    // The executor's registry, not the global one: custom
-                    // function overrides must behave like the evaluator
-                    // path this replaces
                     super::expression::compile_expression_with_params(
                         expr,
                         &column_names,
                         params,
-                        &self.function_registry,
+                        crate::functions::global_registry(),
                     )
                     .ok()
                 });
@@ -3167,7 +3164,8 @@ impl Executor {
                 .collect();
 
             // Create evaluator for WHERE filtering
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+            let mut evaluator =
+                CompiledEvaluator::new(crate::functions::global_registry()).with_context(ctx);
             // Initialize with prefixed column names to support alias.column syntax
             evaluator.init_columns(&column_names_with_prefix);
 
@@ -3186,7 +3184,7 @@ impl Executor {
                         expr,
                         &column_names_with_prefix,
                         params,
-                        &self.function_registry,
+                        crate::functions::global_registry(),
                     )
                     .ok()
                 });

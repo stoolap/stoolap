@@ -343,12 +343,12 @@ impl stoolap::functions::ScalarFunction for Tick {
 #[test]
 fn an_uncorrelated_subquery_answers_once_for_the_rows_it_chooses_and_writes() {
     use std::sync::Arc;
-    let registry = stoolap::functions::registry::FunctionRegistry::new();
-    registry.register_scalar::<Tick>();
+    stoolap::functions::global_registry()
+        .register_scalar::<Tick>()
+        .unwrap();
     let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor =
-        stoolap::executor::Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    let executor = stoolap::executor::Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
         "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
@@ -376,12 +376,12 @@ fn an_uncorrelated_subquery_answers_once_for_the_rows_it_chooses_and_writes() {
 #[test]
 fn a_correlated_volatile_where_answers_once_for_the_row_it_writes() {
     use std::sync::Arc;
-    let registry = stoolap::functions::registry::FunctionRegistry::new();
-    registry.register_scalar::<Tick>();
+    stoolap::functions::global_registry()
+        .register_scalar::<Tick>()
+        .unwrap();
     let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor =
-        stoolap::executor::Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    let executor = stoolap::executor::Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
         "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",

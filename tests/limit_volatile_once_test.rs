@@ -49,12 +49,9 @@ impl ScalarFunction for NextCount {
     }
 }
 
-/// A database holding `t`, its view and an index, with NEXT_COUNT known
+/// A database holding `t`, its view and an index
 fn open(dsn: &str) -> Database {
     let db = Database::open(dsn).unwrap();
-    stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
-        .function_registry()
-        .register_scalar::<NextCount>();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
         "INSERT INTO t SELECT value, value % 9, 'b' || value FROM generate_series(1, 1000)",
@@ -166,7 +163,7 @@ fn check_cte_bodies(db: &Database, phase: &str, wrong: &mut Vec<String>) {
 
 #[test]
 fn a_volatile_limit_and_offset_are_read_once_on_every_path() {
-    global_registry().register_scalar::<NextCount>();
+    global_registry().register_scalar::<NextCount>().unwrap();
     let mut wrong = Vec::new();
     let db = open("memory://limit_volatile_once");
     check(&db, "hot", &mut wrong);

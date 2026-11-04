@@ -20,10 +20,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::common::StringMap;
+use crate::common::{StringMap, StringSet};
+use crate::core::{Error, Result};
 
 /// Global function registry instance
 static GLOBAL_REGISTRY: OnceLock<FunctionRegistry> = OnceLock::new();
+
+/// The functions the engine computes itself, which the registry holds no
+/// entry for: the compiler loads the transaction id, grouping reads its flag
+const ENGINE_FUNCTIONS: [&str; 2] = ["CURRENT_TRANSACTION_ID", "GROUPING"];
 
 /// The kinds a name may hold a function of, as indexes of its volatilities
 const SCALAR: usize = 0;
@@ -103,6 +108,9 @@ pub struct FunctionRegistry {
     /// registered after them: a statement calling one may not run twice safely
     built: AtomicBool,
     extended: AtomicBool,
+    /// The names the built-in and the engine's own functions hold, of any
+    /// kind: no registration takes one, as paths read them by name
+    built_in_names: StringSet,
 }
 
 impl Default for FunctionRegistry {
@@ -114,7 +122,7 @@ impl Default for FunctionRegistry {
 impl FunctionRegistry {
     /// Create a new function registry with all built-in functions registered
     pub fn new() -> Self {
-        let registry = Self {
+        let mut registry = Self {
             aggregate_functions: RwLock::new(StringMap::new()),
             scalar_functions: RwLock::new(StringMap::new()),
             window_functions: RwLock::new(StringMap::new()),
@@ -123,164 +131,172 @@ impl FunctionRegistry {
             volatilities: RwLock::new(StringMap::new()),
             built: AtomicBool::new(false),
             extended: AtomicBool::new(false),
+            built_in_names: StringSet::default(),
         };
 
         // Register built-in aggregate functions
-        registry.register_aggregate::<CountFunction>();
-        registry.register_aggregate::<SumFunction>();
-        registry.register_aggregate::<AvgFunction>();
-        registry.register_aggregate::<MinFunction>();
-        registry.register_aggregate::<MaxFunction>();
-        registry.register_aggregate::<FirstFunction>();
-        registry.register_aggregate::<LastFunction>();
-        registry.register_aggregate::<StringAggFunction>();
-        registry.register_aggregate::<GroupConcatFunction>();
-        registry.register_aggregate::<ArrayAggFunction>();
-        registry.register_aggregate::<StddevPopFunction>();
-        registry.register_aggregate::<StddevFunction>();
-        registry.register_aggregate::<StddevSampFunction>();
-        registry.register_aggregate::<VarPopFunction>();
-        registry.register_aggregate::<VarianceFunction>();
-        registry.register_aggregate::<VarSampFunction>();
-        registry.register_aggregate::<MedianFunction>();
+        registry.add_aggregate::<CountFunction>();
+        registry.add_aggregate::<SumFunction>();
+        registry.add_aggregate::<AvgFunction>();
+        registry.add_aggregate::<MinFunction>();
+        registry.add_aggregate::<MaxFunction>();
+        registry.add_aggregate::<FirstFunction>();
+        registry.add_aggregate::<LastFunction>();
+        registry.add_aggregate::<StringAggFunction>();
+        registry.add_aggregate::<GroupConcatFunction>();
+        registry.add_aggregate::<ArrayAggFunction>();
+        registry.add_aggregate::<StddevPopFunction>();
+        registry.add_aggregate::<StddevFunction>();
+        registry.add_aggregate::<StddevSampFunction>();
+        registry.add_aggregate::<VarPopFunction>();
+        registry.add_aggregate::<VarianceFunction>();
+        registry.add_aggregate::<VarSampFunction>();
+        registry.add_aggregate::<MedianFunction>();
 
         // Register built-in scalar functions
         // String functions
-        registry.register_scalar::<UpperFunction>();
-        registry.register_scalar::<LowerFunction>();
-        registry.register_scalar::<LengthFunction>();
-        registry.register_scalar::<CharLengthFunction>();
-        registry.register_scalar::<CharFunction>();
-        registry.register_scalar::<ConcatFunction>();
-        registry.register_scalar::<ConcatWsFunction>();
-        registry.register_scalar::<SubstringFunction>();
-        registry.register_scalar::<SubstrFunction>();
-        registry.register_scalar::<TrimFunction>();
-        registry.register_scalar::<LtrimFunction>();
-        registry.register_scalar::<RtrimFunction>();
-        registry.register_scalar::<ReplaceFunction>();
-        registry.register_scalar::<ReverseFunction>();
-        registry.register_scalar::<LeftFunction>();
-        registry.register_scalar::<RightFunction>();
-        registry.register_scalar::<RepeatFunction>();
-        registry.register_scalar::<SplitPartFunction>();
-        registry.register_scalar::<StartsWithFunction>();
-        registry.register_scalar::<EndsWithFunction>();
-        registry.register_scalar::<ContainsFunction>();
-        registry.register_scalar::<PositionFunction>();
-        registry.register_scalar::<StrposFunction>();
-        registry.register_scalar::<InstrFunction>();
-        registry.register_scalar::<LocateFunction>();
-        registry.register_scalar::<LpadFunction>();
-        registry.register_scalar::<RpadFunction>();
+        registry.add_scalar::<UpperFunction>();
+        registry.add_scalar::<LowerFunction>();
+        registry.add_scalar::<LengthFunction>();
+        registry.add_scalar::<CharLengthFunction>();
+        registry.add_scalar::<CharFunction>();
+        registry.add_scalar::<ConcatFunction>();
+        registry.add_scalar::<ConcatWsFunction>();
+        registry.add_scalar::<SubstringFunction>();
+        registry.add_scalar::<SubstrFunction>();
+        registry.add_scalar::<TrimFunction>();
+        registry.add_scalar::<LtrimFunction>();
+        registry.add_scalar::<RtrimFunction>();
+        registry.add_scalar::<ReplaceFunction>();
+        registry.add_scalar::<ReverseFunction>();
+        registry.add_scalar::<LeftFunction>();
+        registry.add_scalar::<RightFunction>();
+        registry.add_scalar::<RepeatFunction>();
+        registry.add_scalar::<SplitPartFunction>();
+        registry.add_scalar::<StartsWithFunction>();
+        registry.add_scalar::<EndsWithFunction>();
+        registry.add_scalar::<ContainsFunction>();
+        registry.add_scalar::<PositionFunction>();
+        registry.add_scalar::<StrposFunction>();
+        registry.add_scalar::<InstrFunction>();
+        registry.add_scalar::<LocateFunction>();
+        registry.add_scalar::<LpadFunction>();
+        registry.add_scalar::<RpadFunction>();
 
         // Math functions
-        registry.register_scalar::<AbsFunction>();
-        registry.register_scalar::<RoundFunction>();
-        registry.register_scalar::<FloorFunction>();
-        registry.register_scalar::<CeilingFunction>();
-        registry.register_scalar::<CeilFunction>();
-        registry.register_scalar::<ModFunction>();
-        registry.register_scalar::<PowerFunction>();
-        registry.register_scalar::<PowFunction>();
-        registry.register_scalar::<SqrtFunction>();
-        registry.register_scalar::<LogFunction>();
-        registry.register_scalar::<Log10Function>();
-        registry.register_scalar::<Log2Function>();
-        registry.register_scalar::<LnFunction>();
-        registry.register_scalar::<ExpFunction>();
-        registry.register_scalar::<SignFunction>();
-        registry.register_scalar::<TruncateFunction>();
-        registry.register_scalar::<TruncFunction>();
-        registry.register_scalar::<PiFunction>();
-        registry.register_scalar::<RandomFunction>();
-        registry.register_scalar::<SinFunction>();
-        registry.register_scalar::<CosFunction>();
-        registry.register_scalar::<TanFunction>();
+        registry.add_scalar::<AbsFunction>();
+        registry.add_scalar::<RoundFunction>();
+        registry.add_scalar::<FloorFunction>();
+        registry.add_scalar::<CeilingFunction>();
+        registry.add_scalar::<CeilFunction>();
+        registry.add_scalar::<ModFunction>();
+        registry.add_scalar::<PowerFunction>();
+        registry.add_scalar::<PowFunction>();
+        registry.add_scalar::<SqrtFunction>();
+        registry.add_scalar::<LogFunction>();
+        registry.add_scalar::<Log10Function>();
+        registry.add_scalar::<Log2Function>();
+        registry.add_scalar::<LnFunction>();
+        registry.add_scalar::<ExpFunction>();
+        registry.add_scalar::<SignFunction>();
+        registry.add_scalar::<TruncateFunction>();
+        registry.add_scalar::<TruncFunction>();
+        registry.add_scalar::<PiFunction>();
+        registry.add_scalar::<RandomFunction>();
+        registry.add_scalar::<SinFunction>();
+        registry.add_scalar::<CosFunction>();
+        registry.add_scalar::<TanFunction>();
 
         // Date/Time functions
-        registry.register_scalar::<NowFunction>();
-        registry.register_scalar::<CurrentDateFunction>();
-        registry.register_scalar::<CurrentTimeFunction>();
-        registry.register_scalar::<CurrentTimestampFunction>();
-        registry.register_scalar::<DateTruncFunction>();
-        registry.register_scalar::<TimeTruncFunction>();
-        registry.register_scalar::<ExtractFunction>();
-        registry.register_scalar::<YearFunction>();
-        registry.register_scalar::<MonthFunction>();
-        registry.register_scalar::<DayFunction>();
-        registry.register_scalar::<HourFunction>();
-        registry.register_scalar::<MinuteFunction>();
-        registry.register_scalar::<SecondFunction>();
-        registry.register_scalar::<DateAddFunction>();
-        registry.register_scalar::<DateSubFunction>();
-        registry.register_scalar::<DateDiffFunction>();
-        registry.register_scalar::<DateDiffAliasFunction>(); // DATE_DIFF alias for DATEDIFF
-        registry.register_scalar::<ToCharFunction>();
+        registry.add_scalar::<NowFunction>();
+        registry.add_scalar::<CurrentDateFunction>();
+        registry.add_scalar::<CurrentTimeFunction>();
+        registry.add_scalar::<CurrentTimestampFunction>();
+        registry.add_scalar::<DateTruncFunction>();
+        registry.add_scalar::<TimeTruncFunction>();
+        registry.add_scalar::<ExtractFunction>();
+        registry.add_scalar::<YearFunction>();
+        registry.add_scalar::<MonthFunction>();
+        registry.add_scalar::<DayFunction>();
+        registry.add_scalar::<HourFunction>();
+        registry.add_scalar::<MinuteFunction>();
+        registry.add_scalar::<SecondFunction>();
+        registry.add_scalar::<DateAddFunction>();
+        registry.add_scalar::<DateSubFunction>();
+        registry.add_scalar::<DateDiffFunction>();
+        registry.add_scalar::<DateDiffAliasFunction>(); // DATE_DIFF alias for DATEDIFF
+        registry.add_scalar::<ToCharFunction>();
 
         // Utility/System functions
-        registry.register_scalar::<VersionFunction>();
-        registry.register_scalar::<CoalesceFunction>();
-        registry.register_scalar::<NullIfFunction>();
-        registry.register_scalar::<IfNullFunction>();
-        registry.register_scalar::<CastFunction>();
-        registry.register_scalar::<CollateFunction>();
-        registry.register_scalar::<GreatestFunction>();
-        registry.register_scalar::<LeastFunction>();
-        registry.register_scalar::<IifFunction>();
-        registry.register_scalar::<JsonExtractFunction>();
-        registry.register_scalar::<JsonArrayLengthFunction>();
-        registry.register_scalar::<JsonArrayFunction>();
-        registry.register_scalar::<JsonObjectFunction>();
-        registry.register_scalar::<JsonTypeFunction>();
-        registry.register_scalar::<JsonTypeOfFunction>();
-        registry.register_scalar::<JsonValidFunction>();
-        registry.register_scalar::<JsonKeysFunction>();
-        registry.register_scalar::<TypeOfFunction>();
-        registry.register_scalar::<SleepFunction>();
+        registry.add_scalar::<VersionFunction>();
+        registry.add_scalar::<CoalesceFunction>();
+        registry.add_scalar::<NullIfFunction>();
+        registry.add_scalar::<IfNullFunction>();
+        registry.add_scalar::<CastFunction>();
+        registry.add_scalar::<CollateFunction>();
+        registry.add_scalar::<GreatestFunction>();
+        registry.add_scalar::<LeastFunction>();
+        registry.add_scalar::<IifFunction>();
+        registry.add_scalar::<JsonExtractFunction>();
+        registry.add_scalar::<JsonArrayLengthFunction>();
+        registry.add_scalar::<JsonArrayFunction>();
+        registry.add_scalar::<JsonObjectFunction>();
+        registry.add_scalar::<JsonTypeFunction>();
+        registry.add_scalar::<JsonTypeOfFunction>();
+        registry.add_scalar::<JsonValidFunction>();
+        registry.add_scalar::<JsonKeysFunction>();
+        registry.add_scalar::<TypeOfFunction>();
+        registry.add_scalar::<SleepFunction>();
 
         // Hash functions
-        registry.register_scalar::<Md5Function>();
-        registry.register_scalar::<Sha1Function>();
-        registry.register_scalar::<Sha256Function>();
-        registry.register_scalar::<Sha384Function>();
-        registry.register_scalar::<Sha512Function>();
-        registry.register_scalar::<Crc32Function>();
+        registry.add_scalar::<Md5Function>();
+        registry.add_scalar::<Sha1Function>();
+        registry.add_scalar::<Sha256Function>();
+        registry.add_scalar::<Sha384Function>();
+        registry.add_scalar::<Sha512Function>();
+        registry.add_scalar::<Crc32Function>();
 
         // Register vector functions
-        registry.register_scalar::<VecDistanceL2Function>();
-        registry.register_scalar::<VecDistanceCosineFunction>();
-        registry.register_scalar::<VecDistanceIpFunction>();
-        registry.register_scalar::<VecDimsFunction>();
-        registry.register_scalar::<VecNormFunction>();
-        registry.register_scalar::<VecToTextFunction>();
+        registry.add_scalar::<VecDistanceL2Function>();
+        registry.add_scalar::<VecDistanceCosineFunction>();
+        registry.add_scalar::<VecDistanceIpFunction>();
+        registry.add_scalar::<VecDimsFunction>();
+        registry.add_scalar::<VecNormFunction>();
+        registry.add_scalar::<VecToTextFunction>();
 
         // Register semantic embedding function (requires --features semantic)
         #[cfg(feature = "semantic")]
-        registry.register_scalar::<EmbedFunction>();
+        registry.add_scalar::<EmbedFunction>();
 
         // Register generate_series as scalar (returns JSON array for SELECT usage)
-        registry.register_scalar::<GenerateSeriesScalarFunction>();
+        registry.add_scalar::<GenerateSeriesScalarFunction>();
 
         // Register built-in window functions
-        registry.register_window::<RowNumberFunction>();
-        registry.register_window::<RankFunction>();
-        registry.register_window::<DenseRankFunction>();
-        registry.register_window::<NtileFunction>();
-        registry.register_window::<LeadFunction>();
-        registry.register_window::<LagFunction>();
-        registry.register_window::<FirstValueFunction>();
-        registry.register_window::<LastValueFunction>();
-        registry.register_window::<NthValueFunction>();
-        registry.register_window::<PercentRankFunction>();
-        registry.register_window::<CumeDistFunction>();
+        registry.add_window::<RowNumberFunction>();
+        registry.add_window::<RankFunction>();
+        registry.add_window::<DenseRankFunction>();
+        registry.add_window::<NtileFunction>();
+        registry.add_window::<LeadFunction>();
+        registry.add_window::<LagFunction>();
+        registry.add_window::<FirstValueFunction>();
+        registry.add_window::<LastValueFunction>();
+        registry.add_window::<NthValueFunction>();
+        registry.add_window::<PercentRankFunction>();
+        registry.add_window::<CumeDistFunction>();
 
         // Register built-in table-valued functions
-        registry.register_tvf(
+        registry.add_tvf(
             "GENERATE_SERIES",
             Arc::new(|| Box::new(GenerateSeriesFunction)),
         );
 
+        registry.built_in_names = registry.list_all().into_iter().collect();
+        registry
+            .built_in_names
+            .extend(registry.tvf_functions.read().unwrap().keys().cloned());
+        registry
+            .built_in_names
+            .extend(ENGINE_FUNCTIONS.map(String::from));
         registry.built.store(true, Ordering::Release);
         registry
     }
@@ -296,9 +312,26 @@ impl FunctionRegistry {
         }
     }
 
-    /// Register an aggregate function
+    /// An error when `name` is a built-in function's, of any kind
+    fn refuse_built_in(&self, name: &str) -> Result<()> {
+        match self.built_in_names.contains(&name.to_uppercase()) {
+            true => Err(Error::invalid_argument(format!(
+                "{} is a built-in function name and cannot be registered",
+                name.to_uppercase()
+            ))),
+            false => Ok(()),
+        }
+    }
+
+    /// Register an aggregate function under a name no built-in holds
+    pub fn register_aggregate<F: AggregateFunction + Default + 'static>(&self) -> Result<()> {
+        self.refuse_built_in(F::default().name())?;
+        self.add_aggregate::<F>();
+        Ok(())
+    }
+
     #[inline]
-    pub fn register_aggregate<F: AggregateFunction + Default + 'static>(&self) {
+    fn add_aggregate<F: AggregateFunction + Default + 'static>(&self) {
         let instance = F::default();
         self.register_aggregate_inner(
             instance.name().to_uppercase(),
@@ -334,9 +367,15 @@ impl FunctionRegistry {
         }
     }
 
-    /// Register a scalar function
+    /// Register a scalar function under a name no built-in holds
+    pub fn register_scalar<F: ScalarFunction + Default + 'static>(&self) -> Result<()> {
+        self.refuse_built_in(F::default().name())?;
+        self.add_scalar::<F>();
+        Ok(())
+    }
+
     #[inline]
-    pub fn register_scalar<F: ScalarFunction + Default + 'static>(&self) {
+    fn add_scalar<F: ScalarFunction + Default + 'static>(&self) {
         let instance = F::default();
         self.register_scalar_inner(
             instance.name().to_uppercase(),
@@ -355,9 +394,15 @@ impl FunctionRegistry {
         self.function_info.write().unwrap().insert(name, info);
     }
 
-    /// Register a window function
+    /// Register a window function under a name no built-in holds
+    pub fn register_window<F: WindowFunction + Default + 'static>(&self) -> Result<()> {
+        self.refuse_built_in(F::default().name())?;
+        self.add_window::<F>();
+        Ok(())
+    }
+
     #[inline]
-    pub fn register_window<F: WindowFunction + Default + 'static>(&self) {
+    fn add_window<F: WindowFunction + Default + 'static>(&self) {
         let instance = F::default();
         self.register_window_inner(
             instance.name().to_uppercase(),
@@ -448,8 +493,14 @@ impl FunctionRegistry {
         funcs.contains_key(&upper)
     }
 
-    /// Register a table-valued function
-    pub fn register_tvf(&self, name: &str, factory: TvfFactory) {
+    /// Register a table-valued function under a name no built-in holds
+    pub fn register_tvf(&self, name: &str, factory: TvfFactory) -> Result<()> {
+        self.refuse_built_in(name)?;
+        self.add_tvf(name, factory);
+        Ok(())
+    }
+
+    fn add_tvf(&self, name: &str, factory: TvfFactory) {
         self.note_registration();
         let mut funcs = self.tvf_functions.write().unwrap();
         funcs.insert(name.to_string(), factory);

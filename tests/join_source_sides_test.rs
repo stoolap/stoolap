@@ -520,11 +520,8 @@ mod drops_before_the_join {
     #[test]
     fn a_side_s_condition_on_values_read_once_drops_its_rows_before_the_join() {
         let _guard = super::serial();
-        global_registry().register_scalar::<SideCalls>();
+        global_registry().register_scalar::<SideCalls>().unwrap();
         let db = Database::open("memory://join_source_sides_drops_first").unwrap();
-        stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
-            .function_registry()
-            .register_scalar::<SideCalls>();
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
             "INSERT INTO t SELECT g.value, 1 FROM generate_series(1, 100) g",
@@ -614,11 +611,8 @@ mod a_failed_read {
     #[test]
     fn an_uncorrelated_block_s_failed_read_is_raised_by_the_row_that_needs_it() {
         let _guard = super::serial();
-        global_registry().register_scalar::<FailOnce>();
+        global_registry().register_scalar::<FailOnce>().unwrap();
         let db = Database::open("memory://join_source_sides_failed_read").unwrap();
-        stoolap::Executor::new(std::sync::Arc::clone(db.engine()))
-            .function_registry()
-            .register_scalar::<FailOnce>();
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY)",
             "INSERT INTO t VALUES (1)",

@@ -26,8 +26,8 @@ use std::sync::Arc;
 use stoolap::core::Value;
 use stoolap::executor::Executor;
 use stoolap::functions::{
-    global_registry, FunctionDataType, FunctionInfo, FunctionRegistry, FunctionSignature,
-    FunctionType, ScalarFunction,
+    global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
+    ScalarFunction,
 };
 use stoolap::storage::mvcc::engine::MVCCEngine;
 use stoolap::test_failpoints::{prepared_strategy_runs, PreparedStrategy};
@@ -246,14 +246,11 @@ impl ScalarFunction for Tick {
 #[test]
 fn a_block_error_is_raised_again_without_reading_the_block_again() {
     let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
-    // Aggregates resolve functions in the global registry; no other test
-    // here calls TICK
-    global_registry().register_scalar::<Tick>();
-    let registry = FunctionRegistry::new();
-    registry.register_scalar::<Tick>();
+    // No other test here calls TICK
+    global_registry().register_scalar::<Tick>().unwrap();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
-    let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    let executor = Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER)",
         "INSERT INTO t VALUES (1, 5), (2, 6)",

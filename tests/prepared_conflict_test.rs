@@ -329,12 +329,10 @@ fn a_conflict_subquery_does_not_see_a_commit_made_during_the_statement() {
     for level in ["READ COMMITTED", "SNAPSHOT"] {
         let db = Database::open(&format!("memory://prepared_conflict_commit_{level}")).unwrap();
         setup(&db);
-        let functions = stoolap::functions::FunctionRegistry::new();
-        functions.register_scalar::<CommitOnCall>();
-        let executor = stoolap::Executor::with_function_registry(
-            std::sync::Arc::clone(db.engine()),
-            std::sync::Arc::new(functions),
-        );
+        stoolap::functions::global_registry()
+            .register_scalar::<CommitOnCall>()
+            .unwrap();
+        let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
         executor
             .execute(&format!("SET isolation_level = '{level}'"))
             .unwrap();
@@ -360,12 +358,10 @@ fn a_kept_conflict_answer_is_not_one_read_before_a_commit() {
     for level in ["READ COMMITTED", "SNAPSHOT"] {
         let db = Database::open(&format!("memory://prepared_conflict_kept_{level}")).unwrap();
         setup(&db);
-        let functions = stoolap::functions::FunctionRegistry::new();
-        functions.register_scalar::<CommitOnCall>();
-        let executor = stoolap::Executor::with_function_registry(
-            std::sync::Arc::clone(db.engine()),
-            std::sync::Arc::new(functions),
-        );
+        stoolap::functions::global_registry()
+            .register_scalar::<CommitOnCall>()
+            .unwrap();
+        let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
         executor
             .execute(&format!("SET isolation_level = '{level}'"))
             .unwrap();

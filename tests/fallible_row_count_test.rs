@@ -334,11 +334,14 @@ struct InvalidFirstPattern;
 
 impl ScalarFunction for InvalidFirstPattern {
     fn name(&self) -> &str {
-        "SLEEP"
+        "INVALID_FIRST_PATTERN"
     }
 
     fn info(&self) -> FunctionInfo {
-        SleepFunction.info()
+        FunctionInfo {
+            name: "INVALID_FIRST_PATTERN".into(),
+            ..SleepFunction.info()
+        }
     }
 
     fn evaluate(&self, _args: &[Value]) -> Result<Value> {
@@ -358,7 +361,6 @@ struct WindowHook {
 
 impl Drop for WindowHook {
     fn drop(&mut self) {
-        global_registry().register_scalar::<SleepFunction>();
         clear_program_cache();
     }
 }
@@ -375,10 +377,12 @@ fn lazy_window_propagates_first_error_without_retrying() {
         _serial: WINDOW_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
     };
     WINDOW_HOOK_CALLS.store(0, Ordering::SeqCst);
-    global_registry().register_scalar::<InvalidFirstPattern>();
+    global_registry()
+        .register_scalar::<InvalidFirstPattern>()
+        .unwrap();
     clear_program_cache();
     let result = db.query_one::<bool, _>(
-        "SELECT 'x' REGEXP CASE WHEN SLEEP(v) = 0 THEN '[' ELSE 'x' END, \
+        "SELECT 'x' REGEXP CASE WHEN INVALID_FIRST_PATTERN(v) = 0 THEN '[' ELSE 'x' END, \
          ROW_NUMBER() OVER (PARTITION BY v) FROM t LIMIT 1",
         (),
     );

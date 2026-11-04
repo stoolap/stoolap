@@ -1457,7 +1457,7 @@ impl Executor {
         };
         let mut plan = plan.holding(held);
         for wf in &mut plan.window_functions {
-            if self.function_registry.is_aggregate(&wf.name) {
+            if global_registry().is_aggregate(&wf.name) {
                 let later = wf.arguments.get(1..).unwrap_or_default();
                 let held = wf.held.as_deref().map(|held| &*held.extra);
                 let read = aggregate_extra_args(later, Some(ctx), blocks, held)?;
@@ -1850,13 +1850,13 @@ impl Executor {
         let resolved_wfs: Vec<_> = window_functions
             .iter()
             .map(|wf| {
-                let is_agg = self.function_registry.is_aggregate(&wf.name);
+                let is_agg = global_registry().is_aggregate(&wf.name);
                 let func = if is_agg {
                     None
                 } else {
-                    self.function_registry.get_window(&wf.name)
+                    global_registry().get_window(&wf.name)
                 };
-                let mut args = CallArgs::of(wf, &self.function_registry, blocks);
+                let mut args = CallArgs::of(wf, global_registry(), blocks);
                 args.input = self.window_input(
                     wf,
                     base_rows,
@@ -2076,18 +2076,13 @@ impl Executor {
         let mut resolved_wfs: Vec<_> = window_functions
             .iter()
             .map(|wf| {
-                let is_agg = self.function_registry.is_aggregate(&wf.name);
+                let is_agg = global_registry().is_aggregate(&wf.name);
                 let func = if is_agg {
                     None
                 } else {
-                    self.function_registry.get_window(&wf.name)
+                    global_registry().get_window(&wf.name)
                 };
-                (
-                    wf,
-                    func,
-                    is_agg,
-                    CallArgs::of(wf, &self.function_registry, None),
-                )
+                (wf, func, is_agg, CallArgs::of(wf, global_registry(), None))
             })
             .collect();
 
@@ -2773,7 +2768,7 @@ impl Executor {
         // Build column name
         let column_name = format!("{}()", func.function);
         let (extra_args, extra_error) = match read {
-            Some((ctx, blocks)) if self.function_registry.is_aggregate(&func.function) => {
+            Some((ctx, blocks)) if global_registry().is_aggregate(&func.function) => {
                 let later = func.arguments.get(1..).unwrap_or_default();
                 super::aggregation::aggregate_extra_args(later, Some(ctx), blocks, None)?
             }
@@ -2878,11 +2873,11 @@ impl Executor {
     fn over_clause_is_shareable(&self, wf: &WindowFunctionInfo) -> bool {
         wf.partition_by_exprs
             .iter()
-            .all(|e| expr_is_deterministic(e, &self.function_registry))
+            .all(|e| expr_is_deterministic(e, global_registry()))
             && wf
                 .order_by
                 .iter()
-                .all(|ob| expr_is_deterministic(&ob.expression, &self.function_registry))
+                .all(|ob| expr_is_deterministic(&ob.expression, global_registry()))
     }
 
     /// Structural identity of an ORDER BY clause. Rendered SQL cannot
@@ -3009,7 +3004,7 @@ impl Executor {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
         // Check if this is an aggregate function used as window function
-        let is_aggregate = self.function_registry.is_aggregate(&wf_info.name);
+        let is_aggregate = global_registry().is_aggregate(&wf_info.name);
 
         if is_aggregate {
             // Handle aggregate functions as window functions (SUM, COUNT, AVG, etc.)
@@ -3029,18 +3024,15 @@ impl Executor {
                 pre_sorted,
                 cached_order_by,
                 partition_cache,
-                &CallArgs::of(wf_info, &self.function_registry, blocks),
+                &CallArgs::of(wf_info, global_registry(), blocks),
                 blocks,
             );
         }
 
         // Get the window function from registry
-        let window_func = self
-            .function_registry
-            .get_window(&wf_info.name)
-            .ok_or_else(|| {
-                Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
-            })?;
+        let window_func = global_registry().get_window(&wf_info.name).ok_or_else(|| {
+            Error::NotSupported(format!("Unknown window function: {}", wf_info.name))
+        })?;
 
         // Look up precomputed ORDER BY values from cache using semantic key
         let precomputed_order_by: Option<&ColumnarOrderByValues> = if !wf_info.order_by.is_empty() {
@@ -3072,7 +3064,7 @@ impl Executor {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let mut args = CallArgs::of(wf_info, &self.function_registry, blocks);
+        let mut args = CallArgs::of(wf_info, global_registry(), blocks);
         args.input = self.window_input(
             wf_info,
             rows,
@@ -4301,7 +4293,7 @@ impl Executor {
     ) -> Result<crate::functions::aggregate::AggregateState> {
         let order_by: &[OrderByExpression] = if ordered { &wf_info.call_order_by } else { &[] };
         Self::aggregate_state(
-            &self.function_registry,
+            global_registry(),
             &wf_info.name,
             wf_info.is_distinct,
             &wf_info.extra_args,
@@ -4321,8 +4313,7 @@ impl Executor {
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Vec<Value>>> {
         if wf_info.call_order_by.is_empty()
-            || !self
-                .function_registry
+            || !global_registry()
                 .get_aggregate(&wf_info.name)
                 .is_some_and(|f| f.supports_order_by())
         {
