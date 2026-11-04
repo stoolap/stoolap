@@ -104,6 +104,19 @@ const CASES: &[(&str, Written)] = &[
         "SELECT * FROM (SELECT 1 AS k) JOIN t ON k = t.id JOIN u ON u.tid = t.id WHERE u.id IN (SELECT id FROM u WHERE name > 'a')",
         Ok((&["k", "t.id", "t.a", "t.v", "u.id", "u.tid", "u.name"], &["Integer(1)|Integer(1)|Integer(1)|Integer(10)|Integer(1)|Integer(1)|Text(\"alpha\")", "Integer(1)|Integer(1)|Integer(1)|Integer(10)|Integer(2)|Integer(1)|Text(\"bo\")"])),
     ),
+    // An empty alias names its table, as any other alias does
+    (
+        "SELECT \"\".* FROM t AS \"\" CROSS JOIN b",
+        Ok((&["id", "a", "v"], &["Integer(1)|Integer(1)|Integer(10)", "Integer(1)|Integer(1)|Integer(10)", "Integer(2)|Integer(2)|Integer(20)", "Integer(2)|Integer(2)|Integer(20)"])),
+    ),
+    (
+        "SELECT \"\".v FROM t AS \"\" JOIN u ON u.tid = \"\".id JOIN b ON b.id = u.id",
+        Ok((&["v"], &["Integer(10)", "Integer(10)"])),
+    ),
+    (
+        "SELECT * FROM t AS \"\" JOIN u ON u.tid = \"\".id JOIN b ON b.id = u.id",
+        Ok((&[".id", ".a", ".v", "u.id", "u.tid", "u.name", "b.id"], &["Integer(1)|Integer(1)|Integer(10)|Integer(1)|Integer(1)|Text(\"alpha\")|Integer(1)", "Integer(1)|Integer(1)|Integer(10)|Integer(2)|Integer(1)|Text(\"bo\")|Integer(2)"])),
+    ),
 ];
 
 /// The column names and the rows sorted, or the error

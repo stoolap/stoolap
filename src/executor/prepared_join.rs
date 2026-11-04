@@ -167,7 +167,8 @@ impl<K, T: ?Sized> Shelf<K, T> {
 /// is itself a join; and whether the side is read as rows
 #[derive(Debug, Clone)]
 pub(crate) struct JoinSide {
-    pub(crate) leaves: SmallVec<[(SmartString, CompactArc<Schema>); 1]>,
+    /// Each table's name, None for a source without one, and its columns
+    pub(crate) leaves: SmallVec<[(Option<SmartString>, CompactArc<Schema>); 1]>,
     pub(crate) rows: bool,
 }
 
@@ -180,13 +181,23 @@ impl JoinSide {
         }
     }
 
-    /// Each column as a reference spells it: its table's name and its own
-    pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, &str)> {
+    /// Each column as a reference spells it: its table's name, None for a
+    /// source without one, and its own
+    pub(crate) fn columns(&self) -> impl Iterator<Item = (Option<&str>, &str)> {
         self.leaves.iter().flat_map(|(name, schema)| {
             schema
                 .columns
                 .iter()
-                .map(move |c| (name.as_str(), c.name.as_str()))
+                .map(move |c| (name.as_deref(), c.name.as_str()))
+        })
+    }
+
+    /// Each column's text, read through its table's name, bare for a source
+    /// without one
+    pub(crate) fn column_texts(&self) -> impl Iterator<Item = String> + '_ {
+        self.columns().map(|(table, name)| match table {
+            Some(table) => super::utils::qualified(table, name),
+            None => name.to_string(),
         })
     }
 }

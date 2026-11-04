@@ -839,7 +839,7 @@ fn natural_join_condition(
 #[derive(Clone, Copy)]
 pub(crate) enum SplitSide<'a> {
     Source(Option<&'a str>, Option<&'a Schema>),
-    Joined(&'a [(SmartString, CompactArc<Schema>)]),
+    Joined(&'a [(Option<SmartString>, CompactArc<Schema>)]),
 }
 
 impl<'a> SplitSide<'a> {
@@ -883,7 +883,9 @@ impl<'a> SplitSide<'a> {
         };
         match self {
             SplitSide::Source(alias, _) => alias.is_some_and(names),
-            SplitSide::Joined(leaves) => leaves.iter().any(|(name, _)| names(name)),
+            SplitSide::Joined(leaves) => {
+                (leaves.iter()).any(|(name, _)| name.as_deref().is_some_and(names))
+            }
         }
     }
 
@@ -4806,7 +4808,7 @@ impl Executor {
             // view or a CTE of the name has no history to read
             Expression::TableSource(ts) if ts.as_of.is_some() => {
                 let schema = self.base_table_side_schema(expr, CteNames::Context(ctx))?;
-                let name = SmartString::from(get_table_alias_from_expr(expr).unwrap_or_default());
+                let name = get_table_alias_from_expr(expr).map(SmartString::from);
                 Some(JoinSide {
                     leaves: smallvec::smallvec![(name, schema)],
                     rows: true,
@@ -4816,7 +4818,7 @@ impl Executor {
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
             | Expression::FunctionTableSource(_) => {
-                let name = SmartString::from(get_table_alias_from_expr(expr).unwrap_or_default());
+                let name = get_table_alias_from_expr(expr).map(SmartString::from);
                 let (schema, rows) = match self.base_table_side_schema(expr, CteNames::Context(ctx))
                 {
                     Some(schema) => (schema, false),
@@ -4892,11 +4894,7 @@ impl Executor {
         self.join_output_family(stmt)?;
         // Each WHERE part as its site reads it, the SELECT aliases it names
         // opened over the joined columns the sides lay out
-        let columns: Vec<String> = sides
-            .iter()
-            .flat_map(|side| side.columns())
-            .map(|(table, name)| qualified(table, name))
-            .collect();
+        let columns: Vec<String> = sides.iter().flat_map(JoinSide::column_texts).collect();
         let Some(where_clause) = stmt.where_clause.as_deref() else {
             return Ok(());
         };
@@ -5025,16 +5023,14 @@ impl Executor {
         let [left_side, right_side] = sides;
         prepared.join_blocks(|| {
             // Each column by its table and its own name, which may hold a dot
-            let spelled: [Vec<(&str, &str)>; 2] = [
+            let spelled: [Vec<(Option<&str>, &str)>; 2] = [
                 left_side.columns().collect(),
                 right_side.columns().collect(),
             ];
             // The WHERE's SELECT aliases open over the columns the sides lay
             // out, as the decision to run blocks read them
-            let columns: Vec<String> = spelled
-                .iter()
-                .flatten()
-                .map(|(table, name)| qualified(table, name))
+            let columns: Vec<String> = (left_side.column_texts())
+                .chain(right_side.column_texts())
                 .collect();
             // The equalities of a NATURAL join or a USING list stand for its
             // ON, each column read by its place, as two sides without a name
@@ -5395,11 +5391,7 @@ impl Executor {
                             }
                         }
                     }
-                    let names = |side: &JoinSide| -> Vec<String> {
-                        side.columns()
-                            .map(|(table, name)| qualified(table, name))
-                            .collect()
-                    };
+                    let names = |side: &JoinSide| -> Vec<String> { side.column_texts().collect() };
                     (names(&sides[0]), names(&sides[1]))
                 }
                 _ => {
@@ -8046,19 +8038,20 @@ impl Executor {
         // A side read from the source the blocks prepared, unless the join
         // adds conditions of its own to this read
         if let (Some((run, index)), None) = (rows, extra) {
-            let alias = get_table_alias_from_expr(expr).unwrap_or_default();
+            let alias = get_table_alias_from_expr(expr);
             let read = self.join_sourced_side_rows(
                 run.blocks,
                 run.run,
                 index,
-                (alias.as_str(), ctx),
+                (alias.as_deref().unwrap_or_default(), ctx),
                 (limit, offset),
             )?;
             if let Some((result, bounded)) = read {
-                let columns = result
-                    .columns()
-                    .iter()
-                    .map(|c| qualified(&alias, c))
+                let columns = (result.columns().iter())
+                    .map(|c| match &alias {
+                        Some(alias) => qualified(alias, c),
+                        None => c.clone(),
+                    })
                     .collect();
                 return Ok((result, columns, bounded, None));
             }

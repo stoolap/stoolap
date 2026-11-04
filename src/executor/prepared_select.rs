@@ -1635,8 +1635,9 @@ impl ScopeTable {
 /// The scope of each side of `join` over `sides`, its tables side by side,
 /// read by position in the joined row
 fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable; 2]> {
-    let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
-        ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
+    let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
+        let name = name.as_deref().unwrap_or_default().to_lowercase();
+        ScopeTable::of(SmartString::from(name.as_str()), schema)
     };
     let side_scope = |expr: &Expression, side: &JoinSide| {
         ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
@@ -10299,8 +10300,9 @@ impl JoinBlocks {
         param_count: usize,
     ) -> Result<Option<Self>> {
         let rows_sides = [sides[0].rows, sides[1].rows];
-        let table = |(name, schema): &(SmartString, CompactArc<Schema>)| {
-            ScopeTable::of(SmartString::from(name.to_lowercase().as_str()), schema)
+        let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
+            let name = name.as_deref().unwrap_or_default().to_lowercase();
+            ScopeTable::of(SmartString::from(name.as_str()), schema)
         };
         let Some([left_scope, right_scope]) = side_scopes(join, sides) else {
             return Ok(None);
