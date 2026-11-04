@@ -26,6 +26,10 @@ use crate::core::{Error, Result};
 /// Global function registry instance
 static GLOBAL_REGISTRY: OnceLock<FunctionRegistry> = OnceLock::new();
 
+/// The functions the engine computes itself, which the registry holds no
+/// entry for: the compiler loads the transaction id, grouping reads its flag
+const ENGINE_FUNCTIONS: [&str; 2] = ["CURRENT_TRANSACTION_ID", "GROUPING"];
+
 /// The kinds a name may hold a function of, as indexes of its volatilities
 const SCALAR: usize = 0;
 const AGGREGATE: usize = 1;
@@ -104,8 +108,8 @@ pub struct FunctionRegistry {
     /// registered after them: a statement calling one may not run twice safely
     built: AtomicBool,
     extended: AtomicBool,
-    /// The names the built-in functions hold, of any kind: no registration
-    /// takes one, as paths read a built-in by its name
+    /// The names the built-in and the engine's own functions hold, of any
+    /// kind: no registration takes one, as paths read them by name
     built_in_names: StringSet,
 }
 
@@ -290,6 +294,9 @@ impl FunctionRegistry {
         registry
             .built_in_names
             .extend(registry.tvf_functions.read().unwrap().keys().cloned());
+        registry
+            .built_in_names
+            .extend(ENGINE_FUNCTIONS.map(String::from));
         registry.built.store(true, Ordering::Release);
         registry
     }

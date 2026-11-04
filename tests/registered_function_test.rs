@@ -50,27 +50,35 @@ impl AggregateFunction for NinetyNine {
     }
 }
 
-/// A scalar under the built-in window NTILE's name
-#[derive(Default)]
-struct ScalarNtile;
+/// A scalar answering 99 under `$name`, a name the engine already reads
+macro_rules! scalar_named {
+    ($type:ident, $name:literal) => {
+        #[derive(Default)]
+        struct $type;
 
-impl ScalarFunction for ScalarNtile {
-    fn name(&self) -> &str {
-        "NTILE"
-    }
-    fn info(&self) -> FunctionInfo {
-        FunctionInfo {
-            name: "NTILE".into(),
-            ..RegisteredId.info()
+        impl ScalarFunction for $type {
+            fn name(&self) -> &str {
+                $name
+            }
+            fn info(&self) -> FunctionInfo {
+                FunctionInfo {
+                    name: $name.into(),
+                    ..RegisteredId.info()
+                }
+            }
+            fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+                Ok(Value::Integer(99))
+            }
+            fn clone_box(&self) -> Box<dyn ScalarFunction> {
+                Box::new($type)
+            }
         }
-    }
-    fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        Ok(args[0].clone())
-    }
-    fn clone_box(&self) -> Box<dyn ScalarFunction> {
-        Box::new(ScalarNtile)
-    }
+    };
 }
+
+scalar_named!(ScalarNtile, "NTILE");
+scalar_named!(TransactionId, "current_transaction_id");
+scalar_named!(Grouping, "GROUPING");
 
 /// Answers its argument
 #[derive(Default)]
@@ -243,6 +251,8 @@ fn a_built_in_name_takes_no_registration_and_keeps_its_answer() {
     let refused = [
         registry.register_aggregate::<NinetyNine>(),
         registry.register_scalar::<ScalarNtile>(),
+        registry.register_scalar::<TransactionId>(),
+        registry.register_scalar::<Grouping>(),
         registry.register_tvf(
             "generate_series",
             std::sync::Arc::new(|| Box::new(stoolap::functions::tvf::GenerateSeriesFunction)),
@@ -268,6 +278,10 @@ fn a_built_in_name_takes_no_registration_and_keeps_its_answer() {
             vec!["3", "3"],
         ),
         ("SELECT NTILE(2) OVER (ORDER BY id) FROM t", vec!["1", "2"]),
+        (
+            "SELECT a, GROUPING(a) FROM t GROUP BY ROLLUP(a) ORDER BY 2, 1",
+            vec!["1|0", "2|0", "NULL|1"],
+        ),
     ] {
         let want: Vec<String> = want.into_iter().map(String::from).collect();
         assert_eq!(answer(db.query(sql, ())), Ok(want), "{sql}");
