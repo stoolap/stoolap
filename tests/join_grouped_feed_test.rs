@@ -13,18 +13,18 @@
 // limitations under the License.
 
 //! A grouped join whose clauses hold no subquery feeds its calls through
-//! programs its plan holds: it answers as the general path does, and run
-//! again compiles nothing through the evaluator bridge
+//! programs its plan holds: it answers as its rows, summed here, say, and
+//! run again compiles nothing through the evaluator bridge
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::atomic::Ordering::SeqCst;
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{bridge_compiles, PREPARED_FAMILIES_OFF};
+use stoolap::test_failpoints::bridge_compiles;
 use stoolap::{Database, Value};
 
-// The families switch and the bridge counter are process-wide
+// The bridge counter is process-wide
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -32,7 +32,7 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 /// The column names and each row, or the error
-type Answer = Result<(Vec<String>, Vec<String>), String>;
+type Answer = Result<(Vec<String>, Vec<Vec<Option<i64>>>), String>;
 
 fn answer(db: &Database, sql: &str, params: &[Value]) -> Answer {
     let result = db.query(sql, params.to_vec()).map_err(|e| e.to_string())?;
@@ -42,25 +42,26 @@ fn answer(db: &Database, sql: &str, params: &[Value]) -> Answer {
         let row = row.map_err(|e| e.to_string())?;
         rows.push(
             (0..row.len())
-                .map(|i| format!("{:?}", row.get_value(i).unwrap()))
-                .collect::<Vec<_>>()
-                .join("|"),
+                .map(|i| row.get::<Option<i64>>(i).unwrap())
+                .collect(),
         );
     }
     Ok((columns, rows))
 }
 
-/// `sql` answered with the prepared families refused: the general path
-fn general(db: &Database, sql: &str, params: &[Value]) -> Answer {
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PREPARED_FAMILIES_OFF.store(false, SeqCst);
-        }
-    }
-    let _restore = Restore;
-    PREPARED_FAMILIES_OFF.store(true, SeqCst);
-    answer(db, sql, params)
+/// l: id 1..40, k = id % 7, g = id % 4
+fn l_rows() -> impl Iterator<Item = (i64, i64, i64)> {
+    (1..=40).map(|id| (id, id % 7, id % 4))
+}
+
+/// r: id 1..30, k = id % 5, w = id * 3
+fn r_rows() -> impl Iterator<Item = (i64, i64, i64)> {
+    (1..=30).map(|id| (id, id % 5, id * 3))
+}
+
+/// The rows of r joined to an l row with key `k`
+fn joined(k: i64) -> Vec<(i64, i64, i64)> {
+    r_rows().filter(|r| r.1 == k).collect()
 }
 
 fn open(dsn: &str) -> Database {
@@ -71,64 +72,167 @@ fn open(dsn: &str) -> Database {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    for i in 1..=40 {
-        db.execute("INSERT INTO l VALUES ($1, $2, $3)", (i, i % 7, i % 4))
+    for (id, k, g) in l_rows() {
+        db.execute("INSERT INTO l VALUES ($1, $2, $3)", (id, k, g))
             .unwrap();
     }
-    for i in 1..=30 {
-        db.execute("INSERT INTO r VALUES ($1, $2, $3)", (i, i % 5, i * 3))
+    for (id, k, w) in r_rows() {
+        db.execute("INSERT INTO r VALUES ($1, $2, $3)", (id, k, w))
             .unwrap();
     }
     db
 }
 
-/// Each statement with the parameter values of two runs
-const SHAPES: &[(&str, &[i64], &[i64])] = &[
+/// For each l.g, `value` folded over the inner join's pairs with l.id
+/// past `after`, in g order
+fn per_g(
+    after: i64,
+    value: impl Fn((i64, i64, i64), (i64, i64, i64)) -> i64,
+    fold: impl Fn(i64, i64) -> i64,
+) -> Vec<(i64, i64)> {
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for l in l_rows().filter(|l| l.0 > after) {
+        for r in joined(l.1) {
+            let v = value(l, r);
+            groups
+                .entry(l.2)
+                .and_modify(|acc| *acc = fold(*acc, v))
+                .or_insert(v);
+        }
+    }
+    groups.into_iter().collect()
+}
+
+fn sum(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+/// Each statement, its columns, the parameter values of two runs and the
+/// rows it answers for a run's first value
+type Shape = (
+    &'static str,
+    &'static [&'static str],
+    &'static [i64],
+    &'static [i64],
+    fn(i64) -> Vec<Vec<Option<i64>>>,
+);
+
+const SHAPES: &[Shape] = &[
     (
         "SELECT l.id, SUM(r.w + 1) FROM l LEFT JOIN r ON l.k = r.k GROUP BY l.id ORDER BY l.id",
+        &["id", "SUM(r.w + 1)"],
         &[],
         &[],
+        |_| {
+            l_rows()
+                .map(|l| {
+                    let m = joined(l.1);
+                    let total = (!m.is_empty()).then(|| m.iter().map(|r| r.2 + 1).sum());
+                    vec![Some(l.0), total]
+                })
+                .collect()
+        },
     ),
     (
         "SELECT 10 - l.id AS id, COUNT(*) FROM l JOIN r ON r.k = l.k GROUP BY 10 - l.id \
          ORDER BY 1",
+        &["id", "COUNT(*)"],
         &[],
         &[],
+        |_| {
+            let mut rows: Vec<Vec<Option<i64>>> = l_rows()
+                .filter_map(|l| {
+                    let n = joined(l.1).len() as i64;
+                    (n > 0).then(|| vec![Some(10 - l.0), Some(n)])
+                })
+                .collect();
+            rows.sort();
+            rows
+        },
     ),
     (
         "SELECT COUNT(*), SUM(CASE WHEN r.id IS NULL THEN 1 ELSE 0 END) FROM l LEFT JOIN r \
          ON l.k = r.k",
+        &[
+            "COUNT(*)",
+            "SUM(CASE WHEN (r.id IS NULL) THEN 1 ELSE 0 END)",
+        ],
         &[],
         &[],
+        |_| {
+            let counts = l_rows().map(|l| joined(l.1).len() as i64);
+            let (rows, unmatched) = counts.fold((0, 0), |(rows, unmatched), n| match n {
+                0 => (rows + 1, unmatched + 1),
+                n => (rows + n, unmatched),
+            });
+            vec![vec![Some(rows), Some(unmatched)]]
+        },
     ),
     (
         "SELECT l.g, SUM(r.w * l.k) FROM l JOIN r ON r.k = l.k GROUP BY l.g \
          HAVING SUM(r.w) > 10 ORDER BY l.g",
+        &["g", "SUM(r.w * l.k)"],
         &[],
         &[],
+        |_| {
+            let weights: BTreeMap<i64, i64> = per_g(0, |_, r| r.2, sum).into_iter().collect();
+            per_g(0, |l, r| r.2 * l.1, sum)
+                .into_iter()
+                .filter(|(g, _)| weights[g] > 10)
+                .map(|(g, v)| vec![Some(g), Some(v)])
+                .collect()
+        },
     ),
     (
         "SELECT l.g, SUM(r.w + $1) FROM l JOIN r ON r.k = l.k GROUP BY l.g ORDER BY l.g",
+        &["g", "SUM(r.w + $1)"],
         &[1],
         &[100],
+        |p| {
+            per_g(0, |_, r| r.2 + p, sum)
+                .into_iter()
+                .map(|(g, v)| vec![Some(g), Some(v)])
+                .collect()
+        },
     ),
     (
         "SELECT l.g, MAX(r.w - l.id) FROM l JOIN r ON r.k = l.k WHERE l.id > $1 GROUP BY l.g \
          ORDER BY l.g",
+        &["g", "MAX(r.w - l.id)"],
         &[5],
         &[30],
+        |p| {
+            per_g(p, |l, r| r.2 - l.0, i64::max)
+                .into_iter()
+                .map(|(g, v)| vec![Some(g), Some(v)])
+                .collect()
+        },
     ),
     (
         "SELECT l.g, SUM(r.w + 1) + ROW_NUMBER() OVER (ORDER BY l.g) FROM l JOIN r \
          ON r.k = l.k GROUP BY l.g ORDER BY l.g",
+        &["g", "SUM(r.w + 1) + ROW_NUMBER() OVER (ORDER BY l.g)"],
         &[],
         &[],
+        |_| {
+            (1..)
+                .zip(per_g(0, |_, r| r.2 + 1, sum))
+                .map(|(n, (g, v))| vec![Some(g), Some(v + n)])
+                .collect()
+        },
     ),
     (
         "SELECT d.g, SUM(d.w + 1) FROM (SELECT l.g, r.w FROM l JOIN r ON r.k = l.k) AS d \
          GROUP BY d.g ORDER BY d.g",
+        &["g", "SUM(d.w + 1)"],
         &[],
         &[],
+        |_| {
+            per_g(0, |_, r| r.2 + 1, sum)
+                .into_iter()
+                .map(|(g, v)| vec![Some(g), Some(v)])
+                .collect()
+        },
     ),
 ];
 
@@ -137,15 +241,18 @@ fn values(params: &[i64]) -> Vec<Value> {
 }
 
 #[test]
-fn a_grouped_join_answers_as_the_general_path_run_after_run() {
+fn a_grouped_join_answers_as_its_rows_say_run_after_run() {
     let _guard = serial();
     let db = open("memory://join_grouped_feed_answers");
     let mut wrong = Vec::new();
-    for (sql, first, second) in SHAPES {
+    for (sql, columns, first, second, rows) in SHAPES {
         for params in [first, second, first] {
-            let params = values(params);
-            let (got, want) = (answer(&db, sql, &params), general(&db, sql, &params));
-            if got != want || got.is_err() {
+            let got = answer(&db, sql, &values(params));
+            let want: Answer = Ok((
+                columns.iter().map(|c| c.to_string()).collect(),
+                rows(params.first().copied().unwrap_or(0)),
+            ));
+            if got != want {
                 wrong.push(format!("{sql} {params:?}\n  got  {got:?}\n  want {want:?}"));
             }
         }
@@ -158,7 +265,7 @@ fn a_grouped_join_run_again_compiles_nothing_through_the_bridge() {
     let _guard = serial();
     let db = open("memory://join_grouped_feed_bridge");
     let mut wrong = Vec::new();
-    for (sql, first, second) in SHAPES {
+    for (sql, _, first, second, _) in SHAPES {
         answer(&db, sql, &values(first)).unwrap();
         let before = bridge_compiles();
         answer(&db, sql, &values(second)).unwrap();
