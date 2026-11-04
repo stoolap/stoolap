@@ -15,17 +15,21 @@
 //! A filter over a compiled program, run per row with the statement's
 //! parameters and transaction
 
+use std::cell::RefCell;
+
 use crate::api::params::ParamVec;
 use crate::common::CompactArc;
 use crate::core::{Result, Row};
 use crate::executor::context::ExecutionContext;
 
-use super::program::{Program, SharedProgram};
+use super::bound_program::BoundProgram;
+use super::program::SharedProgram;
 use super::vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 
-/// The parameters of a filter no context gave any, shared by every filter
-pub(super) static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
-    std::sync::LazyLock::new(|| CompactArc::new(ParamVec::new()));
+thread_local! {
+    /// The VM row filters run in on this thread
+    static VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
+}
 
 /// A lightweight, thread-safe row filter for closure-based filtering.
 ///
@@ -33,56 +37,43 @@ pub(super) static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
 /// `CompactArc<Program>` internally). Each thread runs it in a VM of its own.
 #[derive(Clone)]
 pub struct RowFilter {
-    /// Pre-compiled program (shared across clones)
-    program: SharedProgram,
-    /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
-    params: CompactArc<ParamVec>,
-    /// Transaction ID for CURRENT_TRANSACTION_ID()
-    transaction_id: Option<u64>,
+    bound: BoundProgram,
 }
 
 impl RowFilter {
     /// A filter over a program compiled earlier for the same columns
     pub fn from_program(program: SharedProgram) -> Self {
         Self {
-            program,
-            params: EMPTY_PARAMS.clone(),
-            transaction_id: None,
+            bound: BoundProgram::new(program),
         }
     }
 
-    /// Create a filter from execution context.
-    ///
-    /// PERF: `params` shares the Arc - zero cloning.
-    pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
-        // Share params Arc - no cloning needed (both use CompactArc<Vec<Value>>)
-        self.params = CompactArc::clone(ctx.params_arc());
-        self.program = Program::bound(self.program, &self.params);
-        self.transaction_id = ctx.transaction_id();
-        self
+    /// This filter bound to the parameters and transaction of `ctx`
+    pub fn with_context(self, ctx: &ExecutionContext) -> Self {
+        Self {
+            bound: self.bound.with_context(ctx),
+        }
     }
 
     /// The parameters the program reads, in place of the context's
-    pub(crate) fn with_params(mut self, params: CompactArc<ParamVec>) -> Self {
-        self.params = params;
-        self.program = Program::bound(self.program, &self.params);
-        self
+    pub(crate) fn with_params(self, params: CompactArc<ParamVec>) -> Self {
+        Self {
+            bound: self.bound.with_params(params),
+        }
     }
 
     /// Whether every thread may run this filter as it is, without a
     /// [`Self::worker`] of its own
     #[cfg(feature = "parallel")]
     pub(crate) fn shares_across_threads(&self) -> bool {
-        !self.program.holds_thread_state()
+        !self.bound.program.holds_thread_state()
     }
 
     /// This filter for one more thread, over the program's worker copy
     #[cfg(feature = "parallel")]
     pub(crate) fn worker(&self) -> Self {
         Self {
-            program: CompactArc::new(self.program.worker_copy()),
-            params: CompactArc::clone(&self.params),
-            transaction_id: self.transaction_id,
+            bound: self.bound.worker(),
         }
     }
 
@@ -104,27 +95,13 @@ impl RowFilter {
         row: &Row,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<bool> {
-        thread_local! {
-            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
-        }
-
         VM.with(|vm| {
-            let mut ctx = ExecuteContext::new(row);
-
-            let params = blocks.and_then(|b| b.params()).unwrap_or(&self.params);
-            if !params.is_empty() {
-                ctx = ctx.with_params(params);
-            }
-            ctx = ctx.with_transaction_id(self.transaction_id);
-            if let Some(blocks) = blocks {
-                ctx = ctx.with_subquery_executor(blocks);
-            }
-
-            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
-                borrowed_vm.execute_bool_checked(&self.program, &ctx)
-            } else {
-                let mut temp_vm = ExprVM::new();
-                temp_vm.execute_bool_checked(&self.program, &ctx)
+            let ctx = self.bound.context(ExecuteContext::new(row), blocks);
+            // A filter calling a function that runs a filter again on this
+            // thread gets a fresh VM
+            match vm.try_borrow_mut() {
+                Ok(mut vm) => vm.execute_bool_checked(&self.bound.program, &ctx),
+                Err(_) => ExprVM::new().execute_bool_checked(&self.bound.program, &ctx),
             }
         })
     }
