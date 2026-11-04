@@ -8993,7 +8993,17 @@ impl Executor {
                     &aggregations,
                     &stmt.columns,
                 );
-                Some(RowFilter::with_aliases(having, &result_columns, &slots)?.with_context(ctx))
+                // Bound after compiling: a value that fails to fold, such as
+                // an invalid pattern, errs only where the run reaches it
+                let program = super::aggregation::compile_over_slots(
+                    having,
+                    &result_columns,
+                    global_registry(),
+                    Some(&slots),
+                    false,
+                    None,
+                )?;
+                Some(super::expression::Program::bound(program, ctx.params()))
             }
             None => None,
         };
@@ -9104,7 +9114,16 @@ impl Executor {
             }
             let row = Row::from_values(values);
             if let Some(having) = &having {
-                if !having.matches_checked(&row)? {
+                thread_local! {
+                    static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+                }
+                let exec = super::aggregation::slot_context(&row, ctx);
+                // A function HAVING calls may run such a join again on this thread
+                let passes = VM.with(|vm| match vm.try_borrow_mut() {
+                    Ok(mut vm) => vm.execute_bool_checked(having, &exec),
+                    Err(_) => ExprVM::new().execute_bool_checked(having, &exec),
+                })?;
+                if !passes {
                     return Ok(false);
                 }
             }
