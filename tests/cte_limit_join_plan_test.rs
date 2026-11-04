@@ -20,7 +20,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::test_failpoints::{general_path_hits, random_draws, GeneralPath};
+use stoolap::test_failpoints::{bridge_compiles, general_path_hits, random_draws, GeneralPath};
 use stoolap::Database;
 
 // The counters are process-wide
@@ -199,6 +199,39 @@ fn a_join_whose_limit_cuts_a_cte_side_keeps_its_plan_and_the_cut() {
     check(&hot("matrix"), "hot", &mut wrong);
     let dir = tempfile::tempdir().unwrap();
     check(&sealed(&dir), "sealed", &mut wrong);
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_cut_cte_body_run_again_compiles_nothing_through_the_bridge() {
+    let _guard = serial();
+    let db = hot("bridge");
+    let mut wrong = Vec::new();
+    for from in FROMS {
+        for (select, on) in PLACES {
+            for order in ORDERS {
+                for limit in LIMITS {
+                    for v in ["(SELECT MAX(x) FROM w)", "9"] {
+                        let from = from.replace("{on}", on);
+                        let sql = format!("{WITH}SELECT {select} FROM {from}{order}{limit}")
+                            .replace("{v}", v);
+                        answer(&db, &sql).unwrap();
+                        let before = bridge_compiles();
+                        answer(&db, &sql).unwrap();
+                        let compiled = bridge_compiles() - before;
+                        if compiled != 0 {
+                            wrong.push(format!("{sql}: run again, {compiled} bridge compiles"));
+                        }
+                    }
+                }
+            }
+        }
+    }
     assert!(
         wrong.is_empty(),
         "{} wrong:\n{}",

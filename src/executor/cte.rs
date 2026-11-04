@@ -1786,7 +1786,6 @@ impl Executor {
 
         // Push LIMIT if CTE doesn't already have one: under a plan as a
         // parameter past the statement's own, so every cut runs one shape
-        let plan = plan.filter(|_| Self::body_runs_blocks(stmt));
         let mut cut_ctx = None;
         if modified_stmt.limit.is_none() {
             let limit = match plan {
@@ -1810,34 +1809,6 @@ impl Executor {
         // Execute with the pushed optimizations
         let ctx = cut_ctx.as_ref().unwrap_or(ctx);
         self.execute_cte_query(&modified_stmt, plan, ctx, cte_registry)
-    }
-
-    /// Whether the CTE body `stmt` runs blocks under its plan: a subquery,
-    /// a set operation branch's and a derived FROM's included, or a join
-    fn body_runs_blocks(stmt: &SelectStatement) -> bool {
-        let classification = get_classification(stmt);
-        classification.where_has_subqueries
-            || classification.output_has_subqueries
-            || classification.grouped_has_subqueries
-            || stmt
-                .table_expr
-                .as_deref()
-                .is_some_and(Self::source_runs_blocks)
-            || stmt
-                .set_operations
-                .iter()
-                .any(|op| Self::body_runs_blocks(&op.right))
-    }
-
-    /// Whether a FROM source runs blocks under its statement's plan: a join,
-    /// which reads its sides through them, or a derived table's statement
-    /// holding a subquery
-    fn source_runs_blocks(source: &Expression) -> bool {
-        match source {
-            Expression::JoinSource(_) => true,
-            Expression::SubquerySource(derived) => Self::body_runs_blocks(&derived.subquery),
-            _ => false,
-        }
     }
 }
 
