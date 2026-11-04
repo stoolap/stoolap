@@ -2637,8 +2637,12 @@ pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item =
 /// qualified column with `qualified`
 pub const QUALIFIER_SEP: char = '\u{1F}';
 
-/// The column text of `name` read through the FROM entry `qualifier`
+/// The column text of `name` read through the FROM entry `qualifier`; an
+/// entry without a name, such as an unaliased derived table, gives it bare
 pub fn qualified(qualifier: &str, name: &str) -> String {
+    if qualifier.is_empty() {
+        return name.to_string();
+    }
     let mut column = String::with_capacity(qualifier.len() + 1 + name.len());
     column.push_str(qualifier);
     column.push(QUALIFIER_SEP);

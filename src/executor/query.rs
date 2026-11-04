@@ -4781,11 +4781,7 @@ impl Executor {
             Expression::JoinSource(join) => {
                 let mut leaves = smallvec::SmallVec::new();
                 for side in [&join.left, &join.right] {
-                    let side = self.join_side(side, ctx, runs)?;
-                    if side.leaves.iter().any(|(name, _)| name.is_empty()) {
-                        return None;
-                    }
-                    leaves.extend(side.leaves);
+                    leaves.extend(self.join_side(side, ctx, runs)?.leaves);
                 }
                 Some(JoinSide { leaves, rows: true })
             }
