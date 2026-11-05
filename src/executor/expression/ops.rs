@@ -173,12 +173,12 @@ pub enum Op {
     /// Logical AND with short-circuit
     /// If top of stack is false, jump to target
     /// Stack: [bool] -> [bool] (or jump)
-    And(u16), // Jump target if false
+    And(u32), // Jump target if false
 
     /// Logical OR with short-circuit
     /// If top of stack is true, jump to target
     /// Stack: [bool] -> [bool] (or jump)
-    Or(u16), // Jump target if true
+    Or(u32), // Jump target if true
 
     /// Logical NOT
     /// Stack: [bool] -> [bool]
@@ -439,11 +439,11 @@ pub enum Op {
 
     /// WHEN condition: if top is false, jump to next branch
     /// Stack: [bool] -> [] (condition consumed)
-    CaseWhen(u16), // Jump to next WHEN/ELSE/END if false
+    CaseWhen(u32), // Jump to next WHEN/ELSE/END if false
 
     /// THEN result: jump to CASE end after pushing result
     /// Stack: [value] -> [value] (then jump)
-    CaseThen(u16), // Jump to END
+    CaseThen(u32), // Jump to END
 
     /// ELSE clause marker
     CaseElse,
@@ -459,26 +459,26 @@ pub enum Op {
     // CONTROL FLOW
     // =========================================================================
     /// Unconditional jump
-    Jump(u16),
+    Jump(u32),
 
     /// Jump if top of stack is true (doesn't pop)
-    JumpIfTrue(u16),
+    JumpIfTrue(u32),
 
     /// Jump if top of stack is false (doesn't pop)
-    JumpIfFalse(u16),
+    JumpIfFalse(u32),
 
     /// Jump if top of stack is NULL (doesn't pop)
-    JumpIfNull(u16),
+    JumpIfNull(u32),
 
     /// Jump if top of stack is NOT NULL (doesn't pop)
     /// Used for COALESCE short-circuit evaluation
-    JumpIfNotNull(u16),
+    JumpIfNotNull(u32),
 
     /// Pop and jump if true
-    PopJumpIfTrue(u16),
+    PopJumpIfTrue(u32),
 
     /// Pop and jump if false
-    PopJumpIfFalse(u16),
+    PopJumpIfFalse(u32),
 
     /// Duplicate top of stack
     Dup,

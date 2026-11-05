@@ -2089,7 +2089,7 @@ impl ExprVM {
             && steps.iter().enumerate().all(|(k, step)| {
                 matches!(step,
                     [Op::And(to), p, Op::AndFinalize] | [Op::Or(to), p, Op::OrFinalize]
-                        if usize::from(*to) == 3 * k + 4 && Self::is_single_op_predicate(p))
+                        if *to as usize == 3 * k + 4 && Self::is_single_op_predicate(p))
             })
     }
 

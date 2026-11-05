@@ -73,7 +73,7 @@ impl Program {
 
     /// [`Self::new`] with the ranges of `ops` that fold once the
     /// execution's parameters are known
-    pub fn with_folds(ops: Vec<Op>, mut folds: Vec<(u16, u16)>) -> Self {
+    pub fn with_folds(ops: Vec<Op>, mut folds: Vec<(u32, u32)>) -> Self {
         // Apply peephole optimizations
         let ops = Self::peephole_optimize(ops, &mut folds);
 
@@ -361,7 +361,7 @@ impl Program {
         };
         let mut folds: SmallVec<[(usize, usize); 4]> = marked
             .iter()
-            .map(|&(start, end)| (usize::from(start), usize::from(end)))
+            .map(|&(start, end)| (start as usize, end as usize))
             .filter(|&(start, end)| holds_replaced(start, end))
             .collect();
         let mut folded: SmallVec<[(usize, usize, Value); 2]> = SmallVec::new();
@@ -373,7 +373,7 @@ impl Program {
         let mut jumps: SmallVec<[(usize, usize); 8]> = source
             .iter_mut()
             .enumerate()
-            .filter_map(|(at, op)| jump_target(op).map(|target| (usize::from(*target), at)))
+            .filter_map(|(at, op)| jump_target(op).map(|target| (*target as usize, at)))
             .collect();
         jumps.sort_unstable();
         for (start, end) in folds {
@@ -415,11 +415,11 @@ impl Program {
         let mut range = Vec::with_capacity(end - start + 1);
         range.extend_from_slice(&source[start..end]);
         for target in range.iter_mut().filter_map(jump_target) {
-            let at = usize::from(*target);
+            let at = *target as usize;
             if !(start..=end).contains(&at) {
                 return None;
             }
-            *target = u16::try_from(at - start).ok()?;
+            *target = u32::try_from(at - start).ok()?;
         }
         Some(range)
     }
@@ -506,7 +506,7 @@ impl Program {
     }
 
     /// Peephole optimizer: fuse common instruction patterns into single ops
-    fn peephole_optimize(mut ops: Vec<Op>, folds: &mut Vec<(u16, u16)>) -> Vec<Op> {
+    fn peephole_optimize(mut ops: Vec<Op>, folds: &mut Vec<(u32, u32)>) -> Vec<Op> {
         if ops.len() < 2 {
             return ops;
         }
@@ -683,12 +683,12 @@ impl Program {
 
     /// The fold ranges at their positions after fusion; a range an op fused
     /// across its edge folds no more
-    fn adjust_folds(folds: &mut Vec<(u16, u16)>, position_map: &[usize], len: usize) {
-        let at = |old: u16| position_map.get(usize::from(old)).copied().unwrap_or(len);
+    fn adjust_folds(folds: &mut Vec<(u32, u32)>, position_map: &[usize], len: usize) {
+        let at = |old: u32| position_map.get(old as usize).copied().unwrap_or(len);
         folds.retain_mut(|(start, end)| {
             let edges_kept =
                 (*start == 0 || at(*start - 1) != at(*start)) && at(*end - 1) != at(*end);
-            (*start, *end) = (at(*start) as u16, at(*end) as u16);
+            (*start, *end) = (at(*start) as u32, at(*end) as u32);
             edges_kept
         });
     }
@@ -698,7 +698,7 @@ impl Program {
         for t in ops.iter_mut().filter_map(jump_target) {
             let old_target = *t as usize;
             if old_target < position_map.len() {
-                *t = position_map[old_target] as u16;
+                *t = position_map[old_target] as u32;
             }
         }
     }
@@ -761,7 +761,7 @@ pub(crate) fn known_params(op: &Op, value: impl Fn(u32) -> Option<Value>) -> Opt
 struct Binding {
     /// The ranges of ops that fold into one value once the parameters are
     /// known, as the compiler marked them
-    folds: Vec<(u16, u16)>,
+    folds: Vec<(u32, u32)>,
     /// Whether binding the parameters shrinks the program, once a bind
     /// found it out for every value
     shrinks: std::sync::OnceLock<bool>,
@@ -773,7 +773,7 @@ struct Binding {
 impl Binding {
     /// The binding of a program of `ops`, when one loads a parameter or
     /// tests a column against parameters read as its type
-    fn of(ops: &[Op], folds: Vec<(u16, u16)>) -> Option<Box<Self>> {
+    fn of(ops: &[Op], folds: Vec<(u32, u32)>) -> Option<Box<Self>> {
         let reads = ops.iter().any(|op| read_as_of(op).is_some());
         (reads || ops.iter().any(|op| matches!(op, Op::LoadParam(_)))).then(|| {
             Box::new(Self {
@@ -835,7 +835,7 @@ impl JumpTargets {
             if ranges.peek().is_some_and(|(start, ..)| *start <= at) {
                 continue;
             }
-            if let Some(target) = targets.get_mut(usize::from(*t)) {
+            if let Some(target) = targets.get_mut(*t as usize) {
                 *target = true;
             }
         }
@@ -849,7 +849,7 @@ impl JumpTargets {
 }
 
 /// The position `op` jumps to, when it jumps
-fn jump_target(op: &mut Op) -> Option<&mut u16> {
+fn jump_target(op: &mut Op) -> Option<&mut u32> {
     match op {
         Op::And(t)
         | Op::Or(t)
@@ -880,7 +880,7 @@ impl std::fmt::Debug for Program {
 pub struct ProgramBuilder {
     ops: Vec<Op>,
     /// The ranges of ops that fold once the execution's parameters are known
-    folds: Vec<(u16, u16)>,
+    folds: Vec<(u32, u32)>,
     /// How many parameter loads were emitted
     params_loaded: u32,
 }
@@ -912,21 +912,21 @@ impl ProgramBuilder {
 
     /// How many ops were emitted since `start`, none when the program has
     /// grown past what a position holds
-    pub fn emitted_since(&self, start: u16) -> usize {
-        match u16::try_from(self.ops.len()) {
-            Ok(end) => usize::from(end - start),
+    pub fn emitted_since(&self, start: u32) -> usize {
+        match u32::try_from(self.ops.len()) {
+            Ok(end) => (end - start) as usize,
             Err(_) => 0,
         }
     }
 
     /// The ops emitted since `start` fold into one value once the
     /// execution's parameters are known
-    pub fn mark_fold(&mut self, start: u16) {
+    pub fn mark_fold(&mut self, start: u32) {
         self.folds.push((start, self.position()));
     }
 
     /// Whether the ops emitted since `start` were marked to fold as one
-    pub fn folds_since(&self, start: u16) -> bool {
+    pub fn folds_since(&self, start: u32) -> bool {
         self.folds.last() == Some(&(start, self.position()))
     }
 
@@ -939,13 +939,13 @@ impl ProgramBuilder {
 
     /// Get current position (for jump targets)
     #[inline]
-    pub fn position(&self) -> u16 {
-        self.ops.len() as u16
+    pub fn position(&self) -> u32 {
+        self.ops.len() as u32
     }
 
     /// The value of the one `LoadConst` emitted since `start`, taken back out
-    pub fn take_constant_since(&mut self, start: u16) -> Option<Value> {
-        if self.ops.len() != usize::from(start) + 1 {
+    pub fn take_constant_since(&mut self, start: u32) -> Option<Value> {
+        if self.ops.len() != start as usize + 1 {
             return None;
         }
         match self.ops.pop() {
@@ -959,7 +959,7 @@ impl ProgramBuilder {
     }
 
     /// Patch a jump target at a specific position
-    pub fn patch_jump(&mut self, pos: usize, target: u16) {
+    pub fn patch_jump(&mut self, pos: usize, target: u32) {
         if pos < self.ops.len() {
             match &mut self.ops[pos] {
                 Op::And(t)
