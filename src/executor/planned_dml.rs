@@ -98,6 +98,8 @@ pub struct PlannedDml {
     pub(crate) validity: PlanValidity,
     pk_column: SmartString,
     key: PkValueSource,
+    /// The WHERE over the row the key names, when it asks more than the key
+    where_: Option<SharedProgram>,
     write: DmlWrite,
     /// Whether a value it sets is a row expression, which a run reads its
     /// parameters for from its context
@@ -185,7 +187,8 @@ impl Executor {
     }
 
     /// The plan of `stmt` when its WHERE is its table's single-column primary
-    /// key equality and its write needs nothing the general path runs: no
+    /// key equality, or for an UPDATE ANDs it with other conditions, and its
+    /// write needs nothing the general path runs: no
     /// RETURNING or WITH, no foreign key to keep, no CHECK reading a column
     /// it sets. An UPDATE of the primary key is refused
     fn dml_plan(
@@ -225,8 +228,28 @@ impl Executor {
                 DmlWrite::Delete
             }
         };
-        let Some(key) = Self::key_source(where_clause, pk_column) else {
+        let conjuncts = super::utils::extract_and_conditions(where_clause);
+        let Some(key) = conjuncts
+            .iter()
+            .find_map(|conjunct| Self::key_source(conjunct, pk_column))
+        else {
             return Ok(None);
+        };
+        // The row the key names is still asked the whole WHERE, by the VM
+        let where_ = match conjuncts.len() {
+            1 => None,
+            // The general path's DELETE asks them of the version it deletes
+            _ if matches!(write, DmlWrite::Delete) => return Ok(None),
+            _ if Self::expr_contains_subquery(where_clause) => return Ok(None),
+            _ => {
+                let compile = super::expression::CompileContext::with_global_registry(
+                    schema.column_names_owned(),
+                );
+                match super::expression::ExprCompiler::new(&compile).compile(where_clause) {
+                    Ok(program) => Some(CompactArc::new(program)),
+                    Err(_) => return Ok(None),
+                }
+            }
         };
         let sets_rows = match &write {
             DmlWrite::Update(columns) => columns
@@ -242,6 +265,7 @@ impl Executor {
             token,
             validity,
             key,
+            where_,
             write,
         }))
     }
@@ -299,7 +323,7 @@ impl Executor {
         Ok(Some(columns))
     }
 
-    /// Where the key of a WHERE `pk_column = value` comes from: a literal
+    /// Where the key of a conjunct `pk_column = value` comes from: a literal
     /// that is an integer, or a parameter whose value each run checks
     fn key_source(where_clause: &Expression, pk_column: &str) -> Option<PkValueSource> {
         let Expression::Infix(infix) = where_clause else {
@@ -381,7 +405,7 @@ impl Executor {
         ctx: Option<&ExecutionContext>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        if plan.sets_rows && ctx.is_none() {
+        if (plan.sets_rows || plan.where_.is_some()) && ctx.is_none() {
             return None;
         }
         let key = match &plan.key {
@@ -488,6 +512,12 @@ impl Executor {
             DmlWrite::Update(_) => {
                 let mut vm = super::expression::ExprVM::new();
                 let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+                    if let Some(where_) = &plan.where_ {
+                        let exec_ctx = super::expression::execute_context(&row, ctx, None);
+                        if !vm.execute_bool_checked(where_, &exec_ctx)? {
+                            return Ok((row, false));
+                        }
+                    }
                     if !programs.is_empty() {
                         let mut computed = Vec::with_capacity(programs.len());
                         {
@@ -564,6 +594,9 @@ impl Executor {
             PkValueSource::Parameter(at) => format!("${}", at + 1),
         };
         let mut lines = vec![head, format!("  PkGet {table} {} = {key}", plan.pk_column)];
+        if plan.where_.is_some() {
+            lines.push(format!("    Filter: {where_clause}"));
+        }
         // A key that names no row id leaves the WHERE to the table's write,
         // whose index rule reads a key equality by the key
         let scan = ScanChoice::Index(IndexPlan::Key, std::sync::Weak::new());

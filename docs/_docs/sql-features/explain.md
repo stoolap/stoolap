@@ -97,6 +97,23 @@ Update users SET email = 'new@example.com'
     PkKey
 ```
 
+An UPDATE whose WHERE ANDs the key's equality with other conditions takes the same plan. The row the key names is written only when the whole WHERE holds for it, which the `Filter` line shows:
+
+```sql
+EXPLAIN UPDATE users SET email = 'new@example.com' WHERE id = 1 AND email <> 'new@example.com';
+```
+
+Output:
+```
+plan
+----
+Update users SET email = 'new@example.com'
+  PkGet users id = 1
+    Filter: ((id = 1) AND (email <> 'new@example.com'))
+  else IndexScan users ((id = 1) AND (email <> 'new@example.com'))
+    PkKey
+```
+
 Any other UPDATE or DELETE shows its clauses:
 
 ```sql

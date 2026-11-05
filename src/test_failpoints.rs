@@ -403,6 +403,7 @@ thread_local! {
     static CLEAR_GENERATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static TRUNCATE_MARKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COUNT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static KEY_DELETE_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -488,6 +489,19 @@ pub fn after_count_captured(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn count_captured() {
     let hook = COUNT_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next delete by a primary key is about
+/// to read the version it deletes
+pub fn before_key_delete_read(hook: impl FnOnce() + 'static) {
+    KEY_DELETE_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn key_delete_read() {
+    let hook = KEY_DELETE_READ_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -3452,6 +3466,7 @@ pub fn reset_all() {
     CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = None);
     TRUNCATE_MARKED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    KEY_DELETE_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
