@@ -1997,9 +1997,16 @@ impl Executor {
                     SelectItemSource::WindowFunction(name) => {
                         CompiledItem::WindowFunction(name.as_str())
                     }
-                    SelectItemSource::Expression(expr) => CompiledItem::Expression(
-                        RowPrograms::compile([expr], base_columns, None, ctx, blocks, held)?,
-                    ),
+                    SelectItemSource::Expression(expr) => {
+                        CompiledItem::Expression(RowPrograms::compile(
+                            [expr],
+                            base_columns,
+                            Some(group_slots),
+                            ctx,
+                            blocks,
+                            held,
+                        )?)
+                    }
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
                         let transformed =
@@ -2011,7 +2018,7 @@ impl Executor {
                         let eval = RowPrograms::compile(
                             [&transformed],
                             &ext_columns,
-                            None,
+                            Some(group_slots),
                             ctx,
                             blocks,
                             held,

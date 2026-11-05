@@ -107,6 +107,12 @@ fn a_grouped_column_named_like_a_select_alias_reads_the_column() {
         assert_eq!(rows(&db, sql, false), want, "{sql}");
         assert_eq!(rows(&db, sql, true), want, "prepared: {sql}");
     }
+    let sql = "SELECT SUM(a) AS b, b + 1, SUM(b) OVER (PARTITION BY b) FROM t GROUP BY b LIMIT 2";
+    for prepared in [false, true] {
+        let mut got = rows(&db, sql, prepared);
+        got.sort();
+        assert_eq!(got, vec![row(&[3, 11, 10]), row(&[3, 21, 20])], "{sql}");
+    }
 }
 
 #[test]
