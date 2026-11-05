@@ -28,7 +28,7 @@ use crate::storage::expression::{
 };
 use std::sync::Arc;
 
-use super::{registry, PushdownContext, PushdownResult, PushdownRule};
+use super::{registry, runs_ahead, PushdownContext, PushdownResult, PushdownRule};
 use crate::common::SmartString;
 use crate::executor::utils::{
     column_name_of, extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
@@ -258,10 +258,8 @@ impl PushdownRule for LogicalAndRule {
 
         let needs_memory_filter = left_needs_mem || right_needs_mem;
 
-        // A right side pushed past a left one kept in memory runs first, so it
-        // goes only if it cannot raise an error the left would have prevented
         let left_whole = left_pushable.is_some() && !left_needs_mem;
-        let right_pushable = right_pushable.filter(|right| left_whole || !right.can_fail());
+        let right_pushable = right_pushable.filter(|right| runs_ahead(&**right, left_whole));
 
         match (left_pushable, right_pushable) {
             (Some(mut left), Some(mut right)) => {

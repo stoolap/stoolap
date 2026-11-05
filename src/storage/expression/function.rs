@@ -30,7 +30,7 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::core::predicate::{sql_compare, sql_eq};
-use crate::core::{Operator, Result, Row, Schema, Value};
+use crate::core::{Operator, Result, Row, Schema, Value, NULL_VALUE};
 use crate::functions::ScalarFunction;
 
 use super::{find_column_index, resolve_alias, Expression};
@@ -249,8 +249,8 @@ impl Expression for FunctionExpr {
         if self.arguments.len() == 1 {
             if let FunctionArg::Column(_) = &self.arguments[0] {
                 if let Some(idx) = self.arg_indices.first().copied().flatten() {
-                    let value = row.get(idx).cloned().unwrap_or_else(Value::null_unknown);
-                    let result = self.function.evaluate(std::slice::from_ref(&value))?;
+                    let value = row.get(idx).unwrap_or(&NULL_VALUE);
+                    let result = self.function.evaluate(std::slice::from_ref(value))?;
                     return Ok(self.compare(&result, &self.compare_value));
                 }
             }

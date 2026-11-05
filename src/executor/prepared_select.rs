@@ -2598,6 +2598,23 @@ fn bind_aliases(
     }
 }
 
+/// Whether the scan's filter takes `conjunct` whole, judged now when no
+/// run's values change that, after the conjuncts before it; `left_out`
+/// tells whether it left one of them out, and is told
+fn filter_takes(conjunct: &Expression, schema: &Schema, left_out: &mut bool) -> bool {
+    if super::utils::expression_has_parameters(conjunct)
+        || expression_volatility(conjunct, global_registry()) != Volatility::Fixed
+    {
+        return true;
+    }
+    let taken = match pushdown::try_pushdown(conjunct, schema, None) {
+        (Some(filter), false) => pushdown::runs_ahead(&*filter, !*left_out),
+        _ => false,
+    };
+    *left_out |= !taken;
+    taken
+}
+
 /// Whether every column `expr` reads is one the scan compares
 fn scans_whole(expr: &Expression, schema: &Schema) -> bool {
     match expr {
@@ -11518,10 +11535,13 @@ impl Builder<'_> {
         conjuncts(where_clause, &mut parts);
         let mut rewritten = Vec::with_capacity(parts.len());
         let mut set_tests = Vec::new();
+        let mut left_out = false;
         for (at, part) in parts.into_iter().enumerate() {
             let part = self.statement_conjunct(chain, part, false, work, run_slots)?;
-            let scanned =
-                !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema);
+            let scanned = !mentions_subquery(&part)
+                && !needs_folding(&part)
+                && scans_whole(&part, schema)
+                && filter_takes(&part, schema, &mut left_out);
             let set_test = match &part {
                 Expression::Exists(mark) => Some((&mark.subquery, false, None)),
                 Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Not => {
