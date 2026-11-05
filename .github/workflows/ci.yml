@@ -15,6 +15,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
+  # Every test file links its own binary: debug info would multiply in each
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   lint:
@@ -102,8 +104,11 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /usr/local/lib/android
         sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /opt/hostedtoolcache
+        sudo rm -rf /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/node_modules /usr/share/swift /usr/local/.ghcup
         sudo docker image prune --all --force
+        df -h /
 
     - uses: actions/checkout@v4
 
@@ -133,8 +138,11 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /usr/local/lib/android
         sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /opt/hostedtoolcache
+        sudo rm -rf /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/node_modules /usr/share/swift /usr/local/.ghcup
         sudo docker image prune --all --force
+        df -h /
 
     - uses: actions/checkout@v4
 
@@ -167,8 +175,11 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /usr/local/lib/android
         sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /opt/hostedtoolcache
+        sudo rm -rf /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/node_modules /usr/share/swift /usr/local/.ghcup
         sudo docker image prune --all --force
+        df -h /
 
     - uses: actions/checkout@v4
 
