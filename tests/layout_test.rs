@@ -123,9 +123,11 @@ fn a_top_level_test_file_is_one_that_needs_a_binary_of_its_own() {
         if !name.ends_with(".rs") || OWN_BINARIES.contains(&name.as_str()) {
             continue;
         }
+        // CI's allocation step finds these files by this line, at its start
         if !fs::read_to_string(&path)
             .unwrap()
-            .contains("#[global_allocator]")
+            .lines()
+            .any(|l| l.starts_with("#[global_allocator]"))
         {
             extra.push(name);
         }
