@@ -17,15 +17,29 @@
 
 use stoolap::Database;
 
-/// `p` is a pattern REGEXP refuses, so evaluating `'x' REGEXP p` fails
+/// `p` is a pattern REGEXP refuses and `ABS(x)` overflows, so evaluating
+/// `'x' REGEXP p` or `ABS(x) >= 0` fails
 fn setup(db: &Database) {
     db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER, p TEXT)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER, p TEXT, x INTEGER)",
         (),
     )
     .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 0, '[')", ()).unwrap();
+    insert(db, 1);
 }
+
+fn insert(db: &Database, id: i64) {
+    db.execute("INSERT INTO t VALUES ($1, 0, '[', $2)", (id, i64::MIN))
+        .unwrap();
+}
+
+/// A WHERE whose AND is false on every row, with an operand the storage
+/// can filter by on the right
+const FALSE_WHERES: [&str; 3] = [
+    "SELECT id FROM t WHERE b AND ABS(x) >= 0",
+    "UPDATE t SET b = 1 WHERE b AND ABS(x) >= 0",
+    "DELETE FROM t WHERE b AND ABS(x) >= 0",
+];
 
 fn answers(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     db.query(sql, ())
@@ -91,6 +105,15 @@ fn check(db: &Database, rows: usize) -> Vec<String> {
             }
         }
     }
+    for sql in FALSE_WHERES {
+        let got = match sql.starts_with("SELECT") {
+            true => answers(db, sql).map(|rows| rows.len() as i64),
+            false => db.execute(sql, ()).map_err(|e| e.to_string()),
+        };
+        if got != Ok(0) {
+            wrong.push(format!("{sql}: {got:?}"));
+        }
+    }
     wrong
 }
 
@@ -113,7 +136,7 @@ fn a_left_operand_of_any_type_decides_and_and_or_on_sealed_rows() {
     setup(&db);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     assert!(!db.engine().volume_stats().is_empty(), "sealed");
-    db.execute("INSERT INTO t VALUES (2, 0, '[')", ()).unwrap();
+    insert(&db, 2);
     let wrong = check(&db, 2);
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }

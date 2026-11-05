@@ -258,6 +258,11 @@ impl PushdownRule for LogicalAndRule {
 
         let needs_memory_filter = left_needs_mem || right_needs_mem;
 
+        // A right side pushed past a left one kept in memory runs first, so it
+        // goes only if it cannot raise an error the left would have prevented
+        let left_whole = left_pushable.is_some() && !left_needs_mem;
+        let right_pushable = right_pushable.filter(|right| left_whole || !right.can_fail());
+
         match (left_pushable, right_pushable) {
             (Some(mut left), Some(mut right)) => {
                 // Both sides pushable - combine with AND
