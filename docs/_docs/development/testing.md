@@ -27,8 +27,11 @@ Stoolap has a comprehensive test suite covering all major subsystems, from SQL p
 # Run all tests (debug mode)
 cargo nextest run
 
-# Run a specific test file (faster, compiles only that target)
-cargo nextest run --test subquery_advanced_test
+# Run one group of tests (compiles only that binary)
+cargo nextest run --test subquery
+
+# Run one file of a group
+cargo nextest run --test subquery -E 'test(/^subquery_advanced_test::/)'
 
 # Run library unit tests only
 cargo nextest run --lib
@@ -40,7 +43,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-**Important**: Always use `cargo nextest run --test <name>` instead of keyword filtering (`cargo nextest run <keyword>`). The `--test` flag compiles only the specified test binary, which is significantly faster.
+**Important**: Always use `cargo nextest run --test <group>` instead of keyword filtering (`cargo nextest run <keyword>`). The `--test` flag compiles only that group's binary, which is significantly faster.
+
+Integration tests live in groups: each directory under `tests/` (`join`, `subquery`, `seal_compaction`, ...) is one test binary, and each file in it is a module its `main.rs` declares. A file at the top of `tests/` is a binary of its own, kept for tests that set the global allocator, need a feature of their own, or run long stress loops. CI runs the tests with nextest, one process per test.
 
 **Never** use `cargo test --release` due to disk space constraints. Always test in debug mode.
 
@@ -57,8 +62,8 @@ cargo nextest run --features stress-tests --test concurrency_history_test
 # Differential oracle (compares against SQLite, in the stoolap-compare crate)
 cargo nextest run -p stoolap-compare --test differential_oracle_test
 
-# I/O fault injection (must run single-threaded)
-cargo nextest run --features test-failpoints --test failpoint_io_test -- --test-threads=1
+# I/O fault injection
+cargo nextest run --features test-failpoints --test persistence -E 'test(/^failpoint_io_test::/)'
 
 # C FFI layer tests
 cargo nextest run --features ffi --test ffi_test
@@ -226,7 +231,7 @@ Stoolap uses [proptest](https://github.com/proptest-rs/proptest) for metamorphic
 
 ## Writing New Tests
 
-1. Create a test file in `tests/` following the naming pattern: `<feature>_test.rs`
+1. Create a test file in the group under `tests/` it tests, named `<feature>_test.rs`, and declare it as `mod <feature>_test;` in that group's `main.rs`
 2. Use `stoolap::Database` for the public API
 3. Use `memory://` connection strings for in-memory test databases
 4. Each test function should be independent (create its own database)

@@ -36,11 +36,16 @@ cargo fmt
 # Run all tests (debug mode, never use --release)
 cargo nextest run
 
-# Run a specific test file (faster, compiles only that target)
-cargo nextest run --test my_feature_test
+# Run one group of tests (compiles only that binary)
+cargo nextest run --test join
+
+# Run one file of a group
+cargo nextest run --test join -E 'test(/^join_plan_test::/)'
 ```
 
-**Important**: Use `cargo nextest run --test <name>` instead of keyword filtering. The `--test` flag compiles only the specified test binary, which is significantly faster.
+Integration tests live in groups: each directory under `tests/` is one test binary, and each file in it is a module its `main.rs` declares. Add a new test file to the group it tests and declare it in that group's `main.rs`; `layout_test` fails on a file that is not declared, and on a new file at the top of `tests/`.
+
+**Important**: Use `cargo nextest run --test <group>` instead of keyword filtering. The `--test` flag compiles only that group's binary, which is significantly faster.
 
 ## Pull Request Process
 

@@ -36,8 +36,13 @@ pub struct Answers {
 #[macro_export]
 macro_rules! answers {
     ($name:literal) => {
-        oracle::Answers {
-            text: include_str!(concat!("oracle/", $name, ".answers")),
+        $crate::oracle::Answers {
+            text: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/oracle/",
+                $name,
+                ".answers"
+            )),
             path: concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/oracle/",

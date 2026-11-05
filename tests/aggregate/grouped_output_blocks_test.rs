@@ -1,0 +1,1335 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A grouped statement over one table whose SELECT list or HAVING holds a
+//! subquery runs it through prepared blocks: it answers as recorded, or as
+//! its literal twin, hot and sealed, and an uncorrelated
+//! value keeps the aggregate path its literal takes, which the runner groups
+//! where the blocks' rows are grouped by the general aggregation
+
+#![cfg(feature = "test-failpoints")]
+
+use crate::oracle;
+
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard};
+
+use stoolap::test_failpoints::{
+    aggregate_paths_taken, before_grouped_table_opened, general_path_total, random_draws,
+    reset_aggregate_paths,
+};
+use stoolap::Database;
+
+// The general path counters are process-wide
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The aggregate path the literal twin of a statement that took `taken`
+/// takes: the runner groups the rows of a statement without subqueries
+fn literal_path(taken: &[&'static str]) -> Vec<&'static str> {
+    match taken {
+        ["general"] => vec!["hash_groups"],
+        other => other.to_vec(),
+    }
+}
+
+/// t: id 1..200, a = id % 9, b = id % 13; u: id 1..40, k = id % 11, x = id % 7
+fn fill(db: &Database) {
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        "INSERT INTO t SELECT g.value, g.value % 9, g.value % 13 FROM generate_series(1, 200) g",
+        "INSERT INTO u SELECT g.value, g.value % 11, g.value % 7 FROM generate_series(1, 40) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+}
+
+/// Each statement, and for one whose subqueries read no row, the same
+/// statement with each subquery written as its value
+const CASES: &[(&str, Option<&str>)] = &[
+    (
+        "SELECT a, SUM(b), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a ORDER BY a",
+        Some("SELECT a, SUM(b), 6 FROM t GROUP BY a ORDER BY a"),
+    ),
+    (
+        "SELECT a, (SELECT MAX(u.x) FROM u) + SUM(b) AS s FROM t GROUP BY a ORDER BY a",
+        Some("SELECT a, 6 + SUM(b) AS s FROM t GROUP BY a ORDER BY a"),
+    ),
+    (
+        "SELECT SUM(b), (SELECT MAX(u.x) FROM u), COUNT(*) FROM t",
+        Some("SELECT SUM(b), 6, COUNT(*) FROM t"),
+    ),
+    (
+        "SELECT a, SUM(b) FROM t GROUP BY a HAVING SUM(b) > (SELECT MAX(u.x) FROM u) * 20 ORDER BY a",
+        Some("SELECT a, SUM(b) FROM t GROUP BY a HAVING SUM(b) > 6 * 20 ORDER BY a"),
+    ),
+    (
+        "SELECT a, COUNT(*), EXISTS (SELECT 1 FROM u WHERE u.x > 5) FROM t GROUP BY a ORDER BY a",
+        Some("SELECT a, COUNT(*), TRUE FROM t GROUP BY a ORDER BY a"),
+    ),
+    (
+        "SELECT a, SUM(b), (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, EXISTS (SELECT 1 FROM u WHERE u.k = t.a AND u.x > 3) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, a IN (SELECT u.k FROM u WHERE u.x > 3) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, a > ANY (SELECT u.k FROM u WHERE u.x = t.a) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, (SELECT MAX(u.x) FROM u WHERE u.k = t.a) * COUNT(*) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) > ANY (SELECT u.k * 12 FROM u WHERE u.x = t.a) FROM t GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) FROM t GROUP BY a HAVING COUNT(*) IN (SELECT u.k * 2 + 2 FROM u) ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, b, (SELECT COUNT(*) FROM u WHERE u.k = t.a AND u.x = t.b) FROM t \
+         GROUP BY a, b ORDER BY a, b",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) FROM t GROUP BY a HAVING EXISTS (SELECT 1 FROM u WHERE u.k = t.a) ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, COUNT(*) FROM t GROUP BY a \
+         HAVING COUNT(*) >= 6 * (SELECT COUNT(*) FROM u WHERE u.k = t.a) ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) FROM t GROUP BY a HAVING a IN (SELECT u.k FROM u WHERE u.x > 3) ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a AS g, COUNT(*) FROM t GROUP BY a HAVING g IN (SELECT u.k FROM u WHERE u.x > 3) \
+         ORDER BY g",
+        None,
+    ),
+    (
+        "SELECT a AS g, SUM(b) FROM t GROUP BY a HAVING g > ANY (SELECT u.k FROM u WHERE u.x = t.a) \
+         ORDER BY g",
+        None,
+    ),
+    (
+        "SELECT a AS k, b AS k, COUNT(*) FROM t GROUP BY a, b \
+         HAVING k = (SELECT MIN(u.k) + 1 FROM u) ORDER BY 1, 2",
+        Some("SELECT a AS k, b AS k, COUNT(*) FROM t GROUP BY a, b HAVING k = 1 ORDER BY 1, 2"),
+    ),
+    (
+        "SELECT a, (SELECT MAX(u.x) FROM u), (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM t \
+         GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b), (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM t WHERE b > 3 \
+         GROUP BY a ORDER BY a LIMIT 4",
+        None,
+    ),
+];
+
+/// Each statement whose subqueries read the input rows, the same answer
+/// with each subquery's value computed as a column of a derived table, and
+/// for one whose subqueries read no row, the statement with their values
+const INPUT_CASES: &[(&str, &str, Option<&str>)] = &[
+    (
+        "SELECT COUNT(*) FROM t GROUP BY id > (SELECT MAX(u.x) * 20 FROM u) ORDER BY 1",
+        "SELECT COUNT(*) FROM (SELECT id > (SELECT MAX(u.x) * 20 FROM u) AS g FROM t) d \
+         GROUP BY g ORDER BY 1",
+        Some("SELECT COUNT(*) FROM t GROUP BY id > 120 ORDER BY 1"),
+    ),
+    (
+        "SELECT COUNT(*), SUM(b) FROM t GROUP BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) \
+         ORDER BY 1, 2",
+        "SELECT COUNT(*), SUM(b) FROM (SELECT b, (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g \
+         FROM t) d GROUP BY g ORDER BY 1, 2",
+        None,
+    ),
+    (
+        "SELECT id > (SELECT MAX(u.x) * 20 FROM u), COUNT(*) FROM t \
+         GROUP BY id > (SELECT MAX(u.x) * 20 FROM u) ORDER BY 1",
+        "SELECT g, COUNT(*) FROM (SELECT id > (SELECT MAX(u.x) * 20 FROM u) AS g FROM t) d \
+         GROUP BY g ORDER BY 1",
+        Some("SELECT id > 120, COUNT(*) FROM t GROUP BY id > 120 ORDER BY 1"),
+    ),
+    (
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS c, COUNT(*) FROM t \
+         GROUP BY (SELECT COUNT(*) FROM u WHERE u.k = t.a) ORDER BY 1",
+        "SELECT g, COUNT(*) FROM (SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g FROM t) d \
+         GROUP BY g ORDER BY 1",
+        None,
+    ),
+    (
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS c, COUNT(*) FROM t GROUP BY c \
+         ORDER BY 1",
+        "SELECT g, COUNT(*) FROM (SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g FROM t) d \
+         GROUP BY g ORDER BY 1",
+        None,
+    ),
+    (
+        "SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a), COUNT(*) FROM t GROUP BY 1 ORDER BY 1",
+        "SELECT g, COUNT(*) FROM (SELECT (SELECT COUNT(*) FROM u WHERE u.k = t.a) AS g FROM t) d \
+         GROUP BY g ORDER BY 1",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b * (SELECT MAX(u.x) FROM u)) FROM t GROUP BY a ORDER BY a",
+        "SELECT a, SUM(v) FROM (SELECT a, b * (SELECT MAX(u.x) FROM u) AS v FROM t) d \
+         GROUP BY a ORDER BY a",
+        Some("SELECT a, SUM(b * 6) FROM t GROUP BY a ORDER BY a"),
+    ),
+    (
+        "SELECT a, SUM((SELECT COUNT(*) FROM u WHERE u.k = t.b)) FROM t GROUP BY a ORDER BY a",
+        "SELECT a, SUM(v) FROM (SELECT a, (SELECT COUNT(*) FROM u WHERE u.k = t.b) AS v FROM t) d \
+         GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, COUNT(*) FILTER (WHERE b > (SELECT MIN(u.x) FROM u WHERE u.k = t.a)) FROM t \
+         GROUP BY a ORDER BY a",
+        "SELECT a, COUNT(*) FILTER (WHERE f) FROM (SELECT a, b > (SELECT MIN(u.x) FROM u \
+         WHERE u.k = t.a) AS f FROM t) d GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) FILTER (WHERE b IN (SELECT u.x FROM u WHERE u.k < 3)) FROM t \
+         GROUP BY a ORDER BY a",
+        "SELECT a, SUM(b) FILTER (WHERE f) FROM (SELECT a, b, b IN (SELECT u.x FROM u \
+         WHERE u.k < 3) AS f FROM t) d GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, STRING_AGG(CAST(b AS TEXT), ',' ORDER BY (SELECT COUNT(*) FROM u \
+         WHERE u.x = t.b), b) FROM t GROUP BY a ORDER BY a",
+        "SELECT a, STRING_AGG(CAST(b AS TEXT), ',' ORDER BY o, b) FROM (SELECT a, b, \
+         (SELECT COUNT(*) FROM u WHERE u.x = t.b) AS o FROM t) d GROUP BY a ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.a AND u.x > 4)), \
+         SUM(b) FROM t",
+        "SELECT c, s FROM (SELECT COUNT(*) AS c FROM t WHERE EXISTS (SELECT 1 FROM u \
+         WHERE u.k = t.a AND u.x > 4)) x, (SELECT SUM(b) AS s FROM t) y",
+        None,
+    ),
+    (
+        "SELECT a FROM t GROUP BY a HAVING SUM((SELECT COUNT(*) FROM u WHERE u.k = t.b)) > 60 \
+         ORDER BY a",
+        "SELECT a FROM (SELECT a, (SELECT COUNT(*) FROM u WHERE u.k = t.b) AS v FROM t) d \
+         GROUP BY a HAVING SUM(v) > 60 ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b * (SELECT MAX(u.x) FROM u WHERE u.k = t.a)) FROM t GROUP BY a \
+         HAVING SUM(b * (SELECT MAX(u.x) FROM u WHERE u.k = t.a)) > 300 ORDER BY a",
+        "SELECT a, SUM(v) FROM (SELECT a, b * (SELECT MAX(u.x) FROM u WHERE u.k = t.a) AS v \
+         FROM t) d GROUP BY a HAVING SUM(v) > 300 ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM(b) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.b) GROUP BY a \
+         HAVING SUM(b) > (SELECT MAX(u.x) FROM u) * 10 ORDER BY a",
+        "SELECT a, SUM(b) FROM (SELECT a, b FROM t WHERE EXISTS (SELECT 1 FROM u \
+         WHERE u.k = t.b)) d GROUP BY a HAVING SUM(b) > 60 ORDER BY a",
+        None,
+    ),
+    (
+        "SELECT a, SUM((SELECT COUNT(*) FROM u WHERE u.k = t.b)) FROM t \
+         WHERE b > (SELECT MIN(u.x) FROM u) + 2 GROUP BY a ORDER BY a",
+        "SELECT a, SUM(v) FROM (SELECT a, (SELECT COUNT(*) FROM u WHERE u.k = t.b) AS v FROM t \
+         WHERE b > 2) d GROUP BY a ORDER BY a",
+        None,
+    ),
+];
+
+/// Each row, without the column names
+fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
+    let result = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in result {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push(
+            (0..row.len())
+                .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+    }
+    Ok(out)
+}
+
+fn columns(db: &Database, sql: &str) -> Vec<String> {
+    db.query(sql, ()).unwrap().columns().to_vec()
+}
+
+fn prepared_line(db: &Database, sql: &str) -> String {
+    db.query(&format!("EXPLAIN {sql}"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.trim_start().starts_with("Prepared:"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default()
+}
+
+const RECORDED: oracle::Answers = answers!("grouped_output_blocks");
+const RECORDED_INPUT: oracle::Answers = answers!("grouped_output_blocks_input");
+const RECORDED_BEFORE: oracle::Answers = answers!("grouped_output_blocks_before");
+const RECORDED_AROUND: oracle::Answers = answers!("grouped_output_blocks_around");
+const RECORDED_ERRORS: oracle::Answers = answers!("grouped_output_blocks_errors");
+const RECORDED_KEYED: oracle::Answers = answers!("grouped_output_blocks_keyed");
+const RECORDED_SCHEMA: oracle::Answers = answers!("grouped_output_blocks_schema");
+
+/// The rows of `sql`, or its error, as `answers` records them under `key`
+fn recorded(
+    db: &Database,
+    answers: &oracle::Answers,
+    key: &str,
+    sql: &str,
+) -> Result<Vec<String>, String> {
+    let got = rows(db, sql);
+    if let Some(why) = oracle::check_answer(answers, key, &got) {
+        panic!("{why}");
+    }
+    got
+}
+
+#[test]
+fn a_grouped_statement_reads_its_output_s_subqueries_through_its_blocks() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://grouped_output_blocks").unwrap();
+            fill(&db);
+            db
+        };
+        for (sql, literal) in CASES {
+            let first = rows(&db, sql);
+            reset_aggregate_paths();
+            let again = rows(&db, sql);
+            let taken = aggregate_paths_taken();
+            wrong.extend(
+                oracle::check_answer(&RECORDED, sql, &first)
+                    .map(|why| format!("sealed {sealed}: {why}")),
+            );
+            let want = first.clone();
+            if !want.as_ref().is_ok_and(|rows| !rows.is_empty()) {
+                wrong.push(format!("sealed {sealed}: {sql}: answers {want:?}"));
+                continue;
+            }
+            let line = prepared_line(&db, sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("sealed {sealed}: {sql}: {line}"));
+            }
+            if again != want {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql}: gave {first:?} then {again:?}"
+                ));
+            }
+            if let Some(literal) = literal {
+                let _ = rows(&db, literal);
+                reset_aggregate_paths();
+                let literal_rows = rows(&db, literal);
+                let literal_taken = aggregate_paths_taken();
+                if literal_path(&taken) != literal_taken {
+                    wrong.push(format!(
+                        "sealed {sealed}: {sql}: took {taken:?}, its literal {literal_taken:?}"
+                    ));
+                }
+                if literal_rows != want {
+                    wrong.push(format!("sealed {sealed}: {literal}: {literal_rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn an_aggregate_beside_an_uncorrelated_value_answers_as_its_literal_twin() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_value_twin").unwrap();
+    fill(&db);
+    for (sql, twin) in [
+        (
+            "SELECT COUNT(*) + (SELECT 1) FROM t",
+            "SELECT COUNT(*) + 1 FROM t",
+        ),
+        (
+            "SELECT SUM(b) + (SELECT 1) FROM t",
+            "SELECT SUM(b) + 1 FROM t",
+        ),
+        (
+            "SELECT COUNT(*) + (SELECT 1) FROM t WHERE a > (SELECT 4)",
+            "SELECT COUNT(*) + 1 FROM t WHERE a > 4",
+        ),
+    ] {
+        let want = rows(&db, twin);
+        assert!(want.is_ok(), "{twin}: {want:?}");
+        for _ in 0..2 {
+            assert_eq!(rows(&db, sql), want, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn a_grouped_statement_reads_its_input_rows_subqueries_through_its_blocks() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://grouped_input_blocks").unwrap();
+            fill(&db);
+            db
+        };
+        for (sql, reference, literal) in INPUT_CASES {
+            // The reference reads its subqueries as a derived table's columns,
+            // its answer the one recorded
+            let want = rows(&db, reference);
+            wrong.extend(
+                oracle::check_answer(&RECORDED_INPUT, reference, &want)
+                    .map(|why| format!("sealed {sealed}: {why}")),
+            );
+            if !want.as_ref().is_ok_and(|rows| !rows.is_empty()) {
+                wrong.push(format!("sealed {sealed}: {reference}: {want:?}"));
+                continue;
+            }
+            let first = rows(&db, sql);
+            reset_aggregate_paths();
+            let again = rows(&db, sql);
+            let taken = aggregate_paths_taken();
+            let line = prepared_line(&db, sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("sealed {sealed}: {sql}: {line}"));
+            }
+            if first != want || again != want {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql}: gave {first:?} then {again:?}, the reference {want:?}"
+                ));
+            }
+            if let Some(literal) = literal {
+                let _ = rows(&db, literal);
+                reset_aggregate_paths();
+                let literal_rows = rows(&db, literal);
+                let literal_taken = aggregate_paths_taken();
+                if literal_path(&taken) != literal_taken {
+                    wrong.push(format!(
+                        "sealed {sealed}: {sql}: took {taken:?}, its literal {literal_taken:?}"
+                    ));
+                }
+                if literal_rows != want {
+                    wrong.push(format!("sealed {sealed}: {literal}: {literal_rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_grouped_column_holding_a_subquery_is_named_by_its_expression() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_names").unwrap();
+    fill(&db);
+    for (sql, names) in [
+        (
+            "SELECT a, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a",
+            &["a", "(SELECT MAX(u.x) FROM u)"][..],
+        ),
+        (
+            "SELECT a, (SELECT MAX(u.x) FROM u) + SUM(b) FROM t GROUP BY a",
+            &["a", "(SELECT MAX(u.x) FROM u) + SUM(b)"],
+        ),
+        (
+            "SELECT a, a IN (SELECT u.k FROM u) FROM t GROUP BY a",
+            &["a", "a IN (SELECT u.k FROM u)"],
+        ),
+        (
+            "SELECT a, (SELECT COUNT(*) FROM u WHERE u.k = t.a) FROM t GROUP BY a",
+            &["a", "(SELECT COUNT(*) FROM u WHERE (u.k = t.a))"],
+        ),
+        (
+            "SELECT SUM(b), (SELECT MAX(u.x) FROM u) AS m FROM t",
+            &["SUM(b)", "m"],
+        ),
+    ] {
+        assert_eq!(columns(&db, sql), names, "{sql}");
+    }
+}
+
+#[test]
+fn an_uncorrelated_grouped_subquery_is_read_before_any_group() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_before").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a, (SELECT u.x FROM u WHERE u.k = 1) FROM t WHERE a < 0 GROUP BY a",
+        "SELECT a, COUNT(*) FROM t WHERE a < 0 GROUP BY a HAVING COUNT(*) > (SELECT u.x FROM u)",
+        "SELECT a, a IN (SELECT u.x * 9223372036854775807 FROM u) FROM t WHERE a < 0 GROUP BY a",
+    ] {
+        let got = recorded(&db, &RECORDED_BEFORE, sql, sql);
+        assert!(got.is_err(), "{sql}: {got:?}");
+    }
+}
+
+#[test]
+fn a_value_around_an_uncorrelated_grouped_subquery_is_computed_only_for_a_group() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_around").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a, 9223372036854775807 + (SELECT 1) FROM t WHERE a < 0 GROUP BY a",
+        "SELECT a FROM t WHERE a < 0 GROUP BY a HAVING 9223372036854775807 + (SELECT 1) > 0",
+    ] {
+        assert_eq!(
+            recorded(&db, &RECORDED_AROUND, sql, sql),
+            Ok(Vec::new()),
+            "{sql}"
+        );
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+}
+
+#[test]
+fn a_correlated_grouped_subquery_raises_its_error_for_the_group_that_reaches_it() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_errors").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a, (SELECT u.x FROM u WHERE u.k = t.a) FROM t GROUP BY a",
+        "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > (SELECT u.x FROM u WHERE u.k = t.a)",
+        "SELECT a, (SELECT u.x FROM u WHERE u.k = t.a) FROM t WHERE a = 0 GROUP BY a",
+    ] {
+        let _ = recorded(&db, &RECORDED_ERRORS, sql, sql);
+    }
+}
+
+#[test]
+fn an_input_row_subquery_raises_its_error_only_for_a_row_that_reaches_it() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_errors").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        "INSERT INTO t VALUES (1, 0, 1), (2, 1, 2), (3, 1, 3)",
+        "INSERT INTO u VALUES (1, 0, 5), (2, 1, 6), (3, 1, 7)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let rows_of = |want: &[&str]| Ok(want.iter().map(|row| row.to_string()).collect::<Vec<_>>());
+    for (sql, want) in [
+        (
+            "SELECT a, SUM((SELECT u.x FROM u WHERE u.k = t.a)) FILTER (WHERE a = 0) FROM t \
+             GROUP BY a ORDER BY a",
+            rows_of(&["Integer(0)|Integer(5)", "Integer(1)|Null(Null)"]),
+        ),
+        (
+            "SELECT a, SUM(CASE WHEN a = 0 THEN (SELECT u.x FROM u WHERE u.k = t.a) ELSE 0 END) \
+             FROM t GROUP BY a ORDER BY a",
+            rows_of(&["Integer(0)|Integer(5)", "Integer(1)|Integer(0)"]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE a = 0 GROUP BY (SELECT u.x FROM u WHERE u.k = t.a)",
+            rows_of(&["Integer(1)"]),
+        ),
+    ] {
+        assert_eq!(rows(&db, sql), want, "{sql}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+    for sql in [
+        "SELECT COUNT(*) FROM t GROUP BY (SELECT u.x FROM u WHERE u.k = t.a)",
+        "SELECT COUNT(*) FROM t WHERE a = 7 GROUP BY (SELECT u.x FROM u WHERE u.k = 1)",
+        "SELECT a, SUM((SELECT u.x FROM u WHERE u.k = 1)) FROM t WHERE a = 7 GROUP BY a",
+    ] {
+        let got = rows(&db, sql);
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("more than one row")),
+            "{sql}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn two_anonymous_parameters_in_grouped_items_stay_two() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_anonymous").unwrap();
+    fill(&db);
+    for (sql, literal) in [
+        (
+            "SELECT a + (SELECT ?) AS x, a + (SELECT ?) AS y, COUNT(*) FROM t GROUP BY 1, 2 \
+             ORDER BY 1, 2",
+            "SELECT a + 1 AS x, a + 2 AS y, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 1, 2",
+        ),
+        (
+            "SELECT a + (SELECT ?) AS x, a + (SELECT ?) AS y, COUNT(*) FROM t GROUP BY x, y \
+             ORDER BY 1, 2",
+            "SELECT a + 1 AS x, a + 2 AS y, COUNT(*) FROM t GROUP BY x, y ORDER BY 1, 2",
+        ),
+        (
+            "SELECT COUNT(*), MIN(a) FROM t GROUP BY a + (SELECT ?), a - (SELECT ?) ORDER BY 1, 2",
+            "SELECT COUNT(*), MIN(a) FROM t GROUP BY a + 1, a - 2 ORDER BY 1, 2",
+        ),
+    ] {
+        let got: Vec<String> = db
+            .query(sql, (1i64, 2i64))
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        assert_eq!(Ok(got), rows(&db, literal), "{sql}");
+    }
+}
+
+#[test]
+fn a_grouped_item_named_by_alias_or_position_is_read_wherever_it_is_written() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_named_item").unwrap();
+    fill(&db);
+    for (sql, literal) in [
+        (
+            "SELECT a + (SELECT 1) AS g, COUNT(*) FROM t GROUP BY g \
+             HAVING a + (SELECT 1) > 3 ORDER BY 1",
+            "SELECT a + 1 AS g, COUNT(*) FROM t GROUP BY g HAVING a + 1 > 3 ORDER BY 1",
+        ),
+        (
+            "SELECT a + (SELECT 1), COUNT(*), (a + (SELECT 1)) * 2 FROM t GROUP BY 1 \
+             HAVING a + (SELECT 1) > 3 ORDER BY 1",
+            "SELECT a + 1, COUNT(*), (a + 1) * 2 FROM t GROUP BY 1 HAVING a + 1 > 3 ORDER BY 1",
+        ),
+    ] {
+        let got = rows(&db, sql);
+        assert!(
+            got.as_ref().is_ok_and(|rows| !rows.is_empty()),
+            "{sql}: {got:?}"
+        );
+        assert_eq!(got, rows(&db, literal), "{sql}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+}
+
+#[test]
+fn a_where_naming_a_select_alias_reads_that_item() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_input_blocks_where_alias").unwrap();
+    fill(&db);
+    let sql = "SELECT a AS z, (SELECT MAX(u.x) FROM u) FROM t WHERE z IN (SELECT u.k FROM u \
+               WHERE u.x > 3) GROUP BY a ORDER BY 1";
+    let got = rows(&db, sql);
+    assert!(
+        got.as_ref().is_ok_and(|rows| !rows.is_empty()),
+        "{sql}: {got:?}"
+    );
+    assert_eq!(
+        got,
+        rows(&db, &sql.replace("WHERE z IN", "WHERE a IN")),
+        "{sql}"
+    );
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+}
+
+#[test]
+fn an_aggregate_whose_only_subqueries_are_in_its_where_reads_a_select_alias_there() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_where_alias_runner").unwrap();
+    fill(&db);
+    for (sql, item) in [
+        (
+            "SELECT a AS z, COUNT(*) FROM t WHERE z IN (SELECT u.k FROM u WHERE u.x > 3) \
+             GROUP BY a ORDER BY 1",
+            "a",
+        ),
+        (
+            "SELECT a + 1 AS z, SUM(b) FROM t WHERE z IN (SELECT u.k + 1 FROM u) \
+             GROUP BY a + 1 ORDER BY 1",
+            "a + 1",
+        ),
+        (
+            "SELECT a AS z, COUNT(*) FROM t WHERE z = (SELECT MIN(u.k) + 3 FROM u) GROUP BY a",
+            "a",
+        ),
+        (
+            "SELECT a AS z, SUM(b), RANK() OVER (ORDER BY SUM(b)) FROM t \
+             WHERE z IN (SELECT u.k FROM u) GROUP BY a ORDER BY 1",
+            "a",
+        ),
+        (
+            "SELECT b AS z, COUNT(*) FROM t WHERE z > (SELECT MIN(u.x) FROM u) GROUP BY b \
+             HAVING COUNT(*) > 1 ORDER BY 1",
+            "b",
+        ),
+    ] {
+        let got = rows(&db, sql);
+        assert!(
+            got.as_ref().is_ok_and(|rows| !rows.is_empty()),
+            "{sql}: {got:?}"
+        );
+        let written = sql.replace("WHERE z", &format!("WHERE {item}"));
+        assert_eq!(got, rows(&db, &written), "{sql}");
+    }
+}
+
+#[test]
+fn a_grouped_statement_s_subqueries_read_parameters_and_the_transaction_s_writes() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_params").unwrap();
+    fill(&db);
+    let read = |sql: &str, params: (i64, i64)| -> Vec<String> {
+        db.query(sql, params)
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    for sql in [
+        "SELECT a, SUM(b) + (SELECT MAX(u.x) FROM u WHERE u.k < $1) + $2 FROM t \
+         GROUP BY a ORDER BY a",
+        "SELECT a, SUM(b) + $1, (SELECT COUNT(*) FROM u WHERE u.k = t.a + $2) FROM t \
+         GROUP BY a ORDER BY a",
+        "SELECT a, SUM(b * (SELECT MAX(u.x) FROM u WHERE u.k < $1)) + $2 FROM t \
+         GROUP BY a ORDER BY a",
+        "SELECT a, COUNT(*) FILTER (WHERE b > (SELECT MIN(u.x) FROM u WHERE u.k = t.a + $2)) + $1 \
+         FROM t GROUP BY a ORDER BY a",
+        "SELECT a, SUM(b) + $1 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.b + $2) \
+         GROUP BY a HAVING SUM(b) > (SELECT MIN(u.x) FROM u) ORDER BY a",
+    ] {
+        for (p1, p2) in [(3, 0), (11, 1), (0, -2)] {
+            let literal = sql
+                .replace("$1", &p1.to_string())
+                .replace("$2", &p2.to_string());
+            // Its literal twin, the parameters written in
+            let want = rows(&db, &literal).unwrap();
+            assert_eq!(read(sql, (p1, p2)), want, "{sql}: {p1} {p2}");
+        }
+    }
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO u VALUES (500, 4, 99)", ()).unwrap();
+    let mut seen = tx
+        .query(
+            "SELECT a, (SELECT MAX(u.x) FROM u WHERE u.k = t.a) FROM t WHERE a = 4 GROUP BY a",
+            (),
+        )
+        .unwrap();
+    let row = seen.next().unwrap().unwrap();
+    assert_eq!(row.get::<i64>(1).unwrap(), 99, "the transaction's own row");
+    drop(seen);
+    let mut seen = tx
+        .query(
+            "SELECT a, MAX((SELECT MAX(u.x) FROM u WHERE u.k = t.a)) FROM t WHERE a = 4 GROUP BY a",
+            (),
+        )
+        .unwrap();
+    let row = seen.next().unwrap().unwrap();
+    assert_eq!(row.get::<i64>(1).unwrap(), 99, "an input row reads it too");
+    drop(seen);
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn a_windowed_statement_that_does_not_group_sorts_by_an_alias_in_a_subquery_key() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_windowed_rows").unwrap();
+    fill(&db);
+    let sql = "SELECT id AS z, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > (SELECT 190) \
+               ORDER BY (SELECT 0) - z";
+    let twin = "SELECT id AS z, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id > 190 \
+                ORDER BY 0 - z";
+    assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
+}
+
+#[test]
+fn a_windowed_grouped_statement_sorts_by_a_key_holding_a_subquery() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://grouped_output_blocks_windowed_key").unwrap();
+            fill(&db);
+            db
+        };
+        let counted = "(SELECT a, COUNT(*) AS c, RANK() OVER (ORDER BY a DESC) AS r FROM t \
+                       GROUP BY a) g LEFT JOIN (SELECT k, COUNT(*) AS n FROM u GROUP BY k) m \
+                       ON m.k = g.a";
+        for (sql, twin) in [
+            (
+                "SELECT a, RANK() OVER (ORDER BY a), (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+                 ORDER BY (SELECT MIN(u.x) FROM u) - a"
+                    .to_string(),
+                "SELECT a, RANK() OVER (ORDER BY a), 6 FROM t GROUP BY a ORDER BY 0 - a"
+                    .to_string(),
+            ),
+            (
+                "SELECT a, SUM(b), ROW_NUMBER() OVER (ORDER BY SUM(b) DESC, a) FROM t GROUP BY a \
+                 ORDER BY (SELECT MAX(u.x) FROM u) - a LIMIT 4 OFFSET 1"
+                    .to_string(),
+                "SELECT a, SUM(b), ROW_NUMBER() OVER (ORDER BY SUM(b) DESC, a) FROM t GROUP BY a \
+                 ORDER BY 6 - a LIMIT 4 OFFSET 1"
+                    .to_string(),
+            ),
+            (
+                "SELECT a, COUNT(*), RANK() OVER (ORDER BY a DESC) FROM t GROUP BY a \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a), a"
+                    .to_string(),
+                format!("SELECT g.a, g.c, g.r FROM {counted} ORDER BY COALESCE(m.n, 0), g.a"),
+            ),
+            (
+                "SELECT a, RANK() OVER (ORDER BY a) FROM t GROUP BY a \
+                 ORDER BY (SELECT MAX(u.x) FROM u) - a, RANK() OVER (ORDER BY a DESC)"
+                    .to_string(),
+                "SELECT a, RANK() OVER (ORDER BY a) FROM t GROUP BY a ORDER BY 6 - a".to_string(),
+            ),
+        ] {
+            let mode = if sealed { "sealed" } else { "hot" };
+            let before = general_path_total();
+            let got = rows(&db, &sql);
+            if general_path_total() != before {
+                wrong.push(format!("{mode}: {sql} ran a general path mechanism"));
+            }
+            if got != rows(&db, &twin) {
+                wrong.push(format!(
+                    "{mode}: {sql}: {got:?}, want {:?}",
+                    rows(&db, &twin)
+                ));
+            }
+            let line = prepared_line(&db, &sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("{mode}: {sql} says {line}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_grouped_key_reading_an_alias_of_a_volatile_item_runs_prepared() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_volatile_alias").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a, RANDOM() AS g, (SELECT MAX(u.x) FROM u) FROM t GROUP BY a \
+         ORDER BY (SELECT MIN(u.x) FROM u) + g",
+        "SELECT DISTINCT ON ((SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
+         FROM u ORDER BY u.x LIMIT 1 OFFSET 1)) a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
+         ORDER BY a",
+        "SELECT a, RANDOM() < 0.5 AS g FROM t GROUP BY a \
+         ORDER BY (SELECT DISTINCT ON (CASE WHEN g THEN u.x ELSE 0 END) u.x \
+         FROM u ORDER BY u.x LIMIT 1 OFFSET 1), 1",
+    ] {
+        let before = general_path_total();
+        let got = rows(&db, sql);
+        assert_eq!(
+            general_path_total(),
+            before,
+            "{sql} ran on the general path"
+        );
+        assert!(got.is_ok(), "{sql}: {got:?}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+    // The key reads the value its item returns: the rows sort by that column
+    let sql = "SELECT a, RANDOM() AS g FROM t GROUP BY a ORDER BY (SELECT 0) + g";
+    let drawn: Vec<f64> = rows(&db, sql)
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let value = row.rsplit_once('|').unwrap().1;
+            value
+                .trim_start_matches("Float(")
+                .trim_end_matches(')')
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(drawn.windows(2).all(|pair| pair[0] <= pair[1]), "{drawn:?}");
+    // An item read by its alias draws once for each group; a key that is
+    // RANDOM() itself draws again
+    for (key, draws) in [("(SELECT 0) + g", 9), ("(SELECT 0) + RANDOM()", 18)] {
+        let sql = format!("SELECT a, RANDOM() AS g FROM t GROUP BY a ORDER BY {key}");
+        let before = random_draws();
+        rows(&db, &sql).unwrap();
+        assert_eq!(random_draws() - before, draws, "{sql}");
+    }
+    // A column of the subquery's own table of the alias's name is no alias
+    let sql = "SELECT a, SUM(b) AS z, RANDOM() AS x FROM t GROUP BY a \
+               ORDER BY (SELECT DISTINCT ON (u.x) z FROM u LIMIT 1), a";
+    let twin = "SELECT a, SUM(b) AS z, RANDOM() AS x FROM t GROUP BY a ORDER BY z, a";
+    let before = general_path_total();
+    let got = rows(&db, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert_eq!(
+        general_path_total(),
+        before,
+        "{sql} ran on the general path"
+    );
+    // Each row without its volatile column
+    let shown = |rows: Vec<String>| -> Vec<String> {
+        rows.iter()
+            .map(|row| row.rsplit_once('|').map_or(row.as_str(), |(kept, _)| kept))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(shown(got), shown(rows(&db, twin).unwrap()), "{sql}");
+}
+
+#[test]
+fn a_grouped_key_reading_an_alias_of_an_item_holding_a_subquery_reads_its_value() {
+    let _guard = serial();
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://grouped_output_blocks_subquery_alias").unwrap();
+            fill(&db);
+            db
+        };
+        let mode = if sealed { "sealed" } else { "hot" };
+        let m = "(SELECT COUNT(*) FROM u WHERE u.k = t.a)";
+        for (sql, twin) in [
+            (
+                format!("SELECT a, {m} AS m FROM t GROUP BY a ORDER BY (SELECT 0) + m DESC, a"),
+                format!("SELECT a, {m} AS m FROM t GROUP BY a ORDER BY m DESC, a"),
+            ),
+            (
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a ORDER BY (SELECT 0) + m DESC, a \
+                     LIMIT 3 OFFSET 2"
+                ),
+                format!("SELECT a, {m} AS m FROM t GROUP BY a ORDER BY m DESC, a LIMIT 3 OFFSET 2"),
+            ),
+            // A value of the group that is no item: an aggregate, a column
+            (
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a \
+                     ORDER BY (SELECT 0) + m * 1000 + SUM(b), aa"
+                ),
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a ORDER BY m * 1000 + SUM(b), aa"
+                ),
+            ),
+            (
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a \
+                     ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = t.a + 1 AND u.x < m) DESC, aa"
+                ),
+                format!(
+                    "SELECT a AS aa, {m} AS m FROM t GROUP BY a ORDER BY \
+                     (SELECT COUNT(*) FROM u AS v WHERE v.k = t.a + 1 AND v.x < {m}) DESC, aa"
+                ),
+            ),
+            // The general path reads no alias inside a key's subquery, so the
+            // twin writes the item out
+            (
+                format!(
+                    "SELECT DISTINCT ON ((SELECT m / 2)) a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY (SELECT m / 2), a"
+                ),
+                format!(
+                    "SELECT DISTINCT ON ({m} / 2) a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY {m} / 2, a"
+                ),
+            ),
+            // A join's groups, whose run returns its rows on its own path
+            (
+                "SELECT DISTINCT ON ((SELECT 0) + z) t.a, (SELECT t.a) AS z, COUNT(*) \
+                 FROM t JOIN u ON u.id = t.id GROUP BY t.a ORDER BY t.a"
+                    .to_string(),
+                "SELECT DISTINCT ON (t.a) t.a, t.a AS z, COUNT(*) \
+                 FROM t JOIN u ON u.id = t.id GROUP BY t.a ORDER BY t.a"
+                    .to_string(),
+            ),
+            // A group column on the left of an ANY, outside its block
+            (
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY CASE WHEN a = ANY (SELECT k FROM u WHERE k < 5) THEN m ELSE -m END, a"
+                ),
+                format!(
+                    "SELECT a, {m} AS m FROM t GROUP BY a \
+                     ORDER BY CASE WHEN a IN (0, 1, 2, 3, 4) THEN m ELSE -m END, a"
+                ),
+            ),
+            // A window item, computed after the groups
+            (
+                "SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM t GROUP BY a \
+                 ORDER BY (SELECT 0) - rn"
+                    .to_string(),
+                "SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM t GROUP BY a \
+                 ORDER BY rn DESC"
+                    .to_string(),
+            ),
+        ] {
+            let before = general_path_total();
+            let got = rows(&db, &sql);
+            if general_path_total() != before {
+                wrong.push(format!("{mode}: {sql} ran on the general path"));
+            }
+            let want = rows(&db, &twin);
+            if got != want {
+                wrong.push(format!("{mode}: {sql}\n  got {got:?}\n  want {want:?}"));
+            }
+            let line = prepared_line(&db, &sql);
+            if line != "Prepared: yes" {
+                wrong.push(format!("{mode}: {sql} says {line}"));
+            }
+        }
+        // A key's subquery that fails for a group fails, though the LIMIT
+        // keeps one group
+        let sql = format!(
+            "SELECT a, {m} AS m FROM t GROUP BY a \
+             ORDER BY (SELECT u.x FROM u WHERE u.k = t.a) + m LIMIT 1"
+        );
+        let got = rows(&db, &sql);
+        if !got.as_ref().is_err_and(|e| e.contains("more than one row")) {
+            wrong.push(format!("{mode}: {sql}\n  got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_grouped_statement_keyed_by_an_item_holding_a_subquery_groups_by_it() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_keyed").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT a IN (SELECT u.k FROM u WHERE u.k < 4) AS g, COUNT(*) FROM t GROUP BY g",
+        "SELECT a IN (SELECT u.k FROM u WHERE u.k < 4), COUNT(*) FROM t GROUP BY 1",
+        "SELECT 0 AS g, a IN (SELECT u.k FROM u WHERE u.k < 4) AS g, COUNT(*) FROM t GROUP BY g",
+    ] {
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+        let sorted = |sql: &str| {
+            rows(&db, sql).map(|mut rows| {
+                rows.sort();
+                rows
+            })
+        };
+        let got = sorted(sql);
+        assert!(
+            got.as_ref().is_ok_and(|rows| rows.len() == 2),
+            "{sql}: {got:?}"
+        );
+        let subquery = "SELECT u.k FROM u WHERE u.k < 4";
+        let twin = || sorted(&oracle::literal_twin(&db, sql, subquery, true));
+        assert_eq!(
+            oracle::check_confirmed(&RECORDED_KEYED, sql, &got, twin),
+            None
+        );
+    }
+}
+
+#[test]
+fn a_table_whose_columns_changed_after_preparing_raises_schema_changed() {
+    let _guard = serial();
+    for (name, sql) in [
+        (
+            "grouped_output_blocks_retype",
+            "SELECT k, k IN (SELECT u.a FROM u) FROM t GROUP BY k",
+        ),
+        (
+            "grouped_output_blocks_retype_where",
+            "SELECT k, k IN (SELECT u.a FROM u) FROM t \
+             WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) GROUP BY k",
+        ),
+    ] {
+        let db = Database::open(&format!("memory://{name}")).unwrap();
+        for setup in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, a TEXT)",
+            "INSERT INTO t VALUES (1, 1)",
+            "INSERT INTO u VALUES (1, '01')",
+        ] {
+            db.execute(setup, ()).unwrap();
+        }
+        // Twice, so the second run reads the plan the first one held
+        for _ in 0..2 {
+            let _ = recorded(&db, &RECORDED_SCHEMA, &format!("{name} before: {sql}"), sql);
+        }
+        let writer = db.clone();
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        before_grouped_table_opened(move || {
+            writer
+                .execute("ALTER TABLE t MODIFY COLUMN k TEXT", ())
+                .unwrap();
+            flag.set(true);
+        });
+        let got = rows(&db, sql);
+        assert!(
+            done.get(),
+            "{sql}: the columns changed inside the statement"
+        );
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("schema changed")),
+            "{sql}: {got:?}"
+        );
+        let _ = recorded(&db, &RECORDED_SCHEMA, &format!("{name} after: {sql}"), sql);
+    }
+}
+
+#[test]
+fn a_having_name_reads_the_alias_the_grouped_path_reads() {
+    let _guard = serial();
+    let db = Database::open("memory://grouped_output_blocks_having_names").unwrap();
+    fill(&db);
+    for setup in [
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, g INTEGER, b BOOLEAN)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, s TEXT)",
+        "INSERT INTO v VALUES (1, 1, TRUE), (2, 1, FALSE), (3, 2, TRUE)",
+        "INSERT INTO m VALUES (1, '2')",
+    ] {
+        db.execute(setup, ()).unwrap();
+    }
+    let sql =
+        "SELECT g, COUNT(*) AS b FROM v GROUP BY g HAVING b IN (SELECT m.s FROM m) ORDER BY g";
+    let want = rows(&db, &sql.replace(" FROM v", " FROM (SELECT * FROM v) v"));
+    assert_eq!(rows(&db, sql), want, "{sql}");
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    // A name inside a group item or an aggregate's argument is not an alias
+    db.execute(
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO w VALUES (1, 1, 2)", ()).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT SUM(a) AS b FROM w HAVING SUM(b) > (SELECT 0)",
+            "Integer(1)",
+        ),
+        (
+            "SELECT a + 1 AS a FROM w GROUP BY a + 1 HAVING a + 1 = (SELECT 2)",
+            "Integer(2)",
+        ),
+    ] {
+        let general = rows(&db, &sql.replace(" FROM w", " FROM (SELECT * FROM w) w"));
+        assert_eq!(
+            general,
+            Ok(vec![want.to_string()]),
+            "{sql}: the general path"
+        );
+        assert_eq!(rows(&db, sql), general, "{sql}");
+        assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+    }
+    // A subquery that groups reads its own HAVING's aliases the same way
+    let sql = "SELECT id FROM u WHERE EXISTS (SELECT t.a AS k, t.b AS k FROM t \
+               WHERE t.a = u.x GROUP BY t.a, t.b HAVING k = 1) ORDER BY id";
+    assert_eq!(
+        rows(&db, sql),
+        Ok(["1", "8", "15", "22", "29", "36"]
+            .iter()
+            .map(|id| format!("Integer({id})"))
+            .collect()),
+        "{sql}: k is t.a, the first item named k"
+    );
+    assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+}
+
+/// The same rows hot in memory and sealed into a volume
+fn alias_key_tables(name: &str) -> [(Database, tempfile::TempDir); 2] {
+    let open = |dsn: &str, dir: tempfile::TempDir, seal: bool| {
+        let db = Database::open(dsn).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+            "INSERT INTO t VALUES (1, 30, 1), (2, 10, 2), (3, NULL, 1), (4, 20, 3), (5, 10, 2)",
+            "INSERT INTO u VALUES (1, 1, 5), (2, 2, 7), (3, 1, NULL), (4, 4, 1)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if seal {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        (db, dir)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    [
+        open(
+            &format!("memory://{name}"),
+            tempfile::tempdir().unwrap(),
+            false,
+        ),
+        open(&sealed, dir, true),
+    ]
+}
+
+#[test]
+fn a_grouped_key_s_subquery_reads_a_select_alias_as_its_item_over_the_group() {
+    let _guard = serial();
+    for (db, _dir) in alias_key_tables("grouped_output_blocks_alias_key") {
+        for (sql, want) in [
+            // MAX(a) by k: 30, 10, 20
+            (
+                "SELECT k, MAX(a) AS z FROM t GROUP BY k ORDER BY (SELECT z) DESC, 1",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            // u.k * 20 <= 60, 20, 40 counts 3, 2, 3 rows
+            (
+                "SELECT k, MAX(a) * 2 AS z FROM t GROUP BY k \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k * 20 <= z) DESC, 1",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            (
+                "SELECT k + 1 AS z, COUNT(*) FROM t GROUP BY k + 1 \
+                 ORDER BY (SELECT (SELECT z)) DESC",
+                vec![Some(4), Some(3), Some(2)],
+            ),
+            // SUM(a) by k: 30, 20, 20, and 70 over every row
+            (
+                "SELECT k, SUM(a) AS z FROM t GROUP BY ROLLUP (k) ORDER BY (SELECT z) DESC, 1",
+                vec![None, Some(1), Some(2), Some(3)],
+            ),
+            (
+                "SELECT t.k AS z, COUNT(*) FROM t JOIN u ON u.k = t.k GROUP BY t.k \
+                 ORDER BY (SELECT z) DESC",
+                vec![Some(2), Some(1)],
+            ),
+            // COUNT(*) by k: 2, 2, 1
+            (
+                "SELECT k, COUNT(*) AS z FROM t GROUP BY k HAVING COUNT(*) > 0 \
+                 ORDER BY (SELECT z), 1 LIMIT 2 OFFSET 1",
+                vec![Some(1), Some(2)],
+            ),
+            // An alias outside the key's subqueries reads its item too
+            (
+                "SELECT k, MAX(a) * 2 AS z FROM t GROUP BY k ORDER BY z + (SELECT 0) DESC",
+                vec![Some(1), Some(3), Some(2)],
+            ),
+            // A correlation equality's value reads the aliases inside it:
+            // k + COUNT(*) - 2 is 1, 2, 2, which u.k holds twice, once, once
+            (
+                "SELECT k AS z, COUNT(*) AS c FROM t GROUP BY k \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = z + c - 2) DESC, 1",
+                vec![Some(1), Some(2), Some(3)],
+            ),
+            // z + 1 reads the set's k, never the key k + 1 of another set
+            (
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY GROUPING SETS ((k), (k + 1)) \
+                 ORDER BY (SELECT COUNT(*) FROM u WHERE u.k = z + 1) DESC, z",
+                vec![Some(1), Some(3), Some(2), None, None, None],
+            ),
+            // The same outside the key's subquery
+            (
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY GROUPING SETS ((k), (k + 1)) \
+                 ORDER BY z + 1 + (SELECT 0) DESC NULLS LAST, z ASC NULLS LAST",
+                vec![Some(3), Some(2), Some(1), None, None, None],
+            ),
+            // A DISTINCT ON key reads the alias as an ORDER BY key does: k % 2
+            // is 1, 0, 1, and the first group of each key is kept
+            (
+                "SELECT DISTINCT ON ((SELECT z % 2)) k AS z, COUNT(*) FROM t GROUP BY k \
+                 ORDER BY (SELECT z % 2), 1",
+                vec![Some(2), Some(1)],
+            ),
+            // over a join, whose groups are k = 1 and 2
+            (
+                "SELECT DISTINCT ON ((SELECT z % 2)) t.k AS z, COUNT(*) FROM t \
+                 JOIN u ON u.k = t.k GROUP BY t.k ORDER BY 1",
+                vec![Some(1), Some(2)],
+            ),
+            // u.k * 10 <= 30, 10, 20 counts 3, 2, 3 rows
+            (
+                "SELECT DISTINCT ON ((SELECT COUNT(*) FROM u WHERE u.k * 10 <= z)) k, MAX(a) AS z \
+                 FROM t GROUP BY k ORDER BY (SELECT COUNT(*) FROM u WHERE u.k * 10 <= z) DESC, 1",
+                vec![Some(1), Some(2)],
+            ),
+        ] {
+            assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
+            let got: Vec<Option<i64>> = db
+                .query(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|row| row.unwrap().get::<Option<i64>>(0).unwrap())
+                .collect();
+            assert_eq!(got, want, "{sql}");
+        }
+        // An aggregate's argument is read over an input row, which holds no item
+        for (sql, want) in [
+            (
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY k ORDER BY (SELECT t.z)",
+                "column 't.z' not found",
+            ),
+            (
+                "SELECT k AS z, COUNT(*) FROM t GROUP BY k ORDER BY SUM((SELECT z)) DESC, z",
+                "column 'z' not found",
+            ),
+        ] {
+            let err = db
+                .query(sql, ())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, want, "{sql}");
+        }
+    }
+}
