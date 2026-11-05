@@ -19,6 +19,7 @@
 //! pre-computed aggregate stats. This is done by a background thread during
 //! the seal operation.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -974,7 +975,13 @@ impl CompressedBlockStore {
         crate::test_failpoints::block_decoded();
         let (decomp_len, group_rows) = self.block_layout(col_idx, gi, type_tag, num_groups)?;
         let raw_bytes = if block.len() == decomp_len {
-            return deserialize_column_block(block, type_tag, group_rows, dict, ext_type);
+            return deserialize_column_block(
+                Cow::Borrowed(block),
+                type_tag,
+                group_rows,
+                dict,
+                ext_type,
+            );
         } else {
             let mut raw = Vec::new();
             raw.try_reserve_exact(decomp_len)
@@ -997,7 +1004,7 @@ impl CompressedBlockStore {
             }
             raw
         };
-        deserialize_column_block(&raw_bytes, type_tag, group_rows, dict, ext_type)
+        deserialize_column_block(Cow::Owned(raw_bytes), type_tag, group_rows, dict, ext_type)
     }
 
     /// Decompress and deserialize a single block, appending directly into

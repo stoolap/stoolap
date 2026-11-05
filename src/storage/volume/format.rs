@@ -38,6 +38,7 @@
 //! └──────────────────────────────┘
 //! ```
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -984,13 +985,16 @@ pub(crate) fn deserialize_column_block_into(
 
 /// Deserialize a single column block from raw bytes.
 /// For Dictionary columns, pass the dictionary; for Bytes columns, pass ext_type.
+/// An owned block whose bytes are mostly its blob becomes the column's bytes.
 pub(crate) fn deserialize_column_block(
-    data: &[u8],
+    block: Cow<'_, [u8]>,
     col_type_tag: u8,
     row_count: usize,
     dictionary: Option<Arc<[SmartString]>>,
     ext_type: DataType,
 ) -> io::Result<ColumnData> {
+    let data = &*block;
+    let block_len = data.len();
     let mut pos = 0;
     let column = match col_type_tag {
         COL_INT64 => {
@@ -1086,7 +1090,18 @@ pub(crate) fn deserialize_column_block(
                     }
                 }
             }
-            let blob = data[pos..end_pos].to_vec();
+            let blob = match block {
+                // Its head of nulls and offsets stays, the offsets moved past it
+                Cow::Owned(raw) if pos <= (end_pos - pos) / 8 => {
+                    for (i, (off, _)) in offsets.iter_mut().enumerate() {
+                        if !nulls[i] {
+                            *off += pos as u64;
+                        }
+                    }
+                    raw
+                }
+                block => block[pos..end_pos].to_vec(),
+            };
             pos = end_pos;
             Ok(ColumnData::Bytes {
                 data: blob,
@@ -1100,7 +1115,7 @@ pub(crate) fn deserialize_column_block(
             format!("unknown column type tag {}", col_type_tag),
         )),
     }?;
-    if pos != data.len() {
+    if pos != block_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "trailing bytes in column block",
