@@ -516,6 +516,20 @@ impl MVCCTable {
     ///
     /// For multi-column indexes, the first column's type determines the index type
     /// unless there's a BOOLEAN (which always gets Bitmap for AND/OR optimization).
+    /// The type an index over columns of `data_types` takes, `requested`
+    /// when one was asked for: a multi-column index is always MultiColumn
+    /// (hash+btree hybrid)
+    pub(crate) fn index_type_for(
+        data_types: &[DataType],
+        requested: Option<IndexType>,
+    ) -> IndexType {
+        if data_types.len() > 1 {
+            IndexType::MultiColumn
+        } else {
+            requested.unwrap_or_else(|| Self::auto_select_index_type(data_types))
+        }
+    }
+
     fn auto_select_index_type(data_types: &[DataType]) -> IndexType {
         if data_types.is_empty() {
             return IndexType::BTree;
@@ -3931,12 +3945,8 @@ impl Table for MVCCTable {
         }
 
         // Determine index type: use explicit type or auto-select based on column types
-        // For multi-column indexes, always use MultiColumn (hash+btree hybrid)
-        let chosen_type = if columns.len() > 1 {
-            IndexType::MultiColumn
-        } else {
-            index_type.unwrap_or_else(|| Self::auto_select_index_type(&data_types))
-        };
+        let chosen_type = Self::index_type_for(&data_types, index_type);
+        super::engine::check_index_name(name, chosen_type)?;
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {
@@ -4176,6 +4186,7 @@ impl Table for MVCCTable {
         ef_search: usize,
         metric: crate::storage::index::HnswDistanceMetric,
     ) -> Result<()> {
+        super::engine::check_index_name(name, IndexType::Hnsw)?;
         let schema = self.version_store.schema();
         let (col_idx, col) = schema
             .find_column(column)
@@ -4477,6 +4488,7 @@ impl Table for MVCCTable {
         let index_name = custom_name
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("idx_{}_{}_btree", self.name(), column_name));
+        super::engine::check_index_name(&index_name, IndexType::BTree)?;
 
         // Check if index with same name already exists
         if self.version_store.index_exists(&index_name) {
@@ -4573,6 +4585,7 @@ impl Table for MVCCTable {
         columns: &[&str],
         is_unique: bool,
     ) -> Result<()> {
+        super::engine::check_index_name(name, IndexType::MultiColumn)?;
         let schema = self.version_store.schema();
 
         // Validate and collect column info

@@ -800,6 +800,9 @@ impl Transaction for MvccTransaction {
 
     fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
         self.check_active()?;
+        // A new table only: a rollback restores a dropped one through the
+        // engine operations directly, whatever name it was given before
+        super::engine::check_new_table(&schema)?;
 
         let ops = self.get_engine_ops()?;
         let table = ops.create_table(name, schema)?;
@@ -920,6 +923,7 @@ impl Transaction for MvccTransaction {
 
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
         self.check_active()?;
+        super::engine::check_path_name(new_name, 0, "a table name")?;
 
         let ops = self.get_engine_ops()?;
         ops.rename_table(old_name, new_name)?;
