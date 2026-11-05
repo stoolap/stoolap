@@ -246,6 +246,7 @@ All indexes are fully persisted:
 
 - Index metadata stored in WAL (type, columns, unique flag, HNSW parameters)
 - Index data rebuilt from table data on recovery
+- A single-column B-tree index on an INTEGER, TIMESTAMP or FLOAT column, and a single-column B-tree or Hash index on a TEXT column, also keep a side file beside each sealed volume, written when the volume is sealed or compacted, or later by the backfill, and attached again when the database is opened (see [Persistence]({{ '/docs/architecture/persistence/' | relative_url }}#secondary-index-side-files))
 - HNSW graph structure is serialized to binary files during snapshots for fast recovery
 - Snapshots capture index definitions
 - Recovery restores all indexes automatically
