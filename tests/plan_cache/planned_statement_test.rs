@@ -469,8 +469,9 @@ fn explain_names_each_read_a_run_may_take() {
             "SELECT id FROM t WHERE 1 = 0 AND v > 1",
             vec![
                 "Project id",
-                "  Empty unless (1 = 0)",
-                "  else SeqScan t ((1 = 0) AND (v > 1))",
+                "  Filter",
+                "    Empty unless (1 = 0)",
+                "    else SeqScan t (v > 1)",
             ],
         ),
     ] {

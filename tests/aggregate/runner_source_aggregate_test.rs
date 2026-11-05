@@ -184,7 +184,8 @@ fn explain_shows_the_aggregate_over_its_source() {
             "Aggregate COUNT(*), SUM(a)",
             "  View v",
             "    Project k, a",
-            "      SeqScan t ((id % 2) = 0)",
+            "      Filter",
+            "        SeqScan t",
         ]
     );
     assert_eq!(

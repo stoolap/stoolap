@@ -512,8 +512,8 @@ impl Program {
         }
 
         // Build a set of positions that are jump targets - we can't fuse instructions
-        // that are jump targets because that would make the jump land in the middle
-        // of what becomes a single instruction.
+        // a jump lands inside of, as it would land in the middle of what becomes a
+        // single instruction.
         let jump_targets = JumpTargets::of(&mut ops);
 
         let mut result = Vec::with_capacity(ops.len());
@@ -527,10 +527,7 @@ impl Program {
 
             // Pattern 1: LoadColumn + LoadConst + LoadConst + Between → BetweenColumnConst (4 ops → 1)
             if i + 3 < ops.len() {
-                let is_safe = !jump_targets.contains(&i)
-                    && !jump_targets.contains(&(i + 1))
-                    && !jump_targets.contains(&(i + 2))
-                    && !jump_targets.contains(&(i + 3));
+                let is_safe = !jump_targets.inside(i, 4);
 
                 if is_safe {
                     if let (
@@ -558,9 +555,7 @@ impl Program {
 
             // Pattern 2: LoadColumn + LoadConst + Compare → XxColumnConst (3 ops → 1)
             if i + 2 < ops.len() {
-                let is_safe = !jump_targets.contains(&i)
-                    && !jump_targets.contains(&(i + 1))
-                    && !jump_targets.contains(&(i + 2));
+                let is_safe = !jump_targets.inside(i, 3);
 
                 if is_safe {
                     if let (
@@ -593,7 +588,7 @@ impl Program {
 
             // Pattern 3: LoadColumn + IsNull/IsNotNull/Like/InSet (2 ops → 1)
             if i + 1 < ops.len() {
-                let is_safe = !jump_targets.contains(&i) && !jump_targets.contains(&(i + 1));
+                let is_safe = !jump_targets.inside(i, 2);
 
                 if is_safe {
                     if let Op::LoadColumn(col_idx) = &ops[i] {
@@ -620,7 +615,7 @@ impl Program {
             // Pattern 4: LoadColumn + parameters + their test → one op
             let at = i;
             if let Some((fused_op, taken)) =
-                Self::param_test(&ops[i..], |k| jump_targets.contains(&(at + k)))
+                Self::param_test(&ops[i..], |taken| jump_targets.inside(at, taken))
             {
                 result.push(fused_op);
                 position_map.extend(std::iter::repeat_n(new_pos, taken));
@@ -645,9 +640,9 @@ impl Program {
 
     /// The op testing a column against the parameters loaded after it that
     /// `ops` start with, each read as one type or each as it is, and how
-    /// many ops it stands for; None when one of them is a jump `target` or
-    /// the test is no comparison, BETWEEN or short IN list
-    fn param_test(ops: &[Op], target: impl Fn(usize) -> bool) -> Option<(Op, usize)> {
+    /// many ops it stands for; None when a jump lands `inside` them or the
+    /// test is no comparison, BETWEEN or short IN list
+    fn param_test(ops: &[Op], inside: impl Fn(usize) -> bool) -> Option<(Op, usize)> {
         let (Op::LoadColumn(col) | Op::LoadAggregateResult(col)) = *ops.first()? else {
             return None;
         };
@@ -678,7 +673,7 @@ impl Program {
             _ => return None,
         };
         let taken = at + 1;
-        (0..taken).all(|k| !target(k)).then_some((fused, taken))
+        (!inside(taken)).then_some((fused, taken))
     }
 
     /// The fold ranges at their positions after fusion; a range an op fused
@@ -845,6 +840,12 @@ impl JumpTargets {
     #[inline]
     fn contains(&self, position: &usize) -> bool {
         self.0.get(*position).copied().unwrap_or(false)
+    }
+
+    /// Whether a jump lands inside the `len` ops from `start`, past the
+    /// first: a jump to the first lands on the op they fuse into
+    fn inside(&self, start: usize, len: usize) -> bool {
+        (start + 1..start + len).any(|position| self.contains(&position))
     }
 }
 

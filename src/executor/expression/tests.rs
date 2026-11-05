@@ -834,3 +834,38 @@ fn a_bound_program_reads_its_columns_by_index_and_no_name() {
         "a bound column compiles only in a bound program"
     );
 }
+
+#[test]
+fn a_column_test_a_jump_lands_on_fuses_into_one_op() {
+    let columns = vec!["a".to_string()];
+    let compile = CompileContext::with_global_registry(&columns);
+    let program = ExprCompiler::new(&compile)
+        .compile(&where_of(
+            "CASE WHEN a > 100 THEN 'g' WHEN a IS NULL THEN 'n' \
+             WHEN a BETWEEN 1 AND 5 THEN 'b' WHEN a > 10 THEN 's' ELSE 'o' END",
+        ))
+        .unwrap();
+    let loads = program
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, Op::LoadColumn(_)))
+        .count();
+    assert_eq!(
+        loads,
+        0,
+        "every WHEN tests its column in one op: {:?}",
+        program.ops()
+    );
+    let mut vm = ExprVM::new();
+    for (a, expected) in [
+        (Value::Integer(200), "g"),
+        (Value::null_unknown(), "n"),
+        (Value::Integer(3), "b"),
+        (Value::Integer(50), "s"),
+        (Value::Integer(7), "o"),
+    ] {
+        let row = Row::from_values(vec![a.clone()]);
+        let result = vm.execute(&program, &ExecuteContext::new(&row)).unwrap();
+        assert_eq!(result, Value::text(expected), "a = {a:?}");
+    }
+}

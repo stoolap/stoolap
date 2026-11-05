@@ -354,6 +354,14 @@ pub fn try_pushdown(
     registry().try_pushdown(expr, schema, exec_ctx)
 }
 
+/// Whether `filter`, an AND's operand, goes to storage after the operands
+/// before it, `taken` when storage takes them all: storage runs it first, so
+/// it goes past one kept in memory only if it cannot raise an error the
+/// other would have prevented
+pub(crate) fn runs_ahead(filter: &dyn StorageExpr, taken: bool) -> bool {
+    taken || !filter.can_fail()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

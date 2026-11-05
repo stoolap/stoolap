@@ -45,6 +45,7 @@ mod not_operator_test;
 mod not_over_compound_test;
 mod null_comparison_test;
 mod null_times_zero_test;
+mod pushed_conjunct_once_test;
 mod row_comparison_rule_test;
 mod scan_with_where_test;
 mod short_circuit_test;
