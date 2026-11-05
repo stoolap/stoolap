@@ -4187,7 +4187,12 @@ impl Executor {
                     left_filter.is_some(),
                     probe(0, !left_is_table),
                     || probe(1, !right_is_table),
-                    || self.right_small_beside(join_plan.probes[1].as_ref(), &join_source.right),
+                    || {
+                        let sides = [&*join_source.left, &*join_source.right];
+                        let filters = [left_filter.as_ref(), right_filter.as_ref()];
+                        let shares = self.join_side_shares(plan.as_deref(), sides, filters);
+                        self.right_small_beside(sides, shares)
+                    },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };
@@ -5130,10 +5135,10 @@ impl Executor {
             let streaming = match join_plan.limit_hash {
                 Some(pairs) => row_counts(stmt, ctx).ok().and_then(|counts| {
                     let limit = counts.limit.filter(|limit| *limit <= 100)?;
-                    let build_left = self.limit_hash_builds_left(
-                        [&join_source.left, &join_source.right],
-                        [left_filter.as_ref(), right_filter.as_ref()],
-                    );
+                    let sides = [&*join_source.left, &*join_source.right];
+                    let filters = [left_filter.as_ref(), right_filter.as_ref()];
+                    let shares = self.join_side_shares(plan.as_deref(), sides, filters);
+                    let build_left = self.limit_hash_builds_left(sides, shares);
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::limit_hash_built(build_left);
                     Some((limit.saturating_add(counts.offset), build_left, pairs))

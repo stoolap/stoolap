@@ -635,6 +635,14 @@ impl QueryPlanner {
         Some(self.estimate_with_feedback(table_name, Some(predicate), estimated))
     }
 
+    /// The share of `table_name`'s rows `predicate` keeps, as its statistics
+    /// estimate it, by the default selectivities when ANALYZE has not run
+    pub(crate) fn filter_share(&self, table_name: &str, predicate: &Expression) -> f64 {
+        let table_stats = self.get_table_stats(table_name).unwrap_or_default();
+        self.estimate_predicate_selectivity(table_name, predicate, &table_stats)
+            .clamp(0.0, 1.0)
+    }
+
     /// Estimate selectivity of a predicate expression
     fn estimate_predicate_selectivity(
         &self,

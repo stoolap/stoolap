@@ -1162,7 +1162,7 @@ impl Executor {
             let picked = if index_use == JoinIndexUse::Grouped {
                 inlj_info.map(|info| (info, false))
             } else {
-                let (left_filtered, right_filtered) = match where_clause {
+                let [left_filter, right_filter] = match where_clause {
                     Some(where_clause) => {
                         let aliases = [join_left, join_right].map(get_table_alias_from_expr);
                         let (left, right, _) = split_join_where(
@@ -1174,22 +1174,27 @@ impl Executor {
                             ),
                             &join_type_upper,
                         );
-                        (left.is_some(), right.is_some())
+                        [left, right]
                     }
-                    None => (false, false),
+                    None => [None, None],
                 };
                 pick_index_join_side(
                     &join_type_upper,
                     right_is_table,
-                    right_filtered,
-                    left_filtered,
+                    right_filter.is_some(),
+                    left_filter.is_some(),
                     inlj_info,
                     || {
                         left_probe.as_ref().and_then(|probe| {
                             self.probe_strategy(probe, bounded, small_outer, !right_is_table)
                         })
                     },
-                    || self.right_small_beside(left_probe.as_ref(), join_right),
+                    || {
+                        let sides = [join_left, join_right];
+                        let filters = [left_filter.as_ref(), right_filter.as_ref()];
+                        let shares = self.join_side_shares(None, sides, filters);
+                        self.right_small_beside(sides, shares)
+                    },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };

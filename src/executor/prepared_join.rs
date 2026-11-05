@@ -262,6 +262,9 @@ pub struct PreparedJoin {
     /// Whether the statement's CTEs are named without reading them, which
     /// keeps the join's plan over them; decided on first need
     ctes_named: std::sync::OnceLock<bool>,
+    /// The share of each side's rows its own conditions keep, with the
+    /// statistics epoch it was estimated under
+    side_shares: RwLock<Option<(u64, [f64; 2])>>,
 }
 
 impl PreparedJoin {
@@ -284,6 +287,7 @@ impl PreparedJoin {
             filters: std::sync::OnceLock::new(),
             join_plan: std::sync::OnceLock::new(),
             ctes_named: std::sync::OnceLock::new(),
+            side_shares: RwLock::new(None),
         }
     }
 
@@ -326,6 +330,21 @@ impl PreparedJoin {
     /// Each side's columns as the blocks read them, as `name` finds once
     pub(crate) fn sides(&self, name: impl FnOnce() -> Option<JoinSides>) -> Option<&JoinSides> {
         self.sides.get_or_init(name).as_ref()
+    }
+
+    /// The share of each side's rows its own conditions keep under the
+    /// statistics of `epoch`, as `estimate` finds once per epoch
+    pub(crate) fn side_shares(&self, epoch: u64, estimate: impl FnOnce() -> [f64; 2]) -> [f64; 2] {
+        if let Some((held, shares)) = self.side_shares.read().ok().and_then(|held| *held) {
+            if held == epoch {
+                return shares;
+            }
+        }
+        let shares = estimate();
+        if let Ok(mut held) = self.side_shares.write() {
+            *held = Some((epoch, shares));
+        }
+        shares
     }
 
     /// Whether the statement's CTEs are named without reading them, as

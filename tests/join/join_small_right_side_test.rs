@@ -18,14 +18,21 @@
 
 use stoolap::Database;
 
-/// `t` has 5,000 rows, k = id % 1000, with an index on k; `s` has 5 rows,
-/// one key past every `t` row; `m` has 2,000 rows and `x` 300 with an
-/// index on k, neither small beside the other side
+/// `t` has 5,000 rows, k = id % 1000, f = id % 2, with an index on k; `s`
+/// has 5 rows, one key past every `t` row; `m` has 2,000 rows and `x` 300
+/// with an index on k, neither small beside the other side; `d` has 20,000
+/// rows and `e` 100, every key 1, `d` with an index on it
 fn tables(db: &Database) {
     for sql in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, f INTEGER)",
         "CREATE INDEX t_k ON t(k)",
-        "INSERT INTO t SELECT g.value, g.value % 1000, g.value FROM generate_series(1, 5000) g",
+        "INSERT INTO t SELECT g.value, g.value % 1000, g.value, g.value % 2 \
+         FROM generate_series(1, 5000) g",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX d_k ON d(k)",
+        "INSERT INTO d SELECT g.value, 1 FROM generate_series(1, 20000) g",
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO e SELECT g.value, 1 FROM generate_series(1, 100) g",
         "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)",
         "INSERT INTO s VALUES (1, 0), (2, 7), (3, 14), (4, 999), (5, 2000)",
         "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER)",
@@ -56,13 +63,12 @@ fn plan(db: &Database, sql: &str) -> String {
         .join("\n")
 }
 
-/// The line of `sql`'s plan that names how its join runs
+/// How `sql`'s plan runs its join, without the cost it estimates
 fn join_method(db: &Database, sql: &str) -> String {
     let plan = plan(db, sql);
     let line = plan.lines().find(|line| line.contains("(INNER Join)"));
-    line.unwrap_or_else(|| panic!("{sql}:\n{plan}"))
-        .trim()
-        .to_string()
+    let line = line.unwrap_or_else(|| panic!("{sql}:\n{plan}")).trim();
+    line.split(" (cost=").next().unwrap_or(line).to_string()
 }
 
 /// Each `s` row with the `t` rows its key matches
@@ -115,6 +121,53 @@ fn a_small_right_table_probes_the_left_tables_index_when_sealed() {
     tables(&db);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     small_right_side_probes_the_left_index(&db);
+}
+
+#[test]
+fn a_left_side_its_conditions_keep_small_is_not_probed_from_the_right() {
+    let db = Database::open("memory://join_small_right_side_left_filtered").unwrap();
+    tables(&db);
+    let sql = "SELECT e.id, d.id FROM d JOIN e ON d.k = e.k WHERE d.id = 1";
+    for analyzed in [false, true] {
+        if analyzed {
+            db.execute("ANALYZE d", ()).unwrap();
+            db.execute("ANALYZE e", ()).unwrap();
+        }
+        assert_eq!(pairs(&db, sql).len(), 100, "{sql}, analyzed {analyzed}");
+        let method = join_method(&db, sql);
+        assert!(
+            method.contains("Hash Join"),
+            "{sql}, analyzed {analyzed}: {method}"
+        );
+    }
+}
+
+// The file engine plans no index join on a secondary index over hot rows
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_left_side_its_conditions_keep_large_is_probed_from_the_small_right() {
+    let db = Database::open("memory://join_small_right_side_wide_filter").unwrap();
+    tables(&db);
+    let sql = "SELECT s.id, t.id FROM t JOIN s ON t.k = s.k WHERE t.f = 0 ORDER BY s.id, t.id";
+    let other_way = "SELECT s.id, t.id FROM s JOIN t ON t.k = s.k WHERE t.f = 0";
+    let even: Vec<_> = written().into_iter().filter(|(_, t)| t % 2 == 0).collect();
+    for analyzed in [false, true] {
+        if analyzed {
+            db.execute("ANALYZE t", ()).unwrap();
+            db.execute("ANALYZE s", ()).unwrap();
+        }
+        assert_eq!(pairs(&db, sql), even, "{sql}, analyzed {analyzed}");
+        let method = join_method(&db, sql);
+        assert!(
+            !method.contains("Hash Join"),
+            "{sql}, analyzed {analyzed}: {method}"
+        );
+        assert_eq!(
+            method,
+            join_method(&db, other_way),
+            "{sql}, analyzed {analyzed}"
+        );
+    }
 }
 
 #[test]

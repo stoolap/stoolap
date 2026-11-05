@@ -25,6 +25,7 @@ use crate::storage::traits::Engine;
 
 use super::aggregation::grouped_item;
 use super::operators::index_nested_loop::IndexLookupStrategy;
+use super::prepared_join::PreparedJoin;
 use super::query::{CteNames, HOT_INNER_ROWS_PER_KEY, SMALL_OUTER_ROWS};
 use super::query_classification::QueryClassification;
 use super::utils::{bare_name, probes_by_equality, qualified, split_qualified};
@@ -299,35 +300,21 @@ impl Executor {
         })
     }
 
-    /// Whether the right table `right` of an INNER join is small beside the
-    /// table `probe` reads on the left: at most SMALL_OUTER_ROWS rows against
-    /// HOT_INNER_ROWS_PER_KEY times as many, so a probe for each of its rows
-    /// reads less than a join that scans the left table
+    /// Whether the right side of an INNER join is small beside its left one,
+    /// each estimated under its own conditions: at most SMALL_OUTER_ROWS rows
+    /// against HOT_INNER_ROWS_PER_KEY times as many, so a probe for each of
+    /// its rows reads less than a join that scans the left side
     pub(crate) fn right_small_beside(
         &self,
-        probe: Option<&IndexProbe>,
-        right: &Expression,
+        [left, right]: [&Expression; 2],
+        shares: [f64; 2],
     ) -> bool {
-        let Some(probe) = probe else {
-            return false;
-        };
-        let right = match right {
-            Expression::TableSource(ts) => ts,
-            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                Expression::TableSource(ts) => ts,
-                _ => return false,
-            },
-            _ => return false,
-        };
-        let rows = |name: &str| self.engine.row_count_hint(name);
-        let Some(right_rows) =
-            rows(&right.name.value_lower).filter(|rows| *rows <= SMALL_OUTER_ROWS)
-        else {
-            return false;
-        };
-        rows(&probe.table).is_some_and(|left_rows| {
-            left_rows >= right_rows.max(1).saturating_mul(HOT_INNER_ROWS_PER_KEY)
-        })
+        let right_rows = self.estimate_side_rows(right, shares[1]);
+        right_rows <= SMALL_OUTER_ROWS as u64
+            && self.estimate_side_rows(left, shares[0])
+                >= right_rows
+                    .max(1)
+                    .saturating_mul(HOT_INNER_ROWS_PER_KEY as u64)
     }
 
     /// The lookup `probe` runs with, when this run takes it. The table's
@@ -406,31 +393,48 @@ impl Executor {
         }
     }
 
-    /// Whether a LIMIT hash join builds on its left side: the side the
-    /// statistics estimate smaller under its conditions, read per run since
-    /// ANALYZE moves the estimates without changing the plan
+    /// Whether a LIMIT hash join builds on its left side: the side estimated
+    /// smaller under its conditions
     pub(crate) fn limit_hash_builds_left(
         &self,
         [left, right]: [&Expression; 2],
-        [left_filter, right_filter]: [Option<&Expression>; 2],
+        shares: [f64; 2],
     ) -> bool {
-        self.estimate_side_rows(left, left_filter) < self.estimate_side_rows(right, right_filter)
+        self.estimate_side_rows(left, shares[0]) < self.estimate_side_rows(right, shares[1])
     }
 
-    /// The rows a base table side is estimated to give under `filter`;
+    /// The rows a base table side is estimated to give: the rows its table
+    /// holds now, times `share`, the share of them its conditions keep;
     /// u64::MAX for any other side
-    fn estimate_side_rows(&self, side: &Expression, filter: Option<&Expression>) -> u64 {
-        let table = match side {
-            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
-            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                Expression::TableSource(ts) => ts.name.value_lower.as_str(),
-                _ => return u64::MAX,
-            },
-            _ => return u64::MAX,
+    fn estimate_side_rows(&self, side: &Expression, share: f64) -> u64 {
+        let Some(table) = base_table_lower(side) else {
+            return u64::MAX;
         };
-        self.get_query_planner()
-            .estimate_scan_rows(table, filter)
-            .unwrap_or(u64::MAX)
+        self.engine
+            .row_count_hint(table)
+            .map_or(u64::MAX, |rows| (rows as f64 * share).ceil() as u64)
+    }
+
+    /// The share of each side's rows its own conditions keep, as the
+    /// statistics estimate it, by the default selectivities without ANALYZE;
+    /// held by the join's `plan` for the statistics it was estimated under,
+    /// since estimating reads them anew
+    pub(crate) fn join_side_shares(
+        &self,
+        plan: Option<&PreparedJoin>,
+        sides: [&Expression; 2],
+        filters: [Option<&Expression>; 2],
+    ) -> [f64; 2] {
+        let estimate = || {
+            [0, 1].map(|i| match (base_table_lower(sides[i]), filters[i]) {
+                (Some(table), Some(filter)) => self.get_query_planner().filter_share(table, filter),
+                _ => 1.0,
+            })
+        };
+        match plan {
+            Some(plan) => plan.side_shares(self.engine.stats_epoch(), estimate),
+            None => estimate(),
+        }
     }
 
     /// The table a subquery passes through: one table, every column in its
@@ -529,6 +533,18 @@ fn has_equality(expr: &Expression) -> bool {
             false
         }
         _ => false,
+    }
+}
+
+/// The lowercase name of the base table `side` reads, when it reads one
+fn base_table_lower(side: &Expression) -> Option<&str> {
+    match side {
+        Expression::TableSource(ts) => Some(ts.name.value_lower.as_str()),
+        Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+            Expression::TableSource(ts) => Some(ts.name.value_lower.as_str()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
