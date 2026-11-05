@@ -629,7 +629,8 @@ const char* stoolap_rows_errmsg(const StoolapRows* rows);
  * byte length.  Caller MUST free with stoolap_buffer_free().
  * The rows handle's data is consumed; call stoolap_rows_close() afterward.
  * A runtime error that ends the result early returns STOOLAP_ERROR and no
- * buffer; read it with stoolap_rows_errmsg().
+ * buffer; read it with stoolap_rows_errmsg().  So does a column name of
+ * more than 65535 bytes, which name_len cannot say: give it an alias.
  */
 int32_t stoolap_rows_fetch_all(
     StoolapRows* rows,

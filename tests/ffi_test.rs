@@ -4537,3 +4537,83 @@ fn test_a_timestamp_past_the_nanosecond_range_is_an_error_not_the_epoch() {
         stoolap_close(db);
     }
 }
+
+#[test]
+fn test_packed_results_refuse_a_column_name_past_its_length_field() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+        let max = u16::MAX as usize;
+        let past = cstr(&format!("SELECT 1 AS \"{}\"", "a".repeat(max + 1)));
+        let refused = "give the column an alias";
+
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, past.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let mut len: i64 = 0;
+        assert_eq!(
+            stoolap_rows_fetch_all(rows, &mut buf, &mut len),
+            STOOLAP_ERROR
+        );
+        assert!(buf.is_null());
+        assert!(
+            read_cstr(stoolap_rows_errmsg(rows)).contains(refused),
+            "fetch all"
+        );
+        assert_eq!(
+            read_cstr(stoolap_rows_column_name(rows, 0)).len(),
+            max + 1,
+            "the name read alone is whole"
+        );
+        stoolap_rows_close(rows);
+
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, past.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut chunk: *const u8 = std::ptr::null();
+        let mut n: i32 = 0;
+        assert_eq!(
+            stoolap_rows_fetch_chunk(rows, 10, &mut chunk, &mut len, &mut n),
+            STOOLAP_ERROR
+        );
+        assert!(
+            read_cstr(stoolap_rows_errmsg(rows)).contains(refused),
+            "fetch chunk"
+        );
+        stoolap_rows_close(rows);
+
+        let mut out: *const u8 = std::ptr::null();
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            past.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut out,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert!(read_cstr(stoolap_errmsg(db)).contains(refused), "query all");
+
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, past.as_ptr(), &mut stmt), STOOLAP_OK);
+        let rc = stoolap_stmt_query_all(
+            stmt,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            &mut out,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "prepared query all");
+        stoolap_stmt_finalize(stmt);
+
+        // A name the length field can say is packed whole
+        let name = "b".repeat(max);
+        let at = format!("SELECT 1 AS \"{name}\"");
+        assert_eq!(
+            fetch_all_of(db, &at),
+            (vec![name], vec![vec!["1".to_string()]])
+        );
+        stoolap_close(db);
+    }
+}
