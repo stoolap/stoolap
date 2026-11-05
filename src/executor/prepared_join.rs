@@ -221,6 +221,10 @@ pub(crate) struct JoinFilters {
     pub cross: Option<Expression>,
 }
 
+/// The share of each side's rows its own conditions keep, with the
+/// statistics epoch and the feedback version it was estimated under
+type HeldShares = ((u64, u64), [f64; 2]);
+
 /// The programs one join statement compiled, valid while its validity holds
 #[derive(Debug)]
 pub struct PreparedJoin {
@@ -262,9 +266,7 @@ pub struct PreparedJoin {
     /// Whether the statement's CTEs are named without reading them, which
     /// keeps the join's plan over them; decided on first need
     ctes_named: std::sync::OnceLock<bool>,
-    /// The share of each side's rows its own conditions keep, with the
-    /// statistics epoch it was estimated under
-    side_shares: RwLock<Option<(u64, [f64; 2])>>,
+    side_shares: RwLock<Option<HeldShares>>,
 }
 
 impl PreparedJoin {
@@ -333,8 +335,13 @@ impl PreparedJoin {
     }
 
     /// The share of each side's rows its own conditions keep under the
-    /// statistics of `epoch`, as `estimate` finds once per epoch
-    pub(crate) fn side_shares(&self, epoch: u64, estimate: impl FnOnce() -> [f64; 2]) -> [f64; 2] {
+    /// statistics and the learned corrections of `epoch`, as `estimate`
+    /// finds once per epoch
+    pub(crate) fn side_shares(
+        &self,
+        epoch: (u64, u64),
+        estimate: impl FnOnce() -> [f64; 2],
+    ) -> [f64; 2] {
         if let Some((held, shares)) = self.side_shares.read().ok().and_then(|held| *held) {
             if held == epoch {
                 return shares;

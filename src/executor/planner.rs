@@ -636,11 +636,44 @@ impl QueryPlanner {
     }
 
     /// The share of `table_name`'s rows `predicate` keeps, as its statistics
-    /// estimate it, by the default selectivities when ANALYZE has not run
+    /// estimate it, by the default selectivities when ANALYZE has not run,
+    /// corrected by what EXPLAIN ANALYZE learned of it
     pub(crate) fn filter_share(&self, table_name: &str, predicate: &Expression) -> f64 {
         let table_stats = self.get_table_stats(table_name).unwrap_or_default();
-        self.estimate_predicate_selectivity(table_name, predicate, &table_stats)
-            .clamp(0.0, 1.0)
+        let share = self.estimate_predicate_selectivity(table_name, predicate, &table_stats);
+        let fingerprint = fingerprint_predicate(table_name, predicate);
+        let correction = global_feedback_cache().get_correction(table_name, fingerprint);
+        (share * correction).clamp(0.0, 1.0)
+    }
+
+    /// Whether `a = b` compares a column of `table_name` that no two rows
+    /// share a value of, its primary key or a column of a unique index, with
+    /// a value that reads no column
+    fn unique_key_equality(&self, table_name: &str, a: &Expression, b: &Expression) -> bool {
+        let reads_none = |expr: &Expression| {
+            let mut refs = 0;
+            crate::executor::utils::visit_column_refs(expr, &mut |_| refs += 1) && refs == 0
+        };
+        let column = match (self.extract_column_name(a), self.extract_column_name(b)) {
+            (Some(column), None) if reads_none(b) => column,
+            (None, Some(column)) if reads_none(a) => column,
+            _ => return false,
+        };
+        let Ok(schema) = self.engine.get_table_schema(table_name) else {
+            return false;
+        };
+        let is_pk = schema
+            .pk_column_index()
+            .is_some_and(|pk| schema.columns[pk].name_lower == column);
+        is_pk
+            || self
+                .engine
+                .get_version_store(table_name)
+                .is_ok_and(|store| {
+                    store
+                        .get_index_by_column(&column)
+                        .is_some_and(|index| index.is_unique())
+                })
     }
 
     /// Estimate selectivity of a predicate expression
@@ -720,6 +753,11 @@ impl QueryPlanner {
                     }
                     // Comparison operators
                     InfixOperator::Equal => {
+                        // A key no two rows share, equal to a value, keeps one
+                        // row, a share no count of rows moves
+                        if self.unique_key_equality(table_name, &infix.left, &infix.right) {
+                            return 0.0;
+                        }
                         let col_name = self
                             .extract_column_name(&infix.left)
                             .or_else(|| self.extract_column_name(&infix.right));

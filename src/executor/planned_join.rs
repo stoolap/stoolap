@@ -30,6 +30,7 @@ use super::query::{CteNames, HOT_INNER_ROWS_PER_KEY, SMALL_OUTER_ROWS};
 use super::query_classification::QueryClassification;
 use super::utils::{bare_name, probes_by_equality, qualified, split_qualified};
 use super::Executor;
+use crate::optimizer::feedback::global_feedback_cache;
 
 /// What a join's plan is decided from: the statement, and its WHERE as the
 /// join split it over the sides
@@ -415,10 +416,10 @@ impl Executor {
             .map_or(u64::MAX, |rows| (rows as f64 * share).ceil() as u64)
     }
 
-    /// The share of each side's rows its own conditions keep, as the
-    /// statistics estimate it, by the default selectivities without ANALYZE;
-    /// held by the join's `plan` for the statistics it was estimated under,
-    /// since estimating reads them anew
+    /// The share of each side's rows its own conditions keep, as
+    /// `filter_share` estimates it; held by the join's `plan` for the
+    /// statistics and the learned corrections it was estimated under, since
+    /// estimating reads them anew
     pub(crate) fn join_side_shares(
         &self,
         plan: Option<&PreparedJoin>,
@@ -432,7 +433,10 @@ impl Executor {
             })
         };
         match plan {
-            Some(plan) => plan.side_shares(self.engine.stats_epoch(), estimate),
+            Some(plan) => {
+                let epoch = (self.engine.stats_epoch(), global_feedback_cache().version());
+                plan.side_shares(epoch, estimate)
+            }
             None => estimate(),
         }
     }

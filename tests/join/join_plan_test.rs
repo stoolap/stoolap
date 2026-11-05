@@ -153,6 +153,47 @@ fn a_limit_hash_join_builds_on_the_side_estimated_smaller_under_its_conditions()
 }
 
 #[test]
+fn a_limit_hash_join_reads_the_corrections_explain_analyze_learned() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_limit_hash_feedback").unwrap();
+    for sql in [
+        "CREATE TABLE fb_s (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE fb_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO fb_s SELECT g.value, g.value % 200 FROM generate_series(1, 20000) g",
+        "INSERT INTO fb_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let stmt = db
+        .prepare("SELECT fb_s.id, fb_t.id FROM fb_s JOIN fb_t ON fb_t.k = fb_s.k WHERE fb_s.k = 1 LIMIT $1")
+        .unwrap();
+    let builds = || {
+        let before = limit_hash_left_builds();
+        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        limit_hash_left_builds() - before
+    };
+    assert_eq!(
+        builds(),
+        0,
+        "an equality estimated to keep a tenth of fb_s keeps more rows than fb_t holds"
+    );
+    for _ in 0..2 {
+        let explained = db.query(
+            "EXPLAIN ANALYZE SELECT fb_s.id FROM fb_s WHERE fb_s.k = 1",
+            (),
+        );
+        explained.unwrap().for_each(|row| {
+            row.unwrap();
+        });
+    }
+    assert_eq!(
+        builds(),
+        1,
+        "EXPLAIN ANALYZE found the equality keeps 100 rows of fb_s"
+    );
+}
+
+#[test]
 fn a_workload_memory_limit_keeps_a_join_off_a_hash_table() {
     let _guard = serial();
     let db = Database::open("memory://join_plan_memory_limit").unwrap();

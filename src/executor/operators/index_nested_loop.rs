@@ -302,6 +302,9 @@ pub struct IndexNestedLoopJoinOperator<'a> {
     // Set when the inner table could not answer a probe; the rows joined
     // so far are then no answer either
     needs_fallback: bool,
+    // The most rows one index probe may find before the join ends for
+    // another way to run it
+    probe_cap: Option<usize>,
     // The outer row the chunk ended on when it left with its last match,
     // kept for the executor's continuation
     ended_on: Option<Row>,
@@ -421,6 +424,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             outer_exhausted: false,
             outer_rows_seen: 0,
             needs_fallback: false,
+            probe_cap: None,
             ended_on: None,
             probe_scratch: ProbeScratch::default(),
             local_rows: None,
@@ -454,6 +458,13 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
     /// the residual's pair read the inner side first
     pub fn with_outer_on_right(mut self) -> Self {
         self.outer_on_right = true;
+        self
+    }
+
+    /// An index probe finding more than `cap` rows ends the join, which the
+    /// executor then runs another way
+    pub fn with_probe_cap(mut self, cap: usize) -> Self {
+        self.probe_cap = Some(cap);
         self
     }
 
@@ -607,6 +618,14 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
                     std::slice::from_ref(key_value),
                     &mut self.row_id_buffer,
                 );
+                if self
+                    .probe_cap
+                    .is_some_and(|cap| self.row_id_buffer.len() > cap)
+                {
+                    self.row_id_buffer.clear();
+                    self.needs_fallback = true;
+                    return Ok(());
+                }
                 epoch.is_some()
                     && self.inner_table.add_removed_equal(
                         &**index,

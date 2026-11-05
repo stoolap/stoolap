@@ -21,18 +21,20 @@ use stoolap::Database;
 /// `t` has 5,000 rows, k = id % 1000, f = id % 2, with an index on k; `s`
 /// has 5 rows, one key past every `t` row; `m` has 2,000 rows and `x` 300
 /// with an index on k, neither small beside the other side; `d` has 20,000
-/// rows and `e` 100, every key 1, `d` with an index on it
+/// rows and `e` 10, every key 1, `d` with an index on it and f = 1 on its
+/// first row alone
 fn tables(db: &Database) {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, f INTEGER)",
         "CREATE INDEX t_k ON t(k)",
         "INSERT INTO t SELECT g.value, g.value % 1000, g.value, g.value % 2 \
          FROM generate_series(1, 5000) g",
-        "CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
         "CREATE INDEX d_k ON d(k)",
-        "INSERT INTO d SELECT g.value, 1 FROM generate_series(1, 20000) g",
+        "INSERT INTO d SELECT g.value, 1, CASE WHEN g.value = 1 THEN 1 ELSE 0 END \
+         FROM generate_series(1, 20000) g",
         "CREATE TABLE e (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO e SELECT g.value, 1 FROM generate_series(1, 100) g",
+        "INSERT INTO e SELECT g.value, 1 FROM generate_series(1, 10) g",
         "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)",
         "INSERT INTO s VALUES (1, 0), (2, 7), (3, 14), (4, 999), (5, 2000)",
         "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER)",
@@ -133,13 +135,29 @@ fn a_left_side_its_conditions_keep_small_is_not_probed_from_the_right() {
             db.execute("ANALYZE d", ()).unwrap();
             db.execute("ANALYZE e", ()).unwrap();
         }
-        assert_eq!(pairs(&db, sql).len(), 100, "{sql}, analyzed {analyzed}");
+        assert_eq!(pairs(&db, sql).len(), 10, "{sql}, analyzed {analyzed}");
         let method = join_method(&db, sql);
         assert!(
             method.contains("Hash Join"),
             "{sql}, analyzed {analyzed}: {method}"
         );
     }
+}
+
+#[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
+#[test]
+fn a_swapped_join_whose_probe_finds_more_than_the_cap_runs_by_hash() {
+    use stoolap::test_failpoints::index_join_outer_rows;
+    let db = Database::open("memory://join_small_right_side_probe_cap").unwrap();
+    tables(&db);
+    let sql = "SELECT e.id, d.id FROM d JOIN e ON d.k = e.k WHERE d.f = 1 ORDER BY e.id";
+    let method = join_method(&db, sql);
+    assert!(!method.contains("Hash Join"), "{sql} swaps: {method}");
+    let before = index_join_outer_rows();
+    let found = pairs(&db, sql);
+    assert_eq!(found, (1..=10).map(|e| (e, 1)).collect::<Vec<_>>(), "{sql}");
+    let read = index_join_outer_rows() - before;
+    assert!(read <= 1, "{sql}: the swapped join probed {read} rows of e");
 }
 
 // The file engine plans no index join on a secondary index over hot rows

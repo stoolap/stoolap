@@ -461,6 +461,7 @@ use super::operator::{Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
+    EQUALITY_CANDIDATE_CAP,
 };
 use super::operators::BloomFilterOperator;
 use super::planned_join::{pick_index_join_side, JoinShape};
@@ -4749,6 +4750,11 @@ impl Executor {
                             }
                             if swapped {
                                 op = op.with_outer_on_right();
+                            }
+                            // A swap is chosen by estimates; a probe past the
+                            // cap a join without a limit fills shows one wrong
+                            if swapped && join_limit.is_none() {
+                                op = op.with_probe_cap(EQUALITY_CANDIDATE_CAP);
                             }
                             if let Some(ref proj) = projection_pushdown {
                                 op = op.with_projection(proj.columns.clone());
