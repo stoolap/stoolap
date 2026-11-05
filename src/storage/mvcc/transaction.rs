@@ -800,6 +800,9 @@ impl Transaction for MvccTransaction {
 
     fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
         self.check_active()?;
+        // A new table only: a rollback restores a dropped one through the
+        // engine operations directly, whatever name it was given before
+        super::engine::check_new_table(&schema)?;
 
         let ops = self.get_engine_ops()?;
         let table = ops.create_table(name, schema)?;

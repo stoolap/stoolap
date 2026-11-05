@@ -179,6 +179,11 @@ fn unique_index_name(table: &str, column: &str) -> String {
     format!("unique_{table}_{column}")
 }
 
+/// The name of the index the `i`th table UNIQUE constraint of a new table gets
+fn table_unique_index_name(table: &str, i: usize) -> String {
+    format!("unique_{table}_{i}")
+}
+
 /// The name of the index a foreign key column of a new table gets
 fn fk_index_name(table: &str, column: &str) -> String {
     format!("fk_{table}_{column}")
@@ -453,21 +458,35 @@ impl Executor {
             fk_index_columns.push(col.name.clone());
         }
         // Refused before the table is made when an index it gets would not be
-        // stored, of the type the index takes on its column
+        // stored, of the type the index takes on its columns
         let indexes = (unique_columns
             .iter()
-            .map(|c| (unique_index_name(table_name, c), c)))
+            .map(|c| (unique_index_name(table_name, c), vec![c.as_str()])))
+        .chain(
+            table_unique_constraints
+                .iter()
+                .enumerate()
+                .map(|(i, columns)| {
+                    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    (table_unique_index_name(table_name, i), columns)
+                }),
+        )
         .chain(
             fk_index_columns
                 .iter()
-                .map(|c| (fk_index_name(table_name, c), c)),
+                .map(|c| (fk_index_name(table_name, c), vec![c.as_str()])),
         );
-        for (name, column) in indexes {
-            let data_type = schema
-                .find_column(column)
-                .map_or(DataType::Null, |(_, col)| col.data_type);
+        for (name, columns) in indexes {
+            let data_types: Vec<DataType> = columns
+                .iter()
+                .map(|c| {
+                    schema
+                        .find_column(c)
+                        .map_or(DataType::Null, |(_, col)| col.data_type)
+                })
+                .collect();
             let index_type =
-                crate::storage::mvcc::table::MVCCTable::auto_select_index_type(&[data_type]);
+                crate::storage::mvcc::table::MVCCTable::index_type_for(&data_types, None);
             crate::storage::mvcc::engine::check_index_name(&name, index_type)?;
         }
 
@@ -503,7 +522,7 @@ impl Executor {
 
             // Create multi-column unique indexes from table-level constraints
             for (i, col_names) in table_unique_constraints.iter().enumerate() {
-                let index_name = format!("unique_{}_{}", table_name, i);
+                let index_name = table_unique_index_name(table_name, i);
                 let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
                 table.create_index(&index_name, &col_refs, true)?;
                 // Get index type for WAL persistence
@@ -580,7 +599,7 @@ impl Executor {
 
                 // Create multi-column unique indexes from table-level constraints
                 for (i, col_names) in table_unique_constraints.iter().enumerate() {
-                    let index_name = format!("unique_{}_{}", table_name, i);
+                    let index_name = table_unique_index_name(table_name, i);
                     let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
                     table.create_index(&index_name, &col_refs, true)?;
                     let idx_type = table

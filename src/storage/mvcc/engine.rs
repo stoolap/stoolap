@@ -9630,7 +9630,6 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
-        check_new_table(&schema)?;
         let table_name = name.to_lowercase();
 
         // Create version store for this table (before acquiring locks)
@@ -11233,6 +11232,34 @@ mod tests {
 
         engine.drop_table_internal("temp").unwrap();
         assert!(!engine.table_exists("temp").unwrap());
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn test_a_rollback_restores_a_table_whose_name_a_new_one_cannot_take() {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+
+        // Renamed as recovery renames a table a database written before holds
+        let name = "a\\b";
+        assert!(
+            check_path_name(name, 0, "a table name").is_err(),
+            "a new table cannot take it"
+        );
+        let schema = SchemaBuilder::new("ab")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        engine.create_table(schema).unwrap();
+        engine.rename_table("ab", name).unwrap();
+
+        let mut txn = engine.begin_transaction().unwrap();
+        txn.drop_table(name).unwrap();
+        txn.rollback().unwrap();
+        assert!(
+            engine.table_exists(name).unwrap(),
+            "restored by the rollback"
+        );
 
         engine.close_engine().unwrap();
     }

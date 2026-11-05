@@ -182,6 +182,24 @@ fn refused_statements() -> Vec<(&'static str, String, &'static str)> {
             stored,
         ),
         (
+            "name of the HNSW index a table UNIQUE on a VECTOR gets",
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, v VECTOR(2), UNIQUE (v))",
+                "a".repeat(220)
+            ),
+            file,
+        ),
+        (
+            "HNSW index with options, name with a /",
+            "CREATE INDEX \"a/b\" ON w (v) USING HNSW WITH (m = 16)".to_string(),
+            path,
+        ),
+        (
+            "HNSW index with options, name too long",
+            format!("CREATE INDEX {long} ON w (v) USING HNSW WITH (m = 16)"),
+            stored,
+        ),
+        (
             "view name whose lowercase is past the limit",
             format!("CREATE VIEW \"{}\" AS SELECT 1", "İ".repeat(22_000)),
             stored,
