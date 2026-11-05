@@ -451,10 +451,10 @@ pub(crate) fn visit_column_refs_outside<'e>(
 /// `filters`, GROUP BY, HAVING and ORDER BY; None when any of them reads
 /// something a name cannot stand for, or a name that is neither a column
 /// nor a SELECT alias
-pub(crate) fn needed_columns<'a>(
+pub(crate) fn needed_columns<'a, 'c>(
     stmt: &'a SelectStatement,
     filters: impl IntoIterator<Item = &'a Expression>,
-    columns_lower: &[String],
+    columns_lower: impl Iterator<Item = &'c str> + Clone,
 ) -> Option<Vec<bool>> {
     let mut names = Vec::new();
     let grouping_sets = match &stmt.group_by.modifier {
@@ -509,11 +509,11 @@ pub(crate) fn needed_columns<'a>(
         return None;
     }
     names.extend(window_names.into_inner());
-    let mut mask = vec![false; columns_lower.len()];
+    let mut mask = vec![false; columns_lower.clone().count()];
     for name in names {
         let mut spelled = false;
-        for (read, column) in mask.iter_mut().zip(columns_lower) {
-            if *column == name.as_str() {
+        for (read, column) in mask.iter_mut().zip(columns_lower.clone()) {
+            if column == name.as_str() {
                 *read = true;
                 spelled = true;
             }

@@ -8438,7 +8438,7 @@ impl PreparedSelect {
                     where_.needed = needed_columns(
                         reads,
                         reads.where_clause.as_deref(),
-                        &schema.column_names_lower_arc(),
+                        schema.columns.iter().map(|c| c.name_lower.as_str()),
                     );
                 }
                 // A DISTINCT reads every row before its LIMIT counts them

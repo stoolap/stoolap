@@ -3706,11 +3706,10 @@ impl Executor {
                 .0;
             let on = natural.as_ref().or(join_source.condition.as_deref());
             // A table side's scan reads only the columns the statement names
-            let lower: Vec<String> = (spelled.iter().flatten())
-                .map(|(_, name)| name.to_lowercase())
-                .collect();
+            let lower = (sides.iter().flat_map(|side| &side.leaves))
+                .flat_map(|(_, schema)| schema.columns.iter().map(|c| c.name_lower.as_str()));
             let filters = stmt.where_clause.as_deref().into_iter().chain(on);
-            let needed = needed_columns(stmt, filters, &lower);
+            let needed = needed_columns(stmt, filters, lower);
             let opened = cross.map(|cross| {
                 Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
             });
