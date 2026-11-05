@@ -35,6 +35,7 @@ mod pragma_restore_test;
 mod retype_fixture_test;
 mod snapshot_recovery_test;
 mod snapshot_system_test;
+mod stored_length_test;
 mod vacuum_test;
 mod volume_checkpoint_test;
 mod wal_acknowledged_commit_test;

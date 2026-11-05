@@ -274,6 +274,82 @@ fn strip_fk_references(
     }
 }
 
+/// The most bytes a name or a text the schema keeps may take: the file
+/// format writes each with a 16-bit length
+pub(crate) const MAX_STORED_LEN: usize = u16::MAX as usize;
+
+/// `len` bytes the schema keeps as `what`, refused when the file format
+/// cannot write them whole
+pub(crate) fn check_stored(len: usize, what: impl FnOnce() -> String) -> Result<()> {
+    if len <= MAX_STORED_LEN {
+        return Ok(());
+    }
+    Err(Error::invalid_argument(format!(
+        "{} takes {len} bytes, more than the {MAX_STORED_LEN} a schema can store",
+        what()
+    )))
+}
+
+/// The most bytes one file or directory name may take on the file systems
+/// the engine runs on
+const MAX_PATH_COMPONENT: usize = 255;
+
+/// The bytes `hnsw_{name}-{YYYYMMDD-HHMMSS.mmm}.bin` adds to an HNSW index's
+/// name in its graph file's name
+pub(crate) const HNSW_FILE_NAME_EXTRA: usize = 29;
+
+/// `name`, which a file or directory of the database is named after with
+/// `extra` bytes around it, refused as `what` unless it makes one path
+/// component inside its directory
+pub(crate) fn check_path_name(name: &str, extra: usize, what: &str) -> Result<()> {
+    let len = name.len().max(name.to_lowercase().len());
+    if len + extra > MAX_PATH_COMPONENT {
+        return Err(Error::invalid_argument(format!(
+            "{what} takes {len} bytes, more than the {} a file name leaves it",
+            MAX_PATH_COMPONENT - extra
+        )));
+    }
+    if name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(Error::invalid_argument(format!(
+            "{what} '{name}' cannot be . or .. or hold /, \\ or NUL, since it names a file"
+        )));
+    }
+    Ok(())
+}
+
+/// Every name and text `schema` keeps, refused as [`check_stored`] refuses one
+pub(crate) fn check_stored_schema(schema: &Schema) -> Result<()> {
+    use super::persistence::serialize_value;
+    for col in &schema.columns {
+        check_stored(col.name.len(), || "a column name".to_string())?;
+        if let Some(default) = &col.default_expr {
+            check_stored(default.len(), || {
+                format!("the DEFAULT of column {}", col.name)
+            })?;
+        }
+        if let Some(check) = &col.check_expr {
+            check_stored(check.len(), || format!("the CHECK of column {}", col.name))?;
+        }
+        if let Some(Ok(bytes)) = col.default_value.as_ref().map(serialize_value) {
+            check_stored(bytes.len(), || {
+                format!("the DEFAULT value of column {}", col.name)
+            })?;
+        }
+    }
+    for fk in &schema.foreign_keys {
+        check_stored(fk.referenced_table.len(), || {
+            "a referenced table name".to_string()
+        })?;
+        check_stored(fk.referenced_column.len(), || {
+            "a referenced column name".to_string()
+        })?;
+    }
+    for check in &schema.table_checks {
+        check_stored(check.len(), || "a table CHECK".to_string())?;
+    }
+    Ok(())
+}
+
 /// The table CHECK constraints a schema record ends with: a count, then
 /// each one's length-prefixed text
 pub(crate) fn write_table_checks(buf: &mut Vec<u8>, checks: &[String]) {
@@ -4410,6 +4486,7 @@ impl MVCCEngine {
         schema: &Schema,
         event: ColumnEvent<'_>,
     ) -> Result<()> {
+        check_stored_schema(schema)?;
         let name = to_lowercase_cow(table_name);
         let Some(mgr) = self
             .segment_managers
@@ -4695,6 +4772,8 @@ impl MVCCEngine {
                 return Err(Error::DuplicateColumn);
             }
         }
+        check_path_name(&schema.table_name, 0, "a table name")?;
+        check_stored_schema(schema)?;
 
         schema.validate_cluster_key()
     }
@@ -4732,6 +4811,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        check_stored(name.len(), || "the view name".to_string())?;
 
         let name_lower = name.to_lowercase();
 

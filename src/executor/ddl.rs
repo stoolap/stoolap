@@ -174,6 +174,16 @@ use super::query_cache::NestedPlan;
 use super::result::ExecResult;
 use super::Executor;
 
+/// The name of the index a UNIQUE column of a new table gets
+fn unique_index_name(table: &str, column: &str) -> String {
+    format!("unique_{table}_{column}")
+}
+
+/// The name of the index a foreign key column of a new table gets
+fn fk_index_name(table: &str, column: &str) -> String {
+    format!("fk_{table}_{column}")
+}
+
 impl Executor {
     /// Execute a CREATE TABLE statement, its AS SELECT under the plan
     /// `plan` holds for it
@@ -442,6 +452,20 @@ impl Executor {
             }
             fk_index_columns.push(col.name.clone());
         }
+        // Refused before the table is made when an index it gets would not be stored
+        let index_names = (unique_columns
+            .iter()
+            .map(|c| unique_index_name(table_name, c)))
+        .chain(
+            fk_index_columns
+                .iter()
+                .map(|c| fk_index_name(table_name, c)),
+        );
+        for name in index_names {
+            crate::storage::mvcc::engine::check_stored(name.len(), || {
+                "the index name".to_string()
+            })?;
+        }
 
         // Check if there's an active transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
@@ -452,7 +476,7 @@ impl Executor {
 
             // Create unique indexes for columns with UNIQUE constraint
             for col_name in &unique_columns {
-                let index_name = format!("unique_{}_{}", table_name, col_name);
+                let index_name = unique_index_name(table_name, col_name);
                 table.create_index(&index_name, &[col_name.as_str()], true)?;
                 // Get index type for WAL persistence
                 let idx_type = table
@@ -499,7 +523,7 @@ impl Executor {
 
             // Auto-create indexes on FK columns for efficient referential integrity checks
             for col_name in &fk_index_columns {
-                let index_name = format!("fk_{}_{}", table_name, col_name);
+                let index_name = fk_index_name(table_name, col_name);
                 table.create_index(&index_name, &[col_name.as_str()], false)?;
                 let idx_type = table
                     .get_index(&index_name)
@@ -531,7 +555,7 @@ impl Executor {
                 let table = tx.get_statement_table(table_name)?;
 
                 for col_name in &unique_columns {
-                    let index_name = format!("unique_{}_{}", table_name, col_name);
+                    let index_name = unique_index_name(table_name, col_name);
                     table.create_index(&index_name, &[col_name.as_str()], true)?;
                     let idx_type = table
                         .get_index(&index_name)
@@ -574,7 +598,7 @@ impl Executor {
 
                 // Auto-create indexes on FK columns for efficient referential integrity checks
                 for col_name in &fk_index_columns {
-                    let index_name = format!("fk_{}_{}", table_name, col_name);
+                    let index_name = fk_index_name(table_name, col_name);
                     table.create_index(&index_name, &[col_name.as_str()], false)?;
                     let idx_type = table
                         .get_index(&index_name)

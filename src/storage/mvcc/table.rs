@@ -3911,6 +3911,7 @@ impl Table for MVCCTable {
         if columns.is_empty() {
             return Err(Error::internal("index must have at least one column"));
         }
+        super::engine::check_stored(name.len(), || "the index name".to_string())?;
 
         let schema = self.version_store.schema();
 
@@ -3937,6 +3938,13 @@ impl Table for MVCCTable {
         } else {
             index_type.unwrap_or_else(|| Self::auto_select_index_type(&data_types))
         };
+        if chosen_type == IndexType::Hnsw {
+            super::engine::check_path_name(
+                name,
+                super::engine::HNSW_FILE_NAME_EXTRA,
+                "an HNSW index name",
+            )?;
+        }
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {

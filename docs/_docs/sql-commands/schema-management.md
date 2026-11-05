@@ -240,3 +240,5 @@ Under the hood, Stoolap's schema management is implemented with the following co
 - Certain ALTER TABLE operations may require significant processing time on large tables
 - Currently, online schema changes for large tables may temporarily block writes
 - There are limits on the number of columns and indexes per table for performance reasons
+- A table name names a directory of the database, so it takes at most 255 bytes and cannot be `.` or `..` or hold `/`, `\` or NUL; `CREATE TABLE` and `ALTER TABLE ... RENAME TO` refuse one that does. The name of an HNSW index names a file the same way and takes at most 226 bytes.
+- Every other name (a column, an index, a view, the index a `UNIQUE` or foreign key column gets), the text of a `CHECK` or `DEFAULT` and a column's default value take at most 65,535 bytes. The text counted is the one stored, which writes each operator in parentheses, so it is longer than the text written. A statement past a limit is refused before it changes anything.
