@@ -120,11 +120,12 @@ All `.rs` source files must include the Apache 2.0 license header. CI will rejec
 Every change must pass the full test suite:
 
 ```bash
-# Run all tests (use --test for specific files, much faster)
+# Run all tests (use --test for one group, much faster)
 cargo nextest run
 
-# Run a specific test file
-cargo nextest run --test my_feature_test
+# Run one group of tests, or one file of it
+cargo nextest run --test join
+cargo nextest run --test join -E 'test(/^join_plan_test::/)'
 
 # Never use --release (disk space constraints)
 # Never use keyword filtering (compiles all targets)

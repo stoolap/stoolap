@@ -118,12 +118,20 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
+    - name: Install nextest
+      uses: taiki-e/install-action@nextest
+
+    # Each test runs in a process of its own, so the tests of one binary
+    # share no process-wide state
     - name: Run tests
-      run: cargo test
+      run: cargo nextest run -P full
+
+    - name: Doc tests
+      run: cargo test --doc
 
     - name: WAL failpoint tests (Windows)
       if: runner.os == 'Windows'
-      run: cargo test --test failpoint_io_test --test wal_torn_tail_test --features test-failpoints -- --test-threads=1
+      run: cargo nextest run -P full --features test-failpoints --test persistence -E 'test(/^(failpoint_io_test|wal_torn_tail_test)::/)'
 
     - name: Heap profile (macOS, Windows)
       if: runner.os != 'Linux'
@@ -155,8 +163,11 @@ jobs:
     - name: Heap profile (heap-profile)
       run: cargo test --test heap_profile_test --features heap-profile
 
+    - name: Install nextest
+      uses: taiki-e/install-action@nextest
+
     - name: Failpoint tests
-      run: cargo test --test failpoint_io_test --test captured_version_payload_test --test cold_read_consistency_test --test limit_cold_read_consistency_test --test limit_seal_consistency_test --test secondary_side_file_test --test secondary_index_query_test --test secondary_index_backfill_test --test join_equality_candidates_test --test join_consumer_rule_test --test join_materialized_side_test --test truncate_walk_and_seal_fetch_test --test visible_row_race_test --test tx_pk_fast_path_test --test tx_pk_fast_path_layout_test --test unique_get_test --test failed_commit_sealed_rows_test --test hot_schema_evolution_test --test keyless_sealed_hnsw_test --test wal_torn_tail_test --test snapshot_history_test --test committed_cache_test --test seal_publication_window_test --test seal_deferral_test --test seal_dead_copy_test --test claim_release_test --test unique_plan_check_test --test ordered_limited_scan_test --test commit_seal_stamp_test --test update_fence_metadata_test --test targeted_cold_load_test --test cluster_by_test --test cold_unique_equality_test --test column_change_close_test --test compaction_publication_order_test --test compaction_tombstone_holders_test --test compiled_positions_test --test count_windows_test --test deduped_count_test --test drop_column_readers_test --test drop_column_transition_test --test exists_side_file_probe_test --test in_equality_candidates_test --test rename_column_index_test --test segmented_count_equal_test --test semantic_cache_clear_test --test semantic_cache_stamp_order_test --test small_outer_join_test --test statement_gate_order_test --test truncate_reader_window_test --test txn_status_table_test --test unique_check_lock_order_test --test unique_index_eviction_test --test wal_acknowledged_commit_test --test retype_protocol_test --test retype_failure_test --test commit_recheck_window_test --test comparison_contract_test --test in_subquery_cache_test --test txn_gate_test --test commit_recheck_outside_test --test insert_cold_rounds_test --test delete_cold_rounds_test --test statement_view_reads_test --test commit_window_reads_test --test maintenance_limit_test --test in_list_duplicate_members_test --test statement_view_test --test statement_view_shortcuts_test --test view_overtaken_test --test view_index_candidates_test --test view_removal_history_test --test range_top_k_test --test order_by_index_gate_test --test exists_few_outer_rows_test --test min_max_index_test --test aggregate_path_equivalence_test --test join_path_equivalence_test --test join_plan_test --test join_nested_side_filter_test --test join_group_limit_chunks_test --test planned_window_test --test prepared_join_test --test join_where_blocks_test --test join_on_blocks_test --test join_side_blocks_test --test join_output_blocks_test --test merged_join_output_blocks_test --test grouped_output_blocks_test --test not_in_null_once_test --test prepared_exists_test --test prepared_in_test --test prepared_select_test --test prepared_strategy_test --test prepared_set_scan_test --test hot_streaming_scan_test --test prepared_kept_members_test --test prepared_dml_test --test prepared_conflict_snapshot_test --test prepared_dml_snapshot_test --test insert_plan_rename_test --test read_table_handle_test --test limit_subquery_prepare_test --test side_index_dictionary_test --test subquery_cache_stamp_test --test constant_false_where_test --test zone_map_visibility_test --test order_by_alias_binding_test --test old_path_ledger_test --test index_count_test --test block_cache_identity_test --test block_order_limit_test --test distinct_set_operation_blocks_test --test derived_table_blocks_test --test prepared_literal_twin_test --test pk_conjunct_test --test prepared_where_pushdown_test --test shared_literals_test --test scan_access_test --test prepared_dml_access_test --test opened_table_access_test --features test-failpoints -- --test-threads=1
+      run: cargo nextest run -P full --features test-failpoints --test aggregate --test cold_read --test distinct_set --test index --test join --test operators --test order_limit --test persistence --test plan_cache --test prepared --test seal_compaction --test subquery --test transaction --test vector --test window -E 'test(/^(failpoint_io_test|captured_version_payload_test|cold_read_consistency_test|limit_cold_read_consistency_test|limit_seal_consistency_test|secondary_side_file_test|secondary_index_query_test|secondary_index_backfill_test|join_equality_candidates_test|join_consumer_rule_test|join_materialized_side_test|truncate_walk_and_seal_fetch_test|visible_row_race_test|tx_pk_fast_path_test|tx_pk_fast_path_layout_test|unique_get_test|failed_commit_sealed_rows_test|hot_schema_evolution_test|keyless_sealed_hnsw_test|wal_torn_tail_test|snapshot_history_test|committed_cache_test|seal_publication_window_test|seal_deferral_test|seal_dead_copy_test|claim_release_test|unique_plan_check_test|ordered_limited_scan_test|commit_seal_stamp_test|update_fence_metadata_test|targeted_cold_load_test|cluster_by_test|cold_unique_equality_test|column_change_close_test|compaction_publication_order_test|compaction_tombstone_holders_test|compiled_positions_test|count_windows_test|deduped_count_test|drop_column_readers_test|drop_column_transition_test|exists_side_file_probe_test|in_equality_candidates_test|rename_column_index_test|segmented_count_equal_test|semantic_cache_clear_test|semantic_cache_stamp_order_test|small_outer_join_test|statement_gate_order_test|truncate_reader_window_test|txn_status_table_test|unique_check_lock_order_test|unique_index_eviction_test|wal_acknowledged_commit_test|retype_protocol_test|retype_failure_test|commit_recheck_window_test|comparison_contract_test|in_subquery_cache_test|txn_gate_test|commit_recheck_outside_test|insert_cold_rounds_test|delete_cold_rounds_test|statement_view_reads_test|commit_window_reads_test|maintenance_limit_test|in_list_duplicate_members_test|statement_view_test|statement_view_shortcuts_test|view_overtaken_test|view_index_candidates_test|view_removal_history_test|range_top_k_test|order_by_index_gate_test|exists_few_outer_rows_test|min_max_index_test|aggregate_path_equivalence_test|join_path_equivalence_test|join_plan_test|join_nested_side_filter_test|join_group_limit_chunks_test|planned_window_test|prepared_join_test|join_where_blocks_test|join_on_blocks_test|join_side_blocks_test|join_output_blocks_test|merged_join_output_blocks_test|grouped_output_blocks_test|not_in_null_once_test|prepared_exists_test|prepared_in_test|prepared_select_test|prepared_strategy_test|prepared_set_scan_test|hot_streaming_scan_test|prepared_kept_members_test|prepared_dml_test|prepared_conflict_snapshot_test|prepared_dml_snapshot_test|insert_plan_rename_test|read_table_handle_test|limit_subquery_prepare_test|side_index_dictionary_test|subquery_cache_stamp_test|constant_false_where_test|zone_map_visibility_test|order_by_alias_binding_test|old_path_ledger_test|index_count_test|block_cache_identity_test|block_order_limit_test|distinct_set_operation_blocks_test|derived_table_blocks_test|prepared_literal_twin_test|pk_conjunct_test|prepared_where_pushdown_test|shared_literals_test|scan_access_test|prepared_dml_access_test|opened_table_access_test)::/)'
 
     # The tests that count allocations set a global allocator of their own,
     # so they need the default stoolap-jemalloc off
@@ -191,11 +202,13 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Install cargo-llvm-cov
-      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Install cargo-llvm-cov and nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov,cargo-nextest
 
     - name: Generate coverage
-      run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      run: cargo llvm-cov nextest -P full --all-features --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5
