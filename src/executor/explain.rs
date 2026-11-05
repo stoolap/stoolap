@@ -108,10 +108,21 @@ impl Executor {
             // Record cardinality feedback for SELECT statements with WHERE
             if let Statement::Select(select) = &*stmt.statement {
                 if let Some(ref where_clause) = select.where_clause {
-                    // What it corrects is one table's scan, so a join records
+                    // What it corrects is a base table's scan as of now, so a
+                    // join, a CTE or a view of the name and an AS OF read record
                     // none; its columns are fingerprinted bare, as a join side's
                     // conditions read them
-                    if let Some(Expression::TableSource(table)) = select.table_expr.as_deref() {
+                    let ctes: Vec<String> = (select.with.iter())
+                        .flat_map(|with| &with.ctes)
+                        .map(|cte| cte.name.value_lower.to_string())
+                        .collect();
+                    if let Some(source @ Expression::TableSource(table)) =
+                        select.table_expr.as_deref()
+                    {
+                        if table.as_of.is_none()
+                            && self
+                                .base_table_side_schema(source, CteNames::Listed(&ctes))
+                                .is_some()
                         {
                             let table_name = table.name.value_lower.to_string();
                             let alias = table.alias.as_ref().unwrap_or(&table.name);

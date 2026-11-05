@@ -240,6 +240,47 @@ fn explain_analyze_of_a_join_teaches_no_side_a_correction() {
 }
 
 #[test]
+fn explain_analyze_of_a_cte_teaches_the_table_of_its_name_no_correction() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_feedback_cte").unwrap();
+    for sql in [
+        "CREATE TABLE fc_t (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE fc_u (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO fc_t SELECT g.value, g.value % 100, 1 FROM generate_series(1, 10000) g",
+        "INSERT INTO fc_u SELECT g.value, g.value % 100 FROM generate_series(1, 500) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let stmt = db
+        .prepare(
+            "SELECT fc_t.id, fc_u.id FROM fc_t JOIN fc_u ON fc_u.k = fc_t.k \
+             WHERE fc_t.f = 1 LIMIT $1",
+        )
+        .unwrap();
+    let builds = || {
+        let before = limit_hash_left_builds();
+        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        limit_hash_left_builds() - before
+    };
+    assert_eq!(builds(), 0, "a tenth of fc_t is more rows than fc_u holds");
+    for _ in 0..2 {
+        let explained = db.query(
+            "EXPLAIN ANALYZE WITH fc_t AS (SELECT 1 AS id, 1 AS f) \
+             SELECT fc_t.id FROM fc_t WHERE fc_t.f = 1",
+            (),
+        );
+        explained.unwrap().for_each(|row| {
+            row.unwrap();
+        });
+    }
+    assert_eq!(
+        builds(),
+        0,
+        "the CTE's one row is no scan of the table fc_t"
+    );
+}
+
+#[test]
 fn a_workload_memory_limit_keeps_a_join_off_a_hash_table() {
     let _guard = serial();
     let db = Database::open("memory://join_plan_memory_limit").unwrap();
