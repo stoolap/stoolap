@@ -18,3 +18,13 @@ slow-timeout = { period = "60s" }
 
 [profile.full]
 default-filter = "all()"
+
+# A test that judges wall-clock time runs with no other test beside it
+[[profile.full.overrides]]
+filter = """
+test(=storage::mvcc::version_store::tests::test_unique_constraint_performance_bulk_update)
+| test(=storage::index::multi_column::tests::test_prefix_build_and_batch_removal_scale)
+| test(=foreign_key_test::test_fk_cascade_delete_performance_with_auto_index)
+| test(=executor::expression::program::tests::binding_a_list_ten_times_longer_takes_about_ten_times_longer)
+"""
+threads-required = "num-test-threads"
