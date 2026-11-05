@@ -1860,6 +1860,11 @@ impl SegmentManager {
         let _ = self.unavailable.set(reason);
     }
 
+    /// Whether the open left a listed segment unloaded
+    pub(crate) fn is_unavailable(&self) -> bool {
+        self.unavailable.get().is_some()
+    }
+
     /// An error while the open left a listed segment unloaded, so no
     /// statement reads the table without that segment's rows
     pub(crate) fn check_available(&self) -> Result<()> {

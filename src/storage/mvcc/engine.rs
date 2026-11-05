@@ -5031,6 +5031,12 @@ impl MVCCEngine {
             _ => return Ok(()),
         };
 
+        // A table missing a listed volume has no whole copy to back up, and a
+        // published partial one would retire the last good backup
+        for mgr in self.segment_managers.read().unwrap().values() {
+            mgr.check_available()?;
+        }
+
         let snapshot_dir = pm.path().join("snapshots");
         if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
             return Err(Error::internal(format!(
@@ -6324,12 +6330,14 @@ impl MVCCEngine {
     /// than its schema's, the table validated first; called at open once the
     /// log is replayed
     fn repair_retyped_volumes(&self) -> Result<()> {
+        // A table missing a listed volume is repaired at the open that has it
         let tables: Vec<String> = self
             .segment_managers
             .read()
             .map_err(|_| Error::internal("segment managers lock poisoned"))?
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, mgr)| !mgr.is_unavailable())
+            .map(|(table, _)| table.clone())
             .collect();
         let _ddl = self.ddl_guard();
         let shared = retype::Shared {
@@ -6885,6 +6893,11 @@ impl MVCCEngine {
             let mgrs = self.segment_managers.read().unwrap();
             mgrs.iter()
                 .filter(|(_, mgr)| {
+                    // Without a listed volume a rewrite cannot see every copy
+                    // of a row, so it could drop a tombstone that still hides one
+                    if mgr.is_unavailable() {
+                        return false;
+                    }
                     // Only count sub-target volumes toward threshold.
                     let sub_target = mgr.sub_target_segment_count(target_volume_rows);
                     if sub_target > compact_threshold {

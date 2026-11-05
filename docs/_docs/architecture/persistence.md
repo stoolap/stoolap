@@ -483,7 +483,7 @@ If WAL corruption is detected during recovery:
 
 ### Missing or Damaged Volume
 
-A volume that the manifest lists holds rows that exist nowhere else once the WAL below the checkpoint is truncated. If, after the WAL is replayed, a listed volume file is missing or does not read (a failed checksum, a truncated file), the database still opens, but that table is unavailable: every statement on it, read or write, fails with an error that names the table, the segments that did not load and the reason, instead of answering without their rows. The other tables are not affected. Putting the file back and reopening makes the table available again; otherwise restore from a backup snapshot:
+A volume that the manifest lists holds rows that exist nowhere else once the WAL below the checkpoint is truncated. If, after the WAL is replayed, a listed volume file is missing or does not read (a failed checksum, a truncated file), the database still opens, but that table is unavailable: every statement on it, read or write, fails with an error that names the table, the segments that did not load and the reason, instead of answering without their rows. The other tables are not affected. While a table is unavailable, compaction and the column type repair leave its volumes alone, since a rewrite that cannot see every copy of a row could drop a tombstone that still hides one, and `PRAGMA SNAPSHOT` fails instead of publishing a backup without its rows, so the last good backup is kept. Putting the file back and reopening makes the table available again; `DROP TABLE` removes it; otherwise restore from a backup snapshot:
 
 ```bash
 stoolap -d "file:///path/to/db" --reset-volumes --restore

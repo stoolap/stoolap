@@ -85,6 +85,12 @@ fn assert_t_refused(dsn: &str, what: &str) {
         "INSERT INTO t VALUES (9999, 1, 9999)",
         "UPDATE t SET v = 0 WHERE id = 5",
         "DELETE FROM t WHERE id = 6",
+        "ALTER TABLE t ADD COLUMN x INTEGER",
+        "ALTER TABLE t MODIFY COLUMN v FLOAT",
+        "ALTER TABLE t RENAME COLUMN v TO v2",
+        "CREATE INDEX t_v ON t(v)",
+        "TRUNCATE TABLE t",
+        "ALTER TABLE t RENAME TO t2",
     ] {
         match run(&db, sql) {
             Err(msg) => assert!(
@@ -150,6 +156,19 @@ fn test_a_listed_volume_whose_file_is_gone_makes_its_table_unavailable() {
 }
 
 #[test]
+fn test_an_unavailable_table_can_be_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "dropped_volume");
+    std::fs::remove_file(&volumes[0]).unwrap();
+    let db = Database::open(&dsn).unwrap();
+    db.execute("DROP TABLE t", ()).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(rows, 0, "a table created under the name starts empty");
+}
+
+#[test]
 fn test_a_volume_put_back_makes_its_table_available_again() {
     let dir = tempfile::tempdir().unwrap();
     let (dsn, volumes) = sealed(dir.path(), "restored_volume");
@@ -164,6 +183,102 @@ fn test_a_volume_put_back_makes_its_table_available_again() {
     let db = Database::open(&dsn).unwrap();
     let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(rows, ROWS, "the table answers whole once its file is back");
+}
+
+/// Every file under `dir`, recursively, with its bytes
+fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else {
+            let bytes = std::fs::read(&path).unwrap();
+            out.push((path, bytes));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn test_a_snapshot_of_an_unavailable_table_fails_and_keeps_the_last_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "snapshot_volume");
+    let dsn = format!("{dsn}?keep_snapshots=1");
+    let db = Database::open(&dsn).unwrap();
+    db.execute("PRAGMA SNAPSHOT", ()).unwrap();
+    db.close().unwrap();
+    let snapshots = dir.path().join("snapshot_volume").join("snapshots");
+    let backup = files_under(&snapshots);
+    std::fs::remove_file(&volumes[0]).unwrap();
+    let db = Database::open(&dsn).unwrap();
+    match db.execute("PRAGMA SNAPSHOT", ()) {
+        Err(e) => assert!(
+            e.to_string().contains("'t' is unavailable"),
+            "the snapshot should name the unavailable table, got: {e}"
+        ),
+        Ok(_) => panic!("a snapshot must not be taken without t's missing rows"),
+    }
+    assert_eq!(
+        files_under(&snapshots),
+        backup,
+        "the last good backup stays as it was"
+    );
+}
+
+#[test]
+fn test_no_compaction_of_an_unavailable_table_drops_a_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join("compacted_volume");
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000&target_volume_rows=65536",
+        db_dir.display()
+    );
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let ids: Vec<i64> = (1..=65_536).collect();
+    for chunk in ids.chunks(8_192) {
+        let values: Vec<String> = chunk.iter().map(|id| format!("({id}, 0)")).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // Newer copies of 5 and of a new row in small volumes
+    db.execute("UPDATE t SET v = 1 WHERE id = 5", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (100000, 1)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    // Row 5 deleted with no checkpoint after it: the tombstone comes back
+    // from the log, and the next compaction is the first to see it
+    let no_close_checkpoint = format!("{dsn}&checkpoint_on_close=off");
+    let db = Database::open(&no_close_checkpoint).unwrap();
+    db.execute("DELETE FROM t WHERE id = 5", ()).unwrap();
+    db.close().unwrap();
+    let full = std::fs::read_dir(db_dir.join("volumes").join("t"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vol"))
+        .max_by_key(|path| std::fs::metadata(path).unwrap().len())
+        .unwrap();
+    let intact = std::fs::read(&full).unwrap();
+    std::fs::remove_file(&full).unwrap();
+    // With the full volume gone, a compaction of the small ones must not
+    // decide that nothing else holds row 5
+    let db = Database::open(&dsn).unwrap();
+    db.execute("PRAGMA COMPACT_THRESHOLD = 1", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    std::fs::write(&full, &intact).unwrap();
+    let db = Database::open(&dsn).unwrap();
+    let five: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE id = 5", ())
+        .unwrap();
+    assert_eq!(five, 0, "the deleted row stays deleted");
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(rows, 65_536);
 }
 
 #[test]
