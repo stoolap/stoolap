@@ -67,7 +67,7 @@ FROM products AS p
 CROSS JOIN colors AS c;
 ```
 
-A join with no condition (a `CROSS JOIN`, `FROM a, b`, or a `JOIN` without `ON`) under a `LIMIT` of at most 100, with no `ORDER BY`, grouping, aggregate, window function or `DISTINCT`, pairs the first rows of one side with the rows of the other as they come, and stops once it has its rows. It reads no more than `LIMIT` plus `OFFSET` rows of the side it pairs, so a row past those is never computed, and a value that would fail in that row raises no error. Without an `ORDER BY`, which pairs it answers is unspecified.
+A join with no condition (a `CROSS JOIN`, `FROM a, b`, or a `JOIN` without `ON`) under a `LIMIT` of at most 100, with no `ORDER BY`, grouping, aggregate, window function or `DISTINCT`, pairs the first rows of one side with the rows of the other as they come, and stops once it has its rows. It takes no more than `LIMIT` plus `OFFSET` rows of the side it pairs. When that side computes its rows as they are read, as a table, a derived table or a view does, a row past those is never computed, and a value that would fail in that row raises no error. A side that computes all of its rows before the join reads one, as a `VALUES` list does, raises an error in any of them. Without an `ORDER BY`, which pairs it answers is unspecified.
 
 ### NATURAL JOIN
 

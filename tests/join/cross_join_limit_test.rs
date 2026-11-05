@@ -160,13 +160,16 @@ fn a_join_with_no_condition_under_a_limit_computes_only_the_rows_it_pairs() {
              FROM bigger) b LIMIT 5"
         )
     };
+    let overflows = |sql: &str| {
+        let err = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .err();
+        err.is_some_and(|err| err.to_string().contains("overflow"))
+    };
     let sql = failing_at(1);
-    let err = db
-        .query(&sql, ())
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .err();
     assert!(
-        err.is_some_and(|err| err.to_string().contains("overflow")),
+        overflows(&sql),
         "{sql}: a row the join pairs raises its error"
     );
     let sql = failing_at(2000);
@@ -174,6 +177,12 @@ fn a_join_with_no_condition_under_a_limit_computes_only_the_rows_it_pairs() {
         pairs(&db, &sql).len(),
         5,
         "{sql}: a row past the pairs is never computed"
+    );
+    let sql = "SELECT a.id, v.n FROM (SELECT id FROM big) a CROSS JOIN \
+               (VALUES (1), (ABS(-9223372036854775807 - 1))) AS v(n) LIMIT 1";
+    assert!(
+        overflows(sql),
+        "{sql}: a VALUES list computes every row before the join reads one"
     );
 }
 
