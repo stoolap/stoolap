@@ -3305,6 +3305,16 @@ thread_local! {
     static STREAMING_JOINS_STREAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIMIT_HASH_LEFT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIMIT_HASH_BUILD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Rows this thread's streaming LIMIT joins built their hash tables on, so far
+pub fn limit_hash_build_rows() -> usize {
+    LIMIT_HASH_BUILD_ROWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn limit_hash_build_read(rows: usize) {
+    LIMIT_HASH_BUILD_ROWS.with(|n| n.set(n.get() + rows));
 }
 
 /// Streaming LIMIT joins this thread ran that built their hash table on

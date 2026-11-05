@@ -20,6 +20,7 @@ mod oracle;
 
 mod anti_join_limit_test;
 mod correlated_join_on_test;
+mod cross_join_limit_test;
 mod cross_type_join_test;
 mod hash_join_test;
 mod join_algorithm_rule_test;

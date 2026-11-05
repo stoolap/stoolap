@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::core::Result;
 use crate::parser::ast::{Expression, InfixOperator, JoinTableSource, SelectStatement};
-use crate::planner::join::{IndexProbe, JoinPlan, ProbeIndex};
+use crate::planner::join::{IndexProbe, JoinPlan, LimitHash, ProbeIndex};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::Engine;
 
@@ -348,12 +348,13 @@ impl Executor {
         ))
     }
 
-    /// Whether a small LIMIT streams the join through a hash table: an
-    /// INNER join with an equality, nothing that orders, groups, aggregates
-    /// or merges the joined rows, and no condition across sides
-    fn limit_hash(shape: &JoinShape<'_>) -> bool {
+    /// How a small LIMIT streams the join through a hash table: an INNER
+    /// join with an equality or with no condition at all, nothing that
+    /// orders, groups, aggregates or merges the joined rows, and no
+    /// condition across sides
+    fn limit_hash(shape: &JoinShape<'_>) -> Option<LimitHash> {
         let (stmt, class, join_type) = (shape.stmt, shape.classification, shape.join_type);
-        !join_type.contains("FULL")
+        let streams = !join_type.contains("FULL")
             && !join_type.contains("LEFT")
             && !join_type.contains("RIGHT")
             && !class.has_order_by
@@ -362,8 +363,16 @@ impl Executor {
             && !class.has_window_functions
             && !stmt.distinct
             && stmt.distinct_on.is_empty()
-            && shape.cross_filter.is_none()
-            && shape.join.condition.as_deref().is_some_and(has_equality)
+            && shape.cross_filter.is_none();
+        let join = shape.join;
+        match join.condition.as_deref() {
+            _ if !streams => None,
+            Some(condition) => has_equality(condition).then_some(LimitHash::Keyed),
+            None if join.using_columns.is_empty() && !join_type.starts_with("NATURAL") => {
+                Some(LimitHash::EveryPair)
+            }
+            None => None,
+        }
     }
 
     /// Whether a LIMIT hash join builds on its left side: the side the
