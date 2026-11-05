@@ -446,14 +446,15 @@ pub(crate) fn visit_column_refs_outside<'e>(
     }
 }
 
-/// The columns a single-table statement reads, as a mask over the table's
-/// columns, from its SELECT list, filter, GROUP BY, HAVING and ORDER BY;
-/// None when any of them reads something a name cannot stand for, or a
-/// name that is neither a column nor a SELECT alias
-pub(crate) fn needed_columns(
-    stmt: &SelectStatement,
-    where_expr: Option<&Expression>,
-    columns_lower: &[String],
+/// The columns a statement reads, as a mask over the columns of its row,
+/// each name marking every column it spells, from its SELECT list,
+/// `filters`, GROUP BY, HAVING and ORDER BY; None when any of them reads
+/// something a name cannot stand for, or a name that is neither a column
+/// nor a SELECT alias
+pub(crate) fn needed_columns<'a, 'c>(
+    stmt: &'a SelectStatement,
+    filters: impl IntoIterator<Item = &'a Expression>,
+    columns_lower: impl Iterator<Item = &'c str> + Clone,
 ) -> Option<Vec<bool>> {
     let mut names = Vec::new();
     let grouping_sets = match &stmt.group_by.modifier {
@@ -468,7 +469,7 @@ pub(crate) fn needed_columns(
         .chain(grouping_sets.iter().flatten())
         .chain(stmt.having.as_deref())
         .chain(stmt.order_by.iter().map(|o| &o.expression))
-        .chain(where_expr);
+        .chain(filters);
     // A window's columns are its call's, and its partition's, its order's and
     // its frame's as it runs with them, a named window's from its definition
     let window_names = std::cell::RefCell::new(Vec::new());
@@ -508,19 +509,22 @@ pub(crate) fn needed_columns(
         return None;
     }
     names.extend(window_names.into_inner());
-    let mut mask = vec![false; columns_lower.len()];
+    let mut mask = vec![false; columns_lower.clone().count()];
     for name in names {
-        match columns_lower.iter().position(|c| *c == name.as_str()) {
-            Some(pos) => mask[pos] = true,
-            None => {
-                let is_alias = stmt
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == name));
-                if !is_alias {
-                    return None;
-                }
+        let mut spelled = false;
+        for (read, column) in mask.iter_mut().zip(columns_lower.clone()) {
+            if column == name.as_str() {
+                *read = true;
+                spelled = true;
             }
+        }
+        let is_alias = || {
+            stmt.columns
+                .iter()
+                .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == name))
+        };
+        if !spelled && !is_alias() {
+            return None;
         }
     }
     Some(mask)

@@ -47,6 +47,7 @@ mod join_plan_test;
 mod join_side_blocks_test;
 mod join_side_error_test;
 mod join_side_function_columns_test;
+mod join_side_needed_columns_test;
 mod join_simple_test;
 mod join_small_right_side_test;
 mod join_source_sides_test;
