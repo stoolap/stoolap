@@ -218,11 +218,11 @@ struct Tick;
 
 impl ScalarFunction for Tick {
     fn name(&self) -> &str {
-        "TICK"
+        "SET_SCAN_TICK"
     }
     fn info(&self) -> FunctionInfo {
         FunctionInfo::new(
-            "TICK",
+            "SET_SCAN_TICK",
             FunctionType::Scalar,
             "test volatile",
             FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
@@ -246,7 +246,7 @@ impl ScalarFunction for Tick {
 #[test]
 fn a_block_error_is_raised_again_without_reading_the_block_again() {
     let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
-    // No other test here calls TICK
+    // No other test here calls SET_SCAN_TICK
     global_registry().register_scalar::<Tick>().unwrap();
     let mut engine = MVCCEngine::in_memory();
     stoolap::storage::traits::Engine::open(&mut engine).unwrap();
@@ -260,7 +260,7 @@ fn a_block_error_is_raised_again_without_reading_the_block_again() {
         executor.execute(sql).unwrap();
     }
     for test in ["> ANY", ">= ALL", "IN", "NOT IN", "= ANY", "<> ALL"] {
-        let sql = format!("SELECT id FROM t WHERE i {test} (SELECT SUM(TICK(v)) FROM m)");
+        let sql = format!("SELECT id FROM t WHERE i {test} (SELECT SUM(SET_SCAN_TICK(v)) FROM m)");
         TICKS.store(0, Ordering::Relaxed);
         let error = match executor.execute(&sql) {
             Err(e) => Some(e),

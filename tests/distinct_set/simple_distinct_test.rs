@@ -54,7 +54,7 @@ fn test_simple_distinct() {
 /// Test DISTINCT with integers
 #[test]
 fn test_distinct_integers() {
-    let db = Database::open("memory://distinct_int").expect("Failed to create database");
+    let db = Database::open("memory://simple_distinct_int").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE numbers (id INTEGER PRIMARY KEY, num INTEGER)",
@@ -117,7 +117,7 @@ fn test_distinct_with_nulls() {
 /// Test DISTINCT with multiple columns
 #[test]
 fn test_distinct_multiple_columns() {
-    let db = Database::open("memory://distinct_multi").expect("Failed to create database");
+    let db = Database::open("memory://simple_distinct_multi").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE pairs (id INTEGER PRIMARY KEY, col1 TEXT, col2 TEXT)",
@@ -151,7 +151,7 @@ fn test_distinct_multiple_columns() {
 /// Test COUNT DISTINCT
 #[test]
 fn test_count_distinct() {
-    let db = Database::open("memory://count_distinct").expect("Failed to create database");
+    let db = Database::open("memory://simple_distinct_count").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT)",
@@ -172,7 +172,7 @@ fn test_count_distinct() {
 /// Test DISTINCT with WHERE clause
 #[test]
 fn test_distinct_with_where() {
-    let db = Database::open("memory://distinct_where").expect("Failed to create database");
+    let db = Database::open("memory://simple_distinct_where").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price INTEGER)",

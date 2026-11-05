@@ -104,7 +104,7 @@ fn test_rollup_basic() {
 
 #[test]
 fn test_rollup_single_column() {
-    let db = Database::open("memory://rollup_single").expect("Failed to create database");
+    let db = Database::open("memory://rollup_cube_single").expect("Failed to create database");
     setup_sales_table(&db);
 
     let result = db
@@ -296,7 +296,8 @@ fn test_regular_group_by_unchanged() {
 
 #[test]
 fn test_grouping_sets_basic() {
-    let db = Database::open("memory://grouping_sets_basic").expect("Failed to create database");
+    let db = Database::open("memory://rollup_cube_grouping_sets_basic")
+        .expect("Failed to create database");
     setup_sales_table(&db);
 
     // GROUPING SETS ((region, product), (region), ()) is equivalent to ROLLUP(region, product)

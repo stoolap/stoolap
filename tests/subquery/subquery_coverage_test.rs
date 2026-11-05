@@ -24,7 +24,7 @@ use stoolap::Database;
 
 #[test]
 fn test_exists_basic() {
-    let db = Database::open("memory://exists_basic").expect("Failed");
+    let db = Database::open("memory://subquery_coverage_exists_basic").expect("Failed");
     db.execute(
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, cust_id INTEGER)",
         (),

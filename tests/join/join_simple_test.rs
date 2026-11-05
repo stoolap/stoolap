@@ -197,7 +197,7 @@ fn test_join_with_multiple_conditions() {
 /// Self JOIN
 #[test]
 fn test_join_self() {
-    let db = Database::open("memory://join_self").expect("Failed to create database");
+    let db = Database::open("memory://join_simple_self").expect("Failed to create database");
 
     // Create a table with hierarchical data
     db.execute(
@@ -264,7 +264,7 @@ fn test_join_self() {
 /// RIGHT JOIN
 #[test]
 fn test_right_join() {
-    let db = Database::open("memory://join_right").expect("Failed to create database");
+    let db = Database::open("memory://join_simple_right").expect("Failed to create database");
     setup_simple_tables(&db);
 
     // RIGHT JOIN - should include all departments, even those without employees

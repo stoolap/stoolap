@@ -51,7 +51,7 @@ fn setup_collate_test_table(db: &Database) {
 /// Test BINARY collation (case-sensitive)
 #[test]
 fn test_collate_binary() {
-    let db = Database::open("memory://collate_binary").expect("Failed to create database");
+    let db = Database::open("memory://collate_test_binary").expect("Failed to create database");
     setup_collate_test_table(&db);
 
     let result = db
@@ -81,7 +81,7 @@ fn test_collate_binary() {
 /// Test NOCASE collation (case-insensitive)
 #[test]
 fn test_collate_nocase() {
-    let db = Database::open("memory://collate_nocase").expect("Failed to create database");
+    let db = Database::open("memory://collate_test_nocase").expect("Failed to create database");
     setup_collate_test_table(&db);
 
     let result = db
@@ -110,7 +110,7 @@ fn test_collate_nocase() {
 /// Test NOACCENT collation (accent-insensitive)
 #[test]
 fn test_collate_noaccent() {
-    let db = Database::open("memory://collate_noaccent").expect("Failed to create database");
+    let db = Database::open("memory://collate_test_noaccent").expect("Failed to create database");
     setup_collate_test_table(&db);
 
     let result = db
@@ -204,7 +204,7 @@ fn test_collate_order_by() {
 /// Test NULL handling with COLLATE
 #[test]
 fn test_collate_null_handling() {
-    let db = Database::open("memory://collate_null").expect("Failed to create database");
+    let db = Database::open("memory://collate_test_null").expect("Failed to create database");
     setup_collate_test_table(&db);
 
     // Insert NULL value

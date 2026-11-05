@@ -199,7 +199,7 @@ fn test_persistence_drop_table() {
 #[test]
 fn test_memory_mode_no_persistence() {
     // Memory mode should work without persistence
-    let db = Database::open("memory://").unwrap();
+    let db = Database::open("memory://memory_mode_no_persistence").unwrap();
     db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", ())
         .unwrap();
     db.execute("INSERT INTO test (id) VALUES (1)", ()).unwrap();

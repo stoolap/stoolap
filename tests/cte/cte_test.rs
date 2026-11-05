@@ -107,7 +107,7 @@ fn test_cte_with_where() {
 /// Test CTE with column selection and aggregation
 #[test]
 fn test_cte_with_aggregation() {
-    let db = Database::open("memory://cte_agg").expect("Failed to create database");
+    let db = Database::open("memory://cte_test_agg").expect("Failed to create database");
     setup_cte_tables(&db);
 
     let result = db
@@ -237,7 +237,7 @@ fn test_multiple_ctes() {
 /// Test CTE referencing another CTE
 #[test]
 fn test_cte_referencing_cte() {
-    let db = Database::open("memory://cte_ref_cte").expect("Failed to create database");
+    let db = Database::open("memory://cte_test_ref_cte").expect("Failed to create database");
 
     // Create employees table
     db.execute(

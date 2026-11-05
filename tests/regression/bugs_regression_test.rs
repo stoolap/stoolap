@@ -4155,7 +4155,7 @@ fn test_bug_113_not_between_with_null() {
 // =============================================================================
 #[test]
 fn test_bugs2_01_order_by_with_rollup() {
-    let db = setup_db("bugs2_01");
+    let db = setup_db("bugs2_01_order_by_with_rollup");
 
     db.execute(
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, product TEXT, amount FLOAT)",
@@ -4203,7 +4203,7 @@ fn test_bugs2_01_order_by_with_rollup() {
 // =============================================================================
 #[test]
 fn test_bugs2_02_correlated_subquery_in_update() {
-    let db = setup_db("bugs2_02");
+    let db = setup_db("bugs2_02_correlated_subquery_in_update");
 
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Create table");
@@ -4248,7 +4248,7 @@ fn test_bugs2_02_correlated_subquery_in_update() {
 // =============================================================================
 #[test]
 fn test_bugs2_03_case_when_with_window_function() {
-    let db = setup_db("bugs2_03");
+    let db = setup_db("bugs2_03_case_when_with_window_function");
 
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Create table");
@@ -4291,7 +4291,7 @@ fn test_bugs2_03_case_when_with_window_function() {
 // =============================================================================
 #[test]
 fn test_bugs2_04_array_agg() {
-    let db = setup_db("bugs2_04");
+    let db = setup_db("bugs2_04_array_agg");
 
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -4339,7 +4339,7 @@ fn test_bugs2_04_array_agg() {
 // =============================================================================
 #[test]
 fn test_bugs2_05_range_frame_specification() {
-    let db = setup_db("bugs2_05");
+    let db = setup_db("bugs2_05_range_frame_specification");
 
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Create table");
@@ -4395,7 +4395,7 @@ fn test_bugs2_05_range_frame_specification() {
 // =============================================================================
 #[test]
 fn test_bugs2_06_cte_with_column_list() {
-    let db = setup_db("bugs2_06");
+    let db = setup_db("bugs2_06_cte_with_column_list");
 
     // Basic CTE with column list
     let result = db
@@ -4437,7 +4437,7 @@ fn test_bugs2_06_cte_with_column_list() {
 // =============================================================================
 #[test]
 fn test_bugs2_07_window_expression_argument() {
-    let db = setup_db("bugs2_07");
+    let db = setup_db("bugs2_07_window_expression_argument");
 
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Create failed");
@@ -4479,7 +4479,7 @@ fn test_bugs2_07_window_expression_argument() {
 // =============================================================================
 #[test]
 fn test_bugs2_08_window_partition_after_join() {
-    let db = setup_db("bugs2_08");
+    let db = setup_db("bugs2_08_window_partition_after_join");
 
     db.execute(
         "CREATE TABLE left_t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -4528,7 +4528,7 @@ fn test_bugs2_08_window_partition_after_join() {
 // =============================================================================
 #[test]
 fn test_bugs2_09_nested_aggregate_window() {
-    let db = setup_db("bugs2_09");
+    let db = setup_db("bugs2_09_nested_aggregate_window");
 
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -4585,7 +4585,7 @@ fn test_bugs2_09_nested_aggregate_window() {
 // =============================================================================
 #[test]
 fn test_bugs2_10_table_level_unique_constraint() {
-    let db = setup_db("bugs2_10");
+    let db = setup_db("bugs2_10_table_level_unique_constraint");
 
     // Test table-level UNIQUE constraint
     db.execute(
@@ -4620,7 +4620,7 @@ fn test_bugs2_10_table_level_unique_constraint() {
 // =============================================================================
 #[test]
 fn test_bugs2_11_cast_of_aggregate() {
-    let db = setup_db("bugs2_11");
+    let db = setup_db("bugs2_11_cast_of_aggregate");
 
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Create failed");
@@ -4658,7 +4658,7 @@ fn test_bugs2_11_cast_of_aggregate() {
 // =============================================================================
 #[test]
 fn test_bugs2_12_order_by_expression_with_alias() {
-    let db = setup_db("bugs2_12");
+    let db = setup_db("bugs2_12_order_by_expression_with_alias");
 
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Create failed");
@@ -4708,7 +4708,7 @@ fn test_bugs2_12_order_by_expression_with_alias() {
 // =============================================================================
 #[test]
 fn test_bugs2_13_window_with_cte_and_join() {
-    let db = setup_db("bugs2_13");
+    let db = setup_db("bugs2_13_window_with_cte_and_join");
 
     db.execute(
         "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price FLOAT)",

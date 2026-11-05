@@ -21,7 +21,7 @@ use stoolap::Database;
 /// Test simple SELECT with column alias
 #[test]
 fn test_column_alias_in_select() {
-    let db = Database::open("memory://alias_select").expect("Failed to create database");
+    let db = Database::open("memory://column_alias_select").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE items (id INTEGER, price INTEGER, name TEXT)",
@@ -53,7 +53,7 @@ fn test_column_alias_in_select() {
 /// Test multiple column aliases
 #[test]
 fn test_multiple_column_aliases() {
-    let db = Database::open("memory://alias_multi").expect("Failed to create database");
+    let db = Database::open("memory://column_alias_multi").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE products (id INTEGER, price INTEGER, quantity INTEGER)",
@@ -86,7 +86,7 @@ fn test_multiple_column_aliases() {
 /// Test alias with expression
 #[test]
 fn test_alias_with_expression() {
-    let db = Database::open("memory://alias_expr").expect("Failed to create database");
+    let db = Database::open("memory://column_alias_expr").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE sales (id INTEGER, price INTEGER, quantity INTEGER)",
@@ -136,7 +136,7 @@ fn test_alias_with_aggregation() {
 /// Test alias in GROUP BY with HAVING
 #[test]
 fn test_alias_in_group_by_having() {
-    let db = Database::open("memory://alias_group").expect("Failed to create database");
+    let db = Database::open("memory://column_alias_group").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE transactions (id INTEGER, category TEXT, amount INTEGER)",
@@ -189,7 +189,7 @@ fn test_alias_in_group_by_having() {
 /// Test alias with ORDER BY
 #[test]
 fn test_alias_with_order_by() {
-    let db = Database::open("memory://alias_order").expect("Failed to create database");
+    let db = Database::open("memory://column_alias_order").expect("Failed to create database");
 
     db.execute("CREATE TABLE items (id INTEGER, value INTEGER)", ())
         .expect("Failed to create table");

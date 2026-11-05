@@ -126,7 +126,7 @@ fn test_row_number_with_partition() {
 
 #[test]
 fn test_rank_basic() {
-    let db = Database::open("memory://rank_basic").expect("Failed");
+    let db = Database::open("memory://window_coverage_rank_basic").expect("Failed");
     db.execute(
         "CREATE TABLE students (id INTEGER PRIMARY KEY, score INTEGER)",
         (),
@@ -273,7 +273,7 @@ fn test_ntile_basic() {
 
 #[test]
 fn test_ntile_with_partition() {
-    let db = Database::open("memory://ntile_partition").expect("Failed");
+    let db = Database::open("memory://window_coverage_ntile_partition").expect("Failed");
     db.execute(
         "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price FLOAT)",
         (),
@@ -321,7 +321,7 @@ fn test_ntile_with_partition() {
 
 #[test]
 fn test_lag_basic() {
-    let db = Database::open("memory://lag_basic").expect("Failed");
+    let db = Database::open("memory://window_coverage_lag_basic").expect("Failed");
     db.execute(
         "CREATE TABLE events (id INTEGER PRIMARY KEY, value INTEGER)",
         (),
@@ -353,7 +353,7 @@ fn test_lag_basic() {
 
 #[test]
 fn test_lead_basic() {
-    let db = Database::open("memory://lead_basic").expect("Failed");
+    let db = Database::open("memory://window_coverage_lead_basic").expect("Failed");
     db.execute(
         "CREATE TABLE events (id INTEGER PRIMARY KEY, value INTEGER)",
         (),
@@ -385,7 +385,7 @@ fn test_lead_basic() {
 
 #[test]
 fn test_lag_with_default() {
-    let db = Database::open("memory://lag_default").expect("Failed");
+    let db = Database::open("memory://window_coverage_lag_default").expect("Failed");
     db.execute(
         "CREATE TABLE data (id INTEGER PRIMARY KEY, val INTEGER)",
         (),
@@ -576,7 +576,7 @@ fn test_percent_rank() {
 
 #[test]
 fn test_cume_dist() {
-    let db = Database::open("memory://cume_dist").expect("Failed");
+    let db = Database::open("memory://window_coverage_cume_dist").expect("Failed");
     db.execute(
         "CREATE TABLE scores (id INTEGER PRIMARY KEY, score INTEGER)",
         (),
