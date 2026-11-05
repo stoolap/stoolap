@@ -47,6 +47,7 @@ mod null_comparison_test;
 mod null_times_zero_test;
 mod row_comparison_rule_test;
 mod scan_with_where_test;
+mod short_circuit_test;
 mod sql_expressions_test;
 mod where_clause_test;
 mod where_value_error_test;
