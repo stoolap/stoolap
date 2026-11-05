@@ -1227,11 +1227,12 @@ impl MVCCEngine {
                         })
                         .unwrap_or(false);
 
+                let mut unreadable = Vec::new();
                 let replay_from_lsn = if let Some(lsn) = volume_lsn {
                     // New path: load manifests + volumes BEFORE WAL replay.
                     // Volumes must be loaded so is_row_id_in_volume() can check
                     // row_ids for idempotent INSERT during replay.
-                    self.load_standalone_volumes_no_schema_check();
+                    unreadable = self.load_standalone_volumes_no_schema_check();
                     lsn
                 } else if has_legacy_snapshots {
                     // Legacy path: load snapshots (creates schemas + version stores)
@@ -1247,6 +1248,9 @@ impl MVCCEngine {
 
                 // Replay WAL entries after the checkpoint/snapshot LSN
                 self.replay_wal(replay_from_lsn)?;
+                // A TRUNCATE or DROP replayed above may have retired a segment
+                // whose file it removed, so the check follows the replay
+                self.mark_unloaded_tables(&unreadable);
 
                 // History opens at the recovered state, above every sequence
                 // a volume or a tombstone kept from earlier runs
@@ -4127,20 +4131,22 @@ impl MVCCEngine {
     /// Used during the new volume-only recovery path where volumes are loaded
     /// BEFORE WAL replay (which creates schemas). Volumes carry their own schema
     /// in the file format, so no external schema lookup is needed.
-    fn load_standalone_volumes_no_schema_check(&self) {
+    /// Returns each listed volume file that did not read, with its table.
+    fn load_standalone_volumes_no_schema_check(&self) -> Vec<(String, String)> {
+        let mut unreadable = Vec::new();
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
-            _ => return,
+            _ => return unreadable,
         };
 
         let vol_dir = pm.path().join("volumes");
         if !vol_dir.exists() {
-            return;
+            return unreadable;
         }
 
         let entries = match std::fs::read_dir(&vol_dir) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => return unreadable,
         };
 
         for entry in entries.flatten() {
@@ -4150,11 +4156,6 @@ impl MVCCEngine {
 
             let table_name = entry.file_name().to_string_lossy().to_lowercase();
 
-            let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
-            if paths.is_empty() {
-                continue;
-            }
-
             // .vol files with no manifest.bin: either a crash before the
             // first manifest write (WAL replay covers the data) or a lost
             // manifest (these files may be the only copy). An empty manager
@@ -4163,6 +4164,9 @@ impl MVCCEngine {
             if !vol_dir.join(&table_name).join("manifest.bin").exists() {
                 continue;
             }
+
+            // A manifest whose every file is gone still lists their segments
+            let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
 
             let mgr = self.get_or_create_segment_manager(&table_name);
             let sides =
@@ -4192,10 +4196,8 @@ impl MVCCEngine {
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
                     Ok(volume) => Arc::new(volume),
                     Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to read volume {:?}: {}. Skipping file.",
-                            path, e
-                        );
+                        let detail = format!("volume {:?} does not read: {}", path, e);
+                        unreadable.push((table_name.clone(), detail));
                         continue;
                     }
                 };
@@ -4204,6 +4206,34 @@ impl MVCCEngine {
             }
             // Recompute visibility bitmaps after all volumes for this table are loaded.
             mgr.recompute_visibility();
+        }
+        unreadable
+    }
+
+    /// Once the log is replayed, a segment a manifest still lists without a
+    /// loaded volume has its rows nowhere else, so its table refuses every
+    /// statement; `unreadable` names the files that did not read
+    fn mark_unloaded_tables(&self, unreadable: &[(String, String)]) {
+        let mgrs: Vec<_> = (self.segment_managers.read().unwrap().iter())
+            .map(|(table, mgr)| (table.clone(), Arc::clone(mgr)))
+            .collect();
+        for (table, mgr) in mgrs {
+            let listed: Vec<u64> = (mgr.manifest().segments.iter())
+                .map(|segment| segment.segment_id)
+                .collect();
+            let missing: Vec<u64> = listed
+                .into_iter()
+                .filter(|&id| !mgr.has_segment(id))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let mut reason = format!("listed volume segments {:?} did not load", missing);
+            for (_, detail) in unreadable.iter().filter(|(of, _)| *of == table) {
+                reason.push_str("; ");
+                reason.push_str(detail);
+            }
+            mgr.mark_unavailable(reason);
         }
     }
 
@@ -8786,6 +8816,7 @@ impl MVCCEngine {
             crate::test_failpoints::pk_hot_rows_fetched();
             let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
+            mgr.check_available()?;
             // Hot rows found before the truncate count are read again after
             // it, and a truncate around the cold read is waited out and retried;
             // a settled read retries a seal around it too, which removes the
@@ -8931,6 +8962,7 @@ impl MVCCEngine {
         epoch: u64,
     ) -> Result<Option<crate::core::KeyRows>> {
         let mgr = self.get_or_create_segment_manager(table_name);
+        mgr.check_available()?;
         // A seal removes its hot rows before it clears their tombstones: the
         // value is looked up in a settled state, and one a seal moved is let go
         let generation = mgr.settled_seal_generation();
@@ -9620,6 +9652,7 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
         };
+        mgr.check_available()?;
         let schema_generation = mgr.schema_generation();
         let table = open(version_store).with_view(view.clone());
         admit(&table)?;

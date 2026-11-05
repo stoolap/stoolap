@@ -481,6 +481,14 @@ If WAL corruption is detected during recovery:
 - Corrupted entries at the end are discarded
 - A warning is logged
 
+### Missing or Damaged Volume
+
+A volume that the manifest lists holds rows that exist nowhere else once the WAL below the checkpoint is truncated. If, after the WAL is replayed, a listed volume file is missing or does not read (a failed checksum, a truncated file), the database still opens, but that table is unavailable: every statement on it, read or write, fails with an error that names the table, the segments that did not load and the reason, instead of answering without their rows. The other tables are not affected. Putting the file back and reopening makes the table available again; otherwise restore from a backup snapshot:
+
+```bash
+stoolap -d "file:///path/to/db" --reset-volumes --restore
+```
+
 ### Disk Full
 
 If disk becomes full:
