@@ -4753,7 +4753,8 @@ impl Executor {
                             }
                             // A swap is chosen by estimates; a probe past the
                             // cap a join without a limit fills shows one wrong
-                            if swapped && join_limit.is_none() {
+                            let keeps_outer = swapped && join_limit.is_none();
+                            if keeps_outer {
                                 op = op.with_probe_cap(EQUALITY_CANDIDATE_CAP);
                             }
                             if let Some(ref proj) = projection_pushdown {
@@ -4770,6 +4771,18 @@ impl Executor {
                             // joined so far are dropped, and the whole join runs
                             // once more on the hash path
                             if op.needs_fallback() {
+                                // A join that kept its outer rows hands them on, so
+                                // its outer side is read once
+                                if keeps_outer {
+                                    let rows = op.take_outer_rows();
+                                    drop(op);
+                                    prepared_side = Some(PreparedSide {
+                                        rows: PreparedRows::Shared(CompactArc::new(rows)),
+                                        columns: outer_cols.clone(),
+                                        is_right: swapped,
+                                    });
+                                    prepared_ctx = Some(ctx_join.clone());
+                                }
                                 break 'index_nl;
                             }
                             let lim = join_limit.unwrap_or(0) as usize;

@@ -160,6 +160,84 @@ fn a_swapped_join_whose_probe_finds_more_than_the_cap_runs_by_hash() {
     assert!(read <= 1, "{sql}: the swapped join probed {read} rows of e");
 }
 
+#[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
+#[test]
+fn a_probe_past_the_cap_across_key_types_runs_by_hash() {
+    use stoolap::test_failpoints::index_join_outer_rows;
+    let db = Database::open("memory://join_small_right_side_cap_across").unwrap();
+    for sql in [
+        "CREATE TABLE dt (id INTEGER PRIMARY KEY, k TEXT, f INTEGER)",
+        "CREATE INDEX dt_k ON dt(k)",
+        "INSERT INTO dt SELECT g.value, '1', CASE WHEN g.value = 1 THEN 1 ELSE 0 END \
+         FROM generate_series(1, 20000) g",
+        "CREATE TABLE ei (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ei SELECT g.value, 1 FROM generate_series(1, 10) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT ei.id, dt.id FROM dt JOIN ei ON dt.k = ei.k WHERE dt.f = 1 ORDER BY ei.id";
+    let method = join_method(&db, sql);
+    assert!(!method.contains("Hash Join"), "{sql} swaps: {method}");
+    let before = index_join_outer_rows();
+    let found = pairs(&db, sql);
+    assert_eq!(found, (1..=10).map(|e| (e, 1)).collect::<Vec<_>>(), "{sql}");
+    let read = index_join_outer_rows() - before;
+    assert!(
+        read <= 1,
+        "{sql}: the swapped join probed {read} rows of ei"
+    );
+}
+
+/// The next of 1, 2, 3, ... on each call
+#[derive(Default)]
+struct JoinSwapNext;
+
+static JOIN_SWAP_CALLS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+impl stoolap::functions::ScalarFunction for JoinSwapNext {
+    fn name(&self) -> &str {
+        "JOIN_SWAP_NEXT"
+    }
+
+    fn info(&self) -> stoolap::functions::FunctionInfo {
+        stoolap::functions::FunctionInfo {
+            name: "JOIN_SWAP_NEXT".into(),
+            ..stoolap::functions::ScalarFunction::info(&stoolap::functions::scalar::SleepFunction)
+        }
+    }
+
+    fn evaluate(
+        &self,
+        _args: &[stoolap::core::Value],
+    ) -> stoolap::core::Result<stoolap::core::Value> {
+        let next = JOIN_SWAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        Ok(stoolap::core::Value::Integer(next))
+    }
+
+    fn clone_box(&self) -> Box<dyn stoolap::functions::ScalarFunction> {
+        Box::new(Self)
+    }
+}
+
+#[test]
+fn a_join_past_the_cap_reads_its_outer_side_once() {
+    stoolap::functions::global_registry()
+        .register_scalar::<JoinSwapNext>()
+        .unwrap();
+    let db = Database::open("memory://join_small_right_side_outer_once").unwrap();
+    for sql in [
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX g_k ON g(k)",
+        "INSERT INTO g SELECT v.value, 1 FROM generate_series(1, 2000) v",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    JOIN_SWAP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let sql = "SELECT COUNT(*) FROM g JOIN (VALUES (JOIN_SWAP_NEXT())) AS v(k) ON g.k = v.k";
+    let count: i64 = db.query_one(sql, ()).unwrap();
+    assert_eq!(count, 2000, "{sql}: the VALUES row is read once and keys 1");
+}
+
 // The file engine plans no index join on a secondary index over hot rows
 #[cfg(not(feature = "test-filedb"))]
 #[test]

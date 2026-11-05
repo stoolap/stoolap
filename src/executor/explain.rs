@@ -108,11 +108,16 @@ impl Executor {
             // Record cardinality feedback for SELECT statements with WHERE
             if let Statement::Select(select) = &*stmt.statement {
                 if let Some(ref where_clause) = select.where_clause {
-                    // Try to get the table name and record feedback
-                    if let Some(ref table_expr) = select.table_expr {
-                        if let Some(table_name) = extract_table_name(table_expr) {
-                            // Compute predicate fingerprint
-                            let predicate_hash = fingerprint_predicate(&table_name, where_clause);
+                    // What it corrects is one table's scan, so a join records
+                    // none; its columns are fingerprinted bare, as a join side's
+                    // conditions read them
+                    if let Some(Expression::TableSource(table)) = select.table_expr.as_deref() {
+                        {
+                            let table_name = table.name.value_lower.to_string();
+                            let alias = table.alias.as_ref().unwrap_or(&table.name);
+                            let bare =
+                                super::utils::strip_table_qualifier(where_clause, &alias.value);
+                            let predicate_hash = fingerprint_predicate(&table_name, &bare);
 
                             // Get estimated row count from planner
                             let tx = self.begin_transaction().ok();

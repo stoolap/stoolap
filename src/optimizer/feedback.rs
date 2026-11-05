@@ -310,23 +310,19 @@ pub fn fingerprint_predicate(table_name: &str, expr: &Expression) -> u64 {
 
 /// Hash the structure of an expression (not literal values)
 fn hash_expression_structure(expr: &Expression, hasher: &mut FxHasher) {
-    // A column is its table's, which the fingerprint holds, so it hashes by
-    // its name alone, bare or qualified
-    let column = match expr {
-        Expression::Identifier(id) => Some(&id.value_lower),
-        Expression::QualifiedIdentifier(qid) => Some(&qid.name.value_lower),
-        _ => None,
-    };
-    if let Some(column) = column {
-        "column".hash(hasher);
-        column.hash(hasher);
-        return;
-    }
-
     // Hash the expression type discriminant
     std::mem::discriminant(expr).hash(hasher);
 
     match expr {
+        Expression::Identifier(id) => {
+            // Column names are part of structure
+            id.value.hash(hasher);
+        }
+        Expression::QualifiedIdentifier(qid) => {
+            // Table.column is structural
+            qid.qualifier.value.hash(hasher);
+            qid.name.value.hash(hasher);
+        }
         Expression::Infix(infix) => {
             // Operator type is structural
             infix.op_type.hash(hasher);

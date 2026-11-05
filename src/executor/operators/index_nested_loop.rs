@@ -302,9 +302,10 @@ pub struct IndexNestedLoopJoinOperator<'a> {
     // Set when the inner table could not answer a probe; the rows joined
     // so far are then no answer either
     needs_fallback: bool,
-    // The most rows one index probe may find before the join ends for
-    // another way to run it
+    // The most rows one probe may find before the join ends for another way
+    // to run it, with the outer rows read so far, kept for that way
     probe_cap: Option<usize>,
+    kept_outer: Option<Vec<Row>>,
     // The outer row the chunk ended on when it left with its last match,
     // kept for the executor's continuation
     ended_on: Option<Row>,
@@ -425,6 +426,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             outer_rows_seen: 0,
             needs_fallback: false,
             probe_cap: None,
+            kept_outer: None,
             ended_on: None,
             probe_scratch: ProbeScratch::default(),
             local_rows: None,
@@ -461,11 +463,20 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
         self
     }
 
-    /// An index probe finding more than `cap` rows ends the join, which the
-    /// executor then runs another way
+    /// A probe finding more than `cap` rows ends the join, which the executor
+    /// then runs another way from the outer rows this one read
     pub fn with_probe_cap(mut self, cap: usize) -> Self {
+        // An outer row without a match leaves an INNER join unread, so each is kept
+        debug_assert!(matches!(self.join_type, JoinType::Inner));
         self.probe_cap = Some(cap);
+        self.kept_outer = Some(Vec::new());
         self
+    }
+
+    /// Every row of the outer side, those the join read and the rest, for
+    /// the way it runs instead once a probe ended it, so the side is read once
+    pub fn take_outer_rows(&mut self) -> Vec<Row> {
+        self.kept_outer.take().unwrap_or_default()
     }
 
     /// The statement's subquery blocks the residual calls
@@ -618,14 +629,6 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
                     std::slice::from_ref(key_value),
                     &mut self.row_id_buffer,
                 );
-                if self
-                    .probe_cap
-                    .is_some_and(|cap| self.row_id_buffer.len() > cap)
-                {
-                    self.row_id_buffer.clear();
-                    self.needs_fallback = true;
-                    return Ok(());
-                }
                 epoch.is_some()
                     && self.inner_table.add_removed_equal(
                         &**index,
@@ -682,20 +685,9 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             local.apply(key_value, &mut self.row_id_buffer);
         }
 
-        if self.row_id_buffer.is_empty() {
+        if !self.fetch_candidates()? {
             return Ok(());
         }
-
-        // Fetch matching rows directly into inner_rows buffer
-        let filter: &dyn Expression = match &self.inner_filter {
-            Some(filter) => filter.as_ref(),
-            None => &self.true_expr,
-        };
-        self.inner_table.fetch_rows_by_ids_into(
-            &self.row_id_buffer,
-            filter,
-            &mut self.current_inner_rows,
-        )?;
 
         // An index entry may point at a row whose key has since changed
         // inside the transaction, so the row's own key decides
@@ -713,6 +705,33 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
     /// The inner rows for a key that meets the inner column across types: a
     /// TEXT key probes as the value it reads as, any other key takes the
     /// TEXT rows that read as it
+    /// The inner rows the probe's candidate ids name, through the inner
+    /// filter; false, with none fetched, for no candidate or for more than
+    /// the probe cap, which ends the join
+    fn fetch_candidates(&mut self) -> Result<bool> {
+        if self.row_id_buffer.is_empty() {
+            return Ok(false);
+        }
+        if self
+            .probe_cap
+            .is_some_and(|cap| self.row_id_buffer.len() > cap)
+        {
+            self.row_id_buffer.clear();
+            self.needs_fallback = true;
+            return Ok(false);
+        }
+        let filter: &dyn Expression = match &self.inner_filter {
+            Some(filter) => filter.as_ref(),
+            None => &self.true_expr,
+        };
+        self.inner_table.fetch_rows_by_ids_into(
+            &self.row_id_buffer,
+            filter,
+            &mut self.current_inner_rows,
+        )?;
+        Ok(true)
+    }
+
     fn lookup_across(&mut self, key_value: &Value) -> Result<()> {
         if let (Some(KeySide::Read(reading)), Value::Text(text)) = (self.inner_side, key_value) {
             return match reading.read(text) {
@@ -727,18 +746,9 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             .text_reads
             .row_ids(&*self.inner_table, idx, key_value)?;
         self.row_id_buffer.extend_from_slice(ids);
-        if self.row_id_buffer.is_empty() {
+        if !self.fetch_candidates()? {
             return Ok(());
         }
-        let filter: &dyn Expression = match &self.inner_filter {
-            Some(filter) => filter.as_ref(),
-            None => &self.true_expr,
-        };
-        self.inner_table.fetch_rows_by_ids_into(
-            &self.row_id_buffer,
-            filter,
-            &mut self.current_inner_rows,
-        )?;
         self.current_inner_rows
             .retain(|(_, row)| row.get(idx).and_then(|key| sql_eq(key, key_value)) == Some(true));
         Ok(())
@@ -746,6 +756,9 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
 
     /// Advance to the next outer row and lookup matching inner rows.
     fn advance_outer(&mut self) -> Result<bool> {
+        if let Some(kept) = &mut self.kept_outer {
+            kept.extend(self.current_outer_row.take());
+        }
         match self.outer.next()? {
             Some(row_ref) => {
                 let outer_row = row_ref.into_owned();
@@ -769,7 +782,16 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
                 // Lookup matching inner rows
                 self.lookup_inner_rows(&key_value)?;
                 if self.needs_fallback {
-                    self.current_outer_row = Some(outer_row);
+                    // Kept rows take the rest of the outer side before the join
+                    // closes it
+                    if let Some(kept) = &mut self.kept_outer {
+                        kept.push(outer_row);
+                        while let Some(row) = self.outer.next()? {
+                            kept.push(row.into_owned());
+                        }
+                    } else {
+                        self.current_outer_row = Some(outer_row);
+                    }
                     self.outer_exhausted = true;
                     return Ok(false);
                 }
@@ -864,6 +886,17 @@ impl Operator for IndexNestedLoopJoinOperator<'_> {
                     // OPTIMIZATION: Check if this is the last inner row to check
                     // If so, we can take ownership of outer_row and move its values
                     let is_last_inner = self.current_inner_idx >= inner_len;
+                    // A join that keeps its outer rows reads the row, which
+                    // the next advance keeps
+                    if is_last_inner && self.kept_outer.is_some() {
+                        let outer_row = self.current_outer_row.as_ref().unwrap();
+                        let combined = self.create_combined_row(outer_row, inner_row);
+                        if !self.advance_outer()? {
+                            self.ended_on =
+                                self.kept_outer.as_ref().and_then(|k| k.last()).cloned();
+                        }
+                        return Ok(Some(RowRef::Owned(combined)));
+                    }
                     if is_last_inner {
                         // No more inner rows - take ownership of outer and move values
                         let outer_row = self.current_outer_row.take().unwrap();
