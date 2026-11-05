@@ -167,14 +167,12 @@ fn a_long_set_operation_is_not_nested() {
 #[test]
 fn text_the_engine_wrote_reads_back_past_the_limits() {
     let db = setup("nesting_limit_written");
-    // The engine writes each operator of a chain in parentheses, nesting
-    // them deeper than the expression limit
-    let chain = |term: &str, op: &str| {
-        let terms = vec![term; MAX_EXPRESSION_DEPTH * 2];
-        terms.join(op)
-    };
-    let sum = chain("1", " + ");
-    let checks = chain("v >= 0", " OR ");
+    // At the limit: a chain in parentheses, and NOTs, which the engine
+    // writes with each operand in parentheses, nesting past the limit
+    let mut terms = vec!["0"; MAX_EXPRESSION_DEPTH - 1];
+    terms[0] = "1";
+    let sum = terms.join(" + ");
+    let checks = format!("{}v >= 0", "NOT ".repeat(MAX_EXPRESSION_DEPTH - 2));
     for sql in [
         format!(
             "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER DEFAULT ({sum}) CHECK ({checks}))"
@@ -186,11 +184,7 @@ fn text_the_engine_wrote_reads_back_past_the_limits() {
             .unwrap_or_else(|e| panic!("{}: {e}", &sql[..30]));
     }
     let v: i64 = db.query_one("SELECT v FROM w WHERE id = 1", ()).unwrap();
-    assert_eq!(
-        v,
-        (MAX_EXPRESSION_DEPTH * 2) as i64,
-        "the stored DEFAULT reads back"
-    );
+    assert_eq!(v, 1, "the stored DEFAULT reads back");
     assert_eq!(
         answer(&db, "SELECT * FROM wv"),
         Ok(1),

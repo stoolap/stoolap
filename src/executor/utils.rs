@@ -819,21 +819,13 @@ pub fn flatten_and_predicates(expr: &Expression) -> Vec<Expression> {
 /// Combine predicates with AND operator.
 /// Returns None if the input is empty.
 pub fn combine_predicates_with_and(preds: Vec<Expression>) -> Option<Expression> {
-    if preds.is_empty() {
-        return None;
-    }
-
-    let mut result = preds.into_iter();
-    let first = result.next().unwrap();
-
-    Some(result.fold(first, |acc, pred| {
-        Expression::Infix(InfixExpression::new(
-            Token::new(TokenType::Keyword, "AND", Position::default()),
-            Box::new(acc),
-            "AND".to_string(),
-            Box::new(pred),
-        ))
-    }))
+    let mut preds = preds.into_iter();
+    let first = preds.next()?;
+    let and = |pred| {
+        let token = Token::new(TokenType::Keyword, "AND", Position::default());
+        (token, SmartString::const_new("AND"), pred)
+    };
+    Some(InfixExpression::balanced_chain(first, preds.map(and)))
 }
 
 /// Extract all AND-ed conditions from an expression as references.

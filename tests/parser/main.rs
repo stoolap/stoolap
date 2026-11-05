@@ -22,6 +22,7 @@ mod bug_keyword_column_case_test;
 mod keyword_identifiers_test;
 mod lexer_tokens_test;
 mod nesting_limit_test;
+mod operator_chain_test;
 mod order_by_parser_test;
 mod parser_edge_cases_test;
 mod sql_comment_parse_test;

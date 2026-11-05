@@ -28,39 +28,118 @@ fn identifier_token(ident: &Identifier) -> Token {
     token
 }
 
+/// The levels a balanced chain of `operands` operands nests
+fn chain_height(operands: usize) -> usize {
+    (usize::BITS - (operands - 1).leading_zeros()) as usize
+}
+
+/// The left-deep chain of `op` at `top` rebuilt balanced, its operands in
+/// the order written; a chain of three or fewer is left as it is
+fn balance_chain(top: Expression, op: InfixOperator, operands: usize) -> Expression {
+    if operands <= 3 {
+        return top;
+    }
+    let mut rights = Vec::with_capacity(operands - 1);
+    let mut node = top;
+    let head = loop {
+        match node {
+            Expression::Infix(infix) if infix.op_type == op => {
+                rights.push((infix.token, infix.operator, *infix.right));
+                node = *infix.left;
+            }
+            other => break other,
+        }
+    };
+    InfixExpression::balanced_chain(head, rights.into_iter().rev())
+}
+
 impl Parser<'_> {
     /// Parse an expression with the given precedence, refusing one nested
     /// past [`MAX_EXPRESSION_DEPTH`] before any later stage recurses that deep
     pub fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
         if self.limited && self.expression_depth >= MAX_EXPRESSION_DEPTH {
-            self.add_error(format!(
-                "statement nested too deeply: more than {MAX_EXPRESSION_DEPTH} expressions inside one another"
-            ));
+            self.nested_too_deeply();
             return None;
         }
         self.expression_depth += 1;
+        let outer_peak = std::mem::replace(&mut self.expression_peak, self.expression_depth);
         let expr = self.parse_operators(precedence);
         self.expression_depth -= 1;
+        self.expression_peak = self.expression_peak.max(outer_peak);
         expr
     }
 
-    /// [`Self::parse_expression`] within the depth it allows
-    fn parse_operators(&mut self, precedence: Precedence) -> Option<Expression> {
-        // Parse prefix expression
-        let mut left = self.parse_prefix_expression()?;
+    fn nested_too_deeply(&mut self) {
+        self.add_error(format!(
+            "statement nested too deeply: more than {MAX_EXPRESSION_DEPTH} expressions inside one another"
+        ));
+    }
 
-        // Parse infix expressions while precedence allows
+    /// [`Self::parse_expression`] within the depth it allows. A chain of one
+    /// of `AND`, `OR` and `||` is built balanced, so it nests the log2 of its
+    /// length; any other operator nests its left operand one level deeper
+    fn parse_operators(&mut self, precedence: Precedence) -> Option<Expression> {
+        let mut left = self.parse_prefix_expression()?;
+        // Levels the operators so far stack above the first operand, and the
+        // balanced operator being chained with its operand count
+        let mut height = 0;
+        let mut run: Option<(InfixOperator, usize)> = None;
+
         while !self.peek_token_is(TokenType::Eof) && precedence < self.peek_precedence() {
-            // Check if this is an infix operator we can handle
             if !self.is_infix_token() {
-                return Some(left);
+                break;
             }
+            let chained = self.peek_balanced_operator();
+            if let Some((op, operands)) = run {
+                if chained != Some(op) {
+                    left = balance_chain(left, op, operands);
+                    height += chain_height(operands);
+                    run = None;
+                }
+            }
+            let wraps = !self.peek_token_is_punctuator(".") && !self.peek_token_is_punctuator("(");
 
             self.next_token();
             left = self.parse_infix_expression(left)?;
+
+            match (chained, &mut run) {
+                (Some(_), Some((_, operands))) => *operands += 1,
+                (Some(op), None) => run = Some((op, 2)),
+                (None, _) => height += usize::from(wraps),
+            }
+            let levels = height + run.map_or(0, |(_, operands)| chain_height(operands));
+            if self.limited
+                && self.expression_peak + levels.saturating_sub(1) > MAX_EXPRESSION_DEPTH
+            {
+                self.nested_too_deeply();
+                return None;
+            }
         }
+        if let Some((op, operands)) = run {
+            left = balance_chain(left, op, operands);
+            height += chain_height(operands);
+        }
+        self.expression_peak += height.saturating_sub(1);
 
         Some(left)
+    }
+
+    /// The operator the peek token starts if it is one a chain of is balanced
+    fn peek_balanced_operator(&self) -> Option<InfixOperator> {
+        let op = match self.peek_token.token_type {
+            TokenType::Operator => InfixOperator::from_str(&self.peek_token.literal),
+            TokenType::Keyword => match self.peek_token.keyword {
+                Some(Keyword::And) => InfixOperator::And,
+                Some(Keyword::Or) => InfixOperator::Or,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        matches!(
+            op,
+            InfixOperator::And | InfixOperator::Or | InfixOperator::Concat
+        )
+        .then_some(op)
     }
 
     /// Check if the peek token is an infix operator

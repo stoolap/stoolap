@@ -1254,6 +1254,36 @@ impl InfixExpression {
             right,
         }
     }
+
+    /// `head` and the operands after it joined by the operator before each,
+    /// as a balanced tree keeping the order written, three or fewer operands
+    /// left-deep. Only for an operator that associates (`AND`, `OR`, `||`):
+    /// it nests the log2 of the chain where a left-deep tree nests its length
+    pub fn balanced_chain(
+        head: Expression,
+        mut rest: impl ExactSizeIterator<Item = (Token, SmartString, Expression)>,
+    ) -> Expression {
+        let operands = rest.len() + 1;
+        Self::chain_of(operands, head, &mut rest)
+    }
+
+    fn chain_of(
+        operands: usize,
+        head: Expression,
+        rest: &mut impl Iterator<Item = (Token, SmartString, Expression)>,
+    ) -> Expression {
+        if operands == 1 {
+            return head;
+        }
+        let left = Self::chain_of(operands - operands / 2, head, rest);
+        match rest.next() {
+            Some((token, operator, first)) => {
+                let right = Self::chain_of(operands / 2, first, rest);
+                Expression::Infix(Self::new(token, Box::new(left), operator, Box::new(right)))
+            }
+            None => left,
+        }
+    }
 }
 
 impl fmt::Display for InfixExpression {
