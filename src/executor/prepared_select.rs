@@ -3124,7 +3124,7 @@ type ScanFilter = (Option<Box<dyn StorageExpr>>, bool);
 /// A statement's WHERE over its table's row: its program, what of it a scan
 /// takes, and the rows a set test's keys may narrow it to
 #[derive(Debug)]
-struct PreparedWhere {
+pub(crate) struct PreparedWhere {
     whole: WhereProgram,
     /// What a row the scan read is still asked when the scan took
     /// `pushdown` whole: the conjuncts outside it
@@ -4407,6 +4407,16 @@ enum SideSource {
     /// As the general path streams a view's or a derived table's rows, so a
     /// join that stops early reads no more of them
     Stream,
+}
+
+/// How a join reads one of its sides, with the conditions on it alone as
+/// that read asks them
+#[derive(Debug)]
+enum SideReading {
+    /// Scanned as a table, TRUE for one without conditions
+    Table(PreparedWhere),
+    /// Read whole as rows, with those of its conditions the read asks
+    Rows(Option<PreparedWhere>),
 }
 
 /// How a FROM entry other than a join is read, by a block or as a join's side
@@ -10056,9 +10066,8 @@ pub(crate) struct JoinBlocks {
     /// The same conditions as written, which the sides' reads are given,
     /// when a subquery that reads the other side moved one to the joined row
     pub(crate) written: Option<[Option<Expression>; 2]>,
-    /// The same conditions as their side's scan reads them, TRUE for a
-    /// table side without any
-    side_wheres: [Option<PreparedWhere>; 2],
+    /// How each side is read, with the same conditions as its read asks them
+    side_reads: [SideReading; 2],
     /// How each side read as rows is read when the blocks ask all of its
     /// conditions; None for a side that reads those without a block itself
     side_sources: [Option<SideSource>; 2],
@@ -10069,8 +10078,6 @@ pub(crate) struct JoinBlocks {
     /// The schema each side was found to hold those columns with; held, any
     /// change to the table's schema replaces it, so the same one skips the check
     fitted: [std::sync::OnceLock<CompactArc<Schema>>; 2],
-    /// Whether each side is read whole as rows, not scanned as a table
-    pub(crate) rows_sides: [bool; 2],
     /// Whether a side runs as a statement of its own: a join, which runs
     /// its ON's subqueries as its own blocks, or a derived table read as rows
     pub(crate) nested: [bool; 2],
@@ -10124,7 +10131,30 @@ impl JoinBlocks {
 
     /// Whether the statement holds a condition on side `side` alone
     pub(crate) fn side_asks(&self, side: usize) -> bool {
-        self.side_wheres[side].is_some()
+        self.side_where(side).is_some()
+    }
+
+    /// The conditions on side `side` alone as its read asks them
+    fn side_where(&self, side: usize) -> Option<&PreparedWhere> {
+        match &self.side_reads[side] {
+            SideReading::Table(where_) => Some(where_),
+            SideReading::Rows(where_) => where_.as_ref(),
+        }
+    }
+
+    /// Whether each side is read whole as rows, not scanned as a table
+    pub(crate) fn rows_sides(&self) -> [bool; 2] {
+        self.side_reads
+            .each_ref()
+            .map(|read| matches!(read, SideReading::Rows(_)))
+    }
+
+    /// The conditions side `side`'s scan reads when it is a table
+    pub(crate) fn table_where(&self, side: usize) -> Option<&PreparedWhere> {
+        match &self.side_reads[side] {
+            SideReading::Table(where_) => Some(where_),
+            SideReading::Rows(_) => None,
+        }
     }
 
     /// Whether side `side` is read from the source the blocks prepared
@@ -10548,6 +10578,18 @@ impl JoinBlocks {
                 side_filters[i] = joined_clause;
             }
         }
+        // A table side is read by the scan its conditions plan
+        let [left_where, right_where] = side_wheres;
+        let reading = |rows: bool, where_: Option<PreparedWhere>| match rows {
+            true => Some(SideReading::Rows(where_)),
+            false => where_.map(SideReading::Table),
+        };
+        let (Some(left_read), Some(right_read)) = (
+            reading(rows_sides[0], left_where),
+            reading(rows_sides[1], right_where),
+        ) else {
+            return Ok(None);
+        };
         let left = scope.columns[..left_width].to_vec();
         let right = scope.columns[left_width..].to_vec();
         let pair_ctx = CompileContext::bound_pair(registry, left_width as u32);
@@ -10583,12 +10625,11 @@ impl JoinBlocks {
             cross,
             sides: side_filters,
             written: crossed.then_some(written),
-            side_wheres,
+            side_reads: [left_read, right_read],
             side_sources,
             side_scans,
             side_columns,
             fitted: Default::default(),
-            rows_sides,
             nested: sides
                 .each_ref()
                 .map(|side| side.leaves.len() > 1 || side.rows),
@@ -10781,8 +10822,8 @@ impl Executor {
     ) -> Result<Option<Option<Box<dyn StorageExpr>>>> {
         // A narrowing reads rows by keys the fetch has already chosen; its
         // set, when it has one, is a filter like the others
-        let Some(where_) = held.side_wheres[side]
-            .as_ref()
+        let Some(where_) = held
+            .side_where(side)
             .filter(|_| held.sides[side].is_some())
             .filter(|w| w.narrowing.is_none() || w.narrowing_set.is_some())
         else {
@@ -10800,23 +10841,20 @@ impl Executor {
     /// The rows of table `name`, side `side` of the join `held` prepared,
     /// that its conditions on that side pass and the `extra` ones too, read
     /// as `run` reads a prepared statement's rows: from the `offset`-th up
-    /// to `limit` of them, with the table's layout, by the scan the side's
-    /// conditions plan. None when the side is no table
+    /// to `limit` of them, with the table's layout, by the scan its
+    /// conditions `where_` plan
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn join_side_rows(
         &self,
         held: &JoinBlocks,
         run: &PreparedRunner<'_>,
-        side: usize,
+        (side, where_): (usize, &PreparedWhere),
         (name, alias): (&str, &str),
         ctx: &ExecutionContext,
         extra: Option<&Expression>,
         limit: Option<usize>,
         offset: usize,
-    ) -> Result<Option<(Box<dyn crate::storage::traits::QueryResult>, LayoutToken)>> {
-        let Some(where_) = &held.side_wheres[side] else {
-            return Ok(None);
-        };
+    ) -> Result<(Box<dyn crate::storage::traits::QueryResult>, LayoutToken)> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
         // A table the side was prepared for and is gone changed under it
@@ -10881,7 +10919,7 @@ impl Executor {
             )? {
                 Passing::Pruned | Passing::Read => {}
                 Passing::Scan(scan) => {
-                    return Ok(Some((Box::new(ScannerResult::new(scan, columns)), token)));
+                    return Ok((Box::new(ScannerResult::new(scan, columns)), token));
                 }
                 Passing::Filtered(scan, bound) => {
                     #[cfg(feature = "test-failpoints")]
@@ -10893,17 +10931,17 @@ impl Executor {
                         filter = filter.with_params(CompactArc::new(run.base.clone()));
                     }
                     let filtered = FilteredResult::from_filter(rows, filter);
-                    return Ok(Some((Box::new(filtered), token)));
+                    return Ok((Box::new(filtered), token));
                 }
                 Passing::Answers(answers) => {
                     kept.rows.extend(answers.into_iter().skip(offset));
                 }
             }
         }
-        Ok(Some((
+        Ok((
             Box::new(ExecutorResult::with_arc_columns(columns, kept.rows()?)),
             token,
-        )))
+        ))
     }
 
     /// Side `side` of the join `held` prepared, read from its source as a
@@ -10923,7 +10961,7 @@ impl Executor {
         let Some((rows, columns, bounded)) = read else {
             return Ok(None);
         };
-        let Some(where_) = &held.side_wheres[side] else {
+        let Some(where_) = held.side_where(side) else {
             let rows = match rows {
                 Ok(rows) => RowVec::from_vec(rows),
                 Err(shared) => RowVec::from_vec((*shared).clone()),
@@ -11012,7 +11050,7 @@ impl Executor {
         let columns = CompactArc::new(result.columns().to_vec());
         held.rows_fit(side, &alias, &columns)?;
         // A side with no condition of its own passes on as the join reads it
-        let Some(where_) = &held.side_wheres[side] else {
+        let Some(where_) = held.side_where(side) else {
             return Ok(result);
         };
         // Its conditions bind before its first row, so they pass its rows

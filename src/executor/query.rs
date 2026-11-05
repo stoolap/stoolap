@@ -3357,7 +3357,7 @@ impl Executor {
             None => [left.clone(), right.clone()],
         };
         // One the blocks read from its source asks them all
-        let rows_sides = blocks.map_or([false; 2], |held| held.rows_sides);
+        let rows_sides = blocks.map_or([false; 2], |held| held.rows_sides());
         let sourced = blocks.map_or([false; 2], |held| [0, 1].map(|i| held.side_sourced(i)));
         let joined = [&join_source.left, &join_source.right]
             .map(|side| matches!(**side, Expression::JoinSource(_)));
@@ -3888,7 +3888,9 @@ impl Executor {
         // A side read as rows reads its conditions without a block; the
         // blocks ask those of its others that bind as it is read, and the
         // rest of the joined row with the WHERE's conditions on both sides
-        let rows_sides = blocks.as_deref().map_or([false; 2], |held| held.rows_sides);
+        let rows_sides = blocks
+            .as_deref()
+            .map_or([false; 2], |held| held.rows_sides());
         let joined = [&join_source.left, &join_source.right]
             .map(|side| matches!(**side, Expression::JoinSource(_)));
         // One the blocks read from its source asks them all
@@ -5887,8 +5889,6 @@ impl Executor {
                 }
                 Err(Self::side_without_blocks())
             }
-            Expression::JoinSource(js) => self.joined_side_rows(js, ctx, filter, None, false),
-            Expression::SubquerySource(ss) => self.derived_side_rows(ss, ctx, filter, None),
             _ => Err(Self::side_without_blocks()),
         }
     }
@@ -5967,7 +5967,7 @@ impl Executor {
         // which the read's limit cannot count
         let rows = side
             .run
-            .filter(|(run, index)| run.blocks.rows_sides[*index]);
+            .filter(|(run, index)| run.blocks.rows_sides()[*index]);
         let side = match rows {
             Some(_) => SideRead { run: None, ..side },
             None => side,
@@ -6007,19 +6007,23 @@ impl Executor {
                 return Ok((result, columns, false, None));
             }
         }
-        if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
+        // Any other side the blocks hold is a table they scan
+        if let Some((run, index)) = side.run {
+            let (Some(where_), Expression::TableSource(ts)) = (run.blocks.table_where(index), expr)
+            else {
+                return Err(Error::internal("a join side read without its schema"));
+            };
             let alias = ts.alias.as_ref().unwrap_or(&ts.name).value.as_str();
             let table = (ts.name.value_lower.as_str(), alias);
-            let read =
-                self.join_side_rows(run.blocks, run.run, index, table, ctx, extra, limit, offset)?;
-            if let Some((result, token)) = read {
-                let columns = result
-                    .columns()
-                    .iter()
-                    .map(|c| qualified(alias, c))
-                    .collect();
-                return Ok((result, columns, limit.is_some(), Some(token)));
-            }
+            let side = (index, where_);
+            let (result, token) =
+                self.join_side_rows(run.blocks, run.run, side, table, ctx, extra, limit, offset)?;
+            let columns = result
+                .columns()
+                .iter()
+                .map(|c| qualified(alias, c))
+                .collect();
+            return Ok((result, columns, limit.is_some(), Some(token)));
         }
         let both;
         let filter = match (side.filter, extra) {
@@ -6029,10 +6033,6 @@ impl Executor {
             }
             (filter, extra) => filter.or(extra),
         };
-        #[cfg(feature = "test-failpoints")]
-        if side.run.is_some() {
-            crate::test_failpoints::join_side_opening();
-        }
         // A joined side runs as a join of its own, under the plan it holds,
         // both columns of a pair it merges kept as the blocks read them
         let nested = match (rows, expr) {
@@ -6085,9 +6085,6 @@ impl Executor {
             let result =
                 self.join_source_side_rows(run.blocks, run.run, index, (expr, result), ctx)?;
             return Ok((result, columns, bounded, None));
-        }
-        if side.run.is_some() {
-            return Err(Error::internal("a join side read without its schema"));
         }
         Ok(fetched)
     }
