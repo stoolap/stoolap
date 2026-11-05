@@ -452,19 +452,23 @@ impl Executor {
             }
             fk_index_columns.push(col.name.clone());
         }
-        // Refused before the table is made when an index it gets would not be stored
-        let index_names = (unique_columns
+        // Refused before the table is made when an index it gets would not be
+        // stored, of the type the index takes on its column
+        let indexes = (unique_columns
             .iter()
-            .map(|c| unique_index_name(table_name, c)))
+            .map(|c| (unique_index_name(table_name, c), c)))
         .chain(
             fk_index_columns
                 .iter()
-                .map(|c| fk_index_name(table_name, c)),
+                .map(|c| (fk_index_name(table_name, c), c)),
         );
-        for name in index_names {
-            crate::storage::mvcc::engine::check_stored(name.len(), || {
-                "the index name".to_string()
-            })?;
+        for (name, column) in indexes {
+            let data_type = schema
+                .find_column(column)
+                .map_or(DataType::Null, |(_, col)| col.data_type);
+            let index_type =
+                crate::storage::mvcc::table::MVCCTable::auto_select_index_type(&[data_type]);
+            crate::storage::mvcc::engine::check_index_name(&name, index_type)?;
         }
 
         // Check if there's an active transaction

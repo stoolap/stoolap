@@ -168,52 +168,109 @@ fn refused_statements() -> Vec<(&'static str, String, &'static str)> {
             "CREATE INDEX \"a/b\" ON w (v) USING HNSW".to_string(),
             path,
         ),
+        (
+            "name of the HNSW index a UNIQUE VECTOR column gets",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, \"a/b\" VECTOR(2) UNIQUE)".to_string(),
+            path,
+        ),
+        (
+            "DEFAULT literal a reopen reads as a value past the limit",
+            format!(
+                "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT DEFAULT '{}')",
+                "a".repeat(MAX - 4)
+            ),
+            stored,
+        ),
+        (
+            "view name whose lowercase is past the limit",
+            format!("CREATE VIEW \"{}\" AS SELECT 1", "İ".repeat(22_000)),
+            stored,
+        ),
     ]
+}
+
+/// t and w, the tables every refused statement runs beside
+fn setup(db: &Database) {
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5)", ()).unwrap();
+    db.execute("INSERT INTO w VALUES (1, '[1, 2]')", ())
+        .unwrap();
+}
+
+/// What a reopen of `dir` finds wrong: tables other than t and w, or t
+/// changed
+fn reopened(dir: &std::path::Path) -> Option<String> {
+    let db = open(dir);
+    let (tables, rows) = (tables(&db), rows_of_t(&db));
+    db.close().unwrap();
+    (tables != ["t", "w"] || rows != Ok(vec![(1, 5)])).then(|| {
+        let tables: Vec<String> = tables
+            .iter()
+            .map(|t| t.chars().take(20).collect())
+            .collect();
+        format!("{tables:?} {rows:?}")
+    })
+}
+
+/// What each refused statement leaves wrong, run alone or, for a CREATE
+/// TABLE, inside a transaction, which makes the table on a path of its own
+fn refusals(in_transaction: bool) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (shape, sql, error) in refused_statements() {
+        if in_transaction && !sql.starts_with("CREATE TABLE") {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            setup(&db);
+            if in_transaction {
+                db.execute("BEGIN", ()).unwrap();
+            }
+            match db.execute(&sql, ()) {
+                Err(e) if e.to_string().contains(error) => {}
+                other => wrong.push(format!(
+                    "{shape}: {}",
+                    format!("{:?}", other.map_err(|e| e.to_string()))
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                )),
+            }
+            if in_transaction {
+                db.execute("COMMIT", ()).unwrap();
+            }
+            db.close().unwrap();
+        }
+        // Reopened from the WAL, then checkpointed and reopened from the
+        // snapshot: a reopen may compute what the statement left to compute
+        if let Some(found) = reopened(dir.path()) {
+            wrong.push(format!("{shape}, reopened: {found}"));
+        }
+        {
+            let db = open(dir.path());
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db.close().unwrap();
+        }
+        if let Some(found) = reopened(dir.path()) {
+            wrong.push(format!("{shape}, checkpointed and reopened again: {found}"));
+        }
+    }
+    wrong
 }
 
 #[test]
 fn a_name_or_text_the_files_cannot_hold_is_refused_and_leaves_nothing() {
-    let mut wrong = Vec::new();
-    for checkpoint in [false, true] {
-        for (shape, sql, error) in refused_statements() {
-            let dir = tempfile::tempdir().unwrap();
-            {
-                let db = open(dir.path());
-                db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", ())
-                    .unwrap();
-                db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
-                    .unwrap();
-                db.execute("INSERT INTO t VALUES (1, 5)", ()).unwrap();
-                db.execute("INSERT INTO w VALUES (1, '[1, 2]')", ())
-                    .unwrap();
-                match db.execute(&sql, ()) {
-                    Err(e) if e.to_string().contains(error) => {}
-                    other => wrong.push(format!(
-                        "{shape}: {}",
-                        format!("{:?}", other.map_err(|e| e.to_string()))
-                            .chars()
-                            .take(200)
-                            .collect::<String>()
-                    )),
-                }
-                if checkpoint {
-                    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-                }
-                db.close().unwrap();
-            }
-            let db = open(dir.path());
-            let (tables, rows) = (tables(&db), rows_of_t(&db));
-            if tables != ["t", "w"] || rows != Ok(vec![(1, 5)]) {
-                let tables: Vec<String> = tables
-                    .iter()
-                    .map(|t| t.chars().take(20).collect())
-                    .collect();
-                wrong.push(format!(
-                    "{shape}, checkpoint {checkpoint}, reopened: {tables:?} {rows:?}"
-                ));
-            }
-        }
-    }
+    let wrong = refusals(false);
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_create_table_in_a_transaction_is_refused_the_same() {
+    let wrong = refusals(true);
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
@@ -250,12 +307,18 @@ fn a_name_or_text_at_the_limits_survives_a_reopen() {
             }
             db.close().unwrap();
         }
+        // Reopened, checkpointed, and reopened again
+        {
+            let db = open(dir.path());
+            db.execute(
+                &format!("INSERT INTO {table} (id, {column}, v) VALUES (2, 8, '[3, 4]')"),
+                (),
+            )
+            .unwrap();
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db.close().unwrap();
+        }
         let db = open(dir.path());
-        db.execute(
-            &format!("INSERT INTO {table} (id, {column}, v) VALUES (2, 8, '[3, 4]')"),
-            (),
-        )
-        .unwrap();
         let rows: Vec<(i64, i64, bool)> = db
             .query(
                 &format!("SELECT id, {column}, s = '{text}' FROM {table} ORDER BY id"),

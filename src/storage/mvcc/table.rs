@@ -516,7 +516,7 @@ impl MVCCTable {
     ///
     /// For multi-column indexes, the first column's type determines the index type
     /// unless there's a BOOLEAN (which always gets Bitmap for AND/OR optimization).
-    fn auto_select_index_type(data_types: &[DataType]) -> IndexType {
+    pub(crate) fn auto_select_index_type(data_types: &[DataType]) -> IndexType {
         if data_types.is_empty() {
             return IndexType::BTree;
         }
@@ -3911,7 +3911,6 @@ impl Table for MVCCTable {
         if columns.is_empty() {
             return Err(Error::internal("index must have at least one column"));
         }
-        super::engine::check_stored(name.len(), || "the index name".to_string())?;
 
         let schema = self.version_store.schema();
 
@@ -3938,13 +3937,7 @@ impl Table for MVCCTable {
         } else {
             index_type.unwrap_or_else(|| Self::auto_select_index_type(&data_types))
         };
-        if chosen_type == IndexType::Hnsw {
-            super::engine::check_path_name(
-                name,
-                super::engine::HNSW_FILE_NAME_EXTRA,
-                "an HNSW index name",
-            )?;
-        }
+        super::engine::check_index_name(name, chosen_type)?;
 
         // Check if index with same name already exists
         if self.version_store.index_exists(name) {
