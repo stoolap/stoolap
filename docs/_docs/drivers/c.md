@@ -730,6 +730,8 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 
 If the query fails while its rows are being produced (for example a parameterized `REGEXP` with an invalid pattern), `stoolap_rows_fetch_all()` returns `STOOLAP_ERROR`, sets no buffer, and the message is available from `stoolap_rows_errmsg()`. A result is never returned cut short.
 
+A column name longer than 65,535 bytes, which `name_len` cannot say, is an error in the same way, for every call that returns this format (`stoolap_rows_fetch_all()`, `stoolap_rows_fetch_chunk()`, `stoolap_query_params_all()`, `stoolap_query_named_all()` and `stoolap_stmt_query_all()`). A column named after a long expression gets such a name; give it an alias. Reading the rows one by one with `stoolap_rows_next()` and `stoolap_rows_column_name()` is not limited.
+
 ### Chunked Fetch
 
 `stoolap_rows_fetch_chunk()` packs at most `max_rows` of the remaining rows in the same format and advances the cursor. A binding can serve its own row iterator from the chunk and cross the FFI boundary once per chunk instead of once per row and column. Every chunk carries the column header; `out_rows` is 0 once the result is exhausted.

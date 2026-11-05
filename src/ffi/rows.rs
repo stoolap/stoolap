@@ -19,7 +19,7 @@ use std::panic;
 
 use crate::api::Rows;
 use crate::core::types::DataType;
-use crate::core::{Result, Value};
+use crate::core::{Error, Result, Value};
 
 use super::types::StoolapRows;
 use super::{
@@ -420,16 +420,28 @@ pub(crate) fn reset_packed(buf: &mut Vec<u8>) {
 }
 
 /// Writes the column names and a zero row count, returning where the
-/// row count sits so `write_rows` can patch it
-fn write_header<'a>(names: impl ExactSizeIterator<Item = &'a [u8]>, buf: &mut Vec<u8>) -> usize {
+/// row count sits so `write_rows` can patch it; a name longer than its
+/// 16-bit length can say is refused
+fn write_header<'a>(
+    names: impl ExactSizeIterator<Item = &'a [u8]>,
+    buf: &mut Vec<u8>,
+) -> Result<usize> {
     buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
     for name in names {
-        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        let len = u16::try_from(name.len()).map_err(|_| {
+            Error::invalid_argument(format!(
+                "a result column name takes {} bytes, more than the {} the packed format carries; \
+                 give the column an alias",
+                name.len(),
+                u16::MAX
+            ))
+        })?;
+        buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(name);
     }
     let count_at = buf.len();
     buf.extend_from_slice(&0u32.to_le_bytes());
-    count_at
+    Ok(count_at)
 }
 
 /// Packs up to `max_rows` rows and patches the count at `count_at`. A
@@ -525,7 +537,7 @@ fn write_rows(
 /// Packs every row of `rows` into `buf`, which is reset first
 pub(crate) fn pack_all(rows: &mut Rows, buf: &mut Vec<u8>) -> Result<u32> {
     reset_packed(buf);
-    let count_at = write_header(rows.columns().iter().map(|n| n.as_bytes()), buf);
+    let count_at = write_header(rows.columns().iter().map(|n| n.as_bytes()), buf)?;
     let col_count = rows.columns().len();
     write_rows(rows, col_count, usize::MAX, count_at, buf)
 }
@@ -578,12 +590,12 @@ pub unsafe extern "C" fn stoolap_rows_fetch_all(
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let mut buf = Vec::with_capacity(4096);
-        let count_at = write_header(handle.columns.iter().map(|n| n.as_bytes()), &mut buf);
         let col_count = handle.columns.len();
-        let packed = match &mut handle.rows {
+        let header = write_header(handle.columns.iter().map(|n| n.as_bytes()), &mut buf);
+        let packed = header.and_then(|count_at| match &mut handle.rows {
             Some(r) => write_rows(r, col_count, usize::MAX, count_at, &mut buf),
             None => Ok(0),
-        };
+        });
         if let Err(e) = packed {
             handle.set_error(&e.to_string());
             return STOOLAP_ERROR;
@@ -651,13 +663,13 @@ pub unsafe extern "C" fn stoolap_rows_fetch_chunk(
         handle.has_row = false;
         reset_packed(&mut handle.packed);
         let names = handle.columns.iter().map(|n| n.as_bytes());
-        let count_at = write_header(names, &mut handle.packed);
+        let header = write_header(names, &mut handle.packed);
         let col_count = handle.columns.len();
         let max = max_rows as usize;
-        let packed = match &mut handle.rows {
+        let packed = header.and_then(|count_at| match &mut handle.rows {
             Some(r) => write_rows(r, col_count, max, count_at, &mut handle.packed),
             None => Ok(0),
-        };
+        });
         match packed {
             Ok(n) => {
                 if (n as usize) < max {
