@@ -299,6 +299,37 @@ impl Executor {
         })
     }
 
+    /// Whether the right table `right` of an INNER join is small beside the
+    /// table `probe` reads on the left: at most SMALL_OUTER_ROWS rows against
+    /// HOT_INNER_ROWS_PER_KEY times as many, so a probe for each of its rows
+    /// reads less than a join that scans the left table
+    pub(crate) fn right_small_beside(
+        &self,
+        probe: Option<&IndexProbe>,
+        right: &Expression,
+    ) -> bool {
+        let Some(probe) = probe else {
+            return false;
+        };
+        let right = match right {
+            Expression::TableSource(ts) => ts,
+            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                Expression::TableSource(ts) => ts,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let rows = |name: &str| self.engine.row_count_hint(name);
+        let Some(right_rows) =
+            rows(&right.name.value_lower).filter(|rows| *rows <= SMALL_OUTER_ROWS)
+        else {
+            return false;
+        };
+        rows(&probe.table).is_some_and(|left_rows| {
+            left_rows >= right_rows.max(1).saturating_mul(HOT_INNER_ROWS_PER_KEY)
+        })
+    }
+
     /// The lookup `probe` runs with, when this run takes it. The table's
     /// candidates answer a probe while they can, deciding per probe: a join
     /// bounded by a limit asks them of a column a probe reads, and a small
@@ -520,9 +551,11 @@ fn index_join_table_name(side: &Expression) -> Option<String> {
 
 /// The side an index join probes, given what the right table offers
 /// (`unswapped`): an INNER join probes its left table instead from a right
-/// side that is not a base table (a subquery, a CTE, a view), or for a
-/// primary key when only the right side is filtered. Some((probe, true))
-/// when the sides swap
+/// side that is not a base table (a subquery, a CTE, a view), from a right
+/// table offering nothing that is small beside the left (`right_small`), or
+/// for a primary key when only the right side is filtered. Some((probe,
+/// true)) when the sides swap
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pick_index_join_side<T>(
     join_type: &str,
     right_is_table: bool,
@@ -530,6 +563,7 @@ pub(crate) fn pick_index_join_side<T>(
     left_filtered: bool,
     unswapped: Option<T>,
     probe_left: impl FnOnce() -> Option<T>,
+    right_small: impl FnOnce() -> bool,
     is_primary_key: impl Fn(&T) -> bool,
 ) -> Option<(T, bool)> {
     // Only an INNER join reads the same with its sides exchanged; a LEFT
@@ -537,7 +571,7 @@ pub(crate) fn pick_index_join_side<T>(
     if join_type != "INNER" {
         return unswapped.map(|probe| (probe, false));
     }
-    if unswapped.is_none() && !right_is_table {
+    if unswapped.is_none() && (!right_is_table || right_small()) {
         return probe_left().map(|probe| (probe, true));
     }
     if right_filtered && !left_filtered {

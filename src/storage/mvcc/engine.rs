@@ -3619,6 +3619,17 @@ impl MVCCEngine {
             .ok_or_else(|| Error::TableNotFound(table_name.as_ref().to_string()))
     }
 
+    /// About how many committed rows table `name` holds, hot and sealed,
+    /// read without a transaction or a table; None for a table it does not hold
+    pub(crate) fn row_count_hint(&self, name: &str) -> Option<usize> {
+        let hot = self.get_version_store(name).ok()?.committed_row_count();
+        let sealed = self.segment_managers.read().ok()?.get(name).cloned();
+        Some(match sealed.filter(|mgr| mgr.has_segments()) {
+            Some(mgr) => mgr.total_row_count() + hot.saturating_sub(mgr.seal_overlap()),
+            None => hot,
+        })
+    }
+
     /// Creates a column in a table
     pub fn create_column(
         &self,

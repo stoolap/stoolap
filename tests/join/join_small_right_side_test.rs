@@ -1,0 +1,154 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! An INNER join whose right table offers no index probe and is small
+//! beside a left table with an index on its key reads the right table as
+//! the outer side of an index join, as the join written the other way does
+
+use stoolap::Database;
+
+/// `t` has 5,000 rows, k = id % 1000, with an index on k; `s` has 5 rows,
+/// one key past every `t` row; `m` has 2,000 rows and `x` 300 with an
+/// index on k, neither small beside the other side
+fn tables(db: &Database) {
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX t_k ON t(k)",
+        "INSERT INTO t SELECT g.value, g.value % 1000, g.value FROM generate_series(1, 5000) g",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO s VALUES (1, 0), (2, 7), (3, 14), (4, 999), (5, 2000)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO m SELECT g.value, g.value FROM generate_series(1, 2000) g",
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX x_k ON x(k)",
+        "INSERT INTO x SELECT g.value, g.value % 100 FROM generate_series(1, 300) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+}
+
+fn pairs(db: &Database, sql: &str) -> Vec<(i64, i64)> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+        })
+        .collect()
+}
+
+fn plan(db: &Database, sql: &str) -> String {
+    db.query(&format!("EXPLAIN {sql}"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The line of `sql`'s plan that names how its join runs
+fn join_method(db: &Database, sql: &str) -> String {
+    let plan = plan(db, sql);
+    let line = plan.lines().find(|line| line.contains("(INNER Join)"));
+    line.unwrap_or_else(|| panic!("{sql}:\n{plan}"))
+        .trim()
+        .to_string()
+}
+
+/// Each `s` row with the `t` rows its key matches
+fn written() -> Vec<(i64, i64)> {
+    [(1, 0), (2, 7), (3, 14), (4, 999)]
+        .into_iter()
+        .flat_map(|(s, k)| {
+            (0..5).map(move |i| (s, if k == 0 { 1000 * (i + 1) } else { k + 1000 * i }))
+        })
+        .collect()
+}
+
+fn small_right_side_probes_the_left_index(db: &Database) {
+    let swapped = "SELECT s.id, t.id FROM t JOIN s ON t.k = s.k";
+    let ordered = format!("{swapped} ORDER BY s.id, t.id");
+    assert_eq!(pairs(db, &ordered), written(), "{ordered}");
+    let written_other_way = "SELECT s.id, t.id FROM s JOIN t ON t.k = s.k ORDER BY s.id, t.id";
+    assert_eq!(
+        pairs(db, written_other_way),
+        written(),
+        "{written_other_way}"
+    );
+    let filtered =
+        "SELECT s.id, t.id FROM t JOIN s ON t.k = s.k WHERE s.id <= 2 ORDER BY s.id, t.id";
+    assert_eq!(pairs(db, filtered), written()[..10].to_vec(), "{filtered}");
+    let other_way = join_method(db, "SELECT s.id, t.id FROM s JOIN t ON t.k = s.k");
+    assert!(!other_way.contains("Hash Join"), "{other_way}");
+    for sql in [swapped, &ordered, filtered] {
+        assert_eq!(join_method(db, sql), other_way, "{sql}");
+    }
+}
+
+// The file engine plans no index join on a secondary index over hot rows
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_small_right_table_probes_the_left_tables_index() {
+    let db = Database::open("memory://join_small_right_side_hot").unwrap();
+    tables(&db);
+    small_right_side_probes_the_left_index(&db);
+}
+
+#[test]
+fn a_small_right_table_probes_the_left_tables_index_when_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    tables(&db);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    small_right_side_probes_the_left_index(&db);
+}
+
+#[test]
+fn a_right_table_not_small_beside_the_left_keeps_its_join() {
+    let db = Database::open("memory://join_small_right_side_kept").unwrap();
+    tables(&db);
+    for sql in [
+        // More rows than a small side holds
+        "SELECT m.id, t.id FROM t JOIN m ON t.k = m.k",
+        // A left table too small for a probe per right row to pay
+        "SELECT s.id, x.id FROM x JOIN s ON x.k = s.k",
+        // A LEFT join keeps the side it preserves
+        "SELECT s.id, t.id FROM t LEFT JOIN s ON t.k = s.k",
+    ] {
+        let plan = plan(&db, sql);
+        assert!(!plan.contains("Index Nested Loop"), "{sql}:\n{plan}");
+    }
+    let sql = "SELECT COUNT(*) FROM t JOIN m ON t.k = m.k";
+    let count: i64 = db.query_one(sql, ()).unwrap();
+    assert_eq!(count, 4995, "{sql}");
+}
+
+#[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
+#[test]
+fn a_small_right_table_is_the_outer_side_its_index_join_reads() {
+    use stoolap::test_failpoints::index_join_outer_rows;
+    let db = Database::open("memory://join_small_right_side_outer").unwrap();
+    tables(&db);
+    let before = index_join_outer_rows();
+    let sql = "SELECT s.id, t.id FROM t JOIN s ON t.k = s.k";
+    assert_eq!(pairs(&db, sql).len(), 20, "{sql}");
+    assert_eq!(
+        index_join_outer_rows() - before,
+        5,
+        "{sql} reads s as its outer side"
+    );
+}

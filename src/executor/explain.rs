@@ -1158,9 +1158,7 @@ impl Executor {
                 .as_ref()
                 .and_then(|probe| self.probe_strategy(probe, bounded, small_outer, !left_is_table));
 
-            // The side execution probes, by the rule it picks it with. The
-            // executor swaps a small outer in only from a right side that is
-            // not a base table
+            // The side execution probes, by the rule it picks it with
             let picked = if index_use == JoinIndexUse::Grouped {
                 inlj_info.map(|info| (info, false))
             } else {
@@ -1191,6 +1189,7 @@ impl Executor {
                             self.probe_strategy(probe, bounded, small_outer, !right_is_table)
                         })
                     },
+                    || self.right_small_beside(left_probe.as_ref(), join_right),
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };

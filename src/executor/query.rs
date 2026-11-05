@@ -4187,6 +4187,7 @@ impl Executor {
                     left_filter.is_some(),
                     probe(0, !left_is_table),
                     || probe(1, !right_is_table),
+                    || self.right_small_beside(join_plan.probes[1].as_ref(), &join_source.right),
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };
