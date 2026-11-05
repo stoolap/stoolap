@@ -1986,7 +1986,8 @@ impl Executor {
         // Names find the result columns that bare names and aliases point at
         let agg_col_index_map = build_column_index_map(&agg_columns);
         // Identities find the slot of each group item and aggregate, however it is named
-        let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
+        let mut slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
+        Self::bind_group_columns(stmt, &group_by_columns, &mut slot_keys);
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
 
         // Check if we have any expressions that need post-processing
@@ -2067,7 +2068,7 @@ impl Executor {
             // name another result column carries
             if let Some(slot) = match col_expr {
                 Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
-                    Self::group_item_index(col_expr, &group_by_columns)
+                    Self::group_item_index(col_expr, &group_by_columns, false)
                 }
                 _ => None,
             } {
@@ -2285,14 +2286,19 @@ impl Executor {
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
     ) -> Option<usize> {
-        Self::group_item_index(func.arguments.first()?, group_by_columns)
+        Self::group_item_index(func.arguments.first()?, group_by_columns, true)
     }
 
     /// The GROUP BY item `arg` reads: the first item written as it is, its
-    /// column qualified alike, its alias or its expression. Else the item
-    /// whose column it names, qualified or not, as a column binds; several
-    /// such items name one only when they all write the same column
-    fn group_item_index(arg: &Expression, group_by_columns: &[GroupByItem]) -> Option<usize> {
+    /// column qualified alike, its alias when `aliases` or its expression.
+    /// Else the item whose column it names, qualified or not, as a column
+    /// binds; several such items name one only when they all write the same
+    /// column
+    fn group_item_index(
+        arg: &Expression,
+        group_by_columns: &[GroupByItem],
+        aliases: bool,
+    ) -> Option<usize> {
         let column = match arg {
             Expression::Identifier(id) => Some((None, id.value_lower.as_str())),
             Expression::QualifiedIdentifier(qid) => Some((
@@ -2325,10 +2331,10 @@ impl Executor {
                 (GroupByItem::Column(_), None) => None,
             };
             let alias = match item {
-                GroupByItem::Expression { display_name, .. } => column
+                GroupByItem::Expression { display_name, .. } if aliases => column
                     .filter(|(qualifier, _)| qualifier.is_none())
                     .and_then(|_| names(None, display_name)),
-                GroupByItem::Column(_) => None,
+                _ => None,
             };
             match read.max(alias) {
                 Some(true) => return Some(at),
@@ -2340,6 +2346,27 @@ impl Executor {
             }
         }
         named.filter(|_| alike)
+    }
+
+    /// Binds in `slots` each column `stmt`'s SELECT list, ORDER BY and window
+    /// definitions read that a GROUP BY item of `items` reads, to that item's
+    /// slot: no SELECT alias, though spelled like the column, takes its place
+    fn bind_group_columns(
+        stmt: &SelectStatement,
+        items: &[GroupByItem],
+        slots: &mut FxHashMap<ExprKey, usize>,
+    ) {
+        let mut refs = Vec::new();
+        let order = stmt.order_by.iter().map(|o| &o.expression);
+        let defs = stmt.window_defs.iter().flat_map(|w| w.expressions());
+        for expr in stmt.columns.iter().chain(order).chain(defs) {
+            column_refs(expr, &mut refs);
+        }
+        for column in refs {
+            if let Some(at) = Self::group_item_index(column, items, false) {
+                slots.insert(ExprKey::of(column), at);
+            }
+        }
     }
 
     /// The ORDER BY of an aggregate that orders its own input, with the
@@ -2416,19 +2443,7 @@ impl Executor {
         let (columns, rows, items) =
             self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
         let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
-        // A column a GROUP BY item reads is that item's slot, whatever name
-        // another result column carries
-        let mut refs = Vec::new();
-        let order = stmt.order_by.iter().map(|o| &o.expression);
-        let defs = stmt.window_defs.iter().flat_map(|w| w.expressions());
-        for expr in stmt.columns.iter().chain(order).chain(defs) {
-            column_refs(expr, &mut refs);
-        }
-        for column in refs {
-            if let Some(at) = Self::group_item_index(column, &items) {
-                slots.insert(ExprKey::of(column), at);
-            }
-        }
+        Self::bind_group_columns(stmt, &items, &mut slots);
         if stmt.group_by.modifier != GroupByModifier::None {
             let mut calls = Vec::new();
             let order = stmt.order_by.iter().map(|o| &o.expression);

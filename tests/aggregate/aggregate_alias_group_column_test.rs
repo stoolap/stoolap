@@ -13,10 +13,12 @@
 // limitations under the License.
 
 //! A grouped column the SELECT list, a window function or its OVER clause
-//! names is that column, though an aggregate's alias has the same name
+//! names is that column, though a SELECT alias has the same name
 
 use stoolap::Database;
 
+/// t's two groups by b sum a alike, so an aggregate read in place of b
+/// merges them where b would keep them apart
 fn open(name: &str) -> Database {
     let db = Database::open(&format!("memory://aggregate_alias_group_column_{name}")).unwrap();
     db.execute(
@@ -25,7 +27,7 @@ fn open(name: &str) -> Database {
     )
     .unwrap();
     db.execute(
-        "INSERT INTO t VALUES (1, 1, 10), (2, 2, 10), (3, 4, 20)",
+        "INSERT INTO t VALUES (1, 1, 10), (2, 2, 10), (3, 3, 20)",
         (),
     )
     .unwrap();
@@ -49,66 +51,79 @@ fn rows(db: &Database, sql: &str, prepared: bool) -> Vec<Vec<Option<i64>>> {
         .collect()
 }
 
+fn row(values: &[i64]) -> Vec<Option<i64>> {
+    values.iter().map(|&v| Some(v)).collect()
+}
+
 #[test]
-fn a_grouped_column_named_like_an_aggregate_alias_reads_the_column() {
+fn a_grouped_column_named_like_a_select_alias_reads_the_column() {
     let db = open("reads");
-    let s = |v: [i64; 2]| vec![Some(v[0]), Some(v[1])];
-    let s3 = |v: [Option<i64>; 3]| v.to_vec();
+    let by_b = vec![row(&[3, 10]), row(&[3, 20])];
+    let plus_one = vec![row(&[3, 11]), row(&[3, 21])];
     for (sql, want) in [
+        ("SELECT SUM(a) AS b, b FROM t GROUP BY b ORDER BY 2", by_b.clone()),
+        ("SELECT SUM(a) AS b, t.b FROM t GROUP BY b ORDER BY 2", by_b.clone()),
+        ("SELECT SUM(a) AS b, b FROM t GROUP BY t.b ORDER BY 2", by_b.clone()),
+        ("SELECT SUM(a) AS b, b AS gb FROM t GROUP BY t.b ORDER BY 2", by_b.clone()),
+        ("SELECT SUM(a) AS b, b + 1 FROM t GROUP BY t.b ORDER BY 2", plus_one.clone()),
+        ("SELECT SUM(a) AS b, t.b + 1 FROM t GROUP BY b ORDER BY 2", plus_one.clone()),
         (
-            "SELECT SUM(a) AS b, b FROM t GROUP BY b ORDER BY 2",
-            vec![s([3, 10]), s([4, 20])],
+            "SELECT SUM(a) AS b, CASE WHEN b > 15 THEN 1 ELSE 0 END FROM t GROUP BY t.b ORDER BY 2",
+            vec![row(&[3, 0]), row(&[3, 1])],
         ),
         (
-            "SELECT SUM(a) AS b, t.b FROM t GROUP BY b ORDER BY 2",
-            vec![s([3, 10]), s([4, 20])],
-        ),
-        (
-            "SELECT SUM(a) AS b, b FROM t GROUP BY t.b ORDER BY 2",
-            vec![s([3, 10]), s([4, 20])],
+            "SELECT a + 1 AS b, b, COUNT(*) FROM t GROUP BY a + 1, t.b ORDER BY 1",
+            vec![row(&[2, 10, 1]), row(&[3, 10, 1]), row(&[4, 20, 1])],
         ),
         (
             "SELECT SUM(a) AS b, b, (SELECT 1) FROM t GROUP BY b ORDER BY 2",
-            vec![
-                s3([Some(3), Some(10), Some(1)]),
-                s3([Some(4), Some(20), Some(1)]),
-            ],
+            vec![row(&[3, 10, 1]), row(&[3, 20, 1])],
         ),
         (
-            "SELECT SUM(a) AS b, SUM(b) OVER () FROM t GROUP BY b ORDER BY 1",
-            vec![s([3, 30]), s([4, 30])],
+            "SELECT SUM(a) AS b, SUM(b) OVER () FROM t GROUP BY b ORDER BY 2",
+            vec![row(&[3, 30]), row(&[3, 30])],
         ),
         (
             "SELECT SUM(a) AS b, b, ROW_NUMBER() OVER (ORDER BY b DESC) FROM t GROUP BY b ORDER BY 2",
-            vec![
-                s3([Some(3), Some(10), Some(2)]),
-                s3([Some(4), Some(20), Some(1)]),
-            ],
+            vec![row(&[3, 10, 2]), row(&[3, 20, 1])],
         ),
         (
-            "SELECT SUM(a) AS b, t.b, SUM(b) OVER (PARTITION BY b) FROM t GROUP BY b ORDER BY 2",
-            vec![
-                s3([Some(3), Some(10), Some(10)]),
-                s3([Some(4), Some(20), Some(20)]),
-            ],
+            "SELECT SUM(a) AS b, SUM(b) OVER (PARTITION BY b) FROM t GROUP BY b ORDER BY 2",
+            by_b.clone(),
+        ),
+        (
+            "SELECT SUM(a) AS b, ROW_NUMBER() OVER (PARTITION BY b ORDER BY b) FROM t GROUP BY b ORDER BY 2",
+            vec![row(&[3, 1]), row(&[3, 1])],
         ),
         (
             "SELECT SUM(a) AS b, b AS gb, LAG(b) OVER (ORDER BY b) FROM t GROUP BY b ORDER BY 2",
-            vec![
-                s3([Some(3), Some(10), None]),
-                s3([Some(4), Some(20), Some(10)]),
-            ],
+            vec![vec![Some(3), Some(10), None], row(&[3, 20, 10])],
         ),
         (
             "SELECT SUM(a) AS b FROM t GROUP BY b HAVING b > 15",
-            vec![vec![Some(4)]],
-        ),
-        (
-            "SELECT SUM(a) AS b, b + 1 FROM t GROUP BY b ORDER BY 2",
-            vec![s([3, 11]), s([4, 21])],
+            vec![row(&[3])],
         ),
     ] {
         assert_eq!(rows(&db, sql, false), want, "{sql}");
         assert_eq!(rows(&db, sql, true), want, "prepared: {sql}");
     }
+}
+
+#[test]
+fn a_grouped_column_named_like_a_window_result_reads_the_column() {
+    let db = open("window_name");
+    db.execute(
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, __wf_0_0 INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO w VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    let sql = "SELECT ROW_NUMBER() OVER (ORDER BY w.__wf_0_0) + 1 FROM w GROUP BY w.__wf_0_0 ORDER BY __wf_0_0";
+    assert_eq!(rows(&db, sql, false), vec![row(&[2]), row(&[3])], "{sql}");
+    assert_eq!(
+        rows(&db, sql, true),
+        vec![row(&[2]), row(&[3])],
+        "prepared: {sql}"
+    );
 }

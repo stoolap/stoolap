@@ -86,6 +86,10 @@ struct RowPrograms<'a> {
     blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
+/// The prefix of the name a window function's result column carries inside
+/// the executor: unwritable, so no column a statement names shares it
+const WINDOW_COLUMN: &str = "\u{0}wf#";
+
 /// The base column a column reference `expr` reads: the slot of the GROUP
 /// BY item it reads when the rows are groups, else the column of its name
 fn base_column(
@@ -729,8 +733,7 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, qualified_index, qualified_key_index,
-    split_qualified,
+    get_table_alias_from_expr, item_name, qualified, qualified_index, split_qualified,
 };
 use super::volatility::{expression_volatility, read_once, window_count_argument, FRAME_OFFSET};
 use super::Executor;
@@ -2388,7 +2391,7 @@ impl Executor {
                                 let name = if wf_idx < window_functions.len() {
                                     window_functions[wf_idx].column_name.to_lowercase()
                                 } else {
-                                    format!("__wf_{}", wf_idx)
+                                    format!("{WINDOW_COLUMN}{wf_idx}")
                                 };
                                 wf_names.push(name);
                                 wf_idx += 1;
@@ -2513,7 +2516,7 @@ impl Executor {
                             let name = if wf_idx < window_functions.len() {
                                 window_functions[wf_idx].column_name.to_lowercase()
                             } else {
-                                format!("__wf_{}", wf_idx)
+                                format!("{WINDOW_COLUMN}{wf_idx}")
                             };
                             wf_names.push(name);
                             wf_idx += 1;
@@ -2547,7 +2550,7 @@ impl Executor {
                             let name = if wf_idx < window_functions.len() {
                                 window_functions[wf_idx].column_name.to_lowercase()
                             } else {
-                                format!("__wf_{}", wf_idx)
+                                format!("{WINDOW_COLUMN}{wf_idx}")
                             };
                             wf_names.push(name);
                             wf_idx += 1;
@@ -2595,7 +2598,7 @@ impl Executor {
                     // Two unaliased windows of the same function would share a
                     // name; the internal one is unique, the output keeps the
                     // function's own
-                    wf_info.column_name = format!("__wf_{}_0", col_idx);
+                    wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_0");
                     window_functions.push(wf_info);
                     col_idx += 1;
                 }
@@ -2608,7 +2611,7 @@ impl Executor {
                         )?;
                         // The alias is only the output name; the internal name
                         // cannot collide with an alias or another window
-                        wf_info.column_name = format!("__wf_{}_0", col_idx);
+                        wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_0");
                         window_functions.push(wf_info);
                     } else {
                         // Collect ALL window functions in the expression
@@ -2623,7 +2626,7 @@ impl Executor {
                                 &stmt.window_defs,
                                 read,
                             )?;
-                            wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
+                            wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_{i}");
                             window_functions.push(wf_info);
                         }
                     }
@@ -2638,7 +2641,7 @@ impl Executor {
                             &stmt.window_defs,
                             read,
                         )?;
-                        wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
+                        wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_{i}");
                         window_functions.push(wf_info);
                     }
                     col_idx += 1;
@@ -2756,9 +2759,10 @@ impl Executor {
 
         match expr {
             Expression::Window(_) => {
+                let unknown = format!("{WINDOW_COLUMN}unknown");
                 let name = wf_names
                     .get(*counter)
-                    .map_or("__wf_unknown", |s| s.as_str());
+                    .map_or(unknown.as_str(), |s| s.as_str());
                 *counter += 1;
                 let dummy_token = Token::new(TokenType::Identifier, name, Position::new(0, 0, 0));
                 Expression::Identifier(Identifier::new(dummy_token, name.to_string()))
@@ -2980,9 +2984,9 @@ impl Executor {
         let partition_indices: Option<SmallVec<[usize; 4]>> =
             match wf_info.partition_by.len() == wf_info.partition_by_exprs.len() {
                 true => wf_info
-                    .partition_by
+                    .partition_by_exprs
                     .iter()
-                    .map(|part_col| qualified_key_index(col_index_map, &part_col.to_lowercase()))
+                    .map(|expr| base_column(expr, col_index_map, group_slots))
                     .collect(),
                 false => None,
             };
