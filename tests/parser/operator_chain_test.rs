@@ -224,6 +224,48 @@ fn setup_rows(db: &Database) {
 }
 
 #[test]
+fn a_chain_cut_short_by_a_syntax_error_fails_with_it() {
+    on_small_stack(|| {
+        let db = Database::open("memory://operator_chain_syntax_error").unwrap();
+        setup(&db);
+        let terms = 10 * TERMS;
+        let long = |operator: &str| chain(terms, operator, |i| format!("a = {i}"));
+        let mut wrong = Vec::new();
+        for (name, sql) in [
+            (
+                "and, then )",
+                format!("SELECT a FROM t WHERE {} AND )", long("AND")),
+            ),
+            (
+                "or, then (",
+                format!("SELECT a FROM t WHERE {} OR (", long("OR")),
+            ),
+            (
+                "or at the end",
+                format!("SELECT a FROM t WHERE {} OR", long("OR")),
+            ),
+            (
+                "concatenation, then )",
+                format!("SELECT {} || )", chain(terms, "||", |_| "'a'".to_string())),
+            ),
+            (
+                "concatenation, then ALL without (",
+                format!(
+                    "SELECT {} || ALL 1",
+                    chain(terms, "||", |_| "'a'".to_string())
+                ),
+            ),
+        ] {
+            match first_column(&db, &sql) {
+                Err(e) if e.contains("parse error") || e.contains("expected") => {}
+                other => wrong.push(format!("{name}: {other:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    });
+}
+
+#[test]
 fn other_chains_nest_one_level_per_operator() {
     on_small_stack(|| {
         let db = Database::open("memory://operator_chain_nesting").unwrap();

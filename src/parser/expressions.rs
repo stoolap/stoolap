@@ -43,25 +43,14 @@ fn balanced_height(heights: &[usize]) -> usize {
     }
 }
 
-/// The left-deep chain of `operands` operands at `top` rebuilt balanced, in
-/// the order written; a chain of three or fewer is left as it is
-fn balance_chain(top: Expression, operands: usize) -> Expression {
-    if operands <= 3 {
-        return top;
-    }
-    let mut rights = Vec::with_capacity(operands - 1);
-    let mut node = top;
-    let head = loop {
-        match node {
-            Expression::Infix(infix) if rights.len() + 1 < operands => {
-                rights.push((infix.token, infix.operator, *infix.right));
-                node = *infix.left;
-            }
-            other => break other,
-        }
-    };
-    InfixExpression::balanced_chain(head, rights.into_iter().rev())
-}
+/// A run of one balanced operator: the operator, the levels below each
+/// operand, and each operand after the first with the operator before it.
+/// Kept flat until the run ends, so an error inside it drops no deep tree
+type Run = (
+    InfixOperator,
+    SmallVec<[usize; 4]>,
+    SmallVec<[(Token, SmartString, Expression); 2]>,
+);
 
 impl Parser<'_> {
     /// Parse an expression with the given precedence, refusing one nested
@@ -94,36 +83,60 @@ impl Parser<'_> {
         // Levels below `left`'s root, and the balanced operator being chained
         // with the levels below each of its operands
         let mut height = self.expression_peak - depth;
-        let mut run: Option<(InfixOperator, SmallVec<[usize; 4]>)> = None;
+        let mut run: Option<Run> = None;
 
         while !self.peek_token_is(TokenType::Eof) && precedence < self.peek_precedence() {
             if !self.is_infix_token() {
                 break;
             }
-            let chained = self.peek_balanced_operator();
-            if let Some((_, heights)) = run.take_if(|(op, _)| chained != Some(*op)) {
-                left = balance_chain(left, heights.len());
+            let mut chained = self.peek_balanced_operator();
+            if let Some((_, heights, rest)) = run.take_if(|(op, ..)| chained != Some(*op)) {
+                left = InfixExpression::balanced_chain(left, rest.into_iter());
                 height = balanced_height(&heights);
             }
             let wraps = !self.peek_token_is_punctuator(".") && !self.peek_token_is_punctuator("(");
 
             self.next_token();
             self.expression_peak = depth;
-            left = self.parse_infix_expression(left)?;
+            let mut operand = None;
+            if chained.is_some() {
+                let token = self.cur_token.clone();
+                let operator = self.cur_token.literal.clone();
+                let precedence = self.cur_precedence();
+                self.next_token();
+                if token.token_type == TokenType::Operator && self.cur_token_is_all_any() {
+                    if let Some((_, heights, rest)) = run.take() {
+                        left = InfixExpression::balanced_chain(left, rest.into_iter());
+                        height = balanced_height(&heights);
+                    }
+                    chained = None;
+                    left = self.parse_all_any_expression(left, token, operator)?;
+                } else {
+                    operand = Some((token, operator, self.parse_expression(precedence)?));
+                }
+            } else {
+                left = self.parse_infix_expression(left)?;
+            }
             // The operands parsed in this step, one level below `depth`
             let reached = self.expression_peak - depth;
 
-            match (chained, &mut run) {
-                (Some(_), Some((_, heights))) => heights.push(reached.saturating_sub(1)),
-                (Some(op), None) => run = Some((op, smallvec![height, reached.saturating_sub(1)])),
-                (None, _) => height = (height + usize::from(wraps)).max(reached),
+            match (chained, &mut run, operand) {
+                (Some(_), Some((_, heights, rest)), Some(operand)) => {
+                    heights.push(reached.saturating_sub(1));
+                    rest.push(operand);
+                }
+                (Some(op), None, Some(operand)) => {
+                    let heights = smallvec![height, reached.saturating_sub(1)];
+                    run = Some((op, heights, smallvec![operand]));
+                }
+                _ => height = (height + usize::from(wraps)).max(reached),
             }
             if run.is_none() && self.past_limit(depth + height) {
                 return None;
             }
         }
-        if let Some((_, heights)) = run {
-            left = balance_chain(left, heights.len());
+        if let Some((_, heights, rest)) = run {
+            left = InfixExpression::balanced_chain(left, rest.into_iter());
             height = balanced_height(&heights);
         }
         if self.past_limit(depth + height) {
@@ -559,11 +572,7 @@ impl Parser<'_> {
 
         self.next_token();
 
-        // Check for ALL/ANY/SOME subquery comparison
-        if self.cur_token_is_keyword(Keyword::All)
-            || self.cur_token_is_keyword(Keyword::Any)
-            || self.cur_token_is_keyword(Keyword::Some)
-        {
+        if self.cur_token_is_all_any() {
             return self.parse_all_any_expression(left, token, operator);
         }
 
@@ -575,6 +584,13 @@ impl Parser<'_> {
             operator,
             Box::new(right),
         )))
+    }
+
+    /// Whether the current token starts an ALL/ANY/SOME subquery comparison
+    fn cur_token_is_all_any(&self) -> bool {
+        self.cur_token_is_keyword(Keyword::All)
+            || self.cur_token_is_keyword(Keyword::Any)
+            || self.cur_token_is_keyword(Keyword::Some)
     }
 
     /// Parse ALL/ANY/SOME subquery comparison (e.g., x > ALL (SELECT ...))
