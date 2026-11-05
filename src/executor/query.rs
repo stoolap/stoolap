@@ -495,7 +495,7 @@ use super::window::WindowOutput;
 use super::Executor;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
-use crate::planner::join::IndexProbe;
+use crate::planner::join::{IndexProbe, LimitHash};
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
 /// The layout an ORDER BY or DISTINCT ON projection produces
@@ -5118,7 +5118,7 @@ impl Executor {
             // Eligibility:
             // - LIMIT ≤ 100 (small limit benefits from early termination)
             // - INNER JOIN (simpler, no NULL padding needed)
-            // - Has equality keys (hash join applicable)
+            // - Has equality keys, or no condition at all (every pair joins)
             // - No ORDER BY, GROUP BY, aggregation (would negate early termination)
             // - No window function, which only the standard path evaluates
             // - No DISTINCT, which reads every joined row before the LIMIT
@@ -5127,7 +5127,7 @@ impl Executor {
             // OFFSET rows are skipped after collection, so the early-termination
             // budget is LIMIT + OFFSET, for a LIMIT of at most 100
             let streaming = match join_plan.limit_hash {
-                true => row_counts(stmt, ctx).ok().and_then(|counts| {
+                Some(pairs) => row_counts(stmt, ctx).ok().and_then(|counts| {
                     let limit = counts.limit.filter(|limit| *limit <= 100)?;
                     let build_left = self.limit_hash_builds_left(
                         [&join_source.left, &join_source.right],
@@ -5135,27 +5135,34 @@ impl Executor {
                     );
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::limit_hash_built(build_left);
-                    Some((limit.saturating_add(counts.offset) as u64, build_left))
+                    Some((limit.saturating_add(counts.offset), build_left, pairs))
                 }),
-                false => None,
+                None => None,
             };
 
             // Use streaming path if eligible; sides it ran but could not join
             // by hash go on to the standard path
             let streamed = 'streaming: {
-                let Some((limit, build_left)) = streaming else {
+                let Some((limit, build_left, pairs)) = streaming else {
                     break 'streaming None;
                 };
+                // Every pair joining, the build side reads no more than the limit
+                let build_limit = (pairs == LimitHash::EveryPair).then_some(limit);
+                let (left_limit, right_limit) = match build_left {
+                    true => (build_limit, None),
+                    false => (None, build_limit),
+                };
+                let limit = limit as u64;
                 // Execute both sides
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::join_side_ran();
-                let (left_result, left_cols, _, _) =
-                    self.read_join_side(&join_source.left, ctx, left_read, None, None, 0)?;
+                let (left_result, left_cols, left_bounded, _) =
+                    self.read_join_side(&join_source.left, ctx, left_read, None, left_limit, 0)?;
 
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::join_side_ran();
-                let (right_result, right_cols, _, _) =
-                    self.read_join_side(&join_source.right, ctx, right_read, None, None, 0)?;
+                let (right_result, right_cols, right_bounded, _) =
+                    self.read_join_side(&join_source.right, ctx, right_read, None, right_limit, 0)?;
 
                 // Extract join keys BEFORE moving columns (uses original left/right positions)
                 let (left_key_indices, right_key_indices, _) = if let Some(cond) = on_condition {
@@ -5168,15 +5175,23 @@ impl Executor {
                 let mut all_cols = left_cols.clone();
                 all_cols.extend(right_cols.iter().cloned());
 
-                // Materialize the smaller side as build, stream the larger as probe
+                // Materialize the smaller side as build, stream the larger as
+                // probe; a build side whose read did not take the limit is cut
+                // as it is collected
+                let build = |result, bounded: bool| match build_limit {
+                    Some(cap) if !bounded => Self::first_rows(result, cap),
+                    _ => Self::materialize_result_arc(result),
+                };
                 let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
                     if build_left {
-                        let build = Self::materialize_result_arc(left_result)?;
+                        let build = build(left_result, left_bounded)?;
                         (build, left_cols, right_result, right_cols, true)
                     } else {
-                        let build = Self::materialize_result_arc(right_result)?;
+                        let build = build(right_result, right_bounded)?;
                         (build, right_cols, left_result, left_cols, false)
                     };
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::limit_hash_build_read(build_rows.len());
 
                 // Map key indices based on which side is build
                 let (build_key_indices, probe_key_indices) = if build_is_left {
@@ -7239,6 +7254,24 @@ impl Executor {
             }
         }
         join_op.close()
+    }
+
+    /// The first `cap` rows of `result`, shared as they are when it holds no
+    /// more; an error in the rows read is the result's
+    fn first_rows(mut result: Box<dyn QueryResult>, cap: usize) -> Result<CompactArc<Vec<Row>>> {
+        if result.exact_len().is_some_and(|len| len <= cap) {
+            if let Some(rows) = result.try_into_arc_rows() {
+                return Ok(rows);
+            }
+        }
+        let mut rows = Vec::new();
+        while rows.len() < cap && result.next() {
+            rows.push(result.take_row());
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
+        Ok(CompactArc::new(rows))
     }
 
     /// Materialize a result into an CompactArc<Vec<Row>> for zero-copy sharing with joins

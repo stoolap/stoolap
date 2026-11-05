@@ -32,9 +32,19 @@ pub(crate) struct JoinPlan {
     /// The probe each side offers as the inner side of an index join, the
     /// right side's first
     pub probes: [Option<IndexProbe>; 2],
-    /// Whether a small LIMIT streams the join through a hash table, built
-    /// on the side a run's statistics estimate smaller
-    pub limit_hash: bool,
+    /// How a small LIMIT streams the join through a hash table, built on
+    /// the side a run's statistics estimate smaller
+    pub limit_hash: Option<LimitHash>,
+}
+
+/// The pairs a small LIMIT's hash join finds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitHash {
+    /// Those its condition's equality keys match
+    Keyed,
+    /// Every pair, the join having no condition: the first probe row pairs
+    /// with each build row, so the build side reads no more than the limit
+    EveryPair,
 }
 
 /// The inner side of an index join: its table, how a key finds its rows,

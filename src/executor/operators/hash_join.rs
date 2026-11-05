@@ -793,13 +793,16 @@ impl Operator for HashJoinOperator<'_> {
                         self.build_matched[build_idx] = true;
                     }
 
-                    // Get probe row: take ownership if last match, clone if more matches pending
+                    // Get probe row: take ownership if last match; with more
+                    // matches pending its values are shared once, so each
+                    // pair's copy is a count, not a copy of the values
                     let probe_row = if self.current_match_idx >= self.current_matches.len() {
                         // No more matches - take ownership (zero-copy)
                         self.current_probe_row.take().unwrap()
                     } else {
-                        // More potential matches - clone probe row (rare 1:N case)
-                        self.current_probe_row.as_ref().unwrap().clone()
+                        let shared = self.current_probe_row.take().unwrap().into_shared();
+                        self.current_probe_row = Some(shared.clone());
+                        shared
                     };
                     return Ok(Some(self.combine_rows_direct(probe_row, build_idx)));
                 }
