@@ -132,7 +132,7 @@ fn test_date_trunc_month() {
 /// Test TIME_TRUNC function with 1-hour interval
 #[test]
 fn test_time_trunc_hour() {
-    let db = Database::open("memory://time_trunc_hour").expect("Failed to create database");
+    let db = Database::open("memory://time_trunc_test_hour").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE time_test (
@@ -247,7 +247,7 @@ fn test_time_trunc_15_minutes() {
 /// Test TIME_TRUNC with GROUP BY
 #[test]
 fn test_time_trunc_group_by() {
-    let db = Database::open("memory://time_trunc_group").expect("Failed to create database");
+    let db = Database::open("memory://time_trunc_test_group").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE sales (

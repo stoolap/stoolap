@@ -151,7 +151,8 @@ fn test_max_on_integer_column() {
 
 #[test]
 fn test_count_star_optimization() {
-    let db = Database::open("memory://count_star").expect("Failed to create database");
+    let db =
+        Database::open("memory://index_optimizer_count_star").expect("Failed to create database");
     setup_indexed_table(&db);
 
     let count: i64 = db
@@ -180,7 +181,8 @@ fn test_count_star_with_alias() {
 
 #[test]
 fn test_keyset_pagination_basic() {
-    let db = Database::open("memory://keyset_basic").expect("Failed to create database");
+    let db =
+        Database::open("memory://index_optimizer_keyset_basic").expect("Failed to create database");
     setup_indexed_table(&db);
 
     // Get products with id > 5, ordered by id, limit 3

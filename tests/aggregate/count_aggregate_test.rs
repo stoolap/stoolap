@@ -93,7 +93,7 @@ fn test_count_with_complex_where() {
 /// Test COUNT with column
 #[test]
 fn test_count_column() {
-    let db = Database::open("memory://count_column").expect("Failed to create database");
+    let db = Database::open("memory://count_aggregate_column").expect("Failed to create database");
     setup_count_test_table(&db);
 
     let count: i64 = db

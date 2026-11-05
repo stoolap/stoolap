@@ -227,7 +227,7 @@ fn test_show_unique_index() {
 /// Test unique index enforcement during UPDATE
 #[test]
 fn test_unique_index_update() {
-    let db = Database::open("memory://unique_update").expect("Failed to create database");
+    let db = Database::open("memory://unique_index_update").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE employees (id INTEGER PRIMARY KEY, employee_id TEXT, name TEXT)",

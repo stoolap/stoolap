@@ -141,7 +141,7 @@ fn test_scalar_subquery_less_than_min() {
 /// Test scalar subquery returning NULL (no rows)
 #[test]
 fn test_scalar_subquery_null_result() {
-    let db = Database::open("memory://scalar_null").expect("Failed to create database");
+    let db = Database::open("memory://scalar_subquery_null").expect("Failed to create database");
     setup_products_table(&db);
 
     // Subquery returns no rows (NULL), so comparison should return no results

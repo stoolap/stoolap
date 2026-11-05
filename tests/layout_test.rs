@@ -61,6 +61,59 @@ fn every_file_in_a_group_is_a_module_of_its_main() {
     );
 }
 
+/// The literal `memory://` names and registered function names a file uses
+fn shared_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (start, _) in text.match_indices("\"memory://") {
+        let rest = &text[start + 1..];
+        let name = &rest[..rest.find('"').unwrap()];
+        if !name.contains('{') {
+            names.push(name.to_string());
+        }
+    }
+    for (start, _) in text.match_indices("fn name(&self)") {
+        let rest = &text[start..];
+        let open = rest.find('"').unwrap() + 1;
+        let close = open + rest[open..].find('"').unwrap();
+        names.push(format!("function {}", rest[open..close].to_uppercase()));
+    }
+    names
+}
+
+#[test]
+fn no_two_files_of_a_group_share_a_database_or_function_name() {
+    let mut shared = Vec::new();
+    for group in fs::read_dir(tests_dir()).unwrap() {
+        let dir = group.unwrap().path();
+        if !dir.join("main.rs").is_file() {
+            continue;
+        }
+        let mut owner = std::collections::HashMap::new();
+        for file in fs::read_dir(&dir).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            for name in shared_names(&fs::read_to_string(&path).unwrap()) {
+                let first = owner.entry(name.clone()).or_insert_with(|| path.clone());
+                if *first != path {
+                    shared.push(format!(
+                        "{name}: {} and {}",
+                        first.display(),
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    shared.sort();
+    shared.dedup();
+    assert!(
+        shared.is_empty(),
+        "tests of one group run in one process under cargo test, rename one side: {shared:#?}"
+    );
+}
+
 #[test]
 fn a_top_level_test_file_is_one_that_needs_a_binary_of_its_own() {
     let mut extra = Vec::new();

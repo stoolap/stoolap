@@ -21,7 +21,7 @@ use stoolap::Database;
 /// Test UPDATE with arithmetic expressions
 #[test]
 fn test_update_arithmetic_verification() {
-    let db = Database::open("memory://update_arith").expect("Failed to create database");
+    let db = Database::open("memory://update_arithmetic_basic").expect("Failed to create database");
 
     // Create and populate test table
     db.execute(

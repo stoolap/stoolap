@@ -21,7 +21,7 @@ use stoolap::Database;
 /// Test simple query without CAST to verify table is working
 #[test]
 fn test_simple_query() {
-    let db = Database::open("memory://cast_simple").expect("Failed to create database");
+    let db = Database::open("memory://cast_test_simple").expect("Failed to create database");
 
     db.execute("CREATE TABLE test_cast_simple (id INTEGER, val TEXT)", ())
         .expect("Failed to create table");
@@ -51,7 +51,7 @@ fn test_simple_query() {
 /// Test CAST with literal value
 #[test]
 fn test_cast_literal() {
-    let db = Database::open("memory://cast_literal").expect("Failed to create database");
+    let db = Database::open("memory://cast_test_literal").expect("Failed to create database");
 
     db.execute("CREATE TABLE test_cast_simple (id INTEGER)", ())
         .expect("Failed to create table");
@@ -69,7 +69,7 @@ fn test_cast_literal() {
 /// Test CAST with column reference
 #[test]
 fn test_cast_column() {
-    let db = Database::open("memory://cast_column").expect("Failed to create database");
+    let db = Database::open("memory://cast_test_column").expect("Failed to create database");
 
     db.execute("CREATE TABLE test_cast_simple (id INTEGER, val TEXT)", ())
         .expect("Failed to create table");
@@ -168,7 +168,7 @@ fn test_cast_float_to_text() {
 /// Test CAST in WHERE clause
 #[test]
 fn test_cast_in_where() {
-    let db = Database::open("memory://cast_where").expect("Failed to create database");
+    let db = Database::open("memory://cast_test_where").expect("Failed to create database");
 
     db.execute("CREATE TABLE strings (id INTEGER, value TEXT)", ())
         .expect("Failed to create table");

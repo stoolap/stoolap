@@ -129,7 +129,7 @@ fn test_cte_with_column_names() {
 
 #[test]
 fn test_multiple_ctes() {
-    let db = Database::open("memory://multi_cte").expect("Failed");
+    let db = Database::open("memory://cte_coverage_multi").expect("Failed");
     db.execute(
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, product_id INTEGER, amount FLOAT)",
         (),
@@ -301,7 +301,7 @@ fn test_cte_with_having() {
 
 #[test]
 fn test_cte_with_join() {
-    let db = Database::open("memory://cte_join").expect("Failed");
+    let db = Database::open("memory://cte_coverage_join").expect("Failed");
     db.execute(
         "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)",
         (),
@@ -530,7 +530,7 @@ fn test_cte_in_subquery() {
 
 #[test]
 fn test_cte_with_exists() {
-    let db = Database::open("memory://cte_exists").expect("Failed");
+    let db = Database::open("memory://cte_coverage_exists").expect("Failed");
     db.execute(
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)",
         (),
@@ -614,7 +614,7 @@ fn test_cte_with_order_by() {
 
 #[test]
 fn test_cte_with_limit_in_definition() {
-    let db = Database::open("memory://cte_limit").expect("Failed");
+    let db = Database::open("memory://cte_coverage_limit").expect("Failed");
     db.execute(
         "CREATE TABLE data (id INTEGER PRIMARY KEY, val INTEGER)",
         (),
@@ -690,7 +690,7 @@ fn test_cte_with_distinct() {
 
 #[test]
 fn test_cte_empty_result() {
-    let db = Database::open("memory://cte_empty").expect("Failed");
+    let db = Database::open("memory://cte_coverage_empty").expect("Failed");
     db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Failed");
 
@@ -782,7 +782,7 @@ fn test_cte_with_nulls() {
 
 #[test]
 fn test_cte_with_union() {
-    let db = Database::open("memory://cte_union").expect("Failed");
+    let db = Database::open("memory://cte_coverage_union").expect("Failed");
     db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .expect("Failed");
     db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER)", ())

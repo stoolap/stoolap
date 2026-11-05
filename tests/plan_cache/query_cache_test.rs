@@ -20,7 +20,7 @@ use stoolap::Database;
 #[test]
 fn test_query_cache_basic() {
     // Create a memory database for testing
-    let db = Database::open("memory://").expect("Failed to create database");
+    let db = Database::open("memory://query_cache_basic").expect("Failed to create database");
 
     // Create a test table with sample data
     db.execute(
@@ -83,7 +83,8 @@ fn test_query_cache_basic() {
 /// Test that cache handles multiple tables correctly
 #[test]
 fn test_query_cache_multiple_tables() {
-    let db = Database::open("memory://").expect("Failed to create database");
+    let db =
+        Database::open("memory://query_cache_multiple_tables").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE table_a (id INTEGER PRIMARY KEY, name TEXT)",
@@ -118,7 +119,8 @@ fn test_query_cache_multiple_tables() {
 /// Test cache with different WHERE clauses
 #[test]
 fn test_query_cache_where_clauses() {
-    let db = Database::open("memory://").expect("Failed to create database");
+    let db =
+        Database::open("memory://query_cache_where_clauses").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)",
@@ -153,7 +155,8 @@ fn test_query_cache_where_clauses() {
 /// Test cache with aggregation queries
 #[test]
 fn test_query_cache_aggregations() {
-    let db = Database::open("memory://").expect("Failed to create database");
+    let db =
+        Database::open("memory://query_cache_aggregations").expect("Failed to create database");
 
     db.execute(
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, amount FLOAT, category TEXT)",
@@ -182,7 +185,7 @@ fn test_query_cache_aggregations() {
 /// Test cache with INSERT (simplified - UPDATE/DELETE have known issues)
 #[test]
 fn test_query_cache_with_dml() {
-    let db = Database::open("memory://").expect("Failed to create database");
+    let db = Database::open("memory://query_cache_with_dml").expect("Failed to create database");
 
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", ())
         .expect("Failed to create table");
@@ -203,7 +206,8 @@ fn test_query_cache_with_dml() {
 /// Test whitespace normalization in cache
 #[test]
 fn test_query_cache_whitespace_normalization() {
-    let db = Database::open("memory://").expect("Failed to create database");
+    let db = Database::open("memory://query_cache_whitespace_normalization")
+        .expect("Failed to create database");
 
     db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", ())
         .unwrap();
