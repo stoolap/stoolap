@@ -86,6 +86,27 @@ struct RowPrograms<'a> {
     blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
+/// The base column a column reference `expr` reads: the slot of the GROUP
+/// BY item it reads when the rows are groups, else the column of its name
+fn base_column(
+    expr: &Expression,
+    col_index_map: &StringMap<usize>,
+    group_slots: &FxHashMap<ExprKey, usize>,
+) -> Option<usize> {
+    if let Some(&slot) = group_slots.get(&ExprKey::of(expr)) {
+        return Some(slot);
+    }
+    match expr {
+        Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
+        Expression::QualifiedIdentifier(qid) => qualified_index(
+            col_index_map,
+            &qid.qualifier.value_lower,
+            &qid.name.value_lower,
+        ),
+        _ => None,
+    }
+}
+
 /// `expr` over `columns` as [`RowPrograms`] compiles it
 fn row_program(
     expr: &Expression,
@@ -2337,9 +2358,11 @@ impl Executor {
                             source: SelectItemSource::WindowFunction(key),
                         });
                         wf_idx += 1;
-                    } else if let Expression::Identifier(id) = aliased.expression.as_ref() {
-                        // Aliased column reference - use pre-computed lowercase
-                        if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
+                    } else if let Expression::Identifier(_) = aliased.expression.as_ref() {
+                        // Aliased column reference
+                        if let Some(idx) =
+                            base_column(&aliased.expression, &col_index_map, group_slots)
+                        {
                             items.push(SelectItem {
                                 output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::BaseColumn(idx),
@@ -2408,8 +2431,8 @@ impl Executor {
                     source: SelectItemSource::BaseColumn(column.index as usize),
                 }),
                 Expression::Identifier(id) => {
-                    // Simple column reference - use pre-computed lowercase
-                    if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
+                    // Simple column reference
+                    if let Some(idx) = base_column(col_expr, &col_index_map, group_slots) {
                         items.push(SelectItem {
                             output_name: id.value.to_string(),
                             source: SelectItemSource::BaseColumn(idx),
@@ -2439,9 +2462,8 @@ impl Executor {
                         }
                     }
                 }
-                Expression::QualifiedIdentifier(qid) => {
-                    let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(idx) = qualified_index(&col_index_map, qualifier, name) {
+                Expression::QualifiedIdentifier(_) => {
+                    if let Some(idx) = base_column(col_expr, &col_index_map, group_slots) {
                         items.push(SelectItem {
                             output_name: item_name(col_expr),
                             source: SelectItemSource::BaseColumn(idx),
@@ -3769,12 +3791,9 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
     ) -> Option<usize> {
         match expr {
-            Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
-            Expression::QualifiedIdentifier(qid) => qualified_index(
-                col_index_map,
-                &qid.qualifier.value_lower,
-                &qid.name.value_lower,
-            ),
+            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                base_column(expr, col_index_map, group_slots)
+            }
             // A group item or aggregate computed before the window reads its slot,
             // and a derived table's aggregate column the name it carries
             _ => (!group_slots.is_empty())
@@ -3824,15 +3843,7 @@ impl Executor {
         // or names no column, which the compiled path reports
         let order_by_indices: Option<Vec<usize>> = order_by
             .iter()
-            .map(|ob| match &ob.expression {
-                Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
-                Expression::QualifiedIdentifier(qid) => qualified_index(
-                    col_index_map,
-                    &qid.qualifier.value_lower,
-                    &qid.name.value_lower,
-                ),
-                _ => None,
-            })
+            .map(|ob| base_column(&ob.expression, col_index_map, group_slots))
             .collect();
 
         // Pre-allocate columns with exact capacity

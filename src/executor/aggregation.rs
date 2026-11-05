@@ -509,6 +509,17 @@ fn grouping_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
     });
 }
 
+/// The column references `expr` writes outside its subqueries, at any depth
+fn column_refs<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
+    if let Expression::Identifier(_) | Expression::QualifiedIdentifier(_) = expr {
+        return out.push(expr);
+    }
+    let _ = super::prepared_select::for_each_child(expr, &mut |child| {
+        column_refs(child, out);
+        Ok(())
+    });
+}
+
 /// Represents a GROUP BY item - either a column reference or an expression
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -2052,6 +2063,17 @@ impl Executor {
 
         for col_expr in columns_to_use {
             final_columns.push(item_name(col_expr));
+            // A column a GROUP BY item reads is that item's slot, whatever
+            // name another result column carries
+            if let Some(slot) = match col_expr {
+                Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                    Self::group_item_index(col_expr, &group_by_columns)
+                }
+                _ => None,
+            } {
+                column_sources.push(ColumnSource::AggSlot(slot));
+                continue;
+            }
             match col_expr {
                 Expression::Identifier(id) => {
                     // A name no result column carries may be another alias of a shared slot
@@ -2263,11 +2285,14 @@ impl Executor {
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
     ) -> Option<usize> {
-        // The first item written as the argument is: its column, qualified
-        // alike, its alias, or its expression. Else the item whose column
-        // the argument names, qualified or not, as a column binds; several
-        // such items name one only when they all write the same column
-        let arg = func.arguments.first()?;
+        Self::group_item_index(func.arguments.first()?, group_by_columns)
+    }
+
+    /// The GROUP BY item `arg` reads: the first item written as it is, its
+    /// column qualified alike, its alias or its expression. Else the item
+    /// whose column it names, qualified or not, as a column binds; several
+    /// such items name one only when they all write the same column
+    fn group_item_index(arg: &Expression, group_by_columns: &[GroupByItem]) -> Option<usize> {
         let column = match arg {
             Expression::Identifier(id) => Some((None, id.value_lower.as_str())),
             Expression::QualifiedIdentifier(qid) => Some((
@@ -2391,6 +2416,19 @@ impl Executor {
         let (columns, rows, items) =
             self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
         let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
+        // A column a GROUP BY item reads is that item's slot, whatever name
+        // another result column carries
+        let mut refs = Vec::new();
+        let order = stmt.order_by.iter().map(|o| &o.expression);
+        let defs = stmt.window_defs.iter().flat_map(|w| w.expressions());
+        for expr in stmt.columns.iter().chain(order).chain(defs) {
+            column_refs(expr, &mut refs);
+        }
+        for column in refs {
+            if let Some(at) = Self::group_item_index(column, &items) {
+                slots.insert(ExprKey::of(column), at);
+            }
+        }
         if stmt.group_by.modifier != GroupByModifier::None {
             let mut calls = Vec::new();
             let order = stmt.order_by.iter().map(|o| &o.expression);
