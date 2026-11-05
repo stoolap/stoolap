@@ -40,7 +40,7 @@ use super::query::order_by_inputs;
 use super::result::ExecutorResult;
 use super::utils::{
     bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
-    qualified_index, qualified_key_index, shown_name, split_qualified,
+    qualified_index, qualified_key_index, shown_name, split_qualified, with_lowercase,
 };
 use super::window::{HeldWindow, WindowOutput};
 use super::Executor;
@@ -550,11 +550,7 @@ fn qualified_parts(name: &str) -> (Option<&str>, &str) {
 /// each one it spells and the first of each table it qualifies, over which
 /// it resolves as it does over all of `source`
 fn columns_named(source: &[String], names: &[(Option<&str>, &str)]) -> Vec<String> {
-    let same = |a: &str, b: &str| {
-        a.chars()
-            .flat_map(char::to_lowercase)
-            .eq(b.chars().flat_map(char::to_lowercase))
-    };
+    let same = |a: &str, b: &str| with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b)));
     let mut tables: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
     let mut kept = Vec::new();
     for column in source {
