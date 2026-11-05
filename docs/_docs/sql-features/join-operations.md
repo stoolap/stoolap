@@ -67,6 +67,8 @@ FROM products AS p
 CROSS JOIN colors AS c;
 ```
 
+A join with no condition (a `CROSS JOIN`, `FROM a, b`, or a `JOIN` without `ON`) under a `LIMIT` of at most 100, with no `ORDER BY`, grouping, aggregate, window function or `DISTINCT`, pairs the first rows of one side with the rows of the other as they come, and stops once it has its rows. It reads no more than `LIMIT` plus `OFFSET` rows of the side it pairs, so a row past those is never computed, and a value that would fail in that row raises no error. Without an `ORDER BY`, which pairs it answers is unspecified.
+
 ### NATURAL JOIN
 
 A NATURAL JOIN automatically matches on all columns with the same name in both tables. Common columns appear once in the result (not duplicated).

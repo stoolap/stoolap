@@ -5156,12 +5156,12 @@ impl Executor {
                 // Execute both sides
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::join_side_ran();
-                let (left_result, left_cols, _, _) =
+                let (left_result, left_cols, left_bounded, _) =
                     self.read_join_side(&join_source.left, ctx, left_read, None, left_limit, 0)?;
 
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::join_side_ran();
-                let (right_result, right_cols, _, _) =
+                let (right_result, right_cols, right_bounded, _) =
                     self.read_join_side(&join_source.right, ctx, right_read, None, right_limit, 0)?;
 
                 // Extract join keys BEFORE moving columns (uses original left/right positions)
@@ -5175,13 +5175,19 @@ impl Executor {
                 let mut all_cols = left_cols.clone();
                 all_cols.extend(right_cols.iter().cloned());
 
-                // Materialize the smaller side as build, stream the larger as probe
+                // Materialize the smaller side as build, stream the larger as
+                // probe; a build side whose read did not take the limit is cut
+                // as it is collected
+                let build = |result, bounded: bool| match build_limit {
+                    Some(cap) if !bounded => Self::first_rows(result, cap),
+                    _ => Self::materialize_result_arc(result),
+                };
                 let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
                     if build_left {
-                        let build = Self::materialize_result_arc(left_result)?;
+                        let build = build(left_result, left_bounded)?;
                         (build, left_cols, right_result, right_cols, true)
                     } else {
-                        let build = Self::materialize_result_arc(right_result)?;
+                        let build = build(right_result, right_bounded)?;
                         (build, right_cols, left_result, left_cols, false)
                     };
                 #[cfg(feature = "test-failpoints")]
@@ -7248,6 +7254,24 @@ impl Executor {
             }
         }
         join_op.close()
+    }
+
+    /// The first `cap` rows of `result`, shared as they are when it holds no
+    /// more; an error in the rows read is the result's
+    fn first_rows(mut result: Box<dyn QueryResult>, cap: usize) -> Result<CompactArc<Vec<Row>>> {
+        if result.exact_len().is_some_and(|len| len <= cap) {
+            if let Some(rows) = result.try_into_arc_rows() {
+                return Ok(rows);
+            }
+        }
+        let mut rows = Vec::new();
+        while rows.len() < cap && result.next() {
+            rows.push(result.take_row());
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
+        }
+        Ok(CompactArc::new(rows))
     }
 
     /// Materialize a result into an CompactArc<Vec<Row>> for zero-copy sharing with joins

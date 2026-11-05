@@ -32,6 +32,7 @@ fn open(name: &str) -> Database {
         "INSERT INTO bigger SELECT g.value, g.value FROM generate_series(1, 3000) g",
         "ANALYZE big",
         "ANALYZE bigger",
+        "CREATE VIEW vb AS SELECT id FROM bigger",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -149,33 +150,98 @@ fn a_join_with_no_condition_over_large_sides_answers_distinct_pairs_up_to_the_li
     }
 }
 
+#[test]
+fn a_join_with_no_condition_under_a_limit_computes_only_the_rows_it_pairs() {
+    let db = open("cross_join_limit_errors");
+    let failing_at = |id: i64| {
+        format!(
+            "SELECT a.id, b.q FROM (SELECT id FROM big) a CROSS JOIN \
+             (SELECT CASE WHEN id = {id} THEN ABS(-9223372036854775807 - 1) ELSE id END AS q \
+             FROM bigger) b LIMIT 5"
+        )
+    };
+    let sql = failing_at(1);
+    let err = db
+        .query(&sql, ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .err();
+    assert!(
+        err.is_some_and(|err| err.to_string().contains("overflow")),
+        "{sql}: a row the join pairs raises its error"
+    );
+    let sql = failing_at(2000);
+    assert_eq!(
+        pairs(&db, &sql).len(),
+        5,
+        "{sql}: a row past the pairs is never computed"
+    );
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_join_with_no_condition_under_a_limit_streams_and_builds_on_no_more_than_the_limit() {
     use stoolap::test_failpoints::{limit_hash_build_rows, streaming_joins_streamed};
     let db = open("cross_join_limit_streams");
-    for (sql, cap) in [
+    for (sql, cap, answered) in [
         (
             "SELECT big.id, bigger.id FROM big CROSS JOIN bigger LIMIT 100",
+            100,
             100,
         ),
         (
             "SELECT bigger.id, big.id FROM bigger CROSS JOIN big LIMIT 100",
             100,
+            100,
         ),
         (
             "SELECT big.id, bigger.id FROM big, bigger LIMIT 10 OFFSET 5",
             15,
+            10,
         ),
         (
             "SELECT big.id, bigger.id FROM big CROSS JOIN bigger WHERE big.a > 500 LIMIT 20",
             20,
+            20,
+        ),
+        // Build sides whose reads do not take the limit
+        (
+            "SELECT a.id, b.id FROM (SELECT id FROM big LIMIT 1000) a \
+             CROSS JOIN (SELECT id FROM bigger LIMIT 3000) b LIMIT 10",
+            10,
+            10,
+        ),
+        (
+            "SELECT a.id, b.id FROM (SELECT id FROM big) a \
+             CROSS JOIN (SELECT id FROM bigger) b LIMIT 10 OFFSET 3",
+            13,
+            10,
+        ),
+        (
+            "WITH c AS (SELECT id FROM bigger) SELECT c.id, d.id FROM c CROSS JOIN c d LIMIT 10",
+            10,
+            10,
+        ),
+        (
+            "SELECT a.id, vb.id FROM (SELECT id FROM big) a CROSS JOIN vb LIMIT 10",
+            10,
+            10,
+        ),
+        (
+            "SELECT a.id, v.n FROM (SELECT id FROM big) a CROSS JOIN \
+             (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12)) AS v(n) LIMIT 5",
+            5,
+            5,
+        ),
+        (
+            "SELECT a.id, g.value FROM (SELECT id FROM big) a \
+             CROSS JOIN generate_series(1, 3000) g LIMIT 10 OFFSET 2",
+            12,
+            10,
         ),
     ] {
         let (streamed, built) = (streaming_joins_streamed(), limit_hash_build_rows());
-        db.query(sql, ()).unwrap().for_each(|row| {
-            row.unwrap();
-        });
+        let found = pairs(&db, sql);
+        assert_eq!(distinct(&found).len(), answered, "{sql}");
         assert_eq!(streaming_joins_streamed() - streamed, 1, "{sql} streams");
         let built = limit_hash_build_rows() - built;
         assert!(built <= cap, "{sql} built on {built} rows");
