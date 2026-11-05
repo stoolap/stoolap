@@ -360,10 +360,10 @@ impl BTreeIndex {
 
     /// Internal method to find row IDs matching an operator
     /// Uses BTreeMap for O(log n + k) range queries instead of O(n) full scans
-    fn find_with_op(&self, op: Operator, value: &Value) -> Vec<i64> {
+    fn find_with_op(&self, op: Operator, value: &Value) -> Option<Vec<i64>> {
         let sorted_values = self.sorted_values.read();
 
-        match op {
+        Some(match op {
             // Equality uses BTreeMap for O(log n) lookup via Borrow trait
             Operator::Eq | Operator::In => sorted_values
                 .get(value)
@@ -418,21 +418,6 @@ impl BTreeIndex {
                 results
             }
 
-            // Not equal and NotIn require full scan
-            Operator::Ne | Operator::NotIn => {
-                let capacity = sorted_values.len();
-                let mut results = Vec::with_capacity(capacity);
-                for (v, rows) in sorted_values.iter() {
-                    if v.as_ref() != value {
-                        rows.copy_into(&mut results);
-                    }
-                }
-                results
-            }
-
-            // Like operator needs string pattern matching - return empty
-            Operator::Like => Vec::new(),
-
             // NULL operators need to check all values
             Operator::IsNull => {
                 let mut results = Vec::new();
@@ -454,7 +439,9 @@ impl BTreeIndex {
                 }
                 results
             }
-        }
+
+            _ => return None,
+        })
     }
 }
 
@@ -853,7 +840,9 @@ impl Index for BTreeIndex {
         }
 
         let value = &values[0];
-        let row_ids = self.find_with_op(op, value);
+        let row_ids = self.find_with_op(op, value).ok_or_else(|| {
+            Error::internal(format!("btree index does not support operator {:?}", op))
+        })?;
 
         Ok(row_ids
             .into_iter()
@@ -1702,11 +1691,12 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 2); // 40, 50
 
-        // Not equal to 30
-        let entries = index
-            .find_with_operator(Operator::Ne, &[Value::Integer(30)])
-            .unwrap();
-        assert_eq!(entries.len(), 4); // 10, 20, 40, 50
+        for op in [Operator::Ne, Operator::NotIn, Operator::Like] {
+            assert!(
+                index.find_with_operator(op, &[Value::Integer(30)]).is_err(),
+                "{op:?}"
+            );
+        }
     }
 
     #[test]
