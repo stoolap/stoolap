@@ -3,4 +3,14 @@
 # the dependency that pulls it in moves.
 
 [advisories]
-ignore = []
+ignore = [
+    # zip 7 is pulled in only by candle-core 0.9 of the optional semantic
+    # feature. All four concern extracting an archive to disk, which candle
+    # never does: it reads .npz and .pth entries, and EMBED loads safetensors.
+    # The fix is zip 9, which only candle 0.11.1 uses, and that release does
+    # not build on the 1.88 MSRV. Reviewed 2026-11-05.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+]
