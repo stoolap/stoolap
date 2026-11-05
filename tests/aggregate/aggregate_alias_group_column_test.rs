@@ -76,6 +76,14 @@ fn a_grouped_column_named_like_a_select_alias_reads_the_column() {
             vec![row(&[2, 10, 1]), row(&[3, 10, 1]), row(&[4, 20, 1])],
         ),
         (
+            "SELECT a + 1 AS b, MIN(b) AS b, b FROM t GROUP BY t.b, a + 1 ORDER BY 1",
+            vec![row(&[2, 10, 10]), row(&[3, 10, 10]), row(&[4, 20, 20])],
+        ),
+        (
+            "SELECT a + 1 AS b, SUM(b) OVER (PARTITION BY b) FROM t GROUP BY t.b, a + 1 ORDER BY 1",
+            vec![row(&[2, 20]), row(&[3, 20]), row(&[4, 20])],
+        ),
+        (
             "SELECT SUM(a) AS b, b, (SELECT 1) FROM t GROUP BY b ORDER BY 2",
             vec![row(&[3, 10, 1]), row(&[3, 20, 1])],
         ),

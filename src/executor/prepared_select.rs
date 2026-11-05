@@ -9242,12 +9242,7 @@ impl PreparedGrouped {
         let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
         let item_ctx = CompileContext::new(&item_names, global_registry());
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {
-            let holding: SmallVec<[usize; 2]> = (0..held.len())
-                .filter(|&item| held[item] == Some(column))
-                .collect();
-            group_item_read(reference, &item_keys, &item_ctx)
-                .filter(|item| holding.contains(item))
-                .or(holding.first().copied())
+            group_item_read(reference, column, &held, &item_keys, &item_ctx)
         };
         let slots_ctx = CompileContext::bound(global_registry());
         let mut holes = Vec::with_capacity(blocks.subqueries.len());
