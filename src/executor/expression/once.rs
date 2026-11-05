@@ -96,7 +96,7 @@ pub(crate) fn evaluate_once_in(
         return Ok(value);
     }
     let row = Row::new();
-    let exec = execute_context(&row, ctx);
+    let exec = execute_context(&row, ctx, None);
     if let Expression::Parameter(param) = expr {
         let index = parameter_slot(param).map_err(compile_error)?;
         return exec.param_ref(index as usize).cloned();
@@ -112,25 +112,21 @@ pub(crate) fn execute_once(
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<Value> {
     let row = Row::new();
-    let exec = execute_context(&row, ctx);
-    run(
-        program,
-        &crate::executor::aggregation::with_blocks(exec, blocks),
-    )
+    run(program, &execute_context(&row, ctx, blocks))
 }
 
-/// The VM context for `row` with `ctx`'s parameters and transaction
+/// The VM context for `row` with `ctx`'s parameters and transaction, its
+/// subqueries answered by `blocks`
 pub(crate) fn execute_context<'a>(
     row: &'a Row,
     ctx: Option<&'a ExecutionContext>,
+    blocks: Option<&'a dyn SubqueryExecutor>,
 ) -> ExecuteContext<'a> {
-    let mut exec = ExecuteContext::new(row);
-    if let Some(ctx) = ctx {
-        exec = exec
-            .with_params(ctx.params())
-            .with_transaction_id(ctx.transaction_id());
-    }
-    exec
+    let (params, transaction_id) = match ctx {
+        Some(ctx) => (ctx.params(), ctx.transaction_id()),
+        None => (&[][..], None),
+    };
+    ExecuteContext::new(row).with_run(params, transaction_id, blocks)
 }
 
 /// A VM of its own, dropped with every value it read: a new VM allocates nothing

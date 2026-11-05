@@ -1948,7 +1948,7 @@ thread_local! {
 /// when it errors, and the fold is not taken
 fn run_fold(program: &Program, params: &[Value]) -> Option<Value> {
     FOLD_ROW.with(|empty_row| {
-        let exec_ctx = ExecuteContext::new(empty_row).with_params(params);
+        let exec_ctx = ExecuteContext::new(empty_row).with_run(params, None, None);
         FOLD_VM.with(|vm_cell| {
             let mut vm = vm_cell.borrow_mut();
             let value = vm.execute(program, &exec_ctx).ok();

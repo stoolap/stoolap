@@ -58,7 +58,7 @@ pub use ops::{CompareOp, Op, QuantifiedMembers, RowComparison, RowMembers, RowTe
 pub(crate) use program::known_params;
 pub use program::{Program, SharedProgram};
 pub use row_filter::RowFilter;
-pub(crate) use vm::concat_values;
+pub(crate) use vm::{concat_values, run_params};
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 
 #[cfg(test)]

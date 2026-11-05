@@ -613,10 +613,8 @@ impl QueryResult for ProjectionResult {
             // Storage comes back only after a caller took the last row
             self.current_row.reserve_inline(self.projection.width());
             self.current_row.clear_inline();
-            let mut exec = ExecuteContext::new(source_row).with_transaction_id(self.transaction_id);
-            if let Some(params) = &self.params {
-                exec = exec.with_params(params);
-            }
+            let params = self.params.as_ref().map_or(&[][..], |params| &params[..]);
+            let exec = ExecuteContext::new(source_row).with_run(params, self.transaction_id, None);
             if let Err(e) = self
                 .projection
                 .project_into(&mut self.vm, &exec, &mut self.current_row)

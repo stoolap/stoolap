@@ -1018,11 +1018,8 @@ impl Executor {
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx =
-            ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
-        if !params.is_empty() {
-            base_exec_ctx = base_exec_ctx.with_params(params);
-        }
+        let base_exec_ctx =
+            ExecuteContext::new(&empty_row).with_run(params, ctx.transaction_id(), None);
 
         let mut rows_affected = 0i64;
 
@@ -1976,11 +1973,8 @@ impl Executor {
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx =
-            ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
-        if !params.is_empty() {
-            base_exec_ctx = base_exec_ctx.with_params(params);
-        }
+        let base_exec_ctx =
+            ExecuteContext::new(&empty_row).with_run(params, ctx.transaction_id(), None);
 
         let mut rows_affected = 0i64;
 
@@ -2599,9 +2593,7 @@ impl Executor {
                     // The prepared WHERE chose these rows already
                     if let Some(program) = &memory_where_program {
                         let program = program.as_ref().map_err(Clone::clone)?;
-                        let exec = super::expression::ExecuteContext::new(row)
-                            .with_params(ctx.params())
-                            .with_transaction_id(ctx.transaction_id());
+                        let exec = super::aggregation::slot_context(row, ctx);
                         if !vm.execute_bool_checked(program, &exec)? {
                             continue;
                         }
@@ -2720,9 +2712,7 @@ impl Executor {
             let no_row = Row::new();
             let row_ctx = match &dml_run {
                 Some(run) => run.context(&no_row),
-                None => ExecuteContext::new(&no_row)
-                    .with_params(params)
-                    .with_transaction_id(transaction_id),
+                None => ExecuteContext::new(&no_row).with_run(params, transaction_id, None),
             };
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // Execute pre-compiled programs (no recompilation per row)
@@ -3200,11 +3190,8 @@ impl Executor {
                 let matches = match &memory_where_program {
                     Some(program) => {
                         let program = program.as_ref().map_err(Clone::clone)?;
-                        let mut exec_ctx =
-                            ExecuteContext::new(row).with_transaction_id(transaction_id);
-                        if !params.is_empty() {
-                            exec_ctx = exec_ctx.with_params(params);
-                        }
+                        let exec_ctx =
+                            ExecuteContext::new(row).with_run(params, transaction_id, None);
                         delete_vm.execute_bool_checked(program, &exec_ctx)?
                     }
                     None => true, // Storage layer already filtered
@@ -3646,14 +3633,11 @@ impl Executor {
             if let Some(program) = &effective.compiled_where {
                 let exec_ctx = match (conflict, joined.as_deref()) {
                     (Some(run), Some(joined)) => run.context(joined),
-                    _ => {
-                        let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
-                            .with_transaction_id(transaction_id);
-                        if !params.is_empty() {
-                            exec_ctx = exec_ctx.with_params(params);
-                        }
-                        exec_ctx
-                    }
+                    _ => ExecuteContext::for_join(&row, &excluded_row).with_run(
+                        params,
+                        transaction_id,
+                        None,
+                    ),
                 };
                 if !vm.execute_bool_checked(program, &exec_ctx)? {
                     return Ok((row, false));
@@ -3665,14 +3649,11 @@ impl Executor {
                 // Use for_join to make EXCLUDED columns available as row2
                 let exec_ctx = match (conflict, joined.as_deref()) {
                     (Some(run), Some(joined)) => run.context(joined),
-                    _ => {
-                        let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
-                            .with_transaction_id(transaction_id);
-                        if !params.is_empty() {
-                            exec_ctx = exec_ctx.with_params(params);
-                        }
-                        exec_ctx
-                    }
+                    _ => ExecuteContext::for_join(&row, &excluded_row).with_run(
+                        params,
+                        transaction_id,
+                        None,
+                    ),
                 };
 
                 let mut updates = Vec::with_capacity(effective.compiled_updates.len());
@@ -3901,7 +3882,7 @@ impl Executor {
             )));
         }
 
-        use super::expression::{ExecuteContext, ExprVM};
+        use super::expression::ExprVM;
 
         if let Some((run, programs)) = prepared.and_then(|run| Some((run, run.returning()?))) {
             let mut vm = ExprVM::new();
@@ -3953,7 +3934,7 @@ impl Executor {
         let mut result_rows = RowVec::with_capacity(source_rows.len());
         for (row_id, row) in source_rows.into_iter().enumerate() {
             // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(&row).with_params(ctx.params());
+            let exec_ctx = super::aggregation::slot_context(&row, ctx);
 
             let mut row_values = Vec::with_capacity(programs.len());
             for program in &programs {

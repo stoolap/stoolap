@@ -267,6 +267,16 @@ fn between_cell(value: &Value, low: &Value, high: &Value) -> Option<bool> {
     }
 }
 
+/// The parameters a statement's programs read: its `blocks`' when they have
+/// them, which hold the parameters past the statement's own, else `params`
+#[inline(always)]
+pub(crate) fn run_params<'a>(
+    params: &'a [Value],
+    blocks: Option<&'a dyn SubqueryExecutor>,
+) -> &'a [Value] {
+    blocks.and_then(|blocks| blocks.params()).unwrap_or(params)
+}
+
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots; a deeper one, a long concatenation
 /// or a call with many arguments, still runs without allocating
@@ -315,24 +325,6 @@ impl<'a> ExecuteContext<'a> {
         }
     }
 
-    /// Create a context with common parameters that can be reused across rows
-    /// Only the row field needs to be updated for each iteration
-    #[inline]
-    pub fn with_common_params(
-        row: &'a Row,
-        params: &'a [Value],
-        transaction_id: Option<u64>,
-    ) -> Self {
-        Self {
-            row,
-            row2: None,
-            params,
-            subquery_executor: None,
-            transaction_id,
-            failed: &[],
-        }
-    }
-
     /// Create context for join evaluation
     pub fn for_join(row1: &'a Row, row2: &'a Row) -> Self {
         Self {
@@ -345,16 +337,22 @@ impl<'a> ExecuteContext<'a> {
         }
     }
 
-    /// Add transaction ID
-    pub fn with_transaction_id(mut self, transaction_id: Option<u64>) -> Self {
+    /// What a statement's run gives every program it runs: its parameters,
+    /// or those of its `blocks` when they have them, its transaction, and
+    /// `blocks` for its subqueries
+    #[inline(always)]
+    pub fn with_run(
+        mut self,
+        params: &'a [Value],
+        transaction_id: Option<u64>,
+        blocks: Option<&'a dyn SubqueryExecutor>,
+    ) -> Self {
+        self.params = run_params(params, blocks);
         self.transaction_id = transaction_id;
-        self
-    }
-
-    /// Add parameters
-    pub fn with_params(mut self, params: &'a [Value]) -> Self {
-        self.params = params;
-        self
+        match blocks {
+            Some(blocks) => self.with_subquery_executor(blocks),
+            None => self,
+        }
     }
 
     /// Add the slots whose value failed to compute
@@ -3055,14 +3053,14 @@ mod tests {
     fn test_context_with_params() {
         let row = Row::from_values(vec![Value::Integer(1)]);
         let params = vec![Value::Text("param1".into())];
-        let ctx = ExecuteContext::new(&row).with_params(&params);
+        let ctx = ExecuteContext::new(&row).with_run(&params, None, None);
         assert_eq!(ctx.params.len(), 1);
     }
 
     #[test]
     fn test_context_with_transaction_id() {
         let row = Row::from_values(vec![Value::Integer(1)]);
-        let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
+        let ctx = ExecuteContext::new(&row).with_run(&[], Some(12345), None);
         assert_eq!(ctx.transaction_id, Some(12345));
     }
 
@@ -3134,7 +3132,7 @@ mod tests {
         let program = Program::new(vec![Op::LoadParam(0), Op::Return]);
         let row = Row::new();
         let params = vec![Value::Text("hello".into())];
-        let ctx = ExecuteContext::new(&row).with_params(&params);
+        let ctx = ExecuteContext::new(&row).with_run(&params, None, None);
         assert_eq!(
             vm.execute(&program, &ctx).unwrap(),
             Value::Text("hello".into())
@@ -3147,7 +3145,7 @@ mod tests {
         let program = Program::new(vec![Op::LoadParam(1), Op::Return]);
         let row = Row::new();
         let params = [Value::Integer(1)];
-        let ctx = ExecuteContext::new(&row).with_params(&params);
+        let ctx = ExecuteContext::new(&row).with_run(&params, None, None);
         assert!(vm.execute(&program, &ctx).is_err());
     }
 
@@ -4536,7 +4534,7 @@ mod tests {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![Op::LoadTransactionId, Op::Return]);
         let row = Row::new();
-        let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
+        let ctx = ExecuteContext::new(&row).with_run(&[], Some(12345), None);
         assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(12345));
     }
 

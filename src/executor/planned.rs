@@ -479,7 +479,7 @@ impl Executor {
         for (id, row) in rows {
             let row = normalize_row_to_schema(row, &plan.schema);
             if let Some(filter) = &plan.filter {
-                let exec = ExecuteContext::with_common_params(&row, params, transaction);
+                let exec = ExecuteContext::new(&row).with_run(params, transaction, None);
                 let vm = vm.get_or_insert_with(ExprVM::new);
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
@@ -503,7 +503,7 @@ impl Executor {
                 out.push((id, Row::from_values(values.collect())));
                 continue;
             }
-            let exec = ExecuteContext::with_common_params(&row, params, transaction);
+            let exec = ExecuteContext::new(&row).with_run(params, transaction, None);
             let mut projected = Row::with_capacity(plan.projection.width());
             let vm = vm.get_or_insert_with(ExprVM::new);
             plan.projection.project_into(vm, &exec, &mut projected)?;

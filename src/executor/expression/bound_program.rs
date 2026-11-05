@@ -68,23 +68,14 @@ impl BoundProgram {
         }
     }
 
-    /// `base` reading this program's parameters, or those of the statement's
-    /// `blocks` when they have them, its transaction, and `blocks` for its
-    /// subqueries
+    /// `base` reading the run this program was bound to, its subqueries
+    /// answered by the statement's `blocks`
     #[inline(always)]
     pub(crate) fn context<'a>(
         &'a self,
-        mut base: ExecuteContext<'a>,
+        base: ExecuteContext<'a>,
         blocks: Option<&'a dyn SubqueryExecutor>,
     ) -> ExecuteContext<'a> {
-        let params = blocks.and_then(|b| b.params()).unwrap_or(&self.params);
-        if !params.is_empty() {
-            base = base.with_params(params);
-        }
-        base = base.with_transaction_id(self.transaction_id);
-        if let Some(blocks) = blocks {
-            base = base.with_subquery_executor(blocks);
-        }
-        base
+        base.with_run(&self.params, self.transaction_id, blocks)
     }
 }

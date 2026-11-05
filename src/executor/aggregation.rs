@@ -35,7 +35,7 @@ use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
-use super::expression::{ExprVM, SubqueryExecutor};
+use super::expression::{run_params, ExprVM, SubqueryExecutor};
 use super::query::order_by_inputs;
 use super::result::ExecutorResult;
 use super::utils::{
@@ -183,34 +183,26 @@ pub(crate) fn slot_context<'a>(
     row: &'a Row,
     ctx: &'a ExecutionContext,
 ) -> super::expression::ExecuteContext<'a> {
-    super::expression::ExecuteContext::with_common_params(row, ctx.params(), ctx.transaction_id())
+    run_context(row, ctx, None)
 }
 
-/// The parameters a slot row's programs read: the `blocks`' when the
-/// statement has them, as `with_blocks` gives them, else the statement's
+/// The VM context for `row` in `ctx`'s statement, its subqueries answered
+/// by the statement's `blocks`
+#[inline(always)]
+pub(crate) fn run_context<'a>(
+    row: &'a Row,
+    ctx: &'a ExecutionContext,
+    blocks: Option<&'a dyn SubqueryExecutor>,
+) -> super::expression::ExecuteContext<'a> {
+    super::expression::ExecuteContext::new(row).with_run(ctx.params(), ctx.transaction_id(), blocks)
+}
+
+/// The parameters a slot row's programs read, see [`run_params`]
 pub(crate) fn slot_params<'a>(
     ctx: &'a ExecutionContext,
     blocks: Option<&'a dyn SubqueryExecutor>,
 ) -> &'a [Value] {
-    blocks
-        .and_then(|blocks| blocks.params())
-        .unwrap_or(ctx.params())
-}
-
-/// `exec` with its subqueries answered by the statement's `blocks`, which
-/// hold the parameters past the statement's own
-pub(crate) fn with_blocks<'a>(
-    exec: super::expression::ExecuteContext<'a>,
-    blocks: Option<&'a dyn SubqueryExecutor>,
-) -> super::expression::ExecuteContext<'a> {
-    let Some(blocks) = blocks else {
-        return exec;
-    };
-    let exec = exec.with_subquery_executor(blocks);
-    match blocks.params() {
-        Some(params) => exec.with_params(params),
-        None => exec,
-    }
+    run_params(ctx.params(), blocks)
 }
 /// Represents a grouping set for ROLLUP/CUBE operations
 /// Each grouping set specifies which columns are active (included in grouping)
@@ -1052,17 +1044,20 @@ struct FeedState {
 }
 
 /// What each row a pass feeds reads beside itself, taken once for the pass:
-/// the parameters, and the blocks answering its subqueries
+/// the statement's parameters and transaction, and the blocks answering its
+/// subqueries
 #[derive(Clone, Copy)]
 struct RowReads<'b> {
     params: &'b [Value],
+    transaction_id: Option<u64>,
     blocks: Option<&'b dyn SubqueryExecutor>,
 }
 
 impl<'b> RowReads<'b> {
     fn of(ctx: &'b ExecutionContext, blocks: Option<&'b dyn SubqueryExecutor>) -> Self {
         Self {
-            params: slot_params(ctx, blocks),
+            params: ctx.params(),
+            transaction_id: ctx.transaction_id(),
             blocks,
         }
     }
@@ -1072,11 +1067,11 @@ impl<'b> RowReads<'b> {
     where
         'b: 'a,
     {
-        let exec = super::expression::ExecuteContext::new(row).with_params(self.params);
-        match self.blocks {
-            Some(blocks) => exec.with_subquery_executor(blocks),
-            None => exec,
-        }
+        super::expression::ExecuteContext::new(row).with_run(
+            self.params,
+            self.transaction_id,
+            self.blocks,
+        )
     }
 }
 
@@ -1429,7 +1424,7 @@ impl<'a> RowFeed<'a> {
         #[cfg(feature = "parallel")]
         if self.splits(groups, rows.len()) {
             let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
-            let params = ctx.params();
+            let (params, transaction_id) = (ctx.params(), ctx.transaction_id());
             let parts: Vec<GroupedAggregates> = rows
                 .par_chunks(chunk_size)
                 .map(|chunk| {
@@ -1437,6 +1432,7 @@ impl<'a> RowFeed<'a> {
                     let mut state = FeedState::default();
                     let reads = RowReads {
                         params,
+                        transaction_id,
                         blocks: None,
                     };
                     for (_, row) in chunk {
@@ -2231,7 +2227,7 @@ impl Executor {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
                     ColumnSource::Expression(_) => match &source_programs[src_idx] {
-                        Some(p) => vm.execute(p, &with_blocks(slot_context(&row, ctx), blocks))?,
+                        Some(p) => vm.execute(p, &run_context(&row, ctx, blocks))?,
                         None => Value::null_unknown(),
                     },
                     ColumnSource::GroupingFlag(idx) => {
@@ -3280,10 +3276,7 @@ impl Executor {
         let mut new_id = 0i64;
         let mut vm = ExprVM::new();
         for (_, row) in rows {
-            if vm.execute_bool_checked(
-                &having_filter,
-                &with_blocks(slot_context(&row, ctx), blocks),
-            )? {
+            if vm.execute_bool_checked(&having_filter, &run_context(&row, ctx, blocks))? {
                 filtered_rows.push((new_id, row));
                 new_id += 1;
             }
