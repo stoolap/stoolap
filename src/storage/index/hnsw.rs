@@ -3166,9 +3166,11 @@ impl Index for HnswIndex {
         Ok(Vec::new())
     }
 
-    fn find_with_operator(&self, _op: Operator, _values: &[Value]) -> Result<Vec<IndexEntry>> {
-        // HNSW does not support operator-based lookup
-        Ok(Vec::new())
+    fn find_with_operator(&self, op: Operator, _values: &[Value]) -> Result<Vec<IndexEntry>> {
+        Err(crate::core::Error::internal(format!(
+            "hnsw index does not support operator {:?}",
+            op
+        )))
     }
 
     fn get_filtered_row_ids(&self, _expr: &dyn Expression) -> RowIdVec {

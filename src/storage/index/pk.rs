@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
-use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::traits::RemovalBuffers;
@@ -567,32 +567,10 @@ impl Index for PkIndex {
             Operator::Gte => self.find_range(values, &[], true, false),
             Operator::Lt => self.find_range(&[], values, false, false),
             Operator::Lte => self.find_range(&[], values, false, true),
-            Operator::Ne => {
-                let Some(exclude_id) = Self::extract_i64(values) else {
-                    return Ok(Vec::new());
-                };
-                let inner = self.data.read();
-                let mut result = Vec::new();
-                for_each_set_bit(&inner.words, |rid| {
-                    if rid != exclude_id {
-                        result.push(IndexEntry {
-                            row_id: rid,
-                            ref_id: rid,
-                        });
-                    }
-                    true
-                });
-                for id in inner.overflow.iter() {
-                    if id != exclude_id {
-                        result.push(IndexEntry {
-                            row_id: id,
-                            ref_id: id,
-                        });
-                    }
-                }
-                Ok(result)
-            }
-            _ => Ok(Vec::new()),
+            _ => Err(Error::internal(format!(
+                "primary key index does not support operator {:?}",
+                op
+            ))),
         }
     }
 
@@ -1069,6 +1047,19 @@ mod tests {
             .find_range(&[Value::Integer(3)], &[Value::Integer(7)], false, false)
             .unwrap();
         assert_eq!(results.len(), 3); // 4, 5, 6
+    }
+
+    #[test]
+    fn test_pk_index_not_equal_is_an_error() {
+        let idx = make_idx();
+        idx.add(&[Value::Integer(5)], 5, 5).unwrap();
+        for value in [Value::Integer(5), Value::Float(5.5), Value::Float(f64::NAN)] {
+            assert!(
+                idx.find_with_operator(Operator::Ne, std::slice::from_ref(&value))
+                    .is_err(),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

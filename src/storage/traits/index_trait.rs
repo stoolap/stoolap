@@ -176,7 +176,10 @@ pub trait Index: Send + Sync {
         max_inclusive: bool,
     ) -> Result<Vec<IndexEntry>>;
 
-    /// Finds all entries matching the given operator and values
+    /// Finds all entries matching the given operator and values. An operator
+    /// the index does not support, `<>` among them, is an error, never an
+    /// empty result; a supported one may return entries that do not match,
+    /// so the caller tests them again
     ///
     /// # Arguments
     /// * `op` - The comparison operator

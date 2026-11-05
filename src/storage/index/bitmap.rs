@@ -776,38 +776,8 @@ impl Index for BitmapIndex {
     fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>> {
         match op {
             Operator::Eq => self.find(values),
-            Operator::Ne => {
-                // Use NOT operation
-                if values.len() != self.column_ids.len() {
-                    return Err(Error::internal(
-                        "bitmap index requires exact match on all columns",
-                    ));
-                }
-                // not_bits() takes &Value, not the key directly
-                // For single column, pass the value; for multi, create composite
-                let result = if values.len() == 1 {
-                    self.not_bits(&values[0])
-                } else {
-                    let composite = Value::Text(
-                        values
-                            .iter()
-                            .map(|v| format!("{:?}", v))
-                            .collect::<Vec<_>>()
-                            .join("||")
-                            .into(),
-                    );
-                    self.not_bits(&composite)
-                };
-                Ok(result
-                    .iter()
-                    .map(|bit| IndexEntry {
-                        row_id: row_of(bit),
-                        ref_id: 0,
-                    })
-                    .collect())
-            }
             _ => Err(Error::internal(format!(
-                "bitmap index only supports = and != operators, not {:?}",
+                "bitmap index only supports the = operator, not {:?}",
                 op
             ))),
         }
@@ -1127,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bitmap_index_not_equal() {
+    fn test_bitmap_index_not_equal_is_an_error() {
         let index = BitmapIndex::new(
             "idx_status".to_string(),
             "orders".to_string(),
@@ -1142,11 +1112,9 @@ mod tests {
         index.add(&[Value::Text("shipped".into())], 2, 0).unwrap();
         index.add(&[Value::Text("delivered".into())], 3, 0).unwrap();
 
-        // != pending should return shipped and delivered
-        let results = index
+        assert!(index
             .find_with_operator(Operator::Ne, &[Value::Text("pending".into())])
-            .unwrap();
-        assert_eq!(results.len(), 2);
+            .is_err());
     }
 
     #[test]
