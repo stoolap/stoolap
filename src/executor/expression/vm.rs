@@ -91,6 +91,14 @@ impl<'a> Stack<'a> {
         self.0.last_mut().map(Cow::to_mut)
     }
 
+    /// The top value replaced by `value`, without copying a borrowed one
+    #[inline]
+    fn replace_last(&mut self, value: Value) {
+        if let Some(top) = self.0.last_mut() {
+            *top = Cow::Owned(value);
+        }
+    }
+
     #[inline]
     fn len(&self) -> usize {
         self.0.len()
@@ -968,23 +976,21 @@ impl ExprVM {
                 // =============================================================
                 Op::And(jump_target) => {
                     // Short-circuit AND: a left operand read as false is the answer
-                    match stack.last_mut() {
-                        Some(top) if Self::to_tribool(top) == Some(false) => {
-                            *top = Value::Boolean(false);
-                            pc = *jump_target as usize;
-                        }
-                        _ => pc += 1,
+                    if stack.last().and_then(Self::to_tribool) == Some(false) {
+                        stack.replace_last(Value::Boolean(false));
+                        pc = *jump_target as usize;
+                    } else {
+                        pc += 1;
                     }
                 }
 
                 Op::Or(jump_target) => {
                     // Short-circuit OR: a left operand read as true is the answer
-                    match stack.last_mut() {
-                        Some(top) if Self::to_tribool(top) == Some(true) => {
-                            *top = Value::Boolean(true);
-                            pc = *jump_target as usize;
-                        }
-                        _ => pc += 1,
+                    if stack.last().and_then(Self::to_tribool) == Some(true) {
+                        stack.replace_last(Value::Boolean(true));
+                        pc = *jump_target as usize;
+                    } else {
+                        pc += 1;
                     }
                 }
 
