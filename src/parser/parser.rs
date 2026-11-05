@@ -186,6 +186,9 @@ pub struct Parser<'a> {
     pub(crate) statement_depth: usize,
     pub(crate) expression_depth: usize,
     pub(crate) limited: bool,
+    /// The deepest level the expression being parsed reaches, an operator
+    /// chain's levels included
+    pub(crate) expression_peak: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -221,6 +224,7 @@ impl<'a> Parser<'a> {
             statement_depth: 0,
             expression_depth: 0,
             limited: true,
+            expression_peak: 0,
         }
     }
 

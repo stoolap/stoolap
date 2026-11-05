@@ -91,6 +91,14 @@ impl<'a> Stack<'a> {
         self.0.last_mut().map(Cow::to_mut)
     }
 
+    /// The top value replaced by `value`, without copying a borrowed one
+    #[inline]
+    fn replace_last(&mut self, value: Value) {
+        if let Some(top) = self.0.last_mut() {
+            *top = Cow::Owned(value);
+        }
+    }
+
     #[inline]
     fn len(&self) -> usize {
         self.0.len()
@@ -967,40 +975,22 @@ impl ExprVM {
                 // LOGICAL OPERATIONS
                 // =============================================================
                 Op::And(jump_target) => {
-                    // Short-circuit AND: if top is false, jump
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    match top {
-                        Value::Boolean(false) => {
-                            // Result is false, jump to target
-                            pc = *jump_target as usize;
-                        }
-                        Value::Null(_) => {
-                            // Need to evaluate right side to check for false
-                            pc += 1;
-                        }
-                        _ => {
-                            // True or truthy, continue to evaluate right side
-                            pc += 1;
-                        }
+                    // Short-circuit AND: a left operand read as false is the answer
+                    if stack.last().and_then(Self::to_tribool) == Some(false) {
+                        stack.replace_last(Value::Boolean(false));
+                        pc = *jump_target as usize;
+                    } else {
+                        pc += 1;
                     }
                 }
 
                 Op::Or(jump_target) => {
-                    // Short-circuit OR: if top is true, jump
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    match top {
-                        Value::Boolean(true) => {
-                            // Result is true, jump to target
-                            pc = *jump_target as usize;
-                        }
-                        Value::Null(_) => {
-                            // Need to evaluate right side to check for true
-                            pc += 1;
-                        }
-                        _ => {
-                            // False or falsy, continue to evaluate right side
-                            pc += 1;
-                        }
+                    // Short-circuit OR: a left operand read as true is the answer
+                    if stack.last().and_then(Self::to_tribool) == Some(true) {
+                        stack.replace_last(Value::Boolean(true));
+                        pc = *jump_target as usize;
+                    } else {
+                        pc += 1;
                     }
                 }
 

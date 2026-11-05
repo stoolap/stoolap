@@ -2736,14 +2736,7 @@ fn conjuncts<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
 
 /// `parts` joined by AND, or None when there are none
 fn conjunction(parts: Vec<Expression>) -> Option<Expression> {
-    parts.into_iter().reduce(|left, right| {
-        Expression::Infix(InfixExpression::new(
-            Token::new(TokenType::Keyword, "AND", Position::default()),
-            Box::new(left),
-            "AND",
-            Box::new(right),
-        ))
-    })
+    combine_predicates_with_and(parts)
 }
 
 /// The condition every row passes

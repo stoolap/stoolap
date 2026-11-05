@@ -725,7 +725,7 @@ statement nested too deeply: more than 32 SELECTs inside one another
 statement nested too deeply: more than 64 expressions inside one another
 ```
 
-A long chain of operators such as `a = 1 OR a = 2 OR ...` is not nesting and is not limited here. The text Stoolap stores for a view, a column `DEFAULT` or a `CHECK` writes each operator of such a chain in parentheses, and it reads back whatever its depth.
+A chain of one of `AND`, `OR` and `||`, such as `a = 1 OR a = 2 OR ...`, is read as a balanced tree, so it nests only the base-2 logarithm of its length: a chain of 20,000 terms nests 15 levels. Such a chain is one expression however it is parenthesized, so `SELECT a || (b || c), COUNT(*) FROM t GROUP BY (a || b) || c` groups by its select item. A chain of any other operator, such as `1 + 2 + 3`, nests one level per operator, its first operand deepest, and counts toward the expression limit: at the top of a select list it may hold one operator fewer than the limit, 63 in a release build. An operand nests under the operators above it only, so in `1 + 1 + 1 * 1 * 1` the product sits one level below the last `+`. The text Stoolap stores for a view, a column `DEFAULT` or a `CHECK` writes each operator and each operand of `NOT` in parentheses, and it reads back whatever its depth.
 
 ## Best Practices
 

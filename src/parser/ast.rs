@@ -1118,6 +1118,15 @@ impl InfixOperator {
             _ => InfixOperator::Other,
         }
     }
+
+    /// Whether any grouping of a chain of this operator, its operands in one
+    /// order, is the same computation
+    pub fn associates(self) -> bool {
+        matches!(
+            self,
+            InfixOperator::And | InfixOperator::Or | InfixOperator::Concat
+        )
+    }
 }
 
 /// Prefix operator type (pre-computed at parse time)
@@ -1253,6 +1262,42 @@ impl InfixExpression {
             op_type,
             right,
         }
+    }
+
+    /// `head` and the operands after it joined by the operator before each,
+    /// as a balanced tree keeping the order written, three or fewer operands
+    /// left-deep. Only for an operator that associates (`AND`, `OR`, `||`):
+    /// it nests the log2 of the chain where a left-deep tree nests its length
+    pub fn balanced_chain(
+        head: Expression,
+        mut rest: impl ExactSizeIterator<Item = (Token, SmartString, Expression)>,
+    ) -> Expression {
+        let operands = rest.len() + 1;
+        Self::chain_of(operands, head, &mut rest)
+    }
+
+    fn chain_of(
+        operands: usize,
+        head: Expression,
+        rest: &mut impl Iterator<Item = (Token, SmartString, Expression)>,
+    ) -> Expression {
+        if operands == 1 {
+            return head;
+        }
+        let half = Self::left_half(operands);
+        let left = Self::chain_of(half, head, rest);
+        match rest.next() {
+            Some((token, operator, first)) => {
+                let right = Self::chain_of(operands - half, first, rest);
+                Expression::Infix(Self::new(token, Box::new(left), operator, Box::new(right)))
+            }
+            None => left,
+        }
+    }
+
+    /// How many of a balanced chain's `operands` its left half holds
+    pub fn left_half(operands: usize) -> usize {
+        operands - operands / 2
     }
 }
 

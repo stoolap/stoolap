@@ -22,8 +22,8 @@ use rustc_hash::FxHasher;
 
 use crate::core::Value;
 use crate::parser::ast::{
-    AllAnyType, Expression, FunctionCall, GroupByModifier, Identifier, OrderByExpression,
-    SelectStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
+    AllAnyType, Expression, FunctionCall, GroupByModifier, Identifier, InfixOperator,
+    OrderByExpression, SelectStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
 };
 
 /// Two expressions share a key when they are the same computation. The key
@@ -164,6 +164,28 @@ fn write_list(items: &[Expression], hasher: &mut KeyHasher) {
     hasher.write_usize(items.len());
     for item in items {
         write_expr(item, hasher);
+    }
+}
+
+/// The operands of the chain of `op` at `expr`, however it is grouped
+fn chain_operands(expr: &Expression, op: InfixOperator) -> usize {
+    match expr {
+        Expression::Infix(infix) if infix.op_type == op => {
+            chain_operands(&infix.left, op) + chain_operands(&infix.right, op)
+        }
+        _ => 1,
+    }
+}
+
+/// The operands of the chain of `op` at `expr` in order, so every grouping
+/// of one chain writes alike
+fn write_chain(expr: &Expression, op: InfixOperator, hasher: &mut KeyHasher) {
+    match expr {
+        Expression::Infix(infix) if infix.op_type == op => {
+            write_chain(&infix.left, op, hasher);
+            write_chain(&infix.right, op, hasher);
+        }
+        _ => write_expr(expr, hasher),
     }
 }
 
@@ -312,6 +334,12 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b'u');
             hasher.name(&prefix.operator);
             write_expr(&prefix.right, hasher);
+        }
+        Expression::Infix(infix) if infix.op_type.associates() => {
+            hasher.tag(b'x');
+            hasher.name(&infix.operator);
+            hasher.write_usize(chain_operands(expr, infix.op_type));
+            write_chain(expr, infix.op_type, hasher);
         }
         Expression::Infix(infix) => {
             hasher.tag(b'x');

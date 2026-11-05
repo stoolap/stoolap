@@ -799,20 +799,9 @@ fn natural_join_condition(
         )));
     }
 
-    // Combine conditions with AND
-    if conditions.is_empty() {
-        (None, Vec::new(), Vec::new())
-    } else {
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = Expression::Infix(InfixExpression::new(
-                Token::new(TokenType::Keyword, "AND", Position::default()),
-                Box::new(combined),
-                "AND".to_string(),
-                Box::new(cond),
-            ));
-        }
-        (Some(combined), excluded_right_indices, join_column_renames)
+    match combine_predicates_with_and(conditions) {
+        None => (None, Vec::new(), Vec::new()),
+        combined => (combined, excluded_right_indices, join_column_renames),
     }
 }
 
