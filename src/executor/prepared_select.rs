@@ -46,9 +46,9 @@ use crate::storage::traits::{
 
 use super::aggregation::{
     aggregate_alias_key, aggregate_extra_args, aggregate_group_key, aggregate_slot_keys,
-    check_grouped_reads, compile_over_slots, grouped_item, grouping_items, ungrouped_column,
-    AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, Modifiers, RowSource,
-    SqlAggregateFunction, COUNT_STAR,
+    check_grouped_reads, compile_over_slots, group_item_read, grouped_item, grouping_items,
+    ungrouped_column, AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, Modifiers,
+    RowSource, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -9242,18 +9242,7 @@ impl PreparedGrouped {
         let item_keys = aggregate_slot_keys(&group_items, &[], &stmt.columns);
         let item_ctx = CompileContext::new(&item_names, global_registry());
         let item_of = |column: usize, reference: &Expression| -> Option<usize> {
-            let holding: SmallVec<[usize; 2]> = (0..held.len())
-                .filter(|&item| held[item] == Some(column))
-                .collect();
-            let output = item_keys.get(&ExprKey::of(reference)).copied().or_else(|| {
-                item_ctx
-                    .reference(reference)
-                    .and_then(|reference| reference.row_column())
-                    .map(usize::from)
-            });
-            output
-                .filter(|item| holding.contains(item))
-                .or(holding.first().copied())
+            group_item_read(reference, column, &held, &item_keys, &item_ctx)
         };
         let slots_ctx = CompileContext::bound(global_registry());
         let mut holes = Vec::with_capacity(blocks.subqueries.len());

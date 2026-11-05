@@ -86,6 +86,31 @@ struct RowPrograms<'a> {
     blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
+/// The prefix of the name a window function's result column carries inside
+/// the executor: unwritable, so no column a statement names shares it
+const WINDOW_COLUMN: &str = "\u{0}wf#";
+
+/// The base column a column reference `expr` reads: the slot of the GROUP
+/// BY item it reads when the rows are groups, else the column of its name
+fn base_column(
+    expr: &Expression,
+    col_index_map: &StringMap<usize>,
+    group_slots: &FxHashMap<ExprKey, usize>,
+) -> Option<usize> {
+    if let Some(&slot) = group_slots.get(&ExprKey::of(expr)) {
+        return Some(slot);
+    }
+    match expr {
+        Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
+        Expression::QualifiedIdentifier(qid) => qualified_index(
+            col_index_map,
+            &qid.qualifier.value_lower,
+            &qid.name.value_lower,
+        ),
+        _ => None,
+    }
+}
+
 /// `expr` over `columns` as [`RowPrograms`] compiles it
 fn row_program(
     expr: &Expression,
@@ -708,8 +733,7 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, qualified_index, qualified_key_index,
-    split_qualified,
+    get_table_alias_from_expr, item_name, qualified, qualified_index, split_qualified,
 };
 use super::volatility::{expression_volatility, read_once, window_count_argument, FRAME_OFFSET};
 use super::Executor;
@@ -1973,9 +1997,16 @@ impl Executor {
                     SelectItemSource::WindowFunction(name) => {
                         CompiledItem::WindowFunction(name.as_str())
                     }
-                    SelectItemSource::Expression(expr) => CompiledItem::Expression(
-                        RowPrograms::compile([expr], base_columns, None, ctx, blocks, held)?,
-                    ),
+                    SelectItemSource::Expression(expr) => {
+                        CompiledItem::Expression(RowPrograms::compile(
+                            [expr],
+                            base_columns,
+                            Some(group_slots),
+                            ctx,
+                            blocks,
+                            held,
+                        )?)
+                    }
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
                         let transformed =
@@ -1987,7 +2018,7 @@ impl Executor {
                         let eval = RowPrograms::compile(
                             [&transformed],
                             &ext_columns,
-                            None,
+                            Some(group_slots),
                             ctx,
                             blocks,
                             held,
@@ -2337,9 +2368,11 @@ impl Executor {
                             source: SelectItemSource::WindowFunction(key),
                         });
                         wf_idx += 1;
-                    } else if let Expression::Identifier(id) = aliased.expression.as_ref() {
-                        // Aliased column reference - use pre-computed lowercase
-                        if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
+                    } else if let Expression::Identifier(_) = aliased.expression.as_ref() {
+                        // Aliased column reference
+                        if let Some(idx) =
+                            base_column(&aliased.expression, &col_index_map, group_slots)
+                        {
                             items.push(SelectItem {
                                 output_name: aliased.alias.value.to_string(),
                                 source: SelectItemSource::BaseColumn(idx),
@@ -2365,7 +2398,7 @@ impl Executor {
                                 let name = if wf_idx < window_functions.len() {
                                     window_functions[wf_idx].column_name.to_lowercase()
                                 } else {
-                                    format!("__wf_{}", wf_idx)
+                                    format!("{WINDOW_COLUMN}{wf_idx}")
                                 };
                                 wf_names.push(name);
                                 wf_idx += 1;
@@ -2408,8 +2441,8 @@ impl Executor {
                     source: SelectItemSource::BaseColumn(column.index as usize),
                 }),
                 Expression::Identifier(id) => {
-                    // Simple column reference - use pre-computed lowercase
-                    if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
+                    // Simple column reference
+                    if let Some(idx) = base_column(col_expr, &col_index_map, group_slots) {
                         items.push(SelectItem {
                             output_name: id.value.to_string(),
                             source: SelectItemSource::BaseColumn(idx),
@@ -2439,9 +2472,8 @@ impl Executor {
                         }
                     }
                 }
-                Expression::QualifiedIdentifier(qid) => {
-                    let (qualifier, name) = (&qid.qualifier.value_lower, &qid.name.value_lower);
-                    if let Some(idx) = qualified_index(&col_index_map, qualifier, name) {
+                Expression::QualifiedIdentifier(_) => {
+                    if let Some(idx) = base_column(col_expr, &col_index_map, group_slots) {
                         items.push(SelectItem {
                             output_name: item_name(col_expr),
                             source: SelectItemSource::BaseColumn(idx),
@@ -2491,7 +2523,7 @@ impl Executor {
                             let name = if wf_idx < window_functions.len() {
                                 window_functions[wf_idx].column_name.to_lowercase()
                             } else {
-                                format!("__wf_{}", wf_idx)
+                                format!("{WINDOW_COLUMN}{wf_idx}")
                             };
                             wf_names.push(name);
                             wf_idx += 1;
@@ -2525,7 +2557,7 @@ impl Executor {
                             let name = if wf_idx < window_functions.len() {
                                 window_functions[wf_idx].column_name.to_lowercase()
                             } else {
-                                format!("__wf_{}", wf_idx)
+                                format!("{WINDOW_COLUMN}{wf_idx}")
                             };
                             wf_names.push(name);
                             wf_idx += 1;
@@ -2573,7 +2605,7 @@ impl Executor {
                     // Two unaliased windows of the same function would share a
                     // name; the internal one is unique, the output keeps the
                     // function's own
-                    wf_info.column_name = format!("__wf_{}_0", col_idx);
+                    wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_0");
                     window_functions.push(wf_info);
                     col_idx += 1;
                 }
@@ -2586,7 +2618,7 @@ impl Executor {
                         )?;
                         // The alias is only the output name; the internal name
                         // cannot collide with an alias or another window
-                        wf_info.column_name = format!("__wf_{}_0", col_idx);
+                        wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_0");
                         window_functions.push(wf_info);
                     } else {
                         // Collect ALL window functions in the expression
@@ -2601,7 +2633,7 @@ impl Executor {
                                 &stmt.window_defs,
                                 read,
                             )?;
-                            wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
+                            wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_{i}");
                             window_functions.push(wf_info);
                         }
                     }
@@ -2616,7 +2648,7 @@ impl Executor {
                             &stmt.window_defs,
                             read,
                         )?;
-                        wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
+                        wf_info.column_name = format!("{WINDOW_COLUMN}{col_idx}_{i}");
                         window_functions.push(wf_info);
                     }
                     col_idx += 1;
@@ -2734,9 +2766,10 @@ impl Executor {
 
         match expr {
             Expression::Window(_) => {
+                let unknown = format!("{WINDOW_COLUMN}unknown");
                 let name = wf_names
                     .get(*counter)
-                    .map_or("__wf_unknown", |s| s.as_str());
+                    .map_or(unknown.as_str(), |s| s.as_str());
                 *counter += 1;
                 let dummy_token = Token::new(TokenType::Identifier, name, Position::new(0, 0, 0));
                 Expression::Identifier(Identifier::new(dummy_token, name.to_string()))
@@ -2958,9 +2991,9 @@ impl Executor {
         let partition_indices: Option<SmallVec<[usize; 4]>> =
             match wf_info.partition_by.len() == wf_info.partition_by_exprs.len() {
                 true => wf_info
-                    .partition_by
+                    .partition_by_exprs
                     .iter()
-                    .map(|part_col| qualified_key_index(col_index_map, &part_col.to_lowercase()))
+                    .map(|expr| base_column(expr, col_index_map, group_slots))
                     .collect(),
                 false => None,
             };
@@ -3769,12 +3802,9 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
     ) -> Option<usize> {
         match expr {
-            Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
-            Expression::QualifiedIdentifier(qid) => qualified_index(
-                col_index_map,
-                &qid.qualifier.value_lower,
-                &qid.name.value_lower,
-            ),
+            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                base_column(expr, col_index_map, group_slots)
+            }
             // A group item or aggregate computed before the window reads its slot,
             // and a derived table's aggregate column the name it carries
             _ => (!group_slots.is_empty())
@@ -3824,15 +3854,7 @@ impl Executor {
         // or names no column, which the compiled path reports
         let order_by_indices: Option<Vec<usize>> = order_by
             .iter()
-            .map(|ob| match &ob.expression {
-                Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
-                Expression::QualifiedIdentifier(qid) => qualified_index(
-                    col_index_map,
-                    &qid.qualifier.value_lower,
-                    &qid.name.value_lower,
-                ),
-                _ => None,
-            })
+            .map(|ob| base_column(&ob.expression, col_index_map, group_slots))
             .collect();
 
         // Pre-allocate columns with exact capacity

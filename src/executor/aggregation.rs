@@ -457,6 +457,27 @@ pub(crate) fn aggregate_slot_keys(
     slots
 }
 
+/// The GROUP BY item a `reference` to the source column `column` reads, of
+/// the items `held` says hold it: the one it is or a SELECT alias of one
+/// names, by `item_keys`, or its name binds to over the items' own names in
+/// `item_names`, else the first
+pub(crate) fn group_item_read(
+    reference: &Expression,
+    column: usize,
+    held: &[Option<usize>],
+    item_keys: &FxHashMap<ExprKey, usize>,
+    item_names: &super::expression::CompileContext<'_>,
+) -> Option<usize> {
+    let holds = |item: &usize| held.get(*item) == Some(&Some(column));
+    let named = item_keys.get(&ExprKey::of(reference)).copied().or_else(|| {
+        item_names
+            .reference(reference)
+            .and_then(|reference| reference.row_column())
+            .map(usize::from)
+    });
+    named.filter(holds).or_else(|| (0..held.len()).find(holds))
+}
+
 /// The qualifier and name of the column `item` groups by, as written; None
 /// for an item grouped by any other expression
 fn column_parts(item: &GroupByItem) -> Option<(Option<&str>, &str)> {
@@ -505,6 +526,17 @@ fn grouping_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
     }
     let _ = super::prepared_select::for_each_child(expr, &mut |child| {
         grouping_calls(child, out);
+        Ok(())
+    });
+}
+
+/// The column references `expr` writes outside its subqueries, at any depth
+fn column_refs<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
+    if let Expression::Identifier(_) | Expression::QualifiedIdentifier(_) = expr {
+        return out.push(expr);
+    }
+    let _ = super::prepared_select::for_each_child(expr, &mut |child| {
+        column_refs(child, out);
         Ok(())
     });
 }
@@ -1975,7 +2007,17 @@ impl Executor {
         // Names find the result columns that bare names and aliases point at
         let agg_col_index_map = build_column_index_map(&agg_columns);
         // Identities find the slot of each group item and aggregate, however it is named
-        let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
+        let mut slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
+        let item_names = agg_columns
+            .get(..group_by_columns.len())
+            .unwrap_or_default();
+        Self::bind_group_columns(
+            stmt,
+            source_columns,
+            &group_by_columns,
+            item_names,
+            &mut slot_keys,
+        );
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
 
         // Check if we have any expressions that need post-processing
@@ -2052,6 +2094,17 @@ impl Executor {
 
         for col_expr in columns_to_use {
             final_columns.push(item_name(col_expr));
+            // A column a GROUP BY item reads is that item's slot, whatever
+            // name another result column carries
+            if let Some(slot) = match col_expr {
+                Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                    slot_of(col_expr).filter(|&slot| slot < group_by_columns.len())
+                }
+                _ => None,
+            } {
+                column_sources.push(ColumnSource::AggSlot(slot));
+                continue;
+            }
             match col_expr {
                 Expression::Identifier(id) => {
                     // A name no result column carries may be another alias of a shared slot
@@ -2317,6 +2370,58 @@ impl Executor {
         named.filter(|_| alike)
     }
 
+    /// Binds in `slots` each column `stmt`'s SELECT list, ORDER BY and window
+    /// definitions read of `source` that a GROUP BY item of `items`, named
+    /// `names`, holds to that item's slot: no alias takes its place
+    fn bind_group_columns(
+        stmt: &SelectStatement,
+        source: &[String],
+        items: &[GroupByItem],
+        names: &[String],
+        slots: &mut FxHashMap<ExprKey, usize>,
+    ) {
+        let mut refs = Vec::new();
+        let order = stmt.order_by.iter().map(|o| &o.expression);
+        let defs = stmt.window_defs.iter().flat_map(|w| w.expressions());
+        for expr in stmt.columns.iter().chain(order).chain(defs) {
+            column_refs(expr, &mut refs);
+        }
+        let registry = crate::functions::registry::global_registry();
+        let source = super::expression::CompileContext::new(source, registry);
+        let column_of = |reference: &Expression| {
+            source
+                .reference(reference)
+                .and_then(|reference| reference.row_column())
+                .map(usize::from)
+        };
+        let held: Vec<Option<usize>> = items
+            .iter()
+            .map(|item| match item {
+                GroupByItem::Column(name) => column_of(&Expression::Identifier(
+                    crate::parser::ast::Identifier::new(
+                        crate::parser::token::Token::new(
+                            crate::parser::token::TokenType::Identifier,
+                            name,
+                            crate::parser::token::Position::default(),
+                        ),
+                        name.as_str(),
+                    ),
+                )),
+                GroupByItem::Expression { expr, .. } => column_of(expr),
+            })
+            .collect();
+        let item_keys = aggregate_slot_keys(items, &[], &stmt.columns);
+        let item_names = super::expression::CompileContext::new(names, registry);
+        for reference in refs {
+            let Some(column) = column_of(reference) else {
+                continue;
+            };
+            if let Some(at) = group_item_read(reference, column, &held, &item_keys, &item_names) {
+                slots.insert(ExprKey::of(reference), at);
+            }
+        }
+    }
+
     /// The ORDER BY of an aggregate that orders its own input, with the
     /// NULLS placement the query asked for
     pub(crate) fn aggregate_order_keys(
@@ -2391,6 +2496,8 @@ impl Executor {
         let (columns, rows, items) =
             self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
         let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
+        let item_names = columns.get(..items.len()).unwrap_or_default();
+        Self::bind_group_columns(stmt, base_columns, &items, item_names, &mut slots);
         if stmt.group_by.modifier != GroupByModifier::None {
             let mut calls = Vec::new();
             let order = stmt.order_by.iter().map(|o| &o.expression);
