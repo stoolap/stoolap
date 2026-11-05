@@ -967,40 +967,24 @@ impl ExprVM {
                 // LOGICAL OPERATIONS
                 // =============================================================
                 Op::And(jump_target) => {
-                    // Short-circuit AND: if top is false, jump
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    match top {
-                        Value::Boolean(false) => {
-                            // Result is false, jump to target
+                    // Short-circuit AND: a left operand read as false is the answer
+                    match stack.last_mut() {
+                        Some(top) if Self::to_tribool(top) == Some(false) => {
+                            *top = Value::Boolean(false);
                             pc = *jump_target as usize;
                         }
-                        Value::Null(_) => {
-                            // Need to evaluate right side to check for false
-                            pc += 1;
-                        }
-                        _ => {
-                            // True or truthy, continue to evaluate right side
-                            pc += 1;
-                        }
+                        _ => pc += 1,
                     }
                 }
 
                 Op::Or(jump_target) => {
-                    // Short-circuit OR: if top is true, jump
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    match top {
-                        Value::Boolean(true) => {
-                            // Result is true, jump to target
+                    // Short-circuit OR: a left operand read as true is the answer
+                    match stack.last_mut() {
+                        Some(top) if Self::to_tribool(top) == Some(true) => {
+                            *top = Value::Boolean(true);
                             pc = *jump_target as usize;
                         }
-                        Value::Null(_) => {
-                            // Need to evaluate right side to check for true
-                            pc += 1;
-                        }
-                        _ => {
-                            // False or falsy, continue to evaluate right side
-                            pc += 1;
-                        }
+                        _ => pc += 1,
                     }
                 }
 
