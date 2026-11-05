@@ -124,6 +124,29 @@ fn a_grouped_column_named_like_a_select_alias_reads_the_column() {
 }
 
 #[test]
+fn a_grouped_column_named_with_a_final_sigma_reads_the_column() {
+    let db = Database::open("memory://aggregate_alias_group_column_sigma").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \"ΟΣ\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 1, 10), (2, 2, 10), (3, 3, 20)",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT SUM(a) AS \"ος\", \"ος\", (SELECT 1) FROM t GROUP BY t.\"ος\" ORDER BY 2";
+    for prepared in [false, true] {
+        assert_eq!(
+            rows(&db, sql, prepared),
+            vec![row(&[3, 10, 1]), row(&[3, 20, 1])],
+            "prepared {prepared}: {sql}"
+        );
+    }
+}
+
+#[test]
 fn a_grouped_column_named_like_a_window_result_reads_the_column() {
     let db = open("window_name");
     db.execute(

@@ -145,6 +145,14 @@ required-features = ["ann-benchmark"]
 debug = "limited"       # Faster incremental builds, keeps file:line backtraces
 split-debuginfo = "unpacked"     # Faster incremental linking on macOS
 
+# Tests keep debug assertions and overflow checks but run optimized code:
+# data-heavy tests run about five times faster, a rebuild takes longer
+[profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

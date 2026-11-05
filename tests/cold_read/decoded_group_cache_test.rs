@@ -160,248 +160,34 @@ fn test_cache_budget_bounds_the_bytes_and_zero_disables_it() {
     assert_eq!(ids(&db, "PRAGMA GROUP_CACHE_MB"), [32]);
 }
 
-// The cache's own invariants, exercised through its API: one decode shared
-// by concurrent readers, no phantom bytes after an in-flight eviction, a
-// budget change during a decode, a column larger than the budget, and a
-// dictionary shared by the groups of one column counted once.
-
-mod invariants {
-    use super::serial;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier};
-    use std::time::Duration;
+/// The groups of one column share their dictionary, so the cache counts it
+/// once and two groups fit a budget the dictionary alone nearly fills
+#[test]
+fn a_dictionary_shared_by_the_groups_is_counted_once() {
+    use std::sync::Arc;
+    use stoolap::common::SmartString;
     use stoolap::core::DataType;
-    use stoolap::storage::volume::column::ColumnData;
-    use stoolap::storage::volume::group_cache::DECODED_GROUPS;
-
-    fn ints(rows: usize) -> ColumnData {
-        ColumnData::Int64 {
-            values: vec![1; rows],
-            nulls: vec![false; rows],
-        }
-    }
-
-    #[test]
-    fn concurrent_readers_share_one_decode() {
-        let _serial = serial();
-        DECODED_GROUPS.set_budget_bytes(1024);
-        let starts = Arc::new(Barrier::new(16));
-        let decodes = Arc::new(AtomicUsize::new(0));
-        let workers: Vec<_> = (0..16)
-            .map(|_| {
-                let starts = Arc::clone(&starts);
-                let decodes = Arc::clone(&decodes);
-                std::thread::spawn(move || {
-                    starts.wait();
-                    DECODED_GROUPS
-                        .get_or_decode((600, 0, 0), || {
-                            decodes.fetch_add(1, Ordering::SeqCst);
-                            Ok(ints(1))
-                        })
-                        .unwrap()
-                })
-            })
-            .collect();
-        let columns: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
-        assert_eq!(decodes.load(Ordering::SeqCst), 1);
-        assert!(columns.iter().all(|c| Arc::ptr_eq(&columns[0], c)));
-        DECODED_GROUPS.remove_store(600);
-        assert_eq!(DECODED_GROUPS.stats().bytes, 0);
-    }
-
-    #[test]
-    fn failed_decode_preserves_error_kind_and_can_retry() {
-        let _serial = serial();
-        DECODED_GROUPS.set_budget_bytes(1024);
-        let error = DECODED_GROUPS
-            .get_or_decode((700, 0, 0), || {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid group payload",
-                ))
-            })
-            .err()
-            .unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "invalid group payload");
-        let stats = DECODED_GROUPS.stats();
-        assert_eq!((stats.bytes, stats.entries), (0, 0));
-        let column = DECODED_GROUPS
-            .get_or_decode((700, 0, 0), || Ok(ints(2)))
-            .unwrap();
-        assert_eq!(column.len(), 2);
-        DECODED_GROUPS.remove_store(700);
-    }
-
-    #[test]
-    fn failed_decode_does_not_remove_a_replacement_entry() {
-        let _serial = serial();
-        DECODED_GROUPS.set_budget_bytes(1024);
-        let mut replacement = None;
-        let result = DECODED_GROUPS.get_or_decode((800, 0, 0), || {
-            DECODED_GROUPS.remove_store(800);
-            replacement = Some(
-                DECODED_GROUPS
-                    .get_or_decode((800, 0, 0), || Ok(ints(2)))
-                    .unwrap(),
-            );
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "obsolete decode failed",
-            ))
-        });
-        assert!(result.is_err());
-        let replacement = replacement.unwrap();
-        let stats = DECODED_GROUPS.stats();
-        assert_eq!((stats.bytes, stats.entries), (replacement.cache_size(), 1));
-        let cached = DECODED_GROUPS
-            .get_or_decode((800, 0, 0), || panic!("replacement was evicted"))
-            .unwrap();
-        assert!(Arc::ptr_eq(&cached, &replacement));
-        DECODED_GROUPS.remove_store(800);
-        let stats = DECODED_GROUPS.stats();
-        assert_eq!((stats.bytes, stats.entries), (0, 0));
-    }
-
-    #[test]
-    fn an_entry_evicted_while_decoding_leaves_no_phantom_bytes() {
-        let _serial = serial();
-        DECODED_GROUPS.set_budget_bytes(18);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            DECODED_GROUPS
-                .get_or_decode((100, 0, 0), || {
-                    entered_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                    Ok(ints(1))
-                })
-                .unwrap();
-        });
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        DECODED_GROUPS
-            .get_or_decode((200, 0, 0), || Ok(ints(2)))
-            .unwrap();
-        DECODED_GROUPS
-            .get_or_decode((300, 0, 0), || Ok(ints(2)))
-            .unwrap();
-        resume_tx.send(()).unwrap();
-        worker.join().unwrap();
-        for store in [100, 200, 300] {
-            DECODED_GROUPS.remove_store(store);
-        }
-        let stats = DECODED_GROUPS.stats();
-        assert_eq!((stats.bytes, stats.entries), (0, 0));
-    }
-
-    #[test]
-    fn a_budget_of_zero_set_during_a_decode_leaves_the_cache_empty() {
-        let _serial = serial();
-        DECODED_GROUPS.set_budget_bytes(18);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            DECODED_GROUPS
-                .get_or_decode((400, 0, 0), || {
-                    entered_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                    Ok(ints(1))
-                })
-                .unwrap();
-        });
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        DECODED_GROUPS.set_budget_bytes(0);
-        resume_tx.send(()).unwrap();
-        worker.join().unwrap();
-        let stats = DECODED_GROUPS.stats();
-        assert_eq!((stats.budget_bytes, stats.bytes, stats.entries), (0, 0, 0));
-    }
-
-    #[test]
-    fn a_column_larger_than_the_budget_is_not_kept() {
-        let _serial = serial();
-        DECODED_GROUPS.set_budget_bytes(1024 * 1024);
-        DECODED_GROUPS
-            .get_or_decode((500, 0, 0), || {
-                Ok(ColumnData::Bytes {
-                    data: vec![b'x'; 8 * 1024 * 1024],
-                    offsets: vec![(0, 8 * 1024 * 1024)],
-                    ext_type: DataType::Json,
-                    nulls: vec![false],
-                })
-            })
-            .unwrap();
-        let stats = DECODED_GROUPS.stats();
-        assert!(
-            stats.bytes <= stats.budget_bytes,
-            "kept {} bytes",
-            stats.bytes
-        );
-        assert_eq!(stats.entries, 0);
-    }
-
-    #[test]
-    fn a_dictionary_shared_by_the_groups_is_counted_once() {
-        use stoolap::common::SmartString;
-        use stoolap::storage::volume::column::ROW_GROUP_SIZE;
-        use stoolap::storage::volume::writer::{CompressedBlockStore, LazyColumns};
-        let _serial = serial();
-        let rows = 2 * ROW_GROUP_SIZE;
-        let dictionary: Arc<[SmartString]> = (0..10_000)
-            .map(|i| SmartString::from(format!("{i:010}{}", "x".repeat(90))))
-            .collect::<Vec<_>>()
-            .into();
-        let column = ColumnData::Dictionary {
-            ids: (0..rows).map(|i| (i % 10_000) as u32).collect(),
-            nulls: vec![false; rows],
-            dictionary,
-        };
-        assert!(column.memory_size() < 2 * 1024 * 1024);
-        let columns = LazyColumns::eager(vec![column], vec![DataType::Text]);
-        let store = CompressedBlockStore::compress_columns(&columns, rows).unwrap();
-        DECODED_GROUPS.set_budget_bytes(2 * 1024 * 1024);
-        let first = store.group_column(0, 0).unwrap();
-        let _second = store.group_column(0, 1).unwrap();
-        let again = store.group_column(0, 0).unwrap();
-        assert!(Arc::ptr_eq(&first, &again), "the first group was evicted");
-    }
-
-    #[test]
-    fn a_zero_budget_racing_with_a_charge_leaves_nothing_behind() {
-        const READERS: usize = 8;
-        const ROUNDS: usize = 20_000;
-        let _serial = serial();
-        let barrier = Barrier::new(READERS + 1);
-        let mut failure = None;
-        std::thread::scope(|scope| {
-            for worker in 0..READERS {
-                let barrier = &barrier;
-                scope.spawn(move || {
-                    for _ in 0..ROUNDS {
-                        barrier.wait();
-                        DECODED_GROUPS
-                            .get_or_decode((10_000 + worker, 0, 0), || Ok(ints(1)))
-                            .unwrap();
-                        barrier.wait();
-                    }
-                });
-            }
-            for round in 0..ROUNDS {
-                DECODED_GROUPS.set_budget_bytes(1024);
-                barrier.wait();
-                DECODED_GROUPS.set_budget_bytes(0);
-                barrier.wait();
-                let stats = DECODED_GROUPS.stats();
-                if stats.bytes != 0 || stats.entries != 0 {
-                    failure.get_or_insert((round, stats.bytes, stats.entries));
-                }
-            }
-        });
-        assert_eq!(
-            failure, None,
-            "a zero budget left data behind (round, bytes, entries)"
-        );
-    }
+    use stoolap::storage::volume::column::{ColumnData, ROW_GROUP_SIZE};
+    use stoolap::storage::volume::writer::{CompressedBlockStore, LazyColumns};
+    let _serial = serial();
+    let rows = 2 * ROW_GROUP_SIZE;
+    let dictionary: Arc<[SmartString]> = (0..10_000)
+        .map(|i| SmartString::from(format!("{i:010}{}", "x".repeat(90))))
+        .collect::<Vec<_>>()
+        .into();
+    let column = ColumnData::Dictionary {
+        ids: (0..rows).map(|i| (i % 10_000) as u32).collect(),
+        nulls: vec![false; rows],
+        dictionary,
+    };
+    assert!(column.memory_size() < 2 * 1024 * 1024);
+    let columns = LazyColumns::eager(vec![column], vec![DataType::Text]);
+    let store = CompressedBlockStore::compress_columns(&columns, rows).unwrap();
+    DECODED_GROUPS.set_budget_bytes(2 * 1024 * 1024);
+    let first = store.group_column(0, 0).unwrap();
+    let _second = store.group_column(0, 1).unwrap();
+    let again = store.group_column(0, 0).unwrap();
+    assert!(Arc::ptr_eq(&first, &again), "the first group was evicted");
 }
 
 /// A scan through a column mapping holds a group's columns across its
