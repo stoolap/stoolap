@@ -156,6 +156,78 @@ fn test_a_listed_volume_whose_file_is_gone_makes_its_table_unavailable() {
 }
 
 #[test]
+fn test_a_hot_row_of_an_unavailable_table_is_refused_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "hot_row_volume");
+    // Rows 5 and 50 change after the checkpoint: the log brings them back hot
+    let no_close_checkpoint = format!("{dsn}?checkpoint_on_close=off");
+    let db = Database::open(&no_close_checkpoint).unwrap();
+    db.execute("UPDATE t SET v = 1 WHERE id = 5", ()).unwrap();
+    db.execute("UPDATE t SET v = 1 WHERE id = 50", ()).unwrap();
+    db.close().unwrap();
+    std::fs::remove_file(&volumes[0]).unwrap();
+    let db = Database::open(&no_close_checkpoint).unwrap();
+    let point = db.prepare("SELECT v FROM t WHERE id = $1").unwrap();
+    for (what, answer) in [
+        ("a point read", run(&db, "SELECT v FROM t WHERE id = 5")),
+        ("a unique read", run(&db, "SELECT v FROM t WHERE w = 50")),
+        (
+            "a prepared point read",
+            point
+                .query((5,))
+                .map_err(|e| e.to_string())
+                .and_then(|rows| {
+                    let mut n = 0;
+                    for row in rows {
+                        row.map_err(|e| e.to_string())?;
+                        n += 1;
+                    }
+                    Ok(n)
+                }),
+        ),
+    ] {
+        match answer {
+            Err(msg) => assert!(
+                msg.contains("'t' is unavailable"),
+                "{what} of a hot row should name the table, got: {msg}"
+            ),
+            Ok(n) => panic!("{what} of a hot row must be refused, it answered {n} rows"),
+        }
+    }
+}
+
+#[test]
+fn test_a_checkpoint_keeps_the_log_of_an_unavailable_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "logged_delete_volume");
+    // Row 7 lives only in t's volumes; its DELETE only in the log
+    let no_close_checkpoint = format!("{dsn}?checkpoint_on_close=off");
+    let db = Database::open(&no_close_checkpoint).unwrap();
+    db.execute("DELETE FROM t WHERE id = 7", ()).unwrap();
+    db.close().unwrap();
+    let intact: Vec<_> = (volumes.iter())
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    for path in &volumes {
+        std::fs::remove_file(path).unwrap();
+    }
+    // A checkpoint and a closing one while t cannot read its volumes
+    let db = Database::open(&dsn).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    for (path, bytes) in &intact {
+        std::fs::write(path, bytes).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    let seven: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE id = 7", ())
+        .unwrap();
+    assert_eq!(seven, 0, "the deleted row stays deleted");
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(rows, ROWS - 1);
+}
+
+#[test]
 fn test_an_unavailable_table_can_be_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let (dsn, volumes) = sealed(dir.path(), "dropped_volume");

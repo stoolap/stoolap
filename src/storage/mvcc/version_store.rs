@@ -1249,6 +1249,9 @@ pub struct VersionStore {
     indexes: RwLock<FxHashMap<String, IndexEntry>>,
     /// Whether this store has been closed
     closed: AtomicBool,
+    /// Whether the open left one of the table's listed volumes unloaded; the
+    /// reads that take no table handle check it here, beside the hot rows
+    cold_unavailable: AtomicBool,
     /// Auto-increment counter for tables without explicit PK
     auto_increment_counter: AtomicI64,
     /// Track which transaction has uncommitted changes to each row
@@ -1460,6 +1463,7 @@ impl VersionStore {
             schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
+            cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
             visibility_checker: checker,
@@ -1500,6 +1504,7 @@ impl VersionStore {
             schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
+            cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
             visibility_checker: checker,
@@ -5884,6 +5889,17 @@ impl VersionStore {
     /// Check if the version store is closed
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Marks the table's volumes incomplete for the rest of the process
+    pub(crate) fn mark_cold_unavailable(&self) {
+        self.cold_unavailable.store(true, Ordering::Release);
+    }
+
+    /// Whether the open left one of the table's listed volumes unloaded
+    #[inline]
+    pub(crate) fn is_cold_unavailable(&self) -> bool {
+        self.cold_unavailable.load(Ordering::Acquire)
     }
 
     // =========================================================================

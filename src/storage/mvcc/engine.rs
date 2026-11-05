@@ -4234,6 +4234,9 @@ impl MVCCEngine {
                 reason.push_str(detail);
             }
             mgr.mark_unavailable(reason);
+            if let Some(store) = self.version_stores.read().unwrap().get(&table) {
+                store.mark_cold_unavailable();
+            }
         }
     }
 
@@ -6223,14 +6226,19 @@ impl MVCCEngine {
                 // Fence acquired — no new commits can start. In-flight commits
                 // finished (they held the read lock, which is now released).
                 // Just check if bulk seal (steps 1-2) drained everything.
-                let all_hot_empty = {
+                // A table missing a listed volume keeps the log its replay read:
+                // a DELETE of a row only that volume holds is recorded nowhere else
+                let (all_hot_empty, any_unavailable) = {
                     let stores = self.version_stores.read().unwrap();
-                    stores
-                        .values()
-                        .all(|store| store.committed_row_count() == 0)
+                    (
+                        stores
+                            .values()
+                            .all(|store| store.committed_row_count() == 0),
+                        stores.values().any(|store| store.is_cold_unavailable()),
+                    )
                 };
 
-                if all_hot_empty && !self.has_incomplete_change() {
+                if all_hot_empty && !any_unavailable && !self.has_incomplete_change() {
                     // All data is in volumes: the cut is the boundary to
                     // publish once the catalog copies are durable
                     if let Some(ref pm) = *self.persistence {
@@ -8801,6 +8809,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
         let store = self.get_version_store(table_name)?;
+        self.check_cold_available(table_name, &store)?;
         let epoch = store.publish_epoch_if_quiet();
         self.fetch_rows_by_ids_in(table_name, &store, row_ids, token, settled, epoch)
     }
@@ -8829,7 +8838,6 @@ impl MVCCEngine {
             crate::test_failpoints::pk_hot_rows_fetched();
             let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
-            mgr.check_available()?;
             // Hot rows found before the truncate count are read again after
             // it, and a truncate around the cold read is waited out and retried;
             // a settled read retries a seal around it too, which removes the
@@ -8885,6 +8893,17 @@ impl MVCCEngine {
         Ok(Some(result))
     }
 
+    /// An error when the open left one of `store`'s listed volumes unloaded:
+    /// a read without a table handle refuses the table as a statement does
+    #[inline]
+    fn check_cold_available(&self, table_name: &str, store: &VersionStore) -> Result<()> {
+        if store.is_cold_unavailable() {
+            self.get_or_create_segment_manager(table_name)
+                .check_available()?;
+        }
+        Ok(())
+    }
+
     /// Row `row_id` in the latest committed state: its hot version as the
     /// chain holds it whatever publishes, one row being read whole; a row
     /// not hot is read settled with the volumes. None sends the caller to a view
@@ -8912,6 +8931,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        self.check_cold_available(table_name, store)?;
         if let Some(hot) = store.get_visible_version(row_id, (INVALID_TRANSACTION_ID + 1).into()) {
             store.check_token(token)?;
             return Ok(Some(crate::core::KeyRows::One(row_id, hot.data)));
@@ -8940,6 +8960,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        self.check_cold_available(table_name, store)?;
         let Some(epoch) = store.publish_epoch_if_quiet() else {
             return Ok(None);
         };
@@ -8975,7 +8996,6 @@ impl MVCCEngine {
         epoch: u64,
     ) -> Result<Option<crate::core::KeyRows>> {
         let mgr = self.get_or_create_segment_manager(table_name);
-        mgr.check_available()?;
         // A seal removes its hot rows before it clears their tombstones: the
         // value is looked up in a settled state, and one a seal moved is let go
         let generation = mgr.settled_seal_generation();
@@ -9032,6 +9052,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
         let store = self.get_version_store(table_name)?;
+        self.check_cold_available(table_name, &store)?;
         let reader = crate::storage::mvcc::version_store::Reader {
             txn_id: INVALID_TRANSACTION_ID + 1,
             view: Some(view),
