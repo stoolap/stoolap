@@ -24,7 +24,7 @@ use stoolap::functions::{
     global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
     ScalarFunction,
 };
-use stoolap::Database;
+use stoolap::{Database, Params};
 
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 static COUNTED: Mutex<()> = Mutex::new(());
@@ -60,9 +60,18 @@ impl ScalarFunction for CountedLength {
 const ROWS: usize = 20;
 
 fn ids(db: &Database, sql: &str, prepared: bool) -> Result<Vec<i64>, String> {
+    ids_with(db, sql, prepared, ())
+}
+
+fn ids_with<P: Params>(
+    db: &Database,
+    sql: &str,
+    prepared: bool,
+    params: P,
+) -> Result<Vec<i64>, String> {
     let rows = match prepared {
-        true => db.prepare(sql).and_then(|stmt| stmt.query(())),
-        false => db.query(sql, ()),
+        true => db.prepare(sql).and_then(|stmt| stmt.query(params)),
+        false => db.query(sql, params),
     };
     rows.and_then(|rows| rows.map(|row| row?.get::<i64>(0)).collect())
         .map_err(|e| e.to_string())
@@ -106,7 +115,13 @@ fn a_fallible_conjunct_waits_for_one_the_scan_leaves_out() {
     db.execute("INSERT INTO t VALUES (1, 'a', $1)", (i64::MIN,))
         .unwrap();
     let sql = "SELECT id FROM t WHERE UPPER(p) LIKE 'Q%' AND ABS(x) >= 0";
+    let with_parameter = "SELECT id FROM t WHERE UPPER(p) LIKE 'Q%' AND ABS(x) >= $1";
     for prepared in [false, true] {
         assert_eq!(ids(&db, sql, prepared), Ok(vec![]), "prepared {prepared}");
+        assert_eq!(
+            ids_with(&db, with_parameter, prepared, (0i64,)),
+            Ok(vec![]),
+            "with a parameter, prepared {prepared}"
+        );
     }
 }

@@ -2598,21 +2598,19 @@ fn bind_aliases(
     }
 }
 
-/// Whether the scan's filter takes `conjunct` whole, judged now when no
-/// run's values change that, after the conjuncts before it; `left_out`
-/// tells whether it left one of them out, and is told
-fn filter_takes(conjunct: &Expression, schema: &Schema, left_out: &mut bool) -> bool {
+/// Whether the scan's filter takes `conjunct` whole after the conjuncts
+/// before it, `taken` when it took them all; None when a run's values
+/// decide that
+fn filter_takes(conjunct: &Expression, schema: &Schema, taken: bool) -> Option<bool> {
     if super::utils::expression_has_parameters(conjunct)
         || expression_volatility(conjunct, global_registry()) != Volatility::Fixed
     {
-        return true;
+        return None;
     }
-    let taken = match pushdown::try_pushdown(conjunct, schema, None) {
-        (Some(filter), false) => pushdown::runs_ahead(&*filter, !*left_out),
+    Some(match pushdown::try_pushdown(conjunct, schema, None) {
+        (Some(filter), false) => pushdown::runs_ahead(&*filter, taken),
         _ => false,
-    };
-    *left_out |= !taken;
-    taken
+    })
 }
 
 /// Whether every column `expr` reads is one the scan compares
@@ -11533,15 +11531,29 @@ impl Builder<'_> {
     ) -> Result<WhereParts> {
         let mut parts = Vec::new();
         conjuncts(where_clause, &mut parts);
-        let mut rewritten = Vec::with_capacity(parts.len());
+        let mut rewritten: Vec<(Expression, bool)> = Vec::with_capacity(parts.len());
         let mut set_tests = Vec::new();
-        let mut left_out = false;
+        let mut left_out = Vec::new();
         for (at, part) in parts.into_iter().enumerate() {
             let part = self.statement_conjunct(chain, part, false, work, run_slots)?;
             let scanned = !mentions_subquery(&part)
                 && !needs_folding(&part)
                 && scans_whole(&part, schema)
-                && filter_takes(&part, schema, &mut left_out);
+                && match filter_takes(&part, schema, left_out.is_empty()) {
+                    Some(taken) => {
+                        if !taken {
+                            left_out.push(at);
+                        }
+                        taken
+                    }
+                    // The filter's AND orders this one after those it left out
+                    None => {
+                        for i in left_out.drain(..) {
+                            rewritten[i].1 = true;
+                        }
+                        true
+                    }
+                };
             let set_test = match &part {
                 Expression::Exists(mark) => Some((&mark.subquery, false, None)),
                 Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Not => {
