@@ -541,6 +541,38 @@ fn column_refs<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
     });
 }
 
+/// A name's qualifier, when its text carries one, and its own name
+fn qualified_parts(name: &str) -> (Option<&str>, &str) {
+    split_qualified(name).map_or((None, name), |(table, name)| (Some(table), name))
+}
+
+/// The columns of `source` that a name of `names` could read, in order:
+/// each one it spells and the first of each table it qualifies, over which
+/// it resolves as it does over all of `source`
+fn columns_named(source: &[String], names: &[(Option<&str>, &str)]) -> Vec<String> {
+    let same = |a: &str, b: &str| {
+        a.chars()
+            .flat_map(char::to_lowercase)
+            .eq(b.chars().flat_map(char::to_lowercase))
+    };
+    let mut tables: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
+    let mut kept = Vec::new();
+    for column in source {
+        let (table, name) = qualified_parts(column);
+        let first_of_table = table.filter(|table| {
+            !tables.iter().any(|seen| same(seen, table))
+                && names.iter().any(|(q, _)| q.is_some_and(|q| same(q, table)))
+        });
+        if let Some(table) = first_of_table {
+            tables.push(table);
+        }
+        if first_of_table.is_some() || names.iter().any(|(_, n)| same(n, name)) {
+            kept.push(column.clone());
+        }
+    }
+    kept
+}
+
 /// Represents a GROUP BY item - either a column reference or an expression
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -2386,8 +2418,30 @@ impl Executor {
         for expr in stmt.columns.iter().chain(order).chain(defs) {
             column_refs(expr, &mut refs);
         }
+        let mut item_refs = Vec::new();
+        for item in items {
+            if let GroupByItem::Expression { expr, .. } = item {
+                column_refs(expr, &mut item_refs);
+            }
+        }
+        let mut spelled: Vec<(Option<&str>, &str)> = refs
+            .iter()
+            .chain(&item_refs)
+            .filter_map(|reference| match reference {
+                Expression::Identifier(id) => Some(qualified_parts(&id.value_lower)),
+                Expression::QualifiedIdentifier(q) => {
+                    Some((Some(q.qualifier.value_lower.as_str()), &q.name.value_lower))
+                }
+                _ => None,
+            })
+            .collect();
+        spelled.extend(items.iter().filter_map(|item| match item {
+            GroupByItem::Column(name) => Some(qualified_parts(name)),
+            GroupByItem::Expression { .. } => None,
+        }));
         let registry = crate::functions::registry::global_registry();
-        let source = super::expression::CompileContext::new(source, registry);
+        let source = columns_named(source, &spelled);
+        let source = super::expression::CompileContext::new(&source, registry);
         let column_of = |reference: &Expression| {
             source
                 .reference(reference)
