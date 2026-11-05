@@ -3259,6 +3259,8 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             let access = write_access(schema, access, Some(expr));
             if let WriteAccess::Key(pk_id) = access {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::key_delete_read();
                 // Direct O(1) lookup by primary key
                 // Use get_local_version to preserve delete signal. txn_versions.get()
                 // swallows deletes as None, causing fallback to committed store and

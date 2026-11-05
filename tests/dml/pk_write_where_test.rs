@@ -150,19 +150,34 @@ fn a_key_write_in_a_transaction_reads_its_own_rows() {
 
 #[cfg(feature = "test-failpoints")]
 #[test]
-fn a_key_write_with_other_conditions_runs_on_the_key_plan() {
+fn a_key_delete_asks_the_where_of_the_version_it_deletes() {
+    let db = open("committed_between");
+    let other = db.clone();
+    stoolap::test_failpoints::before_key_delete_read(move || {
+        other
+            .execute("UPDATE t SET v = 20 WHERE id = 1", ())
+            .unwrap();
+    });
+    let sql = "DELETE FROM t WHERE id = 1 AND v = 10";
+    assert_eq!(db.execute(sql, ()).unwrap(), 0, "{sql}");
+    assert_eq!(rows(&db), vec![(1, Some(20)), (2, None), (3, Some(30))]);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_key_update_with_other_conditions_runs_on_the_key_plan() {
     use std::cell::Cell;
     use std::rc::Rc;
     let db = open("route");
-    for sql in [
-        "UPDATE t SET v = 11 WHERE id = 1 AND v <> 11",
-        "UPDATE t SET v = v + 1 WHERE s = 'c' AND id = 3",
-        "DELETE FROM t WHERE id = 2 AND v IS NULL",
+    for (sql, planned) in [
+        ("UPDATE t SET v = 11 WHERE id = 1 AND v <> 11", true),
+        ("UPDATE t SET v = v + 1 WHERE s = 'c' AND id = 3", true),
+        ("DELETE FROM t WHERE id = 2 AND s = 'b'", false),
     ] {
         let fired = Rc::new(Cell::new(false));
         let hook = Rc::clone(&fired);
         stoolap::test_failpoints::after_compiled_epoch_checked(move || hook.set(true));
         db.execute(sql, ()).unwrap();
-        assert!(fired.get(), "{sql} ran on the key plan");
+        assert_eq!(fired.get(), planned, "{sql} ran on the key plan");
     }
 }

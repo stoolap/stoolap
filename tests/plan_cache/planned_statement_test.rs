@@ -524,15 +524,11 @@ fn explain_names_the_row_a_key_write_reads() {
                 "    PkKey",
             ],
         ),
+        // A DELETE with other conditions the general path runs, asking them
+        // of the version it deletes
         (
             "DELETE FROM t WHERE v = 3 AND id = 2",
-            vec![
-                "Delete t",
-                "  PkGet t id = 2",
-                "    Filter: ((v = 3) AND (id = 2))",
-                "  else IndexScan t ((v = 3) AND (id = 2))",
-                "    PkKey",
-            ],
+            vec!["DELETE FROM t", "  Filter: ((v = 3) AND (id = 2))"],
         ),
         // A key write the general path runs: a parent's delete keeps its
         // children's keys

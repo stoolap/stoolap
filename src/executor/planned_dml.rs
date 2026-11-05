@@ -186,8 +186,9 @@ impl Executor {
         }
     }
 
-    /// The plan of `stmt` when its WHERE is, or ANDs, its table's single-column
-    /// primary key equality and its write needs nothing the general path runs: no
+    /// The plan of `stmt` when its WHERE is its table's single-column primary
+    /// key equality, or for an UPDATE ANDs it with other conditions, and its
+    /// write needs nothing the general path runs: no
     /// RETURNING or WITH, no foreign key to keep, no CHECK reading a column
     /// it sets. An UPDATE of the primary key is refused
     fn dml_plan(
@@ -237,6 +238,8 @@ impl Executor {
         // The row the key names is still asked the whole WHERE, by the VM
         let where_ = match conjuncts.len() {
             1 => None,
+            // The general path's DELETE asks them of the version it deletes
+            _ if matches!(write, DmlWrite::Delete) => return Ok(None),
             _ if Self::expr_contains_subquery(where_clause) => return Ok(None),
             _ => {
                 let compile = super::expression::CompileContext::with_global_registry(
@@ -416,7 +419,14 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::compiled_epoch_checked();
         let DmlWrite::Update(columns) = &plan.write else {
-            return or_normal_path(self.write_planned_dml(plan, key, Vec::new(), &[], ctx, in_txn));
+            return or_normal_path(self.write_planned_dml(
+                plan,
+                key,
+                Vec::new(),
+                &[],
+                None,
+                in_txn,
+            ));
         };
         // Row expressions run per row inside the setter, over its old values
         let mut values = Vec::with_capacity(columns.len());
@@ -497,21 +507,9 @@ impl Executor {
         );
         pk_expr.prepare_for_schema(&plan.schema);
         let access = ScanAccess::Index(&IndexPlan::Key);
-        let written = match (&plan.write, &plan.where_) {
-            (DmlWrite::Delete, None) => table.delete(access, Some(&pk_expr)),
-            // The row the key names goes, as the bare key's does, when the
-            // whole WHERE holds for it
-            (DmlWrite::Delete, Some(where_)) => (|| {
-                let mut vm = super::expression::ExprVM::new();
-                for (_, row) in table.fetch_rows_by_ids(&[key], &pk_expr)? {
-                    let exec_ctx = super::expression::execute_context(&row, ctx, None);
-                    if vm.execute_bool_checked(where_, &exec_ctx)? {
-                        return table.delete(access, Some(&pk_expr));
-                    }
-                }
-                Ok(0)
-            })(),
-            (DmlWrite::Update(_), _) => {
+        let written = match plan.write {
+            DmlWrite::Delete => table.delete(access, Some(&pk_expr)),
+            DmlWrite::Update(_) => {
                 let mut vm = super::expression::ExprVM::new();
                 let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                     if let Some(where_) = &plan.where_ {
