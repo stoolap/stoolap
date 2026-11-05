@@ -81,7 +81,7 @@ Project id, name
 
 A run inside a transaction, or one while a commit is publishing to the table, takes the read after `else`.
 
-An UPDATE or DELETE whose WHERE is the primary key's equality reads its row the same way, when it has no RETURNING or WITH, keeps no foreign key, and runs no CHECK on a column it sets. Its SET values show in column order:
+An UPDATE or DELETE whose WHERE is the primary key's equality, alone or ANDed with other conditions, reads its row the same way, when it has no RETURNING or WITH, keeps no foreign key, and runs no CHECK on a column it sets. Its SET values show in column order:
 
 ```sql
 EXPLAIN UPDATE users SET email = 'new@example.com' WHERE id = 1;
@@ -94,6 +94,23 @@ plan
 Update users SET email = 'new@example.com'
   PkGet users id = 1
   else IndexScan users (id = 1)
+    PkKey
+```
+
+A WHERE that ANDs the key's equality with other conditions takes the same plan. The row the key names is written only when the whole WHERE holds for it, which the `Filter` line shows:
+
+```sql
+EXPLAIN UPDATE users SET email = 'new@example.com' WHERE id = 1 AND email <> 'new@example.com';
+```
+
+Output:
+```
+plan
+----
+Update users SET email = 'new@example.com'
+  PkGet users id = 1
+    Filter: ((id = 1) AND (email <> 'new@example.com'))
+  else IndexScan users ((id = 1) AND (email <> 'new@example.com'))
     PkKey
 ```
 

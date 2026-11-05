@@ -514,6 +514,26 @@ fn explain_names_the_row_a_key_write_reads() {
                 "    PkKey",
             ],
         ),
+        (
+            "UPDATE t SET v = 1 WHERE id = $1 AND v <> 1",
+            vec![
+                "Update t SET v = 1",
+                "  PkGet t id = $1",
+                "    Filter: ((id = $1) AND (v <> 1))",
+                "  else IndexScan t ((id = $1) AND (v <> 1))",
+                "    PkKey",
+            ],
+        ),
+        (
+            "DELETE FROM t WHERE v = 3 AND id = 2",
+            vec![
+                "Delete t",
+                "  PkGet t id = 2",
+                "    Filter: ((v = 3) AND (id = 2))",
+                "  else IndexScan t ((v = 3) AND (id = 2))",
+                "    PkKey",
+            ],
+        ),
         // A key write the general path runs: a parent's delete keeps its
         // children's keys
         (
