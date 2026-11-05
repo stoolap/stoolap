@@ -4807,6 +4807,13 @@ struct KeyedPlan {
     checked: bool,
 }
 
+impl KeyedPlan {
+    /// Whether the WHERE asks more than the keys
+    fn asks_more(&self) -> bool {
+        !self.pushdown.is_empty() || !self.pushed_whole
+    }
+}
+
 /// `column operator value` with the column resolved at preparation; only
 /// the value is bound per call
 #[derive(Debug, Clone)]
@@ -14221,6 +14228,9 @@ struct BlockState {
     answered: RefCell<Option<(u64, BlockAnswer)>>,
     /// A keyed EXISTS or IN block's choice, once made
     keyed_choice: std::cell::Cell<Option<bool>>,
+    /// The candidates its probes may still read in this run, when its WHERE
+    /// asks more than its keys
+    probe_left: std::cell::Cell<Option<usize>>,
     keyed_set: RefCell<Option<CompactArc<ExistsKeys>>>,
     /// A value block's members: an uncorrelated block's, or a keyed IN
     /// block's grouped by key, set once per run
@@ -14399,6 +14409,7 @@ impl<'a> PreparedRunner<'a> {
                     fills: std::cell::Cell::new(0),
                     answered: RefCell::new(None),
                     keyed_choice: std::cell::Cell::new(None),
+                    probe_left: std::cell::Cell::new(None),
                     keyed_set: RefCell::new(None),
                     members: std::cell::OnceCell::new(),
                     read_error: RefCell::new(None),
@@ -15531,18 +15542,67 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// Whether this run answers the block by its keyed set: decided on its
-    /// first call, by the rule the general path's index nested loop uses
+    /// first call, by the rule the general path's index nested loop uses,
+    /// and taken from the call whose key a probe could not read within budget
     fn takes_keyed_set(&self, index: usize, plan: &KeyedPlan) -> bool {
-        if let Some(keyed) = self.blocks[index].keyed_choice.get() {
+        let block = &self.blocks[index];
+        let keyed = match block.keyed_choice.get() {
+            Some(keyed) => keyed,
+            None => {
+                #[cfg(feature = "test-failpoints")]
+                let forced = crate::test_failpoints::forced_exists_strategy();
+                #[cfg(not(feature = "test-failpoints"))]
+                let forced: Option<bool> = None;
+                let keyed = forced.unwrap_or_else(|| !self.probe_cheaper(index, plan));
+                let table = self.tables[index].as_ref().and_then(BlockInput::table);
+                let budget = table
+                    .filter(|_| !keyed && forced.is_none() && plan.asks_more())
+                    .map(block_plan::probe_budget);
+                block.probe_left.set(budget);
+                block.keyed_choice.set(Some(keyed));
+                keyed
+            }
+        };
+        if keyed || self.probe_within_budget(index, plan) {
             return keyed;
         }
-        #[cfg(feature = "test-failpoints")]
-        let forced = crate::test_failpoints::forced_exists_strategy();
-        #[cfg(not(feature = "test-failpoints"))]
-        let forced: Option<bool> = None;
-        let keyed = forced.unwrap_or_else(|| !self.probe_cheaper(index, plan));
-        self.blocks[index].keyed_choice.set(Some(keyed));
-        keyed
+        block.keyed_choice.set(Some(true));
+        true
+    }
+
+    /// Whether the call the buffer holds probes within the run's budget,
+    /// charged with its key's candidates counted before any is copied; a key
+    /// past it, or one the table cannot count, leaves the run to the set
+    fn probe_within_budget(&self, index: usize, plan: &KeyedPlan) -> bool {
+        let block = &self.blocks[index];
+        let Some(left) = block.probe_left.get() else {
+            return true;
+        };
+        let Some(table) = self.tables[index].as_ref().and_then(BlockInput::table) else {
+            return false;
+        };
+        let (own, slot, _) = plan.keys[0];
+        let params = block.buffer.borrow();
+        let key = &params[slot];
+        if key.is_null() {
+            return true;
+        }
+        let mut held = block.count_ids.borrow_mut();
+        let (ids, scratch) = &mut **held.get_or_insert_with(Box::default);
+        ids.clear();
+        let column = &self.prepared.subqueries[index].schema.columns[own].name;
+        let within = match table.equality_candidates(column, key, left, ids, scratch) {
+            Ok(Some(CappedEqual::Copied)) => {
+                block.probe_left.set(Some(left - ids.len()));
+                true
+            }
+            _ => false,
+        };
+        // A key that held many rows does not keep their room for every call
+        if ids.capacity() > COUNT_IDS_KEPT {
+            *ids = Vec::new();
+        }
+        within
     }
 
     /// Whether the keyed set answers the call the buffer holds: each key
@@ -15581,7 +15641,7 @@ impl<'a> PreparedRunner<'a> {
             &sq.schema.columns[plan.keys[0].0].name,
             self.statement_limit.filter(|_| sq.parent.is_none()),
             parent_rows,
-            !plan.pushdown.is_empty() || !plan.pushed_whole,
+            plan.asks_more(),
         )
     }
 

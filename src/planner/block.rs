@@ -47,7 +47,8 @@ pub(crate) fn small_probe_limit(limit: Option<i64>) -> bool {
 /// cheaply than it builds a set: for a small LIMIT or few outer rows,
 /// since a probe per outer row costs about what a set pays for sixteen
 /// inner rows, and only when an index answers the probe. A WHERE that asks
-/// more than the key (`rest`) reads every candidate of a key it rejects
+/// more than the key (`rest`) is probed only over hot rows, within
+/// [`probe_budget`]
 pub(crate) fn probe_cheaper(
     table: &dyn Table,
     column: &str,
@@ -58,23 +59,15 @@ pub(crate) fn probe_cheaper(
     let few_outer =
         outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
     (small_probe_limit(outer_limit) || few_outer)
-        && (!rest || few_candidates(table, column, outer_rows))
+        && !(rest && table.has_sealed_rows())
         && exists_probes(table, column)
 }
 
-/// Whether the outer rows' probes read fewer candidates than the set reads
-/// rows: each reads a key's share of the rows, and a candidate costs a probe
-/// about four times what the set pays for a row. The keys are counted only
-/// where the index holds every row
-fn few_candidates(table: &dyn Table, column: &str, outer_rows: Option<usize>) -> bool {
-    let distinct = (!table.has_sealed_rows())
-        .then(|| table.get_index_on_column(column))
-        .flatten()
-        .and_then(|index| index.distinct_keys_hint());
-    match (outer_rows, distinct) {
-        (Some(rows), Some(distinct)) => rows.saturating_mul(4) <= distinct,
-        _ => false,
-    }
+/// The candidates a run's probes of a WHERE asking more than the key may
+/// read in all, each key's every candidate where the rest rejects them: a
+/// candidate costs a probe about four times what the keyed set pays for a row
+pub(crate) fn probe_budget(table: &dyn Table) -> usize {
+    table.row_count_hint() / 4
 }
 
 fn exists_probes(table: &dyn Table, column: &str) -> bool {

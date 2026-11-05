@@ -1124,13 +1124,6 @@ impl Index for BTreeIndex {
         sorted_values.keys().map(|arc| (**arc).clone()).collect()
     }
 
-    fn distinct_keys_hint(&self) -> Option<usize> {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return None;
-        }
-        Some(self.sorted_values.read().len())
-    }
-
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return None;

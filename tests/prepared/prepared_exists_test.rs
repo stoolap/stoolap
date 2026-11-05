@@ -313,40 +313,64 @@ fn test_the_rule_probes_for_few_outer_rows_or_a_small_limit_on_an_index() {
     // Five outer rows against five inner ones, no LIMIT: the set
     let few = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k) ORDER BY id";
     assert!(keyed(few, vec![1, 2, 4]), "{few}");
-    // More than the keys in the WHERE over seven keys: five probes would read
-    // a seventh of the rows each, so the set
-    let more =
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM big WHERE big.k = t.k AND big.v > 0) ORDER BY id";
-    assert!(keyed(more, vec![1, 2, 4, 5]), "{more}");
 }
 
 #[test]
-fn test_a_where_asking_more_than_its_keys_probes_only_over_many_keys() {
+fn test_a_where_asking_more_than_its_keys_probes_within_its_candidates() {
     let _guard = serial();
     let db = Database::open("memory://prepared_exists_probe_keys").unwrap();
     for sql in [
         "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
-        "CREATE TABLE one (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
-        "CREATE TABLE many (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
-        "CREATE INDEX one_k ON one (k)",
-        "CREATE INDEX many_k ON many (k)",
+        "CREATE TABLE ones (id INTEGER PRIMARY KEY, k INTEGER)",
         "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
-        "INSERT INTO one SELECT value, 1, 1 FROM generate_series(1, 400)",
-        "INSERT INTO many SELECT value, value % 200, 1 FROM generate_series(1, 400)",
+        "INSERT INTO ones SELECT value, 1 FROM generate_series(1, 20)",
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // Twenty outer rows: a probe per row over one key reads all 400 rows
-    // each time, over 200 keys two
-    for (inner, probes) in [("one", false), ("many", true)] {
+    // 2,000 rows each, so the probes may read 500 candidates in all
+    for (inner, k) in [
+        ("one", "1"),
+        ("many", "value % 200"),
+        (
+            "dense",
+            "CASE WHEN value <= 1801 THEN 1 ELSE value - 1800 END",
+        ),
+        (
+            "heavy_last",
+            "CASE WHEN value <= 190 THEN 1 + value % 19 ELSE 20 END",
+        ),
+    ] {
+        for sql in [
+            format!("CREATE TABLE {inner} (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)"),
+            format!("CREATE INDEX {inner}_k ON {inner} (k)"),
+            format!("INSERT INTO {inner} SELECT value, {k}, 1 FROM generate_series(1, 2000)"),
+        ] {
+            db.execute(&sql, ()).unwrap();
+        }
+    }
+    for (outer, inner, probes, built) in [
+        // Every row under one key: the first key is past the budget
+        ("o", "one", false, true),
+        // Ten rows a key: twenty probes read 200
+        ("o", "many", true, false),
+        // 200 keys, but every outer row asks the one holding 1,801 rows
+        ("ones", "dense", false, true),
+        // Nineteen keys of ten rows, then the key of 1,810: the set from there
+        ("o", "heavy_last", true, true),
+    ] {
         let sql = format!(
-            "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM {inner} WHERE {inner}.k = o.k AND {inner}.v > 5)"
+            "SELECT id FROM {outer} WHERE EXISTS \
+             (SELECT 1 FROM {inner} WHERE {inner}.k = {outer}.k AND {inner}.v > 5)"
         );
-        let (before, built, _) = prepared_exists_counts();
+        let (before, built_before, _) = prepared_exists_counts();
         assert_eq!(ids(&db, &sql), Vec::<i64>::new(), "{sql}");
-        let (after, after_built, _) = prepared_exists_counts();
+        let (after, built_after, _) = prepared_exists_counts();
         assert_eq!(after > before, probes, "{sql} probes");
-        assert_eq!(after_built > built, !probes, "{sql} builds the keyed set");
+        assert_eq!(
+            built_after > built_before,
+            built,
+            "{sql} builds the keyed set"
+        );
     }
 }
 
