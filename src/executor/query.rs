@@ -487,9 +487,9 @@ use super::utils::{
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, flatten_and_predicates,
     flip_operator, for_each_qualified_star_column, get_table_alias_from_expr, index_join_residual,
-    infix_to_operator, item_name, order_by_names_an_alias, qualified, qualified_index, shown_name,
-    split_qualified, strip_table_qualifier, substitute_filter_column, visit_column_refs,
-    where_without_aggregates,
+    infix_to_operator, item_name, needed_columns, order_by_names_an_alias, qualified,
+    qualified_index, shown_name, split_qualified, strip_table_qualifier, substitute_filter_column,
+    visit_column_refs, where_without_aggregates,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::WindowOutput;
@@ -3705,6 +3705,12 @@ impl Executor {
                 })
                 .0;
             let on = natural.as_ref().or(join_source.condition.as_deref());
+            // A table side's scan reads only the columns the statement names
+            let lower: Vec<String> = (spelled.iter().flatten())
+                .map(|(_, name)| name.to_lowercase())
+                .collect();
+            let filters = stmt.where_clause.as_deref().into_iter().chain(on);
+            let needed = needed_columns(stmt, filters, &lower);
             let opened = cross.map(|cross| {
                 Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
             });
@@ -3744,7 +3750,7 @@ impl Executor {
                 [&select, &keys, &distinct],
                 |star| joined_aliases(stmt, &columns, star),
                 sides,
-                columns.len(),
+                (columns.len(), needed),
                 ctx,
             )?;
             if let Some(blocks) = blocks.as_ref() {

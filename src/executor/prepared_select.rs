@@ -10310,7 +10310,8 @@ impl JoinBlocks {
     /// keys and DISTINCT ON keys holding a subquery, `output`, over the
     /// joined row of `sides`, each a name, its columns' schema and whether it
     /// is read as rows; None when the join's `width` columns do not line up.
-    /// `items` gives the projected row's aliases, a `*` showing so many columns
+    /// `items` gives the projected row's aliases, a `*` showing so many
+    /// columns; a table side's scan reads only the columns `needed` marks
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
@@ -10321,7 +10322,7 @@ impl JoinBlocks {
         output: [&[Option<&Expression>]; 3],
         items: impl FnOnce(usize) -> Vec<Option<SmartString>>,
         sides: &JoinSides,
-        width: usize,
+        (width, needed): (usize, Option<Vec<bool>>),
         param_count: usize,
     ) -> Result<Option<Self>> {
         let rows_sides = [sides[0].rows, sides[1].rows];
@@ -10565,6 +10566,12 @@ impl JoinBlocks {
                     where_.pushed = 0;
                     where_.conjuncts = 0;
                 }
+                if !rows_sides[i] {
+                    let at = if i == 0 { 0 } else { left_width };
+                    where_.needed = (needed.as_ref())
+                        .and_then(|mask| mask.get(at..at + schema.columns.len()))
+                        .map(<[bool]>::to_vec);
+                }
                 // As a statement over the table plans its scan
                 if blockless {
                     if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
@@ -10757,8 +10764,8 @@ impl Executor {
     }
 
     /// A join statement's `on`, `cross` and `output`, over the joined rows of
-    /// `sides` laid out as `width` columns, with their subqueries prepared
-    /// as blocks
+    /// `sides` laid out as `width` columns, of which it reads those `needed`
+    /// marks, with their subqueries prepared as blocks
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_join_blocks(
         &self,
@@ -10768,7 +10775,7 @@ impl Executor {
         output: [&[Option<&Expression>]; 3],
         items: impl FnOnce(usize) -> Vec<Option<SmartString>>,
         sides: &JoinSides,
-        width: usize,
+        (width, needed): (usize, Option<Vec<bool>>),
         ctx: &ExecutionContext,
     ) -> Result<Option<JoinBlocks>> {
         JoinBlocks::prepare(
@@ -10780,7 +10787,7 @@ impl Executor {
             output,
             items,
             sides,
-            width,
+            (width, needed),
             ctx.params().len(),
         )
     }
