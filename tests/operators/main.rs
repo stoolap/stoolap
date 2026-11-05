@@ -39,6 +39,7 @@ mod int_float_exact_compare_test;
 mod integer_arithmetic_rule_test;
 mod integer_conversion_test;
 mod is_null_test;
+mod long_program_test;
 mod nan_total_order_test;
 mod not_operator_test;
 mod not_over_compound_test;
