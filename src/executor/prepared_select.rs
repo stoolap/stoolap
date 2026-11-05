@@ -12050,8 +12050,7 @@ impl Executor {
             BlockSource::Values(values, programs) => {
                 let programs = programs.as_ref().map_err(Clone::clone)?;
                 let empty = Row::new();
-                let exec =
-                    ExecuteContext::with_common_params(&empty, ctx.params(), ctx.transaction_id());
+                let exec = super::aggregation::slot_context(&empty, ctx);
                 let mut vm = ExprVM::new();
                 let mut rows = RowVec::with_capacity(programs.len());
                 for (id, row) in (0i64..).zip(programs) {
@@ -14462,7 +14461,8 @@ impl<'a> PreparedRunner<'a> {
     /// A context of this run over `row`, reading `params`: the statement's
     /// or a block's, its slots numbered as the statement's
     fn exec_over<'s>(&'s self, row: &'s Row, params: &'s [Value]) -> ExecuteContext<'s> {
-        ExecuteContext::with_common_params(row, params, self.transaction_id)
+        ExecuteContext::new(row)
+            .with_run(params, self.transaction_id, None)
             .with_failed(self.slot_failures())
     }
 

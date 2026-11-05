@@ -769,12 +769,13 @@ SELECT SLEEP(0.5);                         -- Pauses for 500ms
 ```
 
 ### CURRENT_TRANSACTION_ID
-Returns the id of the open explicit transaction as an INTEGER, and NULL for a statement run outside one (autocommit). It is evaluated once per statement, so every row a statement writes gets the same id.
+Returns the id of the open explicit transaction as an INTEGER, and NULL for a statement run outside one (autocommit). It is evaluated once per statement, so every row a statement writes gets the same id, and every clause of a statement reads the same id: its WHERE, its SELECT list, an aggregate's argument and FILTER, HAVING, ORDER BY, a window, a join's ON and its subqueries.
 
 ```sql
 BEGIN;
 INSERT INTO audit (id, txn) VALUES (1, CURRENT_TRANSACTION_ID());
 UPDATE t SET last_txn = CURRENT_TRANSACTION_ID() WHERE id = 7;
+SELECT MAX(CURRENT_TRANSACTION_ID()) FROM t;  -- the open transaction's id
 COMMIT;
 
 SELECT CURRENT_TRANSACTION_ID();           -- NULL outside a transaction

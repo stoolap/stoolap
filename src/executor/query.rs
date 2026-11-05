@@ -4929,7 +4929,7 @@ impl Executor {
                             let mut sort_keys: Vec<Vec<Value>> =
                                 Vec::with_capacity(final_rows.len());
                             for (_, row) in final_rows.iter() {
-                                let exec = super::expression::execute_context(row, Some(ctx));
+                                let exec = super::aggregation::slot_context(row, ctx);
                                 let mut keys = Vec::with_capacity(programs.len());
                                 for p in programs {
                                     keys.push(vm.execute(p, &exec).ok()?);
@@ -7884,7 +7884,7 @@ impl Executor {
         let mut vm = ExprVM::new();
         let transaction_id = ctx.transaction_id();
         for (row_id, row) in rows.drain_rows().enumerate() {
-            let exec = ExecuteContext::with_common_params(&row, params, transaction_id);
+            let exec = ExecuteContext::new(&row).with_run(params, transaction_id, None);
             let mut values = projected.storage(sources.len());
             for source in sources {
                 values.push(match source {

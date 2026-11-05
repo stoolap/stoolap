@@ -491,13 +491,7 @@ impl Executor {
                     if !programs.is_empty() {
                         let mut computed = Vec::with_capacity(programs.len());
                         {
-                            let mut exec_ctx = super::expression::ExecuteContext::new(&row);
-                            if let Some(ctx) = ctx {
-                                exec_ctx = exec_ctx.with_transaction_id(ctx.transaction_id());
-                                if !ctx.params().is_empty() {
-                                    exec_ctx = exec_ctx.with_params(ctx.params());
-                                }
-                            }
+                            let exec_ctx = super::expression::execute_context(&row, ctx, None);
                             for (idx, program, column_type, vector_dims) in programs {
                                 let value = vm.execute(program, &exec_ctx)?;
                                 let coerced = value.coerce_to_type(*column_type);

@@ -215,14 +215,14 @@ impl<'a> RowPrograms<'a> {
     /// The first program's value for `row`
     #[inline]
     fn eval(&mut self, row: &Row) -> Result<Value> {
-        let exec = with_blocks(slot_context(row, self.ctx), self.blocks);
+        let exec = run_context(row, self.ctx, self.blocks);
         self.vm.execute(&self.programs[0], &exec)
     }
 
     /// Each program's value for `row`, in order, into `out`
     #[inline]
     fn eval_into(&mut self, row: &Row, out: &mut Vec<Value>) -> Result<()> {
-        let exec = with_blocks(slot_context(row, self.ctx), self.blocks);
+        let exec = run_context(row, self.ctx, self.blocks);
         out.clear();
         for program in &self.programs {
             out.push(self.vm.execute(program, &exec)?);
@@ -454,7 +454,7 @@ impl<'w> CallArgs<'w> {
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Value> {
         match (program, &self.default) {
-            (Some(program), _) => vm.execute(program, &with_blocks(slot_context(row, ctx), blocks)),
+            (Some(program), _) => vm.execute(program, &run_context(row, ctx, blocks)),
             (None, Some((_, ArgSource::Literal(value)))) => Ok(value.clone()),
             (None, Some((expr, _))) => evaluate_once(expr, Some(ctx)),
             (None, None) => Ok(Value::null_unknown()),
@@ -697,9 +697,7 @@ use crate::functions::{Volatility, WindowFunction};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::aggregation::{
-    aggregate_extra_args, compile_over_slots, slot_context, slot_params, with_blocks,
-};
+use super::aggregation::{aggregate_extra_args, compile_over_slots, run_context, slot_params};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{

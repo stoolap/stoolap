@@ -358,12 +358,12 @@ fn test_parameters() {
 
     let row = Row::from_values(vec![Value::Integer(42)]);
     let params = vec![Value::Integer(42)];
-    let ctx = ExecuteContext::new(&row).with_params(&params);
+    let ctx = ExecuteContext::new(&row).with_run(&params, None, None);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(true));
 
     let params = vec![Value::Integer(100)];
-    let ctx = ExecuteContext::new(&row).with_params(&params);
+    let ctx = ExecuteContext::new(&row).with_run(&params, None, None);
     let result = vm.execute(&program, &ctx).unwrap();
     assert_eq!(result, Value::Boolean(false));
 }
@@ -564,7 +564,7 @@ fn test_a_column_test_against_parameters_answers_as_its_unfused_ops() {
                     );
                 }
                 for (r, row) in rows.iter().enumerate() {
-                    let ctx = ExecuteContext::new(row).with_params(&params);
+                    let ctx = ExecuteContext::new(row).with_run(&params, None, None);
                     let case = format!("{listing} {params:?} on row {r}");
                     let expected = vm.execute(&unfused, &ctx).unwrap();
                     assert_eq!(vm.execute(&fused, &ctx).unwrap(), expected, "{case}");
@@ -590,7 +590,7 @@ fn test_a_column_test_against_parameters_answers_as_its_unfused_ops() {
                 }
             }
             let row = &rows[0];
-            let missing = ExecuteContext::new(row).with_params(&[]);
+            let missing = ExecuteContext::new(row).with_run(&[], None, None);
             assert!(
                 vm.execute_bool_checked(&fused, &missing).is_err()
                     && vm.execute_bool_checked(&unfused, &missing).is_err(),
