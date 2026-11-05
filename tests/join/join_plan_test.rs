@@ -119,19 +119,53 @@ mod index_replaced {
 }
 
 #[test]
-fn a_limit_hash_join_builds_on_the_side_statistics_found_smaller_after_analyze() {
+fn a_limit_hash_join_builds_on_the_side_estimated_smaller_under_its_conditions() {
     let _guard = serial();
     let db = Database::open("memory://join_plan_limit_hash_analyze").unwrap();
     for sql in [
         "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)",
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO s VALUES (1, 3)",
-        "INSERT INTO t SELECT g.value, g.value % 10 FROM generate_series(1, 3000) g",
+        "INSERT INTO s SELECT g.value, g.value % 2 FROM generate_series(1, 1000) g",
+        "INSERT INTO t SELECT g.value, g.value % 2 FROM generate_series(1, 300) g",
     ] {
         db.execute(sql, ()).unwrap();
     }
     let stmt = db
-        .prepare("SELECT s.id, t.id FROM s JOIN t ON t.k = s.k LIMIT $1")
+        .prepare("SELECT s.id, t.id FROM s JOIN t ON t.k = s.k WHERE s.k = 1 LIMIT $1")
+        .unwrap();
+    let builds = || {
+        let before = limit_hash_left_builds();
+        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        limit_hash_left_builds() - before
+    };
+    assert_eq!(
+        builds(),
+        1,
+        "without statistics an equality keeps a tenth of s, fewer rows than t holds"
+    );
+    db.execute("ANALYZE s", ()).unwrap();
+    db.execute("ANALYZE t", ()).unwrap();
+    assert_eq!(
+        builds(),
+        0,
+        "after ANALYZE the equality keeps half of s, more rows than t holds"
+    );
+}
+
+#[test]
+fn a_limit_hash_join_reads_the_corrections_explain_analyze_learned() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_limit_hash_feedback").unwrap();
+    for sql in [
+        "CREATE TABLE fb_s (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE fb_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO fb_s SELECT g.value, g.value % 200 FROM generate_series(1, 20000) g",
+        "INSERT INTO fb_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let stmt = db
+        .prepare("SELECT fb_s.id, fb_t.id FROM fb_s JOIN fb_t ON fb_t.k = fb_s.k WHERE fb_s.k = 1 LIMIT $1")
         .unwrap();
     let builds = || {
         let before = limit_hash_left_builds();
@@ -141,11 +175,109 @@ fn a_limit_hash_join_builds_on_the_side_statistics_found_smaller_after_analyze()
     assert_eq!(
         builds(),
         0,
-        "without statistics neither side is known smaller"
+        "an equality estimated to keep a tenth of fb_s keeps more rows than fb_t holds"
     );
-    db.execute("ANALYZE s", ()).unwrap();
-    db.execute("ANALYZE t", ()).unwrap();
-    assert_eq!(builds(), 1, "after ANALYZE the one-row side builds");
+    for _ in 0..2 {
+        let explained = db.query(
+            "EXPLAIN ANALYZE SELECT fb_s.id FROM fb_s WHERE fb_s.k = 1",
+            (),
+        );
+        explained.unwrap().for_each(|row| {
+            row.unwrap();
+        });
+    }
+    assert_eq!(
+        builds(),
+        1,
+        "EXPLAIN ANALYZE found the equality keeps 100 rows of fb_s"
+    );
+}
+
+#[test]
+fn explain_analyze_of_a_join_teaches_no_side_a_correction() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_feedback_join").unwrap();
+    for sql in [
+        "CREATE TABLE fj_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE fj_t (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "INSERT INTO fj_s SELECT g.value, g.value % 200, g.value % 200 \
+         FROM generate_series(1, 20000) g",
+        "INSERT INTO fj_t SELECT g.value, g.value % 200, g.value FROM generate_series(1, 1500) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let stmt = db
+        .prepare(
+            "SELECT fj_s.id, fj_t.id FROM fj_s JOIN fj_t ON fj_t.k = fj_s.k \
+             WHERE fj_s.f = 1 LIMIT $1",
+        )
+        .unwrap();
+    let builds = || {
+        let before = limit_hash_left_builds();
+        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        limit_hash_left_builds() - before
+    };
+    assert_eq!(builds(), 0, "a tenth of fj_s is more rows than fj_t holds");
+    for _ in 0..2 {
+        for filter in ["fj_t.f = 1", "fj_s.f = 1"] {
+            let explained = db.query(
+                &format!(
+                    "EXPLAIN ANALYZE SELECT fj_s.id FROM fj_s JOIN fj_t ON fj_t.k = fj_s.k \
+                     WHERE {filter}"
+                ),
+                (),
+            );
+            explained.unwrap().for_each(|row| {
+                row.unwrap();
+            });
+        }
+    }
+    assert_eq!(
+        builds(),
+        0,
+        "a join's EXPLAIN ANALYZE counts joined rows, no scan of fj_s or fj_t"
+    );
+}
+
+#[test]
+fn explain_analyze_of_a_cte_teaches_the_table_of_its_name_no_correction() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_feedback_cte").unwrap();
+    for sql in [
+        "CREATE TABLE fc_t (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE fc_u (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO fc_t SELECT g.value, g.value % 100, 1 FROM generate_series(1, 10000) g",
+        "INSERT INTO fc_u SELECT g.value, g.value % 100 FROM generate_series(1, 500) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let stmt = db
+        .prepare(
+            "SELECT fc_t.id, fc_u.id FROM fc_t JOIN fc_u ON fc_u.k = fc_t.k \
+             WHERE fc_t.f = 1 LIMIT $1",
+        )
+        .unwrap();
+    let builds = || {
+        let before = limit_hash_left_builds();
+        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        limit_hash_left_builds() - before
+    };
+    assert_eq!(builds(), 0, "a tenth of fc_t is more rows than fc_u holds");
+    for _ in 0..2 {
+        let explained = db.query(
+            "EXPLAIN ANALYZE WITH fc_t AS (SELECT 1 AS id, 1 AS f) \
+             SELECT fc_t.id FROM fc_t WHERE fc_t.f = 1",
+            (),
+        );
+        explained.unwrap().for_each(|row| {
+            row.unwrap();
+        });
+    }
+    assert_eq!(
+        builds(),
+        0,
+        "the CTE's one row is no scan of the table fc_t"
+    );
 }
 
 #[test]

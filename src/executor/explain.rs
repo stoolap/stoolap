@@ -108,11 +108,27 @@ impl Executor {
             // Record cardinality feedback for SELECT statements with WHERE
             if let Statement::Select(select) = &*stmt.statement {
                 if let Some(ref where_clause) = select.where_clause {
-                    // Try to get the table name and record feedback
-                    if let Some(ref table_expr) = select.table_expr {
-                        if let Some(table_name) = extract_table_name(table_expr) {
-                            // Compute predicate fingerprint
-                            let predicate_hash = fingerprint_predicate(&table_name, where_clause);
+                    // What it corrects is a base table's scan as of now, so a
+                    // join, a CTE or a view of the name and an AS OF read record
+                    // none; its columns are fingerprinted bare, as a join side's
+                    // conditions read them
+                    let ctes: Vec<String> = (select.with.iter())
+                        .flat_map(|with| &with.ctes)
+                        .map(|cte| cte.name.value_lower.to_string())
+                        .collect();
+                    if let Some(source @ Expression::TableSource(table)) =
+                        select.table_expr.as_deref()
+                    {
+                        if table.as_of.is_none()
+                            && self
+                                .base_table_side_schema(source, CteNames::Listed(&ctes))
+                                .is_some()
+                        {
+                            let table_name = table.name.value_lower.to_string();
+                            let alias = table.alias.as_ref().unwrap_or(&table.name);
+                            let bare =
+                                super::utils::strip_table_qualifier(where_clause, &alias.value);
+                            let predicate_hash = fingerprint_predicate(&table_name, &bare);
 
                             // Get estimated row count from planner
                             let tx = self.begin_transaction().ok();
@@ -1158,13 +1174,11 @@ impl Executor {
                 .as_ref()
                 .and_then(|probe| self.probe_strategy(probe, bounded, small_outer, !left_is_table));
 
-            // The side execution probes, by the rule it picks it with. The
-            // executor swaps a small outer in only from a right side that is
-            // not a base table
+            // The side execution probes, by the rule it picks it with
             let picked = if index_use == JoinIndexUse::Grouped {
                 inlj_info.map(|info| (info, false))
             } else {
-                let (left_filtered, right_filtered) = match where_clause {
+                let [left_filter, right_filter] = match where_clause {
                     Some(where_clause) => {
                         let aliases = [join_left, join_right].map(get_table_alias_from_expr);
                         let (left, right, _) = split_join_where(
@@ -1176,20 +1190,26 @@ impl Executor {
                             ),
                             &join_type_upper,
                         );
-                        (left.is_some(), right.is_some())
+                        [left, right]
                     }
-                    None => (false, false),
+                    None => [None, None],
                 };
                 pick_index_join_side(
                     &join_type_upper,
                     right_is_table,
-                    right_filtered,
-                    left_filtered,
+                    right_filter.is_some(),
+                    left_filter.is_some(),
                     inlj_info,
                     || {
                         left_probe.as_ref().and_then(|probe| {
                             self.probe_strategy(probe, bounded, small_outer, !right_is_table)
                         })
+                    },
+                    || {
+                        let sides = [join_left, join_right];
+                        let filters = [left_filter.as_ref(), right_filter.as_ref()];
+                        let shares = self.join_side_shares(None, sides, filters);
+                        self.right_small_beside(sides, shares)
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )

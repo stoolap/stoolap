@@ -461,6 +461,7 @@ use super::operator::{Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
+    EQUALITY_CANDIDATE_CAP,
 };
 use super::operators::BloomFilterOperator;
 use super::planned_join::{pick_index_join_side, JoinShape};
@@ -4187,6 +4188,12 @@ impl Executor {
                     left_filter.is_some(),
                     probe(0, !left_is_table),
                     || probe(1, !right_is_table),
+                    || {
+                        let sides = [&*join_source.left, &*join_source.right];
+                        let filters = [left_filter.as_ref(), right_filter.as_ref()];
+                        let shares = self.join_side_shares(plan.as_deref(), sides, filters);
+                        self.right_small_beside(sides, shares)
+                    },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };
@@ -4744,6 +4751,12 @@ impl Executor {
                             if swapped {
                                 op = op.with_outer_on_right();
                             }
+                            // A swap is chosen by estimates; a probe past the
+                            // cap a join without a limit fills shows one wrong
+                            let keeps_outer = swapped && join_limit.is_none();
+                            if keeps_outer {
+                                op = op.with_probe_cap(EQUALITY_CANDIDATE_CAP);
+                            }
                             if let Some(ref proj) = projection_pushdown {
                                 op = op.with_projection(proj.columns.clone());
                             }
@@ -4758,6 +4771,18 @@ impl Executor {
                             // joined so far are dropped, and the whole join runs
                             // once more on the hash path
                             if op.needs_fallback() {
+                                // A join that kept its outer rows hands them on, so
+                                // its outer side is read once
+                                if keeps_outer {
+                                    let rows = op.take_outer_rows();
+                                    drop(op);
+                                    prepared_side = Some(PreparedSide {
+                                        rows: PreparedRows::Shared(CompactArc::new(rows)),
+                                        columns: outer_cols.clone(),
+                                        is_right: swapped,
+                                    });
+                                    prepared_ctx = Some(ctx_join.clone());
+                                }
                                 break 'index_nl;
                             }
                             let lim = join_limit.unwrap_or(0) as usize;
@@ -5129,10 +5154,10 @@ impl Executor {
             let streaming = match join_plan.limit_hash {
                 Some(pairs) => row_counts(stmt, ctx).ok().and_then(|counts| {
                     let limit = counts.limit.filter(|limit| *limit <= 100)?;
-                    let build_left = self.limit_hash_builds_left(
-                        [&join_source.left, &join_source.right],
-                        [left_filter.as_ref(), right_filter.as_ref()],
-                    );
+                    let sides = [&*join_source.left, &*join_source.right];
+                    let filters = [left_filter.as_ref(), right_filter.as_ref()];
+                    let shares = self.join_side_shares(plan.as_deref(), sides, filters);
+                    let build_left = self.limit_hash_builds_left(sides, shares);
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::limit_hash_built(build_left);
                     Some((limit.saturating_add(counts.offset), build_left, pairs))

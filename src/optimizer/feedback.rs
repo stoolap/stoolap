@@ -151,6 +151,9 @@ pub struct FeedbackCache {
     decay_factor: f64,
     /// Maximum number of entries to keep
     max_entries: usize,
+    /// Moves on every change to the entries, so an estimate held across
+    /// runs knows when to read them again
+    version: std::sync::atomic::AtomicU64,
 }
 
 impl Default for FeedbackCache {
@@ -162,11 +165,7 @@ impl Default for FeedbackCache {
 impl FeedbackCache {
     /// Create a new feedback cache with default settings
     pub fn new() -> Self {
-        Self {
-            entries: RwLock::new(FxHashMap::default()),
-            decay_factor: DEFAULT_DECAY_FACTOR,
-            max_entries: 10000,
-        }
+        Self::with_settings(DEFAULT_DECAY_FACTOR, 10000)
     }
 
     /// Create a cache with custom settings
@@ -175,7 +174,18 @@ impl FeedbackCache {
             entries: RwLock::new(FxHashMap::default()),
             decay_factor,
             max_entries,
+            version: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The version of the entries, which every change to them moves
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Record cardinality feedback for a predicate
@@ -208,6 +218,7 @@ impl FeedbackCache {
             );
             entries.insert(key, feedback);
         }
+        self.changed();
     }
 
     /// Look up feedback for a predicate pattern
@@ -234,6 +245,7 @@ impl FeedbackCache {
     /// Clear all feedback entries
     pub fn clear(&self) {
         self.entries.write().unwrap().clear();
+        self.changed();
     }
 
     /// Get the number of feedback entries
