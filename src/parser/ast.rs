@@ -1118,6 +1118,15 @@ impl InfixOperator {
             _ => InfixOperator::Other,
         }
     }
+
+    /// Whether any grouping of a chain of this operator, its operands in one
+    /// order, is the same computation
+    pub fn associates(self) -> bool {
+        matches!(
+            self,
+            InfixOperator::And | InfixOperator::Or | InfixOperator::Concat
+        )
+    }
 }
 
 /// Prefix operator type (pre-computed at parse time)
@@ -1275,14 +1284,20 @@ impl InfixExpression {
         if operands == 1 {
             return head;
         }
-        let left = Self::chain_of(operands - operands / 2, head, rest);
+        let half = Self::left_half(operands);
+        let left = Self::chain_of(half, head, rest);
         match rest.next() {
             Some((token, operator, first)) => {
-                let right = Self::chain_of(operands / 2, first, rest);
+                let right = Self::chain_of(operands - half, first, rest);
                 Expression::Infix(Self::new(token, Box::new(left), operator, Box::new(right)))
             }
             None => left,
         }
+    }
+
+    /// How many of a balanced chain's `operands` its left half holds
+    pub fn left_half(operands: usize) -> usize {
+        operands - operands / 2
     }
 }
 

@@ -14,6 +14,8 @@
 
 //! Expression parsing methods for the SQL Parser
 
+use smallvec::{smallvec, SmallVec};
+
 use crate::common::SmartString;
 
 use super::ast::*;
@@ -28,14 +30,22 @@ fn identifier_token(ident: &Identifier) -> Token {
     token
 }
 
-/// The levels a balanced chain of `operands` operands nests
-fn chain_height(operands: usize) -> usize {
-    (usize::BITS - (operands - 1).leading_zeros()) as usize
+/// The levels below the root of a balanced chain whose operands have
+/// `heights` levels below theirs
+fn balanced_height(heights: &[usize]) -> usize {
+    match heights {
+        [] => 0,
+        [height] => *height,
+        _ => {
+            let (left, right) = heights.split_at(InfixExpression::left_half(heights.len()));
+            1 + balanced_height(left).max(balanced_height(right))
+        }
+    }
 }
 
-/// The left-deep chain of `op` at `top` rebuilt balanced, its operands in
+/// The left-deep chain of `operands` operands at `top` rebuilt balanced, in
 /// the order written; a chain of three or fewer is left as it is
-fn balance_chain(top: Expression, op: InfixOperator, operands: usize) -> Expression {
+fn balance_chain(top: Expression, operands: usize) -> Expression {
     if operands <= 3 {
         return top;
     }
@@ -43,7 +53,7 @@ fn balance_chain(top: Expression, op: InfixOperator, operands: usize) -> Express
     let mut node = top;
     let head = loop {
         match node {
-            Expression::Infix(infix) if infix.op_type == op => {
+            Expression::Infix(infix) if rights.len() + 1 < operands => {
                 rights.push((infix.token, infix.operator, *infix.right));
                 node = *infix.left;
             }
@@ -79,49 +89,58 @@ impl Parser<'_> {
     /// of `AND`, `OR` and `||` is built balanced, so it nests the log2 of its
     /// length; any other operator nests its left operand one level deeper
     fn parse_operators(&mut self, precedence: Precedence) -> Option<Expression> {
+        let depth = self.expression_depth;
         let mut left = self.parse_prefix_expression()?;
-        // Levels the operators so far stack above the first operand, and the
-        // balanced operator being chained with its operand count
-        let mut height = 0;
-        let mut run: Option<(InfixOperator, usize)> = None;
+        // Levels below `left`'s root, and the balanced operator being chained
+        // with the levels below each of its operands
+        let mut height = self.expression_peak - depth;
+        let mut run: Option<(InfixOperator, SmallVec<[usize; 4]>)> = None;
 
         while !self.peek_token_is(TokenType::Eof) && precedence < self.peek_precedence() {
             if !self.is_infix_token() {
                 break;
             }
             let chained = self.peek_balanced_operator();
-            if let Some((op, operands)) = run {
-                if chained != Some(op) {
-                    left = balance_chain(left, op, operands);
-                    height += chain_height(operands);
-                    run = None;
-                }
+            if let Some((_, heights)) = run.take_if(|(op, _)| chained != Some(*op)) {
+                left = balance_chain(left, heights.len());
+                height = balanced_height(&heights);
             }
             let wraps = !self.peek_token_is_punctuator(".") && !self.peek_token_is_punctuator("(");
 
             self.next_token();
+            self.expression_peak = depth;
             left = self.parse_infix_expression(left)?;
+            // The operands parsed in this step, one level below `depth`
+            let reached = self.expression_peak - depth;
 
             match (chained, &mut run) {
-                (Some(_), Some((_, operands))) => *operands += 1,
-                (Some(op), None) => run = Some((op, 2)),
-                (None, _) => height += usize::from(wraps),
+                (Some(_), Some((_, heights))) => heights.push(reached.saturating_sub(1)),
+                (Some(op), None) => run = Some((op, smallvec![height, reached.saturating_sub(1)])),
+                (None, _) => height = (height + usize::from(wraps)).max(reached),
             }
-            let levels = height + run.map_or(0, |(_, operands)| chain_height(operands));
-            if self.limited
-                && self.expression_peak + levels.saturating_sub(1) > MAX_EXPRESSION_DEPTH
-            {
-                self.nested_too_deeply();
+            if run.is_none() && self.past_limit(depth + height) {
                 return None;
             }
         }
-        if let Some((op, operands)) = run {
-            left = balance_chain(left, op, operands);
-            height += chain_height(operands);
+        if let Some((_, heights)) = run {
+            left = balance_chain(left, heights.len());
+            height = balanced_height(&heights);
         }
-        self.expression_peak += height.saturating_sub(1);
+        if self.past_limit(depth + height) {
+            return None;
+        }
+        self.expression_peak = depth + height;
 
         Some(left)
+    }
+
+    /// Whether `level` is past [`MAX_EXPRESSION_DEPTH`], with the error added
+    fn past_limit(&mut self, level: usize) -> bool {
+        let past = self.limited && level > MAX_EXPRESSION_DEPTH;
+        if past {
+            self.nested_too_deeply();
+        }
+        past
     }
 
     /// The operator the peek token starts if it is one a chain of is balanced
@@ -135,11 +154,7 @@ impl Parser<'_> {
             },
             _ => return None,
         };
-        matches!(
-            op,
-            InfixOperator::And | InfixOperator::Or | InfixOperator::Concat
-        )
-        .then_some(op)
+        op.associates().then_some(op)
     }
 
     /// Check if the peek token is an infix operator

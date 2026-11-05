@@ -264,6 +264,120 @@ fn other_chains_nest_one_level_per_operator() {
             Err(e) if e.contains(&expressions_error()) => {}
             other => wrong.push(format!("case under a chain: {other:?}")),
         }
+        // An operand nests under the operators above it, not under the whole
+        // chain: the `*` chain is the right operand of the last `+` only
+        let ones = |n: usize, operator: &str| chain(n + 1, operator, |_| "1".to_string());
+        let sum = |pluses: usize, times: usize| {
+            format!("SELECT {} + {}", ones(pluses - 1, "+"), ones(times, "*"))
+        };
+        match first_column(&db, &sum(deepest, deepest - 1)) {
+            Ok(rows) if rows == vec![deepest as i64 + 1] => {}
+            other => wrong.push(format!("product under a sum: {other:?}")),
+        }
+        match first_column(&db, &sum(deepest, deepest)) {
+            Err(e) if e.contains(&expressions_error()) => {}
+            other => wrong.push(format!("product under a sum, past: {other:?}")),
+        }
+        // The fifth of five ANDs sits two levels below their root, one below
+        // the CASE
+        let fifth = |pluses: usize| {
+            format!(
+                "SELECT CASE WHEN TRUE AND TRUE AND TRUE AND TRUE AND {} = {} THEN 1 END",
+                ones(pluses, "+"),
+                pluses + 1
+            )
+        };
+        match first_column(&db, &fifth(deepest - 4)) {
+            Ok(rows) if rows == vec![1] => {}
+            other => wrong.push(format!("sum in a balanced chain: {other:?}")),
+        }
+        match first_column(&db, &fifth(deepest - 3)) {
+            Err(e) if e.contains(&expressions_error()) => {}
+            other => wrong.push(format!("sum in a balanced chain, past: {other:?}")),
+        }
         assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     });
+}
+
+#[test]
+fn a_balanced_chain_stops_where_the_written_one_does() {
+    let db = Database::open("memory://operator_chain_short_circuit").unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, p TEXT)",
+        (),
+    )
+    .unwrap();
+    // REGEXP refuses the pattern '[', so the chain fails if it reads it
+    db.execute("INSERT INTO r VALUES (1, 1, 0, '[')", ())
+        .unwrap();
+    let mut wrong = Vec::new();
+    for (sql, expected) in [
+        (
+            "SELECT CASE WHEN a = 1 AND a = 1 AND b AND 'x' REGEXP p THEN 1 ELSE 2 END FROM r",
+            vec![2],
+        ),
+        (
+            "SELECT CASE WHEN a = 2 OR a = 2 OR b + 1 OR 'x' REGEXP p THEN 1 ELSE 2 END FROM r",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM r WHERE NOT (a = 1 AND a = 1 AND b AND 'x' REGEXP p)",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM r WHERE a = 2 OR a = 2 OR b + 1 OR 'x' REGEXP p",
+            vec![1],
+        ),
+    ] {
+        match first_column(&db, sql) {
+            Ok(rows) if rows == expected => {}
+            other => wrong.push(format!("{sql}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_chain_groups_by_any_grouping_of_itself() {
+    let db = Database::open("memory://operator_chain_grouping").unwrap();
+    db.execute(
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO g VALUES (1, 'a', 'b', 'c', 'd')", ())
+        .unwrap();
+    let mut wrong = Vec::new();
+    for (sql, expected) in [
+        (
+            "SELECT a || b || c || d, COUNT(*) FROM g GROUP BY (((a || b) || c) || d)",
+            "abcd",
+        ),
+        (
+            "SELECT ((a || b) || c) || d, COUNT(*) FROM g GROUP BY a || b || c || d",
+            "abcd",
+        ),
+        (
+            "SELECT a || (b || c), COUNT(*) FROM g GROUP BY (a || b) || c",
+            "abc",
+        ),
+        (
+            "SELECT CASE WHEN a = 'a' AND b = 'b' AND c = 'c' AND d = 'd' THEN 'abcd' END, COUNT(*) \
+             FROM g GROUP BY (((a = 'a' AND b = 'b') AND c = 'c') AND d = 'd')",
+            "abcd",
+        ),
+    ] {
+        let answer = db.query(sql, ()).and_then(|rows| {
+            rows.map(|row| {
+                let row = row?;
+                Ok((row.get::<String>(0)?, row.get::<i64>(1)?))
+            })
+            .collect::<Result<Vec<_>, _>>()
+        });
+        match answer {
+            Ok(rows) if rows == vec![(expected.to_string(), 1)] => {}
+            other => wrong.push(format!("{sql}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
