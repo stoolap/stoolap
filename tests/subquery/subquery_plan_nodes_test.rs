@@ -57,7 +57,7 @@ fn explain_analyze_says_how_each_block_answers() {
         ),
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)",
-            &["1: EXISTS over w, per call: a keyed set"],
+            &["1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions"],
         ),
         (
             "SELECT id, (SELECT COUNT(*) FROM w WHERE w.k = t.k) FROM t",
@@ -65,7 +65,7 @@ fn explain_analyze_says_how_each_block_answers() {
         ),
         (
             "SELECT id, (SELECT COUNT(*) FROM w WHERE w.k = t.k AND w.v > 0) FROM t",
-            &["1: scalar over w, per call: a keyed set"],
+            &["1: scalar over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions"],
         ),
         (
             "SELECT id FROM t WHERE k IN (SELECT k FROM w)",
@@ -110,26 +110,26 @@ fn explain_analyze_says_how_each_block_answers() {
         (
             "SELECT id FROM t WHERE k = 1 UNION ALL \
              SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)",
-            &["1: EXISTS over w, per call: a keyed set"],
+            &["1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions"],
         ),
         (
             "SELECT q.id FROM (SELECT id FROM t WHERE EXISTS \
              (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)) AS q",
-            &["1: EXISTS over w, per call: a keyed set"],
+            &["1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions"],
         ),
         (
             "WITH c AS (SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)) \
              SELECT id FROM c WHERE id IN (SELECT rid FROM r)",
             &[
                 "1: IN over r, once per run",
-                "2: EXISTS over w, per call: a keyed set",
+                "2: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions",
             ],
         ),
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0) \
              LIMIT (SELECT COUNT(*) FROM u) OFFSET (SELECT MIN(rid) - 1 FROM r)",
             &[
-                "1: EXISTS over w, per call: a keyed set",
+                "1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions",
                 "2: scalar over u, once per run",
                 "3: scalar over r, once per run",
             ],
@@ -162,13 +162,13 @@ fn explain_analyze_says_how_each_block_answers() {
             "SELECT t.k, (SELECT COUNT(*) FROM w WHERE w.k = t.k) FROM t JOIN r ON r.rid = t.id \
              WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v > 0) GROUP BY t.k",
             &[
-                "1: EXISTS over u, per call: a keyed set",
+                "1: EXISTS over u, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions",
                 "2: scalar over w, per call: a keyed set, or where the index on k makes probing cheaper: the count the index on k holds, else a scan",
             ],
         ),
         (
             "UPDATE t SET k = k WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)",
-            &["1: EXISTS over w, per call: a keyed set"],
+            &["1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions"],
         ),
     ];
     let mut wrong = Vec::new();

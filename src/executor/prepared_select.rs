@@ -87,7 +87,7 @@ use super::window::{
     HeldWindow, WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows,
 };
 use super::Executor;
-use crate::planner::block::{self as block_plan, BlockRuns, CallRead, KeyedRead};
+use crate::planner::block::{self as block_plan, BlockRuns, CallRead};
 use crate::planner::{
     distinct_values_column, nearest_read, ordered_read, scan_choice, KeyRead, NearestRead,
     OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
@@ -4308,13 +4308,10 @@ impl PreparedSubquery {
             .or(self.grouping.as_deref().and_then(|g| g.keyed.as_ref()));
         let read = match keyed {
             None => call,
-            Some(plan) => match plan.read {
-                KeyedRead::Set => "a keyed set".to_string(),
-                KeyedRead::ProbeOrSet => format!(
-                    "a keyed set, or where the index on {} makes probing cheaper: {call}",
-                    plan.keys.first().map_or("", |key| column(key.0))
-                ),
-            },
+            Some(plan) => format!(
+                "a keyed set, or where the index on {} makes probing cheaper: {call}",
+                plan.keys.first().map_or("", |key| column(key.0))
+            ),
         };
         format!("{test} over {over}, {runs}: {read}")
     }
@@ -4805,7 +4802,6 @@ struct KeyedPlan {
     /// The comparisons of what the keys leave of the WHERE that the scan takes
     pushdown: Vec<PreparedComparison>,
     pushed_whole: bool,
-    read: KeyedRead,
     /// A parent column has no type: a call whose key value is not of its
     /// own column's type is asked without the keys
     checked: bool,
@@ -7074,10 +7070,6 @@ fn keyed_plan(
             .collect(),
         pushdown,
         pushed_whole,
-        read: match filter {
-            None => KeyedRead::ProbeOrSet,
-            Some(_) => KeyedRead::Set,
-        },
         checked: keys
             .iter()
             .any(|((_, _, parent), _)| chain.scopes[1].types[*parent] == DataType::Null),
@@ -15548,10 +15540,7 @@ impl<'a> PreparedRunner<'a> {
         let forced = crate::test_failpoints::forced_exists_strategy();
         #[cfg(not(feature = "test-failpoints"))]
         let forced: Option<bool> = None;
-        let keyed = forced.unwrap_or_else(|| match plan.read {
-            KeyedRead::Set => true,
-            KeyedRead::ProbeOrSet => !self.probe_cheaper(index, plan),
-        });
+        let keyed = forced.unwrap_or_else(|| !self.probe_cheaper(index, plan));
         self.blocks[index].keyed_choice.set(Some(keyed));
         keyed
     }
@@ -15592,6 +15581,7 @@ impl<'a> PreparedRunner<'a> {
             &sq.schema.columns[plan.keys[0].0].name,
             self.statement_limit.filter(|_| sq.parent.is_none()),
             parent_rows,
+            !plan.pushdown.is_empty() || !plan.pushed_whole,
         )
     }
 

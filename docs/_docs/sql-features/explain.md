@@ -620,8 +620,7 @@ SELECT (actual time=1.58ms, rows=2)
 | once per row of N | It reads only values of subquery N's enclosing row: computed once for each such row |
 | per call | Computed for each row that asks it |
 | a statement | It runs as a statement of its own, such as one over a join |
-| a keyed set | The rows of every key are read once per execution, and each call looks its key up |
-| a keyed set, or where the index on k makes probing cheaper: ... | Each execution chooses on its first call: a probe per call when an index on `k` answers it and the enclosing rows are few or its `LIMIT` is small, else the keyed set |
+| a keyed set, or where the index on k makes probing cheaper: ... | Each execution chooses on its first call: a probe per call when an index on `k` answers it and the enclosing rows are few or its `LIMIT` is small, else the keyed set, whose rows of every key are read once and each call looks its key up. A subquery whose WHERE asks more than the key also needs the index to hold at least four keys for each enclosing row, since a probe reads every row of a key the rest rejects; the keys are counted only while the table holds no sealed rows |
 | the count the index on k holds, else a scan | A `COUNT(*)` of one equality is counted from the index where it answers for the call |
 | the row its key names | The equality on the primary key reads that one row |
 | its pushed conditions, a scan | The rows the conditions the scan takes pass, or every row |

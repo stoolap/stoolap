@@ -313,10 +313,68 @@ fn test_the_rule_probes_for_few_outer_rows_or_a_small_limit_on_an_index() {
     // Five outer rows against five inner ones, no LIMIT: the set
     let few = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k) ORDER BY id";
     assert!(keyed(few, vec![1, 2, 4]), "{few}");
-    // More than the keys in the WHERE: the set, as the general path chooses
+    // More than the keys in the WHERE over seven keys: five probes would read
+    // a seventh of the rows each, so the set
     let more =
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM big WHERE big.k = t.k AND big.v > 0) ORDER BY id";
     assert!(keyed(more, vec![1, 2, 4, 5]), "{more}");
+}
+
+#[test]
+fn test_a_where_asking_more_than_its_keys_probes_only_over_many_keys() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_keys").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE TABLE many (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX one_k ON one (k)",
+        "CREATE INDEX many_k ON many (k)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO one SELECT value, 1, 1 FROM generate_series(1, 400)",
+        "INSERT INTO many SELECT value, value % 200, 1 FROM generate_series(1, 400)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Twenty outer rows: a probe per row over one key reads all 400 rows
+    // each time, over 200 keys two
+    for (inner, probes) in [("one", false), ("many", true)] {
+        let sql = format!(
+            "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM {inner} WHERE {inner}.k = o.k AND {inner}.v > 5)"
+        );
+        let (before, built, _) = prepared_exists_counts();
+        assert_eq!(ids(&db, &sql), Vec::<i64>::new(), "{sql}");
+        let (after, after_built, _) = prepared_exists_counts();
+        assert_eq!(after > before, probes, "{sql} probes");
+        assert_eq!(after_built > built, !probes, "{sql} builds the keyed set");
+    }
+}
+
+#[test]
+fn test_a_where_asking_more_than_its_keys_over_sealed_rows_takes_the_keyed_set() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE many (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX many_k ON many (k)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO many SELECT value, value % 200, 1 FROM generate_series(1, 400)",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql =
+        "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM many WHERE many.k = o.k AND many.v > 5)";
+    let (before, built, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), Vec::<i64>::new(), "{sql}");
+    let (after, after_built, _) = prepared_exists_counts();
+    assert_eq!(
+        after, before,
+        "{sql} probes: the index counts no sealed key"
+    );
+    assert!(after_built > built, "{sql} builds the keyed set");
 }
 
 #[test]

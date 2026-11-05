@@ -28,16 +28,6 @@ pub(crate) enum BlockRuns {
     PerCall,
 }
 
-/// How a block keyed on its parent's values answers a call
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyedRead {
-    /// From the keyed set it builds once per run
-    Set,
-    /// By a probe of the index on its key where [`probe_cheaper`] holds for
-    /// the run, else from the keyed set: its WHERE is the keys alone
-    ProbeOrSet,
-}
-
 /// How a grouped block reads its rows for a call it answers itself
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallRead {
@@ -56,16 +46,35 @@ pub(crate) fn small_probe_limit(limit: Option<i64>) -> bool {
 /// Whether an EXISTS on `column` of `table` probes it per outer row more
 /// cheaply than it builds a set: for a small LIMIT or few outer rows,
 /// since a probe per outer row costs about what a set pays for sixteen
-/// inner rows, and only when an index answers the probe
+/// inner rows, and only when an index answers the probe. A WHERE that asks
+/// more than the key (`rest`) reads every candidate of a key it rejects
 pub(crate) fn probe_cheaper(
     table: &dyn Table,
     column: &str,
     outer_limit: Option<i64>,
     outer_rows: Option<usize>,
+    rest: bool,
 ) -> bool {
     let few_outer =
         outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
-    (small_probe_limit(outer_limit) || few_outer) && exists_probes(table, column)
+    (small_probe_limit(outer_limit) || few_outer)
+        && (!rest || few_candidates(table, column, outer_rows))
+        && exists_probes(table, column)
+}
+
+/// Whether the outer rows' probes read fewer candidates than the set reads
+/// rows: each reads a key's share of the rows, and a candidate costs a probe
+/// about four times what the set pays for a row. The keys are counted only
+/// where the index holds every row
+fn few_candidates(table: &dyn Table, column: &str, outer_rows: Option<usize>) -> bool {
+    let distinct = (!table.has_sealed_rows())
+        .then(|| table.get_index_on_column(column))
+        .flatten()
+        .and_then(|index| index.distinct_keys_hint());
+    match (outer_rows, distinct) {
+        (Some(rows), Some(distinct)) => rows.saturating_mul(4) <= distinct,
+        _ => false,
+    }
 }
 
 fn exists_probes(table: &dyn Table, column: &str) -> bool {
