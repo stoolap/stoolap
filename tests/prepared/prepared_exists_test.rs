@@ -24,9 +24,9 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    before_prepared_exists, force_exists_strategy, general_path_hits, prepared_exists_counts,
-    prepared_rows_narrowed, prepared_strategy_runs, subquery_cache_hits, GeneralPath,
-    PreparedStrategy,
+    before_prepared_exists, equality_candidate_ids_copied_count, force_exists_strategy,
+    general_path_hits, hot_index_ids_read, prepared_exists_counts, prepared_rows_narrowed,
+    prepared_strategy_runs, subquery_cache_hits, GeneralPath, PreparedStrategy,
 };
 use stoolap::Database;
 
@@ -313,10 +313,150 @@ fn test_the_rule_probes_for_few_outer_rows_or_a_small_limit_on_an_index() {
     // Five outer rows against five inner ones, no LIMIT: the set
     let few = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k) ORDER BY id";
     assert!(keyed(few, vec![1, 2, 4]), "{few}");
-    // More than the keys in the WHERE: the set, as the general path chooses
-    let more =
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM big WHERE big.k = t.k AND big.v > 0) ORDER BY id";
-    assert!(keyed(more, vec![1, 2, 4, 5]), "{more}");
+}
+
+#[test]
+fn test_a_where_asking_more_than_its_keys_probes_within_its_candidates() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_keys").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE ones (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO ones SELECT value, 1 FROM generate_series(1, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // 2,000 rows each, so the probes may read 500 candidates in all
+    for (inner, k) in [
+        ("one", "1"),
+        ("many", "value % 200"),
+        (
+            "dense",
+            "CASE WHEN value <= 1801 THEN 1 ELSE value - 1800 END",
+        ),
+        (
+            "heavy_last",
+            "CASE WHEN value <= 190 THEN 1 + value % 19 ELSE 20 END",
+        ),
+    ] {
+        for sql in [
+            format!("CREATE TABLE {inner} (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)"),
+            format!("CREATE INDEX {inner}_k ON {inner} (k)"),
+            format!("INSERT INTO {inner} SELECT value, {k}, 1 FROM generate_series(1, 2000)"),
+        ] {
+            db.execute(&sql, ()).unwrap();
+        }
+    }
+    for (outer, inner, probes, built) in [
+        // Every row under one key: the first key is past the budget
+        ("o", "one", false, true),
+        // Ten rows a key: twenty probes read 200
+        ("o", "many", true, false),
+        // 200 keys, but every outer row asks the one holding 1,801 rows
+        ("ones", "dense", false, true),
+        // Nineteen keys of ten rows, then the key of 1,810: the set from there
+        ("o", "heavy_last", true, true),
+    ] {
+        let sql = format!(
+            "SELECT id FROM {outer} WHERE EXISTS \
+             (SELECT 1 FROM {inner} WHERE {inner}.k = {outer}.k AND {inner}.v > 5)"
+        );
+        let (before, built_before, _) = prepared_exists_counts();
+        assert_eq!(ids(&db, &sql), Vec::<i64>::new(), "{sql}");
+        let (after, built_after, _) = prepared_exists_counts();
+        assert_eq!(after > before, probes, "{sql} probes");
+        assert_eq!(
+            built_after > built_before,
+            built,
+            "{sql} builds the keyed set"
+        );
+    }
+}
+
+#[test]
+fn test_a_probe_within_budget_reads_only_the_candidates_it_was_charged_with() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_reads").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w INTEGER)",
+        "CREATE INDEX i_k ON i (k)",
+        "CREATE INDEX i_v ON i (v)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO n SELECT value, NULL FROM generate_series(1, 20)",
+        "INSERT INTO i SELECT value, value % 200, 1, 0 FROM generate_series(1, 1000)",
+        "INSERT INTO i SELECT value, NULL, 1, 0 FROM generate_series(1001, 2000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Five rows a key, each also under the one v every row holds; twenty
+    // NULL keys against a thousand NULL rows, past the budget: the set's
+    // one pass over the table, no read per call
+    for (outer, copied_at_most) in [("o", 100), ("n", 0)] {
+        let sql = format!(
+            "SELECT id FROM {outer} WHERE EXISTS \
+             (SELECT 1 FROM i WHERE i.k = {outer}.k AND i.v = 1 AND i.w > 5)"
+        );
+        let (index_ids, copied) = (hot_index_ids_read(), equality_candidate_ids_copied_count());
+        assert_eq!(ids(&db, &sql), Vec::<i64>::new(), "{sql}");
+        let read = hot_index_ids_read() - index_ids;
+        let copied = equality_candidate_ids_copied_count() - copied;
+        assert!(read <= 2000, "{sql} read {read} ids through the index plan");
+        assert!(copied <= copied_at_most, "{sql} copied {copied} candidates");
+    }
+}
+
+#[test]
+fn test_probes_whose_lookups_find_nothing_still_spend_the_budget() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_empty").unwrap();
+    for sql in [
+        "CREATE TABLE oo (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE ii (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX ii_k ON ii (k)",
+        "INSERT INTO oo SELECT value FROM generate_series(1001, 3000)",
+        "INSERT INTO ii SELECT value, value, 0 FROM generate_series(1, 400)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // A LIMIT small enough to probe, over 2,000 outer keys none of the 400
+    // rows holds: a budget of 100 pays for 25 lookups, then the set
+    let sql = "SELECT id FROM oo WHERE EXISTS \
+               (SELECT 1 FROM ii WHERE ii.k = oo.id AND ii.v > 5) LIMIT 10";
+    let (probes, built, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), Vec::<i64>::new(), "{sql}");
+    let (after_probes, after_built, _) = prepared_exists_counts();
+    assert_eq!(after_probes - probes, 25, "{sql}: probes before the set");
+    assert!(after_built > built, "{sql} builds the keyed set");
+}
+
+#[test]
+fn test_a_where_asking_more_than_its_keys_over_sealed_rows_takes_the_keyed_set() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE many (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX many_k ON many (k)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO many SELECT value, value % 200, 1 FROM generate_series(1, 400)",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql =
+        "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM many WHERE many.k = o.k AND many.v > 5)";
+    let (before, built, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), Vec::<i64>::new(), "{sql}");
+    let (after, after_built, _) = prepared_exists_counts();
+    assert_eq!(
+        after, before,
+        "{sql} probes: the index counts no sealed key"
+    );
+    assert!(after_built > built, "{sql} builds the keyed set");
 }
 
 #[test]

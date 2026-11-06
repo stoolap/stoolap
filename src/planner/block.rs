@@ -28,16 +28,6 @@ pub(crate) enum BlockRuns {
     PerCall,
 }
 
-/// How a block keyed on its parent's values answers a call
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyedRead {
-    /// From the keyed set it builds once per run
-    Set,
-    /// By a probe of the index on its key where [`probe_cheaper`] holds for
-    /// the run, else from the keyed set: its WHERE is the keys alone
-    ProbeOrSet,
-}
-
 /// How a grouped block reads its rows for a call it answers itself
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallRead {
@@ -56,17 +46,33 @@ pub(crate) fn small_probe_limit(limit: Option<i64>) -> bool {
 /// Whether an EXISTS on `column` of `table` probes it per outer row more
 /// cheaply than it builds a set: for a small LIMIT or few outer rows,
 /// since a probe per outer row costs about what a set pays for sixteen
-/// inner rows, and only when an index answers the probe
+/// inner rows, and only when an index answers the probe. A WHERE that asks
+/// more than the key (`rest`) is probed only over hot rows, within
+/// [`probe_budget`]
 pub(crate) fn probe_cheaper(
     table: &dyn Table,
     column: &str,
     outer_limit: Option<i64>,
     outer_rows: Option<usize>,
+    rest: bool,
 ) -> bool {
     let few_outer =
         outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
-    (small_probe_limit(outer_limit) || few_outer) && exists_probes(table, column)
+    (small_probe_limit(outer_limit) || few_outer)
+        && !(rest && table.has_sealed_rows())
+        && exists_probes(table, column)
 }
+
+/// The candidates a run's probes of a WHERE asking more than the key may
+/// read in all, each key's every candidate where the rest rejects them: a
+/// candidate costs a probe about four times what the keyed set pays for a row
+pub(crate) fn probe_budget(table: &dyn Table) -> usize {
+    table.row_count_hint() / 4
+}
+
+/// What one probe costs before it reads a candidate, in the budget's
+/// candidates: the sixteen rows of the set [`probe_cheaper`] weighs it at
+pub(crate) const PROBE_CALL_CANDIDATES: usize = 4;
 
 fn exists_probes(table: &dyn Table, column: &str) -> bool {
     // The table vouches for its indexes; one with local changes or an
