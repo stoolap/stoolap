@@ -207,6 +207,46 @@ fn returning_names_its_columns_as_a_select_list_does() {
 }
 
 #[test]
+fn returning_takes_an_alias_as_a_select_item_does() {
+    let returning =
+        "RETURNING id AS k, a + 1 AS plus, b c, (SELECT u.x FROM u WHERE u.id = t.a) AS x, a";
+    let expected = ["k", "plus", "c", "x", "a"];
+    let read = |rows: stoolap::Rows, sql: &str| -> Vec<Vec<i64>> {
+        assert_eq!(rows.columns(), expected, "{sql}");
+        rows.map(|row| {
+            let row = row.unwrap();
+            (0..5).map(|i| row.get::<i64>(i).unwrap()).collect()
+        })
+        .collect()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for (context, db) in [("hot", hot("returning_aliases")), ("sealed", sealed(&dir))] {
+        for (sql, values) in [
+            ("UPDATE t SET a = 2 WHERE id = 1", [1, 3, 5, 4, 2]),
+            ("INSERT INTO t VALUES (4, 1, 8)", [4, 2, 8, 2, 1]),
+            (
+                "INSERT INTO t VALUES (4, 0, 0) ON CONFLICT (id) DO UPDATE SET a = 2",
+                [4, 3, 8, 4, 2],
+            ),
+            ("DELETE FROM t WHERE id = 4", [4, 3, 8, 4, 2]),
+        ] {
+            let sql = format!("{sql} {returning}");
+            let rows = db.query(&sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(read(rows, &sql), [values], "{context}: {sql}");
+        }
+        for (sql, values) in [
+            ("INSERT INTO t VALUES ($1, 1, 8)", [5, 2, 8, 2, 1]),
+            ("UPDATE t SET a = 2 WHERE id = $1", [5, 3, 8, 4, 2]),
+            ("DELETE FROM t WHERE id = $1", [5, 3, 8, 4, 2]),
+        ] {
+            let sql = format!("{sql} {returning}");
+            let rows = db.prepare(&sql).unwrap().query((5,)).unwrap();
+            assert_eq!(read(rows, &sql), [values], "{context}, prepared: {sql}");
+        }
+    }
+}
+
+#[test]
 fn a_table_created_from_a_select_takes_its_names() {
     let db = hot("ctas");
     db.execute(
