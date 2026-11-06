@@ -142,7 +142,31 @@ pub(crate) fn compile_over_slots(
     blocks: bool,
     params: Option<&[Value]>,
 ) -> Result<super::expression::SharedProgram> {
-    let mut compile = super::expression::CompileContext::new(columns, registry);
+    compile_over(expr, (columns, &[]), registry, aliases, blocks, params)
+}
+
+/// [`compile_over_slots`] over a grouped statement's source row, a name
+/// that resolves to one of the `repeated` columns refused as ambiguous
+fn compile_over_source(
+    expr: &Expression,
+    (columns, repeated): (&[String], &[usize]),
+    registry: &crate::functions::FunctionRegistry,
+    blocks: bool,
+    params: Option<&[Value]>,
+) -> Result<super::expression::SharedProgram> {
+    compile_over(expr, (columns, repeated), registry, None, blocks, params)
+}
+
+fn compile_over(
+    expr: &Expression,
+    (columns, repeated): (&[String], &[usize]),
+    registry: &crate::functions::FunctionRegistry,
+    aliases: Option<&FxHashMap<ExprKey, usize>>,
+    blocks: bool,
+    params: Option<&[Value]>,
+) -> Result<super::expression::SharedProgram> {
+    let mut compile =
+        super::expression::CompileContext::new(columns, registry).refusing_repeated(repeated);
     if blocks {
         compile = compile.with_prepared_subqueries();
     }
@@ -160,7 +184,12 @@ pub(crate) fn compile_over_slots(
     super::expression::ExprCompiler::new(&compile)
         .compile(expr)
         .map(CompactArc::new)
-        .map_err(|e| crate::core::Error::internal(format!("Compile error: {}", e)))
+        .map_err(|e| match e {
+            super::expression::CompileError::Ambiguous(name) => {
+                super::prepared_select::ambiguous_column(&name)
+            }
+            e => crate::core::Error::internal(format!("Compile error: {}", e)),
+        })
 }
 
 /// A program over the pair of rows a join reads, `left`'s columns then
@@ -316,6 +345,26 @@ pub(crate) fn check_grouped_reads(
         Some(name) => Err(ungrouped_column(&name)),
         None => Ok(()),
     }
+}
+
+/// The positions of `columns` whose name another column carries, folded as
+/// the compiler folds a name; empty, allocating nothing, when none is
+pub(crate) fn repeated_columns(columns: &[String]) -> Vec<usize> {
+    let same = |a: &str, b: &str| match a.is_ascii() && b.is_ascii() {
+        true => a.eq_ignore_ascii_case(b),
+        false => with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b))),
+    };
+    let mut repeated = Vec::new();
+    for (at, name) in columns.iter().enumerate() {
+        if columns
+            .iter()
+            .enumerate()
+            .any(|(other, column)| other != at && same(name, column))
+        {
+            repeated.push(at);
+        }
+    }
+    repeated
 }
 
 /// A column of `source` that `stmt` reads outside every GROUP BY item and
@@ -1182,30 +1231,35 @@ impl<'a> RowFeed<'a> {
         ctx: &ExecutionContext,
         (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&'a HeldFeed>),
     ) -> Result<Self> {
-        let at = (group_items, stmt, col_index_map);
         let registry = crate::functions::registry::global_registry();
         let feed = match held {
             Some(held) => {
                 let compiled = super::expression::held_or_compile(held, || {
+                    let repeated = repeated_columns(columns);
+                    let at = (group_items, stmt, col_index_map, &repeated[..]);
                     CompiledFeed::compile(aggregations, at, |expr| {
-                        compile_over_slots(expr, columns, registry, None, blocks.is_some(), None)
+                        let source = (columns, &repeated[..]);
+                        compile_over_source(expr, source, registry, blocks.is_some(), None)
                     })
                 })?;
                 compiled.bound(slot_params(ctx, blocks), blocks)
             }
-            None => std::borrow::Cow::Owned(CompiledFeed::compile(aggregations, at, |expr| {
-                let program = compile_over_slots(
-                    expr,
-                    columns,
-                    registry,
-                    None,
-                    blocks.is_some(),
-                    Some(slot_params(ctx, blocks)),
-                )?;
-                Ok(blocks
-                    .and_then(|blocks| blocks.bind_members(&program))
-                    .unwrap_or(program))
-            })?),
+            None => {
+                let repeated = repeated_columns(columns);
+                let at = (group_items, stmt, col_index_map, &repeated[..]);
+                std::borrow::Cow::Owned(CompiledFeed::compile(aggregations, at, |expr| {
+                    let program = compile_over_source(
+                        expr,
+                        (columns, &repeated),
+                        registry,
+                        blocks.is_some(),
+                        Some(slot_params(ctx, blocks)),
+                    )?;
+                    Ok(blocks
+                        .and_then(|blocks| blocks.bind_members(&program))
+                        .unwrap_or(program))
+                })?)
+            }
         };
         Ok(Self { aggregations, feed })
     }
@@ -1213,17 +1267,23 @@ impl<'a> RowFeed<'a> {
 
 impl CompiledFeed {
     /// The feed of `aggregations` grouped by `group_items`, the keys `stmt`
-    /// writes, over the columns `col_index_map` finds, each program made by
-    /// `compile`
+    /// writes, over the columns `col_index_map` finds, a key naming one of the
+    /// `repeated` columns ambiguous, each program made by `compile`
     fn compile(
         aggregations: &[SqlAggregateFunction],
-        (group_items, stmt, col_index_map): (
+        (group_items, stmt, col_index_map, repeated): (
             &[GroupByItem],
             Option<&SelectStatement>,
             &StringMap<usize>,
+            &[usize],
         ),
         compile: impl Fn(&Expression) -> Result<super::expression::SharedProgram>,
     ) -> Result<Self> {
+        // A column a name reads by the map, refused when another carries its name
+        let unique = |idx: usize, name: &str| match repeated.contains(&idx) {
+            true => Err(super::prepared_select::ambiguous_column(&shown_name(name))),
+            false => Ok(idx),
+        };
         let items = group_items
             .iter()
             .enumerate()
@@ -1231,7 +1291,7 @@ impl CompiledFeed {
                 Ok(match item {
                     GroupByItem::Column(name) => {
                         match Executor::lookup_column_index(&name.to_lowercase(), col_index_map) {
-                            Some(idx) => KeyItem::Column(idx),
+                            Some(idx) => KeyItem::Column(unique(idx, name)?),
                             // No column binds it, nor another alias
                             None if stmt.is_some_and(|s| {
                                 aggregate_alias_key(
@@ -1280,7 +1340,7 @@ impl CompiledFeed {
                     return Ok(None);
                 }
                 match Executor::lookup_column_index(&agg.column_lower, col_index_map) {
-                    Some(idx) => Ok(Some(idx)),
+                    Some(idx) => Ok(Some(unique(idx, &agg.column)?)),
                     // A qualified name its source lacks
                     None if split_qualified(&agg.column).is_some() => {
                         Err(ungrouped_column(&shown_name(&agg.column)))

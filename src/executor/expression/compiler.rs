@@ -63,6 +63,8 @@ pub enum CompileError {
     UnsupportedExpression(String),
     /// Type error
     TypeError(String),
+    /// A name two columns carry
+    Ambiguous(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -77,6 +79,9 @@ impl std::fmt::Display for CompileError {
                 write!(f, "Unsupported expression: {}", msg)
             }
             CompileError::TypeError(msg) => write!(f, "Type error: {}", msg),
+            CompileError::Ambiguous(name) => {
+                write!(f, "column reference '{}' is ambiguous", name)
+            }
         }
     }
 }
@@ -129,6 +134,8 @@ pub(crate) enum Reference {
     Text,
     /// No column has it: the name as the error spells it
     Missing(String),
+    /// Two columns carry it: the name as the error spells it
+    Ambiguous(String),
 }
 
 impl Reference {
@@ -183,6 +190,10 @@ pub struct CompileContext<'a> {
     /// A program over the prepared builder's bound columns: one below the
     /// split reads the first row, the rest the second row from the split on
     bound: Option<u32>,
+
+    /// The first row's columns whose name another column carries: a name
+    /// that resolves to one is ambiguous
+    repeated: &'a [usize],
 }
 
 impl<'a> CompileContext<'a> {
@@ -222,6 +233,7 @@ impl<'a> CompileContext<'a> {
             read_as: None,
             params: None,
             bound: None,
+            repeated: &[],
         }
     }
 
@@ -302,6 +314,13 @@ impl<'a> CompileContext<'a> {
         self
     }
 
+    /// Refuse a name that resolves to one of the `repeated` columns, whose
+    /// name another column carries, as ambiguous
+    pub(crate) fn refusing_repeated(mut self, repeated: &'a [usize]) -> Self {
+        self.repeated = repeated;
+        self
+    }
+
     /// Fold what reads only `params` and constants, for a program compiled
     /// for one execution and dropped with it; a fold that errors is not taken
     pub fn with_params(mut self, params: &'a [Value]) -> Self {
@@ -354,7 +373,17 @@ impl<'a> CompileContext<'a> {
     /// What a bare or qualified name reads, by the one rule every compiled
     /// name is read by; None for an expression that is not a name
     pub(crate) fn reference(&self, expr: &Expression) -> Option<Reference> {
-        let found = |source: Option<ColumnSource>| source.map(Reference::Column);
+        let found = |source: Option<ColumnSource>| {
+            source.map(|source| match source {
+                ColumnSource::Row1(at) if self.repeated.contains(&usize::from(at)) => {
+                    Reference::Ambiguous(match expr {
+                        Expression::Identifier(id) => id.value.to_string(),
+                        other => other.to_string(),
+                    })
+                }
+                source => Reference::Column(source),
+            })
+        };
         Some(match expr {
             Expression::Identifier(id) => match split_qualified(&id.value_lower) {
                 Some((table, column)) => found(self.resolve_qualified(table, column)),
@@ -829,6 +858,7 @@ impl<'a> ExprCompiler<'a> {
                 builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
             }
             Some(Reference::Missing(name)) => return Err(CompileError::ColumnNotFound(name)),
+            Some(Reference::Ambiguous(name)) => return Err(CompileError::Ambiguous(name)),
             None => return Err(CompileError::InvalidExpression(expr.to_string())),
         }
         Ok(())
