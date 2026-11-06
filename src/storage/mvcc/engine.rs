@@ -7867,6 +7867,11 @@ impl MVCCEngine {
             stores
                 .iter()
                 .filter_map(|(table_name, store)| {
+                    // An unavailable table's rows stay hot until it is repaired:
+                    // a seal would weigh its tombstones against loaded volumes only
+                    if store.is_cold_unavailable() {
+                        return None;
+                    }
                     let row_count = store.committed_row_count();
                     if force_seal {
                         if row_count == 0 {

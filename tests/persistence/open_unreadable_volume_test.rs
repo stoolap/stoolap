@@ -167,6 +167,15 @@ fn test_a_hot_row_of_an_unavailable_table_is_refused_too() {
     db.close().unwrap();
     std::fs::remove_file(&volumes[0]).unwrap();
     let db = Database::open(&no_close_checkpoint).unwrap();
+    // The open seals no row of an unavailable table, so the two stay hot
+    let hot_rows: i64 = db
+        .query("PRAGMA MEMORY_STATS", ())
+        .unwrap()
+        .map(|row| row.unwrap())
+        .find(|row| row.get::<String>(0).unwrap() == "t")
+        .map(|row| row.get(1).unwrap())
+        .unwrap();
+    assert_eq!(hot_rows, 2, "rows 5 and 50 are hot when they are read");
     let point = db.prepare("SELECT v FROM t WHERE id = $1").unwrap();
     for (what, answer) in [
         ("a point read", run(&db, "SELECT v FROM t WHERE id = 5")),
