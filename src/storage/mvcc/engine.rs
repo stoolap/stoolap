@@ -9372,6 +9372,18 @@ impl EngineOperations {
         }
     }
 
+    /// Moves the schema epoch for a rename of `old` to `new`, both lower
+    /// case, done or undone: a cache built meanwhile is rebuilt
+    fn renamed(&self, old: &str, new: &str) {
+        let schemas = self.schemas().read().unwrap();
+        let mut names = fk_neighbors(&schemas, schemas.get(new).map(|s| &**s), old);
+        names.extend(fk_neighbors(&schemas, schemas.get(old).map(|s| &**s), new));
+        names.push(old.to_string());
+        names.push(new.to_string());
+        self.ddl
+            .changed(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
     fn new(engine: &MVCCEngine) -> Self {
         Self {
             schemas: Arc::clone(&engine.schemas),
@@ -9939,6 +9951,8 @@ impl TransactionEngineOperations for EngineOperations {
                             || std::fs::rename(&old_dir, &new_dir),
                         )
                     };
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::rename_directory_moving();
                     let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
                         Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
                         None => move_dir(),
@@ -9982,6 +9996,7 @@ impl TransactionEngineOperations for EngineOperations {
                                 mgrs.insert(old_name_lower.clone(), mgr);
                             }
                         }
+                        self.renamed(&old_name_lower, &new_name_lower);
                         return Err(Error::Internal {
                             message: format!("Failed to rename volume directory: {}", e),
                         });
@@ -9998,19 +10013,7 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
 
-        // Increment schema epoch for cache invalidation
-        let schemas = self.schemas().read().unwrap();
-        let mut names = fk_neighbors(
-            &schemas,
-            schemas.get(&new_name_lower).map(|s| &**s),
-            &old_name_lower,
-        );
-        names.extend(fk_neighbors(&schemas, None, &new_name_lower));
-        names.push(old_name_lower);
-        names.push(new_name_lower);
-        self.ddl
-            .changed(&names.iter().map(String::as_str).collect::<Vec<_>>());
-
+        self.renamed(&old_name_lower, &new_name_lower);
         Ok(())
     }
 

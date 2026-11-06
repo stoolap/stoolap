@@ -67,3 +67,34 @@ fn a_child_key_follows_its_renamed_parent() {
         db.close().unwrap();
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_failed_rename_leaves_no_child_lookup_of_the_new_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO c VALUES (10, 1)",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // A non-empty directory in the way fails the volume directory's move
+    let blocker = dir.path().join("volumes").join("p2");
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("x"), b"x").unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::in_rename_before_the_move(move || {
+        other.execute("DELETE FROM u WHERE id = 1", ()).unwrap();
+    });
+    assert!(db.execute("ALTER TABLE p RENAME TO p2", ()).is_err());
+    assert!(
+        db.execute("DELETE FROM p WHERE id = 1", ()).is_err(),
+        "c still references p's row 1"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM p"), 1);
+}

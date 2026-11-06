@@ -1313,6 +1313,23 @@ pub(crate) fn rename_directory_moved() {
 }
 
 thread_local! {
+    static RENAME_MOVING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table rename has renamed the
+/// schemas and is about to move the directory, which may fail and undo them
+pub fn in_rename_before_the_move(hook: impl FnOnce() + 'static) {
+    RENAME_MOVING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn rename_directory_moving() {
+    let hook = RENAME_MOVING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static VOLUME_PATH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
