@@ -58,7 +58,27 @@ pub struct VolumeFile {
     path: parking_lot::RwLock<std::path::PathBuf>,
     retired: std::sync::atomic::AtomicBool,
     loaded: parking_lot::Mutex<std::sync::Weak<FrozenVolume>>,
+    /// A descriptor kept for block reads while the file is among the
+    /// `KEPT_READERS` read most recently
+    reader: parking_lot::Mutex<Option<Arc<std::fs::File>>>,
+    /// `READ_CLOCK` at the file's last block read
+    last_read: std::sync::atomic::AtomicU64,
 }
+
+/// The files holding a kept descriptor
+static OPEN_READERS: parking_lot::Mutex<Vec<std::sync::Weak<VolumeFile>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Counts block reads, the age by which a descriptor is given up
+static READ_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Descriptors kept across block reads, process-wide
+const KEPT_READERS: usize = 64;
+
+/// Room for every listed file while one is chosen to give up, a size
+/// `SmallVec` takes
+const UPGRADED_ON_STACK: usize = 96;
+const _: () = assert!(KEPT_READERS < UPGRADED_ON_STACK);
 
 static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -95,6 +115,8 @@ impl VolumeFile {
             path: parking_lot::RwLock::new(path.to_path_buf()),
             retired: std::sync::atomic::AtomicBool::new(false),
             loaded: parking_lot::Mutex::new(std::sync::Weak::new()),
+            reader: parking_lot::Mutex::new(None),
+            last_read: std::sync::atomic::AtomicU64::new(0),
         });
         registry
             .files
@@ -148,7 +170,70 @@ impl VolumeFile {
     /// Opens the file at the path it is now, holding the path lock across
     /// the open so a rename cannot land between the two
     pub(super) fn open(&self) -> std::io::Result<std::fs::File> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::volume_file_opened();
         std::fs::File::open(&*self.path.read())
+    }
+
+    /// A descriptor for block reads, kept while the file is among the
+    /// `KEPT_READERS` read most recently; a rename or a retire leaves an
+    /// open descriptor reading the same file
+    fn block_reader(self: &Arc<Self>) -> std::io::Result<Arc<std::fs::File>> {
+        use std::sync::atomic::Ordering;
+        let now = READ_CLOCK.fetch_add(1, Ordering::Relaxed);
+        self.last_read.store(now, Ordering::Relaxed);
+        if let Some(file) = &*self.reader.lock() {
+            return Ok(Arc::clone(file));
+        }
+        // Files upgraded below go after every lock (a last drop takes the
+        // registry a move holds); at most `KEPT_READERS + 1`, on the stack
+        let mut upgraded: smallvec::SmallVec<[Arc<VolumeFile>; UPGRADED_ON_STACK]> =
+            smallvec::SmallVec::new();
+        let mut evicted: Option<(Arc<VolumeFile>, Option<Arc<std::fs::File>>)> = None;
+        let file = {
+            // Opened and kept under the path lock, so a move, which holds
+            // it, never meets a descriptor kept after it gave them up
+            let path = self.path.read();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::volume_file_opened();
+            let file = Arc::new(std::fs::File::open(&*path)?);
+            let mut open = OPEN_READERS.lock();
+            let mut slot = self.reader.lock();
+            if let Some(kept) = &*slot {
+                return Ok(Arc::clone(kept));
+            }
+            *slot = Some(Arc::clone(&file));
+            drop(slot);
+            open.retain(|weak| weak.strong_count() > 0);
+            open.push(Arc::downgrade(self));
+            // Past the limit, the file read longest ago gives its descriptor up
+            if open.len() > KEPT_READERS {
+                upgraded.extend(open.iter().filter_map(std::sync::Weak::upgrade));
+                let oldest = upgraded
+                    .iter()
+                    .filter(|f| !Arc::ptr_eq(f, self))
+                    .min_by_key(|f| f.last_read.load(Ordering::Relaxed))
+                    .map(Arc::clone);
+                if let Some(old) = oldest {
+                    open.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&old)));
+                    let descriptor = old.reader.lock().take();
+                    evicted = Some((old, descriptor));
+                }
+            }
+            file
+        };
+        drop(evicted);
+        drop(upgraded);
+        Ok(file)
+    }
+
+    /// Gives up the kept descriptor and the file's place among the kept,
+    /// under the lock a descriptor is kept under
+    fn drop_reader(self: &Arc<Self>) {
+        let mut open = OPEN_READERS.lock();
+        if self.reader.lock().take().is_some() {
+            open.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(self)));
+        }
     }
 
     /// Moves every file under `old_dir` to `new_dir` through `move_dir`:
@@ -188,6 +273,11 @@ impl VolumeFile {
             }
         }
         let mut paths: Vec<_> = moved.iter().map(|(_, file)| file.path.write()).collect();
+        // With the paths locked no block read opens; a kept descriptor
+        // would stop a directory move on Windows
+        for (_, file) in &moved {
+            file.drop_reader();
+        }
         let result = move_dir();
         if result.is_ok() {
             for ((old_path, file), path) in moved.iter().zip(paths.iter_mut()) {
@@ -221,6 +311,12 @@ impl Drop for VolumeFile {
     fn drop(&mut self) {
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::volume_file_dropped();
+        // The kept descriptor closes before the wait on the registry: a
+        // move holding it would otherwise meet an open file on Windows
+        if self.reader.get_mut().take().is_some() {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::volume_file_descriptor_closed(self.id);
+        }
         // The file goes under the registry lock, which a move holds too
         let mut registry = VOLUME_FILES.lock();
         let path = registry
@@ -247,8 +343,8 @@ impl Drop for VolumeFile {
 /// when a group is decoded
 enum BlockSource {
     Memory(Vec<Vec<Vec<u8>>>),
-    /// The file is opened for each block read and closed after it, so a
-    /// store holds no descriptor between reads
+    /// Blocks read through the file's kept descriptor, reopened once the
+    /// file falls out of the most recently read
     File {
         file: Arc<VolumeFile>,
         /// offsets[col_idx][group_idx] and lens[col_idx][group_idx] of
@@ -519,7 +615,7 @@ impl CompressedBlockStore {
     }
 
     /// Keep compressed blocks on disk and acquire their shared file owner.
-    /// Offsets and lengths locate each block; each read opens its own descriptor.
+    /// Offsets and lengths locate each block.
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
         path: std::path::PathBuf,
@@ -660,7 +756,7 @@ impl CompressedBlockStore {
                 scratch.resize(len, 0);
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::block_file_read();
-                read_exact_at(&file.open()?, scratch, offset)?;
+                read_exact_at(&*file.block_reader()?, scratch, offset)?;
                 Ok(scratch.as_slice())
             }
         }
@@ -4177,6 +4273,17 @@ mod tests {
         assert!(!dir.path().join("old").join("v.vol").exists());
     }
 
+    /// Descriptors of this process open on the file with inode `ino`
+    #[cfg(unix)]
+    fn descriptors_open(ino: u64) -> usize {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir("/dev/fd")
+            .unwrap()
+            .flatten()
+            .filter(|fd| std::fs::metadata(fd.path()).is_ok_and(|m| m.ino() == ino))
+            .count()
+    }
+
     #[test]
     fn a_file_whose_last_holder_lets_go_during_a_move_is_removed_at_its_new_place() {
         let dir = tempfile::tempdir().unwrap();
@@ -4186,12 +4293,28 @@ mod tests {
         std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
         let file = VolumeFile::shared(&old_dir.join("v.vol"));
         file.retire();
+        // A block read keeps a descriptor the move must not meet
+        drop(file.block_reader().unwrap());
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(old_dir.join("v.vol")).unwrap().ino()
+        };
         let gone = Arc::downgrade(&file);
+        let id = file.id;
         // The moves hold the registry; the last holder lets go meanwhile,
         // its drop waiting on the lock
         let mut registry = VOLUME_FILES.lock();
         let letting_go = std::thread::spawn(move || drop(file));
         while gone.strong_count() > 0 {
+            std::thread::yield_now();
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !crate::test_failpoints::descriptor_closed_at_drop(id) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the letting-go file's drop did not close its descriptor before the move"
+            );
             std::thread::yield_now();
         }
         // There, back, and there again: the same names twice over
@@ -4200,8 +4323,14 @@ mod tests {
             (&new_dir, &old_dir),
             (&old_dir, &new_dir),
         ] {
-            let (result, held) =
-                VolumeFile::relocate_in(&mut registry, from, to, || std::fs::rename(from, to));
+            let (result, held) = VolumeFile::relocate_in(&mut registry, from, to, || {
+                #[cfg(unix)]
+                assert!(
+                    descriptors_open(ino) == 0,
+                    "the letting-go file kept its descriptor open during the move"
+                );
+                std::fs::rename(from, to)
+            });
             result.unwrap();
             assert!(held.is_empty());
         }

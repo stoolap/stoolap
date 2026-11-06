@@ -33,6 +33,7 @@ mod hot_limits_test;
 mod hot_schema_evolution_test;
 mod hot_streaming_scan_test;
 mod insert_cold_rounds_test;
+mod kept_descriptor_test;
 mod keyless_cold_update_test;
 mod limit_cold_read_consistency_test;
 mod opened_table_access_test;

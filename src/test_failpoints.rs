@@ -2694,6 +2694,24 @@ pub(crate) fn volume_file_dropped() {
     count_by_fence_depth(&VOLUME_FILE_DROPS);
 }
 
+/// Ids of the volume files whose drop closed a kept descriptor
+static DESCRIPTORS_CLOSED_AT_DROP: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Whether the drop of volume file `id` has closed its kept descriptor
+pub fn descriptor_closed_at_drop(id: u64) -> bool {
+    DESCRIPTORS_CLOSED_AT_DROP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&id)
+}
+
+pub(crate) fn volume_file_descriptor_closed(id: u64) {
+    DESCRIPTORS_CLOSED_AT_DROP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(id);
+}
+
 /// Volumes this thread loaded through the live segment map, not through a
 /// statement's captured owners
 pub fn live_volume_loads() -> usize {
@@ -3409,6 +3427,18 @@ pub(crate) fn volume_load_requested() {
 pub(crate) fn volume_file_read() {
     VOLUME_FILE_READS.with(|n| n.set(n.get() + 1));
     count_by_fence_depth(&VOLUME_FILE_READS_BY_DEPTH);
+}
+
+/// Times a volume file was opened, by every thread of the process
+static VOLUME_FILE_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Volume file opens so far, process-wide
+pub fn volume_file_opens() -> usize {
+    VOLUME_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn volume_file_opened() {
+    VOLUME_FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Reset all failpoints to disabled state
