@@ -409,6 +409,30 @@ fn test_a_probe_within_budget_reads_only_the_candidates_it_was_charged_with() {
 }
 
 #[test]
+fn test_probes_whose_lookups_find_nothing_still_spend_the_budget() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_empty").unwrap();
+    for sql in [
+        "CREATE TABLE oo (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE ii (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX ii_k ON ii (k)",
+        "INSERT INTO oo SELECT value FROM generate_series(1001, 3000)",
+        "INSERT INTO ii SELECT value, value, 0 FROM generate_series(1, 400)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // A LIMIT small enough to probe, over 2,000 outer keys none of the 400
+    // rows holds: a budget of 100 pays for 25 lookups, then the set
+    let sql = "SELECT id FROM oo WHERE EXISTS \
+               (SELECT 1 FROM ii WHERE ii.k = oo.id AND ii.v > 5) LIMIT 10";
+    let (probes, built, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), Vec::<i64>::new(), "{sql}");
+    let (after_probes, after_built, _) = prepared_exists_counts();
+    assert_eq!(after_probes - probes, 25, "{sql}: probes before the set");
+    assert!(after_built > built, "{sql} builds the keyed set");
+}
+
+#[test]
 fn test_a_where_asking_more_than_its_keys_over_sealed_rows_takes_the_keyed_set() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();

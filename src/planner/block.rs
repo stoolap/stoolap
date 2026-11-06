@@ -70,6 +70,10 @@ pub(crate) fn probe_budget(table: &dyn Table) -> usize {
     table.row_count_hint() / 4
 }
 
+/// What one probe costs before it reads a candidate, in the budget's
+/// candidates: the sixteen rows of the set [`probe_cheaper`] weighs it at
+pub(crate) const PROBE_CALL_CANDIDATES: usize = 4;
+
 fn exists_probes(table: &dyn Table, column: &str) -> bool {
     // The table vouches for its indexes; one with local changes or an
     // older snapshot refuses every probe

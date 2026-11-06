@@ -15589,15 +15589,19 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// Whether the call the buffer holds probes within the run's budget,
-    /// charged with its key's candidates counted before any is copied, which
-    /// its probe then reads; a key past it, or one the table cannot count,
-    /// leaves the run to the set
+    /// charged with its lookup and its key's candidates counted before any is
+    /// copied, which its probe then reads; a key past it, or one the table
+    /// cannot count, leaves the run to the set
     fn probe_within_budget(&self, index: usize, plan: &KeyedPlan) -> bool {
         let block = &self.blocks[index];
         let Some(left) = block.probe_left.get() else {
             return true;
         };
         block.counted.set(false);
+        // Every call pays its lookup, an empty one too
+        let Some(left) = left.checked_sub(block_plan::PROBE_CALL_CANDIDATES) else {
+            return false;
+        };
         let Some(table) = self.tables[index].as_ref().and_then(BlockInput::table) else {
             return false;
         };
