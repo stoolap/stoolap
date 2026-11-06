@@ -84,6 +84,10 @@ fn a_grouped_statement_reading_a_repeated_name_is_ambiguous() {
             "SELECT MAX(s.k) FROM (SELECT id, 10 AS \"\u{212A}\", 20 AS k FROM t) AS s \
              WHERE id > $1"
                 .to_string(),
+            // A final sigma folds as the name it ends, not as its letter alone
+            "SELECT MAX(s.\"ος\") FROM (SELECT id, 10 AS \"ΟΣ\", 20 AS \"ος\" FROM t) AS s \
+             WHERE id > $1"
+                .to_string(),
         ] {
             for prepared in [false, true] {
                 let err = rows(&db, &sql, prepared)

@@ -352,10 +352,7 @@ pub(crate) fn check_grouped_reads(
 pub(crate) fn repeated_columns(columns: &[String]) -> Vec<usize> {
     let same = |a: &str, b: &str| match a.is_ascii() && b.is_ascii() {
         true => a.eq_ignore_ascii_case(b),
-        false => a
-            .chars()
-            .flat_map(char::to_lowercase)
-            .eq(b.chars().flat_map(char::to_lowercase)),
+        false => with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b))),
     };
     let mut repeated = Vec::new();
     for (at, name) in columns.iter().enumerate() {
