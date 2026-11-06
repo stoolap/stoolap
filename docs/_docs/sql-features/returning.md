@@ -79,6 +79,16 @@ RETURNING id, name, price;
 -- Returns all deleted rows
 ```
 
+## Column Names
+
+A `RETURNING` item takes an alias as a `SELECT` item does, with or without `AS`. A returned column is named by its alias, else as the `SELECT` list names the same expression:
+
+```sql
+UPDATE counters SET count = count + 5 WHERE id = 1
+RETURNING id AS counter, count + 1 next_count, count * 2;
+-- Columns: counter, next_count, count * 2
+```
+
 ## Subqueries in RETURNING
 
 A `RETURNING` value may hold a subquery. It sees the tables as the statement found them, and a column of the target in it names the row returned:

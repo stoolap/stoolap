@@ -1296,9 +1296,10 @@ impl Parser<'_> {
         }
 
         self.next_token(); // consume RETURNING
+        self.next_token(); // move to the first item
 
-        // Parse the expression list
-        self.parse_expression_list()
+        // The items of a SELECT list: each may take an alias
+        self.parse_select_columns()
     }
 
     /// Parse value lists for INSERT
