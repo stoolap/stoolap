@@ -72,6 +72,18 @@ fn a_grouped_statement_reading_a_repeated_name_is_ambiguous() {
             format!(
                 "SELECT COUNT(*) {FROM} WHERE id IN (SELECT id FROM t WHERE id > $1) GROUP BY s.x"
             ),
+            // A key reading the name inside an expression, beside an alias of it
+            format!("SELECT id AS x, COUNT(*) {FROM} WHERE id > $1 GROUP BY id, x + 1"),
+            format!("SELECT COUNT(*) {FROM} WHERE id > $1 GROUP BY GROUPING SETS ((x))"),
+            format!("SELECT MAX(x), ROW_NUMBER() OVER () {FROM} WHERE id > $1"),
+            // Names that fold alike: two of one non-ASCII spelling, and the
+            // Kelvin sign beside k
+            "SELECT MAX(s.\"É\") FROM (SELECT id, 10 AS \"É\", 20 AS \"É\" FROM t) AS s \
+             WHERE id > $1"
+                .to_string(),
+            "SELECT MAX(s.k) FROM (SELECT id, 10 AS \"\u{212A}\", 20 AS k FROM t) AS s \
+             WHERE id > $1"
+                .to_string(),
         ] {
             for prepared in [false, true] {
                 let err = rows(&db, &sql, prepared)
