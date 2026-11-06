@@ -1227,11 +1227,12 @@ impl MVCCEngine {
                         })
                         .unwrap_or(false);
 
+                let mut unreadable = Vec::new();
                 let replay_from_lsn = if let Some(lsn) = volume_lsn {
                     // New path: load manifests + volumes BEFORE WAL replay.
                     // Volumes must be loaded so is_row_id_in_volume() can check
                     // row_ids for idempotent INSERT during replay.
-                    self.load_standalone_volumes_no_schema_check();
+                    unreadable = self.load_standalone_volumes_no_schema_check();
                     lsn
                 } else if has_legacy_snapshots {
                     // Legacy path: load snapshots (creates schemas + version stores)
@@ -1247,6 +1248,9 @@ impl MVCCEngine {
 
                 // Replay WAL entries after the checkpoint/snapshot LSN
                 self.replay_wal(replay_from_lsn)?;
+                // A TRUNCATE or DROP replayed above may have retired a segment
+                // whose file it removed, so the check follows the replay
+                self.mark_unloaded_tables(&unreadable);
 
                 // History opens at the recovered state, above every sequence
                 // a volume or a tombstone kept from earlier runs
@@ -4127,20 +4131,22 @@ impl MVCCEngine {
     /// Used during the new volume-only recovery path where volumes are loaded
     /// BEFORE WAL replay (which creates schemas). Volumes carry their own schema
     /// in the file format, so no external schema lookup is needed.
-    fn load_standalone_volumes_no_schema_check(&self) {
+    /// Returns each listed volume file that did not read, with its table.
+    fn load_standalone_volumes_no_schema_check(&self) -> Vec<(String, String)> {
+        let mut unreadable = Vec::new();
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
-            _ => return,
+            _ => return unreadable,
         };
 
         let vol_dir = pm.path().join("volumes");
         if !vol_dir.exists() {
-            return;
+            return unreadable;
         }
 
         let entries = match std::fs::read_dir(&vol_dir) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => return unreadable,
         };
 
         for entry in entries.flatten() {
@@ -4150,11 +4156,6 @@ impl MVCCEngine {
 
             let table_name = entry.file_name().to_string_lossy().to_lowercase();
 
-            let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
-            if paths.is_empty() {
-                continue;
-            }
-
             // .vol files with no manifest.bin: either a crash before the
             // first manifest write (WAL replay covers the data) or a lost
             // manifest (these files may be the only copy). An empty manager
@@ -4163,6 +4164,9 @@ impl MVCCEngine {
             if !vol_dir.join(&table_name).join("manifest.bin").exists() {
                 continue;
             }
+
+            // A manifest whose every file is gone still lists their segments
+            let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
 
             let mgr = self.get_or_create_segment_manager(&table_name);
             let sides =
@@ -4192,10 +4196,8 @@ impl MVCCEngine {
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
                     Ok(volume) => Arc::new(volume),
                     Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to read volume {:?}: {}. Skipping file.",
-                            path, e
-                        );
+                        let detail = format!("volume {:?} does not read: {}", path, e);
+                        unreadable.push((table_name.clone(), detail));
                         continue;
                     }
                 };
@@ -4204,6 +4206,37 @@ impl MVCCEngine {
             }
             // Recompute visibility bitmaps after all volumes for this table are loaded.
             mgr.recompute_visibility();
+        }
+        unreadable
+    }
+
+    /// Once the log is replayed, a segment a manifest still lists without a
+    /// loaded volume has its rows nowhere else, so its table refuses every
+    /// statement; `unreadable` names the files that did not read
+    fn mark_unloaded_tables(&self, unreadable: &[(String, String)]) {
+        let mgrs: Vec<_> = (self.segment_managers.read().unwrap().iter())
+            .map(|(table, mgr)| (table.clone(), Arc::clone(mgr)))
+            .collect();
+        for (table, mgr) in mgrs {
+            let listed: Vec<u64> = (mgr.manifest().segments.iter())
+                .map(|segment| segment.segment_id)
+                .collect();
+            let missing: Vec<u64> = listed
+                .into_iter()
+                .filter(|&id| !mgr.has_segment(id))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let mut reason = format!("listed volume segments {:?} did not load", missing);
+            for (_, detail) in unreadable.iter().filter(|(of, _)| *of == table) {
+                reason.push_str("; ");
+                reason.push_str(detail);
+            }
+            mgr.mark_unavailable(reason);
+            if let Some(store) = self.version_stores.read().unwrap().get(&table) {
+                store.mark_cold_unavailable();
+            }
         }
     }
 
@@ -5000,6 +5033,12 @@ impl MVCCEngine {
             Some(pm) if pm.is_enabled() => pm,
             _ => return Ok(()),
         };
+
+        // A table missing a listed volume has no whole copy to back up, and a
+        // published partial one would retire the last good backup
+        for mgr in self.segment_managers.read().unwrap().values() {
+            mgr.check_available()?;
+        }
 
         let snapshot_dir = pm.path().join("snapshots");
         if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
@@ -6187,14 +6226,19 @@ impl MVCCEngine {
                 // Fence acquired — no new commits can start. In-flight commits
                 // finished (they held the read lock, which is now released).
                 // Just check if bulk seal (steps 1-2) drained everything.
-                let all_hot_empty = {
+                // A table missing a listed volume keeps the log its replay read:
+                // a DELETE of a row only that volume holds is recorded nowhere else
+                let (all_hot_empty, any_unavailable) = {
                     let stores = self.version_stores.read().unwrap();
-                    stores
-                        .values()
-                        .all(|store| store.committed_row_count() == 0)
+                    (
+                        stores
+                            .values()
+                            .all(|store| store.committed_row_count() == 0),
+                        stores.values().any(|store| store.is_cold_unavailable()),
+                    )
                 };
 
-                if all_hot_empty && !self.has_incomplete_change() {
+                if all_hot_empty && !any_unavailable && !self.has_incomplete_change() {
                     // All data is in volumes: the cut is the boundary to
                     // publish once the catalog copies are durable
                     if let Some(ref pm) = *self.persistence {
@@ -6294,12 +6338,14 @@ impl MVCCEngine {
     /// than its schema's, the table validated first; called at open once the
     /// log is replayed
     fn repair_retyped_volumes(&self) -> Result<()> {
+        // A table missing a listed volume is repaired at the open that has it
         let tables: Vec<String> = self
             .segment_managers
             .read()
             .map_err(|_| Error::internal("segment managers lock poisoned"))?
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, mgr)| !mgr.is_unavailable())
+            .map(|(table, _)| table.clone())
             .collect();
         let _ddl = self.ddl_guard();
         let shared = retype::Shared {
@@ -6855,6 +6901,11 @@ impl MVCCEngine {
             let mgrs = self.segment_managers.read().unwrap();
             mgrs.iter()
                 .filter(|(_, mgr)| {
+                    // Without a listed volume a rewrite cannot see every copy
+                    // of a row, so it could drop a tombstone that still hides one
+                    if mgr.is_unavailable() {
+                        return false;
+                    }
                     // Only count sub-target volumes toward threshold.
                     let sub_target = mgr.sub_target_segment_count(target_volume_rows);
                     if sub_target > compact_threshold {
@@ -7816,6 +7867,11 @@ impl MVCCEngine {
             stores
                 .iter()
                 .filter_map(|(table_name, store)| {
+                    // An unavailable table's rows stay hot until it is repaired:
+                    // a seal would weigh its tombstones against loaded volumes only
+                    if store.is_cold_unavailable() {
+                        return None;
+                    }
                     let row_count = store.committed_row_count();
                     if force_seal {
                         if row_count == 0 {
@@ -8758,6 +8814,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
         let store = self.get_version_store(table_name)?;
+        self.check_cold_available(table_name, &store)?;
         let epoch = store.publish_epoch_if_quiet();
         self.fetch_rows_by_ids_in(table_name, &store, row_ids, token, settled, epoch)
     }
@@ -8841,6 +8898,17 @@ impl MVCCEngine {
         Ok(Some(result))
     }
 
+    /// An error when the open left one of `store`'s listed volumes unloaded:
+    /// a read without a table handle refuses the table as a statement does
+    #[inline]
+    fn check_cold_available(&self, table_name: &str, store: &VersionStore) -> Result<()> {
+        if store.is_cold_unavailable() {
+            self.get_or_create_segment_manager(table_name)
+                .check_available()?;
+        }
+        Ok(())
+    }
+
     /// Row `row_id` in the latest committed state: its hot version as the
     /// chain holds it whatever publishes, one row being read whole; a row
     /// not hot is read settled with the volumes. None sends the caller to a view
@@ -8868,6 +8936,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        self.check_cold_available(table_name, store)?;
         if let Some(hot) = store.get_visible_version(row_id, (INVALID_TRANSACTION_ID + 1).into()) {
             store.check_token(token)?;
             return Ok(Some(crate::core::KeyRows::One(row_id, hot.data)));
@@ -8896,6 +8965,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        self.check_cold_available(table_name, store)?;
         let Some(epoch) = store.publish_epoch_if_quiet() else {
             return Ok(None);
         };
@@ -8987,6 +9057,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
         let store = self.get_version_store(table_name)?;
+        self.check_cold_available(table_name, &store)?;
         let reader = crate::storage::mvcc::version_store::Reader {
             txn_id: INVALID_TRANSACTION_ID + 1,
             view: Some(view),
@@ -9620,6 +9691,7 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
         };
+        mgr.check_available()?;
         let schema_generation = mgr.schema_generation();
         let table = open(version_store).with_view(view.clone());
         admit(&table)?;

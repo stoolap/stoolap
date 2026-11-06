@@ -1644,6 +1644,9 @@ pub struct SegmentManager {
     pub current_eviction_epoch: std::sync::atomic::AtomicU64,
     /// True when any segment in the map is cold (metadata only, needs reload).
     has_cold: std::sync::atomic::AtomicBool,
+    /// Why the open could not load every segment the manifest lists; while
+    /// set, every statement on the table is refused
+    unavailable: std::sync::OnceLock<String>,
     /// Recluster requests, one at construction and one per key change, and
     /// the last request a full check of the volumes closed
     recluster_requested: std::sync::atomic::AtomicU64,
@@ -1731,6 +1734,7 @@ impl SegmentManager {
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
+            unavailable: std::sync::OnceLock::new(),
             recluster_requested: std::sync::atomic::AtomicU64::new(1),
             recluster_done: std::sync::atomic::AtomicU64::new(0),
             key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
@@ -1773,6 +1777,7 @@ impl SegmentManager {
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
+            unavailable: std::sync::OnceLock::new(),
             recluster_requested: std::sync::atomic::AtomicU64::new(1),
             recluster_done: std::sync::atomic::AtomicU64::new(0),
             key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
@@ -1847,6 +1852,32 @@ impl SegmentManager {
             return Err(self.schema_changed());
         }
         Ok(())
+    }
+
+    /// Marks the table unreadable for the rest of the process: the open could
+    /// not load a segment the manifest lists, for `reason`
+    pub(crate) fn mark_unavailable(&self, reason: String) {
+        let _ = self.unavailable.set(reason);
+    }
+
+    /// Whether the open left a listed segment unloaded
+    pub(crate) fn is_unavailable(&self) -> bool {
+        self.unavailable.get().is_some()
+    }
+
+    /// An error while the open left a listed segment unloaded, so no
+    /// statement reads the table without that segment's rows
+    pub(crate) fn check_available(&self) -> Result<()> {
+        match self.unavailable.get() {
+            Some(reason) => Err(crate::core::Error::Internal {
+                message: format!(
+                    "table '{}' is unavailable: {}; refusing to serve partial data",
+                    self.table_name.read(),
+                    reason
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Whether `generation` is the settled schema generation now; allocates
