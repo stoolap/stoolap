@@ -40,7 +40,7 @@ use rustc_hash::FxHashMap;
 
 use crate::core::{DataType, Error, Result, Schema, Value};
 
-use super::column::{ColumnData, ROW_GROUP_SIZE};
+use super::column::ColumnData;
 use super::writer::{ColSource, ColumnMapping, FrozenVolume, TypedCells, VolumeBuilder};
 
 /// Where a transfer's batches go: a builder in memory or a file writer.
@@ -291,6 +291,12 @@ pub struct Transfer<'a> {
     nulled: Option<Vec<(i64, DateTime<Utc>)>>,
 }
 
+/// The row group of `inputs[input]` that holds `row`
+#[inline]
+fn group_of(inputs: &[(u64, Arc<FrozenVolume>)], input: usize, row: usize) -> usize {
+    row >> inputs[input].1.meta.group_shift()
+}
+
 impl<'a> Transfer<'a> {
     /// A transfer from `inputs` into volumes of `schema`, each input read
     /// through its mapping
@@ -344,7 +350,10 @@ impl<'a> Transfer<'a> {
         }
         let mut last_use: FxHashMap<(u32, u32), usize> = FxHashMap::default();
         for (position, &(_, input, row)) in refs.iter().enumerate() {
-            last_use.insert((input as u32, (row / ROW_GROUP_SIZE) as u32), position);
+            last_use.insert(
+                (input as u32, group_of(inputs, input, row) as u32),
+                position,
+            );
         }
         Ok(Self {
             inputs,
@@ -462,7 +471,7 @@ impl<'a> Transfer<'a> {
         self.ref_handle.reserve(refs.len());
         let mut missing = false;
         for &(_, input, row) in refs {
-            let key = (input as u32, (row / ROW_GROUP_SIZE) as u32);
+            let key = (input as u32, group_of(self.inputs, input, row) as u32);
             match self.handle_of.get(&key) {
                 Some(&slot) => {
                     self.handles[slot].used = true;
@@ -530,7 +539,7 @@ impl<'a> Transfer<'a> {
             if self.ref_handle[index] != u32::MAX {
                 continue;
             }
-            let group = row / ROW_GROUP_SIZE;
+            let group = group_of(self.inputs, input, row);
             let key = (input as u32, group as u32);
             let position = match self.handle_of.get(&key) {
                 Some(&position) => position,
@@ -568,7 +577,7 @@ impl<'a> Transfer<'a> {
                 .ok_or_else(|| Error::internal("compaction input has no column data to read"))?;
             let column = store.group_column(physical, group)?;
             held_bytes += column.cache_size();
-            columns.push(Some(Cell::Group(column, group * ROW_GROUP_SIZE)));
+            columns.push(Some(Cell::Group(column, group * volume.meta.group_rows)));
         }
         Ok(Handle {
             input,
@@ -744,6 +753,7 @@ fn gather(
 mod tests {
     use super::*;
     use crate::core::{Row, SchemaBuilder};
+    use crate::storage::volume::column::ROW_GROUP_SIZE;
     use crate::storage::volume::io::serialize_v4_public;
     use crate::storage::volume::stats::ColumnAggregateStats;
 

@@ -127,7 +127,8 @@ pub struct ZoneMap {
     pub row_count: u32,
 }
 
-/// Default number of rows per row group for sub-volume zone map pruning.
+/// Rows per row group the writer cuts at, and the most a group holds; a
+/// volume read from its file keeps the size it was written with
 pub const ROW_GROUP_SIZE: usize = 65536; // 64K rows
 
 /// Zone map metadata for a single row group within a volume.

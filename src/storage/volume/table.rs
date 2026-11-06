@@ -7977,7 +7977,7 @@ impl Table for SegmentedTable {
                     let mut group_candidates: Vec<usize> = Vec::new();
                     let row_ids = vol.row_ids()?;
                     let row_count = vol.meta.row_count;
-                    let rg_size = super::column::ROW_GROUP_SIZE;
+                    let rg_size = vol.meta.group_rows;
                     let num_groups = row_count.div_ceil(rg_size);
 
                     for gi in 0..num_groups {
