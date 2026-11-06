@@ -3411,6 +3411,18 @@ pub(crate) fn volume_file_read() {
     count_by_fence_depth(&VOLUME_FILE_READS_BY_DEPTH);
 }
 
+/// Times a volume file was opened, by every thread of the process
+static VOLUME_FILE_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Volume file opens so far, process-wide
+pub fn volume_file_opens() -> usize {
+    VOLUME_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn volume_file_opened() {
+    VOLUME_FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
