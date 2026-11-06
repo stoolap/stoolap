@@ -3860,6 +3860,7 @@ impl PreparedSelect {
             filter,
             whole_row: projection.is_columns_in_order(schema.columns.len()),
             projection,
+            needed: self.where_.needed.clone(),
             names: CompactArc::clone(&self.output_columns),
             offset,
             limit,
