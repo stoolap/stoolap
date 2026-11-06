@@ -6174,7 +6174,7 @@ impl Table for SegmentedTable {
                     if let Some(zone) = vol.meta.zone_maps.get(pi).filter(|_| can_use_dict) {
                         if let Some(dict_arc) = vol.get_column_dictionary(pi)? {
                             for entry in dict_arc.iter() {
-                                distinct.insert(Value::text(entry.as_str()));
+                                distinct.insert(Value::Text(entry.clone()));
                             }
                             // The dictionary holds no NULL; every row is visible here
                             if zone.null_count > 0 {
