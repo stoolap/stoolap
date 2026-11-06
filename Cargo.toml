@@ -146,9 +146,11 @@ debug = "limited"       # Faster incremental builds, keeps file:line backtraces
 split-debuginfo = "unpacked"     # Faster incremental linking on macOS
 
 # Tests keep debug assertions and overflow checks but run optimized code:
-# data-heavy tests run about five times faster, a rebuild takes longer
+# data-heavy tests run about five times faster, a rebuild takes longer.
+# The crate-local ThinLTO pass reruns over every unit after any edit
 [profile.test]
 opt-level = 1
+lto = "off"
 
 [profile.test.package."*"]
 opt-level = 3
