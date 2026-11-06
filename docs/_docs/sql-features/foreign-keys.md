@@ -250,6 +250,17 @@ TRUNCATE TABLE parents;
 TRUNCATE TABLE children;
 ```
 
+### RENAME TO
+
+Renaming a parent table renames it in every foreign key that references it, so the children keep their checks and actions under the new name, also after the database is opened again:
+
+```sql
+ALTER TABLE parents RENAME TO families;
+
+-- Checked against families
+INSERT INTO children VALUES (2, 1, 'Second');
+```
+
 ## CREATE TABLE Validation
 
 FK constraints are validated at table creation time:
