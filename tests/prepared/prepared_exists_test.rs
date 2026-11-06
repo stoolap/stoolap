@@ -24,9 +24,9 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    before_prepared_exists, force_exists_strategy, general_path_hits, prepared_exists_counts,
-    prepared_rows_narrowed, prepared_strategy_runs, subquery_cache_hits, GeneralPath,
-    PreparedStrategy,
+    before_prepared_exists, equality_candidate_ids_copied_count, force_exists_strategy,
+    general_path_hits, hot_index_ids_read, prepared_exists_counts, prepared_rows_narrowed,
+    prepared_strategy_runs, subquery_cache_hits, GeneralPath, PreparedStrategy,
 };
 use stoolap::Database;
 
@@ -371,6 +371,40 @@ fn test_a_where_asking_more_than_its_keys_probes_within_its_candidates() {
             built,
             "{sql} builds the keyed set"
         );
+    }
+}
+
+#[test]
+fn test_a_probe_within_budget_reads_only_the_candidates_it_was_charged_with() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_reads").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w INTEGER)",
+        "CREATE INDEX i_k ON i (k)",
+        "CREATE INDEX i_v ON i (v)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO n SELECT value, NULL FROM generate_series(1, 20)",
+        "INSERT INTO i SELECT value, value % 200, 1, 0 FROM generate_series(1, 1000)",
+        "INSERT INTO i SELECT value, NULL, 1, 0 FROM generate_series(1001, 2000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Five rows a key, each also under the one v every row holds; twenty
+    // NULL keys against a thousand NULL rows, past the budget: the set's
+    // one pass over the table, no read per call
+    for (outer, copied_at_most) in [("o", 100), ("n", 0)] {
+        let sql = format!(
+            "SELECT id FROM {outer} WHERE EXISTS \
+             (SELECT 1 FROM i WHERE i.k = {outer}.k AND i.v = 1 AND i.w > 5)"
+        );
+        let (index_ids, copied) = (hot_index_ids_read(), equality_candidate_ids_copied_count());
+        assert_eq!(ids(&db, &sql), Vec::<i64>::new(), "{sql}");
+        let read = hot_index_ids_read() - index_ids;
+        let copied = equality_candidate_ids_copied_count() - copied;
+        assert!(read <= 2000, "{sql} read {read} ids through the index plan");
+        assert!(copied <= copied_at_most, "{sql} copied {copied} candidates");
     }
 }
 
