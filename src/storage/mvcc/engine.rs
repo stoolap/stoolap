@@ -274,6 +274,35 @@ fn strip_fk_references(
     }
 }
 
+/// Point every FK constraint referencing `from` at `to`, both lower case, in
+/// the schemas map and each affected VersionStore's schema.
+/// Caller must hold schemas as write-locked and version_stores as read-locked.
+fn retarget_fk_references(
+    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
+    version_stores: &FxHashMap<String, Arc<VersionStore>>,
+    from: &str,
+    to: &str,
+) {
+    for (name, schema_arc) in schemas.iter_mut() {
+        if !schema_arc
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.referenced_table == from)
+        {
+            continue;
+        }
+        let schema = CompactArc::make_mut(schema_arc);
+        for fk in &mut schema.foreign_keys {
+            if fk.referenced_table == from {
+                fk.referenced_table = to.to_string();
+            }
+        }
+        if let Some(vs) = version_stores.get(name.as_str()) {
+            *vs.schema_mut() = schema_arc.clone();
+        }
+    }
+}
+
 /// The most bytes a name or a text the schema keeps may take: the file
 /// format writes each with a 16-bit length
 pub(crate) const MAX_STORED_LEN: usize = u16::MAX as usize;
@@ -9867,6 +9896,11 @@ impl TransactionEngineOperations for EngineOperations {
                 stores.insert(new_name_lower.clone(), store);
             }
         }
+        {
+            let mut schemas = self.schemas().write().unwrap();
+            let stores = self.version_stores().read().unwrap();
+            retarget_fk_references(&mut schemas, &stores, &old_name_lower, &new_name_lower);
+        }
 
         // Move segment manager to new name and update its manifest table_name
         // (persist() uses manifest.table_name for the on-disk directory)
@@ -9931,6 +9965,16 @@ impl TransactionEngineOperations for EngineOperations {
                                 }
                                 stores.insert(old_name_lower.clone(), store);
                             }
+                        }
+                        {
+                            let mut schemas = self.schemas().write().unwrap();
+                            let stores = self.version_stores().read().unwrap();
+                            retarget_fk_references(
+                                &mut schemas,
+                                &stores,
+                                &new_name_lower,
+                                &old_name_lower,
+                            );
                         }
                         {
                             let mut mgrs = self.segment_managers.write().unwrap();
