@@ -271,6 +271,9 @@ pub struct KeyRead {
     /// The WHERE's other conjuncts
     pub(crate) filter: Option<SharedProgram>,
     pub(crate) projection: Projection,
+    /// The table columns the projection and filter read; a sealed row
+    /// decodes only these. None reads every column
+    pub(crate) needed: Option<Vec<bool>>,
     /// Whether the output row is the table row as it is
     pub(crate) whole_row: bool,
     pub(crate) names: CompactArc<Vec<String>>,

@@ -46,6 +46,7 @@ mod pk_conjunct_test;
 mod pk_fast_path_limit_test;
 mod pk_fast_path_test;
 mod pk_in_lookup_test;
+mod pk_point_read_columns_test;
 mod reinsert_unique_check_test;
 mod secondary_index_backfill_test;
 mod secondary_index_query_test;

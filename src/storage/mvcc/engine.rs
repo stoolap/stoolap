@@ -8793,7 +8793,7 @@ impl Engine for MVCCEngine {
         row_ids: &[i64],
         token: crate::storage::mvcc::version_store::LayoutToken,
     ) -> Result<crate::core::RowVec> {
-        self.fetch_rows_by_ids_settled(table_name, row_ids, token, false)
+        self.fetch_rows_by_ids_settled(table_name, row_ids, token, false, None)
             .map(Option::unwrap_or_default)
     }
 }
@@ -8802,13 +8802,15 @@ impl MVCCEngine {
     /// The rows `row_ids` name in the latest committed state. When `settled`,
     /// None unless no commit published to the table across the read: a
     /// commit that has published its rows or tombstones and is not visible
-    /// yet would leave a row half read
+    /// yet would leave a row half read. A sealed row reads only the columns
+    /// `needed` marks, the others null
     pub(crate) fn fetch_rows_by_ids_settled(
         &self,
         table_name: &str,
         row_ids: &[i64],
         token: crate::storage::mvcc::version_store::LayoutToken,
         settled: bool,
+        needed: Option<&[bool]>,
     ) -> Result<Option<crate::core::RowVec>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -8816,12 +8818,13 @@ impl MVCCEngine {
         let store = self.get_version_store(table_name)?;
         self.check_cold_available(table_name, &store)?;
         let epoch = store.publish_epoch_if_quiet();
-        self.fetch_rows_by_ids_in(table_name, &store, row_ids, token, settled, epoch)
+        self.fetch_rows_by_ids_in(table_name, &store, row_ids, token, settled, epoch, needed)
     }
 
     /// [`Self::fetch_rows_by_ids_settled`] from `store`, found by
     /// `table_name`, whose publish epoch the caller read as `epoch`
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn fetch_rows_by_ids_in(
         &self,
         table_name: &str,
@@ -8830,6 +8833,7 @@ impl MVCCEngine {
         token: crate::storage::mvcc::version_store::LayoutToken,
         settled: bool,
         epoch: Option<u64>,
+        needed: Option<&[bool]>,
     ) -> Result<Option<crate::core::RowVec>> {
         if settled && epoch.is_none() {
             return Ok(None);
@@ -8869,7 +8873,7 @@ impl MVCCEngine {
                         result.iter().map(|(id, _)| *id).collect();
                     for &rid in row_ids {
                         if !found_ids.contains(&rid) {
-                            if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
+                            if let Some(row) = mgr.get_cold_row_normalized(rid, &schema, needed)? {
                                 result.push((rid, row));
                             }
                         }
@@ -8911,18 +8915,20 @@ impl MVCCEngine {
 
     /// Row `row_id` in the latest committed state: its hot version as the
     /// chain holds it whatever publishes, one row being read whole; a row
-    /// not hot is read settled with the volumes. None sends the caller to a view
+    /// not hot is read settled with the volumes, only its columns `needed`
+    /// marks. None sends the caller to a view
     pub(crate) fn fetch_latest_row(
         &self,
         table_name: &str,
         row_id: i64,
         token: crate::storage::mvcc::version_store::LayoutToken,
+        needed: Option<&[bool]>,
     ) -> Result<Option<crate::core::KeyRows>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
         let store = self.get_version_store(table_name)?;
-        self.fetch_latest_row_in(table_name, &store, row_id, token)
+        self.fetch_latest_row_in(table_name, &store, row_id, token, needed)
     }
 
     /// [`Self::fetch_latest_row`] from `store`, the table `table_name` names
@@ -8932,6 +8938,7 @@ impl MVCCEngine {
         store: &Arc<VersionStore>,
         row_id: i64,
         token: crate::storage::mvcc::version_store::LayoutToken,
+        needed: Option<&[bool]>,
     ) -> Result<Option<crate::core::KeyRows>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -8945,7 +8952,8 @@ impl MVCCEngine {
         if epoch.is_none() {
             return Ok(None);
         }
-        let rows = self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, epoch)?;
+        let rows =
+            self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, epoch, needed)?;
         Ok(rows.map(crate::core::KeyRows::Many))
     }
 
@@ -8961,6 +8969,7 @@ impl MVCCEngine {
         store: &Arc<VersionStore>,
         (column, value): (usize, &Value),
         token: crate::storage::mvcc::version_store::LayoutToken,
+        needed: Option<&[bool]>,
     ) -> Result<Option<crate::core::KeyRows>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -8980,7 +8989,9 @@ impl MVCCEngine {
         });
         let rows = match hot {
             Some(rows) => Some(rows),
-            None => self.cold_unique_row(table_name, store, (column, value), token, epoch)?,
+            None => {
+                self.cold_unique_row(table_name, store, (column, value), token, epoch, needed)?
+            }
         };
         if store.publish_epoch_if_quiet() != Some(epoch) {
             return Ok(None);
@@ -8999,6 +9010,7 @@ impl MVCCEngine {
         (column, value): (usize, &Value),
         token: crate::storage::mvcc::version_store::LayoutToken,
         epoch: u64,
+        needed: Option<&[bool]>,
     ) -> Result<Option<crate::core::KeyRows>> {
         let mgr = self.get_or_create_segment_manager(table_name);
         // A seal removes its hot rows before it clears their tombstones: the
@@ -9033,9 +9045,15 @@ impl MVCCEngine {
             false => None,
         };
         let rows = match found {
-            Some(row_id) => {
-                self.fetch_rows_by_ids_in(table_name, store, &[row_id], token, true, Some(epoch))?
-            }
+            Some(row_id) => self.fetch_rows_by_ids_in(
+                table_name,
+                store,
+                &[row_id],
+                token,
+                true,
+                Some(epoch),
+                needed,
+            )?,
             None => Some(crate::core::RowVec::new()),
         };
         if mgr.seal_generation() != generation {

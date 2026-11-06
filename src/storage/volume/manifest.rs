@@ -143,6 +143,22 @@ impl ColdSegment {
     }
 }
 
+/// Row `idx` of `vol` through `mapping`, only the columns `needed` marks
+/// read, the others null
+fn row_of(
+    vol: &FrozenVolume,
+    idx: usize,
+    mapping: &super::writer::ColumnMapping,
+    needed: Option<&[bool]>,
+) -> std::io::Result<crate::core::Row> {
+    match (needed, mapping.is_identity) {
+        (None, true) => vol.get_row(idx),
+        (None, false) => vol.get_row_mapped(idx, mapping),
+        (Some(needed), true) => vol.get_row_needed(idx, needed),
+        (Some(needed), false) => vol.get_row_mapped_needed(idx, mapping, needed),
+    }
+}
+
 /// A bitmap over `row_count` rows with every bit set but `dead`'s
 fn bits_without(row_count: usize, dead: &[u32]) -> Vec<u64> {
     let mut bits = vec![!0u64; row_count.div_ceil(64)];
@@ -3685,6 +3701,7 @@ impl SegmentManager {
         &self,
         row_id: i64,
         schema: &crate::core::Schema,
+        needed: Option<&[bool]>,
     ) -> crate::core::Result<Option<crate::core::Row>> {
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
@@ -3712,7 +3729,7 @@ impl SegmentManager {
                             Some(v) => v,
                             None => {
                                 // Segment removed by compaction — retry with fresh state.
-                                return self.get_cold_row_normalized_retry(row_id, schema);
+                                return self.get_cold_row_normalized_retry(row_id, schema, needed);
                             }
                         }
                     } else {
@@ -3720,10 +3737,7 @@ impl SegmentManager {
                         Arc::clone(&cold.volume)
                     };
                     let mapping = self.get_volume_mapping(*seg_id, schema);
-                    if mapping.is_identity {
-                        return Ok(Some(vol.get_row(idx)?));
-                    }
-                    return Ok(Some(vol.get_row_mapped(idx, &mapping)?));
+                    return Ok(Some(row_of(&vol, idx, &mapping, needed)?));
                 }
             }
         }
@@ -3735,6 +3749,7 @@ impl SegmentManager {
         &self,
         row_id: i64,
         schema: &crate::core::Schema,
+        needed: Option<&[bool]>,
     ) -> crate::core::Result<Option<crate::core::Row>> {
         self.ensure_columns();
         let (seg_ids, segments) = {
@@ -3763,10 +3778,7 @@ impl SegmentManager {
                     }
                     cold.volume.mark_accessed();
                     let mapping = self.get_volume_mapping(*seg_id, schema);
-                    if mapping.is_identity {
-                        return Ok(Some(cold.volume.get_row(idx)?));
-                    }
-                    return Ok(Some(cold.volume.get_row_mapped(idx, &mapping)?));
+                    return Ok(Some(row_of(&cold.volume, idx, &mapping, needed)?));
                 }
             }
         }

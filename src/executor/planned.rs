@@ -420,7 +420,16 @@ impl Executor {
         let rows = match unique {
             false => {
                 let key = plan.key.integer(params)?;
-                self.fetch_pk_row(&plan.table, key, plan.token, in_txn, view, &plan.store)
+                let needed = plan.needed.as_deref();
+                self.fetch_pk_row(
+                    &plan.table,
+                    key,
+                    plan.token,
+                    in_txn,
+                    view,
+                    &plan.store,
+                    needed,
+                )
             }
             true => self
                 .fetch_unique_row(plan, params, in_txn, view)
@@ -457,6 +466,7 @@ impl Executor {
             &store,
             (plan.key.column(), &value),
             plan.token,
+            plan.needed.as_deref(),
         )?;
         #[cfg(feature = "test-failpoints")]
         if rows.is_some() {
@@ -519,7 +529,9 @@ impl Executor {
     /// else what the active transaction sees through a handle taken for this
     /// statement, refused as SchemaChanged unless it holds layout `token`.
     /// A view the statement already took, `taken`, holds the read to it.
-    /// `held` is the table's store as a plan keeps it, read while it is open
+    /// `held` is the table's store as a plan keeps it, read while it is open.
+    /// A sealed row read in committed state decodes only the columns `needed` marks
+    #[allow(clippy::too_many_arguments)]
     fn fetch_pk_row(
         &self,
         table_name: &str,
@@ -528,6 +540,7 @@ impl Executor {
         in_txn: bool,
         taken: Option<&StatementView>,
         held: &Weak<VersionStore>,
+        needed: Option<&[bool]>,
     ) -> Result<KeyRows> {
         let read_committed = |level| level == crate::core::IsolationLevel::ReadCommitted;
         if !in_txn {
@@ -538,12 +551,14 @@ impl Executor {
                     match held.upgrade() {
                         Some(store) if !store.is_closed() => self
                             .engine
-                            .fetch_latest_row_in(table_name, &store, pk_value, token)?,
-                        _ => self.engine.fetch_latest_row(table_name, pk_value, token)?,
+                            .fetch_latest_row_in(table_name, &store, pk_value, token, needed)?,
+                        _ => self
+                            .engine
+                            .fetch_latest_row(table_name, pk_value, token, needed)?,
                     }
                 } else {
                     self.engine
-                        .fetch_rows_by_ids_settled(table_name, &[pk_value], token, true)?
+                        .fetch_rows_by_ids_settled(table_name, &[pk_value], token, true, needed)?
                         .map(KeyRows::Many)
                 };
                 if let Some(rows) = latest {
