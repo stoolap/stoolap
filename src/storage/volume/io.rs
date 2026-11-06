@@ -164,7 +164,7 @@ fn serialize_v4_opts(
     use std::io::Write;
 
     let col_count = vol.columns.len();
-    let group_size = ROW_GROUP_SIZE;
+    let group_size = vol.meta.group_rows;
     let num_groups = if vol.meta.row_count == 0 {
         0
     } else {
@@ -177,8 +177,12 @@ fn serialize_v4_opts(
     drop(meta_raw);
 
     // 2. Build CompressedBlockStore (compresses all column blocks when enabled)
-    let store =
-        CompressedBlockStore::compress_columns_opts(&vol.columns, vol.meta.row_count, compress)?;
+    let store = CompressedBlockStore::compress_columns_opts(
+        &vol.columns,
+        vol.meta.row_count,
+        group_size,
+        compress,
+    )?;
 
     // 3. Compute total size for pre-allocation
     let all_blocks = store.raw_blocks();
@@ -223,6 +227,25 @@ fn serialize_v4_opts(
     buf.write_all(&crc.to_le_bytes())?;
 
     Ok((buf, store))
+}
+
+/// The volume's rows per group: every group `size` rows from `i * size`
+/// but the last, `size` a power of two up to `ROW_GROUP_SIZE`; None when
+/// the groups do not tile the rows that way
+fn group_geometry(row_count: usize, row_groups: &[super::column::RowGroupMeta]) -> Option<usize> {
+    let Some(first) = row_groups.first() else {
+        return (row_count <= ROW_GROUP_SIZE).then_some(ROW_GROUP_SIZE);
+    };
+    let size = first.end_idx.checked_sub(first.start_idx)? as usize;
+    if !size.is_power_of_two() || size > ROW_GROUP_SIZE {
+        return None;
+    }
+    let tiles = row_groups.len() == row_count.div_ceil(size)
+        && row_groups.iter().enumerate().all(|(i, g)| {
+            g.start_idx as usize == i * size
+                && g.end_idx as usize == ((i + 1) * size).min(row_count)
+        });
+    tiles.then_some(size)
 }
 
 /// Verify V4 magic and CRC through the opened file.
@@ -316,7 +339,9 @@ fn read_volume_v4(
             meta.col_type_tags.len()
         )));
     }
-    if num_groups != meta.row_count.div_ceil(ROW_GROUP_SIZE) {
+    let group_size = group_geometry(meta.row_count, &meta.row_groups)
+        .ok_or_else(|| inv("row groups do not tile the rows at one power-of-two size"))?;
+    if num_groups != meta.row_count.div_ceil(group_size) {
         return Err(inv("block group count does not match row count"));
     }
 
@@ -357,7 +382,6 @@ fn read_volume_v4(
     drop(index_buf);
 
     let col_data_types = meta.column_types.clone();
-    let group_size = ROW_GROUP_SIZE;
 
     // 5. The blocks stay in the file: their offsets follow from the index
     //    (column-major, as written), and the rest of the file passes
@@ -449,6 +473,7 @@ fn read_volume_v4(
             sorted_columns: meta.col_sorted,
             column_name_map: meta.column_name_map,
             row_groups: meta.row_groups,
+            group_rows: group_size,
         }),
         unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
             rustc_hash::FxHashMap::default(),
@@ -457,6 +482,36 @@ fn read_volume_v4(
             super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
         ),
     })
+}
+
+/// Rewrites the volume file at `path` with the same rows in row groups of
+/// `group_rows`: the files tests read when a volume was written with a
+/// group size other than the writer's
+#[cfg(feature = "test-failpoints")]
+pub fn rewrite_volume_with_group_rows(path: &Path, group_rows: usize) -> Result<()> {
+    let volume = read_volume_from_disk(path)?;
+    let columns = (0..volume.columns.len())
+        .map(|i| volume.columns.get(i).cloned())
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))?;
+    let mut meta = (*volume.meta).clone();
+    meta.row_groups = super::writer::row_groups_of(&columns, meta.row_count, group_rows);
+    meta.group_rows = group_rows;
+    let rewritten = FrozenVolume {
+        columns: LazyColumns::eager(columns, meta.column_types.clone()),
+        meta: Arc::new(meta),
+        unique_indices: Arc::new(super::writer::UniqueIndexes::new(
+            rustc_hash::FxHashMap::default(),
+        )),
+        last_access_epoch: std::sync::atomic::AtomicU64::new(0),
+    };
+    drop(volume);
+    let (data, _) = serialize_v4_opts(&rewritten, true)
+        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))?;
+    let tmp = path.with_extension("vol.tmp");
+    std::fs::write(&tmp, &data)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))
 }
 
 /// Read a frozen volume from disk. Only V4 (STV4) format is supported.

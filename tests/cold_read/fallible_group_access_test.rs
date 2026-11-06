@@ -757,7 +757,9 @@ fn valid_group_round_trip_preserves_all_column_types_and_nulls() {
         types.clone(),
     );
     for compress in [false, true] {
-        let store = CompressedBlockStore::compress_columns_opts(&columns, 2, compress).unwrap();
+        let store =
+            CompressedBlockStore::compress_columns_opts(&columns, 2, ROW_GROUP_SIZE, compress)
+                .unwrap();
         for ci in 0..types.len() {
             let group = store.group_column(ci, 0).unwrap();
             assert_eq!(group.len(), 2);
@@ -812,7 +814,9 @@ fn valid_final_partial_group_preserves_rows() {
         vec![DataType::Integer],
     );
     for compress in [false, true] {
-        let store = CompressedBlockStore::compress_columns_opts(&columns, rows, compress).unwrap();
+        let store =
+            CompressedBlockStore::compress_columns_opts(&columns, rows, ROW_GROUP_SIZE, compress)
+                .unwrap();
         assert_eq!(store.group_column(0, 0).unwrap().len(), ROW_GROUP_SIZE);
         let last = store.group_column(0, 1).unwrap();
         assert_eq!(last.len(), 3);

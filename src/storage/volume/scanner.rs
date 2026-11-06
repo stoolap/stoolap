@@ -115,6 +115,8 @@ impl Drop for SideState {
 pub struct VolumeScanner {
     /// Shared reference to the frozen volume
     volume: Arc<FrozenVolume>,
+    /// The volume's `group_shift`, read once for the per-row walks
+    group_shift: u32,
     /// Column indices to project (empty = all columns)
     project_cols: Vec<usize>,
     /// Pre-computed flag: true when project_cols is an identity mapping over
@@ -303,7 +305,7 @@ impl VolumeScanner {
                 }
             }
         }
-        let group_start = group_idx * super::column::ROW_GROUP_SIZE;
+        let group_start = group_idx << self.group_shift;
         let mut candidates = Vec::new();
         let decided = {
             let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
@@ -341,8 +343,8 @@ impl VolumeScanner {
         }
         while self.current_idx < self.end_idx {
             let idx = self.end_idx - 1;
-            let group_idx = idx / super::column::ROW_GROUP_SIZE;
-            let group_start = group_idx * super::column::ROW_GROUP_SIZE;
+            let group_idx = idx >> self.group_shift;
+            let group_start = group_idx << self.group_shift;
             let cached = self.group_cache.as_ref().map(|c| c.group_idx);
             if cached != Some(group_idx) {
                 if let Some(ref skips) = self.row_group_skips {
@@ -443,6 +445,7 @@ impl VolumeScanner {
         volume.mark_accessed();
         let mut s = Self {
             end_idx,
+            group_shift: volume.meta.group_shift(),
             volume,
             project_cols: project,
             is_full_projection,
@@ -505,6 +508,7 @@ impl VolumeScanner {
         let is_full_projection = Self::compute_is_full_projection(&project, volume.columns.len());
         volume.mark_accessed();
         let mut s = Self {
+            group_shift: volume.meta.group_shift(),
             volume,
             project_cols: project,
             is_full_projection,
@@ -595,12 +599,14 @@ impl VolumeScanner {
                     sorted_columns: Vec::new(),
                     column_name_map: ahash::AHashMap::new(),
                     row_groups: Vec::new(),
+                    group_rows: super::column::ROW_GROUP_SIZE,
                 }),
                 unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
                     rustc_hash::FxHashMap::default(),
                 )),
                 last_access_epoch: std::sync::atomic::AtomicU64::new(0),
             }),
+            group_shift: super::column::ROW_GROUP_SIZE.trailing_zeros(),
             project_cols: Vec::new(),
             is_full_projection: true,
             current_idx: 0,
@@ -750,8 +756,8 @@ impl VolumeScanner {
                 let num_grp = st.num_groups(first_col);
                 let mut exceeded = false;
                 for gi in 0..num_grp {
-                    let gs = gi * super::column::ROW_GROUP_SIZE;
-                    let ge = ((gi + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                    let gs = gi << self.group_shift;
+                    let ge = ((gi + 1) << self.group_shift).min(self.end_idx);
                     if gs >= self.end_idx || ge <= self.current_idx || self.group_pruned(gi) {
                         continue;
                     }
@@ -827,8 +833,8 @@ impl VolumeScanner {
                     // One chunk per row group, ending at the group's own
                     // boundary, so a range starting inside a group does not
                     // carry the skip of that group into the next
-                    let gi = lo / super::column::ROW_GROUP_SIZE;
-                    let hi = ((gi + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                    let gi = lo >> self.group_shift;
+                    let hi = ((gi + 1) << self.group_shift).min(self.end_idx);
                     if self.group_pruned(gi) {
                         lo = hi;
                         continue;
@@ -1179,7 +1185,7 @@ impl VolumeScanner {
             }
         };
         let col_count = self.volume.columns.len();
-        let group_start = group_idx * super::column::ROW_GROUP_SIZE;
+        let group_start = group_idx << self.group_shift;
 
         // The volume columns the rows need: the mask names schema columns,
         // which a mapping resolves to the volume's
@@ -1560,7 +1566,7 @@ impl VolumeScanner {
 
                 // Load group cache on group transition (matching_indices are sorted)
                 if use_group_cache_fast {
-                    let gi = idx / super::column::ROW_GROUP_SIZE;
+                    let gi = idx >> self.group_shift;
                     let need_load = self.group_cache.as_ref().is_none_or(|c| c.group_idx != gi);
                     if need_load {
                         self.load_group_cache(gi);
@@ -1595,9 +1601,8 @@ impl VolumeScanner {
         while self.current_idx < self.end_idx {
             // Row-group boundary: skip pruned groups + load group cache
             if self.current_idx >= self.next_group_boundary {
-                let group_idx = self.current_idx / super::column::ROW_GROUP_SIZE;
-                self.next_group_boundary =
-                    ((group_idx + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                let group_idx = self.current_idx >> self.group_shift;
+                self.next_group_boundary = ((group_idx + 1) << self.group_shift).min(self.end_idx);
 
                 // Zone map skip
                 if let Some(ref skips) = self.row_group_skips {

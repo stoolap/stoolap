@@ -401,7 +401,7 @@ pub struct CompressedBlockStore {
     /// Created once at construction — group decompression clones the Arc (~5ns)
     /// instead of cloning all dictionary strings per group.
     col_dicts: Vec<(usize, Arc<[SmartString]>)>,
-    /// Row group size (ROW_GROUP_SIZE = 65536)
+    /// Rows per group, the volume's group size
     group_size: usize,
     /// Total row count across all groups
     row_count: usize,
@@ -464,7 +464,7 @@ impl CompressedBlockStore {
     /// Compress existing columns into per-group LZ4 blocks.
     /// Used when sealing (VolumeBuilder::finish() → eager columns → V4 write).
     pub fn compress_columns(columns: &LazyColumns, row_count: usize) -> std::io::Result<Self> {
-        Self::compress_columns_opts(columns, row_count, true)
+        Self::compress_columns_opts(columns, row_count, ROW_GROUP_SIZE, true)
     }
 
     /// Build per-group blocks from columns. When `compress` is true, blocks are
@@ -473,9 +473,9 @@ impl CompressedBlockStore {
     pub fn compress_columns_opts(
         columns: &LazyColumns,
         row_count: usize,
+        group_size: usize,
         compress: bool,
     ) -> std::io::Result<Self> {
-        let group_size = ROW_GROUP_SIZE;
         let col_count = columns.len();
         let num_groups = if row_count == 0 {
             0
@@ -1748,11 +1748,20 @@ pub struct VolumeMeta {
     /// Built once at construction; replaces O(C) linear scan in column_index().
     pub column_name_map: AHashMap<SmartString, usize>,
     /// Row group metadata for sub-volume zone map pruning.
-    /// Empty for volumes with <= ROW_GROUP_SIZE rows (single implicit group).
+    /// Empty for a volume of one group.
     pub row_groups: Vec<super::column::RowGroupMeta>,
+    /// Rows per row group, a power of two: every group holds this many
+    /// but the last. The writer cuts at `ROW_GROUP_SIZE`; a read takes the file's
+    pub group_rows: usize,
 }
 
 impl VolumeMeta {
+    /// log2 of `group_rows`: the group of row `i` is `i >> group_shift()`
+    #[inline]
+    pub fn group_shift(&self) -> u32 {
+        self.group_rows.trailing_zeros()
+    }
+
     /// NaN cells of a physical column: the zone map counts them among its
     /// rows, the stats never count them. Zero for a non-FLOAT column, None
     /// when the column has no zone map or stats.
@@ -2209,6 +2218,32 @@ pub(crate) fn timestamp_value(nanos: i64) -> Value {
     }
 }
 
+/// The row groups of `group_rows` rows each over `columns`, with their
+/// zone maps for pruning; none for a volume of one group
+pub(crate) fn row_groups_of(
+    columns: &[ColumnData],
+    row_count: usize,
+    group_rows: usize,
+) -> Vec<super::column::RowGroupMeta> {
+    if row_count <= group_rows {
+        return Vec::new();
+    }
+    (0..row_count)
+        .step_by(group_rows)
+        .map(|start| {
+            let end = (start + group_rows).min(row_count);
+            super::column::RowGroupMeta {
+                start_idx: start as u32,
+                end_idx: end as u32,
+                zone_maps: columns
+                    .iter()
+                    .map(|col| col.zone_map_for_range(start, end))
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
 /// Positions of `ids` sorted by id
 pub(crate) fn row_order_of(ids: &[i64]) -> Box<[u32]> {
     let mut order: Vec<u32> = (0..ids.len() as u32).collect();
@@ -2517,6 +2552,7 @@ impl VolumeBuilder {
             sorted_columns: std::mem::take(&mut self.sorted),
             column_name_map,
             row_groups,
+            group_rows: super::column::ROW_GROUP_SIZE,
         };
         Ok((meta, std::mem::take(&mut self.dict_tables)))
     }
@@ -3199,28 +3235,7 @@ impl VolumeBuilder {
         let row_order = self.row_order()?;
         let column_name_map = column_name_map(&column_names);
 
-        // Build row-group zone maps for sub-volume pruning.
-        // Only worth it for volumes larger than one group.
-        let row_groups = if self.row_count > super::column::ROW_GROUP_SIZE {
-            let mut groups = Vec::new();
-            let mut start = 0;
-            while start < self.row_count {
-                let end = (start + super::column::ROW_GROUP_SIZE).min(self.row_count);
-                let group_zone_maps: Vec<super::column::ZoneMap> = columns
-                    .iter()
-                    .map(|col| col.zone_map_for_range(start, end))
-                    .collect();
-                groups.push(super::column::RowGroupMeta {
-                    start_idx: start as u32,
-                    end_idx: end as u32,
-                    zone_maps: group_zone_maps,
-                });
-                start = end;
-            }
-            groups
-        } else {
-            Vec::new()
-        };
+        let row_groups = row_groups_of(&columns, self.row_count, super::column::ROW_GROUP_SIZE);
 
         Ok(FrozenVolume {
             columns: LazyColumns::eager(columns, column_types.clone()),
@@ -3236,6 +3251,7 @@ impl VolumeBuilder {
                 sorted_columns,
                 column_name_map,
                 row_groups,
+                group_rows: super::column::ROW_GROUP_SIZE,
             }),
             unique_indices: Arc::new(UniqueIndexes::new(rustc_hash::FxHashMap::default())),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
@@ -3272,7 +3288,8 @@ impl RowReader {
         if let Some(column) = self.volume.columns.resident(col_idx) {
             return Ok(column.get_value(row_idx));
         }
-        let start = row_idx / ROW_GROUP_SIZE * ROW_GROUP_SIZE;
+        let shift = self.volume.meta.group_shift();
+        let start = row_idx >> shift << shift;
         if let Some((column, held)) = &self.pinned[col_idx] {
             if *held == start {
                 return Ok(column.get_value(row_idx - start));
@@ -3281,7 +3298,7 @@ impl RowReader {
         let store = self.volume.columns.compressed_store().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
         })?;
-        let column = store.group_column(col_idx, row_idx / ROW_GROUP_SIZE)?;
+        let column = store.group_column(col_idx, row_idx >> shift)?;
         let value = column.get_value(row_idx - start);
         self.pinned[col_idx] = Some((column, start));
         Ok(value)
@@ -3948,9 +3965,10 @@ impl FrozenVolume {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
         })?;
         let groups = store.num_groups(col_idx);
-        for group in from / ROW_GROUP_SIZE..groups {
+        let shift = self.meta.group_shift();
+        for group in from >> shift..groups {
             let column = store.group_column(col_idx, group)?;
-            if !f(group * ROW_GROUP_SIZE, &column)? {
+            if !f(group << shift, &column)? {
                 return Ok(());
             }
         }
@@ -3987,7 +4005,7 @@ impl FrozenVolume {
             let column = store.group_column(col_idx, group)?;
             let local = column.binary_search_ge(target);
             if local < column.len() {
-                return Ok(Some(group * ROW_GROUP_SIZE + local));
+                return Ok(Some((group << self.meta.group_shift()) + local));
             }
         }
         Ok(None)
@@ -4003,8 +4021,9 @@ impl FrozenVolume {
         let store = self.columns.compressed_store().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
         })?;
-        let group = store.group_column(col_idx, row_idx / ROW_GROUP_SIZE)?;
-        Ok(group.get_value(row_idx % ROW_GROUP_SIZE))
+        let shift = self.meta.group_shift();
+        let group = store.group_column(col_idx, row_idx >> shift)?;
+        Ok(group.get_value(row_idx & ((1 << shift) - 1)))
     }
 
     /// Pre-build the unique sorted index for a set of column indices.

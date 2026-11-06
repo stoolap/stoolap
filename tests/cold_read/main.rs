@@ -45,6 +45,7 @@ mod retyped_unique_lookup_test;
 mod row_group_prune_test;
 mod scan_access_test;
 mod scanner_group_cache_test;
+mod small_row_groups_test;
 mod snapshot_cold_fetch_test;
 mod snapshot_cold_test;
 mod storage_aggregate_admission_test;

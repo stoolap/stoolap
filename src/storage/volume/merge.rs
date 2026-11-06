@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::core::{Error, Result, Schema, Value};
 
-use super::column::{ColumnData, ROW_GROUP_SIZE};
+use super::column::ColumnData;
 use super::writer::{ColSource, ColumnMapping, FrozenVolume};
 
 /// One key column of one input as the merge reads it
@@ -60,7 +60,7 @@ impl<'a> Cursor<'a> {
 
     /// The cells of the group `row` is in; the previous group's go
     fn load(&mut self, row: usize) -> Result<()> {
-        let group = row / ROW_GROUP_SIZE;
+        let group = row >> self.volume.meta.group_shift();
         if self.group == Some(group) {
             return Ok(());
         }
@@ -81,7 +81,7 @@ impl<'a> Cursor<'a> {
                         })?;
                         let column = store.group_column(*physical, group)?;
                         self.held_bytes += column.cache_size();
-                        KeyCell::Group(column, group * ROW_GROUP_SIZE)
+                        KeyCell::Group(column, group * self.volume.meta.group_rows)
                     }
                 }
             };
@@ -141,7 +141,8 @@ fn compare_heads(a: &Cursor<'_>, b: &Cursor<'_>) -> Ordering {
 fn in_order(cursor: &Cursor<'_>) -> bool {
     let (id, _, row) = cursor.refs[cursor.next];
     let (prev_id, _, prev_row) = cursor.refs[cursor.next - 1];
-    let order = if prev_row / ROW_GROUP_SIZE == row / ROW_GROUP_SIZE {
+    let shift = cursor.volume.meta.group_shift();
+    let order = if prev_row >> shift == row >> shift {
         cursor
             .cells
             .iter()
@@ -297,8 +298,9 @@ pub fn volume_in_key_order(volume: &FrozenVolume, key: &[usize]) -> Result<bool>
     let mut cells: Vec<KeyCell<'_>> = Vec::with_capacity(key.len());
     let mut last_key: Vec<Value> = Vec::new();
     let mut group_start = 0;
+    let group_rows = volume.meta.group_rows;
     while group_start < rows {
-        let group = group_start / ROW_GROUP_SIZE;
+        let group = group_start / group_rows;
         cells.clear();
         for &column in key {
             cells.push(if let Some(resident) = volume.columns.resident(column) {
@@ -311,7 +313,7 @@ pub fn volume_in_key_order(volume: &FrozenVolume, key: &[usize]) -> Result<bool>
                 KeyCell::Group(store.group_column(column, group)?, group_start)
             });
         }
-        let group_end = (group_start + ROW_GROUP_SIZE).min(rows);
+        let group_end = (group_start + group_rows).min(rows);
         if group_start > 0 {
             let across = cells
                 .iter()
@@ -350,6 +352,7 @@ pub fn volume_in_key_order(volume: &FrozenVolume, key: &[usize]) -> Result<bool>
 mod tests {
     use super::*;
     use crate::core::{DataType, Row, SchemaBuilder};
+    use crate::storage::volume::column::ROW_GROUP_SIZE;
     use crate::storage::volume::io::serialize_v4_public;
     use crate::storage::volume::writer::VolumeBuilder;
 
