@@ -7243,6 +7243,9 @@ impl Executor {
             outer_result = restarted;
         }
 
+        if let Some(name) = super::aggregation::ambiguous_read(stmt, &all_columns) {
+            return Err(super::prepared_select::ambiguous_column(&name));
+        }
         let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
             stmt,
             ctx,

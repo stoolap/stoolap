@@ -311,11 +311,99 @@ pub(crate) fn check_grouped_reads(
     stmt: &SelectStatement,
     source: &[String],
 ) -> Result<()> {
+    if let Some(name) = ambiguous_read(stmt, source) {
+        return Err(super::prepared_select::ambiguous_column(&name));
+    }
     let items = executor.parse_group_by(stmt, source)?;
     match ungrouped_read(stmt, &items, source) {
         Some(name) => Err(ungrouped_column(&name)),
         None => Ok(()),
     }
+}
+
+/// A name `stmt` reads that two columns of `source` carry, in its SELECT
+/// list, GROUP BY, HAVING or ORDER BY, an aggregate's arguments included;
+/// outside the SELECT list a bare name a SELECT alias carries is the alias's
+pub(crate) fn ambiguous_read(stmt: &SelectStatement, source: &[String]) -> Option<String> {
+    let bare: smallvec::SmallVec<[&str; 16]> = source
+        .iter()
+        .map(|column| split_qualified(column).map_or(column.as_str(), |(_, name)| name))
+        .collect();
+    let first = |name: &str| name.bytes().next().map(|b| b.to_ascii_lowercase());
+    let repeated = bare.iter().enumerate().any(|(at, name)| {
+        bare[at + 1..].iter().any(|other| {
+            other.len() == name.len() && first(other) == first(name) && eq_folded(name, other)
+        })
+    });
+    if !repeated {
+        return None;
+    }
+    // The columns a reference reads, as the compiler binds it: a column
+    // spelled as the name before the others a bare part of it names
+    let count = |test: &dyn Fn(Option<&str>, &str) -> bool| {
+        source
+            .iter()
+            .filter(|column| match split_qualified(column) {
+                Some((table, name)) => test(Some(table), name),
+                None => test(None, column),
+            })
+            .count()
+    };
+    let carriers = |reference: &Expression| match reference {
+        Expression::Identifier(id) => {
+            let name = id.value_lower.as_str();
+            match count(&|table, column| table.is_none() && eq_folded(column, name)) {
+                0 => count(&|table, column| table.is_some() && eq_folded(column, name)),
+                plain => plain,
+            }
+        }
+        Expression::QualifiedIdentifier(q) => {
+            let (qualifier, name) = (
+                q.qualifier.value_lower.as_str(),
+                q.name.value_lower.as_str(),
+            );
+            let named = |table: Option<&str>, column: &str| {
+                table.is_some_and(|table| eq_folded(table, qualifier)) && eq_folded(column, name)
+            };
+            match count(&named) {
+                0 => count(&|table, column| table.is_none() && eq_folded(column, name)),
+                named => named,
+            }
+        }
+        _ => 0,
+    };
+    let is_alias = |reference: &Expression| match reference {
+        Expression::Identifier(id) => stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower)),
+        _ => false,
+    };
+    let mut found = None;
+    let mut check = |reference: &Expression, aliases: bool| {
+        if found.is_some() || (aliases && is_alias(reference)) {
+            return;
+        }
+        if carriers(reference) > 1 {
+            found = Some(match reference {
+                Expression::Identifier(id) => id.value.to_string(),
+                other => other.to_string(),
+            });
+        }
+    };
+    for column in &stmt.columns {
+        super::utils::visit_column_refs(column, &mut |r| check(r, false));
+    }
+    let clauses = stmt
+        .group_by
+        .columns
+        .iter()
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|ob| &ob.expression));
+    for clause in clauses {
+        super::utils::visit_column_refs(clause, &mut |r| check(r, true));
+    }
+    found
 }
 
 /// A column of `source` that `stmt` reads outside every GROUP BY item and
@@ -1850,6 +1938,9 @@ impl Executor {
             blocks,
             alone,
         } = slots;
+        if let Some(name) = ambiguous_read(written_stmt, source_columns) {
+            return Err(super::prepared_select::ambiguous_column(&name));
+        }
         // An ORDER BY key computed over the groups is projected with the items
         let keyed = self.with_order_by_items(stmt);
         let lifted = !std::ptr::eq(stmt, written_stmt);
