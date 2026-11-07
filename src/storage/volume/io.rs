@@ -1469,6 +1469,60 @@ mod tests {
     }
 
     #[test]
+    fn readers_probing_a_column_at_once_read_its_bloom_words_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", 1, &mixed_volume(200_000)).unwrap();
+        let read = read_volume_from_disk(&path).unwrap();
+        let blooms = &read.meta.bloom_filters;
+        let h = super::super::column::ColumnBloomFilter::hash_value_static(&Value::Integer(4));
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    start.wait();
+                    assert!(blooms.might_contain_hash(0, h).unwrap());
+                });
+            }
+        });
+        assert_eq!(blooms.file_reads(0), 1);
+    }
+
+    #[test]
+    fn the_shared_dictionary_text_counts_until_every_column_lets_it_go() {
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("long", DataType::Text, false, false)
+            .column("short", DataType::Text, false, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        for i in 0..2_000i64 {
+            let long = Value::text(format!("a distinct value long enough {i}"));
+            let short = Value::text(format!("s{}", i % 3));
+            builder.add_row(i, &Row::from_values(vec![Value::Integer(i), long, short]));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", 1, &builder.finish().unwrap()).unwrap();
+        let read = read_volume_from_disk(&path).unwrap();
+        let store = read.columns.compressed_store().unwrap();
+        let strings = |col| -> usize {
+            let entries = store.get_column_dictionary(col).unwrap();
+            entries.iter().map(|s| s.len() + 24).sum()
+        };
+        let text: usize = (0..2_000)
+            .map(|i| format!("a distinct value long enough {i}").len())
+            .sum();
+        let long = strings(1);
+        assert!(
+            store.memory_size() >= long + text,
+            "the unbuilt column keeps the whole text: {} < {}",
+            store.memory_size(),
+            long + text
+        );
+        let short = strings(2);
+        assert_eq!(store.memory_size(), long + short, "the text is let go");
+    }
+
+    #[test]
     fn a_v4_file_reads_as_the_v5_file_of_the_same_volume() {
         let dir = tempfile::tempdir().unwrap();
         let rows = 70_000;

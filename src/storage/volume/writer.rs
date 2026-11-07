@@ -424,10 +424,9 @@ struct DictText {
 }
 
 impl DictText {
-    /// The byte span of entries `start..end` in `text`
-    fn span(&self, start: usize, end: usize) -> (usize, usize) {
-        let at = |i: usize| i.checked_sub(1).map_or(0, |i| self.ends[i] as usize);
-        (at(start), at(end))
+    /// Where entry `i` starts in `text`
+    fn start_of(&self, i: usize) -> usize {
+        i.checked_sub(1).map_or(0, |i| self.ends[i] as usize)
     }
 }
 
@@ -478,7 +477,7 @@ impl ColumnDict {
             let Some((dict, start, end)) = self.text.lock().take() else {
                 return Arc::from(Vec::new());
             };
-            let mut from = dict.span(start, end).0;
+            let mut from = dict.start_of(start);
             dict.ends[start..end]
                 .iter()
                 .map(|&to| {
@@ -490,18 +489,28 @@ impl ColumnDict {
         })
     }
 
-    fn memory_size(&self) -> usize {
-        if let Some(built) = self.built.get() {
-            return built.iter().map(|s| s.len() + 24).sum();
-        }
-        match &*self.text.lock() {
-            Some((dict, start, end)) => {
-                let (from, to) = dict.span(*start, *end);
-                to - from + (end - start) * 4
+    fn built_size(&self) -> usize {
+        self.built
+            .get()
+            .map_or(0, |built| built.iter().map(|s| s.len() + 24).sum())
+    }
+}
+
+/// Bytes of the store's dictionaries: each column's built strings, and the
+/// text the columns share, whole, while any of them still holds it
+fn dictionary_memory(dicts: &[(usize, ColumnDict)]) -> usize {
+    let mut size = 0;
+    let mut text: Option<Arc<DictText>> = None;
+    for (_, dict) in dicts {
+        size += dict.built_size();
+        if let Some((held, _, _)) = &*dict.text.lock() {
+            if !text.as_ref().is_some_and(|t| Arc::ptr_eq(t, held)) {
+                size += held.text.capacity() + held.ends.len() * 4;
+                text = Some(Arc::clone(held));
             }
-            None => 0,
         }
     }
+    size
 }
 
 pub struct CompressedBlockStore {
@@ -1505,10 +1514,7 @@ impl CompressedBlockStore {
                 }
             }
         }
-        for (_, dict) in &self.col_dicts {
-            size += dict.memory_size();
-        }
-        size
+        size + dictionary_memory(&self.col_dicts)
     }
 
     /// Access raw compressed blocks (for V4 write without re-compression).
@@ -1902,6 +1908,10 @@ enum BloomSlot {
         place: BloomPlace,
         file: Arc<VolumeFile>,
         loaded: std::sync::OnceLock<super::column::ColumnBloomFilter>,
+        /// Held by the one reader loading the filter; the others wait
+        loading: Arc<parking_lot::Mutex<()>>,
+        #[cfg(test)]
+        reads: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
@@ -1929,6 +1939,9 @@ impl VolumeBlooms {
                     place,
                     file: Arc::clone(file),
                     loaded: std::sync::OnceLock::new(),
+                    loading: Arc::default(),
+                    #[cfg(test)]
+                    reads: Arc::default(),
                 },
                 None => BloomSlot::Resident(super::column::ColumnBloomFilter::accept_all()),
             })
@@ -1950,16 +1963,26 @@ impl VolumeBlooms {
         let Some(slot) = self.columns.get(col) else {
             return Ok(None);
         };
-        let (place, file, loaded) = match slot {
+        let (place, file, loaded, loading) = match slot {
             BloomSlot::Resident(filter) => return Ok(Some(filter)),
             BloomSlot::InFile {
                 place,
                 file,
                 loaded,
-            } => (place, file, loaded),
+                loading,
+                ..
+            } => (place, file, loaded, loading),
         };
         if let Some(filter) = loaded.get() {
             return Ok(Some(filter));
+        }
+        let _loading = loading.lock();
+        if let Some(filter) = loaded.get() {
+            return Ok(Some(filter));
+        }
+        #[cfg(test)]
+        if let BloomSlot::InFile { reads, .. } = slot {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let mut bytes = Vec::new();
         bytes
@@ -1975,6 +1998,17 @@ impl VolumeBlooms {
         }
         let filter = super::column::ColumnBloomFilter::from_parts(place.num_bits, &bytes);
         Ok(Some(loaded.get_or_init(|| filter)))
+    }
+
+    /// Reads of column `col`'s words from the file so far
+    #[cfg(test)]
+    pub(crate) fn file_reads(&self, col: usize) -> usize {
+        match self.columns.get(col) {
+            Some(BloomSlot::InFile { reads, .. }) => {
+                reads.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            _ => 0,
+        }
     }
 
     /// Whether column `col` may hold a value of hash `h`; true for a column
