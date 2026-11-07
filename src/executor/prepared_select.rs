@@ -18,6 +18,7 @@
 //! slots.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -53,6 +54,7 @@ use super::aggregation::{
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
     CteScope, ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys, MemberSet,
+    SubqueryStamp,
 };
 use super::expr_key::ExprKey;
 use super::expression::{
@@ -14229,9 +14231,9 @@ struct BlockState {
     answered: RefCell<Option<(u64, BlockAnswer)>>,
     /// A keyed EXISTS or IN block's choice, once made
     keyed_choice: std::cell::Cell<Option<bool>>,
-    /// The candidates its probes may still read in this run, when its WHERE
-    /// asks more than its keys
-    probe_left: std::cell::Cell<Option<usize>>,
+    /// The candidates its probes may still read, when its WHERE asks more
+    /// than its keys: this run's, or every run's over unchanged tables
+    probe_left: RefCell<Option<Arc<AtomicUsize>>>,
     /// The call's candidates were counted into `count_ids`, for its probe
     /// to read them and no others
     counted: std::cell::Cell<bool>,
@@ -14423,7 +14425,7 @@ impl<'a> PreparedRunner<'a> {
                     fills: std::cell::Cell::new(0),
                     answered: RefCell::new(None),
                     keyed_choice: std::cell::Cell::new(None),
-                    probe_left: std::cell::Cell::new(None),
+                    probe_left: RefCell::new(None),
                     counted: std::cell::Cell::new(false),
                     keyed_set: RefCell::new(None),
                     members: std::cell::OnceCell::new(),
@@ -15579,14 +15581,62 @@ impl<'a> PreparedRunner<'a> {
         let forced = crate::test_failpoints::forced_exists_strategy();
         #[cfg(not(feature = "test-failpoints"))]
         let forced: Option<bool> = None;
-        let keyed = forced.unwrap_or_else(|| !self.probe_cheaper(index, plan));
+        let mut keyed = forced.unwrap_or_else(|| !self.probe_cheaper(index, plan));
         let table = self.tables[index].as_ref().and_then(BlockInput::table);
-        let budget = table
-            .filter(|_| !keyed && forced.is_none() && plan.asks_more())
-            .map(block_plan::probe_budget);
-        block.probe_left.set(budget);
+        if let Some(table) = table.filter(|_| !keyed && forced.is_none() && plan.asks_more()) {
+            let budget = self.probe_budget(index, table);
+            keyed = budget.is_none();
+            *block.probe_left.borrow_mut() = budget;
+        }
         block.keyed_choice.set(Some(keyed));
         keyed
+    }
+
+    /// The candidates a probing run of a WHERE asking more than its keys may
+    /// read: what is left of the budget every run shares over tables
+    /// unchanged since it was opened, so repeated probes cost at most the set
+    /// they would keep; None when a run before kept that set, now taken
+    fn probe_budget(&self, index: usize, table: &dyn Table) -> Option<Arc<AtomicUsize>> {
+        let fresh = || Arc::new(AtomicUsize::new(block_plan::probe_budget(table)));
+        let sq = &self.prepared.subqueries[index];
+        let kept = match &sq.answer {
+            Answer::Exists(kept) | Answer::Members(kept, _) if sq.grouping.is_none() => kept,
+            // A grouped block's keyed groups are read for one run only
+            _ => return Some(fresh()),
+        };
+        let (origin, key, stamp) = self.kept_origin(kept);
+        let Some(stamp) = stamp else {
+            return Some(fresh());
+        };
+        match get_cached_block_answer(&origin, key, &stamp) {
+            Some(BlockAnswer::Keyed(set)) => {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::prepared_strategy_ran(
+                    crate::test_failpoints::PreparedStrategy::KeyedSet,
+                );
+                *self.blocks[index].keyed_set.borrow_mut() = Some(set);
+                None
+            }
+            Some(members @ BlockAnswer::KeyedMembers(_)) => {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::prepared_strategy_ran(
+                    crate::test_failpoints::PreparedStrategy::KeyedMembers,
+                );
+                let _ = self.blocks[index].members.set(members);
+                None
+            }
+            Some(BlockAnswer::ProbeBudget(left)) => Some(left),
+            _ => {
+                let left = fresh();
+                cache_block_answer(
+                    &origin,
+                    key,
+                    stamp,
+                    BlockAnswer::ProbeBudget(Arc::clone(&left)),
+                );
+                Some(left)
+            }
+        }
     }
 
     /// Whether the call the buffer holds probes within the run's budget,
@@ -15595,9 +15645,11 @@ impl<'a> PreparedRunner<'a> {
     /// cannot count, leaves the run to the set
     fn probe_within_budget(&self, index: usize, plan: &KeyedPlan) -> bool {
         let block = &self.blocks[index];
-        let Some(left) = block.probe_left.get() else {
+        let budget = block.probe_left.borrow();
+        let Some(budget) = budget.as_ref() else {
             return true;
         };
+        let left = budget.load(Ordering::Relaxed);
         block.counted.set(false);
         // Every call pays its lookup, an empty one too
         let Some(left) = left.checked_sub(block_plan::PROBE_CALL_CANDIDATES) else {
@@ -15624,7 +15676,7 @@ impl<'a> PreparedRunner<'a> {
         ids.clear();
         match table.equality_candidates(&column.name, key, left, ids, scratch) {
             Ok(Some(CappedEqual::Copied)) => {
-                block.probe_left.set(Some(left - ids.len()));
+                budget.store(left - ids.len(), Ordering::Relaxed);
                 block.counted.set(true);
                 true
             }
@@ -15820,6 +15872,28 @@ impl<'a> PreparedRunner<'a> {
         existence: &Kept,
         compute: impl FnOnce() -> Result<BlockAnswer>,
     ) -> Result<BlockAnswer> {
+        let (origin, key, stamp) = self.kept_origin(existence);
+        if let Some(stamp) = &stamp {
+            // A probes' budget is no answer: the set read past it replaces it
+            if let Some(answer) = get_cached_block_answer(&origin, key, stamp)
+                .filter(|answer| !matches!(answer, BlockAnswer::ProbeBudget(_)))
+            {
+                return Ok(answer);
+            }
+        }
+        let answer = compute()?;
+        if let Some(stamp) = stamp {
+            cache_block_answer(&origin, key, stamp, answer.clone());
+        }
+        Ok(answer)
+    }
+
+    /// What the block's answer is kept under across runs, with the stamp
+    /// taken now, None where the run keeps none
+    fn kept_origin<'k>(
+        &'k self,
+        existence: &'k Kept,
+    ) -> (BlockOrigin<'k>, u64, Option<SubqueryStamp>) {
         let statement = self.statement;
         let keeps = !existence.reads_source
             && Executor::reads_cacheable_rows(statement)
@@ -15837,16 +15911,7 @@ impl<'a> PreparedRunner<'a> {
             read: existence.params.as_deref(),
         };
         let key = origin.key();
-        if let Some(stamp) = &stamp {
-            if let Some(answer) = get_cached_block_answer(&origin, key, stamp) {
-                return Ok(answer);
-            }
-        }
-        let answer = compute()?;
-        if let Some(stamp) = stamp {
-            cache_block_answer(&origin, key, stamp, answer.clone());
-        }
-        Ok(answer)
+        (origin, key, stamp)
     }
 }
 

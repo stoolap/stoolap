@@ -409,6 +409,46 @@ fn test_a_probe_within_budget_reads_only_the_candidates_it_was_charged_with() {
 }
 
 #[test]
+fn test_runs_over_unchanged_tables_share_one_probe_budget_then_keep_the_set() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_runs").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX i_k ON i (k)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO i SELECT value, value % 200, value % 10 FROM generate_series(1, 2000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // A run's twenty probes cost 280 of the 500 the runs share: the second
+    // run spends the rest and builds the set, the runs after take it kept
+    let sql = "SELECT id FROM o WHERE EXISTS \
+               (SELECT 1 FROM i WHERE i.k = o.k AND i.v > 5) ORDER BY id";
+    let passing = vec![6, 7, 8, 9, 16, 17, 18, 19];
+    for _ in 0..2 {
+        assert_eq!(ids(&db, sql), passing);
+    }
+    for run in 3..=5 {
+        let (probed, built, _) = prepared_exists_counts();
+        assert_eq!(ids(&db, sql), passing);
+        let (probed_after, built_after, _) = prepared_exists_counts();
+        assert_eq!(
+            (probed_after - probed, built_after - built),
+            (0, 0),
+            "run {run} probes or builds again"
+        );
+    }
+    db.execute("INSERT INTO i VALUES (2001, 1, 9)", ()).unwrap();
+    let (probed, _, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), [vec![1], passing].concat());
+    assert!(
+        prepared_exists_counts().0 > probed,
+        "a changed table probes again"
+    );
+}
+
+#[test]
 fn test_probes_whose_lookups_find_nothing_still_spend_the_budget() {
     let _guard = serial();
     let db = Database::open("memory://prepared_exists_probe_empty").unwrap();
