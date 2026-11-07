@@ -536,7 +536,7 @@ fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
     use stoolap::core::{Operator, Row, Value};
     use stoolap::storage::expression::ComparisonExpr;
     use stoolap::storage::traits::{Engine, Table};
-    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
     use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
     use stoolap::storage::volume::table::SegmentedTable;
     use stoolap::storage::volume::writer::VolumeBuilder;
@@ -552,7 +552,7 @@ fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
     builder.add_row(1, &Row::from_values(vec![Value::Integer(10)]));
     builder.add_row(2, &Row::from_values(vec![Value::Integer(20)]));
     let volume = builder.finish().unwrap();
-    let path = write_volume_to_disk(dir.path(), "c", 1, &volume).unwrap();
+    let path = write_volume_to_disk_v4(dir.path(), "c", 1, &volume).unwrap();
 
     // Keep the framing, metadata and CRC valid; replace the column block
     let original = std::fs::read(&path).unwrap();

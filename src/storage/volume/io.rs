@@ -76,7 +76,7 @@ fn barrier_unsupported(code: Option<i32>) -> bool {
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
 
-/// Write a frozen volume to disk atomically (V4 format, LZ4 compressed).
+/// Write a frozen volume to disk atomically (V5 format, LZ4 compressed).
 pub fn write_volume_to_disk(
     dir: &Path,
     table_name: &str,
@@ -87,12 +87,8 @@ pub fn write_volume_to_disk(
     Ok(path)
 }
 
-/// Write a frozen volume to disk atomically, with optional LZ4 compression.
-///
-/// Always writes V4 format (per-column per-group blocks with CRC32).
-/// When `compress` is true, blocks are LZ4-compressed (blocks that don't
-/// compress well are stored raw automatically). When false, all blocks
-/// are stored raw (same V4 layout, no LZ4 overhead).
+/// Write a frozen volume to disk atomically as V5, with optional LZ4
+/// compression of its blocks (a block that does not shrink is stored raw).
 /// Returns (path, CompressedBlockStore).
 pub fn write_volume_to_disk_opts(
     dir: &Path,
@@ -101,6 +97,34 @@ pub fn write_volume_to_disk_opts(
     volume: &FrozenVolume,
     compress: bool,
 ) -> Result<(PathBuf, CompressedBlockStore)> {
+    let (data, store) = serialize_v5_opts(volume, compress, volume_id)
+        .map_err(|e| crate::core::Error::internal(format!("V5 serialize failed: {}", e)))?;
+    let path = write_volume_file(dir, table_name, volume_id, data)?;
+    Ok((path, store))
+}
+
+/// Writes a volume as V4, the format files written before V5 have: the
+/// fixtures of tests that read or damage V4 files
+#[doc(hidden)]
+pub fn write_volume_to_disk_v4(
+    dir: &Path,
+    table_name: &str,
+    volume_id: u64,
+    volume: &FrozenVolume,
+) -> Result<PathBuf> {
+    let (data, _) = serialize_v4_opts(volume, true)
+        .map_err(|e| crate::core::Error::internal(format!("V4 serialize failed: {}", e)))?;
+    write_volume_file(dir, table_name, volume_id, data)
+}
+
+/// Writes `data` as `dir/table_name/vol_<id>.vol` through a synced
+/// temporary file, then syncs the directory
+fn write_volume_file(
+    dir: &Path,
+    table_name: &str,
+    volume_id: u64,
+    data: Vec<u8>,
+) -> Result<PathBuf> {
     let table_dir = dir.join(table_name);
     std::fs::create_dir_all(&table_dir)
         .map_err(|e| crate::core::Error::internal(format!("failed to create volume dir: {}", e)))?;
@@ -108,9 +132,6 @@ pub fn write_volume_to_disk_opts(
     let filename = format!("vol_{:016x}.{}", volume_id, VOLUME_EXT);
     let final_path = table_dir.join(&filename);
     let tmp_path = table_dir.join(format!("{}.tmp", filename));
-
-    let (data, store) = serialize_v4_opts(volume, compress)
-        .map_err(|e| crate::core::Error::internal(format!("V4 serialize failed: {}", e)))?;
 
     {
         use std::io::Write;
@@ -137,7 +158,57 @@ pub fn write_volume_to_disk_opts(
         })?;
     }
 
-    Ok((final_path, store))
+    Ok(final_path)
+}
+
+/// Serializes a volume as V5: the header, the blocks group by group, then
+/// the sections and the footer
+pub(crate) fn serialize_v5_opts(
+    vol: &FrozenVolume,
+    compress: bool,
+    volume_id: u64,
+) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
+    let col_count = vol.columns.len();
+    let group_size = vol.meta.group_rows;
+    let num_groups = vol.meta.row_count.div_ceil(group_size);
+    let meta = super::format::v5_volume_sections(vol)?;
+    let meta_bytes: usize = meta.iter().map(|s| s.bytes.len()).sum();
+    let store = CompressedBlockStore::compress_columns_opts(
+        &vol.columns,
+        vol.meta.row_count,
+        group_size,
+        compress,
+    )?;
+    let blocks = store.raw_blocks();
+    let decoded = store.decompressed_lens();
+    let block_bytes: usize = blocks.iter().flatten().map(Vec::len).sum();
+    let mut buf = Vec::with_capacity(block_bytes + meta_bytes + 4096);
+    buf.extend_from_slice(&super::v5::header());
+    let mut entries = Vec::with_capacity(col_count * num_groups);
+    for group in 0..num_groups {
+        for (col, col_blocks) in blocks.iter().enumerate() {
+            let block = &col_blocks[group];
+            entries.push(super::v5::BlockEntry::new(
+                buf.len() as u64,
+                block,
+                decoded[col][group],
+                col,
+                group,
+            )?);
+            buf.extend_from_slice(block);
+        }
+    }
+    let pos = buf.len() as u64;
+    let root = super::v5::Root {
+        cols: col_count as u32,
+        groups: num_groups as u32,
+        group_rows: group_size as u32,
+        rows: vol.meta.row_count as u64,
+        volume_id,
+        nonce: super::v5::new_nonce(),
+    };
+    super::v5::write_tail(&mut buf, pos, &root, meta, &entries)?;
+    Ok((buf, store))
 }
 
 /// Serialize a FrozenVolume to V4 format.
@@ -381,8 +452,6 @@ fn read_volume_v4(
     }
     drop(index_buf);
 
-    let col_data_types = meta.column_types.clone();
-
     // 5. The blocks stay in the file: their offsets follow from the index
     //    (column-major, as written), and the rest of the file passes
     //    through the hasher in a small buffer so the whole-file CRC is
@@ -433,6 +502,26 @@ fn read_volume_v4(
     //    Columns start in the file. First scan decodes per group on
     //    demand. After all columns are accessed, is_eager flips to true
     //    (automatic hot promotion).
+    Ok(file_volume(
+        handle,
+        meta,
+        (all_offsets, all_comp_lens, all_decomp_lens),
+        group_size,
+        None,
+    ))
+}
+
+/// A volume whose columns are read from `handle` a group at a time, each
+/// block where `blocks` (offsets, stored and decoded lengths, by column
+/// and group) places it, checked against `crcs` on every read when given
+fn file_volume(
+    handle: std::sync::Arc<super::writer::VolumeFile>,
+    meta: super::format::VolumeMetadata,
+    (all_offsets, all_comp_lens, all_decomp_lens): BlockPlaces,
+    group_size: usize,
+    crcs: Option<Vec<Vec<u32>>>,
+) -> FrozenVolume {
+    let col_data_types = meta.column_types.clone();
     let dict_ranges: Vec<(usize, usize, usize)> = {
         let mut ranges = Vec::new();
         let mut offset = 0usize;
@@ -445,7 +534,7 @@ fn read_volume_v4(
         }
         ranges
     };
-    let store = CompressedBlockStore::from_shared_file(
+    let mut store = CompressedBlockStore::from_shared_file(
         handle,
         all_offsets,
         all_comp_lens,
@@ -457,9 +546,12 @@ fn read_volume_v4(
         group_size,
         meta.row_count,
     );
+    if let Some(crcs) = crcs {
+        store.check_blocks(crcs);
+    }
     let columns = LazyColumns::deferred(store, col_data_types);
 
-    Ok(FrozenVolume {
+    FrozenVolume {
         columns,
         meta: Arc::new(super::writer::VolumeMeta {
             zone_maps: meta.zone_maps,
@@ -481,7 +573,61 @@ fn read_volume_v4(
         last_access_epoch: std::sync::atomic::AtomicU64::new(
             super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
         ),
-    })
+    }
+}
+
+/// Every block's offset, stored length and decoded length, by column and
+/// group
+type BlockPlaces = (Vec<Vec<u64>>, Vec<Vec<usize>>, Vec<Vec<usize>>);
+
+/// Reads a V5 volume: the footer, the section table and the sections; the
+/// blocks stay in the file, each checked against its CRC when read
+fn read_volume_v5(
+    file: std::fs::File,
+    handle: std::sync::Arc<super::writer::VolumeFile>,
+    path: &Path,
+) -> Result<FrozenVolume> {
+    use super::format::{
+        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
+    };
+    let fail = |e: std::io::Error| crate::core::Error::internal(format!("{:?}: {}", path, e));
+    let inv = |msg: &str| crate::core::Error::internal(format!("{:?}: V5: {}", path, msg));
+    let len = file.metadata().map_err(fail)?.len();
+    let read_at = |buf: &mut [u8], at: u64| super::writer::read_exact_at(&file, buf, at);
+    let known = [
+        V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_BLOOMS, V5_STATS,
+    ];
+    let opened = super::v5::open(len, &known, &read_at).map_err(fail)?;
+    drop(file);
+    let super::format::V5Metadata { meta, bounds } =
+        super::format::v5_metadata_from_sections(&opened.meta).map_err(fail)?;
+    drop(opened.meta);
+    let root = &opened.root;
+    if meta.col_type_tags.len() != root.cols as usize
+        || meta.row_count as u64 != root.rows
+        || bounds.len() != root.groups as usize
+    {
+        return Err(inv("root does not match the metadata"));
+    }
+    // One group spans every row; more tile them at one power-of-two size,
+    // which their zone maps' bounds carry
+    let group_size = match bounds.as_slice() {
+        [] if meta.row_count == 0 => ROW_GROUP_SIZE,
+        [(0, end)] if *end as usize == meta.row_count && meta.row_count <= ROW_GROUP_SIZE => {
+            ROW_GROUP_SIZE
+        }
+        [_, _, ..] => group_geometry(meta.row_count, &meta.row_groups)
+            .filter(|&size| size == root.group_rows as usize)
+            .ok_or_else(|| inv("groups do not tile the rows at the root's group size"))?,
+        _ => return Err(inv("group directory does not cover the rows")),
+    };
+    Ok(file_volume(
+        handle,
+        meta,
+        (opened.offsets, opened.stored, opened.decoded),
+        group_size,
+        Some(opened.crcs),
+    ))
 }
 
 /// Rewrites the volume file at `path` with the same rows in row groups of
@@ -514,7 +660,7 @@ pub fn rewrite_volume_with_group_rows(path: &Path, group_rows: usize) -> Result<
         .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))
 }
 
-/// Read a frozen volume from disk. Only V4 (STV4) format is supported.
+/// Read a frozen volume from disk, V5 or V4 by its magic.
 pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
     // The V4 reader checks the format itself, so this opens the file once
     // and the store comes back holding the handle every later read shares
@@ -532,6 +678,11 @@ pub fn read_volume_from_handle(
     let file = handle.open().map_err(|e| {
         crate::core::Error::internal(format!("failed to open volume {:?}: {}", handle.path(), e))
     })?;
+    // A file shorter than a magic is refused by the V4 reader
+    let mut magic = [0u8; 4];
+    if super::writer::read_exact_at(&file, &mut magic, 0).is_ok() && magic == super::v5::V5_MAGIC {
+        return read_volume_v5(file, std::sync::Arc::clone(handle), &handle.path());
+    }
     read_volume_v4(file, std::sync::Arc::clone(handle), &handle.path())
 }
 
@@ -1028,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_roundtrip_basic() {
+    fn test_v5_roundtrip_basic() {
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaBuilder::new("test")
             .column("id", DataType::Integer, false, true)
@@ -1063,11 +1214,10 @@ mod tests {
         );
         let vol = builder.finish().unwrap();
 
-        // write_volume_to_disk with compress=true produces V4
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
-        // Verify STV4 magic
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..4], b"STV4");
+        assert_eq!(&bytes[..4], b"STV5");
+        assert_eq!(&bytes[bytes.len() - 4..], b"STV5");
 
         // Read back and verify eager loading
         let loaded = read_volume_from_disk(&path).unwrap();
@@ -1096,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_roundtrip_with_nulls() {
+    fn test_roundtrip_with_nulls() {
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaBuilder::new("test")
             .column("id", DataType::Integer, false, true)
@@ -1130,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_roundtrip_multiple_row_groups() {
+    fn test_roundtrip_multiple_row_groups() {
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaBuilder::new("test")
             .column("id", DataType::Integer, false, true)
@@ -1175,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_roundtrip_timestamp_boolean() {
+    fn test_roundtrip_timestamp_boolean() {
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaBuilder::new("test")
             .column("time", DataType::Timestamp, false, false)
@@ -1212,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_get_row_roundtrip() {
+    fn test_get_row_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaBuilder::new("test")
             .column("id", DataType::Integer, false, true)
@@ -1232,6 +1382,89 @@ mod tests {
         let row = loaded.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(42)));
         assert_eq!(row.get(1), Some(&Value::text("test")));
+    }
+
+    fn mixed_volume(rows: usize) -> FrozenVolume {
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("label", DataType::Text, true, false)
+            .column("x", DataType::Float, true, false)
+            .build();
+        let mut builder = VolumeBuilder::with_capacity(&schema, rows);
+        for i in 0..rows {
+            let label = match i % 3 {
+                0 => Value::Null(DataType::Text),
+                1 => Value::text("one"),
+                _ => Value::text(format!("t{}", i % 7)),
+            };
+            builder.add_row(
+                i as i64 * 2,
+                &Row::from_values(vec![
+                    Value::Integer(i as i64 * 2),
+                    label,
+                    Value::Float(i as f64),
+                ]),
+            );
+        }
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_v4_file_reads_as_the_v5_file_of_the_same_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = 70_000;
+        let vol = mixed_volume(rows);
+        let v4 = write_volume_to_disk_v4(dir.path(), "t", 1, &vol).unwrap();
+        let v5 = write_volume_to_disk(dir.path(), "t", 2, &vol).unwrap();
+        assert_eq!(&std::fs::read(&v4).unwrap()[..4], b"STV4");
+        let (old, new) = (
+            read_volume_from_disk(&v4).unwrap(),
+            read_volume_from_disk(&v5).unwrap(),
+        );
+        let zones = |z: &[super::super::column::ZoneMap]| -> Vec<(Value, Value, u32, u32)> {
+            z.iter()
+                .map(|z| (z.min.clone(), z.max.clone(), z.null_count, z.row_count))
+                .collect()
+        };
+        let groups = |v: &FrozenVolume| -> Vec<_> {
+            v.meta
+                .row_groups
+                .iter()
+                .map(|g| (g.start_idx, g.end_idx, zones(&g.zone_maps)))
+                .collect()
+        };
+        assert_eq!(old.meta.row_ids, new.meta.row_ids);
+        assert_eq!(old.meta.group_rows, new.meta.group_rows);
+        assert_eq!(groups(&old), groups(&new));
+        assert_eq!(zones(&old.meta.zone_maps), zones(&new.meta.zone_maps));
+        for row in [0, 1, 2, 65_535, 65_536, rows - 1] {
+            let want = vol.get_row(row).unwrap();
+            assert_eq!(old.get_row(row).unwrap(), want, "row {row}");
+            assert_eq!(new.get_row(row).unwrap(), want, "row {row}");
+        }
+    }
+
+    #[test]
+    fn the_column_directory_refuses_a_type_encoding_or_kind_it_lacks() {
+        let vol = mixed_volume(10);
+        let read = |patch: Option<(usize, u8)>| {
+            let sections: Vec<(u32, u8, Vec<u8>)> = super::super::format::v5_volume_sections(&vol)
+                .unwrap()
+                .into_iter()
+                .map(|mut s| {
+                    if let (super::super::format::V5_COLUMNS, Some((at, byte))) = (s.kind, patch) {
+                        s.bytes[16 + at] = byte;
+                    }
+                    (s.kind, s.encoding, s.bytes)
+                })
+                .collect();
+            super::super::format::v5_metadata_from_sections(&sections)
+        };
+        assert!(read(None).is_ok());
+        // Type tag, encoding, kind and data type of the first column
+        for (at, byte) in [(0, 0xEE), (3, 2), (4, 1), (5, 0xEE)] {
+            assert!(read(Some((at, byte))).is_err(), "byte {at} = {byte:#x}");
+        }
     }
 }
 

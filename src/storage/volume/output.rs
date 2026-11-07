@@ -12,37 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Writes a V4 volume file from typed batches as they arrive.
+//! Writes a V5 volume file from typed batches as they arrive.
 //!
 //! The rows go into one row group's typed accumulators; when the group is
 //! full, each column's block is encoded from the accumulators, compressed
-//! when that shrinks it, and appended to a temporary block file, and the
+//! when that shrinks it, and appended to the file being written, and the
 //! accumulators are cleared with their capacity kept. Neither the output's
 //! decoded columns nor its compressed blocks accumulate in memory. When
-//! every row is in, the metadata is serialized from its parts and the
-//! final file is assembled in V4's order (header, metadata, length index,
-//! blocks column-major): each block is copied from the block file through
-//! a bounded buffer, the whole-file CRC hashed as it goes. The compressed
-//! data is therefore written and read once more than a single-pass layout
-//! would need. The finished volume has its metadata resident and its
-//! columns backed by the file, read a group at a time.
+//! every row is in, the metadata sections, the section table and the
+//! footer follow the blocks, and the file is synced and renamed into
+//! place. The finished volume has its metadata resident and its columns
+//! backed by the file, read a group at a time.
 
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{Error, Result, Schema};
 
 use super::column::ROW_GROUP_SIZE;
-use super::format::{serialize_typed_block, serialize_volume_metadata_parts};
+use super::format::serialize_typed_block;
 use super::transfer::TypedSink;
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns, TypedCells, VolumeBuilder};
 
-/// Bytes copied at a time when the final file is assembled
+/// The write buffer of the file being written
 const COPY_BUFFER: usize = 1 << 20;
 
-/// The block file's name next to the final file
+/// The name the file has until it is complete, next to the final file
 fn block_file_path(final_path: &Path) -> PathBuf {
     final_path.with_extension("blocks.tmp")
 }
@@ -59,15 +56,18 @@ pub struct VolumeFileWriter {
     final_path: PathBuf,
     blocks_path: PathBuf,
     blocks: Option<BufWriter<File>>,
-    /// Bytes written to the block file so far, the next block's position
+    /// Bytes written to the file so far, the next block's position
     block_pos: u64,
-    /// By column, by group: (position in the block file, compressed
-    /// length, decompressed length)
-    index: Vec<Vec<(u64, usize, usize)>>,
+    /// By column, by group: (position in the file, compressed length,
+    /// decompressed length, CRC-32C of the stored bytes)
+    index: Vec<Vec<(u64, usize, usize, u32)>>,
+    /// Every block written, in file order, for the block table
+    entries: Vec<super::v5::BlockEntry>,
     packed: Vec<u8>,
     finished: bool,
     /// Rows the writer was sized for; caps a unique set's capacity
     expected_rows: usize,
+    volume_id: u64,
     /// The unique column sets indexed as the rows pass
     unique: Vec<UniqueIndexing>,
 }
@@ -107,7 +107,6 @@ impl VolumeFileWriter {
             table_dir.join(format!("vol_{:016x}.{}", volume_id, super::io::VOLUME_EXT));
         let blocks_path = block_file_path(&final_path);
         let blocks = std::fs::OpenOptions::new()
-            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
@@ -116,17 +115,23 @@ impl VolumeFileWriter {
         let mut builder = VolumeBuilder::new(schema);
         builder.feed_bloom_filters(expected_rows);
         builder.reserve_rows(expected_rows);
+        let mut blocks = BufWriter::with_capacity(COPY_BUFFER, blocks);
+        blocks
+            .write_all(&super::v5::header())
+            .map_err(|e| io_error("failed to write volume header", e))?;
         Ok(Self {
             index: vec![Vec::new(); schema.columns.len()],
+            entries: Vec::new(),
             builder: Some(builder),
             compress,
             final_path,
             blocks_path,
-            blocks: Some(BufWriter::with_capacity(COPY_BUFFER, blocks)),
-            block_pos: 0,
+            blocks: Some(blocks),
+            block_pos: super::v5::HEADER_LEN,
             packed: Vec::new(),
             finished: false,
             expected_rows,
+            volume_id,
             unique: Vec::new(),
         })
     }
@@ -333,7 +338,12 @@ impl VolumeFileWriter {
             .as_mut()
             .ok_or_else(|| Error::internal("volume writer already finished"))?;
         let compress = self.compress;
-        let (packed, index, block_pos) = (&mut self.packed, &mut self.index, &mut self.block_pos);
+        let (packed, index, block_pos, entries) = (
+            &mut self.packed,
+            &mut self.index,
+            &mut self.block_pos,
+            &mut self.entries,
+        );
         let builder = self
             .builder
             .as_mut()
@@ -357,7 +367,12 @@ impl VolumeFileWriter {
             blocks
                 .write_all(bytes)
                 .map_err(|e| io_error("failed to write volume block", e))?;
-            index[col_idx].push((*block_pos, bytes.len(), decompressed_len));
+            let group = index[col_idx].len();
+            let entry =
+                super::v5::BlockEntry::new(*block_pos, bytes, decompressed_len, col_idx, group)
+                    .map_err(|e| io_error("V5 block", e))?;
+            index[col_idx].push((*block_pos, bytes.len(), decompressed_len, entry.crc()));
+            entries.push(entry);
             *block_pos += bytes.len() as u64;
             Ok(())
         })
@@ -374,12 +389,6 @@ impl VolumeFileWriter {
             .blocks
             .take()
             .ok_or_else(|| Error::internal("volume writer already finished"))?;
-        blocks
-            .flush()
-            .map_err(|e| io_error("failed to flush volume block file", e))?;
-        let mut block_file = blocks
-            .into_inner()
-            .map_err(|e| io_error("failed to flush volume block file", e.into_error()))?;
 
         let builder = self
             .builder
@@ -391,10 +400,8 @@ impl VolumeFileWriter {
         let (meta, dict_tables) = builder.finish_streamed()?;
         let dictionaries: Vec<&[crate::common::SmartString]> =
             dict_tables.iter().map(Vec::as_slice).collect();
-        let meta_raw = serialize_volume_metadata_parts(&meta, &kinds, &dictionaries)
-            .map_err(|e| io_error("V4 metadata", e))?;
-        let meta_compressed = lz4_flex::compress_prepend_size(&meta_raw);
-        drop(meta_raw);
+        let sections = super::format::v5_metadata_sections(&meta, &kinds, &dictionaries)
+            .map_err(|e| io_error("V5 metadata", e))?;
 
         let col_count = self.index.len();
         let num_groups = self.index.first().map(Vec::len).unwrap_or(0);
@@ -404,59 +411,25 @@ impl VolumeFileWriter {
             ));
         }
 
-        // The final file in V4's order, hashed as it is written
-        let tmp_path = self.final_path.with_extension("vol.tmp");
-        let mut hasher = crc32fast::Hasher::new();
-        {
-            let file = File::create(&tmp_path)
-                .map_err(|e| io_error("failed to create volume tmp file", e))?;
-            let mut out = BufWriter::with_capacity(COPY_BUFFER, file);
-            let mut put = |out: &mut BufWriter<File>, bytes: &[u8]| -> Result<()> {
-                hasher.update(bytes);
-                out.write_all(bytes)
-                    .map_err(|e| io_error("failed to write volume file", e))
-            };
-            put(&mut out, &super::io::V4_MAGIC)?;
-            put(&mut out, &super::io::V4_VERSION.to_le_bytes())?;
-            put(&mut out, &(col_count as u32).to_le_bytes())?;
-            put(&mut out, &(num_groups as u32).to_le_bytes())?;
-            put(&mut out, &(meta_compressed.len() as u32).to_le_bytes())?;
-            put(&mut out, &meta_compressed)?;
-            drop(meta_compressed);
-            for col in &self.index {
-                for &(_, compressed_len, decompressed_len) in col {
-                    put(&mut out, &(compressed_len as u64).to_le_bytes())?;
-                    put(&mut out, &(decompressed_len as u64).to_le_bytes())?;
-                }
-            }
-            let mut copy = vec![0u8; COPY_BUFFER];
-            for col in &self.index {
-                for &(position, compressed_len, _) in col {
-                    block_file
-                        .seek(SeekFrom::Start(position))
-                        .map_err(|e| io_error("failed to seek volume block file", e))?;
-                    let mut left = compressed_len;
-                    while left > 0 {
-                        let take = copy.len().min(left);
-                        block_file
-                            .read_exact(&mut copy[..take])
-                            .map_err(|e| io_error("failed to read volume block file", e))?;
-                        put(&mut out, &copy[..take])?;
-                        left -= take;
-                    }
-                }
-            }
-            let crc = hasher.finalize();
-            out.write_all(&crc.to_le_bytes())
-                .map_err(|e| io_error("failed to write volume file", e))?;
-            out.flush()
-                .map_err(|e| io_error("failed to flush volume file", e))?;
-            super::io::sync_ordered(out.get_ref())
-                .map_err(|e| io_error("failed to fsync volume tmp file", e))?;
-        }
-        drop(block_file);
-        let _ = std::fs::remove_file(&self.blocks_path);
-        std::fs::rename(&tmp_path, &self.final_path)
+        // The blocks are in the file already, group by group; the
+        // sections, their table and the footer follow them
+        let root = super::v5::Root {
+            cols: col_count as u32,
+            groups: num_groups as u32,
+            group_rows: meta.group_rows as u32,
+            rows: meta.row_count as u64,
+            volume_id: self.volume_id,
+            nonce: super::v5::new_nonce(),
+        };
+        super::v5::write_tail(&mut blocks, self.block_pos, &root, sections, &self.entries)
+            .map_err(|e| io_error("failed to write volume file", e))?;
+        let file = blocks
+            .into_inner()
+            .map_err(|e| io_error("failed to flush volume file", e.into_error()))?;
+        super::io::sync_ordered(&file)
+            .map_err(|e| io_error("failed to fsync volume tmp file", e))?;
+        drop(file);
+        std::fs::rename(&self.blocks_path, &self.final_path)
             .map_err(|e| io_error("failed to rename volume file", e))?;
         // From here the final file exists; whatever fails until the volume
         // is handed over removes it, since nothing has published it
@@ -474,8 +447,7 @@ impl VolumeFileWriter {
     }
 
     /// Syncs the directory and builds the volume over the file just
-    /// written: the block offsets follow from the lengths as the reader
-    /// computes them
+    /// written, its blocks at the positions they were written to
     fn publish(
         &mut self,
         kinds: &[(u8, u8)],
@@ -490,24 +462,25 @@ impl VolumeFileWriter {
             super::io::sync_ordered(&d)
                 .map_err(|e| io_error("failed to fsync volume directory", e))?;
         }
-        let blocks_start = 20 + lz4_meta_len(&self.final_path)? + col_count * num_groups * 16;
         let mut offsets = Vec::with_capacity(col_count);
         let mut comp_lens = Vec::with_capacity(col_count);
         let mut decomp_lens = Vec::with_capacity(col_count);
-        let mut position = blocks_start as u64;
+        let mut crcs = Vec::with_capacity(col_count);
         for col in &self.index {
             let mut col_offsets = Vec::with_capacity(num_groups);
             let mut col_comp = Vec::with_capacity(num_groups);
             let mut col_decomp = Vec::with_capacity(num_groups);
-            for &(_, compressed_len, decompressed_len) in col {
+            let mut col_crcs = Vec::with_capacity(num_groups);
+            for &(position, compressed_len, decompressed_len, crc) in col {
                 col_offsets.push(position);
                 col_comp.push(compressed_len);
                 col_decomp.push(decompressed_len);
-                position += compressed_len as u64;
+                col_crcs.push(crc);
             }
             offsets.push(col_offsets);
             comp_lens.push(col_comp);
             decomp_lens.push(col_decomp);
+            crcs.push(col_crcs);
         }
         let mut shared_dict = Vec::new();
         let mut dict_ranges = Vec::new();
@@ -521,7 +494,7 @@ impl VolumeFileWriter {
             }
         }
         let column_types = meta.column_types.clone();
-        let store = CompressedBlockStore::from_file(
+        let mut store = CompressedBlockStore::from_file(
             self.final_path.clone(),
             offsets,
             comp_lens,
@@ -533,6 +506,7 @@ impl VolumeFileWriter {
             ROW_GROUP_SIZE,
             meta.row_count,
         );
+        store.check_blocks(crcs);
         let mut unique_indices = rustc_hash::FxHashMap::default();
         for UniqueIndexing {
             columns,
@@ -563,18 +537,8 @@ impl Drop for VolumeFileWriter {
         if !self.finished {
             self.blocks = None;
             let _ = std::fs::remove_file(&self.blocks_path);
-            let _ = std::fs::remove_file(self.final_path.with_extension("vol.tmp"));
         }
     }
-}
-
-/// The compressed metadata length in a written V4 file's header
-fn lz4_meta_len(path: &Path) -> Result<usize> {
-    let mut file = File::open(path).map_err(|e| io_error("failed to open volume file", e))?;
-    let mut header = [0u8; 20];
-    file.read_exact(&mut header)
-        .map_err(|e| io_error("failed to read volume header", e))?;
-    Ok(u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize)
 }
 
 #[cfg(test)]
@@ -582,7 +546,51 @@ mod tests {
     use super::*;
     use crate::core::{DataType, Row, SchemaBuilder, Value};
     use crate::storage::volume::column::ColumnData;
-    use crate::storage::volume::io::{read_volume_from_disk, serialize_v4_public};
+    use crate::storage::volume::format::{
+        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
+    };
+    use crate::storage::volume::io::{read_volume_from_disk, serialize_v5_opts};
+
+    type Layout = (
+        Vec<u8>,
+        Vec<(u32, u8, Vec<u8>)>,
+        Vec<Vec<usize>>,
+        Vec<Vec<u32>>,
+        [u64; 5],
+    );
+
+    /// A V5 file's blocks, sections and root, all but its random nonce
+    fn layout(bytes: &[u8]) -> Layout {
+        let read_at = |buf: &mut [u8], at: u64| {
+            buf.copy_from_slice(&bytes[at as usize..at as usize + buf.len()]);
+            Ok(())
+        };
+        let known = [
+            V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_BLOOMS, V5_STATS,
+        ];
+        let o = crate::storage::volume::v5::open(bytes.len() as u64, &known, &read_at).unwrap();
+        let end = o
+            .offsets
+            .iter()
+            .zip(&o.stored)
+            .flat_map(|(at, len)| at.iter().zip(len).map(|(at, len)| at + *len as u64))
+            .max()
+            .unwrap_or(crate::storage::volume::v5::HEADER_LEN) as usize;
+        let r = &o.root;
+        (
+            bytes[..end].to_vec(),
+            o.meta,
+            o.decoded,
+            o.crcs,
+            [
+                r.cols as u64,
+                r.groups as u64,
+                r.group_rows as u64,
+                r.rows,
+                r.volume_id,
+            ],
+        )
+    }
 
     fn schema() -> Schema {
         SchemaBuilder::new("t")
@@ -672,7 +680,7 @@ mod tests {
             builder.add_row(i, &row(i));
         }
         let by_rows = builder.finish().unwrap();
-        let (bytes, _) = serialize_v4_public(&by_rows).unwrap();
+        let (bytes, _) = serialize_v5_opts(&by_rows, true, 7).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -760,14 +768,14 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_the_one_serialize_v4_writes_for_the_same_rows() {
+    fn the_file_is_the_one_serialize_v5_writes_for_the_same_rows() {
         let schema = schema();
         for (rows, batch) in [(500, 64), (500, 500), (3, 1)] {
             let (want, volume, path, _dir) = written(&schema, rows, batch);
             let got = std::fs::read(&path).unwrap();
             assert_eq!(got.len(), want.len(), "{rows} rows in batches of {batch}");
             assert!(
-                got == want,
+                layout(&got) == layout(&want),
                 "{rows} rows in batches of {batch}: file differs"
             );
             assert!(volume.is_warm());
@@ -803,7 +811,7 @@ mod tests {
             );
         }
         let by_rows = builder.finish().unwrap();
-        let (want, _) = serialize_v4_public(&by_rows).unwrap();
+        let (want, _) = serialize_v5_opts(&by_rows, true, 9).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -850,7 +858,7 @@ mod tests {
             start = end;
         }
         let (volume, path) = writer.finish().unwrap();
-        assert!(std::fs::read(&path).unwrap() == want);
+        assert!(layout(&std::fs::read(&path).unwrap()) == layout(&want));
         assert_eq!(volume.meta.row_groups.len(), 3);
         assert_eq!(
             volume
@@ -887,11 +895,9 @@ mod tests {
         let schema = schema();
         let dir = tempfile::tempdir().unwrap();
         let mut writer = VolumeFileWriter::new(dir.path(), "t", 13, &schema, 10, true).unwrap();
-        // The temporary file already exists, writable but not readable:
-        // the writer writes it, renames it, and cannot open it to read
-        let tmp = writer.path().with_extension("vol.tmp");
-        std::fs::write(&tmp, b"").unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o200)).unwrap();
+        // The table directory takes the rename but cannot be opened to sync
+        let table_dir = dir.path().join("t");
+        std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
         let ids = [1i64];
         let nulls = [false];
         let name = writer.builder().unwrap().intern_text(5, "a").unwrap();
@@ -932,16 +938,19 @@ mod tests {
             )
             .unwrap();
         let final_path = writer.path().to_path_buf();
-        let error = match writer.finish() {
-            Ok(_) => panic!("finish succeeded on an unreadable file"),
+        let finished = writer.finish();
+        std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = match finished {
+            Ok(_) => panic!("finish succeeded in an unreadable directory"),
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("failed to open volume"),
+            error
+                .to_string()
+                .contains("failed to open volume directory"),
             "{error}"
         );
         assert!(!final_path.exists(), "the final file was left behind");
-        assert!(!final_path.with_extension("vol.tmp").exists());
         assert!(!final_path.with_extension("blocks.tmp").exists());
     }
 
@@ -978,13 +987,28 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupted_file_is_refused_at_open_and_an_aborted_writer_leaves_nothing() {
+    fn a_damaged_file_is_refused_where_it_is_read_and_an_aborted_writer_leaves_nothing() {
         let schema = schema();
         let (_, volume, path, dir) = written(&schema, 200, 50);
         drop(volume);
-        let mut bytes = std::fs::read(&path).unwrap();
-        let middle = bytes.len() / 2;
-        bytes[middle] ^= 0xff;
+        let intact = std::fs::read(&path).unwrap();
+        let mut bytes = intact.clone();
+        bytes[crate::storage::volume::v5::HEADER_LEN as usize] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let damaged = read_volume_from_disk(&path).unwrap();
+        let Err(error) = damaged
+            .columns
+            .compressed_store()
+            .unwrap()
+            .group_column(0, 0)
+        else {
+            panic!("a damaged block was decoded");
+        };
+        assert!(error.to_string().contains("CRC mismatch"), "{error}");
+        drop(damaged);
+        let mut bytes = intact;
+        let footer = bytes.len() - 8;
+        bytes[footer] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
         assert!(read_volume_from_disk(&path).is_err());
 

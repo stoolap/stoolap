@@ -1145,6 +1145,20 @@ pub(crate) struct VolumeMetadata {
 /// Serialize volume metadata (everything except column data) for V4 format.
 /// The caller LZ4-compresses the result before writing to disk.
 pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
+    let (kinds, dictionaries) = column_kinds(vol)?;
+    serialize_volume_metadata_parts(&vol.meta, &kinds, &dictionaries)
+}
+
+/// The V5 metadata sections of a volume with decoded columns
+pub(crate) fn v5_volume_sections(vol: &FrozenVolume) -> io::Result<Vec<V5Section>> {
+    let (kinds, dictionaries) = column_kinds(vol)?;
+    v5_metadata_sections(&vol.meta, &kinds, &dictionaries)
+}
+
+/// Every column's (storage type tag, extension type tag), and the text
+/// columns' dictionaries in column order
+#[allow(clippy::type_complexity)]
+fn column_kinds(vol: &FrozenVolume) -> io::Result<(Vec<(u8, u8)>, Vec<&[SmartString]>)> {
     let col_count = vol.columns.len();
     let mut kinds = Vec::with_capacity(col_count);
     let mut dictionaries: Vec<&[SmartString]> = Vec::new();
@@ -1162,7 +1176,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
             dictionaries.push(dictionary);
         }
     }
-    serialize_volume_metadata_parts(&vol.meta, &kinds, &dictionaries)
+    Ok((kinds, dictionaries))
 }
 
 /// The metadata section from its parts, for a producer that has no
@@ -1533,19 +1547,7 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         ));
     }
 
-    let column_name_map = column_names
-        .iter()
-        .enumerate()
-        .flat_map(|(i, name)| {
-            let lower = SmartString::from(name.to_lowercase());
-            let original = SmartString::from(name.as_str());
-            if lower == original {
-                vec![(lower, i)]
-            } else {
-                vec![(original, i), (lower, i)]
-            }
-        })
-        .collect();
+    let column_name_map = name_map(&column_names);
 
     Ok(VolumeMetadata {
         row_count,
@@ -1567,4 +1569,544 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         row_groups,
         column_name_map,
     })
+}
+
+/// Original and lowercase column names to positions
+fn name_map(column_names: &[String]) -> ahash::AHashMap<SmartString, usize> {
+    column_names
+        .iter()
+        .enumerate()
+        .flat_map(|(i, name)| {
+            let lower = SmartString::from(name.to_lowercase());
+            let original = SmartString::from(name.as_str());
+            if lower == original {
+                vec![(lower, i)]
+            } else {
+                vec![(original, i), (lower, i)]
+            }
+        })
+        .collect()
+}
+
+// =============================================================================
+// V5 metadata sections
+// =============================================================================
+
+pub(crate) const V5_COLUMNS: u32 = 4;
+pub(crate) const V5_GROUPS: u32 = 5;
+pub(crate) const V5_DICT: u32 = 6;
+pub(crate) const V5_ROW_IDS: u32 = 7;
+pub(crate) const V5_ZONES: u32 = 8;
+pub(crate) const V5_BLOOMS: u32 = 9;
+pub(crate) const V5_STATS: u32 = 10;
+
+/// Column entries (type, flags, extension, encoding, kind, data type,
+/// dictionary size, name length), then the names
+const V5_COLUMN_ENTRY: usize = 16;
+/// Group entries: first row u64, rows u32, reserved u32
+const V5_GROUP_ENTRY: usize = 16;
+/// Every row id as i64
+const ROW_IDS_RAW: u8 = 1;
+/// Ascending ids with no gap: the first and the count
+const ROW_IDS_RANGE: u8 = 2;
+/// Bloom hash: FNV-1a 64 over a type tag and the value's LE bytes, three
+/// probes, bits as LE u64 words
+const BLOOM_FNV1A64_K3: u8 = 1;
+/// Bloom section header: hash id, probes, reserved, column count, CRC of
+/// the entries, entry size; one entry per column (bits, words, CRC of
+/// the words, offset from the section's start), then the words
+const V5_BLOOM_HEAD: usize = 16;
+const V5_BLOOM_ENTRY: usize = 24;
+
+/// One metadata section as written: its kind, whether a reader must
+/// understand it, its encoding, whether to LZ4 it, and its bytes
+pub(crate) struct V5Section {
+    pub kind: u32,
+    pub required: bool,
+    pub encoding: u8,
+    pub compress: bool,
+    pub bytes: Vec<u8>,
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("V5 metadata: {msg}"))
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// The metadata of a volume as V5 sections, from the same parts the V4
+/// metadata is written from
+pub(crate) fn v5_metadata_sections(
+    meta: &super::writer::VolumeMeta,
+    kinds: &[(u8, u8)],
+    dictionaries: &[&[SmartString]],
+) -> io::Result<Vec<V5Section>> {
+    let col_count = kinds.len();
+    let section = |kind, required, encoding, compress, bytes| V5Section {
+        kind,
+        required,
+        encoding,
+        compress,
+        bytes,
+    };
+    let mut sections = Vec::with_capacity(7);
+
+    let mut columns = Vec::with_capacity(16 + col_count * (V5_COLUMN_ENTRY + 16));
+    columns.extend_from_slice(&(meta.row_count as u64).to_le_bytes());
+    columns.extend_from_slice(&(col_count as u32).to_le_bytes());
+    columns.extend_from_slice(&(V5_COLUMN_ENTRY as u32).to_le_bytes());
+    let mut dict_col = 0usize;
+    for (i, &(type_tag, ext_tag)) in kinds.iter().enumerate() {
+        let flags = if meta.sorted_columns[i] {
+            FLAG_SORTED
+        } else {
+            0
+        };
+        let dict_count = if type_tag == COL_DICTIONARY {
+            let d = dictionaries.get(dict_col).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "text column without a dictionary",
+                )
+            })?;
+            dict_col += 1;
+            d.len() as u32
+        } else {
+            0
+        };
+        let dtype = meta.column_types.get(i).copied().unwrap_or(DataType::Null) as u8;
+        // Encoding 1 is V4's cells; kind 0 a data column
+        columns.extend_from_slice(&[type_tag, flags, ext_tag, 1, 0, dtype, 0, 0]);
+        columns.extend_from_slice(&dict_count.to_le_bytes());
+        columns.extend_from_slice(&(meta.column_names[i].len() as u32).to_le_bytes());
+    }
+    for name in &meta.column_names {
+        columns.extend_from_slice(name.as_bytes());
+    }
+    sections.push(section(V5_COLUMNS, true, 1, false, columns));
+
+    let group_count = meta.row_count.div_ceil(meta.group_rows);
+    let mut groups = Vec::with_capacity(8 + group_count * V5_GROUP_ENTRY);
+    groups.extend_from_slice(&(group_count as u32).to_le_bytes());
+    groups.extend_from_slice(&(V5_GROUP_ENTRY as u32).to_le_bytes());
+    for g in 0..group_count {
+        let start = g * meta.group_rows;
+        let rows = meta.group_rows.min(meta.row_count - start);
+        groups.extend_from_slice(&(start as u64).to_le_bytes());
+        groups.extend_from_slice(&(rows as u32).to_le_bytes());
+        groups.extend_from_slice(&[0u8; 4]);
+    }
+    sections.push(section(V5_GROUPS, true, 1, false, groups));
+
+    let strings: usize = dictionaries.iter().map(|d| d.len()).sum();
+    if strings > 0 {
+        let text: usize = dictionaries
+            .iter()
+            .flat_map(|d| d.iter())
+            .map(|s| s.len())
+            .sum();
+        let mut dict = Vec::with_capacity(4 + strings * 4 + text);
+        dict.extend_from_slice(&(strings as u32).to_le_bytes());
+        let mut end = 0u64;
+        for s in dictionaries.iter().flat_map(|d| d.iter()) {
+            end += s.len() as u64;
+            let end = u32::try_from(end).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "V5 dictionary over 4 GiB")
+            })?;
+            dict.extend_from_slice(&end.to_le_bytes());
+        }
+        for s in dictionaries.iter().flat_map(|d| d.iter()) {
+            dict.extend_from_slice(s.as_bytes());
+        }
+        sections.push(section(V5_DICT, true, 1, true, dict));
+    }
+
+    let ids = &meta.row_ids;
+    let contiguous = !ids.is_empty() && ids.windows(2).all(|w| w[0].checked_add(1) == Some(w[1]));
+    if contiguous {
+        let mut b = Vec::with_capacity(16);
+        b.extend_from_slice(&ids[0].to_le_bytes());
+        b.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        sections.push(section(V5_ROW_IDS, true, ROW_IDS_RANGE, false, b));
+    } else {
+        let mut b = Vec::with_capacity(8 + ids.len() * 8);
+        b.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        write_i64_le(&mut b, ids)?;
+        sections.push(section(V5_ROW_IDS, true, ROW_IDS_RAW, true, b));
+    }
+
+    let mut zones = Vec::new();
+    let put_zone = |b: &mut Vec<u8>, zm: &ZoneMap| -> io::Result<()> {
+        write_value(b, &zm.min)?;
+        write_value(b, &zm.max)?;
+        b.extend_from_slice(&zm.null_count.to_le_bytes());
+        b.extend_from_slice(&zm.row_count.to_le_bytes());
+        Ok(())
+    };
+    for zm in &meta.zone_maps {
+        put_zone(&mut zones, zm)?;
+    }
+    zones.extend_from_slice(&(meta.row_groups.len() as u32).to_le_bytes());
+    for rg in &meta.row_groups {
+        for zm in &rg.zone_maps {
+            put_zone(&mut zones, zm)?;
+        }
+    }
+    sections.push(section(V5_ZONES, true, 1, true, zones));
+
+    // A bytes column's values all hash alike, so its filter rejects
+    // nothing and is not written
+    let filters: Vec<Option<&super::column::ColumnBloomFilter>> = (0..col_count)
+        .map(|i| {
+            (kinds[i].0 != COL_BYTES)
+                .then(|| meta.bloom_filters.get(i))
+                .flatten()
+        })
+        .collect();
+    let head = V5_BLOOM_HEAD + col_count * V5_BLOOM_ENTRY;
+    let words: usize = filters.iter().flatten().map(|bf| bf.bits().len()).sum();
+    let mut blooms = Vec::with_capacity(head + words * 8);
+    blooms.extend_from_slice(&[BLOOM_FNV1A64_K3, 3, 0, 0]);
+    blooms.extend_from_slice(&(col_count as u32).to_le_bytes());
+    blooms.extend_from_slice(&[0u8; 4]);
+    blooms.extend_from_slice(&(V5_BLOOM_ENTRY as u32).to_le_bytes());
+    let mut offset = head as u64;
+    let mut words_bytes = Vec::new();
+    for bf in &filters {
+        let (bits, words, crc) = match bf {
+            Some(bf) => {
+                words_bytes.clear();
+                write_u64_le(&mut words_bytes, bf.bits())?;
+                let crc = super::v5::checksum(&words_bytes);
+                (bf.num_bits() as u64, bf.bits().len() as u32, crc)
+            }
+            None => (0, 0, 0),
+        };
+        blooms.extend_from_slice(&bits.to_le_bytes());
+        blooms.extend_from_slice(&words.to_le_bytes());
+        blooms.extend_from_slice(&crc.to_le_bytes());
+        blooms.extend_from_slice(&offset.to_le_bytes());
+        offset += u64::from(words) * 8;
+    }
+    let entries_crc = super::v5::checksum(&blooms[V5_BLOOM_HEAD..head]);
+    blooms[8..12].copy_from_slice(&entries_crc.to_le_bytes());
+    for bf in filters.iter().flatten() {
+        write_u64_le(&mut blooms, bf.bits())?;
+    }
+    sections.push(section(V5_BLOOMS, false, 1, false, blooms));
+
+    let mut stats = Vec::with_capacity(20 + col_count * 64);
+    stats.extend_from_slice(&meta.stats.total_rows.to_le_bytes());
+    stats.extend_from_slice(&meta.stats.live_rows.to_le_bytes());
+    stats.extend_from_slice(&(meta.stats.columns.len() as u32).to_le_bytes());
+    for cs in &meta.stats.columns {
+        stats.extend_from_slice(&cs.sum_int.to_le_bytes());
+        stats.extend_from_slice(&cs.sum_float.to_le_bytes());
+        stats.extend_from_slice(&cs.numeric_count.to_le_bytes());
+        stats.extend_from_slice(&cs.non_null_count.to_le_bytes());
+        write_value(&mut stats, &cs.min)?;
+        write_value(&mut stats, &cs.max)?;
+    }
+    sections.push(section(V5_STATS, true, 1, false, stats));
+    Ok(sections)
+}
+
+/// A V5 volume's metadata and its group directory's (first, end) rows
+pub(crate) struct V5Metadata {
+    pub meta: VolumeMetadata,
+    pub bounds: Vec<(u32, u32)>,
+}
+
+/// The volume metadata from its V5 sections, each (kind, encoding, bytes)
+pub(crate) fn v5_metadata_from_sections(sections: &[(u32, u8, Vec<u8>)]) -> io::Result<V5Metadata> {
+    let get = |kind: u32| {
+        sections
+            .iter()
+            .find(|s| s.0 == kind)
+            .map(|s| (s.1, s.2.as_slice()))
+    };
+
+    let (enc, data) = get(V5_COLUMNS).ok_or_else(|| invalid("no column directory"))?;
+    if enc != 1 || data.len() < 16 {
+        return Err(invalid("column directory"));
+    }
+    let mut pos = 0;
+    let row_count = usize::try_from(read_u64(data, &mut pos)?).map_err(|_| invalid("row count"))?;
+    let col_count = read_u32(data, &mut pos)? as usize;
+    let entry = read_u32(data, &mut pos)? as usize;
+    if entry < V5_COLUMN_ENTRY {
+        return Err(invalid("column entry size"));
+    }
+    check_metadata_count(data, pos, col_count, entry)?;
+    let mut col_type_tags = Vec::with_capacity(col_count);
+    let mut col_ext_types = Vec::with_capacity(col_count);
+    let mut col_sorted = Vec::with_capacity(col_count);
+    let mut col_dict_counts = Vec::with_capacity(col_count);
+    let mut column_types = Vec::with_capacity(col_count);
+    let mut name_lens = Vec::with_capacity(col_count);
+    for i in 0..col_count {
+        let e = &data[pos + i * entry..pos + (i + 1) * entry];
+        // A cell encoding, column kind or data type this reader lacks
+        // would be read as something else
+        let dtype = DataType::from_u8(e[5]).ok_or_else(|| invalid("unknown data type"))?;
+        if e[3] != 1 || e[4] != 0 || !(COL_INT64..=COL_BYTES).contains(&e[0]) {
+            return Err(invalid("unknown column type, encoding or kind"));
+        }
+        col_type_tags.push(e[0]);
+        col_sorted.push(e[1] & FLAG_SORTED != 0);
+        col_ext_types.push(if e[0] == COL_BYTES { e[2] } else { 0 });
+        column_types.push(dtype);
+        col_dict_counts.push(u32_at(e, 8));
+        name_lens.push(u32_at(e, 12) as usize);
+    }
+    pos += col_count * entry;
+    let mut column_names = Vec::with_capacity(col_count);
+    for len in name_lens {
+        if len > data.len() - pos {
+            return Err(invalid("column name"));
+        }
+        let s = std::str::from_utf8(&data[pos..pos + len]).map_err(|_| invalid("column name"))?;
+        column_names.push(s.to_string());
+        pos += len;
+    }
+
+    let (enc, data) = get(V5_GROUPS).ok_or_else(|| invalid("no group directory"))?;
+    if enc != 1 || data.len() < 8 {
+        return Err(invalid("group directory"));
+    }
+    let (group_count, entry) = (u32_at(data, 0) as usize, u32_at(data, 4) as usize);
+    if entry < V5_GROUP_ENTRY {
+        return Err(invalid("group entry size"));
+    }
+    check_metadata_count(data, 8, group_count, entry)?;
+    let mut bounds = Vec::with_capacity(group_count);
+    for g in 0..group_count {
+        let mut p = 8 + g * entry;
+        let start = read_u64(data, &mut p)?;
+        let rows = u64::from(read_u32(data, &mut p)?);
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| invalid("group bounds"))?;
+        let narrow = |v: u64| u32::try_from(v).map_err(|_| invalid("group bounds"));
+        bounds.push((narrow(start)?, narrow(end)?));
+    }
+
+    let strings = col_dict_counts
+        .iter()
+        .try_fold(0usize, |sum, &c| sum.checked_add(c as usize))
+        .ok_or_else(|| invalid("dictionary count"))?;
+    let mut shared_dict = Vec::with_capacity(strings);
+    if strings > 0 {
+        let (enc, data) = get(V5_DICT).ok_or_else(|| invalid("no dictionary"))?;
+        if enc != 1 || data.len() < 4 || u32_at(data, 0) as usize != strings {
+            return Err(invalid("dictionary"));
+        }
+        check_metadata_count(data, 4, strings, 4)?;
+        let text = std::str::from_utf8(&data[4 + strings * 4..])
+            .map_err(|_| invalid("dictionary text"))?;
+        let mut start = 0usize;
+        for i in 0..strings {
+            let end = u32_at(data, 4 + i * 4) as usize;
+            if end < start || end > text.len() || !text.is_char_boundary(end) {
+                return Err(invalid("dictionary bounds"));
+            }
+            shared_dict.push(SmartString::from(&text[start..end]));
+            start = end;
+        }
+        if start != text.len() {
+            return Err(invalid("dictionary trailing text"));
+        }
+    }
+
+    let (enc, data) = get(V5_ROW_IDS).ok_or_else(|| invalid("no row ids"))?;
+    let mut pos = 0;
+    let row_ids = match enc {
+        ROW_IDS_RANGE => {
+            let first = read_u64(data, &mut pos)? as i64;
+            let count = read_u64(data, &mut pos)?;
+            if count != row_count as u64
+                || first.checked_add(count as i64).is_none()
+                || pos != data.len()
+            {
+                return Err(invalid("row id range"));
+            }
+            (0..count as i64).map(|i| first + i).collect()
+        }
+        ROW_IDS_RAW => {
+            let count = read_u64(data, &mut pos)?;
+            if count != row_count as u64 {
+                return Err(invalid("row id count"));
+            }
+            check_metadata_count(data, pos, row_count, 8)?;
+            let ids = read_i64_bulk(data, &mut pos, row_count)?;
+            if pos != data.len() {
+                return Err(invalid("row id trailing bytes"));
+            }
+            ids
+        }
+        _ => return Err(invalid("row id encoding")),
+    };
+
+    let (enc, data) = get(V5_ZONES).ok_or_else(|| invalid("no zone maps"))?;
+    if enc != 1 {
+        return Err(invalid("zone map encoding"));
+    }
+    let mut pos = 0;
+    let read_zone = |pos: &mut usize| -> io::Result<ZoneMap> {
+        Ok(ZoneMap {
+            min: read_value(data, pos)?,
+            max: read_value(data, pos)?,
+            null_count: read_u32(data, pos)?,
+            row_count: read_u32(data, pos)?,
+        })
+    };
+    check_metadata_count(data, pos, col_count, 12)?;
+    let mut zone_maps = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        zone_maps.push(read_zone(&mut pos)?);
+    }
+    let zoned = read_u32(data, &mut pos)? as usize;
+    // Groups have their zone maps exactly when there is more than one
+    if zoned != if group_count > 1 { group_count } else { 0 } {
+        return Err(invalid("group zone map count"));
+    }
+    check_metadata_count(data, pos, zoned, col_count * 12)?;
+    let mut row_groups = Vec::with_capacity(zoned);
+    for &(start_idx, end_idx) in bounds.iter().take(zoned) {
+        let mut zms = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            zms.push(read_zone(&mut pos)?);
+        }
+        row_groups.push(super::column::RowGroupMeta {
+            start_idx,
+            end_idx,
+            zone_maps: zms,
+        });
+    }
+    if pos != data.len() {
+        return Err(invalid("zone map trailing bytes"));
+    }
+
+    let bloom_filters = match get(V5_BLOOMS) {
+        Some((enc, data)) => v5_blooms_from_section(enc, data, col_count)?,
+        // A reader without the section prunes nothing
+        None => (0..col_count).map(|_| accept_all_filter()).collect(),
+    };
+
+    let (enc, data) = get(V5_STATS).ok_or_else(|| invalid("no statistics"))?;
+    if enc != 1 {
+        return Err(invalid("statistics encoding"));
+    }
+    let mut pos = 0;
+    let total_rows = read_u64(data, &mut pos)?;
+    let live_rows = read_u64(data, &mut pos)?;
+    let stats_cols = read_u32(data, &mut pos)? as usize;
+    if stats_cols != col_count {
+        return Err(invalid("statistics column count"));
+    }
+    check_metadata_count(data, pos, stats_cols, 44)?;
+    let mut stat_columns = Vec::with_capacity(stats_cols);
+    for _ in 0..stats_cols {
+        let sum_int = read_i128(data, &mut pos)?;
+        let sum_float = read_f64(data, &mut pos)?;
+        let numeric_count = read_u64(data, &mut pos)?;
+        let non_null_count = read_u64(data, &mut pos)?;
+        let min = read_value(data, &mut pos)?;
+        let max = read_value(data, &mut pos)?;
+        stat_columns.push(ColumnAggregateStats {
+            sum_int,
+            sum_float,
+            numeric_count,
+            min,
+            max,
+            non_null_count,
+        });
+    }
+    if pos != data.len() {
+        return Err(invalid("statistics trailing bytes"));
+    }
+
+    let column_name_map = name_map(&column_names);
+    Ok(V5Metadata {
+        meta: VolumeMetadata {
+            row_count,
+            col_type_tags,
+            col_ext_types,
+            col_sorted,
+            col_dict_counts,
+            shared_dict,
+            row_ids,
+            zone_maps,
+            bloom_filters,
+            stats: VolumeAggregateStats {
+                total_rows,
+                live_rows,
+                columns: stat_columns,
+            },
+            column_names,
+            column_types,
+            row_groups,
+            column_name_map,
+        },
+        bounds,
+    })
+}
+
+/// A filter that rejects nothing: every bit set
+fn accept_all_filter() -> super::column::ColumnBloomFilter {
+    super::column::ColumnBloomFilter::from_parts(64, &[0xFF; 8])
+}
+
+/// Every column's filter of a V5 bloom section; a column the section has
+/// no filter for gets one that rejects nothing
+fn v5_blooms_from_section(
+    enc: u8,
+    data: &[u8],
+    col_count: usize,
+) -> io::Result<Vec<super::column::ColumnBloomFilter>> {
+    if enc != 1 || data.len() < V5_BLOOM_HEAD || data[0] != BLOOM_FNV1A64_K3 || data[1] != 3 {
+        return Err(invalid("bloom hash or probes"));
+    }
+    let (count, entry) = (u32_at(data, 4) as usize, u32_at(data, 12) as usize);
+    if count != col_count || entry < V5_BLOOM_ENTRY {
+        return Err(invalid("bloom header"));
+    }
+    check_metadata_count(data, V5_BLOOM_HEAD, count, entry)?;
+    let head = V5_BLOOM_HEAD + count * entry;
+    if super::v5::checksum(&data[V5_BLOOM_HEAD..head]) != u32_at(data, 8) {
+        return Err(invalid("bloom header CRC mismatch"));
+    }
+    (0..count)
+        .map(|i| {
+            let mut p = V5_BLOOM_HEAD + i * entry;
+            let num_bits = read_u64(data, &mut p)?;
+            let words = read_u32(data, &mut p)? as usize;
+            let crc = read_u32(data, &mut p)?;
+            let offset =
+                usize::try_from(read_u64(data, &mut p)?).map_err(|_| invalid("bloom offset"))?;
+            if words == 0 {
+                return if num_bits == 0 {
+                    Ok(accept_all_filter())
+                } else {
+                    Err(invalid("bloom geometry"))
+                };
+            }
+            let end = words
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(offset))
+                .filter(|&end| offset >= head && end <= data.len())
+                .ok_or_else(|| invalid("bloom bits outside the section"))?;
+            if num_bits.div_ceil(64) != words as u64 {
+                return Err(invalid("bloom geometry"));
+            }
+            let bits = &data[offset..end];
+            if super::v5::checksum(bits) != crc {
+                return Err(invalid("bloom CRC mismatch"));
+            }
+            let num_bits = usize::try_from(num_bits).map_err(|_| invalid("bloom size"))?;
+            Ok(super::column::ColumnBloomFilter::from_parts(num_bits, bits))
+        })
+        .collect()
 }

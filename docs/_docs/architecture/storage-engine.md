@@ -27,7 +27,7 @@ Tables in Stoolap are composed of:
 
 - **Metadata** - Schema information, column definitions, and indexes
 - **Hot Buffer** - In-memory row storage for recent writes (row-major, MVCC-managed)
-- **Cold Segments (Frozen Volumes)** - Column-major storage for sealed historical data. Stores timestamps at nanosecond precision. Includes zone maps, bloom filters, dictionary encoding, CRC32 integrity checks, and columnar aggregate pushdown (aggregates computed directly on raw typed arrays without Row/Value construction)
+- **Cold Segments (Frozen Volumes)** - Column-major storage for sealed historical data. Stores timestamps at nanosecond precision. Includes zone maps, bloom filters, dictionary encoding, CRC-32C integrity checks, and columnar aggregate pushdown (aggregates computed directly on raw typed arrays without Row/Value construction)
 - **Tombstones** - Manifest-tracked markers for deleted cold rows, with per-transaction deferred application for isolation
 - **Version Store** - Tracks row versions for MVCC
 - **Indexes** - B-tree, Hash, Bitmap, HNSW, and multi-column indexes (hot data only, cold uses zone maps and bloom filters)
@@ -220,7 +220,7 @@ Stoolap's storage engine combines ideas from several database architectures into
 The core design follows the **delta-main** pattern used by systems like SAP HANA and SingleStore (MemSQL):
 
 - **Delta store (hot buffer):** Row-oriented, MVCC-managed B-tree for writes. Supports full transaction isolation with version chains, visibility checks, and lock-free reads.
-- **Main store (cold volumes):** Columnar, immutable `.vol` files optimized for analytical reads. Zone maps, bloom filters, dictionary encoding, and CRC32 checksums.
+- **Main store (cold volumes):** Columnar, immutable `.vol` files optimized for analytical reads. Zone maps, bloom filters, dictionary encoding, and CRC-32C checksums.
 
 Most databases pick one format. PostgreSQL is row-oriented everywhere. DuckDB is columnar everywhere. Stoolap uses **row-oriented for writes** and **columnar for reads**, which gives good performance on both OLTP and analytical workloads without the complexity of a distributed system.
 
