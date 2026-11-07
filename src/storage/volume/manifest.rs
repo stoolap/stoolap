@@ -4257,26 +4257,31 @@ impl SegmentManager {
         // The manifest and the tombstones are taken together, manifest first;
         // the list is built and written outside both locks
         let _persisting = self.persisting.lock();
-        let (mut manifest, tombstones) = {
-            let manifest = self.manifest.read();
+        let loaded = Arc::clone(&*self.segments.read());
+        let (manifest, tombstones) = {
+            let mut manifest = self.manifest.write();
+            // A segment's identity is recorded once, from the volume first
+            // seen with it; a volume reloaded later never replaces it
+            let TableManifest {
+                segments,
+                identities,
+                ..
+            } = &mut *manifest;
+            identities.retain(|id, _| segments.iter().any(|seg| seg.segment_id == *id));
+            for seg in segments.iter() {
+                if identities.contains_key(&seg.segment_id) {
+                    continue;
+                }
+                let identity = loaded
+                    .get(&seg.segment_id)
+                    .and_then(|s| s.volume.meta.file_identity.get().copied());
+                if let Some(identity) = identity {
+                    identities.insert(seg.segment_id, identity);
+                }
+            }
             let tombstones = Arc::clone(&*self.tombstones.read());
             (manifest.clone(), tombstones)
         };
-        // Each listed segment's file identity: its loaded volume's, else the
-        // one the manifest was read with
-        let loaded = Arc::clone(&*self.segments.read());
-        manifest.identities = manifest
-            .segments
-            .iter()
-            .filter_map(|seg| {
-                let id = seg.segment_id;
-                loaded
-                    .get(&id)
-                    .and_then(|s| s.volume.meta.file_identity.get().copied())
-                    .or_else(|| manifest.identities.get(&id).copied())
-                    .map(|identity| (id, identity))
-            })
-            .collect();
         drop(loaded);
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::manifest_captured();
