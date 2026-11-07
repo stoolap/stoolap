@@ -122,3 +122,82 @@ fn compaction_rewrites_one_v4_volume_per_cycle_as_v5() {
     assert_eq!(magics(&dir).0, 0);
     assert_eq!(rows(&db), want, "the V5 volumes read back after a reopen");
 }
+
+#[test]
+fn a_v4_volume_whose_overlap_exceeds_the_limit_is_rewritten_alone() {
+    use std::sync::Arc;
+    use stoolap::core::{DataType, Row, SchemaBuilder, Value};
+    use stoolap::storage::volume::io::write_volume_to_disk;
+    use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
+    use stoolap::storage::volume::writer::VolumeBuilder;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v4_overlap");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        (),
+    )
+    .unwrap();
+    db.close().unwrap();
+    drop(db);
+    let schema = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .column("v", DataType::Integer, true, false)
+        .column("s", DataType::Text, true, false)
+        .build();
+    let volumes = dir.join("volumes");
+    let manager = SegmentManager::new("t", Some(volumes.clone()));
+    // A to D hold the same rows at the target size, in V4; E, oversized and
+    // in V5, is the cycle's own work
+    let layout = [
+        (1, 1, VOLUME_ROWS, true),
+        (2, 1, VOLUME_ROWS, true),
+        (3, 1, VOLUME_ROWS, true),
+        (4, 1, VOLUME_ROWS, true),
+        (5, 200_001, 300_000, false),
+    ];
+    for (id, first, last, v4) in layout {
+        let mut builder = VolumeBuilder::new(&schema);
+        for row in first..=last {
+            let values = vec![Value::Integer(row), Value::Integer(id), Value::text("x")];
+            builder.add_row(row, &Row::from_values(values));
+        }
+        let volume = builder.finish().unwrap();
+        let path = if v4 {
+            write_volume_to_disk_v4(&volumes, "t", id as u64, &volume).unwrap()
+        } else {
+            write_volume_to_disk(&volumes, "t", id as u64, &volume).unwrap()
+        };
+        manager
+            .register_segment(
+                id as u64,
+                Arc::new(read_volume_from_disk(&path).unwrap()),
+                SegmentMeta {
+                    segment_id: id as u64,
+                    file_path: path.file_name().unwrap().into(),
+                    row_count: (last - first + 1) as usize,
+                    min_row_id: first,
+                    max_row_id: last,
+                    creation_lsn: 0,
+                    seal_seq: 0,
+                    schema_version: 0,
+                },
+                Some(&schema),
+            )
+            .unwrap();
+    }
+    manager.persist().unwrap();
+    drop(manager);
+    assert_eq!(magics(&dir), (4, 1));
+
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(
+        magics(&dir).0,
+        3,
+        "one cycle rewrote one V4 volume, not the volumes its rows overlap"
+    );
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(rows, VOLUME_ROWS + 100_000);
+}
