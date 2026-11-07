@@ -462,6 +462,8 @@ impl VolumeFileWriter {
             super::io::sync_ordered(&d)
                 .map_err(|e| io_error("failed to fsync volume directory", e))?;
         }
+        // The volume is handed over only over a file its readers can open
+        File::open(&self.final_path).map_err(|e| io_error("failed to open volume file", e))?;
         let mut offsets = Vec::with_capacity(col_count);
         let mut comp_lens = Vec::with_capacity(col_count);
         let mut decomp_lens = Vec::with_capacity(col_count);
@@ -569,10 +571,13 @@ mod tests {
             V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_BLOOMS, V5_STATS,
         ];
         let o = crate::storage::volume::v5::open(bytes.len() as u64, &known, &read_at).unwrap();
-        let end = o
+        let p = o
+            .places(o.root.cols as usize, o.root.groups as usize)
+            .unwrap();
+        let end = p
             .offsets
             .iter()
-            .zip(&o.stored)
+            .zip(&p.stored)
             .flat_map(|(at, len)| at.iter().zip(len).map(|(at, len)| at + *len as u64))
             .max()
             .unwrap_or(crate::storage::volume::v5::HEADER_LEN) as usize;
@@ -580,8 +585,8 @@ mod tests {
         (
             bytes[..end].to_vec(),
             o.meta,
-            o.decoded,
-            o.crcs,
+            p.decoded,
+            p.crcs,
             [
                 r.cols as u64,
                 r.groups as u64,
@@ -895,9 +900,10 @@ mod tests {
         let schema = schema();
         let dir = tempfile::tempdir().unwrap();
         let mut writer = VolumeFileWriter::new(dir.path(), "t", 13, &schema, 10, true).unwrap();
-        // The table directory takes the rename but cannot be opened to sync
-        let table_dir = dir.path().join("t");
-        std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        // The file being written is writable but not readable: the writer
+        // writes it, renames it, and cannot open it to read
+        let tmp = writer.path().with_extension("blocks.tmp");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o200)).unwrap();
         let ids = [1i64];
         let nulls = [false];
         let name = writer.builder().unwrap().intern_text(5, "a").unwrap();
@@ -938,16 +944,12 @@ mod tests {
             )
             .unwrap();
         let final_path = writer.path().to_path_buf();
-        let finished = writer.finish();
-        std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = match finished {
-            Ok(_) => panic!("finish succeeded in an unreadable directory"),
+        let error = match writer.finish() {
+            Ok(_) => panic!("finish succeeded on an unreadable file"),
             Err(error) => error,
         };
         assert!(
-            error
-                .to_string()
-                .contains("failed to open volume directory"),
+            error.to_string().contains("failed to open volume file"),
             "{error}"
         );
         assert!(!final_path.exists(), "the final file was left behind");

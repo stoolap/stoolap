@@ -1321,7 +1321,10 @@ fn write_volume_metadata_parts<W: Write>(
 }
 
 fn check_metadata_count(data: &[u8], pos: usize, count: usize, width: usize) -> io::Result<()> {
-    if count > (data.len() - pos) / width {
+    if (data.len() - pos)
+        .checked_div(width)
+        .is_some_and(|room| count > room)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "V4 metadata count exceeds remaining bytes",
@@ -1892,18 +1895,32 @@ pub(crate) fn v5_metadata_from_sections(sections: &[(u32, u8, Vec<u8>)]) -> io::
         let narrow = |v: u64| u32::try_from(v).map_err(|_| invalid("group bounds"));
         bounds.push((narrow(start)?, narrow(end)?));
     }
+    // The groups tile the rows, none above the largest group a reader
+    // decodes, before anything is sized by the row count
+    let mut covered = 0usize;
+    for &(start, end) in &bounds {
+        let rows = (end - start) as usize;
+        if start as usize != covered || rows == 0 || rows > super::column::ROW_GROUP_SIZE {
+            return Err(invalid("group bounds"));
+        }
+        covered = end as usize;
+    }
+    if covered != row_count {
+        return Err(invalid("groups do not cover the rows"));
+    }
 
     let strings = col_dict_counts
         .iter()
         .try_fold(0usize, |sum, &c| sum.checked_add(c as usize))
         .ok_or_else(|| invalid("dictionary count"))?;
-    let mut shared_dict = Vec::with_capacity(strings);
+    let mut shared_dict = Vec::new();
     if strings > 0 {
         let (enc, data) = get(V5_DICT).ok_or_else(|| invalid("no dictionary"))?;
         if enc != 1 || data.len() < 4 || u32_at(data, 0) as usize != strings {
             return Err(invalid("dictionary"));
         }
         check_metadata_count(data, 4, strings, 4)?;
+        shared_dict.reserve_exact(strings);
         let text = std::str::from_utf8(&data[4 + strings * 4..])
             .map_err(|_| invalid("dictionary text"))?;
         let mut start = 0usize;
@@ -1926,13 +1943,17 @@ pub(crate) fn v5_metadata_from_sections(sections: &[(u32, u8, Vec<u8>)]) -> io::
         ROW_IDS_RANGE => {
             let first = read_u64(data, &mut pos)? as i64;
             let count = read_u64(data, &mut pos)?;
-            if count != row_count as u64
-                || first.checked_add(count as i64).is_none()
-                || pos != data.len()
-            {
+            let last = i64::try_from(count)
+                .ok()
+                .and_then(|n| first.checked_add(n.checked_sub(1)?));
+            if count != row_count as u64 || (count > 0 && last.is_none()) || pos != data.len() {
                 return Err(invalid("row id range"));
             }
-            (0..count as i64).map(|i| first + i).collect()
+            let mut ids = Vec::new();
+            ids.try_reserve_exact(row_count)
+                .map_err(|_| invalid("row id range exceeds memory"))?;
+            ids.extend((0..count as i64).map(|i| first + i));
+            ids
         }
         ROW_IDS_RAW => {
             let count = read_u64(data, &mut pos)?;

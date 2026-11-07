@@ -224,7 +224,14 @@ pub(crate) struct Opened {
     pub root: Root,
     /// The metadata sections this reader knows: (kind, encoding, bytes)
     pub meta: Vec<(u32, u8, Vec<u8>)>,
-    /// By column, by group
+    /// The block table, its entry size and where the sections begin
+    blocks: Vec<u8>,
+    block_entry: usize,
+    sections_start: u64,
+}
+
+/// Every block's place, by column, by group
+pub(crate) struct Places {
     pub offsets: Vec<Vec<u64>>,
     pub stored: Vec<Vec<usize>>,
     pub decoded: Vec<Vec<usize>>,
@@ -350,15 +357,18 @@ pub(crate) fn open(
             _ => return Err(invalid(format!("section {kind} codec {codec}"))),
         };
         match kind {
-            SECTION_ROOT => root = Some(bytes),
+            SECTION_ROOT => root = Some((encoding, bytes)),
             SECTION_BLOCKS => blocks = Some((encoding, bytes)),
             _ => meta.push((kind, encoding, bytes)),
         }
     }
-    let (root, (block_encoding, blocks)) = match (root, blocks) {
+    let ((root_encoding, root), (block_encoding, blocks)) = match (root, blocks) {
         (Some(r), Some(b)) => (r, b),
         _ => return Err(invalid("a required section is missing")),
     };
+    if root_encoding != 1 {
+        return Err(invalid("root encoding"));
+    }
     if root.len() < ROOT_LEN || u32_at(&root, 0) as usize != root.len() {
         return Err(invalid("root length"));
     }
@@ -379,48 +389,63 @@ pub(crate) fn open(
         volume_id: u64_at(&root, 40),
         nonce: u64_at(&root, 48),
     };
-    let (cols, groups) = (root.cols as usize, root.groups as usize);
-    if block_encoding != 1
-        || block_entry < BLOCK_ENTRY
-        || cols
-            .checked_mul(groups)
-            .and_then(|n| n.checked_mul(block_entry))
-            .is_none_or(|n| n != blocks.len())
-    {
-        return Err(invalid("block table size"));
-    }
-    let mut offsets = vec![vec![u64::MAX; groups]; cols];
-    let mut stored = vec![vec![0usize; groups]; cols];
-    let mut decoded = vec![vec![0usize; groups]; cols];
-    let mut crcs = vec![vec![0u32; groups]; cols];
-    for e in blocks.chunks_exact(block_entry) {
-        let (at, len, dec) = (u64_at(e, 0), u64_at(e, 8), u64_at(e, 16));
-        let (col, group) = (u32_at(e, 24) as usize, u32_at(e, 28) as usize);
-        if col >= cols || group >= groups || offsets[col][group] != u64::MAX {
-            return Err(invalid("block table names a block twice or out of range"));
-        }
-        if at < HEADER_LEN || at.checked_add(len).is_none_or(|end| end > sections_start) {
-            return Err(invalid("block outside the block area"));
-        }
-        // The decoders tell a raw block by its length: the codec must agree
-        let dec_limit = match e[32] {
-            CODEC_RAW if len == dec => len,
-            CODEC_LZ4 if len != dec => len.saturating_mul(LZ4_MAX_RATIO).saturating_add(16),
-            _ => return Err(invalid("block codec")),
-        };
-        offsets[col][group] = at;
-        stored[col][group] = bounded(len, sections_start, "block")?;
-        decoded[col][group] = bounded(dec, dec_limit, "decoded block")?;
-        crcs[col][group] = u32_at(e, 36);
+    if block_encoding != 1 || block_entry < BLOCK_ENTRY {
+        return Err(invalid("block table encoding"));
     }
     Ok(Opened {
         root,
         meta,
-        offsets,
-        stored,
-        decoded,
-        crcs,
+        blocks,
+        block_entry,
+        sections_start,
     })
+}
+
+impl Opened {
+    /// The blocks' places, for the column and group counts the metadata
+    /// gives; refused unless the root and the block table agree with them
+    pub(crate) fn places(&self, cols: usize, groups: usize) -> io::Result<Places> {
+        if cols != self.root.cols as usize
+            || groups != self.root.groups as usize
+            || cols
+                .checked_mul(groups)
+                .and_then(|n| n.checked_mul(self.block_entry))
+                .is_none_or(|n| n != self.blocks.len())
+        {
+            return Err(invalid("block table size"));
+        }
+        let mut offsets = vec![vec![u64::MAX; groups]; cols];
+        let mut stored = vec![vec![0usize; groups]; cols];
+        let mut decoded = vec![vec![0usize; groups]; cols];
+        let mut crcs = vec![vec![0u32; groups]; cols];
+        let sections_start = self.sections_start;
+        for e in self.blocks.chunks_exact(self.block_entry) {
+            let (at, len, dec) = (u64_at(e, 0), u64_at(e, 8), u64_at(e, 16));
+            let (col, group) = (u32_at(e, 24) as usize, u32_at(e, 28) as usize);
+            if col >= cols || group >= groups || offsets[col][group] != u64::MAX {
+                return Err(invalid("block table names a block twice or out of range"));
+            }
+            if at < HEADER_LEN || at.checked_add(len).is_none_or(|end| end > sections_start) {
+                return Err(invalid("block outside the block area"));
+            }
+            // The decoders tell a raw block by its length: the codec must agree
+            let dec_limit = match e[32] {
+                CODEC_RAW if len == dec => len,
+                CODEC_LZ4 if len != dec => len.saturating_mul(LZ4_MAX_RATIO).saturating_add(16),
+                _ => return Err(invalid("block codec")),
+            };
+            offsets[col][group] = at;
+            stored[col][group] = bounded(len, sections_start, "block")?;
+            decoded[col][group] = bounded(dec, dec_limit, "decoded block")?;
+            crcs[col][group] = u32_at(e, 36);
+        }
+        Ok(Places {
+            offsets,
+            stored,
+            decoded,
+            crcs,
+        })
+    }
 }
 
 /// A random nonce for a new volume file
@@ -493,14 +518,54 @@ mod tests {
             ),
             (1, 1, 4, 4, 3)
         );
-        assert_eq!(opened.offsets, vec![vec![HEADER_LEN]]);
-        assert_eq!(opened.stored, vec![vec![BLOCK.len()]]);
-        assert_eq!(opened.decoded, vec![vec![BLOCK.len()]]);
-        assert_eq!(opened.crcs, vec![vec![checksum(BLOCK)]]);
+        let places = opened.places(1, 1).unwrap();
+        assert_eq!(places.offsets, vec![vec![HEADER_LEN]]);
+        assert_eq!(places.stored, vec![vec![BLOCK.len()]]);
+        assert_eq!(places.decoded, vec![vec![BLOCK.len()]]);
+        assert_eq!(places.crcs, vec![vec![checksum(BLOCK)]]);
         assert_eq!(
             opened.meta,
             vec![(5, 1, vec![7; 24]), (6, 1, vec![b'x'; 300])]
         );
+    }
+
+    /// Edits the section table and seals the footer over it again
+    fn edit_table(bytes: &mut [u8], edit: impl FnOnce(&mut [u8])) {
+        let footer = bytes.len() - FOOTER_LEN as usize;
+        let at = u64_at(bytes, footer) as usize;
+        let len = u64_at(bytes, footer + 8) as usize;
+        edit(&mut bytes[at..at + len]);
+        let crc = checksum(&bytes[at..at + len]);
+        bytes[footer + 16..footer + 20].copy_from_slice(&crc.to_le_bytes());
+        let crc = checksum(&bytes[footer..footer + 24]);
+        bytes[footer + 24..footer + 28].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn a_root_in_an_unknown_encoding_is_refused() {
+        let mut bytes = file(known_meta());
+        // The root is the table's first entry; byte 33 is its encoding
+        edit_table(&mut bytes, |table| table[8 + 33] = 2);
+        let error = open_bytes(&bytes, &[5, 6]).err().unwrap();
+        assert!(error.to_string().contains("root encoding"), "{error}");
+    }
+
+    #[test]
+    fn block_places_are_sized_only_by_counts_the_metadata_confirms() {
+        let mut out = header().to_vec();
+        let root = Root {
+            cols: u32::MAX,
+            groups: 0,
+            group_rows: 4,
+            rows: 0,
+            volume_id: 3,
+            nonce: new_nonce(),
+        };
+        let pos = out.len() as u64;
+        write_tail(&mut out, pos, &root, known_meta(), &[]).unwrap();
+        let opened = open_bytes(&out, &[5, 6]).unwrap();
+        let error = opened.places(1, 0).err().unwrap();
+        assert!(error.to_string().contains("block table size"), "{error}");
     }
 
     #[test]

@@ -39,6 +39,7 @@ mod snapshot_system_test;
 mod stored_length_test;
 mod vacuum_test;
 mod volume_checkpoint_test;
+mod volume_format_test;
 mod wal_acknowledged_commit_test;
 mod wal_path_test;
 mod wal_torn_tail_test;

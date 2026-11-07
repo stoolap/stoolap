@@ -601,7 +601,6 @@ fn read_volume_v5(
     drop(file);
     let super::format::V5Metadata { meta, bounds } =
         super::format::v5_metadata_from_sections(&opened.meta).map_err(fail)?;
-    drop(opened.meta);
     let root = &opened.root;
     if meta.col_type_tags.len() != root.cols as usize
         || meta.row_count as u64 != root.rows
@@ -621,12 +620,15 @@ fn read_volume_v5(
             .ok_or_else(|| inv("groups do not tile the rows at the root's group size"))?,
         _ => return Err(inv("group directory does not cover the rows")),
     };
+    let places = opened
+        .places(meta.col_type_tags.len(), bounds.len())
+        .map_err(fail)?;
     Ok(file_volume(
         handle,
         meta,
-        (opened.offsets, opened.stored, opened.decoded),
+        (places.offsets, places.stored, places.decoded),
         group_size,
-        Some(opened.crcs),
+        Some(places.crcs),
     ))
 }
 
@@ -675,14 +677,18 @@ pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
 pub fn read_volume_from_handle(
     handle: &std::sync::Arc<super::writer::VolumeFile>,
 ) -> Result<FrozenVolume> {
-    let file = handle.open().map_err(|e| {
+    use std::io::Seek;
+    let open_error = |e| {
         crate::core::Error::internal(format!("failed to open volume {:?}: {}", handle.path(), e))
-    })?;
+    };
+    let mut file = handle.open().map_err(open_error)?;
     // A file shorter than a magic is refused by the V4 reader
     let mut magic = [0u8; 4];
     if super::writer::read_exact_at(&file, &mut magic, 0).is_ok() && magic == super::v5::V5_MAGIC {
         return read_volume_v5(file, std::sync::Arc::clone(handle), &handle.path());
     }
+    // A positioned read moves the cursor on Windows and WASI; V4 reads from it
+    file.rewind().map_err(open_error)?;
     read_volume_v4(file, std::sync::Arc::clone(handle), &handle.path())
 }
 
@@ -1465,6 +1471,63 @@ mod tests {
         for (at, byte) in [(0, 0xEE), (3, 2), (4, 1), (5, 0xEE)] {
             assert!(read(Some((at, byte))).is_err(), "byte {at} = {byte:#x}");
         }
+    }
+
+    fn id_volume(ids: &[i64]) -> FrozenVolume {
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        for &id in ids {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+        }
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn row_ids_that_end_at_the_largest_key_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, ids) in [vec![i64::MAX], vec![i64::MAX - 2, i64::MAX - 1, i64::MAX]]
+            .iter()
+            .enumerate()
+        {
+            let path =
+                write_volume_to_disk(dir.path(), "t", n as u64 + 1, &id_volume(ids)).unwrap();
+            let loaded = read_volume_from_disk(&path).unwrap();
+            assert_eq!(&loaded.meta.row_ids, ids);
+        }
+    }
+
+    #[test]
+    fn a_row_count_the_groups_do_not_cover_is_refused_before_ids_are_expanded() {
+        let vol = id_volume(&[1, 2, 3]);
+        let sections: Vec<(u32, u8, Vec<u8>)> = super::super::format::v5_volume_sections(&vol)
+            .unwrap()
+            .into_iter()
+            .map(|mut s| {
+                let claim = (1u64 << 62).to_le_bytes();
+                match s.kind {
+                    super::super::format::V5_COLUMNS => s.bytes[0..8].copy_from_slice(&claim),
+                    super::super::format::V5_ROW_IDS => s.bytes[8..16].copy_from_slice(&claim),
+                    _ => {}
+                }
+                (s.kind, s.encoding, s.bytes)
+            })
+            .collect();
+        let Err(error) = super::super::format::v5_metadata_from_sections(&sections) else {
+            panic!("a row count past the groups was accepted");
+        };
+        assert!(error.to_string().contains("cover"), "{error}");
+    }
+
+    #[test]
+    fn a_volume_without_columns_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("test").build();
+        let vol = VolumeBuilder::new(&schema).finish().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let loaded = read_volume_from_disk(&path).unwrap();
+        assert_eq!((loaded.columns.len(), loaded.meta.row_count), (0, 0));
     }
 }
 
