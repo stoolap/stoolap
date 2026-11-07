@@ -351,11 +351,18 @@ enum BlockSource {
         /// the compressed block in the file
         offsets: Vec<Vec<u64>>,
         lens: Vec<Vec<usize>>,
+        /// A V5 file's block CRCs by column and group, checked on every
+        /// read from the file; a V4 file was checked whole at open
+        crcs: Option<Vec<Vec<u32>>>,
     },
 }
 
 /// Reads `buf.len()` bytes at `offset` without moving a shared cursor
-fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -667,6 +674,7 @@ impl CompressedBlockStore {
                 file,
                 offsets,
                 lens: compressed_lens,
+                crcs: None,
             },
             decompressed_lens,
             col_type_tags,
@@ -677,6 +685,14 @@ impl CompressedBlockStore {
             id: next_store_id(),
             #[cfg(test)]
             decoded_groups: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Checks every block read from the file against `crcs`, by column and
+    /// group as the offsets are
+    pub(crate) fn check_blocks(&mut self, block_crcs: Vec<Vec<u32>>) {
+        if let BlockSource::File { crcs, .. } = &mut self.source {
+            *crcs = Some(block_crcs);
         }
     }
 
@@ -740,6 +756,7 @@ impl CompressedBlockStore {
                 file,
                 offsets,
                 lens,
+                crcs,
             } => {
                 let offset = *offsets
                     .get(col_idx)
@@ -757,6 +774,15 @@ impl CompressedBlockStore {
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::block_file_read();
                 read_exact_at(&*file.block_reader()?, scratch, offset)?;
+                if let Some(crcs) = crcs {
+                    let want = crcs.get(col_idx).and_then(|col| col.get(group_idx));
+                    if want != Some(&super::v5::checksum(scratch)) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("block CRC mismatch at column {col_idx}, group {group_idx}"),
+                        ));
+                    }
+                }
                 Ok(scratch.as_slice())
             }
         }
@@ -1087,7 +1113,7 @@ impl CompressedBlockStore {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "corrupt V4 block: col={}, group={}/{}: {}",
+                        "corrupt block: col={}, group={}/{}: {}",
                         col_idx, gi, num_groups, e
                     ),
                 )
@@ -1150,7 +1176,7 @@ impl CompressedBlockStore {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "corrupt V4 block: col={}, group={}/{}: {}",
+                        "corrupt block: col={}, group={}/{}: {}",
                         col_idx, gi, num_groups, e
                     ),
                 )

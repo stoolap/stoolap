@@ -1268,7 +1268,7 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
     use stoolap::core::{Row, SchemaBuilder, Value};
     use stoolap::storage::mvcc::MVCCEngine;
     use stoolap::storage::traits::Engine;
-    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
     use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta, TableManifest};
     use stoolap::storage::volume::writer::VolumeBuilder;
     let dir = tempfile::tempdir().unwrap();
@@ -1296,7 +1296,8 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
             builder.add_row(row_id, &Row::from_values(vec![Value::Integer(row_id); 2]));
         }
         let volume = builder.finish().unwrap();
-        let path = write_volume_to_disk(&volume_dir, "group_access", volume_id, &volume).unwrap();
+        let path =
+            write_volume_to_disk_v4(&volume_dir, "group_access", volume_id, &volume).unwrap();
         if volume_id == 2 {
             good_last_file = std::fs::read(&path).unwrap();
             let meta_len = u32::from_le_bytes(good_last_file[16..20].try_into().unwrap()) as usize;
@@ -1520,10 +1521,11 @@ fn scanner_reports_a_missing_group_for_full_and_partial_projections() {
 fn scanner_reports_structural_payload_corruption_after_reopen() {
     use std::sync::Arc;
     use stoolap::storage::traits::Scanner;
-    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
     use stoolap::storage::volume::scanner::VolumeScanner;
     let dir = tempfile::tempdir().unwrap();
-    let path = write_volume_to_disk(dir.path(), "group_access", 1, &two_column_volume()).unwrap();
+    let path =
+        write_volume_to_disk_v4(dir.path(), "group_access", 1, &two_column_volume()).unwrap();
     let original = std::fs::read(&path).unwrap();
     let meta_len = u32::from_le_bytes(original[16..20].try_into().unwrap()) as usize;
     let index_offset = 20 + meta_len;

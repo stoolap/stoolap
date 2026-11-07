@@ -107,7 +107,7 @@ Old WAL files are automatically cleaned up after successful checkpoints when all
 
 ## Cold Volumes (Immutable Segments)
 
-Cold volumes are the primary persistence mechanism. Each table is logically: **Hot Delta + Cold Immutable Segments**. Hot data lives in the MVCC B-tree (WAL-backed, mutable). Cold data lives in frozen volumes (columnar, zone maps, bloom filters, dictionary encoding, CRC32 integrity).
+Cold volumes are the primary persistence mechanism. Each table is logically: **Hot Delta + Cold Immutable Segments**. Hot data lives in the MVCC B-tree (WAL-backed, mutable). Cold data lives in frozen volumes (columnar, zone maps, bloom filters, dictionary encoding, CRC-32C integrity).
 
 ### How Volumes Work
 
@@ -195,7 +195,9 @@ Frozen volumes store data column by column with multiple query acceleration tech
       manifest.bin                # Segment metadata (volumes, tombstones, checkpoint LSN)
 ```
 
-Volume files include a trailing CRC32 checksum for corruption detection. Bloom filters are serialized alongside the volume data (no rebuild on load).
+Volume files are written in the V5 format. A 16-byte header is followed by the column blocks, laid out row group by row group, then the metadata sections (columns, row groups, dictionary, row ids, zone maps, bloom filters, statistics), a section table and a fixed 32-byte footer that locates the table. Every section and every block carries its own CRC-32C. Opening a volume reads the footer, the section table and the sections, and checks each of their checksums. A block is checked each time it is read from the file. A damaged footer, section table or section makes the volume's table unavailable at open. A damaged block fails the statements that read it, with an error naming the column and the row group. Bloom filters are serialized alongside the volume data (no rebuild on load).
+
+Volume files written before V5 (the V4 format, with one CRC32 over the whole file checked at open) remain readable, and a V4 file is rewritten as V5 when compaction next rewrites its volume. Earlier versions of Stoolap cannot read V5 files, so once this version has written a volume the database cannot be opened by an earlier version. Copy the database directory before upgrading if you may need to go back.
 
 ### Secondary Index Side Files
 
