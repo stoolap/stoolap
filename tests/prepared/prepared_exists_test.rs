@@ -449,6 +449,46 @@ fn test_runs_over_unchanged_tables_share_one_probe_budget_then_keep_the_set() {
 }
 
 #[test]
+fn test_each_parameter_value_spends_a_probe_budget_of_its_own() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_probe_params").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX i_k ON i (k)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO i SELECT value, value % 200, value % 10 FROM generate_series(1, 2000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT id FROM o WHERE EXISTS \
+               (SELECT 1 FROM i WHERE i.k = o.k AND i.v > $1) ORDER BY id";
+    let run = |param: i64| {
+        let (probed, built, _) = prepared_exists_counts();
+        let found: Vec<i64> = db
+            .query(sql, (param,))
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        let (probed_after, built_after, _) = prepared_exists_counts();
+        (found, probed_after > probed, built_after - built)
+    };
+    let (five, seven) = (vec![6, 7, 8, 9, 16, 17, 18, 19], vec![8, 9, 18, 19]);
+    // Each value's runs spend 280 of its own 500: the second run of a value
+    // builds its set, whatever ran between
+    for (param, expected, probes, builds, step) in [
+        (5, &five, true, 0, "5 opens its budget"),
+        (7, &seven, true, 0, "7 opens its own"),
+        (5, &five, true, 1, "5 spends the rest of its own"),
+        (5, &five, false, 0, "5 takes its kept set"),
+        (7, &seven, true, 1, "7 spends the rest of its own"),
+        (7, &seven, false, 0, "7 takes its kept set"),
+    ] {
+        assert_eq!(run(param), (expected.clone(), probes, builds), "{step}");
+    }
+}
+
+#[test]
 fn test_probes_whose_lookups_find_nothing_still_spend_the_budget() {
     let _guard = serial();
     let db = Database::open("memory://prepared_exists_probe_empty").unwrap();
