@@ -7071,17 +7071,19 @@ impl MVCCEngine {
                         let sub_target = seg.row_count < target_volume_rows;
                         let oversized = seg.row_count > oversized_threshold;
                         let own_reason = oversized || tombstoned || shed_dead;
-                        if v4_position.is_none()
+                        let v4 = v4_position.is_none()
                             && !own_reason
-                            && segs
-                                .get(&seg.segment_id)
-                                .is_some_and(|cs| cs.file.as_ref().is_some_and(|file| file.is_v4()))
-                        {
+                            && segs.get(&seg.segment_id).is_some_and(|cs| {
+                                cs.file.as_ref().is_some_and(|file| file.is_v4())
+                            });
+                        if v4 {
                             v4_position = Some(planned.len());
                         }
-                        let rewrite = sub_target || own_reason;
+                        // The V4 volume is a selection only, its size work
+                        // included, so the limit counts it
+                        let rewrite = (sub_target && !v4) || own_reason;
                         planned.push((seg.segment_id, seg.row_count, rewrite, false));
-                        size_only.push(sub_target && !own_reason);
+                        size_only.push(sub_target && !own_reason && !v4);
                     }
                 }
                 // Let go before any volume is loaded, so a commit meanwhile

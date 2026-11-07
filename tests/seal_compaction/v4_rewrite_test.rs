@@ -123,17 +123,16 @@ fn compaction_rewrites_one_v4_volume_per_cycle_as_v5() {
     assert_eq!(rows(&db), want, "the V5 volumes read back after a reopen");
 }
 
-#[test]
-fn a_v4_volume_whose_overlap_exceeds_the_limit_is_rewritten_alone() {
+/// A database at `dir` whose table t holds the volumes `layout` lists in
+/// manifest order: (id, first row, last row, written as V4)
+fn registered(dir: &Path, layout: &[(i64, i64, i64, bool)]) {
     use std::sync::Arc;
     use stoolap::core::{DataType, Row, SchemaBuilder, Value};
     use stoolap::storage::volume::io::write_volume_to_disk;
     use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
     use stoolap::storage::volume::writer::VolumeBuilder;
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("v4_overlap");
-    let db = Database::open(&dsn(&dir)).unwrap();
+    let db = Database::open(&dsn(dir)).unwrap();
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
         (),
@@ -148,16 +147,7 @@ fn a_v4_volume_whose_overlap_exceeds_the_limit_is_rewritten_alone() {
         .build();
     let volumes = dir.join("volumes");
     let manager = SegmentManager::new("t", Some(volumes.clone()));
-    // A to D hold the same rows at the target size, in V4; E, oversized and
-    // in V5, is the cycle's own work
-    let layout = [
-        (1, 1, VOLUME_ROWS, true),
-        (2, 1, VOLUME_ROWS, true),
-        (3, 1, VOLUME_ROWS, true),
-        (4, 1, VOLUME_ROWS, true),
-        (5, 200_001, 300_000, false),
-    ];
-    for (id, first, last, v4) in layout {
+    for &(id, first, last, v4) in layout {
         let mut builder = VolumeBuilder::new(&schema);
         for row in first..=last {
             let values = vec![Value::Integer(row), Value::Integer(id), Value::text("x")];
@@ -188,7 +178,24 @@ fn a_v4_volume_whose_overlap_exceeds_the_limit_is_rewritten_alone() {
             .unwrap();
     }
     manager.persist().unwrap();
-    drop(manager);
+}
+
+#[test]
+fn a_v4_volume_whose_overlap_exceeds_the_limit_is_rewritten_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v4_overlap");
+    // A to D hold the same rows at the target size, in V4; E, oversized and
+    // in V5, is the cycle's own work
+    registered(
+        &dir,
+        &[
+            (1, 1, VOLUME_ROWS, true),
+            (2, 1, VOLUME_ROWS, true),
+            (3, 1, VOLUME_ROWS, true),
+            (4, 1, VOLUME_ROWS, true),
+            (5, 200_001, 300_000, false),
+        ],
+    );
     assert_eq!(magics(&dir), (4, 1));
 
     let db = Database::open(&dsn(&dir)).unwrap();
@@ -200,4 +207,32 @@ fn a_v4_volume_whose_overlap_exceeds_the_limit_is_rewritten_alone() {
     );
     let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(rows, VOLUME_ROWS + 100_000);
+}
+
+#[test]
+fn a_sub_target_v4_volume_counts_against_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v4_sub_target");
+    // A, one row short of the target, and B overlap in V4; E, one row in
+    // V5, has its row deleted
+    registered(
+        &dir,
+        &[
+            (1, 1, VOLUME_ROWS - 1, true),
+            (2, 1, VOLUME_ROWS, true),
+            (3, 200_001, 200_001, false),
+        ],
+    );
+    assert_eq!(magics(&dir), (2, 1));
+
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("DELETE FROM t WHERE id = 200001", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(
+        magics(&dir).0,
+        1,
+        "one cycle rewrote one V4 volume, the small one included in the limit"
+    );
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(rows, VOLUME_ROWS);
 }
