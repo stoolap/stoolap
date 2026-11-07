@@ -6952,6 +6952,9 @@ impl MVCCEngine {
                     if mgr.has_dead_copies() {
                         return true;
                     }
+                    if mgr.has_v4_volumes() {
+                        return true;
+                    }
                     // Tombstones exist even without sub-target volumes (pure DELETE).
                     // At-target volumes with tombstoned rows need cleanup.
                     if sub_target == 0 && !mgr.is_tombstone_set_empty() && mgr.segment_count() >= 1
@@ -7031,6 +7034,8 @@ impl MVCCEngine {
                 // acceptance rule below applies to those only
                 let mut size_only: Vec<bool> = Vec::new();
                 let mut deferred = false;
+                // A cycle rewrites one V4 volume for its format alone
+                let mut v4_taken = false;
                 {
                     let segs = mgr.segments_raw();
                     let manifest = mgr.manifest();
@@ -7065,9 +7070,16 @@ impl MVCCEngine {
                         // tombstones to shed
                         let sub_target = seg.row_count < target_volume_rows;
                         let oversized = seg.row_count > oversized_threshold;
-                        let rewrite = sub_target || oversized || tombstoned || shed_dead;
+                        let own_reason = oversized || tombstoned || shed_dead;
+                        let v4 = !own_reason
+                            && !v4_taken
+                            && segs.get(&seg.segment_id).is_some_and(|cs| {
+                                cs.file.as_ref().is_some_and(|file| file.is_v4())
+                            });
+                        v4_taken |= v4;
+                        let rewrite = sub_target || own_reason || v4;
                         planned.push((seg.segment_id, seg.row_count, rewrite, false));
-                        size_only.push(sub_target && !oversized && !tombstoned && !shed_dead);
+                        size_only.push(sub_target && !own_reason && !v4);
                     }
                 }
                 // Let go before any volume is loaded, so a commit meanwhile

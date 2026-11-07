@@ -683,7 +683,9 @@ pub fn read_volume_from_handle(
     }
     // A positioned read moves the cursor on Windows and WASI; V4 reads from it
     file.rewind().map_err(open_error)?;
-    read_volume_v4(file, std::sync::Arc::clone(handle), &handle.path())
+    let volume = read_volume_v4(file, std::sync::Arc::clone(handle), &handle.path())?;
+    handle.mark_v4();
+    Ok(volume)
 }
 
 /// List all volume files for a table, sorted by volume ID (oldest first).

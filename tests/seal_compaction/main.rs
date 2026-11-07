@@ -42,6 +42,7 @@ mod truncate_safety_test;
 mod truncate_walk_and_seal_fetch_test;
 mod unique_index_eviction_test;
 mod update_fence_metadata_test;
+mod v4_rewrite_test;
 mod volume_concurrency_test;
 mod volume_integration_test;
 mod volume_metadata_test;
