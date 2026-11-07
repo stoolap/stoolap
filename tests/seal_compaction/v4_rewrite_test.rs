@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
+use stoolap::storage::volume::manifest::TableManifest;
 use stoolap::Database;
 
 const VOLUME_ROWS: i64 = 65_536;
@@ -96,6 +97,13 @@ fn compaction_rewrites_one_v4_volume_per_cycle_as_v5() {
         let volume = read_volume_from_disk(&path).unwrap();
         write_volume_to_disk_v4(&volumes, "t", id, &volume).unwrap();
     }
+    // A manifest of that time recorded no V5 file identities
+    let manifest_path = volumes.join("t").join("manifest.bin");
+    let stored = TableManifest::deserialize(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let mut manifest = stored.manifest;
+    manifest.identities.clear();
+    let tombstones = stored.tombstones.into_iter().collect();
+    manifest.write_to_disk(&manifest_path, &tombstones).unwrap();
     assert_eq!(magics(&dir), (VOLUMES as usize, 0));
 
     let db = Database::open(&dsn(&dir)).unwrap();

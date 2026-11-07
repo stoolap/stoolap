@@ -1791,6 +1791,18 @@ pub struct VolumeMeta {
     /// Rows per row group, a power of two: every group holds this many
     /// but the last. The writer cuts at `ROW_GROUP_SIZE`; a read takes the file's
     pub group_rows: usize,
+    /// The identity of the V5 file the volume was written to or read from,
+    /// which the manifest records and an open compares
+    pub file_identity: std::sync::OnceLock<FileIdentity>,
+}
+
+/// What tells one V5 volume file from any other: its length, its random
+/// nonce and its section table's CRC
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub len: u64,
+    pub nonce: u64,
+    pub table_crc: u32,
 }
 
 impl VolumeMeta {
@@ -2591,6 +2603,7 @@ impl VolumeBuilder {
             column_name_map,
             row_groups,
             group_rows: super::column::ROW_GROUP_SIZE,
+            file_identity: std::sync::OnceLock::new(),
         };
         Ok((meta, std::mem::take(&mut self.dict_tables)))
     }
@@ -3290,6 +3303,7 @@ impl VolumeBuilder {
                 column_name_map,
                 row_groups,
                 group_rows: super::column::ROW_GROUP_SIZE,
+                file_identity: std::sync::OnceLock::new(),
             }),
             unique_indices: Arc::new(UniqueIndexes::new(rustc_hash::FxHashMap::default())),
             last_access_epoch: std::sync::atomic::AtomicU64::new(

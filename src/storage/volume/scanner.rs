@@ -600,6 +600,7 @@ impl VolumeScanner {
                     column_name_map: ahash::AHashMap::new(),
                     row_groups: Vec::new(),
                     group_rows: super::column::ROW_GROUP_SIZE,
+                    file_identity: std::sync::OnceLock::new(),
                 }),
                 unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
                     rustc_hash::FxHashMap::default(),

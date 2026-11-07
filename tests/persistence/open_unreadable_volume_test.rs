@@ -146,6 +146,43 @@ fn test_a_listed_volume_that_does_not_read_makes_its_table_unavailable() {
 }
 
 #[test]
+fn test_a_listed_volume_replaced_by_another_file_makes_its_table_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "replaced_volume");
+    let other = std::fs::read_dir(volumes[0].parent().unwrap().with_file_name("u"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "vol"))
+        .unwrap();
+    std::fs::copy(&other, &volumes[0]).unwrap();
+    assert_t_refused(&dsn, "a volume of t replaced by a readable file of u");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_file_swapped_under_an_evicted_volume_keeps_the_recorded_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "swapped_after_eviction");
+    let other = std::fs::read_dir(volumes[0].parent().unwrap().with_file_name("u"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "vol"))
+        .unwrap();
+    let db = Database::open(&dsn).unwrap();
+    let (listed, cold) = db.engine().cold_volumes_for_test("t");
+    assert_eq!(cold, listed, "t's volumes went cold");
+    std::fs::copy(&other, &volumes[0]).unwrap();
+    // The reload reads the swapped file, then a checkpoint persists t
+    run(&db, "SELECT * FROM t WHERE v > 100 LIMIT 3").unwrap();
+    db.execute("INSERT INTO t VALUES (9999, 1, 9999)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    drop(db);
+    assert_t_refused(&dsn, "a file swapped under an evicted volume of t");
+}
+
+#[test]
 fn test_a_damaged_block_fails_the_statements_that_read_it() {
     let dir = tempfile::tempdir().unwrap();
     let (dsn, volumes) = sealed(dir.path(), "damaged_block");

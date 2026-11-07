@@ -4145,6 +4145,13 @@ impl MVCCEngine {
                     if mgr.has_segment(stable_id) {
                         continue;
                     }
+                    if !mgr.is_recorded_file(stable_id, &vol) {
+                        eprintln!(
+                            "Warning: volume segment {} is not the file the manifest recorded. Skipping file.",
+                            stable_id
+                        );
+                        continue;
+                    }
                     // Only load if manifest lists this segment_id.
                     if !mgr.load_volume_for_existing_segment(stable_id, Arc::clone(&vol), side) {
                         // Orphan — not in manifest. Skip (file cleanup handled elsewhere).
@@ -4232,6 +4239,11 @@ impl MVCCEngine {
                         continue;
                     }
                 };
+                if !mgr.is_recorded_file(stable_id, &volume) {
+                    let detail = format!("volume {:?} is not the file the manifest recorded", path);
+                    unreadable.push((table_name.clone(), detail));
+                    continue;
+                }
                 let side = sides.open_for(&path, stable_id);
                 mgr.load_volume_for_existing_segment(stable_id, volume, side);
             }

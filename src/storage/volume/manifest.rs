@@ -223,9 +223,25 @@ impl ColdSnapshot {
 
 // Manifest file magic: "STMF" (SToolap ManiFest)
 const MANIFEST_MAGIC: [u8; 4] = *b"STMF";
-const MANIFEST_VERSION: u32 = 7;
+const MANIFEST_VERSION: u32 = 8;
+/// The last version without file identities and with a CRC-32 IEEE, still read
+const MANIFEST_VERSION_V7: u32 = 7;
 /// The last version without dead copies, still read
 const MANIFEST_VERSION_V6: u32 = 6;
+/// A segment entry's fixed fields before V8
+const SEGMENT_FIELDS_V7: usize = 56;
+/// A V8 segment entry: the V7 fields, then the file identity (whether it
+/// is known, the section table CRC, the length and the nonce)
+const SEGMENT_ENTRY_V8: usize = SEGMENT_FIELDS_V7 + 24;
+
+/// The manifest's checksum: CRC-32C from V8, CRC-32 IEEE before
+fn manifest_crc(version: u32, payload: &[u8]) -> u32 {
+    if version >= MANIFEST_VERSION {
+        crc32c::crc32c(payload)
+    } else {
+        crc32fast::hash(payload)
+    }
+}
 
 /// Metadata for a single immutable segment (frozen volume).
 #[derive(Debug, Clone)]
@@ -279,6 +295,9 @@ pub struct TableManifest {
     /// got authority: no reader sees them. Absent for a fully authoritative
     /// segment, and gone with the segment.
     pub dead_copies: FxHashMap<u64, Arc<[u32]>>,
+    /// Per segment, the identity of the V5 file it was written to (V8); an
+    /// open refuses a file that is not that one
+    pub identities: FxHashMap<u64, super::writer::FileIdentity>,
 }
 
 impl TableManifest {
@@ -292,6 +311,7 @@ impl TableManifest {
             column_renames: Vec::new(),
             dropped_columns: Vec::new(),
             dead_copies: FxHashMap::default(),
+            identities: FxHashMap::default(),
         }
     }
 
@@ -346,6 +366,7 @@ impl TableManifest {
         // Segments
         buf.write_all(&(self.segments.len() as u32).to_le_bytes())?;
         for seg in &self.segments {
+            buf.write_all(&(SEGMENT_ENTRY_V8 as u32).to_le_bytes())?;
             buf.write_all(&seg.segment_id.to_le_bytes())?;
             buf.write_all(&(seg.row_count as u64).to_le_bytes())?;
             buf.write_all(&seg.min_row_id.to_le_bytes())?;
@@ -353,6 +374,11 @@ impl TableManifest {
             buf.write_all(&seg.creation_lsn.to_le_bytes())?;
             buf.write_all(&seg.seal_seq.to_le_bytes())?;
             buf.write_all(&seg.schema_version.to_le_bytes())?;
+            let identity = self.identities.get(&seg.segment_id);
+            buf.write_all(&[u8::from(identity.is_some()), 0, 0, 0])?;
+            buf.write_all(&identity.map_or(0, |i| i.table_crc).to_le_bytes())?;
+            buf.write_all(&identity.map_or(0, |i| i.len).to_le_bytes())?;
+            buf.write_all(&identity.map_or(0, |i| i.nonce).to_le_bytes())?;
 
             // File path as UTF-8 string
             let path_str = seg.file_path.to_string_lossy();
@@ -408,8 +434,8 @@ impl TableManifest {
             }
         }
 
-        // Trailing CRC32 over the entire payload
-        let crc = crc32fast::hash(&buf);
+        // Trailing CRC-32C over the entire payload
+        let crc = manifest_crc(MANIFEST_VERSION, &buf);
         buf.write_all(&crc.to_le_bytes())?;
 
         Ok(buf)
@@ -433,11 +459,11 @@ impl TableManifest {
         let mut pos = 4;
 
         let version = read_u32(data, &mut pos)?;
-        if version != MANIFEST_VERSION && version != MANIFEST_VERSION_V6 {
+        if !(MANIFEST_VERSION_V6..=MANIFEST_VERSION).contains(&version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported manifest version {} (expected {} or {})",
+                    "unsupported manifest version {} (expected {} to {})",
                     version, MANIFEST_VERSION_V6, MANIFEST_VERSION
                 ),
             ));
@@ -450,7 +476,7 @@ impl TableManifest {
                 .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad CRC bytes"))?,
         );
-        let computed_crc = crc32fast::hash(payload);
+        let computed_crc = manifest_crc(version, payload);
         if stored_crc != computed_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -476,16 +502,24 @@ impl TableManifest {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         pos += name_len;
 
-        // Segments: V6 fixed fields are 56 bytes per segment (before variable-length path)
+        // Segments: fixed fields, from V8 behind their own length, then the
+        // variable-length path
         let seg_count = read_u32(data, &mut pos)? as usize;
         let mut segments = Vec::with_capacity(seg_count);
+        let mut identities = FxHashMap::default();
         for _ in 0..seg_count {
-            if pos + 56 > data.len() {
+            let entry = if version >= MANIFEST_VERSION {
+                read_u32(data, &mut pos)? as usize
+            } else {
+                SEGMENT_FIELDS_V7
+            };
+            if entry < SEGMENT_FIELDS_V7 || entry > data.len() - pos {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "manifest truncated at segment",
                 ));
             }
+            let entry_end = pos + entry;
             let segment_id = read_u64(data, &mut pos)?;
             let row_count = read_u64(data, &mut pos)? as usize;
             let min_row_id = read_i64(data, &mut pos)?;
@@ -493,6 +527,20 @@ impl TableManifest {
             let creation_lsn = read_u64(data, &mut pos)?;
             let seal_seq = read_u64(data, &mut pos)?;
             let schema_version = read_u64(data, &mut pos)?;
+            if entry >= SEGMENT_ENTRY_V8 && data[pos] != 0 {
+                let mut at = pos + 4;
+                let table_crc = read_u32(data, &mut at)?;
+                let len = read_u64(data, &mut at)?;
+                let nonce = read_u64(data, &mut at)?;
+                let identity = super::writer::FileIdentity {
+                    len,
+                    nonce,
+                    table_crc,
+                };
+                identities.insert(segment_id, identity);
+            }
+            // Fields a later writer appended are skipped
+            pos = entry_end;
 
             let path_len = read_u32(data, &mut pos)? as usize;
             if pos + path_len > data.len() {
@@ -615,9 +663,9 @@ impl TableManifest {
             }
         }
 
-        // Dead copies: V7 only; a V6 manifest's segments are fully authoritative
+        // Dead copies: from V7; a V6 manifest's segments are fully authoritative
         let mut dead_copies: FxHashMap<u64, Arc<[u32]>> = FxHashMap::default();
-        if version >= MANIFEST_VERSION {
+        if version >= MANIFEST_VERSION_V7 {
             let count = read_u32(data, &mut pos)? as usize;
             for _ in 0..count {
                 let seg_id = read_u64(data, &mut pos)?;
@@ -648,6 +696,7 @@ impl TableManifest {
                 column_renames,
                 dropped_columns,
                 dead_copies,
+                identities,
             },
             tombstones,
         })
@@ -3274,6 +3323,15 @@ impl SegmentManager {
     /// false if the segment_id is not in the manifest.
     /// This avoids adding duplicate segment metadata when the manifest was
     /// pre-loaded from disk and volumes are loaded separately.
+    /// Whether `volume` was read from the file the manifest recorded for the
+    /// segment; true when it recorded none (written before V8, or V4)
+    pub fn is_recorded_file(&self, segment_id: u64, volume: &FrozenVolume) -> bool {
+        match self.manifest.read().identities.get(&segment_id) {
+            Some(recorded) => volume.meta.file_identity.get() == Some(recorded),
+            None => true,
+        }
+    }
+
     pub fn load_volume_for_existing_segment(
         &self,
         segment_id: u64,
@@ -4199,11 +4257,32 @@ impl SegmentManager {
         // The manifest and the tombstones are taken together, manifest first;
         // the list is built and written outside both locks
         let _persisting = self.persisting.lock();
+        let loaded = Arc::clone(&*self.segments.read());
         let (manifest, tombstones) = {
-            let manifest = self.manifest.read();
+            let mut manifest = self.manifest.write();
+            // A segment's identity is recorded once, from the volume first
+            // seen with it; a volume reloaded later never replaces it
+            let TableManifest {
+                segments,
+                identities,
+                ..
+            } = &mut *manifest;
+            identities.retain(|id, _| segments.iter().any(|seg| seg.segment_id == *id));
+            for seg in segments.iter() {
+                if identities.contains_key(&seg.segment_id) {
+                    continue;
+                }
+                let identity = loaded
+                    .get(&seg.segment_id)
+                    .and_then(|s| s.volume.meta.file_identity.get().copied());
+                if let Some(identity) = identity {
+                    identities.insert(seg.segment_id, identity);
+                }
+            }
             let tombstones = Arc::clone(&*self.tombstones.read());
             (manifest.clone(), tombstones)
         };
+        drop(loaded);
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::manifest_captured();
         #[cfg(feature = "test-failpoints")]
@@ -5921,35 +6000,118 @@ mod tests {
         assert!(mgr.manifest().dead_copies.is_empty());
     }
 
+    /// A V6 or V7 manifest of one segment as those versions wrote it: no
+    /// entry length, no identity, a CRC-32 IEEE; V7 adds the dead copies
+    fn legacy_manifest(version: u32, seg: &SegmentMeta, dead: &[u32]) -> Vec<u8> {
+        let mut out = b"STMF".to_vec();
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&2u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(b"t");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for field in [
+            seg.segment_id,
+            seg.row_count as u64,
+            seg.min_row_id as u64,
+            seg.max_row_id as u64,
+            seg.creation_lsn,
+            seg.seal_seq,
+            seg.schema_version,
+        ] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        let path = seg.file_path.to_string_lossy();
+        out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        out.extend_from_slice(path.as_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        if version == 7 {
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&seg.segment_id.to_le_bytes());
+            out.extend_from_slice(&(dead.len() as u32).to_le_bytes());
+            for d in dead {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
     #[test]
-    fn a_v7_manifest_keeps_its_dead_copies_and_a_v6_one_has_none() {
-        let with_version = |bytes: &[u8], version: u32| {
-            let mut out = bytes[..bytes.len() - 4].to_vec();
-            out[4..8].copy_from_slice(&version.to_le_bytes());
-            let crc = crc32fast::hash(&out);
-            out.extend_from_slice(&crc.to_le_bytes());
-            out
+    fn v6_and_v7_manifests_read_with_their_crc_and_layout() {
+        let seg = meta_for_ids(1, &[1, 2, 3]);
+        let v7 = TableManifest::deserialize(&legacy_manifest(7, &seg, &[0, 2]))
+            .unwrap()
+            .manifest;
+        assert_eq!(v7.segments.len(), 1);
+        assert_eq!(v7.segments[0].max_row_id, 3);
+        assert_eq!(v7.dead_copies.get(&1).map(|d| d.to_vec()), Some(vec![0, 2]));
+        assert!(v7.identities.is_empty());
+        let v6 = TableManifest::deserialize(&legacy_manifest(6, &seg, &[]))
+            .unwrap()
+            .manifest;
+        assert_eq!((v6.segments.len(), v6.dead_copies.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_v8_manifest_keeps_file_identities_and_its_dead_copies() {
+        let identity = super::super::writer::FileIdentity {
+            len: 4096,
+            nonce: 0x0123_4567_89ab_cdef,
+            table_crc: 0xdead_beef,
         };
         let mut m = TableManifest::new("t");
         m.add_segment(meta_for_ids(1, &[1, 2, 3]));
+        m.add_segment(meta_for_ids(2, &[4, 5]));
+        m.identities.insert(1, identity);
         m.dead_copies.insert(1, Arc::from(vec![0u32, 2]));
-        let v7 = m.serialize(&FxHashMap::default()).unwrap();
-        let back = TableManifest::deserialize(&v7).unwrap().manifest;
+        let bytes = m.serialize(&FxHashMap::default()).unwrap();
+        assert_eq!(&bytes[4..8], &8u32.to_le_bytes());
+        let back = TableManifest::deserialize(&bytes).unwrap().manifest;
+        assert_eq!(back.identities.get(&1), Some(&identity));
+        assert_eq!(back.identities.get(&2), None, "no identity was recorded");
+        assert_eq!(back.segments[1].max_row_id, 5);
         assert_eq!(
             back.dead_copies.get(&1).map(|d| d.to_vec()),
             Some(vec![0, 2])
         );
+    }
 
-        // The layout main writes: no dead-copy section after the dropped columns
-        m.dead_copies.clear();
-        let bare = m.serialize(&FxHashMap::default()).unwrap();
-        let mut v6 = bare[..bare.len() - 8].to_vec();
-        v6.extend_from_slice(&[0; 4]);
-        let v6 = with_version(&v6, 6);
-        let read = TableManifest::deserialize(&v6).unwrap().manifest;
-        assert_eq!((read.segments.len(), read.dead_copies.len()), (1, 0));
+    #[test]
+    fn a_v8_entry_skips_fields_a_later_writer_appended() {
+        let mut m = TableManifest::new("t");
+        m.add_segment(meta_for_ids(1, &[1, 2, 3]));
+        let bytes = m.serialize(&FxHashMap::default()).unwrap();
+        // The entry length sits after the header, the name and the count
+        let at = 4 + 4 + 8 + 8 + 4 + 1 + 4;
+        let mut longer = bytes[..bytes.len() - 4].to_vec();
+        longer[at..at + 4].copy_from_slice(&((SEGMENT_ENTRY_V8 + 8) as u32).to_le_bytes());
+        let path_at = at + 4 + SEGMENT_ENTRY_V8;
+        longer.splice(path_at..path_at, [0xAAu8; 8]);
+        let crc = crc32c::crc32c(&longer);
+        longer.extend_from_slice(&crc.to_le_bytes());
+        let back = TableManifest::deserialize(&longer).unwrap().manifest;
+        assert_eq!(back.segments[0].file_path, PathBuf::from("1.vol"));
+    }
 
-        assert!(TableManifest::deserialize(&with_version(&v7, 8)).is_err());
+    #[test]
+    fn a_manifest_newer_than_v8_or_with_a_v7_checksum_is_refused() {
+        let mut m = TableManifest::new("t");
+        m.add_segment(meta_for_ids(1, &[1, 2, 3]));
+        let bytes = m.serialize(&FxHashMap::default()).unwrap();
+        let mut payload = bytes[..bytes.len() - 4].to_vec();
+        payload[4..8].copy_from_slice(&9u32.to_le_bytes());
+        let crc = crc32c::crc32c(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert!(TableManifest::deserialize(&payload).is_err());
+
+        let mut ieee = bytes[..bytes.len() - 4].to_vec();
+        let crc = crc32fast::hash(&ieee);
+        ieee.extend_from_slice(&crc.to_le_bytes());
+        assert!(TableManifest::deserialize(&ieee).is_err());
     }
 
     /// The visibility every segment would get from a computation over the
