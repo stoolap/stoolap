@@ -1822,8 +1822,12 @@ pub(crate) struct V5Metadata {
     pub bounds: Vec<(u32, u32)>,
 }
 
-/// The volume metadata from its V5 sections, each (kind, encoding, bytes)
-pub(crate) fn v5_metadata_from_sections(sections: &[(u32, u8, Vec<u8>)]) -> io::Result<V5Metadata> {
+/// The volume metadata from its V5 sections, each (kind, encoding, bytes),
+/// refused unless its counts are the root's
+pub(crate) fn v5_metadata_from_sections(
+    sections: &[(u32, u8, Vec<u8>)],
+    root: &super::v5::Root,
+) -> io::Result<V5Metadata> {
     let get = |kind: u32| {
         sections
             .iter()
@@ -1841,6 +1845,9 @@ pub(crate) fn v5_metadata_from_sections(sections: &[(u32, u8, Vec<u8>)]) -> io::
     let entry = read_u32(data, &mut pos)? as usize;
     if entry < V5_COLUMN_ENTRY {
         return Err(invalid("column entry size"));
+    }
+    if row_count as u64 != root.rows || col_count != root.cols as usize {
+        return Err(invalid("root does not match the column directory"));
     }
     check_metadata_count(data, pos, col_count, entry)?;
     let mut col_type_tags = Vec::with_capacity(col_count);
@@ -1882,6 +1889,9 @@ pub(crate) fn v5_metadata_from_sections(sections: &[(u32, u8, Vec<u8>)]) -> io::
     let (group_count, entry) = (u32_at(data, 0) as usize, u32_at(data, 4) as usize);
     if entry < V5_GROUP_ENTRY {
         return Err(invalid("group entry size"));
+    }
+    if group_count != root.groups as usize {
+        return Err(invalid("root does not match the group directory"));
     }
     check_metadata_count(data, 8, group_count, entry)?;
     let mut bounds = Vec::with_capacity(group_count);

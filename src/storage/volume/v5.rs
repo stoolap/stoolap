@@ -392,6 +392,14 @@ pub(crate) fn open(
     if block_encoding != 1 || block_entry < BLOCK_ENTRY {
         return Err(invalid("block table encoding"));
     }
+    // One entry per column per group, checked without sizing anything
+    if (root.cols as usize)
+        .checked_mul(root.groups as usize)
+        .and_then(|n| n.checked_mul(block_entry))
+        .is_none_or(|n| n != blocks.len())
+    {
+        return Err(invalid("block table size"));
+    }
     Ok(Opened {
         root,
         meta,
@@ -405,13 +413,7 @@ impl Opened {
     /// The blocks' places, for the column and group counts the metadata
     /// gives; refused unless the root and the block table agree with them
     pub(crate) fn places(&self, cols: usize, groups: usize) -> io::Result<Places> {
-        if cols != self.root.cols as usize
-            || groups != self.root.groups as usize
-            || cols
-                .checked_mul(groups)
-                .and_then(|n| n.checked_mul(self.block_entry))
-                .is_none_or(|n| n != self.blocks.len())
-        {
+        if cols != self.root.cols as usize || groups != self.root.groups as usize {
             return Err(invalid("block table size"));
         }
         let mut offsets = vec![vec![u64::MAX; groups]; cols];
@@ -565,6 +567,23 @@ mod tests {
         write_tail(&mut out, pos, &root, known_meta(), &[]).unwrap();
         let opened = open_bytes(&out, &[5, 6]).unwrap();
         let error = opened.places(1, 0).err().unwrap();
+        assert!(error.to_string().contains("block table size"), "{error}");
+    }
+
+    #[test]
+    fn a_root_whose_groups_have_no_blocks_is_refused_at_open() {
+        let mut out = header().to_vec();
+        let root = Root {
+            cols: 1,
+            groups: 16_384,
+            group_rows: 65_536,
+            rows: 1 << 30,
+            volume_id: 3,
+            nonce: new_nonce(),
+        };
+        let pos = out.len() as u64;
+        write_tail(&mut out, pos, &root, known_meta(), &[]).unwrap();
+        let error = open_bytes(&out, &[5, 6]).err().unwrap();
         assert!(error.to_string().contains("block table size"), "{error}");
     }
 

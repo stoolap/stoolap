@@ -600,14 +600,8 @@ fn read_volume_v5(
     let opened = super::v5::open(len, &known, &read_at).map_err(fail)?;
     drop(file);
     let super::format::V5Metadata { meta, bounds } =
-        super::format::v5_metadata_from_sections(&opened.meta).map_err(fail)?;
+        super::format::v5_metadata_from_sections(&opened.meta, &opened.root).map_err(fail)?;
     let root = &opened.root;
-    if meta.col_type_tags.len() != root.cols as usize
-        || meta.row_count as u64 != root.rows
-        || bounds.len() != root.groups as usize
-    {
-        return Err(inv("root does not match the metadata"));
-    }
     // One group spans every row; more tile them at one power-of-two size,
     // which their zone maps' bounds carry
     let group_size = match bounds.as_slice() {
@@ -1464,12 +1458,23 @@ mod tests {
                     (s.kind, s.encoding, s.bytes)
                 })
                 .collect();
-            super::super::format::v5_metadata_from_sections(&sections)
+            super::super::format::v5_metadata_from_sections(&sections, &root_of(&vol, 10))
         };
         assert!(read(None).is_ok());
         // Type tag, encoding, kind and data type of the first column
         for (at, byte) in [(0, 0xEE), (3, 2), (4, 1), (5, 0xEE)] {
             assert!(read(Some((at, byte))).is_err(), "byte {at} = {byte:#x}");
+        }
+    }
+
+    fn root_of(vol: &FrozenVolume, rows: u64) -> super::super::v5::Root {
+        super::super::v5::Root {
+            cols: vol.columns.len() as u32,
+            groups: vol.meta.row_count.div_ceil(vol.meta.group_rows) as u32,
+            group_rows: vol.meta.group_rows as u32,
+            rows,
+            volume_id: 1,
+            nonce: 0,
         }
     }
 
@@ -1514,10 +1519,16 @@ mod tests {
                 (s.kind, s.encoding, s.bytes)
             })
             .collect();
-        let Err(error) = super::super::format::v5_metadata_from_sections(&sections) else {
+        let root = root_of(&vol, 1 << 62);
+        let Err(error) = super::super::format::v5_metadata_from_sections(&sections, &root) else {
             panic!("a row count past the groups was accepted");
         };
         assert!(error.to_string().contains("cover"), "{error}");
+        let root = root_of(&vol, 3);
+        let Err(error) = super::super::format::v5_metadata_from_sections(&sections, &root) else {
+            panic!("a row count past the root's was accepted");
+        };
+        assert!(error.to_string().contains("root does not match"), "{error}");
     }
 
     #[test]
