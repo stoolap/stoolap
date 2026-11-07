@@ -146,6 +146,19 @@ fn test_a_listed_volume_that_does_not_read_makes_its_table_unavailable() {
 }
 
 #[test]
+fn test_a_listed_volume_replaced_by_another_file_makes_its_table_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "replaced_volume");
+    let other = std::fs::read_dir(volumes[0].parent().unwrap().with_file_name("u"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "vol"))
+        .unwrap();
+    std::fs::copy(&other, &volumes[0]).unwrap();
+    assert_t_refused(&dsn, "a volume of t replaced by a readable file of u");
+}
+
+#[test]
 fn test_a_damaged_block_fails_the_statements_that_read_it() {
     let dir = tempfile::tempdir().unwrap();
     let (dsn, volumes) = sealed(dir.path(), "damaged_block");

@@ -421,8 +421,10 @@ impl VolumeFileWriter {
             volume_id: self.volume_id,
             nonce: super::v5::new_nonce(),
         };
-        super::v5::write_tail(&mut blocks, self.block_pos, &root, sections, &self.entries)
-            .map_err(|e| io_error("failed to write volume file", e))?;
+        let identity =
+            super::v5::write_tail(&mut blocks, self.block_pos, &root, sections, &self.entries)
+                .map_err(|e| io_error("failed to write volume file", e))?;
+        let _ = meta.file_identity.set(identity);
         let file = blocks
             .into_inner()
             .map_err(|e| io_error("failed to flush volume file", e.into_error()))?;

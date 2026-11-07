@@ -207,7 +207,13 @@ pub(crate) fn serialize_v5_opts(
         volume_id,
         nonce: super::v5::new_nonce(),
     };
-    super::v5::write_tail(&mut buf, pos, &root, meta, &entries)?;
+    let identity = super::v5::write_tail(&mut buf, pos, &root, meta, &entries)?;
+    if vol.meta.file_identity.get_or_init(|| identity) != &identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the volume already belongs to another file",
+        ));
+    }
     Ok((buf, store))
 }
 
@@ -566,6 +572,7 @@ fn file_volume(
             column_name_map: meta.column_name_map,
             row_groups: meta.row_groups,
             group_rows: group_size,
+            file_identity: std::sync::OnceLock::new(),
         }),
         unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
             rustc_hash::FxHashMap::default(),
@@ -617,13 +624,15 @@ fn read_volume_v5(
     let places = opened
         .places(meta.col_type_tags.len(), bounds.len())
         .map_err(fail)?;
-    Ok(file_volume(
+    let volume = file_volume(
         handle,
         meta,
         (places.offsets, places.stored, places.decoded),
         group_size,
         Some(places.crcs),
-    ))
+    );
+    let _ = volume.meta.file_identity.set(opened.identity);
+    Ok(volume)
 }
 
 /// Rewrites the volume file at `path` with the same rows in row groups of
@@ -637,6 +646,7 @@ pub fn rewrite_volume_with_group_rows(path: &Path, group_rows: usize) -> Result<
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))?;
     let mut meta = (*volume.meta).clone();
+    meta.file_identity = std::sync::OnceLock::new();
     meta.row_groups = super::writer::row_groups_of(&columns, meta.row_count, group_rows);
     meta.group_rows = group_rows;
     let rewritten = FrozenVolume {

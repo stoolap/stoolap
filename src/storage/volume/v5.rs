@@ -20,6 +20,7 @@
 use std::io::{self, Write};
 
 use super::format::V5Section;
+use super::writer::FileIdentity;
 
 pub(crate) const V5_MAGIC: [u8; 4] = *b"STV5";
 /// The format this writer produces
@@ -130,14 +131,14 @@ pub(crate) struct Root {
 }
 
 /// Writes the sections, the section table and the footer after the
-/// blocks, which end at `pos`
+/// blocks, which end at `pos`; returns the identity of the file written
 pub(crate) fn write_tail<W: Write>(
     out: &mut W,
     mut pos: u64,
     root: &Root,
     meta: Vec<V5Section>,
     blocks: &[BlockEntry],
-) -> io::Result<()> {
+) -> io::Result<FileIdentity> {
     let mut root_bytes = Vec::with_capacity(ROOT_LEN);
     root_bytes.extend_from_slice(&(ROOT_LEN as u32).to_le_bytes());
     root_bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -208,15 +209,21 @@ pub(crate) fn write_tail<W: Write>(
     }
     out.write_all(&sections)?;
 
+    let table_crc = checksum(&sections);
     let mut footer = [0u8; FOOTER_LEN as usize];
     footer[0..8].copy_from_slice(&pos.to_le_bytes());
     footer[8..16].copy_from_slice(&(sections.len() as u64).to_le_bytes());
-    footer[16..20].copy_from_slice(&checksum(&sections).to_le_bytes());
+    footer[16..20].copy_from_slice(&table_crc.to_le_bytes());
     footer[20..24].copy_from_slice(&FOOTER_VERSION.to_le_bytes());
     let footer_crc = checksum(&footer[0..24]);
     footer[24..28].copy_from_slice(&footer_crc.to_le_bytes());
     footer[28..32].copy_from_slice(&V5_MAGIC);
-    out.write_all(&footer)
+    out.write_all(&footer)?;
+    Ok(FileIdentity {
+        len: pos + sections.len() as u64 + FOOTER_LEN,
+        nonce: root.nonce,
+        table_crc,
+    })
 }
 
 /// What an open reads of a V5 volume besides the blocks
@@ -228,6 +235,7 @@ pub(crate) struct Opened {
     blocks: Vec<u8>,
     block_entry: usize,
     sections_start: u64,
+    pub identity: FileIdentity,
 }
 
 /// Every block's place, by column, by group
@@ -400,12 +408,18 @@ pub(crate) fn open(
     {
         return Err(invalid("block table size"));
     }
+    let identity = FileIdentity {
+        len,
+        nonce: root.nonce,
+        table_crc: u32_at(&footer, 16),
+    };
     Ok(Opened {
         root,
         meta,
         blocks,
         block_entry,
         sections_start,
+        identity,
     })
 }
 
