@@ -3829,6 +3829,14 @@ impl SegmentManager {
         !self.manifest.read().dead_copies.is_empty()
     }
 
+    /// Whether a volume is in a V4 file, which compaction rewrites as V5
+    pub fn has_v4_volumes(&self) -> bool {
+        self.segments
+            .read()
+            .values()
+            .any(|cs| cs.file.as_ref().is_some_and(|file| file.is_v4()))
+    }
+
     /// Get the exact deduplicated row count across all segments.
     /// Uses a cached value that is invalidated on segment/tombstone changes.
     pub fn deduped_row_count(&self) -> Result<usize> {

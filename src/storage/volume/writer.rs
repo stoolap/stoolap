@@ -63,6 +63,8 @@ pub struct VolumeFile {
     reader: parking_lot::Mutex<Option<Arc<std::fs::File>>>,
     /// `READ_CLOCK` at the file's last block read
     last_read: std::sync::atomic::AtomicU64,
+    /// Set when the file was read as V4, which compaction rewrites as V5
+    v4: std::sync::atomic::AtomicBool,
 }
 
 /// The files holding a kept descriptor
@@ -117,6 +119,7 @@ impl VolumeFile {
             loaded: parking_lot::Mutex::new(std::sync::Weak::new()),
             reader: parking_lot::Mutex::new(None),
             last_read: std::sync::atomic::AtomicU64::new(0),
+            v4: std::sync::atomic::AtomicBool::new(false),
         });
         registry
             .files
@@ -127,6 +130,15 @@ impl VolumeFile {
     /// Where the file is now
     pub fn path(&self) -> std::path::PathBuf {
         self.path.read().clone()
+    }
+
+    pub(crate) fn mark_v4(&self) {
+        self.v4.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the file was read as V4
+    pub fn is_v4(&self) -> bool {
+        self.v4.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Removes the file once the last holder lets go

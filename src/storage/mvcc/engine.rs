@@ -6952,6 +6952,9 @@ impl MVCCEngine {
                     if mgr.has_dead_copies() {
                         return true;
                     }
+                    if mgr.has_v4_volumes() {
+                        return true;
+                    }
                     // Tombstones exist even without sub-target volumes (pure DELETE).
                     // At-target volumes with tombstoned rows need cleanup.
                     if sub_target == 0 && !mgr.is_tombstone_set_empty() && mgr.segment_count() >= 1
@@ -7031,6 +7034,8 @@ impl MVCCEngine {
                 // acceptance rule below applies to those only
                 let mut size_only: Vec<bool> = Vec::new();
                 let mut deferred = false;
+                // The one V4 volume a cycle rewrites for its format alone
+                let mut v4_position: Option<usize> = None;
                 {
                     let segs = mgr.segments_raw();
                     let manifest = mgr.manifest();
@@ -7065,9 +7070,20 @@ impl MVCCEngine {
                         // tombstones to shed
                         let sub_target = seg.row_count < target_volume_rows;
                         let oversized = seg.row_count > oversized_threshold;
-                        let rewrite = sub_target || oversized || tombstoned || shed_dead;
+                        let own_reason = oversized || tombstoned || shed_dead;
+                        let v4 = v4_position.is_none()
+                            && !own_reason
+                            && segs.get(&seg.segment_id).is_some_and(|cs| {
+                                cs.file.as_ref().is_some_and(|file| file.is_v4())
+                            });
+                        if v4 {
+                            v4_position = Some(planned.len());
+                        }
+                        // The V4 volume is a selection only, its size work
+                        // included, so the limit counts it
+                        let rewrite = (sub_target && !v4) || own_reason;
                         planned.push((seg.segment_id, seg.row_count, rewrite, false));
-                        size_only.push(sub_target && !oversized && !tombstoned && !shed_dead);
+                        size_only.push(sub_target && !own_reason && !v4);
                     }
                 }
                 // Let go before any volume is loaded, so a commit meanwhile
@@ -7115,6 +7131,20 @@ impl MVCCEngine {
                         selected.push(position);
                     }
                 }
+                // The V4 volume joins as the last selection, so the volumes
+                // its overlap pulls in count against the limit, one without a
+                // recluster: past it, the V4 volume goes alone
+                let recluster_selected = !selected.is_empty();
+                let selection_limit = if recluster_selected {
+                    compact_threshold
+                } else {
+                    1
+                };
+                if let Some(position) = v4_position {
+                    if !selected.contains(&position) {
+                        selected.push(position);
+                    }
+                }
 
                 // Volumes take precedence by manifest position, newest last,
                 // and the rewrite takes the position of the batch's first
@@ -7146,12 +7176,12 @@ impl MVCCEngine {
                         &mut base,
                         &size_only,
                         &mut selected,
-                        compact_threshold,
+                        selection_limit,
                         target_volume_rows,
                         ids_of,
                     )
                 };
-                let reclustering = !selected.is_empty();
+                let reclustering = selected.iter().any(|&p| Some(p) != v4_position);
                 if let Some(request) = recluster_request {
                     if all_checked && !reduced && !reclustering {
                         mgr.recluster_done(request);
@@ -7173,7 +7203,7 @@ impl MVCCEngine {
                 // more to accumulate. One with tombstones to shed, an
                 // oversized one, or one out of its table's key order is
                 // rewritten alone
-                if members.len() == 1 && !reclustering && size_only[members[0]] {
+                if members.len() == 1 && selected.is_empty() && size_only[members[0]] {
                     continue;
                 }
                 let merge: Vec<(u64, usize)> = planned
