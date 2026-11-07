@@ -663,7 +663,22 @@ pub fn rewrite_volume_with_group_rows(path: &Path, group_rows: usize) -> Result<
     let tmp = path.with_extension("vol.tmp");
     std::fs::write(&tmp, &data)
         .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))
+        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))?;
+    // The manifest beside it records no identity for the V4 file now there
+    let segment_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("vol_"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .ok_or_else(|| crate::core::Error::internal(format!("rewrite {:?}: no volume id", path)))?;
+    let manifest_path = path.with_file_name("manifest.bin");
+    let bytes = std::fs::read(&manifest_path)
+        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))?;
+    let stored = super::manifest::TableManifest::deserialize(&bytes)
+        .map_err(|e| crate::core::Error::internal(format!("rewrite {:?}: {}", path, e)))?;
+    let mut manifest = stored.manifest;
+    manifest.identities.remove(&segment_id);
+    manifest.write_to_disk(&manifest_path, &stored.tombstones.into_iter().collect())
 }
 
 /// Read a frozen volume from disk, V5 or V4 by its magic.
