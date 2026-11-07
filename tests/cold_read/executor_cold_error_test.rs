@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use stoolap::core::{DataType, Error, Row, SchemaBuilder, Value};
-use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
 use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
 use stoolap::storage::volume::writer::VolumeBuilder;
 use stoolap::Database;
@@ -57,7 +57,7 @@ impl Fixture {
                 &Row::from_values(vec![Value::Integer(id), Value::Integer(id * 10)]),
             );
             let volume = builder.finish().unwrap();
-            let path = write_volume_to_disk(&volume_dir, "t", id as u64, &volume).unwrap();
+            let path = write_volume_to_disk_v4(&volume_dir, "t", id as u64, &volume).unwrap();
             if id == 2 {
                 original = std::fs::read(&path).unwrap();
                 let meta_len = u32::from_le_bytes(original[16..20].try_into().unwrap()) as usize;

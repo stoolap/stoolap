@@ -139,10 +139,28 @@ fn test_a_listed_volume_that_does_not_read_makes_its_table_unavailable() {
     let (dsn, volumes) = sealed(dir.path(), "damaged_volume");
     let path = &volumes[0];
     let mut bytes = std::fs::read(path).unwrap();
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0xFF;
+    let footer = bytes.len() - 8;
+    bytes[footer] ^= 0xFF;
     std::fs::write(path, &bytes).unwrap();
-    assert_t_refused(&dsn, "one flipped byte in a volume");
+    assert_t_refused(&dsn, "one flipped byte in a volume's footer");
+}
+
+#[test]
+fn test_a_damaged_block_fails_the_statements_that_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "damaged_block");
+    let path = &volumes[0];
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..4], b"STV5");
+    bytes[16] ^= 0xFF;
+    std::fs::write(path, &bytes).unwrap();
+    let db = Database::open(&dsn).unwrap();
+    match run(&db, "SELECT * FROM t") {
+        Err(msg) => assert!(msg.contains("CRC mismatch"), "got: {msg}"),
+        Ok(n) => panic!("a damaged block was read: {n} rows"),
+    }
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM u", ()).unwrap();
+    assert_eq!(rows, ROWS, "the intact table answers whole");
 }
 
 #[test]

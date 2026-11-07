@@ -1846,7 +1846,9 @@ impl MVCCEngine {
         // Write volume file to disk and retain CompressedBlockStore for
         // warm-tier eviction (single compress, no double work).
         if vol_row_count > 0 {
-            match crate::storage::volume::io::serialize_v4_public(&volume) {
+            // The volume id is assigned when the file is promoted, so the
+            // root records none
+            match crate::storage::volume::io::serialize_v5_opts(&volume, true, 0) {
                 Ok((data, store)) => {
                     volume.columns.attach_compressed_store(store);
                     if let Err(e) = (|| -> Result<()> {

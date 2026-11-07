@@ -772,6 +772,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3084,6 +3093,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3468,6 +3486,7 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table 7.2.2",
+ "crc32c",
  "crc32fast",
  "criterion",
  "csv",

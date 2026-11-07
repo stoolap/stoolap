@@ -71,4 +71,5 @@ pub mod side_index;
 pub mod stats;
 pub mod table;
 pub mod transfer;
+pub(crate) mod v5;
 pub mod writer;

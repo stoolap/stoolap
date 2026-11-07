@@ -15,7 +15,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use stoolap::core::{DataType, Row, SchemaBuilder, Value};
-use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
 use stoolap::storage::volume::writer::VolumeBuilder;
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
@@ -25,7 +25,8 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
         .build();
     let mut builder = VolumeBuilder::new(&schema);
     builder.add_row(1, &Row::from_values(vec![Value::Null(DataType::Text)]));
-    let path = write_volume_to_disk(dir.path(), "metadata", 1, &builder.finish().unwrap()).unwrap();
+    let path =
+        write_volume_to_disk_v4(dir.path(), "metadata", 1, &builder.finish().unwrap()).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     (dir, path, bytes)
 }
