@@ -309,6 +309,54 @@ fn test_members_are_kept_while_their_stamp_holds_and_by_parameters() {
 }
 
 #[test]
+fn test_runs_over_unchanged_tables_share_one_probe_budget_then_keep_the_members() {
+    use stoolap::test_failpoints::{
+        prepared_exists_counts, prepared_strategy_runs, PreparedStrategy,
+    };
+    let _guard = serial();
+    let db = Database::open("memory://prepared_in_probe_runs").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX i_k ON i (k)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 20)",
+        "INSERT INTO i SELECT value, value % 200, value % 10 FROM generate_series(1, 2000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // A run's twenty probes cost 280 of the 500 the runs share: the second
+    // run spends the rest and builds the members, the runs after take them
+    let sql = "SELECT id FROM o WHERE o.id % 10 IN \
+               (SELECT i.v FROM i WHERE i.k = o.k AND i.v > 5) ORDER BY id";
+    let passing = vec![6, 7, 8, 9, 16, 17, 18, 19];
+    for _ in 0..2 {
+        assert_eq!(ids(&db, sql), Ok(passing.clone()));
+    }
+    for run in 3..=5 {
+        let (probed, built, _) = prepared_exists_counts();
+        let taken = prepared_strategy_runs(PreparedStrategy::KeyedMembers);
+        assert_eq!(ids(&db, sql), Ok(passing.clone()));
+        let (probed_after, built_after, _) = prepared_exists_counts();
+        assert_eq!(
+            (probed_after - probed, built_after - built),
+            (0, 0),
+            "run {run} probes or builds again"
+        );
+        assert!(
+            prepared_strategy_runs(PreparedStrategy::KeyedMembers) > taken,
+            "run {run} takes the kept members"
+        );
+    }
+    db.execute("INSERT INTO i VALUES (2001, 1, 9)", ()).unwrap();
+    let (probed, _, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), Ok(passing));
+    assert!(
+        prepared_exists_counts().0 > probed,
+        "a changed table probes again"
+    );
+}
+
+#[test]
 fn test_a_top_level_set_test_reads_only_the_rows_its_members_name() {
     use stoolap::test_failpoints::prepared_rows_narrowed;
     let _guard = serial();

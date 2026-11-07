@@ -26,7 +26,7 @@ use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -383,6 +383,9 @@ pub enum BlockAnswer {
     /// A value block's members
     Members(CompactArc<KeptMembers>),
     KeyedMembers(CompactArc<MemberKeys>),
+    /// The candidates a keyed block's probes may still read over tables
+    /// unchanged since its stamp, shared by every run that probes them
+    ProbeBudget(Arc<AtomicUsize>),
 }
 
 /// What a prepared EXISTS answer is of: the block's identity, the scopes
