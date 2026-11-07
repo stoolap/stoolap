@@ -27,6 +27,13 @@ fn sealed(dir: &std::path::Path, name: &str) -> (String, Vec<std::path::PathBuf>
     let db_dir = dir.join(name);
     let dsn = format!("file://{}", db_dir.display());
     let db = Database::open(&dsn).unwrap();
+    fill(&db);
+    db.close().unwrap();
+    (dsn, volume_files(&db_dir, "t"))
+}
+
+/// Tables t and u, each sealed into volumes by a checkpoint
+fn fill(db: &Database) {
     for table in ["t", "u"] {
         db.execute(
             &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER UNIQUE)"),
@@ -44,15 +51,20 @@ fn sealed(dir: &std::path::Path, name: &str) -> (String, Vec<std::path::PathBuf>
         db.execute("COMMIT", ()).unwrap();
     }
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    db.close().unwrap();
-    let mut volumes: Vec<_> = std::fs::read_dir(db_dir.join("volumes").join("t"))
+}
+
+fn volume_files(db_dir: &std::path::Path, table: &str) -> Vec<std::path::PathBuf> {
+    let mut volumes: Vec<_> = std::fs::read_dir(db_dir.join("volumes").join(table))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "vol"))
         .collect();
     volumes.sort();
-    assert!(!volumes.is_empty(), "the checkpoint sealed no volume of t");
-    (dsn, volumes)
+    assert!(
+        !volumes.is_empty(),
+        "the checkpoint sealed no volume of {table}"
+    );
+    volumes
 }
 
 /// The rows `sql` answers, read to the end, or its first error
@@ -180,6 +192,27 @@ fn test_a_file_swapped_under_an_evicted_volume_keeps_the_recorded_identity() {
     db.close().unwrap();
     drop(db);
     assert_t_refused(&dsn, "a file swapped under an evicted volume of t");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_file_swapped_between_two_checkpoints_of_one_handle_keeps_the_recorded_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join("swapped_between_checkpoints");
+    let dsn = format!("file://{}", db_dir.display());
+    let db = Database::open(&dsn).unwrap();
+    fill(&db);
+    let (t_vol, u_vol) = (volume_files(&db_dir, "t"), volume_files(&db_dir, "u"));
+    let (listed, cold) = db.engine().cold_volumes_for_test("t");
+    assert_eq!(cold, listed, "t's volumes went cold");
+    std::fs::copy(&u_vol[0], &t_vol[0]).unwrap();
+    run(&db, "SELECT * FROM t WHERE v > 100 LIMIT 3").unwrap();
+    db.execute("INSERT INTO t VALUES (9999, 1, 9999)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    drop(db);
+    assert_t_refused(&dsn, "a file swapped between two checkpoints of one handle");
 }
 
 #[test]

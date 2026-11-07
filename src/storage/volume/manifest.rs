@@ -4267,18 +4267,19 @@ impl SegmentManager {
                 identities,
                 ..
             } = &mut *manifest;
-            identities.retain(|id, _| segments.iter().any(|seg| seg.segment_id == *id));
+            let mut recorded = FxHashMap::default();
+            recorded.reserve(segments.len());
             for seg in segments.iter() {
-                if identities.contains_key(&seg.segment_id) {
-                    continue;
-                }
-                let identity = loaded
-                    .get(&seg.segment_id)
-                    .and_then(|s| s.volume.meta.file_identity.get().copied());
+                let identity = identities.get(&seg.segment_id).copied().or_else(|| {
+                    loaded
+                        .get(&seg.segment_id)
+                        .and_then(|s| s.volume.meta.file_identity.get().copied())
+                });
                 if let Some(identity) = identity {
-                    identities.insert(seg.segment_id, identity);
+                    recorded.insert(seg.segment_id, identity);
                 }
             }
+            *identities = recorded;
             let tombstones = Arc::clone(&*self.tombstones.read());
             (manifest.clone(), tombstones)
         };
