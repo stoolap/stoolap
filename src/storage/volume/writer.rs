@@ -407,6 +407,103 @@ pub(crate) fn read_exact_at(
     }
 }
 
+/// The entries of a volume's dictionary columns, one run after another in
+/// column order
+pub struct SharedDict(DictEntries);
+
+enum DictEntries {
+    Strings(Vec<SmartString>),
+    Text(Arc<DictText>),
+}
+
+/// A V5 dictionary section's entries as read: where each entry ends in
+/// `text`, valid UTF-8 cut on character boundaries
+struct DictText {
+    ends: Box<[u32]>,
+    text: String,
+}
+
+impl DictText {
+    /// The byte span of entries `start..end` in `text`
+    fn span(&self, start: usize, end: usize) -> (usize, usize) {
+        let at = |i: usize| i.checked_sub(1).map_or(0, |i| self.ends[i] as usize);
+        (at(start), at(end))
+    }
+}
+
+impl From<Vec<SmartString>> for SharedDict {
+    fn from(strings: Vec<SmartString>) -> Self {
+        Self(DictEntries::Strings(strings))
+    }
+}
+
+impl SharedDict {
+    /// Entries a reader has checked: `ends` ascend, each within `text` and
+    /// on a character boundary
+    pub(crate) fn text(ends: Box<[u32]>, text: String) -> Self {
+        Self(DictEntries::Text(Arc::new(DictText { ends, text })))
+    }
+
+    /// Each dictionary column's entries, `ranges` (column, first, end)
+    fn columns(self, ranges: &[(usize, usize, usize)]) -> Vec<(usize, ColumnDict)> {
+        ranges
+            .iter()
+            .map(|&(col, start, end)| {
+                let dict = match &self.0 {
+                    DictEntries::Strings(strings) => ColumnDict {
+                        built: std::sync::OnceLock::from(Arc::from(&strings[start..end])),
+                        text: parking_lot::Mutex::new(None),
+                    },
+                    DictEntries::Text(text) => ColumnDict {
+                        built: std::sync::OnceLock::new(),
+                        text: parking_lot::Mutex::new(Some((Arc::clone(text), start, end))),
+                    },
+                };
+                (col, dict)
+            })
+            .collect()
+    }
+}
+
+/// One dictionary column's entries; from a V5 file they are built from its
+/// text on first use and the text given up
+struct ColumnDict {
+    built: std::sync::OnceLock<Arc<[SmartString]>>,
+    text: parking_lot::Mutex<Option<(Arc<DictText>, usize, usize)>>,
+}
+
+impl ColumnDict {
+    fn entries(&self) -> &Arc<[SmartString]> {
+        self.built.get_or_init(|| {
+            let Some((dict, start, end)) = self.text.lock().take() else {
+                return Arc::from(Vec::new());
+            };
+            let mut from = dict.span(start, end).0;
+            dict.ends[start..end]
+                .iter()
+                .map(|&to| {
+                    let entry = SmartString::from(&dict.text[from..to as usize]);
+                    from = to as usize;
+                    entry
+                })
+                .collect()
+        })
+    }
+
+    fn memory_size(&self) -> usize {
+        if let Some(built) = self.built.get() {
+            return built.iter().map(|s| s.len() + 24).sum();
+        }
+        match &*self.text.lock() {
+            Some((dict, start, end)) => {
+                let (from, to) = dict.span(*start, *end);
+                to - from + (end - start) * 4
+            }
+            None => 0,
+        }
+    }
+}
+
 pub struct CompressedBlockStore {
     /// The compressed block of every (column, group), in memory or in the file
     source: BlockSource,
@@ -416,10 +513,9 @@ pub struct CompressedBlockStore {
     col_type_tags: Vec<u8>,
     /// Ext type per column (only meaningful for COL_BYTES columns)
     col_ext_types: Vec<u8>,
-    /// Per dictionary column: pre-built Arc, shared across all group decompressions.
-    /// Created once at construction — group decompression clones the Arc (~5ns)
-    /// instead of cloning all dictionary strings per group.
-    col_dicts: Vec<(usize, Arc<[SmartString]>)>,
+    /// Per dictionary column: its entries' Arc, shared across all group
+    /// decompressions, which clone the Arc instead of the strings
+    col_dicts: Vec<(usize, ColumnDict)>,
     /// Rows per group, the volume's group size
     group_size: usize,
     /// Total row count across all groups
@@ -583,10 +679,7 @@ impl CompressedBlockStore {
             (all_blocks, all_decomp_lens)
         };
 
-        let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
-            .iter()
-            .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
-            .collect();
+        let col_dicts = SharedDict::from(shared_dict).columns(&dict_ranges);
         Ok(Self {
             source: BlockSource::Memory(all_blocks),
             decompressed_lens: all_decomp_lens,
@@ -614,11 +707,7 @@ impl CompressedBlockStore {
         group_size: usize,
         row_count: usize,
     ) -> Self {
-        let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
-            .iter()
-            .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
-            .collect();
-        // shared_dict and dict_ranges are consumed — only col_dicts kept
+        let col_dicts = SharedDict::from(shared_dict).columns(&dict_ranges);
         Self {
             source: BlockSource::Memory(blocks),
             decompressed_lens,
@@ -672,15 +761,12 @@ impl CompressedBlockStore {
         decompressed_lens: Vec<Vec<usize>>,
         col_type_tags: Vec<u8>,
         col_ext_types: Vec<u8>,
-        shared_dict: Vec<SmartString>,
+        shared_dict: impl Into<SharedDict>,
         dict_ranges: Vec<(usize, usize, usize)>,
         group_size: usize,
         row_count: usize,
     ) -> Self {
-        let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
-            .iter()
-            .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
-            .collect();
+        let col_dicts = shared_dict.into().columns(&dict_ranges);
         Self {
             source: BlockSource::File {
                 file,
@@ -833,7 +919,7 @@ impl CompressedBlockStore {
             self.col_dicts
                 .iter()
                 .find(|(ci, _)| *ci == col_idx)
-                .map(|(_, arc)| Arc::clone(arc))
+                .map(|(_, dict)| Arc::clone(dict.entries()))
         } else {
             None
         };
@@ -1240,7 +1326,7 @@ impl CompressedBlockStore {
             self.col_dicts
                 .iter()
                 .find(|(ci, _)| *ci == col_idx)
-                .map(|(_, arc)| Arc::clone(arc))
+                .map(|(_, dict)| Arc::clone(dict.entries()))
         } else {
             None
         };
@@ -1256,7 +1342,7 @@ impl CompressedBlockStore {
             return None;
         }
         let dict = self.col_dicts.iter().find(|(ci, _)| *ci == col_idx)?;
-        for (i, s) in dict.1.iter().enumerate() {
+        for (i, s) in dict.1.entries().iter().enumerate() {
             if s.as_str() == value {
                 return Some(i as u32);
             }
@@ -1406,7 +1492,7 @@ impl CompressedBlockStore {
         self.col_dicts
             .iter()
             .find(|(ci, _)| *ci == col_idx)
-            .map(|(_, arc)| arc)
+            .map(|(_, dict)| dict.entries())
     }
 
     /// Total compressed bytes in RAM.
@@ -1419,11 +1505,8 @@ impl CompressedBlockStore {
                 }
             }
         }
-        // Add dictionary memory (col_dicts Arcs)
         for (_, dict) in &self.col_dicts {
-            for s in dict.iter() {
-                size += s.len() + 24; // SmartString overhead
-            }
+            size += dict.memory_size();
         }
         size
     }
@@ -1766,7 +1849,7 @@ pub struct VolumeMeta {
     /// Zone maps per column
     pub zone_maps: Vec<ZoneMap>,
     /// Bloom filters per column (for fast equality membership testing)
-    pub bloom_filters: Vec<super::column::ColumnBloomFilter>,
+    pub bloom_filters: VolumeBlooms,
     /// Pre-computed aggregate stats
     pub stats: VolumeAggregateStats,
     /// Number of live rows
@@ -1805,6 +1888,117 @@ pub struct FileIdentity {
     pub table_crc: u32,
 }
 
+/// Each column's bloom filter: resident, or read from the volume's V5 file
+/// on the column's first probe
+#[derive(Clone, Default)]
+pub struct VolumeBlooms {
+    columns: Vec<BloomSlot>,
+}
+
+#[derive(Clone)]
+enum BloomSlot {
+    Resident(super::column::ColumnBloomFilter),
+    InFile {
+        place: BloomPlace,
+        file: Arc<VolumeFile>,
+        loaded: std::sync::OnceLock<super::column::ColumnBloomFilter>,
+    },
+}
+
+/// Where one column's bloom words lie in a V5 file, and their checksum
+#[derive(Clone)]
+pub(crate) struct BloomPlace {
+    pub at: u64,
+    pub num_bits: usize,
+    pub words: usize,
+    pub crc: u32,
+}
+
+impl VolumeBlooms {
+    pub fn resident(filters: Vec<super::column::ColumnBloomFilter>) -> Self {
+        Self {
+            columns: filters.into_iter().map(BloomSlot::Resident).collect(),
+        }
+    }
+
+    pub(crate) fn in_file(file: &Arc<VolumeFile>, places: Vec<Option<BloomPlace>>) -> Self {
+        let columns = places
+            .into_iter()
+            .map(|place| match place {
+                Some(place) => BloomSlot::InFile {
+                    place,
+                    file: Arc::clone(file),
+                    loaded: std::sync::OnceLock::new(),
+                },
+                None => BloomSlot::Resident(super::column::ColumnBloomFilter::accept_all()),
+            })
+            .collect();
+        Self { columns }
+    }
+
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Column `col`'s filter, read from the file on first use; an error
+    /// when that read fails or its words fail their CRC
+    pub fn filter(&self, col: usize) -> std::io::Result<Option<&super::column::ColumnBloomFilter>> {
+        let Some(slot) = self.columns.get(col) else {
+            return Ok(None);
+        };
+        let (place, file, loaded) = match slot {
+            BloomSlot::Resident(filter) => return Ok(Some(filter)),
+            BloomSlot::InFile {
+                place,
+                file,
+                loaded,
+            } => (place, file, loaded),
+        };
+        if let Some(filter) = loaded.get() {
+            return Ok(Some(filter));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(place.words * 8)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+        bytes.resize(place.words * 8, 0);
+        read_exact_at(&*file.block_reader()?, &mut bytes, place.at)?;
+        if super::v5::checksum(&bytes) != place.crc {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{:?}: V5 bloom filter CRC mismatch", file.path()),
+            ));
+        }
+        let filter = super::column::ColumnBloomFilter::from_parts(place.num_bits, &bytes);
+        Ok(Some(loaded.get_or_init(|| filter)))
+    }
+
+    /// Whether column `col` may hold a value of hash `h`; true for a column
+    /// without a filter
+    pub fn might_contain_hash(&self, col: usize, h: u64) -> std::io::Result<bool> {
+        Ok(self
+            .filter(col)?
+            .is_none_or(|filter| filter.might_contain_hash(h)))
+    }
+
+    /// Bytes of the filters in memory
+    pub fn memory_size(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|slot| match slot {
+                BloomSlot::Resident(filter) => filter.memory_size(),
+                BloomSlot::InFile { loaded, .. } => {
+                    loaded.get().map_or(0, |filter| filter.memory_size())
+                }
+            })
+            .sum()
+    }
+}
+
 impl VolumeMeta {
     /// log2 of `group_rows`: the group of row `i` is `i >> group_shift()`
     #[inline]
@@ -1837,10 +2031,7 @@ impl VolumeMeta {
         }
         // zone_maps: 2 Values (16 bytes each) + 2 u32 per column
         size += self.zone_maps.len() * (16 + 16 + 8);
-        // bloom_filters: Vec<u64> bitsets
-        for bf in &self.bloom_filters {
-            size += bf.memory_size();
-        }
+        size += self.bloom_filters.memory_size();
         // stats: 16 bytes base + per-column (i128 + f64 + u64 + 2 Values + u64)
         size += 16 + self.stats.columns.len() * (16 + 8 + 8 + 16 + 16 + 8);
         // column_names
@@ -2579,7 +2770,8 @@ impl VolumeBuilder {
         let bloom_filters = self
             .bloom
             .take()
-            .ok_or_else(|| Error::internal("streamed volume without fed bloom filters"))?;
+            .ok_or_else(|| Error::internal("streamed volume without fed bloom filters"))
+            .map(VolumeBlooms::resident)?;
         let row_order = self.row_order()?;
         let column_names: Vec<String> =
             self.schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -3292,7 +3484,7 @@ impl VolumeBuilder {
             columns: LazyColumns::eager(columns, column_types.clone()),
             meta: Arc::new(VolumeMeta {
                 zone_maps: self.zone_maps,
-                bloom_filters,
+                bloom_filters: VolumeBlooms::resident(bloom_filters),
                 stats: self.stats,
                 row_count: self.row_count,
                 column_names,
@@ -4489,10 +4681,11 @@ mod tests {
             )
             .unwrap();
         let volume = builder.finish().unwrap();
-        assert!(volume.meta.bloom_filters[0].might_contain(&Value::Integer(1)));
-        assert!(volume.meta.bloom_filters[0].might_contain(&Value::Integer(2)));
-        assert!(volume.meta.bloom_filters[1].might_contain(&Value::text("one")));
-        assert!(volume.meta.bloom_filters[1].might_contain(&Value::text("two")));
+        let bloom = |col| volume.meta.bloom_filters.filter(col).unwrap().unwrap();
+        assert!(bloom(0).might_contain(&Value::Integer(1)));
+        assert!(bloom(0).might_contain(&Value::Integer(2)));
+        assert!(bloom(1).might_contain(&Value::text("one")));
+        assert!(bloom(1).might_contain(&Value::text("two")));
     }
 
     #[test]

@@ -233,6 +233,43 @@ fn test_a_damaged_block_fails_the_statements_that_read_it() {
     assert_eq!(rows, ROWS, "the intact table answers whole");
 }
 
+/// Where column `col`'s bloom words start in a V5 file: the footer names
+/// the section table, whose bloom section entry (kind 9) names the section
+fn bloom_words_at(bytes: &[u8], col: usize) -> usize {
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    let table = u64_at(bytes.len() - 32);
+    let count = u32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
+    let section = (0..count)
+        .map(|i| table + 8 + i * 40)
+        .find(|&entry| bytes[entry..entry + 4] == 9u32.to_le_bytes())
+        .map(|entry| u64_at(entry + 8))
+        .unwrap();
+    section + u64_at(section + 16 + col * 24 + 16)
+}
+
+#[test]
+fn test_a_damaged_bloom_filter_fails_the_statements_that_probe_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "damaged_bloom");
+    let path = &volumes[0];
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = bloom_words_at(&bytes, 1);
+    bytes[at] ^= 0xFF;
+    std::fs::write(path, &bytes).unwrap();
+    let db = Database::open(&dsn).unwrap();
+    match run(&db, "SELECT id FROM t WHERE v = 50") {
+        Err(msg) => assert!(msg.contains("bloom filter CRC mismatch"), "got: {msg}"),
+        Ok(n) => panic!("a damaged bloom filter was probed: {n} rows"),
+    }
+    assert_eq!(
+        run(&db, "SELECT id FROM t WHERE v > 100"),
+        Ok(ROWS as usize - 10)
+    );
+    assert_eq!(run(&db, "SELECT id FROM t WHERE w = 50"), Ok(1));
+    let rows: i64 = db.query_one("SELECT COUNT(*) FROM u", ()).unwrap();
+    assert_eq!(rows, ROWS, "the intact table answers whole");
+}
+
 #[test]
 fn test_a_listed_volume_whose_file_is_gone_makes_its_table_unavailable() {
     let dir = tempfile::tempdir().unwrap();

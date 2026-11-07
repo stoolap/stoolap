@@ -2881,23 +2881,24 @@ impl SegmentedTable {
             if let Some(col_idx) = mapping.volume_column(vol, col_name) {
                 let zm = &vol.meta.zone_maps[col_idx];
                 let nans = vol.meta.nan_count(col_idx) != Some(0);
-                let dominated =
-                    match op {
-                        crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                            !zm.may_contain_gte(value, nans)
-                        }
-                        crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                            !zm.may_contain_lte(value, nans)
-                        }
-                        crate::core::Operator::Eq => {
-                            !zm.may_contain_eq(value, nans)
-                                || (col_idx < vol.meta.bloom_filters.len()
-                                    && bloom_hashes.get(comp_idx).and_then(|h| *h).is_some_and(
-                                        |h| !vol.meta.bloom_filters[col_idx].might_contain_hash(h),
-                                    ))
-                        }
-                        _ => false,
-                    };
+                let dominated = match op {
+                    crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                        !zm.may_contain_gte(value, nans)
+                    }
+                    crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                        !zm.may_contain_lte(value, nans)
+                    }
+                    crate::core::Operator::Eq => {
+                        !zm.may_contain_eq(value, nans)
+                            || match bloom_hashes.get(comp_idx).and_then(|h| *h) {
+                                Some(h) => {
+                                    !vol.meta.bloom_filters.might_contain_hash(col_idx, h)?
+                                }
+                                None => false,
+                            }
+                    }
+                    _ => false,
+                };
                 if dominated {
                     return Ok((true, 0, 0));
                 }

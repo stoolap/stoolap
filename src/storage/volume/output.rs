@@ -572,7 +572,8 @@ mod tests {
         let known = [
             V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_BLOOMS, V5_STATS,
         ];
-        let o = crate::storage::volume::v5::open(bytes.len() as u64, &known, &read_at).unwrap();
+        let o =
+            crate::storage::volume::v5::open(bytes.len() as u64, &known, &[], &read_at).unwrap();
         let p = o
             .places(o.root.cols as usize, o.root.groups as usize)
             .unwrap();
