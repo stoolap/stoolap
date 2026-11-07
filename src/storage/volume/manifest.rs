@@ -2580,12 +2580,11 @@ impl SegmentManager {
             // Tier 2: Bloom filter pruning
             let mut bloom_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
-                if vi < vol.meta.bloom_filters.len()
-                    && bloom_hashes[i]
-                        .is_some_and(|h| !vol.meta.bloom_filters[vi].might_contain_hash(h))
-                {
-                    bloom_skip = true;
-                    break;
+                if let Some(h) = bloom_hashes[i] {
+                    if !vol.meta.bloom_filters.might_contain_hash(vi, h)? {
+                        bloom_skip = true;
+                        break;
+                    }
                 }
             }
             if bloom_skip {

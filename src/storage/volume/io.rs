@@ -602,12 +602,21 @@ fn read_volume_v5(
     let len = file.metadata().map_err(fail)?.len();
     let read_at = |buf: &mut [u8], at: u64| super::writer::read_exact_at(&file, buf, at);
     let known = [
-        V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_BLOOMS, V5_STATS,
+        V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_STATS,
     ];
-    let opened = super::v5::open(len, &known, &read_at).map_err(fail)?;
+    let mut opened = super::v5::open(len, &known, &[V5_BLOOMS], &read_at).map_err(fail)?;
+    let super::format::V5Metadata { mut meta, bounds } =
+        super::format::v5_metadata_from_sections(&mut opened.meta, &opened.root).map_err(fail)?;
+    // A column's bloom words are read on its first probe
+    let cols = meta.col_type_tags.len();
+    let places = match opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
+        Some(&(_, enc, at, len)) => {
+            super::format::v5_bloom_places(enc, at, len, cols, &read_at).map_err(fail)?
+        }
+        None => (0..cols).map(|_| None).collect(),
+    };
     drop(file);
-    let super::format::V5Metadata { meta, bounds } =
-        super::format::v5_metadata_from_sections(&opened.meta, &opened.root).map_err(fail)?;
+    meta.bloom_filters = super::writer::VolumeBlooms::in_file(&handle, places);
     let root = &opened.root;
     // One group spans every row; more tile them at one power-of-two size,
     // which their zone maps' bounds carry
@@ -1437,6 +1446,83 @@ mod tests {
     }
 
     #[test]
+    fn a_v5_volume_reads_a_bloom_filter_or_builds_a_dictionary_on_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = mixed_volume(1_000);
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let read = read_volume_from_disk(&path).unwrap();
+        let blooms = &read.meta.bloom_filters;
+        assert_eq!(blooms.memory_size(), 0, "bloom words read at open");
+        let store = read.columns.compressed_store().unwrap();
+        let at_open = store.memory_size();
+
+        let h = super::super::column::ColumnBloomFilter::hash_value_static(&Value::Integer(4));
+        assert!(blooms.might_contain_hash(0, h).unwrap());
+        let written = vol.meta.bloom_filters.filter(0).unwrap().unwrap();
+        assert_eq!(blooms.memory_size(), written.memory_size());
+        assert_eq!(blooms.filter(0).unwrap().unwrap().bits(), written.bits());
+
+        let entries = store.get_column_dictionary(1).unwrap();
+        let want = vol.columns.get_column_dictionary(1).unwrap().unwrap();
+        assert_eq!(&entries[..], &want[..]);
+        assert!(store.memory_size() > at_open, "dictionary built at open");
+    }
+
+    #[test]
+    fn readers_probing_a_column_at_once_read_its_bloom_words_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", 1, &mixed_volume(200_000)).unwrap();
+        let read = read_volume_from_disk(&path).unwrap();
+        let blooms = &read.meta.bloom_filters;
+        let h = super::super::column::ColumnBloomFilter::hash_value_static(&Value::Integer(4));
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    start.wait();
+                    assert!(blooms.might_contain_hash(0, h).unwrap());
+                });
+            }
+        });
+        assert_eq!(blooms.file_reads(0), 1);
+    }
+
+    #[test]
+    fn the_shared_dictionary_text_counts_until_every_column_lets_it_go() {
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("long", DataType::Text, false, false)
+            .column("short", DataType::Text, false, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        for i in 0..2_000i64 {
+            let long = Value::text(format!("a distinct value long enough {i}"));
+            let short = Value::text(format!("s{}", i % 3));
+            builder.add_row(i, &Row::from_values(vec![Value::Integer(i), long, short]));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", 1, &builder.finish().unwrap()).unwrap();
+        let read = read_volume_from_disk(&path).unwrap();
+        let store = read.columns.compressed_store().unwrap();
+        let strings = |col| -> usize {
+            let entries = store.get_column_dictionary(col).unwrap();
+            entries.iter().map(|s| s.len() + 24).sum()
+        };
+        let text: usize = (0..2_000)
+            .map(|i| format!("a distinct value long enough {i}").len())
+            .sum();
+        let long = strings(1);
+        assert!(
+            store.memory_size() >= long + text,
+            "the unbuilt column keeps the whole text: {} < {}",
+            store.memory_size(),
+            long + text
+        );
+        let short = strings(2);
+        assert_eq!(store.memory_size(), long + short, "the text is let go");
+    }
+
+    #[test]
     fn a_v4_file_reads_as_the_v5_file_of_the_same_volume() {
         let dir = tempfile::tempdir().unwrap();
         let rows = 70_000;
@@ -1475,17 +1561,20 @@ mod tests {
     fn the_column_directory_refuses_a_type_encoding_or_kind_it_lacks() {
         let vol = mixed_volume(10);
         let read = |patch: Option<(usize, u8)>| {
-            let sections: Vec<(u32, u8, Vec<u8>)> = super::super::format::v5_volume_sections(&vol)
-                .unwrap()
-                .into_iter()
-                .map(|mut s| {
-                    if let (super::super::format::V5_COLUMNS, Some((at, byte))) = (s.kind, patch) {
-                        s.bytes[16 + at] = byte;
-                    }
-                    (s.kind, s.encoding, s.bytes)
-                })
-                .collect();
-            super::super::format::v5_metadata_from_sections(&sections, &root_of(&vol, 10))
+            let mut sections: Vec<(u32, u8, Vec<u8>)> =
+                super::super::format::v5_volume_sections(&vol)
+                    .unwrap()
+                    .into_iter()
+                    .map(|mut s| {
+                        if let (super::super::format::V5_COLUMNS, Some((at, byte))) =
+                            (s.kind, patch)
+                        {
+                            s.bytes[16 + at] = byte;
+                        }
+                        (s.kind, s.encoding, s.bytes)
+                    })
+                    .collect();
+            super::super::format::v5_metadata_from_sections(&mut sections, &root_of(&vol, 10))
         };
         assert!(read(None).is_ok());
         // Type tag, encoding, kind and data type of the first column
@@ -1533,7 +1622,7 @@ mod tests {
     #[test]
     fn a_row_count_the_groups_do_not_cover_is_refused_before_ids_are_expanded() {
         let vol = id_volume(&[1, 2, 3]);
-        let sections: Vec<(u32, u8, Vec<u8>)> = super::super::format::v5_volume_sections(&vol)
+        let mut sections: Vec<(u32, u8, Vec<u8>)> = super::super::format::v5_volume_sections(&vol)
             .unwrap()
             .into_iter()
             .map(|mut s| {
@@ -1547,12 +1636,14 @@ mod tests {
             })
             .collect();
         let root = root_of(&vol, 1 << 62);
-        let Err(error) = super::super::format::v5_metadata_from_sections(&sections, &root) else {
+        let Err(error) = super::super::format::v5_metadata_from_sections(&mut sections, &root)
+        else {
             panic!("a row count past the groups was accepted");
         };
         assert!(error.to_string().contains("cover"), "{error}");
         let root = root_of(&vol, 3);
-        let Err(error) = super::super::format::v5_metadata_from_sections(&sections, &root) else {
+        let Err(error) = super::super::format::v5_metadata_from_sections(&mut sections, &root)
+        else {
             panic!("a row count past the root's was accepted");
         };
         assert!(error.to_string().contains("root does not match"), "{error}");

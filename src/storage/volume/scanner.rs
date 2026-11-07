@@ -589,7 +589,7 @@ impl VolumeScanner {
                 columns: super::writer::LazyColumns::empty(),
                 meta: Arc::new(super::writer::VolumeMeta {
                     zone_maps: Vec::new(),
-                    bloom_filters: Vec::new(),
+                    bloom_filters: super::writer::VolumeBlooms::default(),
                     stats: super::stats::VolumeAggregateStats::new(0),
                     row_count: 0,
                     column_names: Vec::new(),

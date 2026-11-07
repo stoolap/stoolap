@@ -341,13 +341,16 @@ fn test_top_k_loads_no_row_group_without_the_key() {
     drop(db);
     // Reopened, the volume is read group by group through the group cache
     let db = Database::open(&format!("file://{}/key_major_groups", dir.path().display())).unwrap();
-    let resident = |db: &Database| -> i64 {
+    let resident = |db: &Database| -> (i64, i64) {
         db.query("PRAGMA VOLUME_STATS", ())
             .unwrap()
-            .map(|r| r.unwrap().get::<i64>(4).unwrap())
-            .sum()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.get::<i64>(3).unwrap(), r.get::<i64>(4).unwrap())
+            })
+            .fold((0, 0), |(rows, bytes), (r, b)| (rows + r, bytes + b))
     };
-    let before_bytes = resident(&db);
+    let (rows, before_bytes) = resident(&db);
     for dir in ["DESC", "ASC"] {
         let before = group_cache_loads();
         let got = ids(
@@ -361,10 +364,12 @@ fn test_top_k_loads_no_row_group_without_the_key() {
             "{dir}: k17 lies in the second of two row groups"
         );
     }
-    assert_eq!(
-        resident(&db),
-        before_bytes,
-        "the scan made a whole column of the volume resident"
+    // A bloom filter read on its first probe and a dictionary built on first
+    // use, about 1.3 bytes a row; a resident column of k is about 5
+    let grown = resident(&db).1 - before_bytes;
+    assert!(
+        grown < 2 * rows,
+        "the scan made a whole column of the volume resident: {grown} bytes"
     );
 }
 

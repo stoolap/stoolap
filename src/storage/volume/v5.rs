@@ -231,6 +231,9 @@ pub(crate) struct Opened {
     pub root: Root,
     /// The metadata sections this reader knows: (kind, encoding, bytes)
     pub meta: Vec<(u32, u8, Vec<u8>)>,
+    /// The sections left in the file: (kind, encoding, offset, length),
+    /// each stored raw
+    pub deferred: Vec<(u32, u8, u64, u64)>,
     /// The block table, its entry size and where the sections begin
     blocks: Vec<u8>,
     block_entry: usize,
@@ -271,10 +274,12 @@ fn bounded(len: u64, limit: u64, what: &str) -> io::Result<usize> {
 
 /// Reads the footer, the section table and the sections `known` names
 /// (besides the root and the block table) of the file `read_at` reads by
-/// position, `len` bytes long
+/// position, `len` bytes long; the `deferred` ones' places only, their
+/// readers checking what they read
 pub(crate) fn open(
     len: u64,
     known: &[u32],
+    deferred: &[u32],
     read_at: &dyn Fn(&mut [u8], u64) -> io::Result<()>,
 ) -> io::Result<Opened> {
     if len < HEADER_LEN + FOOTER_LEN {
@@ -318,6 +323,7 @@ pub(crate) fn open(
     let mut root = None;
     let mut blocks = None;
     let mut meta: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(count);
+    let mut left = Vec::new();
     let mut seen = Vec::with_capacity(count);
     let mut sections_start = table_at;
     for i in 0..count {
@@ -338,6 +344,13 @@ pub(crate) fn open(
             return Err(invalid("section outside the file"));
         }
         sections_start = sections_start.min(at);
+        if deferred.contains(&kind) {
+            if codec != CODEC_RAW || stored != decoded {
+                return Err(invalid(format!("section {kind} is not stored raw")));
+            }
+            left.push((kind, encoding, at, stored));
+            continue;
+        }
         let wanted = kind == SECTION_ROOT || kind == SECTION_BLOCKS || known.contains(&kind);
         if !wanted {
             if flags & REQUIRED != 0 {
@@ -416,6 +429,7 @@ pub(crate) fn open(
     Ok(Opened {
         root,
         meta,
+        deferred: left,
         blocks,
         block_entry,
         sections_start,
@@ -516,7 +530,7 @@ mod tests {
             buf.copy_from_slice(&bytes[at..at + buf.len()]);
             Ok(())
         };
-        open(bytes.len() as u64, known, &read_at)
+        open(bytes.len() as u64, known, &[], &read_at)
     }
 
     #[test]

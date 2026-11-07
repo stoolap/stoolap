@@ -913,6 +913,11 @@ impl ColumnBloomFilter {
         out
     }
 
+    /// A filter that rejects nothing, for a column the file has none for
+    pub fn accept_all() -> Self {
+        Self::from_parts(64, &[0xFF; 8])
+    }
+
     /// Reconstruct a bloom filter from serialized parts.
     ///
     /// `num_bits` is the logical bit count; `bytes` is the raw bitset written

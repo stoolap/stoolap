@@ -875,7 +875,13 @@ fn a_text_equality_beside_the_key_decodes_only_the_candidates_groups() {
             "only the candidates' group was decoded: {} groups: {sql}",
             delta(&cache_after, &cache_before, "misses")
         );
-        assert_eq!(resident(&db), resident_before, "no column loaded whole: {sql}");
+        // Bloom filters read on their first probe, about 1.3 bytes a row
+        // each; a resident column of k or name is 5 to 9
+        let grown = resident(&db) - resident_before;
+        assert!(
+            grown < 4 * TOTAL as usize,
+            "no column loaded whole: {grown} bytes: {sql}"
+        );
     }
 }
 

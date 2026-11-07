@@ -158,7 +158,15 @@ fn a_reopened_table_reads_its_volumes_from_their_files_a_group_at_a_time() {
         .count();
     assert_eq!(n, 400);
     let read = volumes(&db);
-    assert_eq!(read, opened);
+    for (before, after) in opened.iter().zip(&read) {
+        assert_eq!(
+            (before.0, &before.1, before.2),
+            (after.0, &after.1, after.2)
+        );
+        // A bloom filter read on its first probe and a dictionary built on
+        // first use, about 1.3 bytes a row; a decoded group is far more
+        assert!(after.3 - before.3 < 2 * before.2, "{opened:?} {read:?}");
+    }
     // The unique index is not in the file: the first conflict after a
     // reopen is found by building it, and is found
     assert!(db

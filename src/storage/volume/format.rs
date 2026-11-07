@@ -1131,10 +1131,10 @@ pub(crate) struct VolumeMetadata {
     pub col_ext_types: Vec<u8>,
     pub col_sorted: Vec<bool>,
     pub col_dict_counts: Vec<u32>,
-    pub shared_dict: Vec<SmartString>,
+    pub shared_dict: super::writer::SharedDict,
     pub row_ids: Vec<i64>,
     pub zone_maps: Vec<ZoneMap>,
-    pub bloom_filters: Vec<super::column::ColumnBloomFilter>,
+    pub bloom_filters: super::writer::VolumeBlooms,
     pub stats: VolumeAggregateStats,
     pub column_names: Vec<String>,
     pub column_types: Vec<DataType>,
@@ -1273,7 +1273,10 @@ fn write_volume_metadata_parts<W: Write>(
 
     // Bloom filters
     buf.write_all(&(meta.bloom_filters.len() as u32).to_le_bytes())?;
-    for bf in &meta.bloom_filters {
+    for i in 0..meta.bloom_filters.len() {
+        let Some(bf) = meta.bloom_filters.filter(i)? else {
+            continue;
+        };
         buf.write_all(&(bf.num_bits() as u64).to_le_bytes())?;
         buf.write_all(&((bf.bits().len() * 8) as u32).to_le_bytes())?;
         write_u64_le(buf, bf.bits())?;
@@ -1558,10 +1561,10 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         col_ext_types,
         col_sorted,
         col_dict_counts,
-        shared_dict,
+        shared_dict: shared_dict.into(),
         row_ids,
         zone_maps,
-        bloom_filters,
+        bloom_filters: super::writer::VolumeBlooms::resident(bloom_filters),
         stats: VolumeAggregateStats {
             total_rows,
             live_rows,
@@ -1762,12 +1765,11 @@ pub(crate) fn v5_metadata_sections(
     // A bytes column's values all hash alike, so its filter rejects
     // nothing and is not written
     let filters: Vec<Option<&super::column::ColumnBloomFilter>> = (0..col_count)
-        .map(|i| {
-            (kinds[i].0 != COL_BYTES)
-                .then(|| meta.bloom_filters.get(i))
-                .flatten()
+        .map(|i| match kinds[i].0 {
+            COL_BYTES => Ok(None),
+            _ => meta.bloom_filters.filter(i),
         })
-        .collect();
+        .collect::<io::Result<_>>()?;
     let head = V5_BLOOM_HEAD + col_count * V5_BLOOM_ENTRY;
     let words: usize = filters.iter().flatten().map(|bf| bf.bits().len()).sum();
     let mut blooms = Vec::with_capacity(head + words * 8);
@@ -1823,11 +1825,16 @@ pub(crate) struct V5Metadata {
 }
 
 /// The volume metadata from its V5 sections, each (kind, encoding, bytes),
-/// refused unless its counts are the root's
+/// refused unless its counts are the root's; the dictionary's bytes are
+/// taken, and the bloom filters are left to the reader
 pub(crate) fn v5_metadata_from_sections(
-    sections: &[(u32, u8, Vec<u8>)],
+    sections: &mut [(u32, u8, Vec<u8>)],
     root: &super::v5::Root,
 ) -> io::Result<V5Metadata> {
+    let dict = sections
+        .iter_mut()
+        .find(|s| s.0 == V5_DICT)
+        .map(|s| (s.1, std::mem::take(&mut s.2)));
     let get = |kind: u32| {
         sections
             .iter()
@@ -1923,29 +1930,11 @@ pub(crate) fn v5_metadata_from_sections(
         .iter()
         .try_fold(0usize, |sum, &c| sum.checked_add(c as usize))
         .ok_or_else(|| invalid("dictionary count"))?;
-    let mut shared_dict = Vec::new();
-    if strings > 0 {
-        let (enc, data) = get(V5_DICT).ok_or_else(|| invalid("no dictionary"))?;
-        if enc != 1 || data.len() < 4 || u32_at(data, 0) as usize != strings {
-            return Err(invalid("dictionary"));
-        }
-        check_metadata_count(data, 4, strings, 4)?;
-        shared_dict.reserve_exact(strings);
-        let text = std::str::from_utf8(&data[4 + strings * 4..])
-            .map_err(|_| invalid("dictionary text"))?;
-        let mut start = 0usize;
-        for i in 0..strings {
-            let end = u32_at(data, 4 + i * 4) as usize;
-            if end < start || end > text.len() || !text.is_char_boundary(end) {
-                return Err(invalid("dictionary bounds"));
-            }
-            shared_dict.push(SmartString::from(&text[start..end]));
-            start = end;
-        }
-        if start != text.len() {
-            return Err(invalid("dictionary trailing text"));
-        }
-    }
+    let shared_dict = match dict {
+        Some((enc, data)) if strings > 0 => v5_dictionary(enc, data, strings)?,
+        None if strings > 0 => return Err(invalid("no dictionary")),
+        _ => Vec::new().into(),
+    };
 
     let (enc, data) = get(V5_ROW_IDS).ok_or_else(|| invalid("no row ids"))?;
     let mut pos = 0;
@@ -2020,12 +2009,6 @@ pub(crate) fn v5_metadata_from_sections(
         return Err(invalid("zone map trailing bytes"));
     }
 
-    let bloom_filters = match get(V5_BLOOMS) {
-        Some((enc, data)) => v5_blooms_from_section(enc, data, col_count)?,
-        // A reader without the section prunes nothing
-        None => (0..col_count).map(|_| accept_all_filter()).collect(),
-    };
-
     let (enc, data) = get(V5_STATS).ok_or_else(|| invalid("no statistics"))?;
     if enc != 1 {
         return Err(invalid("statistics encoding"));
@@ -2070,7 +2053,7 @@ pub(crate) fn v5_metadata_from_sections(
             shared_dict,
             row_ids,
             zone_maps,
-            bloom_filters,
+            bloom_filters: super::writer::VolumeBlooms::default(),
             stats: VolumeAggregateStats {
                 total_rows,
                 live_rows,
@@ -2085,59 +2068,93 @@ pub(crate) fn v5_metadata_from_sections(
     })
 }
 
-/// A filter that rejects nothing: every bit set
-fn accept_all_filter() -> super::column::ColumnBloomFilter {
-    super::column::ColumnBloomFilter::from_parts(64, &[0xFF; 8])
+/// A V5 dictionary section's entries, checked: `strings` ends, ascending,
+/// each on a character boundary of the text after them
+fn v5_dictionary(
+    enc: u8,
+    mut data: Vec<u8>,
+    strings: usize,
+) -> io::Result<super::writer::SharedDict> {
+    if enc != 1 || data.len() < 4 || u32_at(&data, 0) as usize != strings {
+        return Err(invalid("dictionary"));
+    }
+    check_metadata_count(&data, 4, strings, 4)?;
+    let head = 4 + strings * 4;
+    let ends: Box<[u32]> = (0..strings).map(|i| u32_at(&data, 4 + i * 4)).collect();
+    data.drain(..head);
+    let text = String::from_utf8(data).map_err(|_| invalid("dictionary text"))?;
+    let mut start = 0usize;
+    for &end in &ends {
+        let end = end as usize;
+        if end < start || end > text.len() || !text.is_char_boundary(end) {
+            return Err(invalid("dictionary bounds"));
+        }
+        start = end;
+    }
+    if start != text.len() {
+        return Err(invalid("dictionary trailing text"));
+    }
+    Ok(super::writer::SharedDict::text(ends, text))
 }
 
-/// Every column's filter of a V5 bloom section; a column the section has
-/// no filter for gets one that rejects nothing
-fn v5_blooms_from_section(
+/// Where each column's words lie in a V5 bloom section of `len` bytes at
+/// `at`: its header and entries read and checked, the words left in the
+/// file. None for a column the section has no filter for.
+pub(crate) fn v5_bloom_places(
     enc: u8,
-    data: &[u8],
+    at: u64,
+    len: u64,
     col_count: usize,
-) -> io::Result<Vec<super::column::ColumnBloomFilter>> {
-    if enc != 1 || data.len() < V5_BLOOM_HEAD || data[0] != BLOOM_FNV1A64_K3 || data[1] != 3 {
+    read_at: &dyn Fn(&mut [u8], u64) -> io::Result<()>,
+) -> io::Result<Vec<Option<super::writer::BloomPlace>>> {
+    let mut header = [0u8; V5_BLOOM_HEAD];
+    if enc != 1 || len < V5_BLOOM_HEAD as u64 {
+        return Err(invalid("bloom section"));
+    }
+    read_at(&mut header, at)?;
+    if header[0] != BLOOM_FNV1A64_K3 || header[1] != 3 {
         return Err(invalid("bloom hash or probes"));
     }
-    let (count, entry) = (u32_at(data, 4) as usize, u32_at(data, 12) as usize);
-    if count != col_count || entry < V5_BLOOM_ENTRY {
+    let (count, entry) = (u32_at(&header, 4) as usize, u32_at(&header, 12) as usize);
+    let Some(head) = count
+        .checked_mul(entry)
+        .and_then(|n| n.checked_add(V5_BLOOM_HEAD))
+        .filter(|&head| head as u64 <= len && count == col_count && entry >= V5_BLOOM_ENTRY)
+    else {
         return Err(invalid("bloom header"));
-    }
-    check_metadata_count(data, V5_BLOOM_HEAD, count, entry)?;
-    let head = V5_BLOOM_HEAD + count * entry;
-    if super::v5::checksum(&data[V5_BLOOM_HEAD..head]) != u32_at(data, 8) {
+    };
+    let mut entries = vec![0u8; head - V5_BLOOM_HEAD];
+    read_at(&mut entries, at + V5_BLOOM_HEAD as u64)?;
+    if super::v5::checksum(&entries) != u32_at(&header, 8) {
         return Err(invalid("bloom header CRC mismatch"));
     }
     (0..count)
         .map(|i| {
-            let mut p = V5_BLOOM_HEAD + i * entry;
-            let num_bits = read_u64(data, &mut p)?;
-            let words = read_u32(data, &mut p)? as usize;
-            let crc = read_u32(data, &mut p)?;
-            let offset =
-                usize::try_from(read_u64(data, &mut p)?).map_err(|_| invalid("bloom offset"))?;
+            let mut p = i * entry;
+            let num_bits = read_u64(&entries, &mut p)?;
+            let words = read_u32(&entries, &mut p)? as u64;
+            let crc = read_u32(&entries, &mut p)?;
+            let offset = read_u64(&entries, &mut p)?;
             if words == 0 {
-                return if num_bits == 0 {
-                    Ok(accept_all_filter())
-                } else {
-                    Err(invalid("bloom geometry"))
+                return match num_bits {
+                    0 => Ok(None),
+                    _ => Err(invalid("bloom geometry")),
                 };
             }
-            let end = words
+            words
                 .checked_mul(8)
                 .and_then(|n| n.checked_add(offset))
-                .filter(|&end| offset >= head && end <= data.len())
+                .filter(|&end| offset >= head as u64 && end <= len)
                 .ok_or_else(|| invalid("bloom bits outside the section"))?;
-            if num_bits.div_ceil(64) != words as u64 {
+            if num_bits.div_ceil(64) != words {
                 return Err(invalid("bloom geometry"));
             }
-            let bits = &data[offset..end];
-            if super::v5::checksum(bits) != crc {
-                return Err(invalid("bloom CRC mismatch"));
-            }
-            let num_bits = usize::try_from(num_bits).map_err(|_| invalid("bloom size"))?;
-            Ok(super::column::ColumnBloomFilter::from_parts(num_bits, bits))
+            Ok(Some(super::writer::BloomPlace {
+                at: at + offset,
+                num_bits: usize::try_from(num_bits).map_err(|_| invalid("bloom size"))?,
+                words: words as usize,
+                crc,
+            }))
         })
         .collect()
 }
